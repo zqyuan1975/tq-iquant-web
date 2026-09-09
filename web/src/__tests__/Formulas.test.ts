@@ -272,4 +272,73 @@ describe('Formulas.vue', () => {
     expect(w.text()).toContain('编辑公式')
     expect(w.find('datalist#tdx-line-names').exists()).toBe(true)
   })
+
+  it('通达信弹窗支持关键字搜索（acCode/acName 过滤，清空恢复）', async () => {
+    const w = mount(Formulas)
+    await flushPromises()
+    await w.find('button.tdx-import-btn').trigger('click')
+    await flushPromises()
+
+    await w.find('input.tdx-search').setValue('COST')
+    let rows = w.findAll('.tdx-table tbody tr')
+    expect(rows.length).toBe(1)
+    expect(rows[0].text()).toContain('COSTLINE')
+    expect(w.text()).not.toContain('QZQ')
+
+    // 清空 → 恢复全量
+    await w.find('input.tdx-search').setValue('')
+    expect(w.findAll('.tdx-table tbody tr').length).toBe(2)
+  })
+
+  it('通达信弹窗搜索无匹配 → 显示空状态', async () => {
+    const w = mount(Formulas)
+    await flushPromises()
+    await w.find('button.tdx-import-btn').trigger('click')
+    await flushPromises()
+
+    await w.find('input.tdx-search').setValue('NOSUCH')
+    expect(w.findAll('.tdx-table tbody tr').length).toBe(0)
+    expect(w.text()).toContain('无匹配公式')
+  })
+
+  it('通达信弹窗分页：每页 10 条，可翻页，搜索后回到第 1 页', async () => {
+    ;(getTdxFormulas as any).mockResolvedValue(
+      Array.from({ length: 25 }, (_, i) => ({
+        acCode: `F${String(i + 1).padStart(2, '0')}`, acName: '', isSys: 0, imported: false, formula_id: null,
+      })),
+    )
+    const w = mount(Formulas)
+    await flushPromises()
+    await w.find('button.tdx-import-btn').trigger('click')
+    await flushPromises()
+
+    // 第 1 页 10 条
+    expect(w.findAll('.tdx-table tbody tr').length).toBe(10)
+    expect(w.text()).toContain('F01')
+    expect(w.text()).not.toContain('F11')
+    expect(w.text()).toContain('共 25 条')
+
+    // 翻到第 2 页
+    const nextBtn = w.findAll('.tdx-pagination button').find(b => b.text().includes('下一页'))!
+    await nextBtn.trigger('click')
+    expect(w.findAll('.tdx-table tbody tr').length).toBe(10)
+    expect(w.text()).toContain('F11')
+    expect(w.text()).not.toContain('F01')
+
+    // 搜索 F2 → 只剩 6 条（≤10 → 分页条隐藏），且从匹配区头部开始
+    await w.find('input.tdx-search').setValue('F2')
+    await flushPromises()
+    let rows = w.findAll('.tdx-table tbody tr')
+    expect(rows.length).toBe(6)  // F20-F25 共 6 条匹配
+    expect(rows[0].text()).toContain('F20')
+    expect(w.find('.tdx-pagination').exists()).toBe(false)
+
+    // 清空 → 回到第 1 页（watch 复位，而非停留在第 2 页）
+    await w.find('input.tdx-search').setValue('')
+    await flushPromises()
+    rows = w.findAll('.tdx-table tbody tr')
+    expect(rows.length).toBe(10)
+    expect(rows[0].text()).toContain('F01')
+    expect(w.text()).toContain('第 1 / 3 页')
+  })
 })

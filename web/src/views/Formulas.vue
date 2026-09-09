@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, onMounted } from 'vue'
+import { ref, computed, watch, onMounted } from 'vue'
 import {
   getFormulas, createFormula, updateFormula, deleteFormula,
   getTdxFormulas, getTdxInfo, importTdxFormula,
@@ -16,6 +16,20 @@ const errorMsg = ref('')
 const showTdx = ref(false)
 const tdxLoading = ref(false)
 const tdxItems = ref<TdxFormulaListItem[]>([])
+// 搜索 + 分页（自编公式可能上百条）
+const TDX_PAGE_SIZE = 10
+const tdxQuery = ref('')
+const tdxPage = ref(1)
+const filteredTdx = computed(() => {
+  const q = tdxQuery.value.trim().toLowerCase()
+  if (!q) return tdxItems.value
+  return tdxItems.value.filter(it =>
+    it.acCode.toLowerCase().includes(q) || (it.acName || '').toLowerCase().includes(q))
+})
+const tdxTotalPages = computed(() => Math.max(1, Math.ceil(filteredTdx.value.length / TDX_PAGE_SIZE)))
+const pagedTdx = computed(() =>
+  filteredTdx.value.slice((tdxPage.value - 1) * TDX_PAGE_SIZE, tdxPage.value * TDX_PAGE_SIZE))
+watch(tdxQuery, () => { tdxPage.value = 1 })
 // 线名选项（tdx-info Line），信号编辑的 signal_name 预填
 const lineNames = ref<string[]>([])
 
@@ -85,6 +99,8 @@ function openEdit(f: FormulaItem) {
 async function openTdx() {
   showTdx.value = true
   tdxLoading.value = true
+  tdxQuery.value = ''
+  tdxPage.value = 1
   try {
     tdxItems.value = await getTdxFormulas(true)
   } catch (e) {
@@ -181,21 +197,29 @@ onMounted(load)
     <div class="modal-content">
       <h3>从通达信导入公式</h3>
       <p style="color:#888;font-size:13px">列出通达信自编公式（isSys=0）；导入后请在编辑弹窗中配置信号。</p>
+      <input v-model="tdxQuery" class="tdx-search" placeholder="搜索公式名 / 中文名" style="margin-bottom:8px;width:100%" />
       <div v-if="tdxLoading" style="padding:12px">加载中…</div>
-      <table v-else class="tdx-table">
-        <thead><tr><th>公式名</th><th>中文名</th><th style="width:100px">操作</th></tr></thead>
-        <tbody>
-          <tr v-for="it in tdxItems" :key="it.acCode">
-            <td>{{ it.acCode }}</td>
-            <td style="color:#888">{{ it.acName || '—' }}</td>
-            <td>
-              <span v-if="it.imported" class="badge badge-blue">已导入</span>
-              <button v-else @click="doImport(it)" class="btn btn-sm btn-primary">导入</button>
-            </td>
-          </tr>
-        </tbody>
-      </table>
-      <div v-if="!tdxLoading && tdxItems.length === 0" class="empty-state"><p>通达信无自编公式</p></div>
+      <template v-else>
+        <table class="tdx-table">
+          <thead><tr><th>公式名</th><th>中文名</th><th style="width:100px">操作</th></tr></thead>
+          <tbody>
+            <tr v-for="it in pagedTdx" :key="it.acCode">
+              <td>{{ it.acCode }}</td>
+              <td style="color:#888">{{ it.acName || '—' }}</td>
+              <td>
+                <span v-if="it.imported" class="badge badge-blue">已导入</span>
+                <button v-else @click="doImport(it)" class="btn btn-sm btn-primary">导入</button>
+              </td>
+            </tr>
+          </tbody>
+        </table>
+        <div v-if="filteredTdx.length === 0" class="empty-state"><p>无匹配公式</p></div>
+        <div v-if="tdxTotalPages > 1" class="tdx-pagination" style="display:flex;align-items:center;gap:12px;margin-top:8px">
+          <button class="btn btn-sm" :disabled="tdxPage <= 1" @click="tdxPage--">上一页</button>
+          <span style="color:#888;font-size:13px">第 {{ tdxPage }} / {{ tdxTotalPages }} 页（共 {{ filteredTdx.length }} 条）</span>
+          <button class="btn btn-sm" :disabled="tdxPage >= tdxTotalPages" @click="tdxPage++">下一页</button>
+        </div>
+      </template>
       <div class="modal-actions">
         <button @click="showTdx = false" class="btn">关闭</button>
       </div>
