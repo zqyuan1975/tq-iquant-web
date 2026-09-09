@@ -1,12 +1,23 @@
 <script setup lang="ts">
 import { ref, onMounted } from 'vue'
-import { getFormulas, createFormula, updateFormula, deleteFormula, type SignalItem, type FormulaItem } from '../api'
+import {
+  getFormulas, createFormula, updateFormula, deleteFormula,
+  getTdxFormulas, getTdxInfo, importTdxFormula,
+  type SignalItem, type FormulaItem, type TdxFormulaListItem,
+} from '../api'
 
 const formulas = ref<FormulaItem[]>([])
 const loading = ref(true)
 const showForm = ref(false)
 const editingId = ref<number | null>(null)
 const errorMsg = ref('')
+
+// 通达信导入弹窗（三步流程：列表 → 导入 → 信号编辑）
+const showTdx = ref(false)
+const tdxLoading = ref(false)
+const tdxItems = ref<TdxFormulaListItem[]>([])
+// 线名选项（tdx-info Line），信号编辑的 signal_name 预填
+const lineNames = ref<string[]>([])
 
 // 从 axios 错误里提取后端错误消息（统一响应 {code,message} 或 Pydantic 422 detail）
 function errMsg(e: any): string {
@@ -42,7 +53,19 @@ async function load() {
 function openCreate() {
   editingId.value = null
   form.value = emptyForm()
+  lineNames.value = []
   showForm.value = true
+}
+
+// 通达信公式元数据的线名（公式不在通达信或接口失败时静默忽略，不阻塞编辑）
+async function fetchLineNames(name: string) {
+  lineNames.value = []
+  try {
+    const info = await getTdxInfo(name, 0)
+    lineNames.value = (info.Line || []).map((l) => l.LineName).filter(Boolean)
+  } catch {
+    /* 非通达信公式或接口不可用：无预填选项即可 */
+  }
 }
 
 function openEdit(f: FormulaItem) {
@@ -56,6 +79,34 @@ function openEdit(f: FormulaItem) {
       : [{ signal_name: '', signal_type: 'OPEN', trigger_value: 1 }],
   }
   showForm.value = true
+  fetchLineNames(f.name)
+}
+
+async function openTdx() {
+  showTdx.value = true
+  tdxLoading.value = true
+  try {
+    tdxItems.value = await getTdxFormulas(true)
+  } catch (e) {
+    alert(`获取通达信公式列表失败：${errMsg(e)}`)
+    showTdx.value = false
+  } finally {
+    tdxLoading.value = false
+  }
+}
+
+async function doImport(item: TdxFormulaListItem) {
+  let created: FormulaItem
+  try {
+    created = await importTdxFormula(item.acCode)
+  } catch (e) {
+    alert(`导入失败：${errMsg(e)}`)
+    return
+  }
+  // 第二步完成 → 直接进第三步：打开编辑弹窗配信号（线名预填）
+  showTdx.value = false
+  load()
+  openEdit(created)
 }
 
 function addSignal() {
@@ -96,7 +147,8 @@ onMounted(load)
 </script>
 
 <template>
-  <div style="margin-bottom:16px;display:flex;justify-content:flex-end">
+  <div style="margin-bottom:16px;display:flex;justify-content:flex-end;gap:8px">
+    <button @click="openTdx" class="btn tdx-import-btn">从通达信导入</button>
     <button @click="openCreate" class="btn btn-primary">+ 新建公式</button>
   </div>
 
@@ -125,6 +177,31 @@ onMounted(load)
     <div v-if="formulas.length === 0" class="empty-state"><p>暂无公式</p></div>
   </div>
 
+  <div v-if="showTdx" class="modal-overlay" @click.self="showTdx = false">
+    <div class="modal-content">
+      <h3>从通达信导入公式</h3>
+      <p style="color:#888;font-size:13px">列出通达信自编公式（isSys=0）；导入后请在编辑弹窗中配置信号。</p>
+      <div v-if="tdxLoading" style="padding:12px">加载中…</div>
+      <table v-else class="tdx-table">
+        <thead><tr><th>公式名</th><th>中文名</th><th style="width:100px">操作</th></tr></thead>
+        <tbody>
+          <tr v-for="it in tdxItems" :key="it.acCode">
+            <td>{{ it.acCode }}</td>
+            <td style="color:#888">{{ it.acName || '—' }}</td>
+            <td>
+              <span v-if="it.imported" class="badge badge-blue">已导入</span>
+              <button v-else @click="doImport(it)" class="btn btn-sm btn-primary">导入</button>
+            </td>
+          </tr>
+        </tbody>
+      </table>
+      <div v-if="!tdxLoading && tdxItems.length === 0" class="empty-state"><p>通达信无自编公式</p></div>
+      <div class="modal-actions">
+        <button @click="showTdx = false" class="btn">关闭</button>
+      </div>
+    </div>
+  </div>
+
   <div v-if="showForm" class="modal-overlay modal-lg" @click.self="showForm = false">
     <div class="modal-content">
       <h3>{{ editingId === null ? '新建公式' : '编辑公式' }}</h3>
@@ -137,8 +214,11 @@ onMounted(load)
       <input v-model.number="form.formula_count" type="number" min="1" placeholder="200" />
 
       <label>信号配置</label>
+      <datalist id="tdx-line-names">
+        <option v-for="n in lineNames" :key="n" :value="n" />
+      </datalist>
       <div v-for="(sig, idx) in form.signals" :key="idx" class="signal-row">
-        <input v-model="sig.signal_name" placeholder="信号名称" />
+        <input v-model="sig.signal_name" list="tdx-line-names" placeholder="信号名称（可从通达信线名中选）" />
         <select v-model="sig.signal_type">
           <option v-for="t in SIGNAL_TYPES" :key="t.value" :value="t.value">{{ t.label }}（{{ t.value }}）</option>
         </select>

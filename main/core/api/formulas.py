@@ -5,6 +5,7 @@ from sqlalchemy.orm import Session
 
 from core.api.response import err, ok
 from core.db import get_db
+from core.services import formula_service
 from core.services.formula_service import (
     list_formulas as _svc_list_formulas,
     get_formula as _svc_get_formula,
@@ -33,6 +34,10 @@ class FormulaCreate(BaseModel):
     formula_count: int = 200
 
 
+class FormulaImport(BaseModel):
+    ac_code: str  # 通达信公式名（acCode）
+
+
 def _validate_signals(signals: list[SignalItem]) -> str | None:
     """返回错误消息（str）或 None（校验通过）。"""
     for sig in signals:
@@ -46,6 +51,38 @@ def _validate_signals(signals: list[SignalItem]) -> str | None:
 @router.get("")
 def list_formulas(db: Session = Depends(get_db)):
     return ok(_svc_list_formulas(db))
+
+
+# ---------------------------------------------------------------------------
+# 通达信公式导入三步（静态路由必须在 /{formula_id} 之前声明）
+# ---------------------------------------------------------------------------
+@router.get("/tdx-list")
+def tdx_list(user_only: bool = False, formula_type: int = 0, db: Session = Depends(get_db)):
+    """第一步：通达信公式列表，附 imported/formula_id 已导入标记。"""
+    return ok(formula_service.tdx_list(db, user_only=user_only, formula_type=formula_type))
+
+
+@router.get("/tdx-info")
+def tdx_info(formula_type: int = 0, ac_code: str = ""):
+    """单公式元数据（Para 参数表 + Line 输出线名，第三步信号预填用）。"""
+    data = formula_service.tdx_info(formula_type, ac_code)
+    if data is None:
+        return err(404, "通达信公式不存在或接口未返回")
+    return ok(data)
+
+
+@router.post("/import")
+def import_from_tdx(req: FormulaImport, db: Session = Depends(get_db)):
+    """第二步：按 acCode 落库（content 留空，formula_count 默认 200，0 信号）。"""
+    if not req.ac_code.strip():
+        return err(400, "ac_code 不能为空")
+    try:
+        data = formula_service.import_from_tdx(db, req.ac_code.strip())
+    except ValueError as e:
+        return err(409, str(e))
+    if data is None:
+        return err(404, "通达信公式不存在或接口未返回")
+    return ok(data)
 
 
 @router.get("/{formula_id}")

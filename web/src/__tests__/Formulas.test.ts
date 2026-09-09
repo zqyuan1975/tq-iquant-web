@@ -8,11 +8,15 @@ vi.mock('../api', () => ({
   createFormula: vi.fn(),
   updateFormula: vi.fn(),
   deleteFormula: vi.fn(),
+  getTdxFormulas: vi.fn(),
+  getTdxInfo: vi.fn(),
+  importTdxFormula: vi.fn(),
 }))
 
 import Formulas from '../views/Formulas.vue'
 import {
   getFormulas, createFormula, deleteFormula,
+  getTdxFormulas, getTdxInfo, importTdxFormula,
 } from '../api'
 
 const mockFormulas = [
@@ -32,6 +36,17 @@ const mockFormulas = [
 beforeEach(() => {
   vi.clearAllMocks()
   ;(getFormulas as any).mockResolvedValue(mockFormulas)
+  ;(getTdxFormulas as any).mockResolvedValue([
+    { acCode: 'QZQ', acName: '', isSys: 0, imported: true, formula_id: 2 },
+    { acCode: 'COSTLINE', acName: '', isSys: 0, imported: false, formula_id: null },
+  ])
+  ;(getTdxInfo as any).mockResolvedValue({
+    acCode: 'COSTLINE', acName: '', isSys: 0, ParaNum: 0,
+    LineNum: 2, Line: [{ LineName: '建仓' }, { LineName: '清仓' }],
+  })
+  ;(importTdxFormula as any).mockResolvedValue({
+    id: 99, name: 'COSTLINE', content: '', formula_count: 200, signals: [],
+  })
 })
 
 describe('Formulas.vue', () => {
@@ -184,5 +199,77 @@ describe('Formulas.vue', () => {
     expect(alertMock).toHaveBeenCalled()
     expect(alertMock.mock.calls[0][0]).toContain('被引用，无法删除')
     vi.unstubAllGlobals()
+  })
+
+  // -------------------------------------------------------------------------
+  // 从通达信导入（三步流程）：列表弹窗 → 导入落库 → 信号编辑线名预填
+  // -------------------------------------------------------------------------
+  it('点[从通达信导入] → 弹窗调 getTdxFormulas，渲染 acCode，已导入的带标记', async () => {
+    const w = mount(Formulas)
+    await flushPromises()
+
+    await w.find('button.tdx-import-btn').trigger('click')
+    await flushPromises()
+
+    expect(getTdxFormulas).toHaveBeenCalledWith(true)  // 默认只看自编
+    expect(w.text()).toContain('COSTLINE')
+    expect(w.text()).toContain('QZQ')
+    // QZQ 已导入 → 标记；COSTLINE 未导入 → 显示「导入」按钮
+    expect(w.text()).toContain('已导入')
+    const importBtn = w.findAll('button').find(b => b.text() === '导入')
+    expect(importBtn).toBeTruthy()
+  })
+
+  it('点未导入行的[导入] → 调 importTdxFormula + getTdxInfo，打开编辑弹窗并预填名称', async () => {
+    const w = mount(Formulas)
+    await flushPromises()
+    await w.find('button.tdx-import-btn').trigger('click')
+    await flushPromises()
+
+    const importBtn = w.findAll('button').find(b => b.text() === '导入')!
+    await importBtn.trigger('click')
+    await flushPromises()
+
+    expect(importTdxFormula).toHaveBeenCalledWith('COSTLINE')
+    expect(getTdxInfo).toHaveBeenCalledWith('COSTLINE', 0)
+    // tdx 弹窗关闭，编辑弹窗打开，名称预填 acCode
+    expect(w.text()).toContain('编辑公式')
+    const nameInput = w.find('input[placeholder*="名称"]')
+    expect((nameInput.element as HTMLInputElement).value).toBe('COSTLINE')
+    // content 预填空（通达信拿不到源码）
+    expect((w.find('textarea').element as HTMLTextAreaElement).value).toBe('')
+  })
+
+  it('信号编辑弹窗打开时，signal_name 输入挂 datalist（线名预填选项）', async () => {
+    const w = mount(Formulas)
+    await flushPromises()
+    await w.find('button.tdx-import-btn').trigger('click')
+    await flushPromises()
+    const importBtn = w.findAll('button').find(b => b.text() === '导入')!
+    await importBtn.trigger('click')
+    await flushPromises()
+
+    const sigInput = w.find('.signal-row input')
+    expect(sigInput.exists()).toBe(true)
+    expect(sigInput.attributes('list')).toBe('tdx-line-names')
+    const datalist = w.find('datalist#tdx-line-names')
+    expect(datalist.exists()).toBe(true)
+    const options = datalist.findAll('option')
+    expect(options.map(o => o.element.value)).toEqual(['建仓', '清仓'])
+  })
+
+  it('编辑已有公式时也拉 tdx-info 填充线名选项（404 静默忽略）', async () => {
+    ;(getTdxInfo as any).mockRejectedValue({ response: { data: { code: 404, message: '不存在' } } })
+    const w = mount(Formulas)
+    await flushPromises()
+
+    // 编辑 id=1 MACROSSPRO
+    await w.findAll('button.btn-sm.btn-primary')[0].trigger('click')
+    await flushPromises()
+
+    expect(getTdxInfo).toHaveBeenCalledWith('MACROSSPRO', 0)
+    // 404 不崩，编辑弹窗照常打开
+    expect(w.text()).toContain('编辑公式')
+    expect(w.find('datalist#tdx-line-names').exists()).toBe(true)
   })
 })

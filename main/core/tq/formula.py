@@ -172,6 +172,11 @@ class TQFormula:
         tq = get_tq()
         return tq.formula_get_all(formula_type=formula_type) or []
 
+    def get_formula_info(self, formula_type: int = 0, formula_code: str = "") -> dict:
+        """单公式元数据（参数表 Para + 输出线名 Line，信号预填用）。"""
+        tq = get_tq()
+        return tq.formula_get_info(formula_type=formula_type, formula_code=formula_code) or {}
+
     def _run_formula(self, formula_name, formula_arg, stocks, period, count, dividend_type,
                      start_time="", end_time="", return_count=-1, return_date=True):
         tq = get_tq()

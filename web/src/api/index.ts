@@ -288,6 +288,44 @@ export async function deleteFormula(id: number) {
   return res.data.data
 }
 
+// 通达信公式导入三步（对齐 formulas.tdx_list / tdx_info / import）
+export interface TdxFormulaListItem {
+  acCode: string
+  acName: string
+  isSys: number | null
+  imported: boolean
+  formula_id: number | null
+}
+
+export interface TdxFormulaInfo {
+  acCode: string
+  acName: string
+  isSys: number
+  ParaNum: number
+  Para?: { ParaName: string; Min: string; Max: string; Default: string }[]
+  LineNum: number
+  Line?: { LineName: string }[]
+}
+
+export async function getTdxFormulas(userOnly = true) {
+  const res = await api.get<ApiResponse<TdxFormulaListItem[]>>('/formulas/tdx-list', {
+    params: { user_only: userOnly },
+  })
+  return res.data.data
+}
+
+export async function getTdxInfo(acCode: string, formulaType = 0) {
+  const res = await api.get<ApiResponse<TdxFormulaInfo>>('/formulas/tdx-info', {
+    params: { ac_code: acCode, formula_type: formulaType },
+  })
+  return res.data.data
+}
+
+export async function importTdxFormula(acCode: string) {
+  const res = await api.post<ApiResponse<FormulaItem>>('/formulas/import', { ac_code: acCode })
+  return res.data.data
+}
+
 export async function getPortfolios() {
   const res = await api.get<ApiResponse<PortfolioItem[]>>('/portfolios')
   return res.data.data

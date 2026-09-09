@@ -256,3 +256,30 @@ def test_compute_injected_passes_period_through(fake_tq, period):
     proc_kwargs = fake_tq.formula_process_mul_zb.call_args.kwargs
     assert set_kwargs["stock_period"] == period
     assert proc_kwargs["stock_period"] == period
+
+
+# ---------------------------------------------------------------------------
+# get_formula_list / get_formula_info — 通达信公式元数据（导入三步流程）
+# ---------------------------------------------------------------------------
+def test_get_formula_info_passes_kwargs(fake_tq):
+    """get_formula_info 按关键字透传 formula_type/formula_code 给 tq.formula_get_info。"""
+    with patch("core.tq.formula.get_tq", return_value=fake_tq):
+        formula = TQFormula()
+        formula.get_formula_info(formula_type=0, formula_code="QZQ")
+
+    fake_tq.formula_get_info.assert_called_once_with(
+        formula_type=0, formula_code="QZQ",
+    )
+
+
+def test_get_formula_info_returns_raw(fake_tq):
+    """get_formula_info 原样返回 tq.formula_get_info 的结果。"""
+    fake_tq.formula_get_info.return_value = {
+        "acCode": "QZQ", "isSys": 0,
+        "LineNum": 1, "Line": [{"LineName": "普通金叉信号"}],
+    }
+    with patch("core.tq.formula.get_tq", return_value=fake_tq):
+        info = TQFormula().get_formula_info(formula_type=0, formula_code="QZQ")
+
+    assert info["acCode"] == "QZQ"
+    assert info["Line"][0]["LineName"] == "普通金叉信号"

@@ -337,6 +337,130 @@ def test_formula_count_below_1_rejected(client):
 
 
 # ---------------------------------------------------------------------------
+# 通达信公式导入（三步流程）：GET tdx-list / GET tdx-info / POST import
+# ---------------------------------------------------------------------------
+class _FakeTQFormula:
+    """mock TQFormula：列表/详情不连真实通达信。"""
+
+    def get_formula_list(self, formula_type=0):
+        return [
+            {"acCode": "MA", "acName": "均线", "isSys": 1},
+            {"acCode": "QZQ", "acName": "", "isSys": 0},
+            {"acCode": "COSTLINE", "acName": "", "isSys": 0},
+        ]
+
+    def get_formula_info(self, formula_type=0, formula_code=""):
+        if formula_code == "MISS":
+            return {}
+        return {
+            "acCode": formula_code, "acName": "", "isSys": 0,
+            "ParaNum": 0,
+            "LineNum": 2,
+            "Line": [{"LineName": "开仓"}, {"LineName": "平仓"}],
+        }
+
+
+@pytest.fixture
+def fake_tq(monkeypatch):
+    """把 service 层引用的 TQFormula 替换为 mock 类。"""
+    from core.services import formula_service
+    monkeypatch.setattr(formula_service, "TQFormula", _FakeTQFormula)
+
+
+def test_tdx_list_user_only_marks_imported(client, fake_tq):
+    """user_only=true 只回自编公式；与库内按 name 匹配出 imported/formula_id。"""
+    c, Session = client
+    db = Session()
+    qzq_id = _seed_formula(db, name="QZQ")
+    db.close()
+
+    resp = c.get("/api/formulas/tdx-list", params={"user_only": "true"})
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["code"] == 0
+    items = body["data"]
+    # 系统公式 MA 被过滤，只剩 2 个自编
+    assert [i["acCode"] for i in items] == ["QZQ", "COSTLINE"]
+    by_code = {i["acCode"]: i for i in items}
+    assert by_code["QZQ"]["imported"] is True
+    assert by_code["QZQ"]["formula_id"] == qzq_id
+    assert by_code["COSTLINE"]["imported"] is False
+    assert by_code["COSTLINE"]["formula_id"] is None
+
+
+def test_tdx_list_without_user_only_includes_system(client, fake_tq):
+    """不带 user_only → 系统公式也返回。"""
+    c, _ = client
+    resp = c.get("/api/formulas/tdx-list")
+    assert resp.json()["code"] == 0
+    codes = [i["acCode"] for i in resp.json()["data"]]
+    assert "MA" in codes and "QZQ" in codes
+
+
+def test_tdx_info_returns_lines(client, fake_tq):
+    """tdx-info 返回公式元数据（含 Line 线名，供信号预填）。"""
+    c, _ = client
+    resp = c.get("/api/formulas/tdx-info", params={"ac_code": "QZQ"})
+    assert resp.json()["code"] == 0
+    data = resp.json()["data"]
+    assert data["acCode"] == "QZQ"
+    assert data["LineNum"] == 2
+    assert [l["LineName"] for l in data["Line"]] == ["开仓", "平仓"]
+
+
+def test_tdx_info_not_found(client, fake_tq):
+    """通达信查无此公式 → code 404。"""
+    c, _ = client
+    resp = c.get("/api/formulas/tdx-info", params={"ac_code": "MISS"})
+    assert resp.json()["code"] == 404
+
+
+def test_import_creates_formula_without_signals(client, fake_tq):
+    """导入 COSTLINE → 建 Formula(name=COSTLINE, content='', formula_count=200)，0 信号。"""
+    c, Session = client
+    resp = c.post("/api/formulas/import", json={"ac_code": "COSTLINE"})
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["code"] == 0
+    new_id = body["data"]["id"]
+    assert body["data"]["name"] == "COSTLINE"
+    assert body["data"]["content"] == ""
+    assert body["data"]["formula_count"] == 200
+    assert body["data"]["signals"] == []
+
+    db = Session()
+    f = db.get(Formula, new_id)
+    assert f is not None
+    assert f.name == "COSTLINE"
+    db.close()
+
+
+def test_import_existing_name_conflict(client, fake_tq):
+    """导入已存在同名公式 → code 409。"""
+    c, Session = client
+    db = Session()
+    _seed_formula(db, name="QZQ")
+    db.close()
+
+    resp = c.post("/api/formulas/import", json={"ac_code": "QZQ"})
+    assert resp.json()["code"] == 409
+    assert "已存在" in resp.json()["message"]
+
+
+def test_import_unknown_ac_code(client, fake_tq):
+    """通达信查无此公式 → code 404，不落库。"""
+    c, Session = client
+    resp = c.post("/api/formulas/import", json={"ac_code": "MISS"})
+    assert resp.json()["code"] == 404
+
+    db = Session()
+    assert db.query(Formula).filter_by(name="MISS").count() == 0
+    db.close()
+
+
+# ---------------------------------------------------------------------------
 # DELETE /api/formulas/{id} — 删公式（信号随 CASCADE 删）
 # ---------------------------------------------------------------------------
 def test_delete_formula_removes_signals(client):
