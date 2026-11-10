@@ -1,5 +1,5 @@
 ﻿<script setup lang="ts">
-import { ref, onMounted } from 'vue'
+import { ref, computed, onMounted } from 'vue'
 import {
   getSystemConfigs, updateSystemConfigs, testLiveChannel,
   getBackupStatus, createBackup,
@@ -161,6 +161,19 @@ function backupLine(rec: BackupRecord | null | undefined): string {
     : `（${rec.status === 'skipped' ? '已跳过' : '失败'}）`
   return `${t} / ${size}${tag}`
 }
+
+/**
+ * 今日自动备份的**实际执行时间**（HH:MM），取自当日自动备份记录的 started_at。
+ * 不能用配置项 backup.daily_at：启动晚于 daily_at 时由补备逻辑执行，实际时间晚于点位。
+ */
+const autoDoneTodayAt = computed(() => {
+  const s = backupStatus.value
+  if (!s?.auto_done_today) return ''
+  const started = s.last_auto?.started_at
+  if (!started) return ''
+  const m = /T(\d{2}):(\d{2})/.exec(started)
+  return m ? `${m[1]}:${m[2]}` : ''
+})
 
 async function runBackup() {
   backupBusy.value = true
@@ -491,8 +504,8 @@ function testTdx() { return testChannel('tdx_tq') }
               <button @click="runBackup" class="btn btn-sm" :disabled="backupBusy">
                 {{ backupBusy ? '备份中…' : '立即备份' }}
               </button>
-              <span v-if="backupStatus?.auto_done_today" class="cfg-hint">
-                今日已自动备份（{{ backupStatus.daily_at }}）
+              <span v-if="autoDoneTodayAt" class="cfg-hint">
+                今日已自动备份（{{ autoDoneTodayAt }}）
               </span>
               <span v-if="backupMsg" style="color:var(--green);font-size:13px">{{ backupMsg }}</span>
               <span v-if="backupErr" style="color:var(--red);font-size:13px">{{ backupErr }}</span>

@@ -239,11 +239,12 @@ describe('SystemConfig.vue', () => {
   it('渲染数据备份区块：上次自动/手动备份时间与大小、今日已自动备份提示', async () => {
     ;(getBackupStatus as any).mockResolvedValue({
       ...emptyBackupStatus,
+      // 启动晚于 15:10 → 补备逻辑实际在 19:42 执行；标签必须显示实际时间而非配置点位
       last_auto: {
         id: 11, kind: 'auto', status: 'success',
-        filename: 'dev-20261110-151000.db', path: '/data/backup/dev-20261110-151000.db',
+        filename: 'dev-20261110-194234.db', path: '/data/backup/dev-20261110-194234.db',
         size_bytes: 3 * 1024 * 1024, message: null,
-        started_at: '2026-11-10T15:10:00', finished_at: '2026-11-10T15:10:02',
+        started_at: '2026-11-10T19:42:34', finished_at: '2026-11-10T19:42:36',
       },
       last_manual: {
         id: 12, kind: 'manual', status: 'success',
@@ -259,10 +260,12 @@ describe('SystemConfig.vue', () => {
     expect(getBackupStatus).toHaveBeenCalled()
     expect(w.text()).toContain('数据备份')
     expect(w.text()).toContain('上次自动备份')
-    expect(w.text()).toContain('2026-11-10 15:10:00 / 3.0 MB')
+    expect(w.text()).toContain('2026-11-10 19:42:34 / 3.0 MB')
     expect(w.text()).toContain('上次手动备份')
     expect(w.text()).toContain('2026-11-10 15:20:00 / 2.0 KB')
-    expect(w.text()).toContain('今日已自动备份（15:10）')
+    // 标签取当日自动备份记录的实际时间，而非配置的 daily_at(15:10)
+    expect(w.text()).toContain('今日已自动备份（19:42）')
+    expect(w.text()).not.toContain('今日已自动备份（15:10）')
     expect(w.text()).toContain('D:/project/tq-iquant-web/main/data/backup')
     // 自动备份配置字段回显（保存走同一表单）
     const dailyInput = w.findAll('input').find(
@@ -276,6 +279,25 @@ describe('SystemConfig.vue', () => {
     await flushPromises()
 
     expect(w.text()).toContain('暂无')
+    expect(w.text()).not.toContain('今日已自动备份')
+    w.unmount()
+  })
+
+  it('当日无自动备份记录（上次自动备份是昨天） → 不显示今日已自动备份提示', async () => {
+    ;(getBackupStatus as any).mockResolvedValue({
+      ...emptyBackupStatus,
+      last_auto: {
+        id: 9, kind: 'auto', status: 'success',
+        filename: 'dev-20261109-151000.db', path: '/data/backup/dev-20261109-151000.db',
+        size_bytes: 3 * 1024 * 1024, message: null,
+        started_at: '2026-11-09T15:10:00', finished_at: '2026-11-09T15:10:02',
+      },
+      auto_done_today: false,
+    })
+    const w = mount(SystemConfig)
+    await flushPromises()
+
+    expect(w.text()).toContain('2026-11-09 15:10:00 / 3.0 MB')
     expect(w.text()).not.toContain('今日已自动备份')
     w.unmount()
   })
