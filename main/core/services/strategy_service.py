@@ -87,7 +87,7 @@ def serialize_portfolio(db: Session, p: PortfolioStrategy) -> dict:
         "stamp_duty_rate": float(p.stamp_duty_rate) if p.stamp_duty_rate is not None else None,
         "slippage": float(p.slippage) if p.slippage is not None else None,
         "trading_session": p.trading_session,
-        "price_limit_check_enabled": bool(p.price_limit_check_enabled) if p.price_limit_check_enabled is not None else False,
+        "price_limit_check_enabled": bool(p.price_limit_check_enabled) if p.price_limit_check_enabled is not None else True,
         "volume_limit_enabled": bool(p.volume_limit_enabled) if p.volume_limit_enabled is not None else False,
         "volume_limit_ratio": float(p.volume_limit_ratio) if p.volume_limit_ratio is not None else 0.10,
         "adaptive_slippage_enabled": bool(p.adaptive_slippage_enabled) if p.adaptive_slippage_enabled is not None else False,

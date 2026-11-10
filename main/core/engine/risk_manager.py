@@ -39,9 +39,14 @@ class StrategyRiskManager:
 
     def check_trailing_stop(self, position: Position, current_price: Decimal,
                             ratio: Optional[Decimal] = None) -> bool:
-        """移动止损。ratio 可覆盖实例阈值（B5 市场状态闸：趋势态放宽止损）。"""
+        """移动止损。ratio 可覆盖实例阈值（B5 市场状态闸：趋势态放宽止损）。
+
+        成本未知（avg_cost<=0，柜台负成本/导入仓无成本基准）时整票跳过风控：
+        此时无法区分「成本基准」与「现价」，回撤判定失去意义（B5 2026-11-10）。
+        """
         threshold = ratio if ratio is not None else self.trailing_stop_ratio
-        if position.quantity == 0 or threshold == 0:
+        if (position.quantity == 0 or position.avg_cost <= 0
+                or threshold == 0):
             return False
         if current_price > position.highest_price:
             return False

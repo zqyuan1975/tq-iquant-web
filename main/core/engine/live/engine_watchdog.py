@@ -329,20 +329,48 @@ class EngineWatchdog:
     # ---------------------------------------------------------------- 通道探针
     def _probe(self, channel: str, now: datetime, session_id: int,
                engine: object) -> Optional[StallSignal]:
+        has_synth = getattr(engine, "_snapshot_synth", None) is not None
+        if channel == "ths_ui":
+            # THS 先判执行面（积压/游标）；无异常再看行情新鲜度（THS 行情也走快照合成）
+            return (self._probe_ths(now, session_id, engine)
+                    or (self._probe_tdx(now, session_id, engine)
+                        if has_synth else None))
         if channel == "tdx_tq":
             return self._probe_tdx(now, session_id, engine)
-        if channel == "ths_ui":
-            return self._probe_ths(now, session_id, engine)
         if channel in ("goldminer_bridge", "iquant_bridge"):
+            # 掘金行情由平台走 TQ 快照合成（不是桥 /quote）：桥心跳正常但快照停摆
+            # 也必须能报 → 先判行情新鲜度，再看桥不可达（两者任一命中即告警）。
+            if has_synth:
+                return (self._probe_tdx(now, session_id, engine)
+                        or self._probe_bridge(now, session_id, engine))
             return self._probe_bridge(now, session_id, engine)
+        if has_synth:
+            # 其它挂了快照合成器的会话（alert 监听等）：按行情新鲜度监控
+            return self._probe_tdx(now, session_id, engine)
         return None  # 未知通道：仅引擎层监控
+
+    def _uptime_basis(self, now: datetime, engine: object) -> Optional[datetime]:
+        """启动时刻基准；同日起步的会话取 max(启动时刻, 今日 09:30)。
+
+        开盘前启动（如 09:15/09:20）时，09:30 前一根已闭合 1m bar 都还没有，
+        直接用启动时刻算「行情静默」会在每天 09:30 必报一次假警（首根 bar 要到
+        09:31 才闭合）。把基准抬到开盘时刻，只有开盘后真停滞才告警。
+        """
+        started = getattr(engine, "_started_at", None)
+        if started is None:
+            return None
+        if started.date() == now.date():
+            floor = datetime.combine(now.date(), _AM_OPEN)
+            if started < floor:
+                return floor
+        return started
 
     def _probe_tdx(self, now: datetime, session_id: int,
                    engine: object) -> Optional[StallSignal]:
-        """tdx：行情新鲜度停滞；或行情链路已标离线。
+        """行情新鲜度停滞；或行情链路已标离线。
 
-        新鲜度基准优先取快照合成器「最近一根已闭合 1m bar」（tdx/ths/alert 的
-        盘中数据源）。**策略周期 bar（1d/1w/1mon）的 00:00:00 不参与判定**——
+        新鲜度基准优先取快照合成器「最近一根已闭合 1m bar」（tdx/ths/alert/掘金
+        的盘中数据源）。**策略周期 bar（1d/1w/1mon）的 00:00:00 不参与判定**——
         直接与墙钟相减会在每天开盘后必报假警（2026-11-05 14:31 实证：
         last bar=00:00:00、静默 52278 秒，实际 5s 账户采样与 1m bar 一直在跑）。
         """
@@ -365,8 +393,9 @@ class EngineWatchdog:
             basis = getattr(synth, "last_completed_at", None)
             basis_name = "snapshot_1m"
             if basis is None:
-                # 合成器在跑但尚无已闭合 1m bar：以启动时刻计（宽限已在外层扣）
-                basis = getattr(engine, "_started_at", None)
+                # 合成器在跑但尚无已闭合 1m bar：以启动时刻计（宽限已在外层扣），
+                # 同日起步抬到开盘时刻，消掉 09:30 的固定假警。
+                basis = self._uptime_basis(now, engine)
                 basis_name = "uptime"
         else:
             bar = getattr(engine, "_available_bar", None)
@@ -378,7 +407,7 @@ class EngineWatchdog:
             basis = getattr(bar, "bar_time", None)
             basis_name = "bar_%s" % (period or "1m")
             if basis is None:
-                basis = getattr(engine, "_started_at", None)
+                basis = self._uptime_basis(now, engine)
                 basis_name = "uptime"
         if basis is None:
             return None
@@ -388,7 +417,7 @@ class EngineWatchdog:
             return None
         return StallSignal(
             rule="market_data_stalled", seconds=silence,
-            message=("tdx 行情停滞：会话 %s 最后行情基准=%s（%s），已 %.0f 秒未推进"
+            message=("行情停滞：会话 %s 最后行情基准=%s（%s），已 %.0f 秒未推进"
                      "（阈值 %.0f 秒）"
                      % (session_id, basis.strftime("%H:%M:%S"), basis_name, silence,
                         self._market_stall)),

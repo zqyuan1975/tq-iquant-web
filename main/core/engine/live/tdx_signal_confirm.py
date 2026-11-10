@@ -217,7 +217,46 @@ class Row:
             n = _norm_digits(c.text)
             if len(n) == 6 and n.isdigit():
                 return n
-        return ""
+        # 代码列被 OCR 拆成多格（真机 2026-11-10 实证：001311 被拆成
+        # 「001 | 31 | 1」，单格都不到 6 位）→ 原先恒返回 ""，_match_row 判
+        # 「无本单行」，自动确认放弃，委托行滞留在「交易信号」窗口未发送。
+        return self._reassembled_code()
+
+    def _reassembled_code(self) -> str:
+        """按「名称列左侧的连续数字片段」重组代码（001|31|1 → 001311）。
+
+        以名称列（首个含汉字的单元格）为右锚，向左逐格累积纯数字片段，遇到
+        时间列（含冒号）或非数字格即停；累计满 6 位取末 6 位——左侧编号/
+        账号列（如 28500208）的数字会成为前缀，代码是紧邻名称的那一段。
+        无名称列/片段不足 6 位 → ""（不猜）。
+        """
+        ordered = sorted(self.cells, key=lambda c: c.x)
+        name_idx = None
+        for i, c in enumerate(ordered):
+            t = c.text.replace(" ", "")
+            if any("\u4e00" <= ch <= "\u9fff" for ch in t):
+                name_idx = i
+                break
+        if name_idx is None:
+            return ""
+        digits = ""
+        for c in reversed(ordered[:name_idx]):
+            t = c.text.strip()
+            if ":" in t or "：" in t:
+                break
+            n = _norm_digits(t)
+            if not n.isdigit() or not n:
+                break
+            if len(n) > 6:
+                # 编号/账号列（如 28500208）不是代码碎片：遇到即停，绝不把
+                # 它的末 6 位当代码返回（否则无代码行会被误判成另一只票）。
+                break
+            digits = n + digits
+            if len(digits) >= 6:
+                break
+        if len(digits) < 6:
+            return ""
+        return digits[-6:]
 
     @property
     def volume(self) -> str:
@@ -254,13 +293,54 @@ class Row:
         """行内委托价（限价）。读不出/市价行返回 None（调用方按「不可判读」处理）。
 
         OCR 常把 17.64 拆成「1」「7」「·」「64」多个词，必须按 x 邻近拼接后
-        再取正则（``_row_text`` 只在列间距大时才插空格）。
+        再取正则（``_row_text`` 只在列间距大时才插空格）；间距大导致拼不上时
+        再按「小数点分隔符左右邻格」重组（真机 2026-11-10 实证 14.95 被拆成
+        「1 | 4 | · | 95」）。
         """
         text = _row_text(self)
         m = _PRICE_RE.search(text)
-        if not m:
-            return None
-        return float("%s.%s" % (m.group(1), m.group(2)))
+        by_sep = self._price_by_separator()
+        if by_sep is not None:
+            # 小数点在独立格时以「分隔符左右邻格」为准：间距大（>8px）时
+            # _row_text 会插空格，正则只能读到「4·95」→ 4.95（丢整数位）。
+            return by_sep
+        if m:
+            return float("%s.%s" % (m.group(1), m.group(2)))
+        return None
+
+    def _price_by_separator(self) -> Optional[float]:
+        """按小数点分隔符的左右邻格重组价格（``1 | 4 | · | 95`` → 14.95）。
+
+        只吃紧邻的短线数字格（左 ≤3 位、右 ≤2 位/格，且与分隔符间距 ≤40px），
+        遇到非数字或长数字格（代码 001311 / 数量 3600 / 编号 28500208）立即停，
+        避免把数量拼进价格。
+        """
+        ws = sorted(self.cells, key=lambda c: c.x)
+        for i, c in enumerate(ws):
+            if c.text.strip() not in (".", "．", "·", "•"):
+                continue
+            left, j, edge = "", i - 1, c.x
+            while j >= 0 and len(left) < 4:
+                t = ws[j].text.strip()
+                if not t.isdigit() or len(t) > 3 or edge - ws[j].right > 40:
+                    break
+                left = t + left
+                edge = ws[j].x
+                j -= 1
+            right, j, edge = "", i + 1, c.right
+            while j < len(ws) and len(right) < 4:
+                t = ws[j].text.strip()
+                if not t.isdigit() or len(t) > 2 or ws[j].x - edge > 40:
+                    break
+                right = right + t
+                edge = ws[j].right
+                j += 1
+            if left and right:
+                try:
+                    return float("%s.%s" % (left, right))
+                except ValueError:
+                    continue
+        return None
 
     @property
     def sent(self) -> bool:
@@ -502,8 +582,24 @@ def _match_row(rows: Sequence[Row], spec: SignalSpec,
     floor = (spec.seconds - _TIME_FLOOR_TOL_SECONDS
              if spec.seconds is not None else None)
     cands: List[Tuple[float, float, Row]] = []
+    # 代码列 OCR 完全不可读的行（重组后仍为空）：只作为「唯一命中」的降级候选，
+    # 需同时满足 数量+方向+价格+时间 全一致，且窗口内唯一（见下）。
+    loose: List[Tuple[float, float, Row]] = []
     for row in _subtract_baseline(rows, baseline or ()):
         if row.code != spec.code6:
+            if row.code or not spec.seconds:
+                continue
+            if row.volume != vol or row.send is None or want_price <= 0:
+                continue
+            if row.direction and row.direction != spec.direction:
+                continue
+            row_price = row.price
+            t = row.seconds
+            if (row_price is None or abs(row_price - want_price) > _PRICE_TOL
+                    or t is None
+                    or _seconds_diff(t, spec.seconds) > tol_seconds):
+                continue
+            loose.append((_seconds_diff(t, spec.seconds), row.cy, row))
             continue
         if row.volume != vol:
             continue
@@ -529,11 +625,48 @@ def _match_row(rows: Sequence[Row], spec: SignalSpec,
                  if (t is not None and spec.seconds is not None) else 0)
         cands.append((delta, row.cy, row))
     if not cands:
+        # 降级：代码列读不出但时间+价格+数量唯一命中（宁可不点也不误点）——
+        # 多候选时不放行，等下一轮渲染。
+        if len(loose) == 1:
+            logger.warning(
+                "tdx 交易信号：本次行代码列 OCR 不可读，按「时间+价格+数量」"
+                "唯一命中降级匹配（行时间 %s 价格 %s 数量 %s）",
+                _fmt_row_seconds(loose[0][2].seconds), loose[0][2].price, vol)
+            return loose[0][2]
         return None
     if spec.seconds is None:
         # 无时间基准：仅唯一候选放行（历史残留行可能真的报单）
         return cands[0][2] if len(cands) == 1 else None
     return min(cands, key=lambda c: (c[0], -c[1]))[2]
+
+
+def _fmt_row_seconds(seconds: Optional[int]) -> str:
+    """行时间（当日秒数）→ HH:MM:SS；读不出返回 '?'。"""
+    if seconds is None:
+        return "?"
+    s = int(seconds)
+    return "%02d:%02d:%02d" % (s // 3600, (s % 3600) // 60, s % 60)
+
+
+def _describe_unmatched_rows(rows: Sequence[Row],
+                             baseline: Optional[Sequence[tuple]],
+                             spec: SignalSpec) -> List[str]:
+    """列出「下单后新增、同代码、未发送」的候选行，供失败告警与人工核对。
+
+    仅用于记录，**不得**据此自动点击（匹配失败时无法确定哪一行属于本单，
+    误点『取消』会撤掉其它真实待发的委托）。字段顺序：代码 方向 数量@价格
+    行时间 状态，与 _match_row 的硬条件口径一致，便于人工比对。
+    """
+    out: List[str] = []
+    for row in _subtract_baseline(rows, baseline or ()):
+        if spec.code6 and row.code != spec.code6:
+            continue
+        if row.sent:
+            continue    # 已发送的不算残留
+        out.append("%s %s %s@%s 行时间 %s（未发送）" % (
+            row.code or "?", row.direction or "?", row.volume, row.price,
+            _fmt_row_seconds(row.seconds)))
+    return out
 
 
 def _image_has_content(img) -> bool:
@@ -621,6 +754,9 @@ class TdxSignalConfirmer:
         clicked = 0
         clicked_row: Optional[Row] = None
         stale = 0
+        # 最后一次成功读到的行（仅用于失败时记录「可能残留的未发送行」，
+        # 绝不据此自动点击——见 _describe_unmatched_rows 的说明）
+        last_rows: Sequence[Row] = ()
         if baseline is None:
             baseline = self._snapshot_rows_impl()
         base_n = len(baseline or ())
@@ -636,6 +772,7 @@ class TdxSignalConfirmer:
                 self._force_show(window)
                 time.sleep(0.2)
             rows = self._read_rows(window)
+            last_rows = rows
             if not rows:
                 detail = "「交易信号」窗口截图/OCR 无有效文本（渲染未完成或被遮挡）"
                 time.sleep(0.4)
@@ -666,6 +803,12 @@ class TdxSignalConfirmer:
             clicked = 1
             clicked_row = hit
             detail = "已点击『发送』，等待委托表出现该单"
+            if hit.code != spec.code6:
+                logger.warning(
+                    "tdx 交易信号：命中行代码列不可读，按「时间+价格+数量」唯一"
+                    "命中降级点击（行时间 %s 价格 %s 数量 %s），点击后由委托表"
+                    "回查二次核对",
+                    _fmt_row_seconds(hit.seconds), hit.price, hit.volume)
             logger.info(
                 "tdx 交易信号自动确认：点击 %s %s x%s @%s 行（行时间 %s，%s）",
                 spec.direction, spec.code6, spec.volume, spec.price,
@@ -680,6 +823,21 @@ class TdxSignalConfirmer:
 
         if clicked and clicked_row is not None:
             self._verify_clicked_row(window, clicked_row)
+
+        # 未点击就失败时，客户端「交易信号」窗口可能残留本次委托的未发送行
+        # （没点『发送』= 没报出去，但那一行仍可被人工误点）。此处**只记录不点击**：
+        # 走到这里的前提是行匹配失败（窗口缺失/OCR 失败/硬条件不符），既然无法
+        # 确定哪一行是本单，点任何『取消』都可能撤掉别人真正待发的委托——比留下
+        # 一行未发送更危险。故降级为明确告警 + 记录候选行内容，交人工核对。
+        if not clicked and last_rows:
+            leftovers = _describe_unmatched_rows(last_rows, baseline, spec)
+            if leftovers:
+                logger.warning(
+                    "tdx 交易信号：自动确认未点击，窗口内存在下单后新增的同代码未发送行"
+                    "（不会自动点『取消』，以免误取消他人委托；请人工核对后手动取消）：%s",
+                    "；".join(leftovers))
+                detail = ("%s；窗口内新增未发送行 %d 条"
+                          "（需人工核对后手动『取消』）" % (detail, len(leftovers)))
 
         if clicked and is_submitted is not None:
             while time.time() < end:
@@ -932,8 +1090,11 @@ class TdxSignalConfirmer:
         if any(r.sent for r in same):
             logger.info("tdx 确认：OCR 判定路径=行尾按钮已变『已发送』")
         else:
-            logger.warning("tdx 确认：OCR 判定路径=行尾按钮仍为『发送』"
-                           "（以委托表认领为准）")
+            # 预期降级：CEF 重绘后 OCR 常把按钮读回『发送』（2026-11-09 实测：
+            # 点击后已报柜台 status=50、资金已冻结，OCR 仍报『发送』）。
+            # 判定以委托表认领为准，这里只保留信息，不伪装成失败。
+            logger.debug("tdx 确认：OCR 复核未见『已发送』（行尾仍读作『发送』或未刷新）；"
+                         "不影响判定，以委托表认领为准")
 
     # ---- 滚动
 

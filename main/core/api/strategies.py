@@ -110,7 +110,7 @@ class PortfolioCreate(BaseModel):
     stamp_duty_rate: float = 0.0005
     slippage: float = 0
     trading_session: str = "full"
-    # #1 涨跌停约束（回测）：None=新建默认开启/编辑不动；显式 bool=按值设置
+    # #1 涨跌停校验（回测成交 + 实盘下单前置）：None=新建默认开启/编辑不动；显式 bool=按值设置
     price_limit_check_enabled: bool | None = None
     # #2 成交量/流动性约束（回测，默认关）：None=不动（新建落默认 False/0.10）
     volume_limit_enabled: bool | None = None

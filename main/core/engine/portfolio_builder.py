@@ -30,6 +30,7 @@ def signal_type_from_str(s: str) -> SignalType:
 def assemble_portfolio(
     ps: PortfolioStrategy, strategies: List[Strategy], db: Session,
     initial_capital_override=None,
+    sell_scope: str = "full",
 ) -> Portfolio:
     """组装 Portfolio + 各 StrategyContext（信号配置 + 策略风控）。
 
@@ -37,9 +38,11 @@ def assemble_portfolio(
     实盘 HttpBridgeDispatcher 不用 cost_params（真实成本从 /deals 回报取），
     但 Portfolio 仍持有以备恢复/评估时记账。
 
-    initial_capital_override（实盘资金基准，可选）：非 None 时覆盖组合表的
-    initial_capital 起账——实盘资金与组合配置不一致时，让全部比率型配置
-    （资金占比/单仓/敞口/熔断分母）等比缩放。回测调用点不传，行为不变。
+    initial_capital_override（实盘资金基准，可选，**账户总资产口径**）：非 None 时
+    覆盖组合表的 initial_capital 起账——实盘资金与组合配置不一致时，让全部比率型
+    配置（资金占比/单仓/敞口/熔断分母）等比缩放。实盘启动后继承持仓的市值由
+    LiveEngine 从起账现金中扣除（见 _import_external_positions），避免与基准双计；
+    回测调用点不传（无继承持仓），行为不变。
     """
     initial_capital = (
         Decimal(str(initial_capital_override))
@@ -70,6 +73,9 @@ def assemble_portfolio(
     )
     # #1 涨跌停约束（默认开；仅回测成交步生效）
     port.price_limit_check_enabled = bool(getattr(ps, "price_limit_check_enabled", True))
+    # 卖出范围口径（实盘读 config.tq_trade.live_sell_scope；回测调用点不传 → full，
+    # 回测持仓全部来自平台成交，两种口径结果等价，行为不变）
+    port.sell_scope = sell_scope if sell_scope in ("full", "platform_only") else "full"
     # 组合级 max_holdings / trading_session（历史死配置首次接线，回测/实盘共用生效）
     port.max_holdings = int(getattr(ps, "max_holdings", 0) or 0)
     port.trading_session = getattr(ps, "trading_session", None) or "full"

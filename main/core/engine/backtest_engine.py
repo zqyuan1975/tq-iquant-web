@@ -155,7 +155,7 @@ class BacktestEngine:
                             )
                         deferred.append(order)
                         continue
-                    # #1 涨跌停约束（可选，默认关）：以本 bar open 判定——BUY open ≥ 涨停价
+                    # #1 涨跌停约束（默认开；组合表显式关闭时不校验）：以本 bar open 判定——BUY open ≥ 涨停价
                     # （前收×(1+幅度)，精确到分）或 SELL open ≤ 跌停价 → 延后至下一 bar
                     # 重试（仿 no_market_data，每订单仅首次记 1 条决策事件）。
                     # 无前收或前收 < 1 元跳过检查：前复权"加性压缩"使早期前收逼近 0/

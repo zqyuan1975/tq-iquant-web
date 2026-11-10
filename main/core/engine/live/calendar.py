@@ -270,6 +270,46 @@ class TradingCalendar:
             return d not in closed  # 内置官方休市表：工作日 - 节假日
         return True  # fail-open：工作日无权威数据，放行
 
+    def is_fail_open(self, d: date) -> bool:
+        """该日所属年份是否处于 fail-open 退化（无权威数据且无内置休市表）。
+
+        fail-open 下工作日一律视为交易日：长假中的工作日会被误判为交易日，
+        ``_next_trading_day`` 因而把「节后首日」算早。调用方据此放宽 deferred 单
+        的过期窗口（见 LiveEngine._DEFERRED_RELEASE_GRACE_DAYS）。
+        """
+        if d.year in self._by_year:
+            return False
+        self._load_year(d.year)
+        return self._degraded.get(d.year) == "fail_open"
+
+    def is_last_trading_day_of_week(self, d: date) -> bool:
+        """d 是否为「本周最后一个交易日」。
+
+        从 d+1 到本周日逐日判定，全为非交易日则 d 是期末（周五休市自动落到周四，
+        长假同理）。d 本身须为交易日。
+        """
+        if not self.is_trading_day(d):
+            return False
+        for offset in range(1, 7 - d.weekday()):
+            if self.is_trading_day(d + timedelta(days=offset)):
+                return False
+        return True
+
+    def is_last_trading_day_of_month(self, d: date) -> bool:
+        """d 是否为「本月最后一个交易日」（月末休市自动前移到前一交易日）。"""
+        if not self.is_trading_day(d):
+            return False
+        if d.month == 12:
+            next_month = date(d.year + 1, 1, 1)
+        else:
+            next_month = date(d.year, d.month + 1, 1)
+        cur = d + timedelta(days=1)
+        while cur < next_month:
+            if self.is_trading_day(cur):
+                return False
+            cur += timedelta(days=1)
+        return True
+
     def is_trading_allowed(self, now: datetime) -> bool:
         """是否允许在 ``now`` 时刻下单：交易日 且 09:30–15:00（左闭右开）。"""
         if not self.is_trading_day(now.date()):

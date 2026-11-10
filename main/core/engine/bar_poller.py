@@ -327,6 +327,9 @@ class BarPoller:
         self._resume_day: Optional[date] = None
         # 回调:每根新完成 bar 触发一次,参数为 BarEvent
         self.on_bar: Callable[[BarEvent], None] = lambda bar: None
+        # 回调:首次基线那根完成 bar 交付一次（BarEvent.baseline=True）。引擎用它放行
+        # 已决定好的 deferred 单，但不跑公式信号评估（防重放历史 bar）。
+        self.on_baseline_bar: Callable[[BarEvent], None] = lambda bar: None
 
     @property
     def stock_codes(self) -> List[str]:
@@ -412,6 +415,8 @@ class BarPoller:
         # 本轮各 code 拉到的原始 bar 列表(count 窗口,含 forming 最新一根)——挂到 BarEvent.
         # bars_by_code 透传,注入并入预热缓存复用,消除 1m 双拉(判完成与算公式共用一次拉取)。
         raw_by_code: Dict[str, list] = {}
+        # 首次基线那根（各 code 最新完成 bar 合并）：只交付给 on_baseline_bar
+        baseline_by_time: Dict[datetime, Dict[str, dict]] = {}
         any_data = False
 
         # 一轮行情拉取:批量或逐只(见 _fetch_bars_by_code),后续处理两条路径完全一致
@@ -450,9 +455,14 @@ class BarPoller:
             if self._resume_day is not None:
                 completed = [t for t in completed if t.date() >= self._resume_day]
 
-            # 首次:建立该 code 基线,不触发(实盘启动不回放历史 bar)
+            # 首次:建立该 code 基线,不触发信号(实盘启动不回放历史 bar)
             if not self._initialized:
-                self._last_completed[code] = max(baseline_from) if baseline_from else None
+                base_t = max(baseline_from) if baseline_from else None
+                self._last_completed[code] = base_t
+                # 基线那根仍要交付给引擎（只放行 deferred，不跑公式）：取各 code
+                # 本轮最新完成 bar，按时间合并成一根 baseline BarEvent。
+                if base_t is not None:
+                    baseline_by_time.setdefault(base_t, {})[code] = stime_map[base_t]
                 continue
 
             last = self._last_completed.get(code)
@@ -485,10 +495,18 @@ class BarPoller:
         if any_data:
             self._resume_guard = False
 
-        # 首次有数据 → 标记初始化完成,不触发
+        # 首次有数据 → 标记初始化完成，不触发信号；但基线那根交付给引擎放行 deferred
         if not self._initialized:
             if any_data:
                 self._initialized = True
+            if baseline_by_time:
+                t = max(baseline_by_time)
+                provided = {c: raw_by_code.get(c, [])
+                            for c in baseline_by_time[t]}
+                self.on_baseline_bar(BarEvent(
+                    stocks=baseline_by_time[t], bar_time=t, period=self._period,
+                    bars_by_code=provided, baseline=True,
+                ))
             return []
 
         # 按时间排序触发(旧→新),每根构造 BarEvent(带周期,C6 节拍过滤用)。

@@ -80,9 +80,9 @@ ENGINES: Dict[int, LiveEngine] = {}
 # ---------------------------------------------------------------------------
 
 def iquant_config() -> dict:
-    """读 QMT 通道双桥配置（config.iquant_bridge 段）。
+    """读 QMT 通道桥配置（config.iquant_bridge 段）。
 
-    simulation（仿真/虚拟资金，8790）/ live（实盘/真实资金，8791）各一个
+    simulation / live 两个模式位当前都指向 8790 的 QMT 仿真账户（410038214257 / STOCK，账户内为仿真资金），各一个
     base_url；桥绑 loopback、无鉴权。超时/慢告警阈值与掘金桥同构配置，
     缺省回退（本机 loopback 桥默认 10s / 5s / 300s），不写死在调用点。
     """
@@ -98,7 +98,7 @@ def iquant_config() -> dict:
         "live": (liv.get("base_url")
                  or "http://127.0.0.1:8791"),
         "request_timeout_seconds": _positive_float(
-            br.get("request_timeout_seconds"), 10.0),
+            br.get("request_timeout_seconds"), 15.0),
         "slow_response_seconds": _positive_float(
             br.get("slow_response_seconds"), 5.0),
         "slow_warn_interval_seconds": _positive_float(
@@ -107,9 +107,9 @@ def iquant_config() -> dict:
 
 
 def bridge_config() -> dict:
-    """读双桥地址：simulation(仿真/虚拟资金)/live(实盘/真实资金) 各一个 base_url。
+    """读桥地址：simulation/live 两个模式位当前都指向 8790 的 QMT 仿真账户。
 
-    session.mode = simulation|live 决定走哪个桥（账号差异，见 live/bridge/README.md）。
+    8791 信用腿（CREDIT）保留但非生产、未启用，见 live/bridge/README.md。
     模拟/实盘（信号 vs 真实下单）不由 Core 控制，由 QMT 客户端启动按钮决定。
     """
     q = iquant_config()
@@ -189,6 +189,26 @@ def tq_trade_config() -> dict:
         # 「交易信号」自动确认单笔总时限（秒）：定位窗口+OCR+点击+等委托表认领。
         "confirm_timeout": float(tq.get("confirm_timeout") or 12.0),
     }
+
+
+def live_sell_scope() -> str:
+    """卖出范围口径（config.tq_trade.live_sell_scope）。
+
+    full（默认，缺键/非法值回退）= 风控与公式卖单按整仓卖出，行为与旧版一致；
+    platform_only = 只卖平台自己买入的部分（Position.platform_quantity），纯外部/
+    手工仓不代卖。回测不走本函数（assemble_portfolio 默认 full）。
+    """
+    cfg = load_config()
+    tq = cfg.get("tq_trade", {}) if isinstance(cfg, dict) else {}
+    value = str((tq.get("live_sell_scope") if isinstance(tq, dict) else "") or "").strip()
+    if value in ("full", "platform_only"):
+        return value
+    if value:
+        logger.warning(
+            "config.tq_trade.live_sell_scope=%r 非法（仅支持 full/platform_only），回退 full",
+            value,
+        )
+    return "full"
 
 
 #: 实盘交易引擎：key -> (渠道标识, 中文名)。渠道标识是 Core 状态机/前端识别的通道名。
@@ -544,7 +564,13 @@ def test_channel(channel: str = "ths_ui", mode: str = "simulation") -> dict:
             if not dispatcher.heartbeat():
                 return {"ok": False, "channel": "tdx_tq",
                         "error": dispatcher.last_error or "通达信交易未就绪"}
-            rows = dispatcher.query_positions()
+            try:
+                rows = dispatcher.query_positions()
+            except Exception as e:
+                # 持仓查询失败会抛 BridgeUnavailableError（读失败≠零持仓）；
+                # 探测接口必须转成 ok=False，不能漏成 500。
+                return {"ok": False, "channel": "tdx_tq",
+                        "error": str(e) or "通达信持仓读取失败"}
             if dispatcher.last_error:
                 return {"ok": False, "channel": "tdx_tq", "error": dispatcher.last_error}
             return {"ok": True, "channel": "tdx_tq",
@@ -728,6 +754,8 @@ def build_engine(
     engine: Optional[str] = None,
     execution_mode: str = "auto",
     signal_file_path: Optional[str] = None,
+    advance_close_enabled: Optional[bool] = None,
+    advance_close_time: Optional[str] = None,
 ) -> LiveEngine:
     """组装一个 session 的 LiveEngine：各组合 Portfolio + dispatcher + BarPoller。
 
@@ -779,13 +807,19 @@ def build_engine(
         .filter(LiveSessionPortfolio.session_id == session_id)
         .all()
     )
-    # 会话级实盘资金基准：非 None 时所有组合以该值起账（比率配置等比缩放）；
-    # None=各组合用自身 initial_capital（现行为）。
+    # 会话级实盘资金基准（账户总资产口径）：非 None 时所有组合以该值起账
+    # （比率配置等比缩放）；None=各组合用自身 initial_capital（现行为）。
+    # 继承持仓的市值由 LiveEngine 从起账现金中扣除，避免与基准重复计入。
     session_row = db.query(LiveSession).filter(LiveSession.id == session_id).first()
     live_capital = getattr(session_row, "live_capital", None)
     # 外部信号注入（0011）：参数优先；未传回退 session.signal_file_path（会话级配置）
     if signal_file_path is None and session_row is not None:
         signal_file_path = getattr(session_row, "signal_file_path", None)
+    # 14:50 提前收盘价（仅 1d）：参数优先；未传回退会话级配置（默认关/14:51）
+    if advance_close_enabled is None and session_row is not None:
+        advance_close_enabled = bool(getattr(session_row, "advance_close_enabled", False))
+    if advance_close_time is None and session_row is not None:
+        advance_close_time = getattr(session_row, "advance_close_time", None)
     portfolios = []
     stock_codes: set = set()
     # B5 市场状态闸：组合 → 基准指数代码（供 LiveEngine 逐日算 regime）
@@ -801,12 +835,18 @@ def build_engine(
     # 简化：先记 (code, period) -> [formula_id...]，formula_map 就绪后取 max(formula_count)。
     code_period_formula_ids: Dict[tuple, set] = {}
     pool_codes_by_portfolio: Dict[int, set] = {}
+    # 卖出范围口径（config.tq_trade.live_sell_scope）：full=整仓卖（默认，旧行为），
+    # platform_only=只卖平台自己买入的部分（外部手工仓不代卖）
+    sell_scope = live_sell_scope()
     for link in links:
         ps = db.query(PortfolioStrategy).filter_by(id=link.portfolio_strategy_id).first()
         if ps is None:
             continue
         strategies = db.query(Strategy).filter_by(portfolio_id=ps.id).order_by(Strategy.id).all()
-        port = assemble_portfolio(ps, strategies, db, initial_capital_override=live_capital)
+        port = assemble_portfolio(
+            ps, strategies, db, initial_capital_override=live_capital,
+            sell_scope=sell_scope,
+        )
         if live_capital is not None:
             logger.info(
                 "实盘资金基准 %s（组合 %s 配置初始资金 %s）",
@@ -949,6 +989,8 @@ def build_engine(
         benchmark_codes=benchmark_codes,
         execution_mode=execution_mode,
         signal_file_path=signal_file_path,
+        advance_close_enabled=bool(advance_close_enabled),
+        advance_close_time=advance_close_time or "14:51",
         formula_id_by_strategy=strategy_formula,
         enable_signal_monitor=True,
         snapshot_synth=snapshot_synth,
@@ -958,6 +1000,9 @@ def build_engine(
         # 行情轮询窗口（config.live.quote_polling）：缺键时引擎侧回落安全默认
         # （交易日 09:15–15:05 之外不轮询，收盘后停对桥/TQ 的行情拉取）
         quote_polling=(load_config().get("live") or {}).get("quote_polling"),
+        # 次日盘前（集合竞价）执行日线信号单：config.tq_trade.pre_open_auction*
+        # 缺键/未开启 → 引擎侧 PreOpenAuctionConfig 默认关闭（旧行为逐字不变）
+        pre_open_auction=(load_config().get("tq_trade") or {}),
     )
     # 桥慢响应告警接引擎事件流（risk/bridge_slow，dispatcher 侧已按 endpoint
     # 冷却去重）；仅 HTTP 桥 dispatcher 有 on_slow 钩子，其它通道不受影响。
@@ -998,6 +1043,10 @@ def list_sessions(db: Session, engines: Optional[Dict[int, LiveEngine]] = None) 
             "live_capital": s.live_capital,
             # 外部信号注入（0011）：None=不启用
             "signal_file_path": s.signal_file_path,
+            # 14:50 提前收盘价（仅 1d）：会话级开关 + 时点 + 当日幂等标记
+            "advance_close_enabled": bool(s.advance_close_enabled),
+            "advance_close_time": s.advance_close_time or "14:51",
+            "advance_close_done_date": s.advance_close_done_date,
             "status": s.status,
             # 引擎是否真的在本进程注册表中运行（工作台据此区分「状态陈旧」与
             # 真正运行中：status=running 但 engine_running=false = 后端重启后
@@ -1051,6 +1100,24 @@ def recover_stale_running_live_sessions(
     return len(stale)
 
 
+def normalize_advance_close(data: dict) -> tuple:
+    """14:50 提前收盘价配置归一：开关默认 False；时点默认 14:51，限定 14:51–14:59。
+
+    时点必须晚于 14:50 分钟 bar 闭合（stime=14:51:00）且早于收盘 15:00，避免
+    「用 14:50 价执行」被配置到取不到价的窗口。非法一律回退默认值。
+    """
+    enabled = bool(data.get("advance_close_enabled"))
+    raw = str(data.get("advance_close_time") or "14:51").strip()
+    try:
+        hh, mm = raw.split(":")
+        minutes = int(hh) * 60 + int(mm)
+        if not (14 * 60 + 51 <= minutes <= 14 * 60 + 59):
+            raw = "14:51"
+    except (TypeError, ValueError):
+        raw = "14:51"
+    return enabled, raw
+
+
 def create_session(db: Session, data: dict, mode: str) -> dict:
     """创建 session。新会话默认 alert；老会话由迁移保持 auto。"""
     execution_mode = data.get("execution_mode") or "alert"
@@ -1058,13 +1125,17 @@ def create_session(db: Session, data: dict, mode: str) -> dict:
     signal_file_path = data.get("signal_file_path")
     if signal_file_path is not None:
         signal_file_path = str(signal_file_path).strip() or None
+    advance_close_enabled, advance_close_time = normalize_advance_close(data)
     session = LiveSession(
         name=data["name"], mode=mode, status="stopped",
         engine=data.get("engine") or default_engine(),
         execution_mode=execution_mode,
         live_capital=data.get("live_capital"),
-        # 外部信号注入（0011）：None=不启用；非空=同花顺条件预警输出文件路径
+        # 外部信号注入（0011）：None=不启用；非空=通达信条件预警输出文件路径
         signal_file_path=signal_file_path,
+        # 14:50 提前收盘价（仅 1d）：默认关 + 14:51
+        advance_close_enabled=advance_close_enabled,
+        advance_close_time=advance_close_time,
     )
     db.add(session)
     db.flush()
@@ -1096,6 +1167,10 @@ def get_session(db: Session, session_id: int, engine: Optional[LiveEngine] = Non
         "live_capital": session.live_capital,
         # 外部信号注入（0011）：None=不启用
         "signal_file_path": session.signal_file_path,
+        # 14:50 提前收盘价（仅 1d）
+        "advance_close_enabled": bool(session.advance_close_enabled),
+        "advance_close_time": session.advance_close_time or "14:51",
+        "advance_close_done_date": session.advance_close_done_date,
         "status": session.status,
         "started_at": session.started_at,
         "stopped_at": session.stopped_at,
@@ -1300,13 +1375,21 @@ def start_session(
         )
 
     execution_mode = getattr(session, "execution_mode", None) or "auto"
-    engine = build_engine(
-        session_id, db, mode,
-        db_session_factory=db_session_factory, dispatcher_cls=dispatcher_cls,
-        engine=session_engine(session),
-        execution_mode=execution_mode,
-        signal_file_path=getattr(session, "signal_file_path", None),
-    )
+    try:
+        engine = build_engine(
+            session_id, db, mode,
+            db_session_factory=db_session_factory, dispatcher_cls=dispatcher_cls,
+            engine=session_engine(session),
+            execution_mode=execution_mode,
+            signal_file_path=getattr(session, "signal_file_path", None),
+            advance_close_enabled=bool(
+                getattr(session, "advance_close_enabled", False)),
+            advance_close_time=getattr(session, "advance_close_time", None),
+        )
+    except RuntimeError as e:
+        # make_dispatcher 对未知引擎键/依赖缺失（pywinauto 等）/路径账号未配置
+        # 统一抛 RuntimeError；这里必须转成 503 可操作提示，不能漏成 500。
+        return None, session, (503, str(e) or "交易通道未就绪")
     # 启动前探测通道在线：客户端未起/未登录直接拒绝，不建引擎、不置 running，
     # 避免「一点就成功、通道离线却无告警」。heartbeat() 本地 loopback 瞬时失败，
     # 不阻塞事件循环。
@@ -1639,39 +1722,74 @@ def engine_external_positions(engine: LiveEngine) -> List[dict]:
     读回结果（dispatcher 原始行）带 60s TTL 缓存在引擎属性 _external_pos_cache
     （(monotonic_ts, rows)）上——THS UI 读回慢，TDX SDK 读快但同样走缓存统一口径。
     dispatcher 缺 get_positions（iquant 桥）/异常/None → 无外部行，不抛错。
+    行内 ``out_of_pool``：代码不在任何组合股票池 → True（池外外部仓，仅展示/对账，
+    不进风控、不占槽位、不代卖；前端据此显示「池外·不参与风控」徽章）。
     """
     dispatcher = getattr(engine, "dispatcher", None)
     if dispatcher is None:
         return []
+    # 组合→股票池代码集：池外外部仓打 out_of_pool=True（前端「池外·不参与风控」
+    # 徽章的唯一判据）。池信息缺失（旧引擎/测试未注入）时不臆断，一律 False。
+    pools = getattr(engine, "_pool_codes_by_portfolio", None) or {}
+    pool_codes: set = set()
+    for codes in pools.values():
+        pool_codes |= set(codes or ())
     virtual_codes = {r["stock_code"] for r in engine_virtual_positions(engine)}
     now = time.monotonic()
     real = None
+    cached_rows = None
     cache = getattr(engine, "_external_pos_cache", None)
     if cache is not None:
         try:
             ts, rows = cache
-            if now - ts < _EXTERNAL_POS_TTL_SECONDS:
-                real = rows
+            if isinstance(rows, list):
+                cached_rows = rows
+            if cached_rows is not None and now - ts < _EXTERNAL_POS_TTL_SECONDS:
+                real = cached_rows
         except Exception:
             real = None
     if real is None:
-        try:
-            fn = getattr(dispatcher, "get_positions", None)
-            real = fn() if callable(fn) else []
-        except Exception:
-            logger.warning("外部持仓读回失败（dispatcher.get_positions）", exc_info=True)
-            real = []
-        if not isinstance(real, list):
-            real = []
-        try:
-            engine._external_pos_cache = (now, real)
-        except Exception:
-            pass
+        fn = getattr(dispatcher, "get_positions", None)
+        if not callable(fn):
+            # 桥通道（HttpBridgeDispatcher 只有 query_positions，没有 get_positions）：
+            # 用引擎每轮采集写入的外部持仓快照（已归一化 symbol/volume/cost/market_value）。
+            # 不读快照的话，iquant/goldminer 的持仓页永远「暂无持仓」——池外仓既不进
+            # 虚拟账本、又不在这里返回（2026-11-10 实证：账户持仓市值 30.8 万、表格为空）。
+            snap = getattr(engine, "_external_positions", None)
+            real = [r for r in (snap or []) if isinstance(r, dict)]
+        else:
+            try:
+                fresh = fn()
+            except Exception:
+                # 读失败（如 TdxTqDispatcher 的 BridgeUnavailableError）不是「零持仓」：
+                # 不刷新缓存、沿用上次成功结果，避免瞬时失败把外部持仓闪成空。
+                logger.warning("外部持仓读回失败（dispatcher.get_positions）", exc_info=True)
+                real = cached_rows or []
+            else:
+                if isinstance(fresh, list):
+                    real = fresh
+                    try:
+                        engine._external_pos_cache = (now, real)
+                    except Exception:
+                        pass
+                else:
+                    # None（ThsUiDispatcher 读表失败契约）同样不是真空仓：
+                    # 不得写成空缓存，否则 60s TTL 内外部持仓会一直闪空。
+                    logger.warning("外部持仓读回失败（dispatcher.get_positions 返回 None）")
+                    real = cached_rows or []
     out = []
     for r in real:
         if not isinstance(r, dict):
             continue
         code = _normalize_external_symbol(r.get("symbol"))
+        if not code:
+            # QMT/掘金桥 /positions 行没有 symbol，只有 instrument(601989)+exchange(SH)。
+            # 之前这里只看 symbol → 桥行全部被丢弃，持仓页对 iquant/goldminer 永远是
+            # 「暂无持仓」（2026-11-10 实证：账户持仓市值 30.8 万、表格为空）。
+            inst = str(r.get("instrument") or "").strip()
+            exch = str(r.get("exchange") or "").strip()
+            if inst and exch:
+                code = _normalize_external_symbol("%s.%s" % (inst, exch))
         if not code or code in virtual_codes:
             continue
         try:
@@ -1693,6 +1811,8 @@ def engine_external_positions(engine: LiveEngine) -> List[dict]:
             "avg_cost": _display_price(avg_cost),
             "market_value": _display_money(market_value),
             "source": "external",
+            # 池外仓：不在任何组合股票池 → 不参与风控/不占槽位/平台不代卖
+            "out_of_pool": bool(pool_codes) and code not in pool_codes,
         })
     return out
 
@@ -1812,7 +1932,9 @@ def serialize_signal(s: LiveSignal) -> dict:
         "alert_error": s.alert_error,
         "tdx_run_id": s.tdx_run_id,
         "created_at": _iso_utc(s.created_at),
-        "alerted_at": _iso_utc(s.alerted_at),
+        # alerted_at 由 SignalMonitor 用 now_shanghai() 写入（非 server_default），
+        # 按上海时区标注；标成 UTC 会让外部消费方偏移 8 小时。
+        "alerted_at": _iso_cst(s.alerted_at),
     }
 
 

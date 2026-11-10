@@ -62,8 +62,11 @@ def window_image_name(pid: int) -> str:
                 k32.CloseHandle(h)
     except Exception:  # noqa: BLE001
         name = ""
-    with _cache_lock:
-        _pid_image_cache[pid] = name
+    # 只缓存成功结果：进程未起来/权限不足导致的空结果若被缓存，会让该 PID 在
+    # 整个进程生命周期内永久判为「不属于本通道」（fail-closed 下等于自动化哑火）。
+    if name:
+        with _cache_lock:
+            _pid_image_cache[pid] = name
     return name
 
 
@@ -71,8 +74,11 @@ def dialog_matches_channel(dialog, channel: str) -> bool:
     """弹窗是否属于指定通道的客户端进程（映像名关键词匹配）。
 
     channel 不在已知映射（如 iquant 桥不弹本机窗口）→ 放行 True（不做过滤，
-    由调用方原语义）。取 PID 失败（映像名空）→ 放行 True（宁宽勿错，与
-    交易日历 fail-open 同则）——避免安全软件干扰导致自动化全部哑火。
+    由调用方原语义）。
+
+    **归属不明一律不放行**（fail-closed）：取 PID 失败或映像名读不出 → False。
+    与「主路径 `window_image_name() == "tdxw.exe"`」口径统一，避免双引擎并行
+    时把其它客户端的弹窗当成本引擎的确认框点掉（2026-11-09 实测复核时统一）。
     """
     keywords = _CHANNEL_PROC_KEYWORDS.get(channel)
     if not keywords:
@@ -80,8 +86,8 @@ def dialog_matches_channel(dialog, channel: str) -> bool:
     try:
         pid = dialog.process_id()
     except Exception:  # noqa: BLE001
-        return True
+        return False
     image = window_image_name(pid)
     if not image:
-        return True
+        return False
     return any(k in image for k in keywords)

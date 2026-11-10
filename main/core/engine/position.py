@@ -50,6 +50,11 @@ class Position:
         # 实盘风控基准一律用桥返回的券商合并均价 avg_cost。
         self.strategy_quantity = 0
         self.strategy_cost = Decimal("0")
+        # 平台自己买入且尚未平掉的股数（实盘槽位闸口径，见 LiveEngine.
+        # _platform_held_count）：只由平台成交（apply_trade）增删，外部/手工仓
+        # （快照 import / mirror 新建）与外部成交补记（note_strategy_trade）都不写，
+        # 故它恒为 0。全平或桥镜面数量归 0 时清零 → 外部仓卖出后平台再买入能重新占位。
+        self.platform_quantity = 0
         # 按买入日期分桶的份额，用于 T+1 可卖判断
         self._lots: Dict[date, int] = {}
         # 已加仓次数（首次建仓清零，全平清零），受 max_add_count 约束
@@ -64,6 +69,9 @@ class Position:
         return self.avg_cost * self.quantity
 
     def buy(self, quantity: int, price: Decimal, trade_time: Optional[datetime] = None, is_add: bool = False) -> None:
+        # 平台自己买入的股数（槽位闸口径）：只有平台成交（apply_trade）走到这里，
+        # 外部/手工导入仓由 mirror_bridge 直接覆盖数量，不经过 buy → 保持 0。
+        self.platform_quantity += quantity
         # 新开仓（原无持仓）重置加仓计数；加仓（原有持仓）累加
         is_new = self.quantity == 0
         if is_add and self.quantity > 0:
@@ -93,6 +101,8 @@ class Position:
         cost_amount = self.avg_cost * quantity
         pnl = sell_amount - cost_amount
         self.quantity -= quantity
+        # 平台自己买入的股数同步扣减（卖出可能包含外部仓份额，按上限夹到 0）
+        self.platform_quantity = max(0, self.platform_quantity - quantity)
         # 全平清零加仓计数与买入时间：否则同日全平后再建仓，buy_time 仍是首笔买入日，
         # can_sell_on(当日) 会误判为可卖（T+1 语义错误）。buy() 见 buy_time 为 None 会重新赋值。
         if self.quantity == 0:
@@ -160,10 +170,17 @@ class Position:
             self.add_count = 0
             self.strategy_quantity = 0
             self.strategy_cost = Decimal("0")
+            # 柜台已无此仓（含外部全卖）：平台占位随之清零，下次平台买入重新占位
+            self.platform_quantity = 0
             return
         self.quantity = quantity
-        if avg_cost is not None and avg_cost > 0:
-            self.avg_cost = Decimal(str(avg_cost))
+        if avg_cost is not None:
+            # B5（2026-11-10）：柜台成本 <= 0（送转/分红后为负，或字段无效）=
+            # 成本未知 → 显式置 0 并保留「未知」标记（不清洗成上一轮的旧值，
+            # 更不用现价冒充）；该票止损/止盈/移动止损整体跳过。
+            self.avg_cost = (
+                Decimal(str(avg_cost)) if Decimal(str(avg_cost)) > 0
+                else Decimal("0"))
         try:
             avail = quantity if available is None else int(available)
         except (TypeError, ValueError, OverflowError):
@@ -197,11 +214,14 @@ class Position:
         """
         if trade.trade_type == TradeType.BUY:
             self.quantity -= trade.quantity
+            self.platform_quantity = max(
+                0, self.platform_quantity - trade.quantity)
             if self.quantity <= 0:
                 self.quantity = 0
                 self.avg_cost = Decimal("0")
         else:
             self.quantity += trade.quantity
+            self.platform_quantity += trade.quantity
 
     def can_sell_on(self, query_date: date) -> bool:
         """T+1：买入当日不可卖，下一交易日及之后可卖。无持仓或当日买入返回 False。

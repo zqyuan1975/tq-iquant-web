@@ -28,7 +28,7 @@ from __future__ import annotations
 import logging
 import threading
 from datetime import date, datetime, time, timedelta
-from typing import Callable, Dict, List, Optional
+from typing import Callable, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -122,17 +122,28 @@ class SnapshotBarSynthesizer:
                             self._last_date, now.date())
             self._last_date = now.date()
             for code in self._codes:
-                snap = snaps.get(code)
-                if not isinstance(snap, dict):
-                    continue
-                price = _f(snap.get("Now"))
-                vol = _f(snap.get("Volume"))
-                if price is None or price <= 0:
-                    continue
-                last_vol = self._last_volume.get(code)
-                delta = 0 if last_vol is None else max(0, int(vol - last_vol))
-                self._last_volume[code] = vol
-                self._update_forming_unlocked(code, now, price, delta)
+                # 单只股票的字段异常不得打断整轮采样（否则后续 code 本分钟全部丢失）
+                try:
+                    snap = snaps.get(code)
+                    if not isinstance(snap, dict):
+                        continue
+                    price = _f(snap.get("Now"))
+                    vol = _f(snap.get("Volume"))
+                    if price is None or price <= 0:
+                        continue
+                    last_vol = self._last_volume.get(code)
+                    # Volume 由数值变 None（快照字段缺失）：本分钟量 clamp 到 0，
+                    # 并保留原差分基线（下次有量时把缺口累计回来），避免
+                    # int(None - last) 抛 TypeError 中断整轮采样。
+                    if vol is None or last_vol is None:
+                        delta = 0
+                    else:
+                        delta = max(0, int(vol - last_vol))
+                    if vol is not None:
+                        self._last_volume[code] = vol
+                    self._update_forming_unlocked(code, now, price, delta)
+                except Exception as e:  # noqa: BLE001
+                    logger.warning("快照合成跳过 %s：%s", code, e)
 
     def completed_bars(
         self, codes: Optional[List[str]] = None, count: int = 10,
@@ -146,6 +157,51 @@ class SnapshotBarSynthesizer:
                 bars = self._completed.get(code, [])[-int(count or 10):]
                 out[code] = [_to_bar_dict(b) for b in bars]
             return out
+
+    def latest_price(self, code: str) -> Optional[Tuple[float, datetime]]:
+        """最近一次快照采样：(价格, 采样所属分钟终点)；无样本 → None。
+
+        forming（本分钟最新样本）优先，回退最近一根已完成 bar 的 close。
+        与 ``completed_bars`` 的区别：这里是**采样价**而非闭合 bar，供提交前
+        价格刷新这类「只要盘口最新价」的场景使用——TQ 本地 1m 盘中只到上一
+        交易日（见模块 docstring），不能用它冒充当日实时价。
+        """
+        c = str(code or "").strip()
+        if not c:
+            return None
+        with self._lock:
+            f = self._forming.get(c)
+            if f is not None:
+                return float(f["close"]), f["label"]
+            bars = self._completed.get(c) or []
+            if bars:
+                return float(bars[-1]["close"]), bars[-1]["label"]
+        return None
+
+    def open_at(self, codes: Optional[List[str]], start: datetime) -> Dict[str, float]:
+        """指定分钟区间（``start`` 起、1 分钟）的开盘价，``{code: open}``。
+
+        bar 标签 = 分钟终点（``start + 1min``）。同时查 forming 与 completed：
+        该分钟刚开始时首个采样即建 forming（open 一经建立不再变化），
+        ``start+1min`` 时刻起由 ``_rollover_unlocked`` 移入 completed。
+        取不到的 code 不返回（调用方 fail-closed，绝不伪造价格）。
+        """
+        label = start.replace(second=0, microsecond=0) + timedelta(minutes=1)
+        want = list(codes) if codes else list(self._codes)
+        out: Dict[str, float] = {}
+        with self._lock:
+            for code in want:
+                f = self._forming.get(code)
+                if f is not None and f["label"] == label:
+                    out[code] = f["open"]
+                    continue
+                for b in reversed(self._completed.get(code, [])):
+                    if b["label"] == label:
+                        out[code] = b["open"]
+                        break
+                    if b["label"] < label:
+                        break
+        return out
 
     def add_codes(self, codes: List[str]) -> None:
         """动态扩池（账户对齐：外部持仓导入后纳入快照合成/风控驱动）。
