@@ -306,14 +306,15 @@ describe('LiveSessions.vue 工作台(B4b)', () => {
     w.unmount()
   })
 
-  it('持仓 tab 归属徽标：池外兜底行显示「非池内·兜底归属」，池内/缺字段不显示', async () => {
+  it('持仓 tab 池外仓徽标：out_of_pool 行显示「池外·不参与风控」，池内/缺字段不显示', async () => {
     ;(getLiveSessions as any).mockResolvedValue([runningSession])
     ;(getLivePositions as any).mockResolvedValue([
       { stock_code: '600000.SH', quantity: 300, avg_cost: 10, market_value: 3000,
-        portfolio_id: 1, strategy_id: 1, source: 'strategy', attribution: 'pool' },
+        portfolio_id: 1, strategy_id: 1, source: 'strategy', out_of_pool: false },
+      // 池外外部仓（后端 engine_external_positions 打 out_of_pool=true）
       { stock_code: '002745.SZ', quantity: 5300, avg_cost: 10.221, market_value: 54171,
-        portfolio_id: 1, strategy_id: 1, source: 'strategy', attribution: 'fallback' },
-      // 旧接口无 attribution → 降级不显示、不报错
+        portfolio_id: null, strategy_id: null, source: 'external', out_of_pool: true },
+      // 旧接口无 out_of_pool → 降级不显示、不报错
       { stock_code: '600888.SH', quantity: 900, avg_cost: 10.99, market_value: 7893,
         portfolio_id: 1, strategy_id: 1, source: 'strategy' },
     ])
@@ -323,13 +324,17 @@ describe('LiveSessions.vue 工作台(B4b)', () => {
     const posTable = w.findAll('table').find((t) => t.text().includes('来源'))!
     const rows = posTable.findAll('tbody tr')
     expect(rows.length).toBe(3)
-    expect(rows[0].text()).not.toContain('非池内')
-    expect(rows[2].text()).not.toContain('非池内')
+    expect(rows[0].text()).not.toContain('池外')
+    expect(rows[2].text()).not.toContain('池外')
 
-    expect(rows[1].text()).toContain('非池内·兜底归属')
-    const fb = rows[1].findAll('.badge').find((b) => b.text().includes('非池内'))!
-    expect(fb.classes()).toContain('badge-orange')
-    expect(fb.attributes('title')).toContain('止损')
+    expect(rows[1].text()).toContain('池外·不参与风控')
+    const badge = rows[1].findAll('.badge').find((b) => b.text().includes('池外'))!
+    expect(badge.classes()).toContain('badge-orange')
+    expect(badge.attributes('title')).toContain('不进风控')
+    expect(badge.attributes('title')).toContain('不占槽位')
+    expect(badge.attributes('title')).toContain('不代卖')
+    // 池外仓仍是外部行：灰色「原有持仓」徽章 + 组合/子策略列显示 —
+    expect(rows[1].find('.badge').text()).toBe('原有持仓')
     w.unmount()
   })
 
@@ -347,7 +352,7 @@ describe('LiveSessions.vue 工作台(B4b)', () => {
       quantity: 5300, avg_cost: 10.221, market_value: 54171 })
     await flushPromises()
 
-    expect(w.text()).toContain('非池内·兜底归属')
+    expect(w.text()).toContain('池外·不参与风控')
     w.unmount()
   })
 
@@ -358,7 +363,7 @@ describe('LiveSessions.vue 工作台(B4b)', () => {
     await flushPromises()
 
     expect(w.text()).toContain('暂无持仓')
-    expect(w.text()).toContain('账户原有持仓（非策略买入）以灰色标注为原有持仓，已自动导入虚拟账本纳入风控（真实成本计算止损/止盈）')
+    expect(w.text()).toContain('池外外部仓仅展示/对账、不进风控、不占槽位、不代卖')
     w.unmount()
   })
 
@@ -570,7 +575,7 @@ describe('LiveSessions.vue 新建实盘选组合', () => {
 
     await w.findAll('button').find((b) => b.text().includes('新建实盘'))!.trigger('click')
     await flushPromises()
-    const boxes = w.findAll('input[type="checkbox"]')
+    const boxes = w.findAll('input[data-portfolio-check]')
     expect(boxes.length).toBe(2)
     expect(w.text()).toContain('稳健组合')
     expect(w.text()).toContain('进取组合')
@@ -597,7 +602,7 @@ describe('LiveSessions.vue 新建实盘选组合', () => {
     // 切到实盘 option
     const modeSelect = w.find('select')
     await modeSelect.setValue('live')
-    const boxes = w.findAll('input[type="checkbox"]')
+    const boxes = w.findAll('input[data-portfolio-check]')
     await boxes[0].setValue(true)
     await w.findAll('button').find((b) => b.text().includes('确认'))!.trigger('click')
     await flushPromises()
@@ -686,7 +691,7 @@ describe('LiveSessions.vue 实盘资金基准（live_capital）', () => {
     await flushPromises()
     const capInput = w.findAll('input').find((i) => (i.element as HTMLInputElement).type === 'number')!
     await capInput.setValue('1000000')
-    const boxes = w.findAll('input[type="checkbox"]')
+    const boxes = w.findAll('input[data-portfolio-check]')
     await boxes[0].setValue(true)
     await w.findAll('button').find((b) => b.text().includes('确认'))!.trigger('click')
     await flushPromises()
@@ -705,7 +710,7 @@ describe('LiveSessions.vue 实盘资金基准（live_capital）', () => {
 
     await w.findAll('button').find((b) => b.text().includes('新建实盘'))!.trigger('click')
     await flushPromises()
-    const boxes = w.findAll('input[type="checkbox"]')
+    const boxes = w.findAll('input[data-portfolio-check]')
     await boxes[0].setValue(true)
     await w.findAll('button').find((b) => b.text().includes('确认'))!.trigger('click')
     await flushPromises()
@@ -854,7 +859,7 @@ describe('LiveSessions.vue 执行模式 + 预警信号', () => {
     expect(w.findAll('select').some((s) => s.html().includes('QMT 通道'))).toBe(true)
 
     // 提交：带 execution_mode=auto
-    const boxes = w.findAll('input[type="checkbox"]')
+    const boxes = w.findAll('input[data-portfolio-check]')
     await boxes[0].setValue(true)
     await w.findAll('button').find((b) => b.text().includes('确认'))!.trigger('click')
     await flushPromises()
@@ -1351,13 +1356,13 @@ describe('LiveSessions.vue 多会话并行监控（M1）', () => {
     w.unmount()
   })
 
-  it('通道条提示多会话并行规则（THS 独占 / 复制交易语义）', async () => {
+  it('通道条提示多会话并行规则（同引擎独占 / 复制交易语义）', async () => {
     ;(getLiveSessions as any).mockResolvedValue([stoppedSession])
     const w = mount(LiveSessions)
     await flushPromises()
 
-    expect(w.text()).toContain('支持多会话并行')
-    expect(w.text()).toContain('同花顺通道同时仅一个会话')
+    expect(w.text()).toContain('支持跨引擎多会话并行')
+    expect(w.text()).toContain('同一引擎同时仅一个会话')
     expect(w.text()).toContain('复制交易')
     w.unmount()
   })

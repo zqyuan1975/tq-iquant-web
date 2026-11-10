@@ -88,7 +88,7 @@ export interface PortfolioItem {
   stamp_duty_rate: number | null
   slippage: number | null
   trading_session: string  // full|am|pm
-  price_limit_check_enabled: boolean  // #1 涨跌停约束（回测）
+  price_limit_check_enabled: boolean  // #1 涨跌停校验（回测成交 + 实盘下单前置，默认开）
   volume_limit_enabled: boolean       // #2 成交量/流动性约束（回测，默认关）
   volume_limit_ratio: number          // 单 bar 成交量占比上限（默认 0.10）
   adaptive_slippage_enabled: boolean  // #4 自适应滑点（回测，默认关）：冲击随订单量占成交量比例上浮
@@ -855,7 +855,7 @@ export interface PortfolioRequest {
   stamp_duty_rate: number
   slippage: number
   trading_session: string  // full|am|pm
-  price_limit_check_enabled?: boolean  // None=新建默认开启/编辑不动
+  price_limit_check_enabled?: boolean  // #1 涨跌停校验；None=新建默认开启（实盘仅 TDX/THS 生效，QMT/掘金桥恒放行）/编辑不动
   volume_limit_enabled?: boolean
   volume_limit_ratio?: number  // (0,1]
   adaptive_slippage_enabled?: boolean  // #4 自适应滑点（默认关）
@@ -1600,6 +1600,9 @@ export interface LivePositionItem {
   // 归属：pool=在组合股票池内 / fallback=不在池内、按兜底规则挂到首个组合；
   // 旧数据/旧接口缺省时按 pool 降级（不显示徽标）
   attribution?: 'pool' | 'fallback'
+  // 池外外部仓（代码不在任何组合股票池）：true 时前端显示「池外·不参与风控」徽章；
+  // 旧接口缺省/池信息未知时按 false 降级（不显示徽章）
+  out_of_pool?: boolean
 }
 
 export async function getLiveOrders(sessionId: number, status?: string) {
@@ -1683,12 +1686,15 @@ export interface LiveSessionItem {
   execution_mode?: LiveExecutionMode  // 执行模式（旧数据缺省视作 auto）
   status: string  // stopped|running
   engine_running?: boolean  // 该会话引擎是否真的在注册表中运行（status=running 但 false=重启后未启动）
-  live_capital?: number | null  // 会话级实盘资金基准（元）；null=各组合用自身 initial_capital
+  live_capital?: number | null  // 会话级实盘资金基准（账户总资产，元）；null=各组合用自身 initial_capital
   started_at: string | null
   stopped_at: string | null
   portfolio_ids: number[]
   portfolios?: { portfolio_id: number; status: string }[]  // 组合级状态(active|circuit_broken)
   reconcile_mismatches?: ReconcileMismatch[]  // 最近一次虚拟持仓 vs 桥实际对账差异（未运行 []）
+  advance_close_enabled?: boolean  // 14:50 提前收盘价（B 可选增强，仅 1d）是否开启
+  advance_close_time?: string      // 提前收盘价轮次时点（默认 14:51，实际不早于 14:52）
+  advance_close_done_date?: string | null  // 提前收盘价轮次已执行日期（幂等标记）
 }
 
 // I-7（audit）：对账差异摘要（LiveEngine._reconcile_positions 产出）
@@ -1713,8 +1719,10 @@ export interface LiveSessionCreate {
   engine?: LiveEngineKey
   execution_mode?: LiveExecutionMode
   portfolio_ids: number[]
-  live_capital?: number | null  // 实盘资金基准（元）；空=null=用组合初始资金
+  live_capital?: number | null  // 实盘资金基准（账户总资产，元）；空=null=用组合初始资金
   signal_file_path?: string | null  // 外部信号文件路径；空=null=走 TQ 公式计算
+  advance_close_enabled?: boolean  // B 可选增强，仅 1d：14:50 定信号、14:52 bar 开盘价报单、当日尾盘成交；默认 false（1d/1w/1mon 均 15:05 收盘落定后算、次日执行）
+  advance_close_time?: string      // 执行时点 HH:MM；默认 14:51，限定 14:51–14:59，实际轮次不早于 14:52
 }
 
 export async function getLiveSession(sessionId: number) {
@@ -1776,6 +1784,9 @@ export interface TqTradeConfig {
   client_path: string
   default_engine: string       // tdx|iquant|ths：新建实盘会话未显式选引擎时使用
   cancel_unfilled_minutes: number  // >0：在途单超时未成交自动撤单；0=禁用
+  pre_open_auction_enabled: boolean       // 次日盘前（集合竞价）执行日线信号单，默认 false
+  pre_open_auction_end_time: string       // 盘前执行窗口结束时间（默认 09:20，左闭右开）
+  pre_open_auction_price_bias_pct: number // 盘前委托价相对信号价的让价幅度（%）
 }
 
 export interface SystemConfig {

@@ -135,10 +135,12 @@ const RISK_RULE_LABEL: Record<string, string> = {
 
 const fmt = (v: unknown): string => (v === null || v === undefined ? '' : String(v))
 
-/** 成本价展示：统一 3 位小数（后端计算/存储仍全精度）。 */
+/** 成本价展示：统一 3 位小数（后端计算/存储仍全精度）；
+ *  avg_cost<=0 = 柜台成本为负/未知（B5），标注「成本未知」而非漂移现价。 */
 function fmtCost(v: unknown): string {
   const n = Number(v)
   if (v === null || v === undefined || !Number.isFinite(n)) return ''
+  if (n <= 0) return '未知'
   return n.toFixed(3)
 }
 

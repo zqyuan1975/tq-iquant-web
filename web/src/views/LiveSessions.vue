@@ -55,6 +55,13 @@ const form = ref({
   live_capital: null as number | string | null,
   // 外部信号注入：通达信条件预警输出的信号文件路径（空=走 TQ 公式计算）
   signal_file_path: '' as string,
+  // 14:50 提前收盘价（B，可选增强，仅 1d）：默认关 → 1d/1w/1mon 都在 15:05
+  // 收盘落定后用完整 bar 算信号、次日开盘执行；勾选后仅 1d 提前到 14:50 定信号、
+  // 14:52 起始 1m bar 开盘价报单、当日尾盘成交（1w/1mon 不受影响）
+  advance_close_enabled: false as boolean,
+  // 提前收盘价轮次时点 HH:MM（默认 14:51，限定 14:51–14:59；委托价需要 14:52
+  // 起始 1m bar 的开盘价，故实际轮次不早于 14:52）
+  advance_close_time: '14:51' as string,
 })
 
 /** live_capital 归一化：空串/未填 → null（用组合初始资金），否则转数值透传。 */
@@ -89,7 +96,7 @@ const otherEngines = computed(
   () => (channel.value?.engines || []).filter((e) => e.key !== channel.value?.engine),
 )
 const channelBadgeTitle =
-  '默认引擎：新建实盘（自动模式）默认使用；可在 系统设置 → 通达信 TQ 交易通道 → 默认交易引擎 修改'
+  '默认引擎：engine 为空的历史会话/旧 qmt(miniQMT) 会话回退使用；可在 系统配置 → 通达信 TQ 通道 → 默认交易引擎 修改'
 // 新建实盘默认引擎：跟随后端 default_engine（SystemConfig 可配，当前默认 tdx）
 function defaultEngineKey(): LiveEngineKey {
   return (channel.value?.engine as LiveEngineKey) || 'tdx'
@@ -186,6 +193,17 @@ function calendarDegradedTitle(cal: any): string {
     .map((y) => calendarYearText(y, cal.years[y]))
   return parts.length > 0 ? parts.join('；') : '交易日历已退化'
 }
+
+/**
+ * 账户快照采集提示按引擎区分：仅同花顺（ths）是读 xiadan 下单窗口表格，
+ * 需要窗口打开；goldminer / iquant / tdx 都是后端定时拉柜台/桥接口，与窗口无关。
+ */
+function snapshotHint(engine: string | null | undefined): string {
+  if ((engine || '').toLowerCase() === 'ths') {
+    return 'THS 通道 60s/次，读表需下单窗口打开'
+  }
+  return '后台每 60s 采集一次，无需打开下单窗口'
+}
 type WbTab = 'positions' | 'orders' | 'trades' | 'decisions' | 'signals'
 const wbTab = ref<WbTab>('positions')
 const TAB_LABEL: Record<WbTab, string> = {
@@ -214,10 +232,14 @@ function alertStatusClass(s: string | null): string {
 function fmtTime(t: string | null): string {
   return t ? t.replace('T', ' ').slice(0, 19) : '—'
 }
-// 成本价展示统一 3 位小数（后端计算/存储仍全精度）
+// 成本价展示统一 3 位小数（后端计算/存储仍全精度）；
+// B5：avg_cost<=0 表示柜台成本为负/未知（或外部导入仓无成本基准），
+// 不显示漂移的现价 / 负数，统一标注「成本未知」（该票不参与风控阈值判断）。
 function fmtCost(v: number | null | undefined): string {
   if (v === null || v === undefined || !Number.isFinite(Number(v))) return '—'
-  return Number(v).toFixed(3)
+  const n = Number(v)
+  if (n <= 0) return '成本未知'
+  return n.toFixed(3)
 }
 // 金额（市值）展示统一 2 位小数（分为精度；后端计算/存储仍全精度）
 function fmtMoney(v: number | null | undefined): string {
@@ -504,7 +526,7 @@ async function load() {
 }
 
 function openCreate() {
-  form.value = { name: '', mode: 'simulation', engine: defaultEngineKey(), execution_mode: 'alert', portfolio_ids: [], live_capital: null, signal_file_path: '' }
+  form.value = { name: '', mode: 'simulation', engine: defaultEngineKey(), execution_mode: 'alert', portfolio_ids: [], live_capital: null, signal_file_path: '', advance_close_enabled: false, advance_close_time: '14:51' }
   showCreate.value = true
 }
 
@@ -516,7 +538,7 @@ async function create() {
   try {
     await createLiveSession({ ...form.value, live_capital: normalizedLiveCapital() })
     showCreate.value = false
-    form.value = { name: '', mode: 'simulation', engine: defaultEngineKey(), execution_mode: 'alert', portfolio_ids: [], live_capital: null, signal_file_path: '' }
+    form.value = { name: '', mode: 'simulation', engine: defaultEngineKey(), execution_mode: 'alert', portfolio_ids: [], live_capital: null, signal_file_path: '', advance_close_enabled: false, advance_close_time: '14:51' }
     load()
   } catch (e: any) {
     // 后端参数校验失败（名称空/资金≤0 等）返回 code!==0 → 拦截器 reject，
@@ -618,8 +640,8 @@ onUnmounted(closeEventStreams)
       v-if="channelTestMsg"
       :style="{ color: channelTestMsg.ok ? 'var(--green)' : 'var(--red)', fontSize: '13px' }"
     >{{ channelTestMsg.text }}</span>
-    <span class="channel-hint">自动模式可在「新建实盘」时另选引擎；默认引擎在 系统设置 → 通达信 TQ 交易通道 修改</span>
-    <span class="channel-hint">支持多会话并行（不同引擎/不同账户）；同花顺通道同时仅一个会话；同组合多会话=复制交易（各账户独立记账）</span>
+    <span class="channel-hint">自动模式可在「新建实盘」时另选引擎；默认引擎在 系统配置 → 通达信 TQ 通道 修改</span>
+    <span class="channel-hint">支持跨引擎多会话并行（不同账户）；同一引擎同时仅一个会话；同组合多会话=复制交易（需不同引擎，各账户独立记账）</span>
     <router-link to="/system" style="margin-left:auto;font-size:13px">通道配置 →</router-link>
   </div>
 
@@ -645,7 +667,7 @@ onUnmounted(closeEventStreams)
             >{{ executionModeLabel(s.execution_mode) }}</span>
           </td>
           <td>
-            <span class="badge badge-gray" :title="isAlert(s) ? '预警模式：引擎决定信号计算数据源（TQ 内存注入），不下单' : '全自动：按交易引擎下单'">{{ engineLabel(s.engine) }}</span>
+            <span class="badge badge-gray" :title="isAlert(s) ? '预警模式：固定走通达信 TQ 行情计算信号，不下单' : '全自动：按交易引擎下单'">{{ engineLabel(s.engine) }}</span>
           </td>
           <td>{{ s.mode === 'simulation' ? '仿真' : '实盘' }}</td>
           <td>
@@ -679,14 +701,14 @@ onUnmounted(closeEventStreams)
 
   <!-- B4b: 工作台（持仓/委托/成交） -->
   <div class="card" style="margin-top:16px">
-    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+    <div class="wb-head">
       <h3 style="margin:0">
         实盘工作台
         <span v-if="watchedSessionId" style="font-size:13px;color:var(--ink-soft);font-weight:normal;margin-left:8px">
           聚焦：#{{ watchedSessionId }} {{ sessions.find((s) => s.id === watchedSessionId)?.name }}
         </span>
       </h3>
-      <div style="display:flex;align-items:center;margin-left:auto">
+      <div class="wb-tabs">
         <select
           v-if="runningSessions.length > 1"
           class="input" style="width:auto;margin-right:8px;padding:4px 8px"
@@ -743,7 +765,7 @@ onUnmounted(closeEventStreams)
             </p>
           </template>
           <p v-else style="margin:4px 0 0;color:var(--ink-soft);font-size:12px">
-            账户快照采集中…（THS 通道 60s/次，读表需下单窗口打开）
+            账户快照采集中…（{{ snapshotHint(s.engine) }}）
           </p>
         </div>
       </div>
@@ -766,9 +788,9 @@ onUnmounted(closeEventStreams)
               <span class="badge" :class="p.source === 'external' ? 'badge-gray' : 'badge-blue'">
                 {{ p.source === 'external' ? '原有持仓' : '策略持仓' }}
               </span>
-              <span v-if="p.attribution === 'fallback'" class="badge badge-orange" style="margin-left:4px"
-                    title="不在该组合股票池内，按兜底规则挂到首个组合；按该组合风控参数管理，触及止损/止盈会自动卖出">
-                非池内·兜底归属
+              <span v-if="p.out_of_pool === true || p.attribution === 'fallback'" class="badge badge-orange" style="margin-left:4px"
+                    title="池外外部仓：只进持仓展示与对账，不进风控、不占槽位、不代卖（每日一条 out_of_pool_position 汇总事件）">
+                池外·不参与风控
               </span>
             </td>
           </tr>
@@ -776,7 +798,7 @@ onUnmounted(closeEventStreams)
       </table>
       <div v-if="positions.length === 0" class="empty-state">
         <p>暂无持仓</p>
-        <p>账户原有持仓（非策略买入）以灰色标注为原有持仓，已自动导入虚拟账本纳入风控（真实成本计算止损/止盈）</p>
+        <p>账户原有持仓（非策略买入）以灰色标注为原有持仓；属于本会话股票池的已导入虚拟账本并按真实成本纳入风控，池外外部仓仅展示/对账、不进风控、不占槽位、不代卖；成本 ≤0 显示「成本未知」且不参与风控。</p>
       </div>
     </div>
 
@@ -926,7 +948,7 @@ onUnmounted(closeEventStreams)
 
   <!-- B4a: 实时事件日志（多会话合并流，带会话前缀 + 过滤） -->
   <div class="card" style="margin-top:16px">
-    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+    <div class="wb-head">
       <h3 style="margin:0">实时事件日志</h3>
       <div style="display:flex;align-items:center;gap:8px">
         <select
@@ -950,9 +972,10 @@ onUnmounted(closeEventStreams)
     </div>
   </div>
 
-  <div v-if="showCreate" class="modal-overlay" @click.self="showCreate = false">
+  <div v-if="showCreate" class="modal-overlay modal-lg" @click.self="showCreate = false">
     <div class="modal-content">
       <h3>新建实盘</h3>
+      <div class="modal-body">
       <label>名称</label><input v-model="form.name" placeholder="例如：模拟盘A" />
       <label>模式</label><select v-model="form.mode"><option value="simulation">仿真</option><option value="live">实盘</option></select>
       <label>执行模式</label>
@@ -967,34 +990,60 @@ onUnmounted(closeEventStreams)
         </option>
       </select>
       <p style="font-size:12px;color:var(--ink-faint);margin:2px 0 12px">
-        仿真=仿真账号(虚拟资金)，实盘=真实账号(真实资金)。
+        模式只对 QMT 通道选桥：simulation / live 两个模式位当前都指向 8790（410038214257，STOCK；
+        该账户是 QMT 仿真账户、账户内为仿真资金）。8791 信用账户桥位保留但未启用。其它引擎的账户由通道自身决定，模式不改变下单账户。
         <span v-if="form.execution_mode === 'alert'">
-          预警模式：按所选引擎的数据源计算信号并通过 send_warn 推送预警，不下单。通达信 TQ 引擎使用 TQ 内存注入计算信号。
+          预警模式：固定走通达信 TQ 行情计算信号（与所选引擎无关）并通过 send_warn 推送，不下单。
         </span>
         <span v-else>
-          自动模式：下单由所选引擎执行——掘金量化桥跑在掘金终端内（桥策略运行中）；通达信 TQ 直连通达信客户端；同花顺走独立交易客户端 UI 自动化。引擎未就绪时启动会直接报错，不会静默换通道。
+          自动模式：下单由所选引擎执行——通达信 TQ 直连客户端（确认面板可自动处置）；同花顺走 UI 自动化（file_builtin 文件交接）；掘金量化桥/QMT 桥须在对应终端内运行桥策略。引擎未就绪时启动直接 503 报错，不会静默换通道。
         </span>
       </p>
       <label>实盘资金基准（元）</label>
       <input v-model="form.live_capital" type="number" min="0" placeholder="留空 = 用组合初始资金" />
       <p style="font-size:12px;color:var(--ink-faint);margin:2px 0 12px">
-        填写后会话内所有组合以该资金起账，资金占比/单仓/敞口等比率配置等比缩放；多组合各自独立记账。组合资金与实盘差异过大时，高价股可能受一手(100股)约束。
+        请填账户「总资产」（可用资金 + 持仓市值）：会话内所有组合以该资金起账，资金占比/单仓/敞口等比率配置等比缩放；多组合各自独立记账。启动后继承的存量持仓市值会从起账现金中扣除，避免与基准重复计入（只填可用资金会低估总资产）。组合资金与实盘差异过大时，高价股可能受一手(100股)约束。
       </p>
       <label>外部信号文件路径（通达信条件预警输出，可选）</label>
       <input v-model="form.signal_file_path" placeholder="留空 = 走 TQ 公式计算信号；填写完整文件路径" />
       <p style="font-size:12px;color:var(--ink-faint);margin:2px 0 12px">
-        填写后（如 D:\project\分时突击.txt）引擎定时读取该文件的新增信号行并注入交易链路——绕过 TQ 公式引擎的周期限制（如 1m 级别）。文件由通达信「条件预警」功能动态输出（GBK 追加写入）。所有级别公式均可走此链路。
+        填写后（如 D:\project\分时突击.txt）引擎定时读取该文件的新增信号行并注入交易链路——绕过 TQ 公式引擎的周期限制（如 1m 级别）。文件由通达信「条件预警」功能动态输出（GBK 追加写入）。所有级别公式均可走此链路。填写即<strong>替换信号来源</strong>：该会话不再跑 TQ 公式计算（风控/仓位/资金等限制条件仍沿用回测口径）；仅自动模式生效，预警模式不读取该文件。
       </p>
+      <p style="font-size:12px;color:var(--ink-faint);margin:2px 0 12px">
+        <strong>买卖方向</strong>：信号动作分买入类（OPEN / ADD）与卖出类（REDUCE / CLOSE），方向由该策略公式信号配置的 <code>signal_type</code> 决定（预警文件本身不含方向列）。<br />
+        ① <strong>买入类</strong>：沿用原有开仓闸门（资金占比 / 最大持仓数 / 单仓金额 / 敞口上限 / 可用现金），满槽或已持仓跳过；槽位上限取各组合自己的 <code>strategies.max_positions</code>（缺失则跳过槽位闸并告警，不写死 5）。<br />
+        ② <strong>卖出类</strong>：不做仓位与资金检查，但受两条硬约束——<strong>无持仓不卖</strong>（不得卖空）、<strong>T+1 实际可用为 0 时拒绝</strong>（沿用实盘 T+1 可用股数校验，不绕过）。<br />
+        ③ <strong>减仓比例</strong>：预警文件 8 列没有数量/比例列，<strong>REDUCE 未给出比例时按清仓执行</strong>（日志与风控事件明确标注「未给出比例，按清仓执行」，不静默猜测百分比）；CLOSE 恒清仓。<br />
+        ④ <strong>去重</strong>：同代码 + 同日 + 同方向各认第一条（买卖互不吞并；同方向重复推送不重复下单）。未知/不可解析的动作一律忽略并节流告警，绝不猜测方向或默认成买入。
+      </p>
+      <label style="display:flex;align-items:center;gap:8px;margin-top:4px">
+        <input v-model="form.advance_close_enabled" type="checkbox" style="width:auto" />
+        14:50 提前收盘价（B 可选增强，仅日线 1d，当日尾盘报单）
+      </label>
+      <template v-if="form.advance_close_enabled">
+        <label>提前收盘价执行时点</label>
+        <select v-model="form.advance_close_time">
+          <option value="14:51">14:51（默认）</option>
+          <option value="14:52">14:52</option>
+          <option value="14:55">14:55</option>
+          <option value="14:57">14:57</option>
+        </select>
+        <p style="font-size:12px;color:var(--ink-faint);margin:2px 0 12px">
+          <strong>默认（不勾选）</strong>：1d/1w/1mon 都等周期收盘价落定后（15:05）用完整 bar 算信号，次一交易日开盘执行；14:30 只做日终估值/日亏/熔断恢复，不再产生日线级信号。周线/月线仅在周期最后一个交易日的 15:05 轮次计算。<br />
+          <strong>勾选后（仅 1d 提前）</strong>：14:50 用快照合成 1m bar 的收盘价定信号，<strong>委托价取 14:52 起始 1m bar 的开盘价</strong>（考虑报价时延，取不到回退 14:51 起始 bar 的开盘价并推送 fallback 风控事件；两者都取不到则该股本日不下单），该轮 1d 信号<strong>当日尾盘提交成交</strong>（不受 risk_timing=next_day 的次日顺延）。<strong>周线/月线不受影响</strong>（仍收盘落定 + 次日执行）。数量/资金/仓位仍按 14:50 收盘价计算；成本价以柜台成交回填为准。外部信号文件模式下 1d 信号仍来自文件，本时点只补跑日线风控。仅自动模式、仅实盘；当日只执行一次（重启不重复）；会话须在 14:50 前启动。
+        </p>
+      </template>
       <label>组合策略（可多选）</label>
       <div class="portfolio-check-list">
         <label v-for="p in portfolios" :key="p.id" class="portfolio-check">
-          <input v-model="form.portfolio_ids" type="checkbox" :value="p.id" />
+          <input v-model="form.portfolio_ids" type="checkbox" :value="p.id" data-portfolio-check />
           {{ p.name }}<span style="color:var(--ink-faint)">（#{{ p.id }}）</span>
           <span v-if="portfolioFormulas(p.id)" class="formula-tag">{{ portfolioFormulas(p.id) }}</span>
         </label>
       </div>
       <div v-if="portfolios.length === 0" class="empty-state" style="padding:8px">
         <p>暂无组合策略，请先在"组合管理"页创建</p>
+      </div>
       </div>
       <div class="modal-actions">
         <button @click="create" class="btn btn-primary">确认</button>
@@ -1012,63 +1061,163 @@ onUnmounted(closeEventStreams)
       </div>
       <div class="modal-body" style="margin-top:12px">
         <div class="form-group">
-          <label class="group-label">一、交易通道选择（三引擎对比）</label>
+          <label class="group-label">一、交易通道选择（四引擎对比）</label>
           <div class="guide-block">
-            <p class="guide-step"><b>通达信 TQ</b>：SDK 直调，无 UI 依赖，撤单/价格校验/大额拆单全支持——<b>无人值守首选</b>。</p>
-            <p class="guide-step"><b>同花顺</b>：UI 自动化（键鼠模拟），file_builtin 文件交接；下单键入已真机校准
-              （2026-10-29 实证：代码/价格/数量三字段全落框、真实委托成交）——撤单已自动化（F3 双击/OCR 导航）；
-              运行期间勿触碰键鼠（UI 独占前台）。</p>
-            <p class="guide-step"><b>掘金量化</b>：HTTP 桥（桥策略跑在掘金终端内，gm API 下单）；确认弹窗自动处置、持仓/资金实时读回。</p>
-            <p class="guide-note">· 前置条件与通道配置入口：系统设置 → 对应通道段（通达信 TQ 交易通道 / 同花顺交易通道 / 掘金量化桥）。</p>
+            <p class="guide-step"><b>通达信 TQ（tdx）</b>：同进程 TQ SDK 直调，撤单/价格校验/大额拆单全支持；
+              下单确认面板可自动处置（config.tq_trade.auto_confirm_dialog，默认开）——<b>无人值守首选</b>。</p>
+            <p class="guide-step"><b>同花顺（ths）</b>：UI 自动化（键鼠模拟），execute_mode 双模式——
+              file_builtin（默认，指令落 JSONL 交内置执行器）/ direct（同步直呼）；price_mode=approval（默认）/
+              latest（本机 latest，按最新价键入）；撤单已自动化（F3 撤单页双击）。
+              运行期间勿触碰键鼠（UI 独占前台），同花顺通道同时仅一个会话。</p>
+            <p class="guide-step"><b>掘金量化（goldminer）</b>：HTTP 桥（goldminer_bridge.py 跑在掘金终端内，
+              127.0.0.1:7801）；持仓/资金/委托经桥实时读回。</p>
+            <p class="guide-step"><b>QMT 通道（iquant）</b>：<b>通道定位</b>——四条生产通道之一，与掘金、
+              同花顺、通达信同级，平台侧正式接入并按生产标准维护；<b>账户资金属性</b>——当前
+              iquant_bridge.py（127.0.0.1:8790）绑定的 410038214257（STOCK）是 <b>QMT 仿真账户，
+              账户内是仿真资金</b>，不是真实资金。会话「模式」simulation / live 两个位都指向这一个桥；
+              iquant_bridge_live.py（8791 信用账户 CREDIT 410009993017）仓库保留但<b>非生产、未启用</b>，
+              无需部署。切真实资金须改桥文件顶部 ACCOUNT / ACCOUNT_TYPE（必要时 TICK_TAG / DRY_RUN）
+              并重跑实盘验证，不能只改 config.yaml。其它引擎的「模式」不改变下单账户。</p>
+            <p class="guide-note">· 委托认领：QMT/掘金桥把 bridge_order_id 写进柜台 remark，按 remark 精确认领；
+              通达信/同花顺不支持 remark，走「代码+方向+数量+提交时间窗」模糊匹配（陌生遗留单会降级排除）。</p>
+            <p class="guide-note">· 撤单能力：仅通达信/同花顺实现 cancel_order；平台对 QMT/掘金桥不下发撤单
+              （掘金桥虽有 /cancel 端点但平台未接），超时在途单按 expire 处理（柜台可能仍挂单，需人工撤），
+              requote 追价重下对桥通道不生效。</p>
+            <p class="guide-note">· 默认引擎：系统配置 → 通达信 TQ 通道 → 默认交易引擎（tq_trade.default_engine，
+              当前 tdx）。engine 为空的历史会话、已移除的旧 `qmt`（miniQMT）会话键都回退该默认；
+              未配置/非法时回退 ths_ui.enabled 且依赖可用→ths，否则 iquant。</p>
+            <p class="guide-note">· 就绪门槛：启动前探活；客户端未启动/未登录、依赖缺失、桥未运行、路径账号未配置时
+              直接 503 并给出可操作中文提示，不会静默换通道。</p>
+            <p class="guide-note">· 信号前置：实盘公式必须是通达信导入公式（engine=tq）；全自动仅支持
+              signal_frequency == period（跨周期信号请改预警模式）。</p>
           </div>
         </div>
 
         <div class="form-group">
-          <label class="group-label">二、会话与组合</label>
+          <label class="group-label">二、桥策略部署（掘金桥 / QMT 生产桥）</label>
+          <div class="guide-block">
+            <p class="guide-step"><b>掘金量化桥</b>：文件 live/bridge/goldminer_bridge.py，部署在掘金终端
+              「我的策略」内；顶部 TOKEN / ACCOUNT / STRATEGY_ID 必须替换为新账户与终端分配的策略 ID
+              （仓库内 STRATEGY_ID 是占位符）；HOST/PORT 默认 127.0.0.1:7801，须与 config.goldminer.base_url
+              一致。gm SDK 装在系统 Python（掘金终端使用的解释器），<b>禁止装进 main/.venv</b>。</p>
+            <p class="guide-step"><b>QMT 生产桥</b>：只部署 iquant_bridge.py（127.0.0.1:8790，账号
+              410038214257，STOCK；<b>该账户是 QMT 仿真账户，账户内为仿真资金</b>），文件粘贴进 QMT
+              客户端策略编辑器运行（客户端自带 Python 3.6.8）。切真实资金须改桥文件顶部
+              ACCOUNT / ACCOUNT_TYPE（必要时 TICK_TAG / DRY_RUN）并重跑实盘验证，不能只改平台配置。
+              iquant_bridge_live.py（8791，信用账户 CREDIT 410009993017）<b>非生产、未启用</b>，
+              换机不必部署；但两份文件须保持镜像（除 PORT / ACCOUNT / ACCOUNT_TYPE / TICK_TAG /
+              /ping 的 service / 日志前缀 / strategyName 外逐字一致），改动须手动同步两份。</p>
+            <p class="guide-note">· <b>启动方式</b>：桥策略只能由对应终端点「运行」启动。禁止用 uv run / 平台 venv
+              启动掘金桥（会把 gm 装进平台环境，下次 uv sync 删掉后桥真断）；掘金终端关闭 = 桥停 = 报单按超时
+              expire 兜底。改完桥文件必须停止再启动策略才生效。</p>
+            <p class="guide-note">· <b>平台侧配置</b>（config.yaml，只读核对）：iquant_bridge.simulation/live.base_url、
+              goldminer.base_url（掘金另含 request_timeout_seconds=30 / slow_response_seconds=15 /
+              slow_warn_interval_seconds=300）、tq_trade.*、ths_ui.work_dir/execute_mode/price_mode。
+              本机当前实际：simulation=8790；live=8790（两位都指向 QMT 仿真账户 410038214257，不使用 8791 信用腿）；
+              goldminer=7801；ths execute_mode=file_builtin、price_mode=latest、work_dir=data/ths。</p>
+            <p class="guide-note">· <b>卖出范围</b>（tq_trade.live_sell_scope）：full＝按整仓卖（默认，含外部仓）；
+              platform_only＝只卖平台自建仓，纯外部仓不代卖并记一条 gate=sell_scope / action=skip。
+              本机 platform_only；买入侧不受影响。</p>
+            <p class="guide-note">· <b>次日盘前集合竞价</b>（tq_trade.pre_open_auction_*）：enabled 默认 false（本机 true）、
+              end_time 默认 09:20、price_bias_pct 默认 2.0。窗口 09:15 ≤ now &lt; end_time；仅当日 due 的日线
+              deferred 单生效（1w/1mon 不走盘前）；价＝信号价×(1±bias%) 并夹进当日涨跌停；每单每日至多一次
+              （at-most-once），09:31 首根 1m bar 兜底且已报出的单不重报。盘前单<b>按单</b>下发 price_type=limit，
+              <b>无需</b>会话级或 config.yaml 里的 price_type=limit；HTTP 桥通道的闸门判据为桥 /ping 自述支持 limit 或提供
+              /price_limit（通达信/同花顺按各自通道能力），若本会话盘前单 /order 回显非 limit 则直接拦下该单。</p>
+            <p class="guide-note">· <b>桥超时</b>：live.bridge_read_timeout_seconds=15（单次读取）、
+              bridge_connect_timeout_seconds=3（建连）、bridge_timeout_seconds=90（持续离线判死阈值，语义不同）；
+              iquant_bridge.request_timeout_seconds 默认 15，掘金保持 30（/quote 首次走云端历史服务慢）。</p>
+            <p class="guide-note">· <b>安全</b>：桥文件与 config.yaml 均含明文 TOKEN / 账户号，且桥绑 127.0.0.1 无鉴权；
+              分发/拷贝时只在可信机器间进行，勿提交到公开仓库或聊天群。</p>
+          </div>
+        </div>
+
+        <div class="form-group">
+          <label class="group-label">三、会话与组合</label>
           <div class="guide-block">
             <p class="guide-step"><b>一个会话 = 一个引擎 + N 个组合</b>（新建实盘多选）；组合内多策略并行。</p>
-            <p class="guide-step"><b>多会话并行</b>：支持（不同引擎/不同账户）；<b>同花顺通道同时仅一个会话</b>（键鼠独占）。</p>
-            <p class="guide-step"><b>复制交易</b>：同一组合挂多个会话 = 各账户独立记账、同一信号两账户各执行一次（执行偏差自担）；
-              资金基准 live_capital 按各账户规模设置。</p>
+            <p class="guide-step"><b>多会话并行</b>：跨引擎可并行（不同账户）；<b>同一引擎同时仅一个会话</b>
+              （tdx/iquant/goldminer/ths 同理，同引擎双会话会双份记账交易同一账户；同花顺另有键鼠独占）。</p>
+            <p class="guide-step"><b>复制交易</b>：同一组合挂多个会话需选<b>不同引擎</b>（= 不同账户），
+              各会话独立记账、同一信号各账户各执行一次（执行偏差自担）；
+              资金基准 live_capital 按各账户「总资产」设置（可用资金 + 持仓市值；继承持仓市值会在起账时扣除；
+              留空则用组合 initial_capital）。</p>
             <p class="guide-note" style="color:var(--red)"><b>禁止</b>：同一资金账号挂两个会话（资金竞争）。</p>
+            <p class="guide-step"><b>日线级别默认口径（1d/1w/1mon）</b>：都等<b>周期收盘价落定</b>后
+              在 15:05 轮次用完整 bar 算信号，<b>次一交易日开盘执行</b>；14:30 只做日终估值 /
+              日亏 / 熔断恢复，不再驱动日线级信号。1w 只在每周最后一个交易日、1mon 只在每月
+              最后一个交易日的 15:05 轮次计算（周五 / 月末休市自动前移到前一交易日），其余日子跳过。</p>
+            <p class="guide-step"><b>14:50 提前收盘价（B，可选增强，仅 1d，advance_close_enabled）</b>：
+              会话级开关，默认关。开启后仅 1d 提前——14:50 用快照合成 1m bar 收盘价定信号，
+              <b>委托价取 14:52 起始 1m bar 的开盘价</b>（考虑报价时延；取不到回退 14:51 起始
+              bar 的开盘价并推送 fallback 风控事件；两者都取不到则该股本日不下单），<b>该轮信号
+              当日尾盘提交成交</b>（不受 risk_timing 的次日顺延）。<b>周线/月线不受影响</b>
+              （仍走 15:05 收盘落定 + 次日执行）。时点限定 14:51–14:59，实际轮次不早于 14:52。
+              四引擎通用、仅实盘 auto 生效、回测忽略；当日只执行一次（跨重启幂等，DB
+              advance_close_done_date）。外部信号文件模式下 1d 信号仍来自文件，该时点只补跑日线风控。
+              14:52/14:51 开盘价都取不到则不下单（不伪造价格，ERROR 日志 + risk 事件可见）；
+              会话须在 14:50 前启动。</p>
+            <p class="guide-note">· 与策略级「风控执行时点 risk_timing」的区别：risk_timing 决定
+              <b>15:05 收盘落定轮次 / 盘中轮次</b>算出的单是否顺延次日（策略级）；提前收盘价的
+              1d 轮次则<b>固定当日提交</b>（等价于该轮强制 immediate）。两者不冲突：未开启提前
+              收盘价时按 risk_timing 执行；开启后该轮不受 next_day 影响。</p>
           </div>
         </div>
 
         <div class="form-group">
-          <label class="group-label">三、实盘执行配置（策略表单「实盘执行」分组）</label>
+          <label class="group-label">四、实盘执行配置（策略表单「实盘执行」分组）</label>
           <div class="guide-block">
             <p class="guide-step"><b>撤单后追价重下 requote</b>：超时未成交 → 自动撤单 → 追 1 tick 重下
-              （最多 requote_max_attempts 次）；默认关。</p>
+              （最多 requote_max_attempts 次）；默认关。依赖通道撤单能力（通达信/同花顺），桥通道不生效。</p>
             <p class="guide-step"><b>大额拆单（仅 TDX）</b>：单笔 ≥ split_order_threshold → 拆 N 子单，成交驱动续发；默认关。</p>
-            <p class="guide-step"><b>风控执行时点 risk_timing</b>：next_day（默认，与回测一致——日线信号次日执行）/
-              immediate（当日确认当日执行）。</p>
+            <p class="guide-step"><b>风控执行时点 risk_timing</b>：next_day（默认，与回测一致——日线信号
+              次日开盘执行）/ immediate（当日确认当日执行，仅盘中周期有效；15:05 收盘落定轮次与
+              提前收盘价之外的日线单仍按本设置）。仅实盘生效，回测忽略（回测固定 T+1）；
+              15:05 收盘落定轮次产生的单<b>强制次日执行</b>（收盘后报单报不进交易所，immediate 也不例外）；
+              开启「14:50 提前收盘价」后，该轮 1d 信号固定当日提交，不受此设置影响（见第三节）。</p>
             <p class="guide-note">· 上述默认关闭 = 与回测行为一致；开启后建议先仿真观察。</p>
+            <p class="guide-note">· <b>卖出同票在途去重</b>（gate=inflight_sell）：同（策略, 代码）已有未结卖单时，
+              目标量先减在途未成交量——≤0 整单跳过，&gt;0 按差额收窄（收窄后记 reduce）。</p>
+            <p class="guide-note">· <b>事件去重</b>：order/submitted 不再重复推送两条；受理未认领时只补一条
+              order_unconfirmed 决策事件说明状态。</p>
           </div>
         </div>
 
         <div class="form-group">
-          <label class="group-label">四、原有持仓</label>
+          <label class="group-label">五、原有持仓</label>
           <div class="guide-block">
-            <p class="guide-step">账户存量持仓自动显示为「<b>原有持仓</b>」（灰色），仅供监视不参与策略交易。</p>
-            <p class="guide-note">· 需会话运行中才显示；与策略持仓（蓝色）分列来源；对账差异含原有持仓属正常。</p>
+            <p class="guide-step">账户存量持仓中、属于本会话股票池的部分会导入虚拟账本，按<b>真实成本</b>纳入止损/止盈/移动止损风控；
+              非策略买入的部分在工作台以灰色「<b>原有持仓</b>」标注来源，与蓝色「策略持仓」并列展示。</p>
+            <p class="guide-note">· <b>池外外部仓不再兜底归属</b>：只进持仓展示与对账，不进风控、不占槽位、不代卖；
+              每会话每日落一条汇总决策事件（gate=out_of_pool_position / action=notice）+ 日志 + SSE，
+              逐票明细只在日志/SSE；对账差异含原有持仓属正常。</p>
+            <p class="guide-note">· <b>成本未知</b>：柜台成本 ≤ 0（送转分红后为负，或柜台返回 0）视为成本未知，
+              不参与止损/止盈/移动止损，持仓表显示「成本未知」（不再用市值÷数量推算）。</p>
           </div>
         </div>
 
         <div class="form-group">
-          <label class="group-label">五、执行模式</label>
+          <label class="group-label">六、执行模式</label>
           <div class="guide-block">
-            <p class="guide-step"><b>预警（alert）</b>：信号/风控全套落文件+推送，不下单——半自动。</p>
-            <p class="guide-step"><b>自动（auto）</b>：全套自动下单——按所选引擎执行。</p>
-            <p class="guide-note">· THS 自动模式已真机验证（下单→成交→撤单全链路）；首次实盘建议小单先行；运行期间勿触碰键鼠。</p>
+            <p class="guide-step"><b>预警（alert）</b>：固定走通达信 TQ 行情计算信号 + send_warn 推送 + 落库，
+              不下单——半自动（此时所选引擎只用于记录，不参与取数）。</p>
+            <p class="guide-step"><b>自动（auto）</b>：全套自动下单——按所选引擎执行；同花顺 file_builtin 下
+              指令/回执落在 {ths_ui.work_dir}/{session_id}/（signals/risk/orders/results + cursor.json）。</p>
+            <p class="guide-note">· THS 自动模式已真机验证（下单→成交→撤单全链路）；首次实盘建议小单先行；
+              运行期间勿触碰键鼠。</p>
           </div>
         </div>
 
         <div class="form-group">
-          <label class="group-label">六、风险提示</label>
+          <label class="group-label">七、风险提示</label>
           <div class="guide-block">
             <p class="guide-note">· 同一资金账号禁止挂两个会话。</p>
             <p class="guide-note">· 同花顺真实账户操作请先小单验证。</p>
             <p class="guide-note">· 佣金/印花税按柜台真实回报记账；下单前费用为估算。</p>
+            <p class="guide-note">· 内置休市表目前只覆盖 2026 年；2027 年及以后无权威日历时按工作日 fail-open
+              并在启动时打 WARNING，需在交易所公布休市安排后补表。</p>
+            <p class="guide-note">· <b>前端生效</b>：前端改动需 npm run build 重建 web/dist 才生效
+              （FastAPI 直接托管 dist，无需重启后端）。</p>
           </div>
         </div>
       </div>
@@ -1139,5 +1288,24 @@ onUnmounted(closeEventStreams)
   color: var(--ink-faint);
   font-size: 11px;
   font-weight: 400;
+}
+/* 工作台标题行与小屏适配：标题与标签/下拉/按钮允许换行，按钮不被挤出可视区 */
+.wb-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-bottom: 8px;
+}
+.wb-tabs { display: flex; align-items: center; flex-wrap: wrap; gap: 4px; margin-left: auto; }
+.wb-tabs select { margin-right: 8px; }
+@media (max-width: 1180px) {
+  .channel-hint { flex-basis: 100%; }
+  .wb-tabs { margin-left: 0; }
+}
+/* 视口高度不足时事件日志不再霸占过多高度（其余内容在 .content 内滚动） */
+@media (max-height: 820px) {
+  .event-log { max-height: min(420px, 34vh); }
 }
 </style>

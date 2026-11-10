@@ -49,6 +49,8 @@ export interface PositionRow {
   // 归属：pool=在组合股票池内 / fallback=不在池内、按兜底规则挂到首个组合；
   // 缺省（旧接口/SSE 事件未带）时不显示徽标，按 pool 降级
   attribution?: 'pool' | 'fallback'
+  // 池外外部仓（后端 out_of_pool）：只展示/对账，不进风控、不占槽位、不代卖
+  out_of_pool?: boolean
 }
 
 /** 决策闸门事件行（调参可观测性）。 */
@@ -349,10 +351,12 @@ export function upsertPositionRows(rows: PositionRow[], ev: Ev): PositionRow[] {
     strategy_id: (ev.strategy_id as number) ?? null,
     source: (ev.source as string) || 'strategy',
     attribution: (ev.attribution as PositionRow['attribution']) || undefined,
+    out_of_pool: ev.out_of_pool === true ? true : undefined,
   }
   const idx = rows.findIndex((r) => positionRowKey(r) === positionRowKey(row))
   // SSE position 事件不携带归属 → 保留已有行的标注，避免徽标闪没
   if (!row.attribution && idx >= 0) row.attribution = rows[idx].attribution
+  if (!row.out_of_pool && idx >= 0) row.out_of_pool = rows[idx].out_of_pool
   if (row.quantity <= 0) {
     if (idx < 0) return rows
     const next = [...rows]
@@ -378,6 +382,7 @@ export function positionHistoryToRows(items: LivePositionItem[]): PositionRow[] 
     strategy_id: i.strategy_id ?? null,
     source: i.source || 'strategy',
     attribution: i.attribution,
+    out_of_pool: i.out_of_pool === true ? true : undefined,
   }))
 }
 
