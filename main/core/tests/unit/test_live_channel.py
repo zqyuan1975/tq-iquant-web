@@ -797,6 +797,9 @@ def test_position_cost_negative_cost_not_faked_with_price():
     from core.engine.live_engine import _position_cost
     assert _position_cost({"cost": -475.0, "market_value": 727.0}, 20) == 0
     assert _position_cost({"cost": 0, "market_value": 727.0}, 20) == 0
+    # 显式给出 cost=None（桥取不到成本属性）语义是「未知」，不是「没这一列」：
+    # 绝不能回退 市值÷股数（=现价冒充成本，盈亏恒 0、成本每轮漂移）
+    assert _position_cost({"cost": None, "market_value": 727.0}, 20) == 0
     # 字段缺失（旧桥/通道不给 cost）仍保留市值÷股数估值兜底
     assert _position_cost({"market_value": 727.0}, 20) == Decimal("36.35")
     assert _position_cost({"cost": 36.43}, 20) == Decimal("36.43")

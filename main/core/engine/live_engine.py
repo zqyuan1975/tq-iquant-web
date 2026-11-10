@@ -178,21 +178,27 @@ def _position_cost(row, volume: int) -> Decimal:
 
     口径（2026-11-10 B5 定稿）：
     - 行的 cost 字段**存在且 > 0** → 直接用（券商合并均价，唯一风控基准）；
-    - cost 字段存在但 **<= 0**（送转/分红后成本为负，实测 300413=-475.00、
-      300722=-10.93；或柜台返回 0 表示无效）→ 返回 Decimal("0") 表示**成本未知**，
-      **绝不**回退「市值÷股数」——那等于拿现价冒充成本：盈亏恒 0、风控失效，
-      且成本随价格每轮漂移（36.430→36.360）。风控见 avg_cost<=0 跳过该票；
+    - cost 字段存在但 **<= 0 或为 None**（送转/分红后成本为负，实测 300413=-475.00、
+      300722=-10.93；或柜台/桥取不到成本，桥给 None）→ 返回 Decimal("0") 表示
+      **成本未知**，**绝不**回退「市值÷股数」——那等于拿现价冒充成本：盈亏恒 0、
+      风控失效，且成本随价格每轮漂移（36.430→36.360）。风控见 avg_cost<=0 跳过该票；
     - cost 字段**缺失**（旧桥/通道不给该列）且市值可用 → 「市值÷股数」估值兜底；
     - 两者都拿不到（停牌票 QMT 市值 Infinity→None）→ 0（未知）。
     """
-    raw = row.get("cost")
-    if raw is not None:
+    if "cost" in row:
+        # 显式带 cost 列（含 None）→ 只信这一列。桥取不到成本时给的是 None
+        # （QMT 客户端无可用成本属性），语义是「未知」而不是「没有这一列」：
+        # 回退「市值÷股数」= 拿现价冒充成本（盈亏恒 0、成本每轮漂移、风控假触发）。
+        raw = row.get("cost")
+        if raw is None:
+            return Decimal("0")
         try:
             cost = Decimal(str(raw))
         except Exception:  # noqa: BLE001
-            cost = None
-        if cost is not None and cost == cost:  # NaN 守卫
-            return cost if cost > 0 else Decimal("0")
+            return Decimal("0")
+        if cost != cost:  # NaN 守卫
+            return Decimal("0")
+        return cost if cost > 0 else Decimal("0")
     try:
         mv = Decimal(str(row.get("market_value") or 0))
         vol = Decimal(int(volume))
@@ -201,6 +207,25 @@ def _position_cost(row, volume: int) -> Decimal:
     if mv > 0 and vol > 0:
         return mv / vol
     return Decimal("0")
+
+
+def _is_share_count_change(before_qty: int, before_cost: Decimal,
+                           qty: int, cost: Decimal) -> bool:
+    """数量增加但「总成本基本不变」→ 送转/拆股等股本变动，不是外部真买入。
+
+    券商合并均价在送转后按新股数摊薄：``cost × qty ≈ before_cost × before_qty``
+    （总成本守恒）；外部买入必然抬高总成本（≈新买入金额）。因此只有数量增加且
+    总成本不增时才判为股本变动。
+
+    保守条件：两侧成本都有效（>0）才判定。任一未知（柜台负成本/0）一律按
+    「外部买入」处理——宁可多扣现金，也不让虚拟净值凭空虚增。
+    容差 0.5%：送转的总成本是守恒的（差异只来自浮点），真实买入的最小增量
+    （1 手）相对大额持仓可能很小，容差过大会把真买入误判成送转。
+    """
+    if before_qty <= 0 or qty <= before_qty or before_cost <= 0 or cost <= 0:
+        return False
+    return (cost * Decimal(int(qty))
+            <= before_cost * Decimal(int(before_qty)) * Decimal("1.005"))
 
 
 def _position_market_value(row, volume: int, cost: Decimal) -> Decimal:
@@ -462,6 +487,8 @@ class LiveEngine:
         self._no_code_rows_reported = False
         # 导入仓成本未知（桥未给 cost 且市值不可用）的告警去重：每代码一次
         self._no_cost_warned: set = set()
+        # 送转/拆股（数量增、合并均价摊薄、总成本未增）识别日志去重：每代码一次
+        self._share_change_noted: set = set()
         # max_positions 缺失（该策略未配置）告警去重：每 (组合, 策略) 一次
         self._slot_limit_warned: set = set()
         # 协作者共享状态容器（0010 步骤 2a）：session_id/portfolios/dispatcher/
@@ -2768,13 +2795,28 @@ class LiveEngine:
                         # 指定成本基准（同会话同票去重）。
                         self._note_cost_unknown(code, qty)
                     # 真实数量超出虚拟账本的部分 = 继承仓/外部手工增仓，其市值
-                    # 已包含在资金基准（账户总资产）里 → 扣等额虚拟现金，避免双计
-                    if vol > 0 and mv_total > 0 and qty > before_qty:
-                        self._deduct_inherited_value(
-                            port,
-                            mv_total / Decimal(vol) * Decimal(qty - before_qty),
-                            "mirror",
-                        )
+                    # 已包含在资金基准（账户总资产）里 → 扣等额虚拟现金，避免双计。
+                    # 例外（2026-11-10）：数量增但总成本未增 = 送转/拆股等股本变动
+                    # （券商合并均价被摊薄），不是新买入 → **不扣现金**，否则虚拟
+                    # 净值凭空少掉增量市值（假回撤 → 可能误触 max_drawdown 熔断）。
+                    added = qty - before_qty
+                    if added > 0 and mv_total > 0:
+                        if _is_share_count_change(before_qty, before_cost, qty, cost):
+                            if code not in self._share_change_noted:
+                                self._share_change_noted.add(code)
+                                logger.info(
+                                    "bridge mirror: %s 数量 %d -> %d 且合并均价 %s -> %s"
+                                    "（总成本未增）= 送转/拆股等股本变动，不扣虚拟现金"
+                                    "（session %s）",
+                                    code, before_qty, qty, before_cost, cost,
+                                    self.session_id,
+                                )
+                        else:
+                            self._deduct_inherited_value(
+                                port,
+                                mv_total / Decimal(vol) * Decimal(added),
+                                "mirror",
+                            )
                     if pos.quantity == before_qty and pos.avg_cost == before_cost:
                         continue
                     changed += 1

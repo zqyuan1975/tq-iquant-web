@@ -178,6 +178,34 @@ def test_import_without_value_keeps_cash_untouched():
     assert port.account.cash == Decimal("100000")
 
 
+def test_mirror_share_bonus_does_not_deduct_cash():
+    """送转/拆股：数量翻倍、合并均价减半（总成本守恒）→ 不是外部买入，不扣现金。
+
+    旧实现只看「真实量 > 虚拟量」就按增量市值扣虚拟现金：送转当天虚拟净值
+    凭空少掉增量市值（一个 10 送 10 就是该仓一半的市值）→ 假回撤，可能误触
+    max_drawdown 熔断（只暂停开仓、不停损，但会整天错过信号）。
+    """
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single()
+    disp = _AcctDispatcher(positions=[
+        # 10 送 10：1000 → 2000 股，合并均价 10 → 5（总成本 10000 不变）
+        {"symbol": "600000.SH", "volume": 2000, "available": 2000,
+         "cost": 5.0, "market_value": 10000.0},
+    ])
+    engine = _mk_engine(disp, factory, port, engine_key="tdx",
+                        account_snapshot_interval=5.0)
+    ctx = engine.ctx.portfolios[0].strategies[0]
+    pos = Position("600000.SH")
+    pos.buy(1000, Decimal("10.0"), datetime(2026, 11, 3, 10, 0))
+    ctx.positions["600000.SH"] = pos
+
+    engine._tick_deals()
+
+    assert ctx.positions["600000.SH"].quantity == 2000
+    assert ctx.positions["600000.SH"].avg_cost == Decimal("5.0")
+    assert port.account.cash == Decimal("100000")   # 股本变动不动现金
+
+
 def test_mirror_increase_deducts_only_external_delta():
     """平台自管仓被外部加仓：只按「真实-虚拟」增量市值扣现金。
 

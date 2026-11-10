@@ -41,11 +41,15 @@ class StrategyRiskManager:
                             ratio: Optional[Decimal] = None) -> bool:
         """移动止损。ratio 可覆盖实例阈值（B5 市场状态闸：趋势态放宽止损）。
 
-        成本未知（avg_cost<=0，柜台负成本/导入仓无成本基准）时整票跳过风控：
-        此时无法区分「成本基准」与「现价」，回撤判定失去意义（B5 2026-11-10）。
+        与止损/止盈不同，移动止损只依赖「持仓期最高价」这条价格序列，**不需要
+        成本基准**，因此成本未知（avg_cost<=0：柜台负成本=送转/分红后已回本、
+        或导入仓无成本）时仍然生效（2026-11-10）：负成本持仓的止损/止盈本就
+        无意义（任何价格都不是亏损），移动止损是这类持仓唯一有效的保护；
+        旧行为把它整票跳过 = 负成本仓完全裸奔。
+        ``highest_price<=0``（从未取到过有效价）时无从判回撤 → 不触发。
         """
         threshold = ratio if ratio is not None else self.trailing_stop_ratio
-        if (position.quantity == 0 or position.avg_cost <= 0
+        if (position.quantity == 0 or position.highest_price <= 0
                 or threshold == 0):
             return False
         if current_price > position.highest_price:

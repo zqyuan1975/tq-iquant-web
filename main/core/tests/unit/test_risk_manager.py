@@ -354,10 +354,11 @@ def test_trailing_stop_ratio_none_falls_back_to_instance():
 
 
 def test_risk_skipped_when_cost_unknown():
-    """B5：柜台成本为负/未知（avg_cost<=0）时止损/止盈/移动止损一律跳过。
+    """B5：柜台成本为负/未知（avg_cost<=0）时止损/止盈跳过（阈值判断无成本基准）。
 
-    成本未知再用阈值判断只会误杀（或形同失效），口径是整票不参与风控，
-    由人工指定成本基准。
+    移动止损例外（2026-11-10）：它只用 highest_price 这条价格序列，不需要成本
+    基准——负成本（送转/分红后已回本）与成本未知的持仓仍必须受移动止损保护，
+    否则这类持仓完全裸奔（实测 300413 cost=-475 / 300722 cost=-10.93）。
     """
     rm = StrategyRiskManager(
         stop_loss_ratio=Decimal("0.05"), take_profit_ratio=Decimal("0.2"),
@@ -369,4 +370,8 @@ def test_risk_skipped_when_cost_unknown():
     pos.highest_price = Decimal("40")
     assert rm.check_stop_loss(pos, Decimal("1")) is False
     assert rm.check_take_profit(pos, Decimal("999")) is False
+    # 40 → 10：回撤 75% ≥ 3% → 移动止损仍生效
+    assert rm.check_trailing_stop(pos, Decimal("10")) is True
+    # 从未取到有效价（无峰值基准）→ 不判回撤
+    pos.highest_price = Decimal("0")
     assert rm.check_trailing_stop(pos, Decimal("10")) is False
