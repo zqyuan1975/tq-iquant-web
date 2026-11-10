@@ -1,32 +1,32 @@
-# QMT 通道桥策略（双桥：仿真 / 实盘）
+# QMT 通道桥策略（生产：`iquant_bridge.py` / 8790 / 股票账户）
 
 在 QMT 通道客户端内以**策略**方式运行的本地 HTTP 桥：Core（main/）通过 HTTP
-调 `/order` `/positions` `/account` `/orders` `/deals` `/quote` 实现实盘下单与行情拉取。
+调 `/order` `/positions` `/account` `/orders` `/deals` `/quote` 实现实盘下单与行情拉取。QMT 与掘金、同花顺、通达信并列为四条生产通道，当前**只部署 8790 这一个桥（账户为 QMT 仿真账户、账户内为仿真资金）**。
 
 - 设计依据：[docs/plans/0009-iquant-http-bridge.md](../../docs/plans/0009-iquant-http-bridge.md)
 - 订单状态机 / 成交回报回填：[docs/plans/0011-order-sync-deal-backfill.md](../../docs/plans/0011-order-sync-deal-backfill.md)
 
-## 双桥结构
+## 桥文件与当前部署
 
-实盘分两个正交维度，桥只承载其中一个：
+当前桥文件分工与部署状态（模拟/实盘由 QMT 启动按钮控制，见下节）：
 
 | 维度 | 取值 | 由谁决定 | 说明 |
 |---|---|---|---|
-| **仿真 / 实盘**（账号环境） | 仿真(虚拟资金) / 实盘(真实资金) | **账号 / 桥** | 一桥一账号一端口，Core 按 `session.mode` 路由 |
+| **仿真 / 实盘**（账号环境） | 仿真(虚拟资金) / 实盘(真实资金) | **QMT 启动按钮** | 当前只部署 8790 的 QMT 仿真账户；Core 两个模式位都指向它 |
 | **模拟 / 实盘**（下单与否） | 模拟(只出信号) / 实盘(真实下单) | **QMT 客户端启动按钮** | 与桥、与 `DRY_RUN` 无关 |
 
 两个维度正交，形成 2×2 组合：仿真·模拟、仿真·实盘(虚拟资金交易)、实盘·模拟、实盘·实盘(真实资金交易)。
 
-| 桥文件 | 端口 | 账号 | session.mode |
+| 桥文件 | 端口 | 账号 | 状态 |
 |---|---|---|---|
-| `iquant_bridge.py` | 8790 | 仿真账号（虚拟资金） | `simulation` |
-| `iquant_bridge_live.py` | 8791 | 实盘槽账号（**当前仍是 QMT 纸面账号，非真实资金**） | `live` |
+| `iquant_bridge.py` | 8790 | 410038214257（STOCK，**QMT 仿真账户**，账户内为仿真资金） | **生产在用**（通道按生产标准维护）；换机只部署这一个 |
+| `iquant_bridge_live.py` | 8791 | 410009993017（CREDIT） | **非生产、未启用**；仓库保留，换机不必部署 |
 
-> **注意**：当前部署两个桥用的都是 QMT 纸面账号（`ACCOUNT_TYPE` 一 `STOCK` 一 `CREDIT`），
-> 文件头注释里也写明「LIVE 只是桥的槽位名，不代表账户有真实资金」。换真实资金账户时只需
-> 改对应桥文件顶部的 `ACCOUNT` 一行并重启策略，其余代码不动。
+> **通道定位 vs 账户资金属性**：QMT 是四条生产通道之一（与掘金/同花顺/通达信同级，平台正式接入、按生产标准维护）；但 8790 桥绑定的 410038214257（`STOCK`）是 **QMT 仿真账户，账户内为仿真资金**，不是真实资金。
+> 平台 `simulation` / `live` 两个模式位的 `base_url` 都指向它；`iquant_bridge_live.py`（8791 / `CREDIT` 410009993017）**非生产、未启用**，仓库保留仅作镜像护栏参考，换机不必部署。
+> **切真实资金**：改桥文件顶部 `ACCOUNT` / `ACCOUNT_TYPE`（必要时 `TICK_TAG` / `DRY_RUN`），并重跑一遍实盘验证，不能只改 `config.yaml`。
 
-> **两文件是独立自包含拷贝**：QMT 通过把文件内容粘进客户端策略编辑器加载（非文件路径 import），故两桥不能 import 共享模块——`DRY_RUN`/白名单/限额/HTTP 层逻辑在两份文件中各有一份，**逻辑改动须手动同步两处**。
+> **两文件是独立自包含拷贝**：QMT 通过把文件内容粘进客户端策略编辑器加载（非文件路径 import），故两桥不能 import 共享模块（8791 虽不部署仍须保持镜像，避免同步遗漏）——`DRY_RUN`/白名单/限额/HTTP 层逻辑在两份文件中各有一份，**逻辑改动须手动同步两处**。
 >
 > 允许的差异**仅限**：`PORT`、`ACCOUNT`、`ACCOUNT_TYPE`、`TICK_TAG`、`/ping` 的 `service` 字段、控制台日志前缀（`[BRIDGE]` / `[BRIDGE-LIVE]`）与 `passorder` 的 strategyName（`iquant_bridge` / `iquant_bridge_live`），外加文件头注释里的账号/端口说明。除此之外逐字一致，由 `tests/test_bridge_tick.py::test_two_bridge_files_are_mirror_copies` 守护（去掉 config 区后按日志名归一化比对）。
 
@@ -41,12 +41,12 @@
 
 ## 部署步骤
 
-1. 在 QMT 客户端**新建两个策略**：
-   - 策略 A：把 `iquant_bridge.py` 内容粘进去 → 仿真桥，监听 `127.0.0.1:8790`。
-   - 策略 B：把 `iquant_bridge_live.py` 内容粘进去 → 实盘桥，监听 `127.0.0.1:8791`。
-   - 两个文件均为**纯 ASCII、GBK 编辑器兼容**，勿加非 ASCII 字符。
-2. 各自配置账号（见下「配置」）。
-3. 两个策略**各以「实盘交易」模式运行**。`init` 只做「绑定端口 + 注册
+1. 在 QMT 客户端**新建一个策略**（生产桥；账户为 QMT 仿真账户、仿真资金）：
+   - 把 `iquant_bridge.py` 内容粘进去 → 生产桥，监听 `127.0.0.1:8790`。
+   - `iquant_bridge_live.py`（8791 / `CREDIT`）**非生产、未启用**，不必部署。
+   - 桥文件必须保持**纯 ASCII、GBK 编辑器兼容**，勿加非 ASCII 字符。
+2. 配置账号（见下「配置」）。
+3. 策略**以「实盘交易」模式运行**。`init` 只做「绑定端口 + 注册
    `C.schedule_run(tick, ...)`」并**立即返回**，由定时回调（默认 1s）驱动有界
    accept/读写循环。控制台应依次看到 `bind ok` → `init done: tick scheduled ...`
    → `tick#N alive ...`（带时间戳与 tick 计数，持续递增才算定时器在跑）。
@@ -55,27 +55,27 @@
    > 官方支持的 `init` 返回 + `schedule_run` 模型（与 QMT 官方示例同形）。
    > 改完桥文件必须在客户端**停止并重新启动策略**才生效（跑着的策略仍是旧代码）。
 4. Core 侧 `config.yaml` 的 `iquant_bridge.simulation.base_url` / `iquant_bridge.live.base_url`
-   分别指向两个桥地址（默认 8790 / 8791，可配）。
-5. 用 `live/scripts/` 下的验证脚本或直接 `curl /ping` 确认两个桥在线后再启动实盘 session。
-   `GET /ping` 返回的 `account` 字段可用于核对各自绑定的账号。
+   都指向同一个生产桥地址（默认都是 8790，可配）。
+5. 用 `live/scripts/` 下的验证脚本或直接 `curl /ping` 确认生产桥在线后再启动实盘 session。
+   `GET /ping` 返回的 `account` 字段可用于核对绑定的账号（应为 410038214257）。
 
 ## 配置
 
 | 项 | 桥 | 说明 | 配置方式 |
 |---|---|---|---|
-| 账号 ID | 仿真桥 | `passorder`/查询用的仿真券商账号（虚拟资金） | 文件顶部 `ACCOUNT` 常量，换账号改这一行 |
-| 账号 ID | 实盘桥 | `passorder`/查询用的真实券商账号（真实资金） | 文件顶部 `ACCOUNT` 常量，换账号改这一行 |
-| 股票白名单 | 两桥 | `ALLOWED_STOCKS`（空 = 不限制） | 策略代码内配置（生产建议配齐） |
-| 试运行 | 两桥 | `DRY_RUN`（默认 False） | 策略代码内配置；True 只打印不发单（**开发开关，非模拟/实盘控制**） |
-| 端口 | 仿真桥 | `PORT = 8790` | 写死在文件顶部 config 区 |
-| 端口 | 实盘桥 | `PORT = 8791` | 写死在文件顶部 config 区 |
+| 账号 ID | 生产桥（8790） | 410038214257（STOCK），**QMT 仿真账户、账户内为仿真资金** | 文件顶部 `ACCOUNT` 常量；切真实资金须同时改 `ACCOUNT_TYPE`（必要时 `TICK_TAG` / `DRY_RUN`）并重跑实盘验证 |
+| 账号 ID | 信用腿（8791） | 410009993017（CREDIT），**非生产、未启用** | 仓库保留，换机不部署 |
+| 股票白名单 | 生产桥 | `ALLOWED_STOCKS`（空 = 不限制） | 策略代码内配置（生产建议配齐） |
+| 试运行 | 生产桥 | `DRY_RUN`（默认 False） | 策略代码内配置；True 只打印不发单（**开发开关，非模拟/实盘控制**） |
+| 端口 | 生产桥 | `PORT = 8790` | 写死在文件顶部 config 区 |
+| 端口 | 信用腿 | `PORT = 8791`（不部署） | 写死在文件顶部 config 区 |
 
 > **账号为何写死在桥文件**：QMT 客户端内运行无环境变量、无外部文件路径机制，且 `ContextInfo`
 > 只有 `set_account`（写入），没有读取当前登录账号的 API——`passorder`/`get_trade_detail_data`
 > 均需显式传账号。故账号只能作为常量写进桥文件。换账号时直接编辑 `ACCOUNT` 那一行即可，
-> 两桥各改一处。`GET /ping` 返回的 `account` 字段可用于部署后核对各自绑定的账号。
+> 改 8790 桥一处即可。`GET /ping` 返回的 `account` 字段可用于部署后核对绑定的账号。
 
-> 鉴权：两桥均绑 `127.0.0.1` loopback，单用户本机部署，不设 token 鉴权（防御在机器边界：
+> 鉴权：桥绑 `127.0.0.1` loopback，单用户本机部署，不设 token 鉴权（防御在机器边界：
 > 仅本机进程可达端口）。白名单、单笔限额、频率限制、审计日志仍强制执行。
 
 ### config.yaml 示例
@@ -85,17 +85,17 @@ iquant_bridge:
   simulation:
     base_url: http://127.0.0.1:8790
   live:
-    base_url: http://127.0.0.1:8791
+    base_url: http://127.0.0.1:8790   # 与 simulation 同指 QMT 仿真账户（不使用 8791 信用腿）
 ```
 
-Core 按 `session.mode` 选桥：`simulation` → 8790，`live` → 8791。端口在此可配（如改用其他端口，
+Core 按 `session.mode` 选桥：当前 `simulation` 与 `live` 都指向 8790 的 QMT 仿真账户。端口在此可配（如改用其他端口，
 需同步改对应桥文件顶部 `PORT`）。
 
-## 接口（两桥一致）
+## 接口（生产桥）
 
 | 端点 | 说明 |
 |---|---|
-| `GET /ping` | 心跳 + 桥状态（含 `port`/`account`/`dry_run`，可核对账号归属） |
+| `GET /ping` | 心跳 + 桥状态（含 `port`/`account`/`dry_run`/`price_type` 能力声明；平台盘前单据此判定是否支持按单 `limit`） |
 | `POST /order` | 下单（幂等 `order_id` + 白名单 + 限额 + 频率限制 + 审计） |
 | `GET /positions` | 持仓（`instrument`/`exchange`/`volume`/`available`/`yesterday`/`on_road`/`market_value`） |
 | `GET /account` | 资金 |
@@ -103,7 +103,38 @@ Core 按 `session.mode` 选桥：`simulation` → 8790，`live` → 8791。端�
 | `GET /deals?order_id=` | 成交回报（回填用 `m_strOrderRef`） |
 | `GET /quote?code=&period=&count=` | 1m/5m/1d bar（缓存） |
 | `GET /calendar?market=SH` | 交易日列表 `["YYYYMMDD", ...]`（缓存） |
+| `GET /price_limit?code=` | 前收 + 交易所涨跌停价（取不到回 `null`，平台 fail-open 放行） |
+| `POST /cancel` | 撤单（入参 `order_ref` = 柜台 `m_strOrderSysID` 合同号，兼容 `cl_ord_id`/`order_id`）；`data.result` 区分 `canceled` / `pending` / `not_found` / `rejected` / `failed` |
 | `GET /shutdown` | 释放端口自行退出（供下一次策略启动时接管） |
+
+> **QMT 桥实测约定**：`passorder` 返回值实测为字符串 `"0"`（不是「返回：无」）；撤单必须传 `m_strOrderSysID`（合同号，不是 `m_strOrderRef`），客户端 `cancel()` 的 `orderId` 只接受字符串；`prType=11`（limit）时才带 `price`，其余价型 `price` 传 0。
+
+> **委托备注与认领键**：柜台 `m_strRemark` **上限 20 字符**。Core 的 `bridge_order_id` 是 32 位 MD5 落库，写进柜台的只是**前 20 位**认领键；认领键生成失败或同会话撞键一律**拒单**（`BridgeOrderIdError`），不静默截断。
+
+### 委托价格类型 `price_type`（可选，`POST /order`）
+
+`passorder` 的 `prType` 不再写死，由请求体可选字段 `price_type` 决定：
+
+| 取值 | prType | `price` 实参 | 说明 |
+|---|---|---|---|
+| 缺字段 / `opponent` | 14 | 0 | **缺省，与改造前逐字一致**：对手价（BUY 取卖1、SELL 取买1） |
+| `limit` | 11 | Core 下发的审批价**原样** | 真实限价单；桥内**不改写、不跟价、不四舍五入** |
+| `market_best5` | 42（`.SH`）/ 47（`.SZ`） | 0 | 最优五档即时成交剩余撤销 |
+
+- 常量来源：QMT 客户端自带 `D:\iquant\bin.x64\Lib\site-packages\xtquant\xtconstant.py`
+  （`FIX_PRICE=11`、`MARKET_SH_CONVERT_5_CANCEL=42`、`MARKET_SZ_CONVERT_5_CANCEL=47`）。
+  `14` 在 xtconstant 里不是股票报价类型（`14=FUTURE_OPEN`），但本桥自 0009 起一直用它、
+  真机表现为对手价，故保留为缺省值。`44`（`MARKET_PEER_PRICE_FIRST`）语义不同且未验证，不启用。
+- **缺省兼容**：老 Core 不带该字段 → prType 仍 14，行为零变化。
+- **fail-closed**：显式未知取值、`market_best5` 缺 `.SH`/`.SZ` 后缀、`limit` 而 `price<=0`
+  一律 `ok:false`，绝不静默退回对手价（宁可这一笔报不出去，也不按没人选过的价格成交）。
+- **回执回报实际类型**：成功应答含 `pr_type` 与 `price_type`（实际生效值），Core 据此
+  在成交回填时核对偏离，不靠猜。
+- **平台侧配置**：`config.yaml` 的 `iquant_bridge.price_type`（默认 `opponent`）只是盘中普通单的缺省价型；**盘前集合竞价单不依赖该配置**——Core 按单显式下发 `price_type=limit`。
+  只要桥 `/ping` 自述支持 `limit`（或提供 `/price_limit`）即可，**无需把会话级价型改成 `limit`**；若本会话盘前单 `/order` 回执的 `price_type` 不是 `limit`，平台直接拦下该单。改配置只影响 Core 下发的字段，桥代码须重新粘贴才生效。
+- 定位说明（不是通用滑点保护）：通达信侧价格本就由平台决定（`PRICE_MY`）且提交前有
+  OCR 价格比对；掘金桥限价原样下发；同花顺现网 `latest` 模式**根本不键入价格**，其
+  ±让价参数是空转。QMT 盘前单按单 `limit` 时与它们同口径——**审批价即委托价**。
 
 ## 环境约束（已真机验证）
 
@@ -119,16 +150,19 @@ Core 按 `session.mode` 选桥：`simulation` → 8790，`live` → 8791。端�
 
 ## 掘金量化桥（`goldminer_bridge.py`）
 
-掘金量化桥与 QMT 双桥**同构协议**（HTTP JSON），Core 的 `HttpBridgeDispatcher`
+掘金量化桥与 QMT 桥**同构协议**（HTTP JSON），Core 的 `HttpBridgeDispatcher`
 零改动接入；区别是它跑在**掘金终端进程内**，端口 `127.0.0.1:7801`。
 
 - 策略格式：标准掘金策略（`init` + `run()` 事件循环 + 后台线程跑 `ThreadingHTTPServer`）。
 - 端点与 QMT 桥一致（`/ping` `/positions` `/account` `/orders` `/deals` `/quote`
-  `/calendar` `POST /order`），另有 `POST /cancel`（撤单）与 `POST /shutdown`（自退）。
+  `/calendar` `/price_limit` `POST /order` `POST /cancel`），另有 `POST /shutdown`（自退）。
+  平台侧 `HttpBridgeDispatcher` 已接 `cancel_order`（按 `order_ref` = 掘金 `cl_ord_id` 撤单）
+  与 `/price_limit` 涨跌停校验；老版本桥缺端点时平台自动降级（撤单退回 expire、
+  涨跌停 fail-open）。
 - 状态码/字段向平台口径映射：委托状态转 QMT `m_nOrderStatus` 数值（平台
   `order_machine` 直接消费）；`/orders` 与 `/deals` 的 `direction` 由 gm `side`
-  推导（买 48 / 卖 49）。行为注意：`side` 缺失/无法识别时 `_is_buy` 返回
-  `False`，即按**卖**兜底（不默认买）。
+  推导（买 48 / 卖 49）。行为注意：`side` 缺失/无法识别时 `_side_of` 返回空串，
+  该行**不写 direction**（平台认领不了会 WARN 跳过），绝不默认成买或卖。
 
 ### 运行方式（强制）
 
@@ -141,7 +175,7 @@ Core 按 `session.mode` 选桥：`simulation` → 8790，`live` → 8791。端�
   平台 venv 无 gm 不影响桥）。
 - **禁止**把 gm SDK 装进 `main/.venv`：PyPI 版 gm 的 C SDK（NATS 协议）与
   goldminer3 终端的服务协议不匹配（实测 `get_cash` 无限挂起），且依赖链会污染平台环境。
-- 终端关闭 = 桥停 = 平台报单 `rejected`（超时 expire 兜底）。
+- `/quote` 回包新增 `cached` 布尔值：空结果（停牌/错码）缓存 10s，非空结果缓存 55s；**耗时不能用来判断是否命中缓存**（gm SDK 持 GIL，快慢无参考意义）。
 
 ### 配置（文件顶部）
 
@@ -160,19 +194,19 @@ Core 按 `session.mode` 选桥：`simulation` → 8790，`live` → 8791。端�
 
 拷到新机器后，按下面逐项核对；标 **必改** 的不能沿用旧机的值。
 
-### A. QMT 双桥
+### A. QMT 桥（生产 8790）
 
 | 项 | 位置 | 换机动作 |
 |---|---|---|
-| `ACCOUNT` | 两文件顶部 config 区 | **必改** 为 QMT 客户端登录的券商账号（两桥各一处） |
-| `ACCOUNT_TYPE` | 两文件顶部 | **必改** 与真实账户类型一致：`STOCK` 普通 / `CREDIT` 两融；不一致会导致查询全空、委托被柜台拒绝 |
-| `PORT` | 两文件顶部 | 默认 8790/8791；改端口须同步 `config.yaml` 的 `iquant_bridge.simulation/live.base_url` |
-| `TICK_TAG` | 两文件顶部 | 两桥必须不同（同 tag 的定时回调会互相覆盖）；保持默认即可 |
-| `DRY_RUN` | 两文件顶部 | 实盘保持 `False` |
+| `ACCOUNT` | `iquant_bridge.py` 顶部 config 区 | **必改** 为 QMT 客户端登录的券商账号（现值 410038214257，**QMT 仿真账户/仿真资金**）；切真实资金须同时改 `ACCOUNT_TYPE`（必要时 `TICK_TAG` / `DRY_RUN`）并重跑实盘验证 |
+| `ACCOUNT_TYPE` | 同上 | **必改** 与真实账户类型一致（现值 `STOCK` 普通账户）：不一致会导致查询全空、委托被柜台拒绝 |
+| `PORT` | 同上 | 默认 8790；改端口须同步 `config.yaml` 的 `iquant_bridge.simulation/live.base_url` |
+| `TICK_TAG` | 同上 | 多桥并存时须不同（同 tag 的定时回调会互相覆盖）；单桥保持默认即可 |
+| `DRY_RUN` | 同上 | 实盘保持 `False` |
 | QMT 客户端 | — | 策略须以「**实盘交易**」模式启动；模拟模式只出信号不下单 |
-| 文件编码 | — | 两文件必须保持**纯 ASCII**（QMT 编辑器按 GBK 存储，粘中文会乱码） |
+| 文件编码 | — | 桥文件必须保持**纯 ASCII**（QMT 编辑器按 GBK 存储，粘中文会乱码） |
 
-验证：`curl http://127.0.0.1:8790/ping` 与 `http://127.0.0.1:8791/ping`，
+验证：`curl http://127.0.0.1:8790/ping`，
 核对返回的 `account` / `port` / `service` / `dry_run`。
 
 ### B. 掘金桥
@@ -195,17 +229,20 @@ iquant_bridge:
   simulation:
     base_url: http://127.0.0.1:8790
   live:
-    base_url: http://127.0.0.1:8791
+    base_url: http://127.0.0.1:8790   # QMT 仿真账户；8791 信用腿不启用，不要改到这里
 goldminer:
   base_url: http://127.0.0.1:7801
 ```
+
+> 平台侧以目标机实际 `config.yaml` 为准；`live.base_url` 也指向 8790，
+> `live` 只是模式位名，会话使用的仍是 QMT 仿真账户（410038214257，账户内为仿真资金），不使用 8791 信用账户。
 
 ### D. 目录内容
 
 | 文件 | 用途 |
 |---|---|
-| `iquant_bridge.py` | QMT 仿真桥（8790） |
-| `iquant_bridge_live.py` | QMT 实盘槽桥（8791，当前仍是纸面账号） |
+| `iquant_bridge.py` | QMT 生产桥（8790 / STOCK） |
+| `iquant_bridge_live.py` | 8791 / CREDIT，**非生产、未启用**（仓库保留） |
 | `goldminer_bridge.py` | 掘金量化桥（7801，终端内运行） |
-| `tests/test_bridge_tick.py` | 桥生命周期/端点/双桥镜像护栏（无终端依赖） |
+| `tests/test_bridge_tick.py` | 桥生命周期/端点/双桥镜像护栏（8791 不部署但仍校验镜像；无终端依赖） |
 | `tests/test_iquant_side.py` | DEAL/ORDER 方向归一（两腿一致） |
