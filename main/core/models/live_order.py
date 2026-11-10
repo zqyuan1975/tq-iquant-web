@@ -32,4 +32,7 @@ class LiveOrder(Base):
     __table_args__ = (
         Index("ix_live_orders_session_status", "live_session_id", "status"),
         Index("ix_live_orders_portfolio", "portfolio_strategy_id"),
+        # SQLite AUTOINCREMENT：id 由 sqlite_sequence 单调分配，删除最大行后不复用 rowid。
+        # 防止 _applied_state（按 order_id 记已记账量）把新订单误认成历史订单。
+        {"sqlite_autoincrement": True},
     )
