@@ -3112,8 +3112,10 @@ class LiveEngine:
         """落一条汇总型决策事件（每会话每日最多一条，防 60s 轮询刷表）。
 
         逐票明细仍只走日志与 SSE risk；表里只有一条汇总（代码×数量清单在
-        message 里，截断到 200 字符与 _drain_decisions 口径一致）。写库失败
-        只记异常，不影响导入/交易主链路（观测链路）。
+        message 里）。**不做 200 字符截断**：该事件每会话每日一条，完整入库
+        才不会把结论句「请把代码加入对应组合股票池」切掉（2026-11-10 实证
+        9 只池外仓时 212 字符被切到「…请把」）。写库失败只记异常，不影响
+        导入/交易主链路（观测链路）。
         """
         today = now_shanghai().date()
         if self._out_of_pool_event_day == today:
@@ -3151,7 +3153,7 @@ class LiveEngine:
             "actual_value": None,
             "requested_qty": None,
             "final_qty": None,
-            "message": message[:200],
+            "message": message,
             "bar_time": None,
         }
         try:

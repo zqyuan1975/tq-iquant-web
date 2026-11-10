@@ -893,7 +893,7 @@ onUnmounted(closeEventStreams)
             <td>{{ fmtGateVal(d.param_value) }}</td>
             <td>{{ fmtGateVal(d.actual_value) }}</td>
             <td style="text-align:right">{{ qtyPair(d.requested_qty, d.final_qty) }}</td>
-            <td style="color:var(--ink-soft);white-space:normal;min-width:160px">{{ d.message || '—' }}</td>
+            <td style="color:var(--ink-soft);white-space:normal;min-width:160px" :title="d.message">{{ d.message || '—' }}</td>
           </tr>
         </tbody>
       </table>

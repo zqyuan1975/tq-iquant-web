@@ -434,6 +434,8 @@ describe('LiveSessions.vue 工作台(B4b)', () => {
     expect(w.text()).toContain('开仓资金不足1手')
     // 历史逐事件行
     expect(w.text()).toContain('000001.SZ')
+    // 原因列带 title，长文案可悬浮读全文
+    expect(w.findAll('td').map((td) => td.attributes('title'))).toContain('开仓资金不足1手')
 
     // SSE 实时 decision 事件插入
     const es = FakeEventSource.instances[0]
@@ -444,6 +446,18 @@ describe('LiveSessions.vue 工作台(B4b)', () => {
     await flushPromises()
     expect(w.text()).toContain('持股数达上限')
     expect(w.text()).toContain('600000.SH')
+
+    // >200 字符的池外清单：title 带完整原文（后端已不截断，前端不再二次裁剪）
+    const longMsg = '柜台持有但不在任何组合股票池：' +
+      Array.from({ length: 15 }, (_, i) => `00${2001 + i}.SZ×${100 * (i + 1)}`).join(', ') +
+      '。这些为外部持仓，不参与策略风控与槽位、平台不代卖（仅在持仓列表展示）；如需纳入策略管理，请把代码加入对应组合股票池。'
+    expect(longMsg.length).toBeGreaterThan(200)
+    es.emit('decision', { gate: 'out_of_pool_position', layer: 'live_gate', action: 'notice',
+      stock_code: null, strategy_id: null, param_name: 'out_of_pool_count',
+      param_value: 15, actual_value: null, requested_qty: null, final_qty: null,
+      message: longMsg })
+    await flushPromises()
+    expect(w.findAll('td').map((td) => td.attributes('title'))).toContain(longMsg)
     w.unmount()
   })
 

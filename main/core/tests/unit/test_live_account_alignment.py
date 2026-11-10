@@ -660,6 +660,39 @@ def test_out_of_pool_persists_one_summary_decision_event():
     assert decisions[0]["action"] == "notice"
 
 
+def test_out_of_pool_decision_message_not_truncated_over_200_chars():
+    """超长池外清单完整入库，结论句不被 200 字符切片截断。
+
+    2026-11-10 实证：会话 4 的 9 只池外仓完整文案 212 字符，旧实现
+    message[:200] 把结尾切成「…请把」，工作台看不到「加入股票池」指引。
+    """
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single()
+    engine = _mk_engine(_AcctDispatcher(positions=[]), factory, port,
+                        pool_codes_by_portfolio={1: {"600000.SH"}})
+    events = []
+    engine._emit = lambda et, p: events.append((et, p))
+    rows = [("00%04d.SZ" % (2001 + i), 100 * (i + 1)) for i in range(15)]
+    detail = ", ".join("%s×%d" % r for r in rows)
+    expected = ("柜台持有但不在任何组合股票池：%s。这些为外部持仓，"
+                "不参与策略风控与槽位、平台不代卖（仅在持仓列表展示）；"
+                "如需纳入策略管理，请把代码加入对应组合股票池。" % detail)
+    assert len(expected) > 200
+
+    with factory() as db:
+        engine._report_out_of_pool(db, rows)
+        db.commit()
+        ev = (db.query(LiveDecisionEvent)
+              .filter_by(live_session_id=1, gate="out_of_pool_position").one())
+
+    assert ev.message == expected                 # 完整原文入库，未截断
+    assert len(ev.message) > 200
+    assert ev.message.endswith("代码加入对应组合股票池。")
+    decisions = [p for et, p in events
+                 if et == "decision" and p.get("gate") == "out_of_pool_position"]
+    assert decisions and decisions[0]["message"] == expected
+
+
 def test_out_of_pool_decision_event_once_per_day():
     """同一会话同日重复上报（即使代码集合变了）也只落一条。"""
     factory, _ = _db_factory()
