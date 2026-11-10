@@ -128,6 +128,17 @@ def _defaults() -> dict:
         "database": {
             "sqlite_path": "data/dev.db",
         },
+        # 内嵌数据备份（core/services/backup_service.py，进程内 daemon 调度）。
+        # 每日 daily_at（Asia/Shanghai，默认 15:10 收盘后）用 VACUUM INTO 生成
+        # 一致性副本并执行一次 wal_checkpoint(TRUNCATE)；自动备份只保留最近 keep 份，
+        # 手动备份不参与自动清理；剩余空间低于 min_free_mb 跳过（不写坏库）。
+        "backup": {
+            "enabled": True,
+            "daily_at": "15:10",
+            "keep": 10,
+            "min_free_mb": 500,
+            "dir": "data/backup",
+        },
         "iquant_bridge": {
             "simulation": {"base_url": "http://127.0.0.1:8790"},
             "live": {"base_url": "http://127.0.0.1:8791"},

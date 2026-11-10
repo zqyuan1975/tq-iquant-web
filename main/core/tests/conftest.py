@@ -1,3 +1,9 @@
+import os
+
+# 测试环境禁用内嵌备份调度：集成测试用 `with TestClient(app)` 会触发 lifespan，
+# 否则 15:10 之后会真的 VACUUM 真实 dev.db 并写备份记录/文件（测试不应有副作用）。
+os.environ.setdefault("TQ_BACKUP_SCHEDULER_DISABLED", "1")
+
 import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker, Session

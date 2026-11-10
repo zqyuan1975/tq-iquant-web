@@ -22,6 +22,7 @@ from .live_trade import LiveTrade
 from .live_signal import LiveSignal
 from .live_account_snapshot import LiveAccountSnapshot, LiveAccountPositionSnapshot
 from .decision_event import BacktestDecisionEvent, LiveDecisionEvent
+from .data_backup import DataBackupRecord
 
 __all__ = [
     "Base",
@@ -50,4 +51,5 @@ __all__ = [
     "LiveAccountPositionSnapshot",
     "BacktestDecisionEvent",
     "LiveDecisionEvent",
+    "DataBackupRecord",
 ]

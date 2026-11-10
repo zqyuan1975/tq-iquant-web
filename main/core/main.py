@@ -2,6 +2,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from contextlib import asynccontextmanager
 import logging
+import os
 
 from core.db import init_db, SessionLocal
 from core.api.stock_pools import router as stock_pools_router
@@ -20,6 +21,7 @@ from core.services.live_service import (
     ENGINES, recover_stale_running_live_sessions,
 )
 from core.engine.live.engine_watchdog import EngineWatchdog
+from core.services.backup_service import BackupScheduler
 from core.services.auto_shutdown import arm as arm_auto_shutdown
 
 
@@ -64,7 +66,22 @@ async def lifespan(app: FastAPI):
     except Exception:  # noqa: BLE001 — 监控启动失败不得阻断主服务
         logger.exception("实盘引擎存活监控启动失败（主服务继续运行）")
         watchdog = None
+    # 内嵌数据备份调度（daemon 线程，每日 backup.daily_at 默认 15:10）：
+    # VACUUM INTO 一致性副本 + WAL 收敛；独立线程，不占用事件循环、不碰实盘锁。
+    backup_scheduler = None
+    if os.environ.get("TQ_BACKUP_SCHEDULER_DISABLED") == "1":
+        logger.info("数据备份调度已禁用（TQ_BACKUP_SCHEDULER_DISABLED=1）")
+    else:
+        try:
+            backup_scheduler = BackupScheduler()
+            backup_scheduler.start()
+            logger.info("数据备份调度已启动（进程内，每日定时）")
+        except Exception:  # noqa: BLE001 — 备份调度失败不得阻断交易主服务
+            logger.exception("数据备份调度启动失败（主服务继续运行）")
+            backup_scheduler = None
     yield
+    if backup_scheduler is not None:
+        backup_scheduler.stop()
     if watchdog is not None:
         watchdog.stop()
 
