@@ -32,16 +32,56 @@ import hashlib
 import logging
 import time
 from datetime import datetime
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from typing import Callable, Dict, Optional, Tuple
 
 import httpx
 
 from .event import OrderEvent, TradeEvent
 from .execution_engine import OrderDispatcher
+from .market_rules import _limit_ratio_for
+from ..config import load_config
 from tq_iquant_shared.constants import TradeType
 
 logger = logging.getLogger(__name__)
+
+
+def _resolve_timeout(explicit, config_key: str, default: float) -> float:
+    """超时解析：显式参数 > config.live.<config_key> > 默认（非法/<=0 回退默认）。
+
+    桥（QMT/掘金）单次请求会被桥内全局锁/GIL 排队，读超时贴太近（旧 10s）会把
+    正常慢应答误判成断链，进而误判通道异常。默认读超时 15s、连接 3s，均可经
+    config.live 调整（不改代码）。
+    """
+    def _valid(v) -> Optional[float]:
+        try:
+            f = float(v)
+        except (TypeError, ValueError):
+            return None
+        return f if f > 0 else None
+
+    if explicit is not None:
+        return _valid(explicit) or default
+    try:
+        cfg = load_config() or {}
+        live = cfg.get("live") if isinstance(cfg, dict) else None
+        value = live.get(config_key) if isinstance(live, dict) else None
+    except Exception:  # 配置读取/格式异常不得影响构造（回退默认）
+        return default
+    return _valid(value) or default
+
+
+def _positive_float(value) -> Optional[float]:
+    """正数价格 → float；None/0/负数/nan/不可解析 → None（桥缺字段的兜底口径）。"""
+    if value is None:
+        return None
+    try:
+        f = float(value)
+    except (TypeError, ValueError):
+        return None
+    if f != f or f <= 0:
+        return None
+    return f
 
 
 class BridgeUnavailableError(RuntimeError):
@@ -54,6 +94,15 @@ class BridgeOrderRejected(RuntimeError):
     与 BridgeUnavailableError 的区别：桥在线、正常受理请求，但业务上拒单
     （如 volume 超限、股票不在白名单、重复单）。上层据此标 rejected 并回显原因，
     而不是笼统的 "approval failed"。
+    """
+
+
+class BridgeOrderIdError(BridgeOrderRejected):
+    """确定性订单 ID / 认领键护栏失败（长度不足或 20 位 remark 撞单）。
+
+    继承 ``BridgeOrderRejected`` 是刻意的：引擎既有拒单路径（标 rejected +
+    决策事件 + SSE 回显 error_message）直接生效，不需要新增捕获分支。拒单原因
+    带「订单ID护栏」字样，与桥业务拒单（涨跌停/可用不足）可区分。
     """
 
 
@@ -122,21 +171,60 @@ class HttpBridgeDispatcher(OrderDispatcher):
     _TRANSIENT_ERROR_PREFIXES: Tuple[str, ...] = ("query_",)
     #: 「瞬时故障转在途」告警的同类节流窗口（秒）
     _transient_warn_interval: float = 60.0
+    #: 可下发给 QMT 桥的委托价格类型（桥侧映射 prType：opponent=14 对手价、
+    #: limit=11 限价、market_best5=42/47 五档即时成交剩余撤销，按代码后缀取）。
+    _PRICE_TYPE_VALUES = frozenset(("opponent", "limit", "market_best5"))
+
+    #: 柜台 m_strRemark 实测只回显 20 字符（给 21 字符只回 20）；桥侧
+    #: ``remark = oid[:20]``，Core 也按 20 位认领——**前 20 位就是认领键，必须唯一**。
+    #: **不改 ID 格式**：完整 oid 仍是 MD5 32 位（DB 存全量、按全量幂等），只护栏派生。
+    REMARK_MAX_LEN: int = 20
+    #: 认领键护栏的内存窗口（超出按插入序淘汰最旧；正常会话远达不到该量级）。
+    _CLAIM_KEY_CAP: int = 10000
+
+    #: 桥读/写/池超时默认（秒）：掘金桥实测 /ping 纯内存应答也要 5~8s（gm SDK
+    #: 主线程长持 GIL），旧 10s 贴太近会偶发误判断链。可被构造参数或
+    #: config.live.bridge_read_timeout_seconds 覆盖；通道级 request_timeout_seconds
+    #: （live_service 传入的 timeout）优先级最高。
+    DEFAULT_READ_TIMEOUT: float = 15.0
+    #: 建连超时默认（秒）：桥只在本机 loopback，建连正常毫秒级，不必等满读超时。
+    DEFAULT_CONNECT_TIMEOUT: float = 3.0
 
     def __init__(self, base_url: str = "http://127.0.0.1:8790",
-                 timeout: float = 10.0,
+                 timeout: Optional[float] = None,
+                 connect_timeout: Optional[float] = None,
                  slow_threshold: float = 15.0,
                  slow_warn_interval: float = 300.0,
                  on_slow: Optional[Callable[..., None]] = None,
                  now_fn: Optional[Callable[[], float]] = None,
                  client: Optional[httpx.Client] = None,
-                 channel: Optional[str] = None):
+                 channel: Optional[str] = None,
+                 price_type: Optional[str] = None):
         # channel 可按实例覆盖（掘金桥实例上报 goldminer_bridge，供引擎识别/
         # 错误文案分流；缺省保持 iquant_bridge 兼容旧用法）
         if channel:
             self.channel = channel
         self._base_url = base_url.rstrip("/")
-        self._client = client or httpx.Client(base_url=self._base_url, timeout=timeout)
+        # 超时按用途拆分：读/写/池走 read 超时（默认 15s），建连走 connect（默认
+        # 3s，且不超过 read）。所有端点（/order /orders /deals /positions
+        # /account /price_limit /cancel /quote）共用同一 client，一处生效。
+        self.timeout = _resolve_timeout(
+            timeout, "bridge_read_timeout_seconds", self.DEFAULT_READ_TIMEOUT)
+        self.connect_timeout = min(
+            _resolve_timeout(connect_timeout, "bridge_connect_timeout_seconds",
+                             self.DEFAULT_CONNECT_TIMEOUT),
+            self.timeout,
+        )
+        # 外部注入 client（测试 MockTransport 等）保持其自身配置，不覆盖。
+        self._client = client or httpx.Client(
+            base_url=self._base_url,
+            timeout=httpx.Timeout(
+                connect=self.connect_timeout,
+                read=self.timeout,
+                write=self.timeout,
+                pool=self.timeout,
+            ),
+        )
         # 最近一次 heartbeat 失败分类：refused=端口无监听 / timeout=已监听但无响应
         # / protocol=应答格式不符 / unreachable=其它网络错误。启动闸据此分级提示。
         self.last_probe_error: Optional[str] = None
@@ -164,13 +252,45 @@ class HttpBridgeDispatcher(OrderDispatcher):
         self.last_broker_order_id: Optional[str] = None
         # 最近一次 /order 业务拒单原文（ok:false 的 error/reason），供引擎直接落库回显
         self.last_order_rejection: Optional[str] = None
+        # 最近一次 /order 应答回显的「桥实际生效的委托价类型」（limit/opponent/
+        # market_best5；桥未回显 = None）。盘前竞价据此核对桥是否把 limit 回退成
+        # 对手价——回退意味着盘前算出的限价被丢弃，必须拦截而不是静默照报。
+        self.last_order_price_type: Optional[str] = None
         # 「瞬时故障转在途」告警节流水位：断连窗口内可能连续多单命中，同类告警
         # 每 _transient_warn_interval 秒只发一条（每单仍记 INFO 级别的 trail）。
         self._transient_warn_at: Optional[float] = None
+        # 撤单能力：新版本桥有 POST /cancel；老桥回 404 时置 False，调用方据此
+        # 按「通道不支持撤单」跳过（退回 180s 超时 expire 兜底，不刷失败告警）。
+        self.supports_cancel: bool = True
+        # 最近一次撤单结局（canceled / pending / not_found / rejected / failed）
+        self.last_cancel_result: Optional[str] = None
+        # 撤单返回 pending 时的有限复查（2026-11-10）：桥的 pending = 撤单请求已发出
+        # 但 ~0.9s 内未在 ORDER 表观测到终态，**不等于已撤**。复查 = 再发一次 POST
+        # /cancel（桥侧幂等，会重新读委托表确认），直到 canceled（真终态）或明确
+        # 失败；复查仍是 pending → 记「撤单未确认」，由调用方保留在途 + 超时兜底。
+        # 默认 2 次（1 次复查，最坏多等 ~2s/单；收盘清扫/多单撤单不会被拖太久），
+        # 仍未确认的由 cancel_unfilled_orders 下一轮（60s 节拍）继续重试。
+        # 间隔/次数可被调用方或测试覆盖。
+        self._cancel_recheck_attempts: int = 2
+        self._cancel_recheck_interval: float = 1.0
+        # 委托价格类型（None = 按通道解析）：仅 iquant_bridge 通道向桥下发该字段，
+        # 缺省 opponent（= 桥侧 prType 14 对手价，与改动前逐字一致）。掘金桥自身
+        # 已走限价，payload 不发该字段。显式参数 > config.iquant_bridge.price_type。
+        self._price_type_override = (price_type or "").strip().lower() or None
+        self._price_type_resolved: Optional[str] = None
+        self._price_type_loaded = False
+        # 认领键护栏：remark（oid 前 REMARK_MAX_LEN 位）-> 完整 oid。同键不同 oid
+        # 意味着柜台 remark 会把两笔单认成同一笔，必须拒绝下单而不是静默放过。
+        self._claim_keys: Dict[str, str] = {}
 
     @property
     def last_unconfirmed_message(self) -> Optional[str]:
         """最近一次「在途未确认」的可读原因（引擎回写 LiveOrder.error_message）。"""
+        return self._last_error
+
+    @property
+    def last_error(self) -> Optional[str]:
+        """最近一次失败原因（撤单等；daily_closer 等调用方只读回显）。"""
         return self._last_error
 
     # ---------------- 请求计时 ----------------
@@ -270,6 +390,8 @@ class HttpBridgeDispatcher(OrderDispatcher):
         """确定性订单 ID：同订单（含数量/价格）重试生成相同 ID，桥侧幂等去重。
 
         数量/价格必须参与：同策略/股票/信号但数量变化的重新触发是不同订单。
+        返回 MD5 32 位十六进制（DB 全量存、桥按全量去重）；写进柜台的认领键是
+        其前 ``REMARK_MAX_LEN``（20）位，由 :meth:`remark_of` 派生并校验。
         """
         key = "%s|%s|%s|%s|%s|%s|%s|%s" % (
             order.strategy_id, order.portfolio_id, order.stock_code,
@@ -280,27 +402,156 @@ class HttpBridgeDispatcher(OrderDispatcher):
             key += "|%s" % order.bar_time.isoformat()
         return hashlib.md5(key.encode("utf-8")).hexdigest()
 
-    def place_order(self, order: OrderEvent) -> Optional[TradeEvent]:
+    @classmethod
+    def remark_of(cls, oid: str) -> str:
+        """派生柜台 remark（认领键）：恒 ``REMARK_MAX_LEN`` 字符。
+
+        柜台 ``m_strRemark`` 实测只回显 20 字符（给 21 字符只回 20），桥侧与 Core
+        都按 20 位认领。护栏口径：
+        - oid 为空或不足 20 → 抛 :class:`BridgeOrderIdError`，**绝不生成短键**
+          （短键必然撞单认领错，且不会静默截断成短键）；
+        - oid 超过 20 → 取前 20 位（既有约定，不改 ID 格式）；唯一性由
+          :meth:`_reserve_claim_key` 在提交前校验。
+        """
+        if not oid or len(oid) < cls.REMARK_MAX_LEN:
+            logger.error(
+                "bridge order id too short for remark: %r (need >= %d chars)",
+                oid, cls.REMARK_MAX_LEN,
+            )
+            raise BridgeOrderIdError(
+                "订单ID护栏：确定性订单号长度 %d < 柜台备注上限 %d，"
+                "拒绝下单（避免 remark 撞单认领错误）"
+                % (len(oid or ""), cls.REMARK_MAX_LEN))
+        return oid[:cls.REMARK_MAX_LEN]
+
+    def _reserve_claim_key(self, claim: str, oid: str) -> None:
+        """认领键唯一性护栏：同一 20 位 remark 不得指向两笔不同单。
+
+        - 同一 oid 重复提交（引擎重试 / 桥按 order_id 去重）→ 放行；
+        - 同 claim 但不同 oid → 记 ERROR 并抛 :class:`BridgeOrderIdError`
+          **拒绝下单**。不重新生成：确定性 ID 重生成会破坏幂等（同单重试被当成
+          新单）且让在途单认领失效；出现撞键说明生成规则退化，必须人工修规则。
+        """
+        prev = self._claim_keys.get(claim)
+        if prev is not None and prev != oid:
+            logger.error(
+                "bridge remark collision: claim=%r existing oid=%s new oid=%s "
+                "(first %d chars must be unique) — refuse order",
+                claim, prev, oid, self.REMARK_MAX_LEN,
+            )
+            raise BridgeOrderIdError(
+                "订单ID护栏：remark %r 已归属另一笔订单（%s），新单 %s 拒绝下单"
+                "（前 %d 位必须唯一，否则柜台认领会串单）"
+                % (claim, prev, oid, self.REMARK_MAX_LEN))
+        self._claim_keys[claim] = oid
+        if len(self._claim_keys) > self._CLAIM_KEY_CAP:
+            self._claim_keys.pop(next(iter(self._claim_keys)))
+
+    def resolved_price_type(self) -> Optional[str]:
+        """本通道 /order 实际下发的 price_type；None = 不发该字段（老行为）。
+
+        解析顺序：构造参数显式值 > ``config.iquant_bridge.price_type`` > ``opponent``。
+        仅 ``channel == "iquant_bridge"`` 才下发：掘金桥自身已走限价，TDX/THS 不走
+        HTTP 桥，给它们塞字段只会让 payload 产生无意义变化。结果缓存，避免每单读 yaml。
+
+        语义定位（不是通用滑点保护）：``limit`` 是把「价格由平台决定」这件事复制到
+        QMT——TDX 早已按 ``PRICE_MY`` 下发并在提交前做 OCR 价格比对，掘金桥限价原样
+        下发，同花顺现网 ``latest`` 模式根本不键入价格（±让价空转）。QMT 桥只有在
+        ``limit`` 下才与它们同口径：审批价原样进 passorder，桥侧不做任何改写/跟价。
+        """
+        if self._price_type_loaded:
+            return self._price_type_resolved
+        self._price_type_loaded = True
+        if self.channel != "iquant_bridge":
+            return None
+        raw = self._price_type_override
+        if raw is None:
+            try:
+                cfg = load_config().get("iquant_bridge") or {}
+                raw = str(cfg.get("price_type") or "").strip().lower() or None
+            except Exception:  # noqa: BLE001 配置不可读 -> 退回缺省语义
+                logger.warning("read iquant_bridge.price_type failed", exc_info=True)
+                raw = None
+        if raw is None:
+            raw = "opponent"
+        if raw not in self._PRICE_TYPE_VALUES:
+            logger.warning(
+                "未知 iquant_bridge.price_type=%r，回退 opponent（对手价）", raw)
+            raw = "opponent"
+        self._price_type_resolved = raw
+        return raw
+
+    def supports_price_type(self, price_type: str = "limit") -> Optional[bool]:
+        """桥进程是否确认支持指定价（``price_type=<price_type>``）。
+
+        判据只看 ``GET /ping`` 的自我声明，不额外探测 /order（探测单在未升级的桥
+        上会变成真实委托）：
+
+        1. 新桥若在 /ping 里给出 ``price_types`` 列表（未来扩展），直接查表；
+        2. 否则看 ``endpoints`` 是否含 ``/price_limit``：该端点与 ``price_type``
+           同一批引入（未升级版桥的 endpoints 里没有它），可视为「已加载支持
+           price_type 的桥代码」的指纹。
+
+        返回 ``True`` = 确认支持；``False`` = 桥自述里明确没有该能力（未升级）；
+        ``None`` = 判不出（桥不可达 / 应答没有 endpoints / 非桥协议）——调用方
+        必须按「不支持」fail-closed 处理，绝不静默退回对手价。
+        """
+        wanted = str(price_type or "").strip().lower()
+        try:
+            r = self._do_request("GET", "/ping")
+        except Exception:  # noqa: BLE001 探测失败 -> 判不出
+            return None
+        if r.status_code != 200:
+            return None
+        try:
+            body = r.json()
+        except Exception:  # noqa: BLE001
+            return None
+        if not isinstance(body, dict) or body.get("ok") is False:
+            return None
+        declared = body.get("price_types")
+        if isinstance(declared, list):
+            names = [str(x).strip().lower() for x in declared]
+            return wanted in names
+        endpoints = body.get("endpoints")
+        if not isinstance(endpoints, list):
+            return None
+        return "/price_limit" in [str(e).strip() for e in endpoints]
+
+    def place_order(self, order: OrderEvent,
+                    price_type: Optional[str] = None) -> Optional[TradeEvent]:
+        """下单。price_type 非空时按单覆盖配置（盘前集合竞价传 "limit"）。"""
         oid = self.order_id(order)
         self.last_unconfirmed_order_id = None
         self._last_error = None
         self.last_broker_order_id = None
         self.last_order_rejection = None
+        self.last_order_price_type = None
+        # 认领键护栏：派生 20 位 remark 并做在途唯一性校验（不足 20 位或撞键
+        # → BridgeOrderIdError 拒绝下单，绝不静默截断/放过）。保持既有 ID 格式。
+        claim = self.remark_of(oid)
+        self._reserve_claim_key(claim, oid)
         payload = {
             "order_id": oid,
             "code": order.stock_code,
             "op": "buy" if order.trade_type.value == "BUY" else "sell",
             "volume": order.quantity,
             "price": float(order.price) if order.price is not None else 0,
-            # prType=14 对手价:BUY 取卖1价、SELL 取买1价报限价单 -> 立即成交。
-            # 桥 _do_place 据此调 passorder(op, 1101, acct, code, 14, 0, vol, ...)。
-            # price 对 prType!=11 无效,传 close 仅作记录/切片5 回填参考。
+            # pr_type=14 是桥的历史缺省（对手价：BUY 取卖1 / SELL 取买1，price 被
+            # 忽略）。保留该字段只为兼容未升级的老桥——新桥以 price_type 为准。
+            # price_type=limit 时 price（=审批价）由桥原样下发，桥内不改写/不跟价。
             "pr_type": 14,
-            # remark = oid 前 20 位:桥作为 passorder 的 userOrderId 写入委托/成交的
-            # m_strRemark，回填时 Core 按 remark 精确认领本单（见 LiveEngine._try_match_order_ref），
-            # 避免 代码+方向+数量 模糊匹配撞到跨会话遗留的同代码同向同量旧单。
-            "remark": oid[:20],
+            # remark（= oid 前 20 位，由 remark_of 统一派生）:桥作为 passorder 的
+            # userOrderId 写入委托/成交的 m_strRemark，回填时 Core 按 remark 精确
+            # 认领本单（见 LiveEngine._try_match_order_ref），避免 代码+方向+数量
+            # 模糊匹配撞到跨会话遗留的同代码同向同量旧单。
+            "remark": claim,
         }
+        # 按单覆盖优先（盘前单显式 limit：prType=11、审批价原样下发），否则用
+        # 配置解析值（盘中默认 opponent→prType=14，与既有行为一致）。
+        effective_price_type = price_type or self.resolved_price_type()
+        if effective_price_type:
+            payload["price_type"] = effective_price_type
         try:
             r = self._do_request("POST", "/order", json=payload)
         except self._INFLIGHT_ERRORS as e:
@@ -334,6 +585,10 @@ class HttpBridgeDispatcher(OrderDispatcher):
                 "bridge /order returned non-JSON body, treated as rejection: %s", e
             )
             data = {}
+        # 桥实际生效的委托价类型（新桥每笔应答都回显；老桥没有该字段 -> None）。
+        # 盘前竞价据此发现「请求 limit 但桥回退成 opponent」——价格已不在平台手里。
+        echo = str(data.get("price_type") or "").strip().lower()
+        self.last_order_price_type = echo or None
         if not data.get("ok"):
             # 桥业务拒绝（白名单/限额/重复/废单）→ 抛 BridgeOrderRejected，上层回显真实原因。
             # 拒单原文可能在 error / reason / rejected=true 的 message 上（掘金桥实测
@@ -580,12 +835,243 @@ class HttpBridgeDispatcher(OrderDispatcher):
 
     # ---------------- 查询 ----------------
     def check_price_limit(self, stock_code: str, direction: str, price) -> Optional[str]:
-        """涨跌停前置校验：桥通道暂无涨跌停校验，恒放行（返回 None）。
+        """涨跌停前置校验：取桥的 GET /price_limit（前收 + 涨跌停价）本地判定。
 
-        引擎按 price_limit_check_enabled 配置统一调用，三通道（iquant/tdx/ths）
-        同签名同语义；QMT 桥无前收/涨跌停数据源，fail-open 放行。
+        口径与 TDX/THS 通道一致：买 ≥ 涨停价 / 卖 ≤ 跌停价 → 返回拒绝原因文案，
+        通过/跳过返回 None。桥同时给了交易所涨跌停价时直接用（ST/新股等特例最
+        准）；只给前收时按 `_limit_ratio_for` 推出涨跌停价（前收取整到分）。
+
+        **fail-open**（默认放行，校验故障绝不阻断下单）：
+          - 桥离线 / 超时 / 非 200（含老版本桥无该端点的 404）
+          - 应答 ok:false 或既无涨跌停价也无有效前收（<1 元，前复权早期失真）
+          - 市价单（price 空/非正，成交价由交易所决定）
         """
-        return None
+        if price is None:
+            return None
+        try:
+            order_price = Decimal(str(price))
+        except (TypeError, ValueError, InvalidOperation):
+            return None
+        if order_price <= 0:
+            return None
+        try:
+            # 用通道解析后的读超时（与 /orders /deals 同一口径）：掘金桥首字节实测
+            # 8~13s，旧的硬编码 3.0s 必然超时，会让涨跌停校验事实上常闭并误报桥异常。
+            r = self._do_request(
+                "GET", "/price_limit?code=%s" % stock_code, timeout=self.timeout
+            )
+            if r.status_code != 200:
+                # 老桥没有 /price_limit（404）属预期，按「无数据」放行，不打 warning
+                logger.debug(
+                    "bridge /price_limit unavailable (HTTP %s) for %s, skip check",
+                    r.status_code, stock_code,
+                )
+                return None
+            body = r.json() or {}
+            if not isinstance(body, dict) or not body.get("ok"):
+                return None
+            data = body.get("data") or {}
+            if not isinstance(data, dict):
+                return None
+            prev_close = _positive_float(data.get("pre_close"))
+            limit_up = _positive_float(data.get("up_limit"))
+            limit_down = _positive_float(data.get("down_limit"))
+            cent = Decimal("0.01")
+            ratio = _limit_ratio_for(stock_code)
+            if limit_up is None or limit_down is None:
+                if prev_close is None or prev_close < 1:
+                    return None
+                pc = Decimal(str(prev_close))
+                if limit_up is None:
+                    limit_up = float(
+                        (pc * (1 + ratio)).quantize(cent, rounding=ROUND_HALF_UP)
+                    )
+                if limit_down is None:
+                    limit_down = float(
+                        (pc * (1 - ratio)).quantize(cent, rounding=ROUND_HALF_UP)
+                    )
+            base = ("前收 %s" % prev_close) if prev_close is not None else "桥内涨跌停价"
+            if direction == "buy" and order_price >= Decimal(str(limit_up)):
+                return ("委托买价 %s ≥ 涨停价 %s（%s），已拦截"
+                        % (price, limit_up, base))
+            if direction == "sell" and order_price <= Decimal(str(limit_down)):
+                return ("委托卖价 %s ≤ 跌停价 %s（%s），已拦截"
+                        % (price, limit_down, base))
+            return None
+        except Exception as e:  # noqa: BLE001
+            logger.warning("涨跌停前置校验异常，跳过检查继续下单：%s", e)
+            return None
+
+    def price_limit_bounds(self, stock_code: str):
+        """当日涨跌停价 ``(prev_close, up_limit, down_limit)``；无数据 → None。
+
+        盘前集合竞价定价用（live_engine 的 pre_open_auction 路径），口径与
+        ``check_price_limit`` 完全一致：桥给涨跌停价直接用，只给前收则按
+        ``_limit_ratio_for`` 推出（前收取整到分）。**fail-open**：桥离线/超时/
+        非 200（含老桥 404）/ok:false/无有效前收 → None，调用方按「不夹价」处理。
+        """
+        try:
+            # 同上：用通道读超时，不用硬编码 3.0s（掘金桥首字节 8~13s）。
+            r = self._do_request(
+                "GET", "/price_limit?code=%s" % stock_code, timeout=self.timeout
+            )
+            if r.status_code != 200:
+                logger.debug(
+                    "bridge /price_limit unavailable (HTTP %s) for %s, no bounds",
+                    r.status_code, stock_code,
+                )
+                return None
+            body = r.json() or {}
+            if not isinstance(body, dict) or not body.get("ok"):
+                return None
+            data = body.get("data") or {}
+            if not isinstance(data, dict):
+                return None
+            prev_close = _positive_float(data.get("pre_close"))
+            limit_up = _positive_float(data.get("up_limit"))
+            limit_down = _positive_float(data.get("down_limit"))
+            if limit_up is None or limit_down is None:
+                if prev_close is None or prev_close < 1:
+                    return None
+                pc = Decimal(str(prev_close))
+                cent = Decimal("0.01")
+                ratio = _limit_ratio_for(stock_code)
+                if limit_up is None:
+                    limit_up = float(
+                        (pc * (1 + ratio)).quantize(cent, rounding=ROUND_HALF_UP)
+                    )
+                if limit_down is None:
+                    limit_down = float(
+                        (pc * (1 - ratio)).quantize(cent, rounding=ROUND_HALF_UP)
+                    )
+            return prev_close, limit_up, limit_down
+        except Exception as e:  # noqa: BLE001
+            logger.warning("涨跌停取价异常，按无数据放行：%s", e)
+            return None
+
+    def cancel_order(self, order_ref: str, stock_code: str = "") -> bool:
+        """撤单（按柜台委托号撤单；QMT=order_ref / 掘金=cl_ord_id，同一字段值）。
+
+        True  = 已确认撤销（result=canceled，或桥 ok:true 受理且无 result）；
+        False = 明确未撤成功（不存在 / 已成交 / 柜台拒撤 / 桥不可用 / 老桥无端点），
+                **或**桥只回 pending 且有限复查后仍未确认（``last_cancel_result``
+                此时为 "pending"，调用方应记「撤单未确认」并保留在途，绝不当已撤）。
+
+        pending 复查（2026-11-10）：桥的 pending 只表示撤单请求已在柜台发出、短窗口内
+        未观测到终态，实际可能仍在撮合。直接当成功会让在途单一直占门且永不收口。
+        这里按 ``_cancel_recheck_attempts`` × ``_cancel_recheck_interval`` 重新 POST
+        /cancel（桥侧幂等，会重读 ORDER 表确认），一旦拿到 canceled 即真终态；仍是
+        pending 就返回 False 并留 ``last_cancel_result="pending"`` 给调用方判「未确认」。
+
+        老版本桥没有 POST /cancel（HTTP 404）→ 置 ``supports_cancel=False`` 并返回
+        False 一次；后续调用方（order_machine / daily_closer / live_engine 停止撤单）
+        据该标记按「通道不支持撤单」跳过，行为退回改前的 180s 超时 expire 兜底。
+        """
+        self._last_error = None
+        self.last_cancel_result = None
+        ref = str(order_ref or "").strip()
+        if not ref:
+            self._last_error = "撤单缺少委托编号（order_ref）"
+            return False
+        attempts = max(1, int(getattr(self, "_cancel_recheck_attempts", 3) or 1))
+        for attempt in range(attempts):
+            outcome = self._cancel_attempt(ref, stock_code)
+            if outcome != "pending":
+                return outcome in ("canceled", "accepted")
+            if attempt + 1 < attempts:
+                interval = float(getattr(self, "_cancel_recheck_interval", 1.0) or 0.0)
+                if interval > 0:
+                    time.sleep(interval)
+                logger.info(
+                    "bridge cancel pending, recheck %d/%d ref=%s",
+                    attempt + 1, attempts, ref,
+                )
+        # 复查仍 pending：撤单未确认。绝不判已撤——订单由调用方保持 submitted，
+        # 等委托表终态（53/54）或超时兜底收敛；工作台可见「撤单未确认」。
+        self.last_cancel_result = "pending"
+        self._last_error = (
+            "撤单未确认：桥返回 pending，复查 %d 次仍未观察到终态，"
+            "该单可能仍在柜台撮合（未撤销），请人工核对" % attempts
+        )
+        logger.warning(
+            "bridge cancel unconfirmed after %d rechecks: ref=%s — keep order "
+            "in-flight (NOT canceled)", attempts, ref,
+        )
+        return False
+
+    def _cancel_attempt(self, ref: str, stock_code: str) -> str:
+        """单次撤单请求，返回 canceled / accepted / pending / not_found / rejected / failed。
+
+        accepted = 桥 ok:true 且未给 result（受理）；其余原样透传桥的 data.result，
+        传输层问题（无响应/非 JSON/404/HTTP 非 200）统一归 failed。
+        """
+        payload = {"order_ref": ref, "cl_ord_id": ref, "code": stock_code or ""}
+        try:
+            r = self._do_request("POST", "/cancel", json=payload)
+        except self._INFLIGHT_ERRORS as e:
+            self._last_error = ("撤单请求已发出但未获响应（%s: %s）"
+                                % (type(e).__name__, e))
+            logger.warning(
+                "bridge /cancel no response (%s: %s) ref=%s",
+                type(e).__name__, e, ref,
+            )
+            return "failed"
+        except Exception as e:  # noqa: BLE001
+            self._last_error = "撤单请求失败：%s" % e
+            logger.warning("bridge /cancel failed ref=%s: %s", ref, e)
+            return "failed"
+        if r.status_code == 404:
+            self.supports_cancel = False
+            self._last_error = "桥不支持撤单（端点 /cancel 不存在，老版本桥）"
+            logger.warning(
+                "bridge /cancel not available (HTTP 404) — 该通道按「不支持撤单」"
+                "处理，超时在途单退回 180s expire 兜底（柜台可能仍挂单，需人工确认）"
+            )
+            return "failed"
+        if r.status_code != 200:
+            self._last_error = "撤单返回 HTTP %s" % r.status_code
+            logger.warning("bridge cancel failed: HTTP %s ref=%s", r.status_code, ref)
+            return "failed"
+        try:
+            body = r.json() or {}
+        except Exception as e:  # noqa: BLE001
+            self._last_error = "撤单返回非 JSON：%s" % e
+            logger.warning("bridge /cancel non-JSON body ref=%s: %s", ref, e)
+            return "failed"
+        if not isinstance(body, dict):
+            self._last_error = "撤单返回格式非对象：%s" % self._short_body(body)
+            logger.warning("bridge /cancel bad body ref=%s: %s", ref, self._short_body(body))
+            return "failed"
+        data = body.get("data") if isinstance(body.get("data"), dict) else {}
+        result = str(data.get("result") or "")
+        self.last_cancel_result = result or None
+        if result == "pending":
+            # 不论 ok:true（桥对 pending 回 ok:true）：pending 不是终态，交调用方复查
+            return "pending"
+        if result in ("not_found", "rejected", "failed"):
+            self._last_error = str(
+                body.get("error") or body.get("reason")
+                or "桥撤单失败（%s）" % result
+            )
+            logger.warning(
+                "bridge cancel rejected: ref=%s result=%s error=%s",
+                ref, result, self._last_error,
+            )
+            return result
+        if body.get("ok") or result == "canceled":
+            # 已处于撤销态（result=canceled 但 ok:false）按幂等成功处理
+            self.supports_cancel = True
+            self.last_cancel_result = result or "accepted"
+            return "canceled" if result == "canceled" else "accepted"
+        self._last_error = str(
+            body.get("error") or body.get("reason")
+            or "桥撤单失败（%s）" % (result or "unknown")
+        )
+        logger.warning(
+            "bridge cancel rejected: ref=%s result=%s error=%s",
+            ref, result or "-", self._last_error,
+        )
+        return "failed"
 
     def _get_json(self, path: str) -> list:
         try:
