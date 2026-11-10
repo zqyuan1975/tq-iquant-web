@@ -439,10 +439,10 @@ def test_make_dispatcher_iquant_reads_timeouts_from_config(monkeypatch):
     assert seen["slow_threshold"] == 6.0
     assert seen["slow_warn_interval"] == 120.0
 
-    # 未配置 → 默认（本机 loopback 桥：10s 超时 / 5s 慢阈值 / 300s 冷却窗）
+    # 未配置 → 默认（本机 loopback 桥：15s 读超时 / 5s 慢阈值 / 300s 冷却窗）
     monkeypatch.setattr(svc, "load_config", lambda: _cfg(False))
     svc.make_dispatcher("iquant", "simulation")
-    assert seen["timeout"] == 10.0
+    assert seen["timeout"] == 15.0
     assert seen["slow_threshold"] == 5.0
     assert seen["slow_warn_interval"] == 300.0
 
@@ -629,6 +629,39 @@ def test_create_session_empty_signal_file_path_becomes_none(db_session):
     assert row2.signal_file_path is None
 
 
+# ---------------- 14:50 提前收盘价：advance_close_* 会话配置（功能二） ----------------
+
+def test_create_session_persists_advance_close(db_session):
+    """create_session 透传提前收盘价开关/时点；get/list 序列化可见。"""
+    data = svc.create_session(
+        db_session, {"name": "adv", "engine": "tdx",
+                     "advance_close_enabled": True,
+                     "advance_close_time": "14:55"}, "simulation")
+    row = db_session.query(svc.LiveSession).filter_by(id=data["id"]).first()
+    assert row.advance_close_enabled is True
+    assert row.advance_close_time == "14:55"
+    detail = svc.get_session(db_session, data["id"])
+    assert detail["advance_close_enabled"] is True
+    assert detail["advance_close_time"] == "14:55"
+    assert detail["advance_close_done_date"] is None
+    listed = svc.list_sessions(db_session)
+    assert listed[0]["advance_close_enabled"] is True
+
+
+def test_create_session_advance_close_defaults_and_clamp(db_session):
+    """缺省 → 关 + 14:51；时点越界（早于 14:51 / 晚于 14:59）回退 14:51。"""
+    data = svc.create_session(
+        db_session, {"name": "adv2", "engine": "tdx"}, "simulation")
+    row = db_session.query(svc.LiveSession).filter_by(id=data["id"]).first()
+    assert row.advance_close_enabled is False
+    assert row.advance_close_time == "14:51"
+    data2 = svc.create_session(
+        db_session, {"name": "adv3", "engine": "tdx",
+                     "advance_close_time": "09:35"}, "simulation")
+    row2 = db_session.query(svc.LiveSession).filter_by(id=data2["id"]).first()
+    assert row2.advance_close_time == "14:51"
+
+
 # ---------------- A-6：create_session 默认引擎（tq_trade.default_engine 覆盖） ----------------
 
 def test_default_engine_prefers_tq_trade_override(monkeypatch):
@@ -662,6 +695,22 @@ def test_bridge_probe_message_three_tiers():
     assert "应答格式不符" in protocol
     # 未知原因兜底仍给出 URL，不丢上下文
     assert url in svc.bridge_probe_message("goldminer_bridge", "unreachable", url)
+
+
+def test_live_sell_scope_default_full_and_invalid_fallback(monkeypatch):
+    """卖出范围口径：缺键/非法 → full（旧行为）；platform_only 透传。"""
+    monkeypatch.setattr(svc, "load_config", lambda: _cfg(False))
+    assert svc.live_sell_scope() == "full"
+    monkeypatch.setattr(
+        svc, "load_config", lambda: _cfg(False, tq_trade={"live_sell_scope": ""}))
+    assert svc.live_sell_scope() == "full"
+    monkeypatch.setattr(
+        svc, "load_config", lambda: _cfg(False, tq_trade={"live_sell_scope": "xyz"}))
+    assert svc.live_sell_scope() == "full"
+    monkeypatch.setattr(
+        svc, "load_config",
+        lambda: _cfg(False, tq_trade={"live_sell_scope": "platform_only"}))
+    assert svc.live_sell_scope() == "platform_only"
 
 
 def test_default_engine_empty_or_invalid_falls_back_to_legacy(monkeypatch):
@@ -737,3 +786,29 @@ def test_make_dispatcher_ths_passes_file_mode_params(monkeypatch):
     assert seen["execute_interval_seconds"] == 5
     assert seen["work_dir"] == "data/ths"
     assert seen["session_id"] == 7
+
+
+def test_position_cost_negative_cost_not_faked_with_price():
+    """B5：柜台成本为负/0（送转分红后常见）→ 成本未知(0)，不得用 市值÷数量 冒充现价。
+
+    旧实现回退成现价：盈亏恒 0、风控形同失效，且成本随价格每轮漂移。
+    """
+    from decimal import Decimal
+    from core.engine.live_engine import _position_cost
+    assert _position_cost({"cost": -475.0, "market_value": 727.0}, 20) == 0
+    assert _position_cost({"cost": 0, "market_value": 727.0}, 20) == 0
+    # 字段缺失（旧桥/通道不给 cost）仍保留市值÷股数估值兜底
+    assert _position_cost({"market_value": 727.0}, 20) == Decimal("36.35")
+    assert _position_cost({"cost": 36.43}, 20) == Decimal("36.43")
+
+
+def test_mirror_bridge_clears_stale_cost_when_unknown():
+    """B5：镜面覆盖拿到未知成本时清回 0（未知标记），不留上一轮旧成本。"""
+    from decimal import Decimal
+    from datetime import date
+    from core.engine.position import Position
+    pos = Position("300413.SZ")
+    pos.quantity = 20
+    pos.avg_cost = Decimal("36.43")
+    pos.mirror_bridge(20, 20, Decimal("0"), date(2026, 11, 10))
+    assert pos.avg_cost == 0

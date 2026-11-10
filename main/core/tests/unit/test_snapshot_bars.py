@@ -65,6 +65,21 @@ def test_minute_rollover_completes_bar_ohlc_volume_delta():
     assert b["volume"] == 200                   # 1200 - 1000（10.2/1600 归下一分钟）
 
 
+def test_open_at_reads_forming_and_completed_by_minute_end_label():
+    """B 执行价：open_at(start) 取 start+1min 标签 bar 的 open（forming/completed 均可）。"""
+    s = _mk({"000001.SZ": {"Now": "10.0", "Volume": "1000"}})
+    s.sample(datetime(2026, 11, 3, 14, 52, 5))
+    # 14:52 分钟 bar 仍在 forming（label=14:53:00）→ 可取 open
+    assert s.open_at(["000001.SZ"], datetime(2026, 11, 3, 14, 52)) == {
+        "000001.SZ": pytest.approx(10.0)}
+    # 14:51 起始 bar 从未采样 → 取不到（调用方 fail-closed）
+    assert s.open_at(["000001.SZ"], datetime(2026, 11, 3, 14, 51)) == {}
+    # 跨到 14:53 后该 bar 移入 completed，open 不变
+    s.sample(datetime(2026, 11, 3, 14, 53, 1))
+    assert s.open_at(["000001.SZ"], datetime(2026, 11, 3, 14, 52)) == {
+        "000001.SZ": pytest.approx(10.0)}
+
+
 def test_zero_volume_minute_still_produces_bar():
     s = _mk({"000001.SZ": {"Now": "10.0", "Volume": "1000"}})
     s.sample(datetime(2026, 11, 3, 10, 50, 30))
@@ -81,6 +96,31 @@ def test_volume_decrease_clamped_to_zero():
     s._test_snaps["000001.SZ"] = {"Now": "10.1", "Volume": "900"}   # 异常回退
     s.sample(datetime(2026, 11, 3, 10, 51, 10))
     assert s.completed_bars(["000001.SZ"])["000001.SZ"][0]["volume"] == 0
+
+
+def test_volume_none_midway_does_not_break_other_codes():
+    """P1（2026-11-09）：单只 Volume 由数值变 None 不得抛 TypeError 中断整轮采样。
+
+    旧实现 int(None - last) 抛错 → for 循环中断，其后股票本分钟全部丢样本
+    （极端情况整日无完成 bar → deferred 永远不放行）。
+    """
+    s = _mk({"000001.SZ": {"Now": "10.0", "Volume": "1000"},
+             "600000.SH": {"Now": "20.0", "Volume": "2000"}},
+            codes=("000001.SZ", "600000.SH"))
+    s.sample(datetime(2026, 11, 3, 10, 50, 30))
+
+    s._test_snaps["000001.SZ"] = {"Now": "10.1", "Volume": None}
+    s._test_snaps["600000.SH"] = {"Now": "20.5", "Volume": "2300"}
+    s.sample(datetime(2026, 11, 3, 10, 50, 40))          # 不得抛异常
+    s.sample(datetime(2026, 11, 3, 10, 51, 10))          # 跨分钟 → 两根都完成
+
+    bars = s.completed_bars(["000001.SZ", "600000.SH"])
+    assert len(bars["600000.SH"]) == 1                   # 其它股票照常采样
+    assert bars["600000.SH"][0]["volume"] == 300
+    assert bars["600000.SH"][0]["close"] == pytest.approx(20.5)
+    assert len(bars["000001.SZ"]) == 1                   # 量缺失只 clamp 到 0
+    assert bars["000001.SZ"][0]["volume"] == 0
+    assert bars["000001.SZ"][0]["close"] == pytest.approx(10.1)
 
 
 def test_fetch_failure_keeps_state_and_rollover():

@@ -79,6 +79,23 @@ def test_provider_returns_empty_fail_open_on_weekday():
     assert cal.is_trading_day(date(2026, 8, 22)) is False
 
 
+def test_last_trading_day_of_week_and_month():
+    """周期末识别：周线认本周最后一个交易日、月线认本月最后一个交易日。"""
+    # 覆盖 08-24..08-31；集合内 08-28（周五）休市、08-31（周一）为 8 月最后交易日
+    cal = TradingCalendar(_provider([
+        date(2026, 8, 24), date(2026, 8, 26),
+        date(2026, 8, 27), date(2026, 8, 31),
+    ]))
+    # 周五休市 → 08-27（周四）成为本周最后一个交易日
+    assert cal.is_last_trading_day_of_week(date(2026, 8, 27)) is True
+    assert cal.is_last_trading_day_of_week(date(2026, 8, 26)) is False
+    # 月末：08-31 是 8 月最后一个交易日；08-27 不是
+    assert cal.is_last_trading_day_of_month(date(2026, 8, 31)) is True
+    assert cal.is_last_trading_day_of_month(date(2026, 8, 27)) is False
+    # 非交易日直接返回 False（不会把周末当周期末）
+    assert cal.is_last_trading_day_of_week(date(2026, 8, 29)) is False
+
+
 def test_calendar_caches_per_year_single_provider_call():
     """同一自然年只拉一次日历（缓存）。"""
     calls = {"n": 0}

@@ -267,6 +267,23 @@ def test_confirm_never_clicks_old_row_when_new_row_not_rendered(
     assert "stale_matching_rows=1" in dumps[0].read_text(encoding="utf-8")
 
 
+def test_confirm_reports_leftover_row_without_clicking(monkeypatch, tmp_path, caplog):
+    """未点击即失败：只告警并记录候选行内容（代码/方向/数量/价格/行时间），
+    绝不自动点『取消』——匹配失败时无法确定哪一行属于本单。"""
+    # 同代码/同量/同价，但行时间 09:35 远早于下单时间 14:52:42 → 不匹配、不点击
+    rows = _rows(_row_words("0020S6", "300", "09", "35", "00", 220))
+    c, clicks = _fake_confirmer(monkeypatch, rows, dump_dir=str(tmp_path))
+    with caplog.at_level("WARNING", logger="core.engine.live.tdx_signal_confirm"):
+        out = c.confirm(SPEC, is_submitted=lambda: False,
+                        deadline=_time.time() + 0.3, baseline=())
+    assert out.ok is False
+    assert out.clicks == 0
+    assert clicks == []                     # 含『取消』在内一次都没点
+    assert "未发送行" in out.detail
+    text = caplog.text
+    assert "002056" in text and "300@17.05" in text and "09:35:00" in text
+
+
 # ------------------------------------------------ 跨引擎 UI 互斥（2026-11-06 P1）
 
 
@@ -302,3 +319,83 @@ def test_confirm_retries_when_ui_lock_busy(monkeypatch, tmp_path):
     assert out.clicks == 0
     assert len(clicks) >= 2, "锁忙应重试，而不是一次就放弃"
     assert "互斥" in out.detail
+
+
+# ---------------------------------------------------------------- 真机回归（2026-11-10）
+
+
+def _incident_row_20261110(*, with_code=True):
+    """真机 2026-11-10 09:31:46 落盘的 OCR 行（logs/tdx_confirm/...001311.../ocr_rows.txt）。
+
+    关键缺陷形态：代码列被拆成「001 | 31 | 1」、方向列整个漏识别、价格拆成
+    「1 | 4 | · | 95」——单格 code 判 "" 导致 ``_match_row`` 判「无本单行」放弃，
+    委托行滞留在「交易信号」窗口未发送。with_code=False 时连代码碎片也没有
+    （走「时间+价格+数量唯一命中」降级路径）。
+    """
+    y = 60.0
+    words = [
+        ("0", 30, y, 8, 11),
+        ("09", 70, y, 18, 11), ("：", 88, y, 3, 11),
+        ("31", 91, y, 18, 11), ("：", 109, y, 3, 11),
+        ("37", 112, y, 18, 11),
+        ("28S00208", 160, y, 70, 11),
+    ]
+    if with_code:
+        words += [("001", 402, y, 18, 11), ("31", 421, y, 18, 11),
+                  ("1", 441, y, 6, 11)]
+    words += [
+        ("多", 470, y, 14, 11), ("利", 484, y, 14, 11),
+        ("科", 498, y, 14, 11), ("技", 512, y, 14, 11),
+        # 间距 > 8px 会让 _row_text 插空格 → 正则只能读到 4·95
+        ("1", 620, y, 6, 11), ("4", 640, y, 6, 11),
+        ("·", 654, y, 4, 11), ("95", 664, y, 12, 11),
+        ("3600", 690, y, 30, 11),
+        ("发", 740, y, 13, 11), ("送", 752, y, 13, 11),
+        ("取", 790, y, 13, 11), ("消", 802, y, 13, 11),
+    ]
+    return words
+
+
+INCIDENT_SPEC = SignalSpec(
+    code6="001311", direction="buy", volume=3600, price=14.95,
+    sent_at=datetime(2026, 11, 10, 9, 31, 37),
+)
+
+
+def test_row_reassembles_code_split_by_ocr_20261110():
+    """001|31|1 → 001311；14|·|95 → 14.95（价格间距大，正则只读到 4·95）。"""
+    row = _build_rows(_incident_row_20261110())[0]
+    assert row.code == "001311"
+    assert row.volume == "3600"
+    assert row.direction == ""                 # 方向列整列漏识别
+    assert abs(row.price - 14.95) <= 1e-9
+
+
+def test_match_row_hits_incident_ocr_row_20261110():
+    """回归：该真机 OCR 行必须被匹配到（原先 code 判空 → 自动确认放弃）。"""
+    rows = _rows(_incident_row_20261110())
+    hit = _match_row(rows, INCIDENT_SPEC)
+    assert hit is not None
+    assert hit.code == "001311"
+    assert hit.seconds == 9 * 3600 + 31 * 60 + 37
+
+
+def test_match_row_loose_degrades_only_when_unique():
+    """代码列完全读不出时：时间+价格+数量唯一命中才降级放行，多候选一律不放。"""
+    one = _rows(_incident_row_20261110(with_code=False))
+    assert one[0].code == ""
+    spec = SignalSpec(code6="001311", direction="buy", volume=3600,
+                      price=14.95, sent_at=datetime(2026, 11, 10, 9, 31, 37))
+    assert _match_row(one, spec) is not None
+
+    # 两行都是同一时间/价格/数量（无法区分）→ 不猜、不点
+    shifted = [(t, x, y + 100, w, h)
+               for (t, x, y, w, h) in _incident_row_20261110(with_code=False)]
+    two = _rows(_incident_row_20261110(with_code=False), shifted)
+    assert len(two) == 2
+    assert _match_row(two, spec) is None
+
+    # 价格不符 → 不降级
+    spec2 = SignalSpec(code6="001311", direction="buy", volume=3600,
+                       price=15.20, sent_at=datetime(2026, 11, 10, 9, 31, 37))
+    assert _match_row(one, spec2) is None

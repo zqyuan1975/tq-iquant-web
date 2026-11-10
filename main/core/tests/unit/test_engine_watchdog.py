@@ -258,6 +258,37 @@ def test_overnight_gap_not_counted_as_stall():
     assert eng.events == []
 
 
+def test_goldminer_snapshot_stall_alerts_even_if_bridge_online():
+    """掘金行情走 TQ 快照合成：桥心跳正常但快照停摆也必须告警（P1 2026-11-09）。"""
+    eng = _Engine(channel="goldminer_bridge",
+                  started=NOW - timedelta(seconds=900), tick=NOW)
+    eng._snapshot_synth = SimpleNamespace(
+        last_completed_at=NOW - timedelta(seconds=200))
+    wd = _watchdog({1: eng}, market_stall_seconds=180)
+    wd.scan()
+    alerts = _risk(eng, "market_data_stalled")
+    assert len(alerts) == 1
+    assert alerts[0]["basis"] == "snapshot_1m"
+
+
+def test_same_day_start_basis_clamped_to_open_no_0930_false_alarm():
+    """同日起步（09:20 启动）：09:30:30 尚无闭合 1m bar 不得报假警；09:35 真停滞才报。"""
+    started = datetime(2026, 11, 5, 9, 20)
+    early = datetime(2026, 11, 5, 9, 30, 30)
+    eng1 = _Engine(channel="tdx_tq", started=started, tick=early)
+    eng1._snapshot_synth = SimpleNamespace(last_completed_at=None)
+    wd1 = _watchdog({1: eng1}, now_fn=lambda: early, market_stall_seconds=180)
+    wd1.scan()
+    assert _risk(eng1, "market_data_stalled") == []
+
+    late = datetime(2026, 11, 5, 9, 35, 0)
+    eng2 = _Engine(channel="tdx_tq", started=started, tick=late)
+    eng2._snapshot_synth = SimpleNamespace(last_completed_at=None)
+    wd2 = _watchdog({2: eng2}, now_fn=lambda: late, market_stall_seconds=180)
+    wd2.scan()
+    assert len(_risk(eng2, "market_data_stalled")) == 1
+
+
 def test_market_data_recovery_clears_active_alarms():
     """误报解除后 active_alarms 必须清空（面板不挂红标）。"""
     eng = _Engine(channel="tdx_tq", started=NOW - timedelta(seconds=900), tick=NOW)

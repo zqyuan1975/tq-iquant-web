@@ -189,6 +189,26 @@ def test_first_poll_baseline_no_trigger():
     assert poller.last_completed_stime == datetime(2026, 8, 5, 10, 8, 0)
 
 
+def test_first_poll_delivers_baseline_bar_for_deferred_release():
+    """P1（2026-11-09）：基线那根完成 bar 仍交付 on_baseline_bar（放行 deferred），
+    poll() 返回值保持空、不进 on_bar（不触发公式信号评估，防重放历史 bar）。"""
+    rec = _QuoteRecorder(per_code={"600000.SH": [
+        [_bar("20260805100800", 9.31), _bar("20260805100900", 9.32)],
+    ]})
+    poller, _ = _make_poller(rec)
+    fired, baseline = [], []
+    poller.on_bar = fired.append
+    poller.on_baseline_bar = baseline.append
+
+    result = poller.poll()
+
+    assert fired == [] and result == []
+    assert len(baseline) == 1
+    assert baseline[0].baseline is True
+    assert baseline[0].bar_time == datetime(2026, 8, 5, 10, 8, 0)
+    assert "600000.SH" in baseline[0].stocks
+
+
 def test_new_bar_completed_when_newer_bar_appears():
     """核心:10:09 在新 bar 10:10 出现后退居第二 → 10:09 完成,触发。"""
     # 第 1 轮:基线 [10:08, 10:09](10:09 最新)

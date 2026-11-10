@@ -8,12 +8,13 @@
 """
 from datetime import datetime
 from decimal import Decimal
+import time
 
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
 from core.engine.position import Position
-from core.models import Base, LiveSession, LiveTrade
+from core.models import Base, LiveOrder, LiveSession, LiveTrade
 from core.services import live_service
 
 
@@ -56,6 +57,18 @@ class _FakeDispatcher:
     def get_positions(self):
         self.calls += 1
         return self.rows
+
+
+class _BridgeDispatcher:
+    """QMT/掘金桥口径：只有 query_positions，没有 get_positions。"""
+
+    def __init__(self, rows=None):
+        self.rows = rows or []
+        self.calls = 0
+
+    def query_positions(self):
+        self.calls += 1
+        return list(self.rows)
 
 
 def _virtual_engine(dispatcher, code="600000.SH"):
@@ -164,6 +177,96 @@ def test_session_positions_stopped_replay_strategy_only():
     assert len(rows) == 1
     assert rows[0]["stock_code"] == "000001.SZ"
     assert rows[0]["source"] == "strategy"
+
+
+def test_external_positions_marks_out_of_pool_by_pool_codes():
+    """池外外部仓打 out_of_pool=True，池内代码打 False（前端徽章判据）。"""
+    disp = _FakeDispatcher([
+        {"symbol": "600000", "volume": 1000, "available": 1000,
+         "cost": 10.0, "market_value": 10500.0},
+    ])
+    eng = _virtual_engine(disp, code="600519.SH")
+    eng._pool_codes_by_portfolio = {1: {"600000.SH"}}
+    rows = live_service.engine_external_positions(eng)
+    assert rows[0]["out_of_pool"] is False
+
+    eng._external_pos_cache = None
+    eng._pool_codes_by_portfolio = {1: {"000001.SZ"}}
+    rows = live_service.engine_external_positions(eng)
+    assert rows[0]["out_of_pool"] is True
+
+
+def test_external_positions_without_pool_info_never_marks_out_of_pool():
+    """池信息缺失（旧引擎/测试未注入）→ 不臆断，一律 False。"""
+    disp = _FakeDispatcher([
+        {"symbol": "000001", "volume": 1000, "available": 1000,
+         "cost": 12.0, "market_value": 13000.0},
+    ])
+    eng = _virtual_engine(disp)
+    rows = live_service.engine_external_positions(eng)
+    assert rows[0]["out_of_pool"] is False
+
+
+def test_positions_merge_external_snapshot_for_bridge_channels():
+    """桥通道（无 get_positions）→ /positions 合并引擎外部持仓快照。
+
+    2026-11-10 实证：iquant 会话账户持仓市值 30.8 万，持仓页却「暂无持仓」——
+    池外仓不进虚拟账本，而展示层只读 dispatcher.get_positions（桥只有
+    query_positions）。修法：读引擎每轮采集写入的 _external_positions 快照。
+    """
+    db = _db()
+    db.add(LiveSession(id=4, name="04", mode="live", status="running",
+                       engine="iquant"))
+    db.commit()
+    eng = _FakeEngine(_BridgeDispatcher())
+    eng._pool_codes_by_portfolio = {1: {"600000.SH"}}
+    eng._external_positions = [
+        {"symbol": "601989.SH", "volume": 17500, "available": 17500,
+         "cost": 0.0, "market_value": 102375.0},
+        {"symbol": "600000.SH", "volume": 500, "available": 500,
+         "cost": 10.0, "market_value": 5000.0},
+    ]
+
+    rows = live_service.session_positions(db, 4, eng)
+    by_code = {r["stock_code"]: r for r in rows}
+
+    ext = by_code["601989.SH"]
+    assert ext["source"] == "external"
+    assert ext["out_of_pool"] is True
+    assert ext["portfolio_id"] is None and ext["strategy_id"] is None
+    assert ext["quantity"] == 17500 and ext["avg_cost"] == 0.0
+    # 池内代码即使不在虚拟账本，也按 out_of_pool=False 返回（展示不误标）
+    assert by_code["600000.SH"]["out_of_pool"] is False
+    # 只读：不写虚拟账本、不产生任何订单
+    assert eng.portfolios[0].strategies[0].positions == {}
+    assert db.query(LiveOrder).count() == 0
+
+
+def test_external_positions_normalize_bridge_raw_rows():
+    """桥原始行（instrument+exchange，无 symbol）必须能归一展示。
+
+    根因回归：引擎快照线程把本轮真实持仓写进 _external_pos_cache（60s 内复用），
+    桥行没有 symbol，旧代码只看 symbol → 全部丢弃 → iquant 持仓页永远空。
+    """
+    disp = _BridgeDispatcher()
+    eng = _FakeEngine(disp)
+    eng._pool_codes_by_portfolio = {1: {"600000.SH"}}
+    eng._external_pos_cache = (time.monotonic(), [
+        {"instrument": "601989", "exchange": "SH", "volume": 17500,
+         "available": 17500, "cost": 5.9903, "market_value": 104830.25},
+        {"instrument": "300413", "exchange": "SZ", "volume": 20,
+         "available": 20, "cost": -475.005, "market_value": 600.0},
+    ])
+
+    rows = live_service.engine_external_positions(eng)
+    by_code = {r["stock_code"]: r for r in rows}
+    assert set(by_code) == {"601989.SH", "300413.SZ"}
+    assert by_code["601989.SH"]["source"] == "external"
+    assert by_code["601989.SH"]["out_of_pool"] is True
+    assert by_code["601989.SH"]["quantity"] == 17500
+    assert str(by_code["601989.SH"]["avg_cost"]) == "5.99"   # _display_price 两位小数
+    # 负成本原样透出（前端 <=0 → 「成本未知」），不得被改写成现价市值估值
+    assert float(by_code["300413.SZ"]["avg_cost"]) == -475.005
 
 
 def test_ths_get_positions_normalizes_to_universal_shape():

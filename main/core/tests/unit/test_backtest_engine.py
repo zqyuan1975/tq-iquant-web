@@ -777,7 +777,7 @@ def test_mixed_period_only_one_snapshot_per_trading_day():
 
 
 # ===========================================================================
-# #1 涨跌停约束（price_limit_check_enabled 默认关）：涨停买不进/跌停卖不出
+# #1 涨跌停约束（price_limit_check_enabled 默认开）：涨停买不进/跌停卖不出
 # ===========================================================================
 def _limit_klines(stock, rows):
     """单股票 1d klines（同 _klines，语义别名便于本组用例阅读）。"""
@@ -1440,6 +1440,8 @@ def test_run_suspended_buy_carried_until_quoted():
     """
     klines = _two_stock_klines(_ROWS_A, _ROWS_B_SUSPENDED)
     port, ctx = _portfolio_with_strategy()
+    # 本用例只验证停牌延后；复牌 18.5→21 的跳空会命中涨跌停门控，显式关闭隔离
+    port.price_limit_check_enabled = False
     cache = {
         (1, "600001.SH", datetime(2026, 7, 29)): [{"name": "open_sig", "value": 1}],
     }

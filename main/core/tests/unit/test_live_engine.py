@@ -6,6 +6,7 @@
 """
 import asyncio
 import json
+import logging
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 
@@ -28,7 +29,8 @@ from core.engine.position import Position
 from core.engine.risk_manager import PortfolioRiskManager, StrategyRiskManager
 from core.engine.strategy_context import StrategyContext
 from core.models import (
-    Base, LiveOrder, LiveTrade, LiveSessionPortfolio, LiveDecisionEvent,
+    Base, LiveOrder, LiveTrade, LiveSession, LiveSessionPortfolio,
+    LiveDecisionEvent,
 )
 from tq_iquant_shared.constants import SignalType, TradeType
 
@@ -188,7 +190,7 @@ def test_handle_bar_signal_to_trade_persisted():
 
 
 # ---- 交易日历下单总闸（#144）----
-def _calendar_engine(factory, port, disp, trading_dates, stock):
+def _calendar_engine(factory, port, disp, trading_dates, stock, engine_key=""):
     """构造带注入假日历的 LiveEngine（假日历不经桥，直接给日期列表）。"""
     from core.engine.trading_calendar import TradingCalendar
     from core.engine.bar_poller import BarPoller
@@ -197,7 +199,7 @@ def _calendar_engine(factory, port, disp, trading_dates, stock):
     return LiveEngine(
         session_id=1, portfolios=[port], dispatcher=disp,
         bar_poller=poller, db_session_factory=factory,
-        trading_calendar=cal,
+        trading_calendar=cal, engine_key=engine_key,
     )
 
 
@@ -336,6 +338,479 @@ def test_handle_bar_deferred_daily_signal_released_next_day():
     assert any(r.url.path == "/order" for r in rec.requests)  # 已发桥
 
 
+def test_goldminer_bridge_quote_releases_deferred_without_snapshot_bar(monkeypatch):
+    """掘金通道：桥 1m 今日已完成 bar → 立即放行 deferred（不等快照首根完成 bar）。
+
+    goldminer 的 1m 驱动行情仍走快照合成（无历史），但放行闸可由桥 /quote 补齐：
+    取桥返回的「今日已完成」1m bar 构造 baseline BarEvent，只放行 deferred。
+    """
+    # 冻结墙钟：after_close_block 闸门按真实时间判「收盘后分钟级信号过期」，
+    # 否则本用例在 15:00 之后跑会必然失败（时间相关假阴性）。
+    monkeypatch.setattr("core.engine.live_engine.now_shanghai",
+                        lambda: datetime(2026, 11, 10, 11, 29, 30))
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single(period="1d")
+    stock = "600000.SH"
+    d1, d2 = date(2026, 11, 9), date(2026, 11, 10)
+    quote_bars = [
+        {"stime": "20261110112900", "open": 10.0, "high": 10.1,
+         "low": 9.9, "close": 10.05, "volume": 1000},
+        {"stime": "20261110113000", "open": 10.05, "high": 10.1,
+         "low": 10.0, "close": 10.08, "volume": 1200},
+    ]
+
+    def _respond(req):
+        if req.url.path == "/quote":
+            return httpx.Response(200, json={"ok": True, "data": {stock: quote_bars}})
+        if req.url.path == "/order":
+            return httpx.Response(200, json={"ok": True})
+        return httpx.Response(200, json={"ok": True, "data": []})
+
+    rec = _Recorder(respond=_respond)
+    disp, _ = _make_dispatcher(rec)
+    engine = _calendar_engine(factory, port, disp, [d1, d2], stock,
+                              engine_key="goldminer")
+    db = factory()
+    engine._submit_one_order(db, port, _deferred_buy_order(stock, d1), "1d")
+    db.close()
+    assert len(engine._signal_bar_deferred) == 1
+
+    engine._maybe_bridge_deferred_release(datetime(2026, 11, 10, 12, 45))
+
+    assert engine._signal_bar_deferred == []  # 首轮即放行，不等快照首根完成 bar
+    db = factory()
+    orders = db.query(LiveOrder).all()
+    assert len(orders) == 1 and orders[0].status == "submitted"
+    # 放行 bar_time = 桥返回的今日已完成 1m bar（11:29，最新一根 11:30 视为 forming）
+    assert orders[0].bar_time == datetime(2026, 11, 10, 11, 29)
+    db.close()
+    assert any(r.url.path == "/order" for r in rec.requests)
+
+
+def test_goldminer_bridge_probe_failsafe_and_engine_isolation():
+    """桥 /quote 失败 → 不放行不清单不崩；非掘金通道不探测（不改变既有行为）。"""
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single(period="1d")
+    stock = "600000.SH"
+    d1, d2 = date(2026, 11, 9), date(2026, 11, 10)
+
+    # ① 掘金通道 + 桥 /quote 断连：fail-safe，队列不动、不发单
+    rec = _Recorder(fail_paths={"/quote"})
+    disp, _ = _make_dispatcher(rec)
+    engine = _calendar_engine(factory, port, disp, [d1, d2], stock,
+                              engine_key="goldminer")
+    db = factory()
+    engine._submit_one_order(db, port, _deferred_buy_order(stock, d1), "1d")
+    db.close()
+    engine._maybe_bridge_deferred_release(datetime(2026, 11, 10, 12, 45))
+    assert len(engine._signal_bar_deferred) == 1
+    assert not any(r.url.path == "/order" for r in rec.requests)
+
+    # ② 非掘金通道：直接跳过，零行情请求（不改 tdx/ths/iquant 行为）
+    rec2 = _Recorder()
+    disp2, _ = _make_dispatcher(rec2)
+    engine2 = _calendar_engine(factory, port, disp2, [d1, d2], stock, engine_key="tdx")
+    db = factory()
+    engine2._submit_one_order(db, port, _deferred_buy_order(stock, d1), "1d")
+    db.close()
+    engine2._maybe_bridge_deferred_release(datetime(2026, 11, 10, 12, 45))
+    assert len(engine2._signal_bar_deferred) == 1
+    assert not any(r.url.path == "/quote" for r in rec2.requests)
+
+
+def _quote_responder(bars_by_code):
+    """按请求 code 返回 /quote 结果（goldminer 桥同构响应）。"""
+    def _respond(req):
+        if req.url.path == "/quote":
+            code = req.url.params.get("code")
+            return httpx.Response(
+                200, json={"ok": True, "data": {code: bars_by_code.get(code, [])}})
+        if req.url.path == "/order":
+            return httpx.Response(200, json={"ok": True})
+        return httpx.Response(200, json={"ok": True, "data": []})
+    return _respond
+
+
+def _today_bars_600000():
+    return [
+        {"stime": "20261110112900", "open": 10.0, "high": 10.1,
+         "low": 9.9, "close": 10.05, "volume": 1000},
+        {"stime": "20261110113000", "open": 10.05, "high": 10.1,
+         "low": 10.0, "close": 10.08, "volume": 1200},
+    ]
+
+
+def test_goldminer_bridge_probe_zero_cost_without_cross_day_deferred():
+    """辅助探测成本≈0：没有跨日 deferred（同一交易日的单不算）→ 一次都不探。"""
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single(period="1d")
+    stock = "600000.SH"
+    today = date(2026, 11, 10)
+    rec = _Recorder(respond=_quote_responder({stock: _today_bars_600000()}))
+    disp, _ = _make_dispatcher(rec)
+    engine = _calendar_engine(factory, port, disp, [today], stock, engine_key="goldminer")
+    db = factory()
+    engine._submit_one_order(db, port, _deferred_buy_order(stock, today), "1d")
+    db.close()
+    assert len(engine._signal_bar_deferred) == 1
+
+    engine._maybe_bridge_deferred_release(datetime(2026, 11, 10, 12, 45))
+
+    assert not any(r.url.path == "/quote" for r in rec.requests)
+    assert len(engine._signal_bar_deferred) == 1
+
+
+def test_goldminer_bridge_probe_budget_exhausted_warns_and_backs_off():
+    """单轮预算耗尽 → 记 WARNING、放弃本轮、置退避；不发单、不清单。"""
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single(period="1d")
+    stock = "600000.SH"
+    d1, d2 = date(2026, 11, 9), date(2026, 11, 10)
+    rec = _Recorder(respond=_quote_responder({stock: _today_bars_600000()}))
+    disp, _ = _make_dispatcher(rec)
+    engine = _calendar_engine(factory, port, disp, [d1, d2], stock, engine_key="goldminer")
+    engine._BRIDGE_PROBE_BUDGET_SECONDS = 0.0  # 预算立即耗尽
+    db = factory()
+    engine._submit_one_order(db, port, _deferred_buy_order(stock, d1), "1d")
+    db.close()
+
+    engine._maybe_bridge_deferred_release(datetime(2026, 11, 10, 12, 45))
+
+    assert not any(r.url.path == "/quote" for r in rec.requests)
+    assert len(engine._signal_bar_deferred) == 1
+    assert not any(r.url.path == "/order" for r in rec.requests)
+    assert engine._bridge_probe_next_at == datetime(2026, 11, 10, 12, 50)
+
+
+def test_goldminer_bridge_probe_backoff_skips_next_ticks():
+    """桥失败 → 退避 5 分钟内零探测；退避结束后才重试。"""
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single(period="1d")
+    stock = "600000.SH"
+    d1, d2 = date(2026, 11, 9), date(2026, 11, 10)
+    rec = _Recorder(fail_paths={"/quote"})
+    disp, _ = _make_dispatcher(rec)
+    engine = _calendar_engine(factory, port, disp, [d1, d2], stock, engine_key="goldminer")
+    db = factory()
+    engine._submit_one_order(db, port, _deferred_buy_order(stock, d1), "1d")
+    db.close()
+
+    def _quotes():
+        return len([r for r in rec.requests if r.url.path == "/quote"])
+
+    engine._maybe_bridge_deferred_release(datetime(2026, 11, 10, 12, 45))
+    assert _quotes() == 1
+    engine._maybe_bridge_deferred_release(datetime(2026, 11, 10, 12, 46))
+    assert _quotes() == 1  # 退避期内
+    engine._maybe_bridge_deferred_release(datetime(2026, 11, 10, 12, 50))
+    assert _quotes() == 2  # 退避结束再试
+    assert len(engine._signal_bar_deferred) == 1
+
+
+def test_goldminer_bridge_probe_only_needed_codes_and_no_repeat():
+    """只探挂跨日 deferred 的 code（不碰池内其它 code）；放行过的不再重复探。"""
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single(period="1d")
+    stock, other = "600000.SH", "000001.SZ"
+    d1, d2 = date(2026, 11, 9), date(2026, 11, 10)
+    bars = _today_bars_600000()
+    rec = _Recorder(respond=_quote_responder({stock: bars, other: bars}))
+    disp, _ = _make_dispatcher(rec)
+    engine = _calendar_engine(factory, port, disp, [d1, d2], stock, engine_key="goldminer")
+    engine._bar_poller.add_codes([other])  # 池内还有别的 code
+    db = factory()
+    engine._submit_one_order(db, port, _deferred_buy_order(stock, d1), "1d")
+    db.close()
+
+    engine._maybe_bridge_deferred_release(datetime(2026, 11, 10, 12, 45))
+    quote_codes = [r.url.params.get("code") for r in rec.requests if r.url.path == "/quote"]
+    # 探测只打 deferred 的 code（提交链自己的定价取价请求也在其中，但绝不含池内其它 code）
+    assert quote_codes and set(quote_codes) == {stock}
+    assert engine._signal_bar_deferred == []
+
+    # 该 code 已借桥放行过：队列里再出现同 code 跨日单也不再探（等快照兜底）
+    engine._signal_bar_deferred.append(_deferred_buy_order(stock, d1))
+    before = len([r for r in rec.requests if r.url.path == "/quote"])
+    engine._maybe_bridge_deferred_release(datetime(2026, 11, 10, 12, 46))
+    assert len([r for r in rec.requests if r.url.path == "/quote"]) == before
+
+
+def _deferred_buy_order(stock, day, qty=300):
+    """BUY 形状的 deferred 日线信号单（放行后走提交链）。"""
+    return OrderEvent(
+        strategy_id=1, portfolio_id=1, stock_code=stock,
+        trade_type=TradeType.BUY, signal_type=SignalType.OPEN,
+        quantity=qty, price=Decimal("9.0"),
+        bar_time=datetime.combine(day, datetime.min.time()),
+        signal_name="open_sig", signal_bar_date=day,
+    )
+
+
+def test_release_expires_deferred_after_one_trading_day():
+    """R2：只允许在 signal_bar_date 的下一交易日放行；再晚 → canceled + 决策事件。"""
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single(period="1d")
+    stock = "600000.SH"
+    d1, d2, d3 = date(2026, 8, 24), date(2026, 8, 25), date(2026, 8, 26)
+    rec = _Recorder()
+    disp, _ = _make_dispatcher(rec)
+    engine = _calendar_engine(factory, port, disp, [d1, d2, d3], stock)
+
+    db = factory()
+    engine._submit_one_order(db, port, _deferred_order(stock, d1), "1d")
+    db.close()
+    assert len(engine._signal_bar_deferred) == 1
+
+    # 8/26 已跨过 8/25（唯一放行窗口）→ 过期取消，不下单
+    # due 当日（8/25）引擎收到过分钟 bar（正常有行情）→ 不算「行情失效」，不顺延
+    engine._note_minute_bar_date(
+        _bar(stock, "9.3", datetime(2026, 8, 25, 9, 31)))
+    engine._note_minute_bar_date(
+        _bar(stock, "9.3", datetime(2026, 8, 26, 9, 31)))
+    bar = _bar(stock, "9.3",
+               datetime.combine(d3, datetime.min.time()).replace(hour=9, minute=31))
+    released = engine._release_signal_bar_deferred(port, bar)
+    assert released == []
+    assert engine._signal_bar_deferred == []
+
+    db = factory()
+    row = db.query(LiveOrder).first()
+    db.close()
+    assert row.status == "canceled"
+    assert "stale_release" in (row.error_message or "")
+    assert not any(r.url.path == "/order" for r in rec.requests)
+
+    events = engine._recorder.drain()
+    assert any(e.gate == "signal_bar_date" and e.action == "expire" for e in events)
+
+
+def test_release_extends_once_when_due_day_had_no_minute_bar():
+    """P1（2026-11-09）：due 当日一根分钟 bar 都没有（行情失效）→ 顺延一个交易日放行。"""
+    factory, _ = _db_factory()
+    port, ctx = _portfolio_single(period="1d")
+    stock = "600000.SH"
+    # SELL 放行需有虚拟持仓（无持仓 cap_quantity=None → 放行后被结算取消）
+    ctx.positions[stock] = Position(stock)
+    ctx.positions[stock].buy(300, Decimal("9.0"), datetime(2026, 8, 24, 9, 30))
+    d1, d2, d3 = date(2026, 8, 24), date(2026, 8, 25), date(2026, 8, 26)
+    rec = _Recorder()
+    disp, _ = _make_dispatcher(rec)
+    engine = _calendar_engine(factory, port, disp, [d1, d2, d3], stock)
+    engine.signal_cache = {}
+
+    db = factory()
+    engine._submit_one_order(db, port, _deferred_order(stock, d1), "1d")
+    db.close()
+    assert len(engine._signal_bar_deferred) == 1
+
+    events = []
+    engine._emit = lambda *a: events.append(a)
+
+    # d2（due）整日没有分钟 bar（行情链路失效）；d3 首根分钟 bar 才恢复
+    engine._handle_bar(
+        port, _bar(stock, "9.3", datetime(2026, 8, 26, 9, 31)))
+
+    assert engine._signal_bar_deferred == []                       # 顺延后已放行
+    assert any(r.url.path == "/order" for r in rec.requests)       # 确实走了提交链
+    risk = [p for t, p in events if t == "risk"]
+    assert any(p.get("rule") == "deferred_extended" for p in risk)
+    assert not any(p.get("rule") == "deferred_expired" for p in risk)
+    db = factory()
+    evs = db.query(LiveDecisionEvent).filter_by(gate="signal_bar_date").all()
+    rows = db.query(LiveOrder).all()
+    db.close()
+    assert any(e.action == "extend" for e in evs)
+    assert any(r.status == "submitted" for r in rows)
+    assert not any(r.status == "canceled" for r in rows)
+
+
+def test_deferred_extended_marker_cancels_on_second_due_day():
+    """P1：已顺延一次（DB 标记读回）→ 第二个到期日仍超期 → 正常取消，不再顺延。"""
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single(period="1d")
+    stock = "600000.SH"
+    d1, d2, d3, d4 = (date(2026, 8, 24), date(2026, 8, 25),
+                      date(2026, 8, 26), date(2026, 8, 27))
+    rec = _Recorder()
+    disp, _ = _make_dispatcher(rec)
+    engine = _calendar_engine(factory, port, disp, [d1, d2, d3, d4], stock)
+
+    db = factory()
+    engine._submit_one_order(db, port, _deferred_order(stock, d1), "1d")
+    db.close()
+    # = recover 从 DB 行 error_message 读回「已顺延一次」
+    engine._signal_bar_deferred[0]._deferred_extended = True
+
+    events = []
+    engine._emit = lambda *a: events.append(a)
+    # 顺延后到期日 = d3；d4 才来 bar → 已超期 → 取消
+    released = engine._release_signal_bar_deferred(
+        port, _bar(stock, "9.3", datetime(2026, 8, 27, 9, 31)))
+
+    assert released == [] and engine._signal_bar_deferred == []
+    risk = [p for t, p in events if t == "risk"]
+    assert any(p.get("rule") == "deferred_expired" for p in risk)
+    assert not any(p.get("rule") == "deferred_extended" for p in risk)
+    assert not any(r.url.path == "/order" for r in rec.requests)
+
+    db = factory()
+    row = db.query(LiveOrder).first()
+    db.close()
+    assert row.status == "canceled"
+    assert "stale_release" in (row.error_message or "")
+
+
+def test_baseline_bar_releases_deferred_without_signal_eval():
+    """P1（2026-11-09）：全新启动首根完成 bar 被 BarPoller 当基线时，deferred 在这一根
+    就放行提交（不再等第二根）；但公式信号评估仍不执行（防重放历史 bar）。"""
+    factory, _ = _db_factory()
+    port, ctx = _portfolio_single(period="1d")
+    stock = "600000.SH"
+    # SELL 放行需有虚拟持仓（无持仓 cap_quantity=None → 放行后被结算取消）
+    ctx.positions[stock] = Position(stock)
+    ctx.positions[stock].buy(300, Decimal("9.0"), datetime(2026, 8, 24, 9, 30))
+    d1, d2 = date(2026, 8, 24), date(2026, 8, 25)
+    rec = _Recorder()
+    disp, _ = _make_dispatcher(rec)
+    engine = _calendar_engine(factory, port, disp, [d1, d2], stock)
+    engine.signal_cache = {}
+
+    db = factory()
+    engine._submit_one_order(db, port, _deferred_order(stock, d1), "1d")
+    db.close()
+    assert len(engine._signal_bar_deferred) == 1
+
+    fill_calls = []
+    engine._fill_signal_cache = lambda *a, **k: fill_calls.append(1)
+
+    bar = _bar(stock, "9.3", datetime(2026, 8, 25, 9, 31))
+    bar.baseline = True
+    engine._handle_bar(port, bar)
+
+    assert engine._signal_bar_deferred == []                   # 基线即放行，不等第二根
+    assert any(r.url.path == "/order" for r in rec.requests)
+    assert fill_calls == []                                    # 公式信号评估未执行
+
+
+def test_recover_alerts_stale_deferred_drop_and_reads_extended_marker(monkeypatch):
+    """P0/P1：recover 丢弃陈旧 deferred 不再静默（risk 事件）；顺延标记可读回。"""
+    import importlib
+
+    from core.engine.trading_calendar import TradingCalendar
+    live_mod = importlib.import_module("core.engine.live_engine")
+    factory, _ = _db_factory()
+    engine, _ = _breaker_engine(factory)
+    monkeypatch.setattr(
+        live_mod, "now_shanghai", lambda: datetime(2026, 8, 25, 9, 0))
+    engine._calendar = TradingCalendar(
+        lambda: [date(2026, 8, 21), date(2026, 8, 24), date(2026, 8, 25)])
+
+    db = factory()
+    _add_deferred_row(db, "600519.SH", datetime(2026, 8, 20, 0, 0))       # 早于上一交易日
+    kept = _add_deferred_row(db, "600000.SH", datetime(2026, 8, 24, 0, 0))
+    kept.error_message = "deferred_extended:due=2026-08-24"
+    db.commit()
+
+    events = []
+    monkeypatch.setattr(engine, "_emit", lambda *a: events.append(a))
+    engine.recover(db)
+    db.close()
+
+    assert [o.stock_code for o in engine._signal_bar_deferred] == ["600000.SH"]
+    assert engine._signal_bar_deferred[0]._deferred_extended is True
+    risk = [p for t, p in events
+            if t == "risk" and p.get("rule") == "deferred_dropped_stale"]
+    assert len(risk) == 1 and risk[0]["stock_code"] == "600519.SH"
+
+
+def test_post_close_restart_keeps_prev_day_deferred_until_next_day():
+    """P0（2026-11-09）：收盘后启动时 15:05 日线轮不得放行上一交易日的 deferred 单。
+
+    复现路径：d1 信号 → d2 15:05（收盘后）引擎才起来，日线级别轮次到来。旧实现把
+    该 bar 当放行 bar：真实报单（收盘后必成废单）且 bar_time 被改写成 d2 00:00，
+    令 15:00 收盘守卫失效。修复后：日线/收盘落定 bar 一律不放行，单保留在队列，
+    等 d3 首根分钟 bar 再放行（收盘后启动导致的顺延）。
+    """
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single(period="1d")
+    stock = "600000.SH"
+    d1, d2, d3 = date(2026, 8, 24), date(2026, 8, 25), date(2026, 8, 26)
+    rec = _Recorder()
+    disp, _ = _make_dispatcher(rec)
+    engine = _calendar_engine(factory, port, disp, [d1, d2, d3], stock)
+    engine._started_at = datetime(2026, 8, 25, 15, 6)  # 收盘后才启动
+    engine.signal_cache = {}
+
+    db = factory()
+    engine._submit_one_order(
+        db, port,
+        _buy_order(stock, "9.3", 300, datetime(2026, 8, 24, 14, 55), d1), "1d")
+    db.close()
+    assert len(engine._signal_bar_deferred) == 1
+
+    # d2 15:05 日线级别轮次（post_close）→ 不放行、不提交
+    bar2 = _bar(stock, "9.3", datetime(2026, 8, 25, 15, 5))
+    bar2.period = "1d"
+    bar2.post_close = True
+    engine._handle_bar(port, bar2)
+    assert len(engine._signal_bar_deferred) == 1
+    assert not any(r.url.path == "/order" for r in rec.requests)
+
+    # d3 首根分钟 bar → 放行提交（顺延一天，不是作废）
+    engine._handle_bar(port, _bar(stock, "9.3", datetime(2026, 8, 26, 9, 31)))
+    assert engine._signal_bar_deferred == []
+    assert any(r.url.path == "/order" for r in rec.requests)
+
+
+def test_released_deferred_orders_join_batch_allocation():
+    """P3：放行后的 deferred 单（bar_time 已刷新为放行 bar）参与批量比例分配。"""
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single(period="1d")
+    port.account.cash = Decimal("10000")  # 两笔各目标 10000，只能分到 1000 股总量
+    disp, _ = _make_dispatcher(_Recorder())
+    engine = _make_engine(disp, factory, port)
+    d1 = date(2026, 8, 24)
+    bt = datetime(2026, 8, 25, 9, 31)  # 放行 bar（bar_time 已刷新）
+    o1 = _buy_order("600000.SH", "10", 1000, bt)
+    o2 = _buy_order("600001.SH", "10", 1000, bt)
+    for o in (o1, o2):
+        o.signal_bar_date = d1
+
+    kept = engine._allocate_batch_buys(port, [o1, o2])
+
+    assert len(kept) == 2  # 两笔都参与（未被当作 deferred 排除）
+    assert sum(o.quantity for o in kept) == 1000  # 现金 10000 / 10 = 1000 股
+    assert all(o.quantity == 500 for o in kept)  # 等额比例分配，非 FIFO 吃满
+
+
+def test_settle_unsubmitted_released_marks_row_canceled():
+    """放行但未提交（闸门拦截）→ DB 行 deferred 转 canceled，避免重启重复恢复。"""
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single(period="1d")
+    stock = "600000.SH"
+    d1 = date(2026, 8, 24)
+    rec = _Recorder()
+    disp, _ = _make_dispatcher(rec)
+    engine = _calendar_engine(factory, port, disp, [d1], stock)
+
+    db = factory()
+    engine._submit_one_order(db, port, _deferred_order(stock, d1), "1d")
+    db.commit()
+    order = engine._signal_bar_deferred[0]
+    assert getattr(order, "_deferred_row_id", None)
+
+    engine._settle_unsubmitted_released(db, port, [order])
+    db.commit()
+    db.close()
+
+    db = factory()
+    row = db.query(LiveOrder).first()
+    db.close()
+    assert row.status == "canceled"
+    assert "released_not_submitted" in (row.error_message or "")
+    assert getattr(order, "_deferred_row_id", None) is None
+
+
 def test_handle_bar_minute_signal_not_gated():
     """B-1：分钟信号（signal_bar_date=None）不受闸门影响，当 bar 照常提交。"""
     factory, _ = _db_factory()
@@ -358,31 +833,44 @@ def test_handle_bar_minute_signal_not_gated():
 
 
 def test_stop_clears_signal_bar_deferred():
-    """B-1：stop() 丢弃 deferred 队列属预期，不报错。"""
+    """B-1：stop() 清空内存队列，但必须把无行单如实重落库（status=deferred）。"""
     factory, _ = _db_factory()
     port, _ = _portfolio_single()
     rec = _Recorder()
     disp, _ = _make_dispatcher(rec)
     engine = _make_engine(disp, factory, port)
-    engine._signal_bar_deferred.append(OrderEvent(
+    order = OrderEvent(
         strategy_id=1, portfolio_id=1, stock_code="600000.SH",
         trade_type=TradeType.BUY, signal_type=SignalType.OPEN,
         quantity=600, price=Decimal("9.3"),
         bar_time=datetime(2026, 8, 24, 0, 0),
         signal_bar_date=date(2026, 8, 24),
-    ))
+    )
+    engine._signal_bar_deferred.append(order)
 
     asyncio.run(engine.stop())
 
     assert engine._signal_bar_deferred == []
+    db = factory()
+    rows = db.query(LiveOrder).filter(LiveOrder.status == "deferred").all()
+    db.close()
+    assert len(rows) == 1                       # 如实落库，任意时刻可 recover
+    assert rows[0].stock_code == "600000.SH"
+    assert rows[0].quantity == 600
+    assert getattr(order, "_deferred_row_id", None) == rows[0].id
 
 
 # ---- B-2 策略级敞口上限实盘透传（对齐回测 _exposure_kwargs）----
 def _preset_position(ctx, stock, quantity, avg_cost):
-    """预置虚拟持仓（实盘每策略独立 ctx.positions）。"""
+    """预置虚拟持仓（实盘每策略独立 ctx.positions）。
+
+    直接写 quantity/avg_cost 视为「平台自己买入的持仓」，同步 platform_quantity
+    （槽位闸口径：外部/手工导入仓 platform_quantity 恒 0，不占名额）。
+    """
     pos = Position(stock)
     pos.quantity = quantity
     pos.avg_cost = avg_cost
+    pos.platform_quantity = quantity
     ctx.positions[stock] = pos
 
 
@@ -489,6 +977,214 @@ def test_handle_bar_amount_cap_none_keeps_old_behavior():
     db.close()
 
 
+# ---- 同批买单资金分配 + 在途预留（避免 FIFO 饿死/最后一笔资金不足）----
+def _buy_order(stock, price, qty, bar_time, signal_bar_date=None):
+    return OrderEvent(
+        strategy_id=1, portfolio_id=1, stock_code=stock,
+        trade_type=TradeType.BUY, signal_type=SignalType.OPEN,
+        quantity=qty, price=Decimal(price), bar_time=bar_time,
+        signal_name="open_sig", signal_bar_date=signal_bar_date,
+    )
+
+
+def test_reserved_buy_cash_and_available_uses_pending_orders():
+    """在途 BUY 预留 = 委托量×挂单价；可用现金 = min(账本−预留, 真实可用×0.98)。"""
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single()
+    disp, _ = _make_dispatcher(_Recorder())
+    engine = _make_engine(disp, factory, port)
+    engine._pending_orders = {
+        7: LiveOrder(
+            id=7, portfolio_strategy_id=1, trade_type="buy",
+            status="submitted", quantity=1000, price=Decimal("10.00"),
+        ),
+        8: LiveOrder(  # 未成交买入的另一组合：不计入组合 1
+            id=8, portfolio_strategy_id=2, trade_type="buy",
+            status="submitted", quantity=500, price=Decimal("10.00"),
+        ),
+        9: LiveOrder(  # 已全成交（status=filled）：不预留，避免与账本扣款双计
+            id=9, portfolio_strategy_id=1, trade_type="buy",
+            status="filled", quantity=1000, price=Decimal("10.00"),
+        ),
+        10: LiveOrder(  # 卖单不占现金
+            id=10, portfolio_strategy_id=1, trade_type="sell",
+            status="submitted", quantity=1000, price=Decimal("10.00"),
+        ),
+    }
+    assert engine._reserved_buy_cash(1) == Decimal("10000.00")
+
+    # 无真实快照：纯虚拟账本口径
+    engine._latest_account_cash = None
+    assert engine._buy_available_cash(port) == Decimal("90000")
+
+    # 真实可用更低 → 取小（真实仍是硬上限）。真实侧扣**会话级**预留（10000+5000）：
+    # 多组合共享同一账户，各组合只扣自己的预留都会看到「整账户可用」并各自吃满。
+    assert engine._reserved_buy_cash() == Decimal("15000.00")
+    engine._latest_account_cash = Decimal("50000")
+    assert engine._buy_available_cash(port) == Decimal("34000.00")
+
+
+def test_buy_available_cash_skips_inflight_already_in_snapshot():
+    """001311 复盘：提交早于快照的在途单冻结已含在真实可用里，不得再扣一次。
+
+    快照 57,260.51 已扣 300415 冻结 50,966.90；若再减预留 50,960，
+    真实侧会从 56,115.30 跌到 5,155.30（3500 股被压成 300 股）。
+    """
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single()
+    disp, _ = _make_dispatcher(_Recorder())
+    engine = _make_engine(disp, factory, port)
+    snap_at = datetime(2026, 11, 10, 13, 1, 42, 804000)
+    early = LiveOrder(
+        id=7, portfolio_strategy_id=1, trade_type="buy",
+        status="submitted", quantity=2800, price=Decimal("18.20"),
+    )
+    early._submit_at = snap_at - timedelta(seconds=1)  # 快照采集前已提交
+    engine._pending_orders = {7: early}
+    engine._latest_account_cash = Decimal("57260.51")
+    engine._latest_account_cash_at = snap_at
+    port.account.cash = Decimal("107164.10")
+    # 账本侧 107,164.10-50,960=56,204.10；真实侧 57,260.51×0.98=56,115.30（不扣预留）
+    assert engine._buy_available_cash(port) == Decimal("56115.30")
+
+
+def test_buy_available_cash_still_counts_inflight_after_snapshot():
+    """提交晚于快照的在途单快照没反映 → 真实侧照扣（保守，防超买）。"""
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single()
+    disp, _ = _make_dispatcher(_Recorder())
+    engine = _make_engine(disp, factory, port)
+    snap_at = datetime(2026, 11, 10, 13, 1, 42, 804000)
+    late = LiveOrder(
+        id=8, portfolio_strategy_id=1, trade_type="buy",
+        status="submitted", quantity=2800, price=Decimal("18.20"),
+    )
+    late._submit_at = snap_at + timedelta(milliseconds=50)  # 快照之后才提交
+    engine._pending_orders = {8: late}
+    engine._latest_account_cash = Decimal("57260.51")
+    engine._latest_account_cash_at = snap_at
+    port.account.cash = Decimal("200000")
+    # 真实侧 57,260.51×0.98-50,960=5,155.30 → 取小
+    assert engine._buy_available_cash(port) == Decimal("5155.30")
+
+
+def test_buy_available_cash_conservative_without_snapshot_time(caplog):
+    """快照采集时间不可知 → 保守全额扣减，并打 WARNING 标注走了保守分支。"""
+    caplog.set_level("WARNING")
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single()
+    disp, _ = _make_dispatcher(_Recorder())
+    engine = _make_engine(disp, factory, port)
+    early = LiveOrder(
+        id=9, portfolio_strategy_id=1, trade_type="buy",
+        status="submitted", quantity=1000, price=Decimal("10.00"),
+    )
+    early._submit_at = datetime(2026, 11, 10, 9, 31, 0)
+    engine._pending_orders = {9: early}
+    engine._latest_account_cash = Decimal("50000")
+    engine._latest_account_cash_at = None  # 尚未采集（recover 后）
+    # 真实侧 50,000×0.98-10,000=39,000；账本 100,000-10,000=90,000 → 取小
+    assert engine._buy_available_cash(port) == Decimal("39000.00")
+    assert any("保守口径" in r.getMessage() for r in caplog.records)
+    # 去重：再调一次不再重复告警
+    engine._buy_available_cash(port)
+    assert sum("保守口径" in r.getMessage() for r in caplog.records) == 1
+
+
+def test_allocate_batch_buys_proportional_then_greedy_fill():
+    """4 笔等额买单超可用现金 → 按目标比例分配 + 整手取整 + 贪心补手，合计吃满。"""
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single()
+    port.account.cash = Decimal("30000")  # 4 笔各 10000 目标合计 40000 > 30000
+    disp, _ = _make_dispatcher(_Recorder())
+    engine = _make_engine(disp, factory, port)
+    bt = datetime(2026, 8, 5, 10, 0)
+    orders = [
+        _buy_order("600000.SH", "10", 1000, bt),
+        _buy_order("600001.SH", "10", 1000, bt),
+        _buy_order("600002.SH", "10", 1000, bt),
+        _buy_order("600003.SH", "10", 1000, bt),
+    ]
+
+    kept = engine._allocate_batch_buys(port, list(orders))
+
+    assert len(kept) == 4
+    qtys = [o.quantity for o in orders]
+    assert qtys == [800, 800, 700, 700]  # 700 起步 + 余量 2000 补两笔整手
+    assert sum(Decimal(o.quantity) * o.price for o in orders) == Decimal("30000")
+    evs = engine._recorder.drain()
+    assert len(evs) == 4 and all(e.gate == "batch_cash_alloc" for e in evs)
+    assert all(e.action == "shrink" for e in evs)
+
+
+def test_allocate_batch_buys_skips_below_one_lot_with_event():
+    """分配额不足 1 手的单剔除（不静默）：返回列表不含该单 + 记 block 决策事件。"""
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single()
+    port.account.cash = Decimal("50000")
+    disp, _ = _make_dispatcher(_Recorder())
+    engine = _make_engine(disp, factory, port)
+    bt = datetime(2026, 8, 5, 10, 0)
+    small = _buy_order("600000.SH", "10", 1000, bt)       # 目标 1 万
+    big = _buy_order("600001.SH", "10", 900000, bt)       # 目标 900 万
+    orders = [small, big]
+
+    kept = engine._allocate_batch_buys(port, orders)
+
+    assert kept == [big]                       # 小额被剔除
+    assert small.quantity == 1000              # 原量不变（不下单）
+    assert big.quantity == 5000                # 4900 + 余量 1000 补 1 手
+    evs = engine._recorder.drain()
+    blocked = [e for e in evs if e.action == "block"]
+    assert len(blocked) == 1 and blocked[0].stock_code == "600000.SH"
+    assert all(e.gate == "batch_cash_alloc" for e in evs)
+
+
+def test_allocate_batch_buys_excludes_deferred_orders():
+    """deferred 单不参与本 bar 资金分配（其额度以放行 bar 为准），数量保持目标值。"""
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single()
+    port.account.cash = Decimal("15000")
+    disp, _ = _make_dispatcher(_Recorder())
+    engine = _make_engine(disp, factory, port)
+    bt = datetime(2026, 8, 5, 10, 0)
+    a = _buy_order("600000.SH", "10", 1000, bt)
+    b = _buy_order("600001.SH", "10", 1000, bt)
+    deferred = _buy_order("600002.SH", "10", 1000, bt,
+                          signal_bar_date=bt.date())
+    orders = [a, b, deferred]
+
+    kept = engine._allocate_batch_buys(port, orders)
+
+    assert len(kept) == 3
+    assert deferred.quantity == 1000           # 不参与分配
+    assert (a.quantity, b.quantity) == (800, 700)
+    assert Decimal(a.quantity) * a.price + Decimal(b.quantity) * b.price \
+        == Decimal("15000")
+
+
+def test_handle_bar_allocates_batch_buy_cash(monkeypatch):
+    """_handle_bar 接线：同 bar 4 笔买单超可用现金时按比例缩量后逐笔提交。"""
+    factory, _ = _db_factory()
+    port, _ctx = _portfolio_single()
+    port.account.cash = Decimal("30000")
+    engine, _rec = _gate_engine(factory, port)
+    submitted = []
+    monkeypatch.setattr(
+        engine, "_submit_one_order",
+        lambda db, p, o, period, emit_signal=True, **kw: submitted.append(
+            (o.stock_code, o.quantity)))
+    buys = [
+        _buy_order(code, "10", 1000, _BT)
+        for code in ("600000.SH", "600001.SH", "600002.SH", "600003.SH")
+    ]
+    monkeypatch.setattr(port, "on_bar", lambda *a, **k: list(buys))
+
+    engine._handle_bar(port, _bar("600000.SH", "10", _BT))
+
+    assert [q for _, q in submitted] == [800, 800, 700, 700]
+
+
 def test_no_signal_no_trade():
     """bar 不触发信号 → 不落 trade、不落 order。"""
     factory, _ = _db_factory()
@@ -556,6 +1252,51 @@ def test_recover_rebuilds_positions_from_trades():
 
     assert ctx.positions[stock].quantity == 100
     assert port.account.cash == Decimal("100000") - Decimal("930")
+
+
+def test_recover_skips_external_trade_replay():
+    """补记单（order_type=external）只留痕不记账：重启重放不得改虚拟现金。
+
+    会话运行期 record_external_deals 刻意不 apply（持仓由桥快照镜面覆盖，
+    资金基准已含该资产）。若 recover 全量重放，外部卖出会被 Position.sell
+    截断为 0 持仓却照加卖出所得 → 虚拟现金虚增（净值/单仓金额被放大）。
+    """
+    factory, _ = _db_factory()
+    port, ctx = _portfolio_single()
+    stock = "600000.SH"
+    rec = _Recorder()
+    disp, _ = _make_dispatcher(rec)
+    from core.engine.bar_poller import BarPoller
+    poller = BarPoller(disp, [stock], period="1m", count=10)
+
+    db = factory()
+    lo = LiveOrder(
+        live_session_id=1, portfolio_strategy_id=1, strategy_id=1, stock_code=stock,
+        trade_type="sell", order_type="external", price=Decimal("9.5"), quantity=100,
+        filled_quantity=100, filled_price=Decimal("9.5"), status="filled",
+        bar_time=datetime(2026, 8, 5, 10, 0),
+    )
+    db.add(lo)
+    db.flush()
+    db.add(LiveTrade(
+        live_session_id=1, live_order_id=lo.id, portfolio_strategy_id=1, strategy_id=1,
+        stock_code=stock, trade_type="sell", price=Decimal("9.5"), quantity=100,
+        amount=Decimal("950"), commission=Decimal("0"), stamp_duty=Decimal("0"),
+        trade_time=datetime(2026, 8, 5, 10, 0),
+    ))
+    db.commit()
+    db.close()
+
+    engine = LiveEngine(
+        session_id=1, portfolios=[port], dispatcher=disp,
+        bar_poller=poller, db_session_factory=factory,
+    )
+    db = factory()
+    engine.recover(db)
+    db.close()
+
+    assert stock not in ctx.positions
+    assert port.account.cash == Decimal("100000")
 
 
 # ---------------- LiveT1Checker ----------------
@@ -1272,6 +2013,36 @@ def test_try_match_order_ref_finds_bridge_order():
     db.close()
 
 
+def test_try_match_order_ref_clears_untraceable_marker():
+    """迟到的 order_ref 追平后撤掉 bridge_order_untraceable 标记。
+
+    在途闸口径统一的配套：180s 不可追溯只是「一次性放行」，不是永久豁免。
+    该单若后来被 /orders 追平（确实在柜台在途），必须重新占用同股同向门，
+    否则同一只票可能被重复报单。
+    """
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single()
+    rec = _Recorder()
+    _mock_orders_deals(rec, orders=[{
+        "source": "BRIDGE", "instrument": "600000", "exchange": "SH",
+        "direction": 48, "volume": 600, "order_ref": "ref-late",
+        "remark": _TEST_REMARK,
+    }])
+    disp, _ = _make_dispatcher(rec)
+    engine = _make_engine(disp, factory, port)
+    db = factory()
+    lo = _submitted_order(db, quantity=600)
+    lo.error_message = ("bridge_order_untraceable: 桥通道 180s 未匹配到柜台委托号"
+                        "（仍在途，不判 rejected；已释放同股同向门）")
+    db.commit()
+
+    engine._try_match_order_ref(lo)
+
+    assert lo.order_ref == "ref-late"
+    assert lo.error_message is None
+    db.close()
+
+
 def test_try_match_order_ref_does_not_collide_same_code_dir_volume():
     """回归：同股票同向同量的多笔在途单，order_ref 匹配不得撞同一个 ref。
 
@@ -1423,6 +2194,109 @@ def test_match_legacy_fuzzy_binds_recent_candidate():
     engine._try_match_order_ref(lo)
 
     assert lo.order_ref == "ref-recent"
+    db.close()
+
+
+def test_match_legacy_fuzzy_claims_unique_smaller_volume_and_records_actual():
+    """P0-1 放宽：柜台委托量(300) < 审批量(600) 且是唯一候选 → 认领，
+    并按实际委托量改写订单量（后续 backfill 可按 300 判 filled 记账）。"""
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single()
+    rec = _Recorder()
+    _mock_orders_deals(rec, orders=[
+        {"source": "BRIDGE", "instrument": "600000", "exchange": "SH",
+         "direction": 48, "volume": 300, "order_ref": "ref-clamped",
+         "insert_date": "20260813", "insert_time": "112200"},
+    ])
+    disp, _ = _make_dispatcher(rec)
+    engine = _make_engine(disp, factory, port)
+    db = factory()
+    lo = _submitted_order(db, quantity=600, bridge_order_id=None)
+    lo.created_at = datetime(2026, 8, 13, 3, 21, 0)  # UTC = 北京 11:21
+    db.commit()
+
+    engine._try_match_order_ref(lo)
+
+    assert lo.order_ref == "ref-clamped"
+    assert lo.quantity == 300  # 认领成功按柜台真实委托量记录
+    db.close()
+
+
+def test_match_legacy_fuzzy_rejects_ambiguous_smaller_volumes():
+    """多个「更小量」候选 → 歧义，不认领（保持原失败语义），委托量不变。"""
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single()
+    rec = _Recorder()
+    _mock_orders_deals(rec, orders=[
+        {"source": "BRIDGE", "instrument": "600000", "exchange": "SH",
+         "direction": 48, "volume": 300, "order_ref": "ref-a",
+         "insert_date": "20260813", "insert_time": "112200"},
+        {"source": "BRIDGE", "instrument": "600000", "exchange": "SH",
+         "direction": 48, "volume": 200, "order_ref": "ref-b",
+         "insert_date": "20260813", "insert_time": "112300"},
+    ])
+    disp, _ = _make_dispatcher(rec)
+    engine = _make_engine(disp, factory, port)
+    db = factory()
+    lo = _submitted_order(db, quantity=600, bridge_order_id=None)
+    lo.created_at = datetime(2026, 8, 13, 3, 21, 0)
+    db.commit()
+
+    engine._try_match_order_ref(lo)
+
+    assert lo.order_ref is None
+    assert lo.quantity == 600
+    db.close()
+
+
+def test_match_legacy_fuzzy_rejects_volume_greater_than_target():
+    """柜台委托量 > 审批量 → 不认领（放宽只接受 ≤ 目标量）。"""
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single()
+    rec = _Recorder()
+    _mock_orders_deals(rec, orders=[
+        {"source": "BRIDGE", "instrument": "600000", "exchange": "SH",
+         "direction": 48, "volume": 700, "order_ref": "ref-big",
+         "insert_date": "20260813", "insert_time": "112200"},
+    ])
+    disp, _ = _make_dispatcher(rec)
+    engine = _make_engine(disp, factory, port)
+    db = factory()
+    lo = _submitted_order(db, quantity=600, bridge_order_id=None)
+    lo.created_at = datetime(2026, 8, 13, 3, 21, 0)
+    db.commit()
+
+    engine._try_match_order_ref(lo)
+
+    assert lo.order_ref is None
+    assert lo.quantity == 600
+    db.close()
+
+
+def test_match_legacy_fuzzy_strict_volume_wins_over_smaller_candidate():
+    """存在数量完全相等的候选时优先严格匹配（放宽只在无严格候选时生效）。"""
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single()
+    rec = _Recorder()
+    _mock_orders_deals(rec, orders=[
+        {"source": "BRIDGE", "instrument": "600000", "exchange": "SH",
+         "direction": 48, "volume": 600, "order_ref": "ref-strict",
+         "insert_date": "20260813", "insert_time": "112200"},
+        {"source": "BRIDGE", "instrument": "600000", "exchange": "SH",
+         "direction": 48, "volume": 300, "order_ref": "ref-small",
+         "insert_date": "20260813", "insert_time": "112300"},
+    ])
+    disp, _ = _make_dispatcher(rec)
+    engine = _make_engine(disp, factory, port)
+    db = factory()
+    lo = _submitted_order(db, quantity=600, bridge_order_id=None)
+    lo.created_at = datetime(2026, 8, 13, 3, 21, 0)
+    db.commit()
+
+    engine._try_match_order_ref(lo)
+
+    assert lo.order_ref == "ref-strict"
+    assert lo.quantity == 600
     db.close()
 
 
@@ -1980,6 +2854,70 @@ def test_handle_bar_sell_blocked_by_inflight_sell_next_bar():
     db.close()
 
 
+def test_handle_bar_sell_allowed_when_inflight_untraceable():
+    """在途闸口径统一（2026-11-10）：已打 bridge_order_untraceable 标记的单不再占
+    同股同向门 → 止损/平仓卖单不被桥通道的 600s 账务窗口压住（最多压 180s）。
+
+    该单仍是 submitted（不判 rejected、迟到成交仍回填纠正），只是不挡新单。
+    """
+    factory, _ = _db_factory()
+    port, ctx = _portfolio_single(strategy_id=1, period="1m")
+    ctx.formula_signals = [
+        {"signal_name": "close_sig", "signal_type": SignalType.CLOSE, "trigger_value": -1},
+    ]
+    stock = "600000.SH"
+    bar_time_first = datetime(2026, 8, 5, 10, 0)
+    bar_time_next = datetime(2026, 8, 5, 10, 5)
+    ctx.positions[stock] = Position(stock)
+    ctx.positions[stock].buy(600, Decimal("9.0"), datetime(2026, 8, 5, 9, 30))
+
+    def respond(request):
+        path = request.url.path
+        if path == "/positions":
+            return httpx.Response(200, json={"ok": True, "data": [
+                {"instrument": "600000", "exchange": "SH",
+                 "available": 600, "volume": 600,
+                 "yesterday_volume": 600, "on_road_volume": 0},
+            ]})
+        if path in ("/order", "/ping"):
+            return httpx.Response(200, json={"ok": True})
+        if path == "/quote":
+            return httpx.Response(200, json={"ok": True, "data": {}})
+        return httpx.Response(404, json={"ok": False, "error": "unknown"})
+    rec = _Recorder(respond=respond)
+    disp, _ = _make_dispatcher(rec)
+    from core.engine.bar_poller import BarPoller
+    poller = BarPoller(disp, [stock], period="1m", count=10)
+
+    # 预置：10:00 已下过 SELL，180s 后仍未拿到 order_ref → 已打不可追溯标记
+    db = factory()
+    lo = _seed_buy_submitted(db, bar_time_first, status="submitted", trade_type="sell")
+    lo.error_message = (
+        "bridge_order_untraceable: 桥通道 180s 未匹配到柜台委托号（仍在途，"
+        "不判 rejected；已释放同股同向门）"
+    )
+    db.commit()
+    db.close()
+
+    engine = LiveEngine(
+        session_id=1, portfolios=[port], dispatcher=disp,
+        bar_poller=poller, db_session_factory=factory,
+    )
+    engine.signal_cache = {(1, stock, bar_time_next): [{"name": "close_sig", "value": -1}]}
+    bar = _bar(stock, "9.0", bar_time_next)
+
+    engine._handle_bar(port, bar)
+
+    db = factory()
+    orders = db.query(LiveOrder).all()
+    assert len(orders) == 2  # 不可追溯单（仍 submitted）+ 新止损卖单
+    assert sorted(o.trade_type for o in orders) == ["sell", "sell"]
+    assert {o.status for o in orders if o.id != lo.id} == {"submitted"}
+    placed = [r for r in rec.requests if r.url.path == "/order"]
+    assert len(placed) == 1
+    db.close()
+
+
 def test_handle_bar_buy_allowed_after_inflight_rejected():
     """在途单门释放：上一单 rejected（桥拒单/离线）→ 门不拦，新 OPEN 正常下单。
 
@@ -2220,7 +3158,94 @@ def test_external_deal_unknown_direction_is_skipped_with_warning(caplog):
     assert db.query(LiveOrder).count() == 0
     assert db.query(LiveTrade).count() == 0
     db.close()
-    assert any("unknown direction" in r.getMessage() for r in caplog.records)
+    assert any("direction unresolved" in r.getMessage() for r in caplog.records)
+
+
+def test_external_deal_direction_uses_offset_flag_without_side():
+    """方向判定以 m_nOffsetFlag 为准（QMT 官方文档：股票 m_nDirection 恒为 48）。
+
+    桥行缺 side 时，direction=48 + offset_flag=49 必须判成卖（49~54=卖），
+    不能因为 direction 是 48 就当买入，也不能当「未知方向」丢掉。
+    """
+    factory, _ = _db_factory()
+    port, ctx = _portfolio_single()
+    ctx.positions["601827.SH"] = Position("601827.SH")
+    ctx.positions["601827.SH"].buy(5400, Decimal("7.90"))
+    rec = _Recorder()
+    _mock_orders_deals(rec, orders=[], deals=[{
+        "order_ref": "ext-offset-sell-1", "trade_id": "T-OF-1",
+        "instrument": "601827", "exchange": "SH",
+        "direction": 48, "direction_raw": 48, "offset_flag": 49,  # 无 side
+        "price": 7.98, "volume": 100, "amount": 798.0,
+        "trade_time": "145620", "trade_date": "20261110",
+    }])
+    disp, _ = _make_dispatcher(rec)
+    engine = _make_engine(disp, factory, port)
+
+    engine._poll_deals()
+
+    db = factory()
+    orders = db.query(LiveOrder).filter(LiveOrder.order_type == "external").all()
+    assert [(o.stock_code, o.trade_type, o.status) for o in orders] == [
+        ("601827.SH", "sell", "filled")]
+    trades = db.query(LiveTrade).all()
+    assert [(t.stock_code, t.trade_type, t.quantity) for t in trades] == [
+        ("601827.SH", "sell", 100)]
+    db.close()
+    assert ctx.positions["601827.SH"].quantity == 5400  # 只留痕，不 apply
+
+
+def test_external_deal_unknown_direction_logs_once_then_aggregates(caplog):
+    """缺陷4 刷屏抑制：同一 (code, direction, 委托号) 只 ERROR 一次，之后按分钟聚合。
+
+    48 不映射（QMT 原始 m_nDirection 对股票/ETF 买卖都回 48，无法判方向），
+    首次 ERROR + 一次性 risk 事件给人工路径，后续轮询不再逐条刷屏。
+    """
+    import logging
+
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single()
+    rec = _Recorder()
+    _mock_orders_deals(rec, orders=[], deals=[{
+        "order_ref": "ext-48-1", "trade_id": "T-48-1",
+        "instrument": "510050", "exchange": "SH", "direction": 48,
+        "price": 3.05, "volume": 1000, "amount": 3050.0,
+        "trade_time": "093000", "trade_date": "20261110",
+    }])
+    disp, _ = _make_dispatcher(rec)
+    engine = _make_engine(disp, factory, port)
+    q = asyncio.Queue()
+    engine._stream_subscribers.append(q)
+    machine = engine._order_machine
+    clock = [1000.0]
+    machine._unknown_deal_dir_clock = lambda: clock[0]
+
+    with caplog.at_level(logging.WARNING):
+        engine._poll_deals()
+        engine._poll_deals()
+        engine._poll_deals()
+
+    errors = [r for r in caplog.records if "external deal skipped" in r.getMessage()]
+    assert len(errors) == 1  # 只记一次（后续两轮静默计数）
+    assert machine._unknown_deal_dirs[("510050.SH", "48", "ext-48-1")]["count"] == 3
+    risks = []
+    while not q.empty():
+        ev = q.get_nowait()
+        if ev.get("type") == "risk":
+            risks.append(ev)
+    assert len(risks) == 1
+    assert risks[0]["rule"] == "external_deal_unknown_direction"
+    assert "510050.SH" in risks[0]["message"]
+    # 一分钟后再刷到 → 只出一条聚合计数，不再逐条
+    clock[0] += 61
+    with caplog.at_level(logging.WARNING):
+        engine._poll_deals()
+    agg = [r for r in caplog.records if "external deal still unresolved" in r.getMessage()]
+    assert len(agg) == 1
+    assert "4 occurrences" in agg[0].getMessage()
+    db = factory()
+    assert db.query(LiveOrder).count() == 0  # 始终不入账（不猜方向）
+    db.close()
 
 
 def test_external_deals_are_idempotent_across_polls():
@@ -2471,8 +3496,8 @@ def test_dispatch_period_bar_bridge_offline_sets_offline():
 
 
 # ---- 日终 1d C6(B) ----
-def test_maybe_daily_bars_14_30_drives_1d_strategy():
-    """C6(B)：14:30 日终 → 拉 1d 快照 → 注入 1d 策略 → 下单；同日幂等只驱动一次。"""
+def test_maybe_daily_bars_1505_drives_1d_strategy():
+    """15:05 收盘落定 → 拉完整 1d bar → 注入 1d 策略 → 下单；同日幂等只驱动一次。"""
     factory, _ = _db_factory()
     port, _ = _portfolio_single(period="1d")
     stock = "600000.SH"
@@ -2488,7 +3513,7 @@ def test_maybe_daily_bars_14_30_drives_1d_strategy():
     }
     daily_time = datetime(2026, 8, 10, 0, 0)
 
-    engine._maybe_daily_bars(now=datetime(2026, 8, 10, 14, 30))
+    engine._maybe_daily_bars(now=datetime(2026, 8, 10, 15, 5))
 
     assert (1, stock, daily_time) in engine.signal_cache
     assert engine._last_daily_bar_date == datetime(2026, 8, 10).date()
@@ -2500,8 +3525,8 @@ def test_maybe_daily_bars_14_30_drives_1d_strategy():
     assert len(orders) == 1 and orders[0].strategy_id == 1
     db.close()
 
-    # 同日幂等：14:31 再调不重复驱动
-    engine._maybe_daily_bars(now=datetime(2026, 8, 10, 14, 31))
+    # 同日幂等：15:06 再调不重复驱动
+    engine._maybe_daily_bars(now=datetime(2026, 8, 10, 15, 6))
     db = factory()
     assert db.query(LiveOrder).count() == 1
     db.close()
@@ -2544,7 +3569,7 @@ def test_maybe_daily_bars_1d_uses_code_period_count_and_dedup():
 
     engine._tq_formula.compute_injected_batch = spy
 
-    engine._maybe_daily_bars(now=datetime(2026, 8, 10, 14, 30))
+    engine._maybe_daily_bars(now=datetime(2026, 8, 10, 15, 5))
 
     # 长度规则：/quote 按 (code,'1d') 的 _code_period_count=3 拉（非周期级 _period_count/全局 200）
     assert any("period=1d" in str(r.url) and "count=3" in str(r.url) for r in rec.requests), \
@@ -2554,8 +3579,8 @@ def test_maybe_daily_bars_1d_uses_code_period_count_and_dedup():
     assert df is not None and len(df["Close"]) == 3
 
 
-def test_maybe_daily_bars_before_1430_no_trigger():
-    """C6(B)：未到 14:30 不触发（不拉快照、不驱动、不记幂等标记）。"""
+def test_maybe_daily_bars_before_1505_no_trigger():
+    """收盘未落定（< 15:05）不触发：不拉 bar、不驱动、不记幂等标记。"""
     factory, _ = _db_factory()
     port, _ = _portfolio_single(period="1d")
     stock = "600000.SH"
@@ -2564,12 +3589,400 @@ def test_maybe_daily_bars_before_1430_no_trigger():
     disp, _ = _make_dispatcher(rec)
     engine = _make_engine_formula_portfolio(disp, factory, port, {1: "MA_CROSS"})
 
-    engine._maybe_daily_bars(now=datetime(2026, 8, 10, 14, 29))
+    engine._maybe_daily_bars(now=datetime(2026, 8, 10, 15, 4))
 
     assert engine._last_daily_bar_date is None
     db = factory()
     assert db.query(LiveOrder).count() == 0
     db.close()
+
+
+# ---- 14:50 提前收盘价（功能二：仅 1d，周线/月线不提前）----
+class _SynthStub:
+    """快照合成器桩：completed_bars 返回固定 1m bars，记录调用次数。"""
+
+    def __init__(self, rows_by_code):
+        self.rows_by_code = rows_by_code
+        self.calls = 0
+
+    def completed_bars(self, codes, count=10):
+        self.calls += 1
+        return {c: list(self.rows_by_code[c]) for c in codes if c in self.rows_by_code}
+
+    def open_at(self, codes, start):
+        """B 执行价：bar 标签 = 分钟终点（start + 1min），返回该 bar 的 open。"""
+        label = start.replace(second=0, microsecond=0) + timedelta(minutes=1)
+        out = {}
+        for c in codes:
+            for row in self.rows_by_code.get(c, []):
+                try:
+                    t = datetime.strptime(str(row.get("stime")), "%Y%m%d%H%M%S")
+                except (TypeError, ValueError):
+                    continue
+                if t == label:
+                    out[c] = row["open"]
+                    break
+        return out
+
+
+def _make_advance_engine(disp, factory, port, stock, synth, trading_dates,
+                         **extra):
+    """构造开启 14:50 提前收盘价的 LiveEngine（注入假日历 + 快照合成器桩）。"""
+    from core.engine.bar_poller import BarPoller
+    from core.engine.trading_calendar import TradingCalendar
+    poller = BarPoller(disp, [stock], period="1m", count=10)
+    engine = LiveEngine(
+        session_id=1, portfolios=[port], dispatcher=disp,
+        bar_poller=poller, db_session_factory=factory,
+        advance_close_enabled=True, advance_close_time="14:51",
+        snapshot_synth=synth, **extra,
+    )
+    engine._calendar = TradingCalendar(lambda: list(trading_dates))
+    return engine
+
+
+def test_advance_close_drives_1d_with_1450_close_price():
+    """功能二：14:51 用快照合成 14:50 1m bar 收盘价（9.6）驱动 1d 信号+风控。
+
+    验证：① 收盘价覆盖为快照价（非桥 1d forming 9.2）；② period=1d；
+    ③ mismatched_risk=False（周线/月线不参与）；④ 幂等标记落内存与 DB；
+    ⑤ 同日再次 tick 不重复执行；⑥ 重启后从 DB 恢复幂等。
+    """
+    factory, _ = _db_factory()
+    db = factory()
+    db.add(LiveSession(id=1, name="adv", mode="live", engine="tdx",
+                       status="running", execution_mode="auto"))
+    db.commit()
+    db.close()
+    port, _ = _portfolio_single(period="1d")
+    stock = "600000.SH"
+    daily_bars = [{"stime": "20260810000000", "open": 9.0, "high": 9.2,
+                   "low": 9.0, "close": 9.2, "volume": 10000, "amount": 92000.0}]
+    rec = _Recorder(respond=_respond_quote_bars(stock, daily_bars))
+    disp, _ = _make_dispatcher(rec)
+    synth = _SynthStub({stock: [
+        {"stime": "20260810145100", "open": 9.3, "high": 9.4,
+         "low": 9.2, "close": 9.6, "volume": 500, "amount": 4800.0},
+        # 14:51 起始 1m bar（兜底执行价）
+        {"stime": "20260810145200", "open": 9.55, "high": 9.6,
+         "low": 9.5, "close": 9.58, "volume": 400, "amount": 3800.0},
+        # 14:52 起始 1m bar（主执行价）
+        {"stime": "20260810145300", "open": 9.7, "high": 9.8,
+         "low": 9.65, "close": 9.75, "volume": 300, "amount": 2900.0},
+    ]})
+    engine = _make_advance_engine(disp, factory, port, stock, synth,
+                                  [date(2026, 8, 10)])
+    daily_time = datetime(2026, 8, 10, 0, 0)
+    engine.signal_cache = {(1, stock, daily_time): [{"name": "open_sig", "value": 1}]}
+    seen = []
+    orig_on_bar = port.on_bar
+
+    def spy(bar, **kwargs):
+        seen.append((bar.period, bar.stocks[stock]["close"],
+                     kwargs.get("mismatched_risk")))
+        return orig_on_bar(bar, **kwargs)
+
+    port.on_bar = spy
+
+    engine._maybe_advance_daily_close(now=datetime(2026, 8, 10, 14, 52))
+
+    assert seen == [("1d", Decimal("9.6"), False)]
+    # 提前收盘价轮次 = 当日尾盘直接报单（用户口径），不再进 B-1 次日延迟队列；
+    # 即便该策略 risk_timing 仍是默认 next_day（收盘落定轮次依旧 defer）。
+    assert port.strategies[0].risk_timing == "next_day"
+    assert len(engine._signal_bar_deferred) == 0
+    db = factory()
+    orders = db.query(LiveOrder).all()
+    assert len(orders) == 1
+    assert orders[0].status == "submitted"
+    assert orders[0].quantity == 600  # int(0.1*60000/9.6/100)*100，按 14:50 价 9.6 计算
+    # B 执行价：委托价 = 14:52 起始 1m bar 的 open（9.7），不是合成收盘价 9.6
+    assert Decimal(orders[0].price) == Decimal("9.7")
+    assert db.query(LiveSession).first().advance_close_done_date == "2026-08-10"
+    db.close()
+
+    # 同日再次 tick（14:53）：不重复执行
+    engine._maybe_advance_daily_close(now=datetime(2026, 8, 10, 14, 53))
+    assert synth.calls == 1 and len(seen) == 1
+
+    # 重启（新引擎同一 DB）：从 advance_close_done_date 恢复幂等，不再执行
+    synth2 = _SynthStub({stock: [
+        {"stime": "20260810145100", "open": 9.3, "high": 9.4,
+         "low": 9.2, "close": 9.6, "volume": 500, "amount": 4800.0},
+        {"stime": "20260810145300", "open": 9.7, "high": 9.8,
+         "low": 9.65, "close": 9.75, "volume": 300, "amount": 2900.0},
+    ]})
+    engine2 = _make_advance_engine(disp, factory, port, stock, synth2,
+                                   [date(2026, 8, 10)])
+    engine2._maybe_advance_daily_close(now=datetime(2026, 8, 10, 14, 53))
+    assert synth2.calls == 0
+
+
+def test_advance_close_sell_still_blocked_by_t1_available():
+    """提前收盘价轮次不绕过 T+1：当日可用为 0 的持仓，14:51 CLOSE 不下单。
+
+    保留「尾盘买入当日不可卖」：advance_close 只改「当日提交」，不改 T+1 校验。
+    """
+    factory, _ = _db_factory()
+    db = factory()
+    db.add(LiveSession(id=1, name="adv_t1", mode="live", engine="tdx",
+                       status="running", execution_mode="auto"))
+    db.commit()
+    db.close()
+    port, ctx = _portfolio_single(period="1d")
+    stock = "600000.SH"
+    ctx.formula_signals = [
+        {"signal_name": "close_sig", "signal_type": SignalType.CLOSE, "trigger_value": 1},
+    ]
+    _hold(ctx)  # 持仓 1000（昨仓，但桥返回可用 0 = 今日已用掉额度）
+    daily_bars = [{"stime": "20260810000000", "open": 9.0, "high": 9.2,
+                   "low": 9.0, "close": 9.2, "volume": 10000, "amount": 92000.0}]
+    rec = _Recorder(respond=_respond_quote_bars(stock, daily_bars))
+    quote_respond = rec._respond
+
+    def respond(request):
+        # 桥 /positions 返回该仓「可用=0」（今日额度已用完）→ T+1 拒卖
+        if request.url.path == "/positions":
+            return httpx.Response(200, json={"ok": True, "data": [{
+                "instrument": "600000", "exchange": "SH",
+                "available": 0, "volume": 1000,
+                "yesterday_volume": 0, "on_road_volume": 0,
+            }]})
+        return quote_respond(request)
+
+    rec._respond = respond
+    disp, _ = _make_dispatcher(rec)
+    synth = _SynthStub({stock: [
+        {"stime": "20260810145100", "open": 9.3, "high": 9.4,
+         "low": 9.2, "close": 9.6, "volume": 500, "amount": 4800.0},
+        {"stime": "20260810145300", "open": 9.7, "high": 9.8,
+         "low": 9.65, "close": 9.75, "volume": 300, "amount": 2900.0},
+    ]})
+    engine = _make_advance_engine(disp, factory, port, stock, synth,
+                                  [date(2026, 8, 10)])
+    daily_time = datetime(2026, 8, 10, 0, 0)
+    engine.signal_cache = {(1, stock, daily_time): [{"name": "close_sig", "value": 1}]}
+
+    engine._maybe_advance_daily_close(now=datetime(2026, 8, 10, 14, 52))
+
+    db = factory()
+    assert db.query(LiveOrder).count() == 0  # T+1 可用 0 → 拒卖
+    db.close()
+    assert not any(r.url.path == "/order" for r in rec.requests)
+
+
+def test_advance_close_missing_1450_bar_fails_closed():
+    """取不到 14:50 快照价 → 不执行、不伪造价格；14:59 后 ERROR + risk 事件。"""
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single(period="1d")
+    stock = "600000.SH"
+    daily_bars = [{"stime": "20260810000000", "open": 9.0, "high": 9.2,
+                   "low": 9.0, "close": 9.2, "volume": 10000, "amount": 92000.0}]
+    rec = _Recorder(respond=_respond_quote_bars(stock, daily_bars))
+    disp, _ = _make_dispatcher(rec)
+    # 只有 14:49 分钟 bar（14:50 未闭合/未采样）
+    synth = _SynthStub({stock: [{
+        "stime": "20260810145000", "open": 9.3, "high": 9.4,
+        "low": 9.2, "close": 9.6, "volume": 500, "amount": 4800.0,
+    }]})
+    engine = _make_advance_engine(disp, factory, port, stock, synth,
+                                  [date(2026, 8, 10)])
+    engine.signal_cache = {}
+    q = asyncio.Queue()
+    engine._stream_subscribers.append(q)
+
+    engine._maybe_advance_daily_close(now=datetime(2026, 8, 10, 14, 52))
+    assert engine._last_advance_close_date is None
+    assert q.empty()  # 仅 INFO 重试提示，不告警
+
+    engine._maybe_advance_daily_close(now=datetime(2026, 8, 10, 14, 59))
+    ev = q.get_nowait()
+    assert ev["type"] == "risk"
+    assert ev["rule"] == "advance_close_unavailable"
+    db = factory()
+    assert db.query(LiveOrder).count() == 0  # 不伪造价格、不下单
+    db.close()
+
+
+def test_advance_close_exec_price_falls_back_to_1451_bar():
+    """14:52 起始 bar 取不到 → 回退 14:51 起始 bar 的 open，并推 fallback 风控事件。"""
+    factory, _ = _db_factory()
+    db = factory()
+    db.add(LiveSession(id=1, name="adv_fb", mode="live", engine="tdx",
+                       status="running", execution_mode="auto"))
+    db.commit()
+    db.close()
+    port, _ = _portfolio_single(period="1d")
+    stock = "600000.SH"
+    daily_bars = [{"stime": "20260810000000", "open": 9.0, "high": 9.2,
+                   "low": 9.0, "close": 9.2, "volume": 10000, "amount": 92000.0}]
+    rec = _Recorder(respond=_respond_quote_bars(stock, daily_bars))
+    disp, _ = _make_dispatcher(rec)
+    synth = _SynthStub({stock: [
+        {"stime": "20260810145100", "open": 9.3, "high": 9.4,
+         "low": 9.2, "close": 9.6, "volume": 500, "amount": 4800.0},
+        # 只有 14:51 起始 bar（14:52 起始缺失）
+        {"stime": "20260810145200", "open": 9.55, "high": 9.6,
+         "low": 9.5, "close": 9.58, "volume": 400, "amount": 3800.0},
+    ]})
+    engine = _make_advance_engine(disp, factory, port, stock, synth,
+                                  [date(2026, 8, 10)])
+    daily_time = datetime(2026, 8, 10, 0, 0)
+    engine.signal_cache = {(1, stock, daily_time): [{"name": "open_sig", "value": 1}]}
+    q = asyncio.Queue()
+    engine._stream_subscribers.append(q)
+
+    engine._maybe_advance_daily_close(now=datetime(2026, 8, 10, 14, 53))
+
+    db = factory()
+    orders = db.query(LiveOrder).all()
+    assert len(orders) == 1
+    assert Decimal(orders[0].price) == Decimal("9.55")  # 14:51 起始 bar 的 open
+    db.close()
+    ev = q.get_nowait()
+    assert ev["type"] == "risk"
+    assert ev["rule"] == "advance_close_exec_price_fallback"
+
+
+def test_advance_close_exec_price_missing_fails_closed():
+    """14:52/14:51 起始 bar 都取不到 → 该 code 不下单 + missing 风控事件（不伪造价格）。"""
+    factory, _ = _db_factory()
+    db = factory()
+    db.add(LiveSession(id=1, name="adv_miss", mode="live", engine="tdx",
+                       status="running", execution_mode="auto"))
+    db.commit()
+    db.close()
+    port, _ = _portfolio_single(period="1d")
+    stock = "600000.SH"
+    daily_bars = [{"stime": "20260810000000", "open": 9.0, "high": 9.2,
+                   "low": 9.0, "close": 9.2, "volume": 10000, "amount": 92000.0}]
+    rec = _Recorder(respond=_respond_quote_bars(stock, daily_bars))
+    disp, _ = _make_dispatcher(rec)
+    synth = _SynthStub({stock: [
+        {"stime": "20260810145100", "open": 9.3, "high": 9.4,
+         "low": 9.2, "close": 9.6, "volume": 500, "amount": 4800.0},
+    ]})
+    engine = _make_advance_engine(disp, factory, port, stock, synth,
+                                  [date(2026, 8, 10)])
+    daily_time = datetime(2026, 8, 10, 0, 0)
+    engine.signal_cache = {(1, stock, daily_time): [{"name": "open_sig", "value": 1}]}
+    q = asyncio.Queue()
+    engine._stream_subscribers.append(q)
+
+    engine._maybe_advance_daily_close(now=datetime(2026, 8, 10, 14, 53))
+
+    db = factory()
+    assert db.query(LiveOrder).count() == 0  # fail-closed，不下单
+    db.close()
+    assert not any(r.url.path == "/order" for r in rec.requests)
+    ev = q.get_nowait()
+    assert ev["type"] == "risk"
+    assert ev["rule"] == "advance_close_exec_price_missing"
+
+
+def test_advance_enabled_skips_1d_on_post_close_round():
+    """提前轮次**已成功执行**后，15:05 收盘落定轮次不再重复驱动 1d。
+
+    2026-08-10 为周一（非周期末）→ periods 为空，不驱动任何周期，只记幂等标记。
+    """
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single(period="1d")
+    stock = "600000.SH"
+    daily_bars = [{"stime": "20260810000000", "open": 9.0, "high": 9.2,
+                   "low": 9.0, "close": 9.2, "volume": 10000, "amount": 92000.0}]
+    rec = _Recorder(respond=_respond_quote_bars(stock, daily_bars))
+    disp, _ = _make_dispatcher(rec)
+    synth = _SynthStub({})
+    from core.tq.formula import TQFormula
+    engine = _make_advance_engine(
+        disp, factory, port, stock, synth, [date(2026, 8, 10)],
+        tq_formula=TQFormula(), formula_by_strategy={1: "MA_CROSS"},
+    )
+    engine._tq_formula.compute = MagicMock(return_value={})
+    engine._tq_formula.compute_injected_batch = MagicMock(return_value=None)
+    # 模拟 14:52 提前轮次当日已成功执行（advance_close_done_date 落库）
+    engine._closer._advance_done_loaded = True
+    engine._closer.last_advance_close_date = date(2026, 8, 10)
+    seen_periods = []
+    orig_on_bar = port.on_bar
+
+    def spy(bar, **kwargs):
+        seen_periods.append(bar.period)
+        return orig_on_bar(bar, **kwargs)
+
+    port.on_bar = spy
+
+    engine._maybe_daily_bars(now=datetime(2026, 8, 10, 15, 5))
+
+    assert seen_periods == []  # 1d 已由提前轮次负责；非周期末无 1w/1mon
+    assert engine._last_daily_bar_date == date(2026, 8, 10)
+    assert not any(r.url.path == "/quote" for r in rec.requests)
+
+
+def test_advance_enabled_falls_back_to_post_close_1d_when_advance_failed():
+    """P1：提前轮次失败（未落 advance_close_done_date）→ 15:05 仍按 post_close 驱动 1d。
+
+    勾了 B 但 14:50 价/执行价取不到时，不能整天没有 1d 信号与风控：收盘落定轮次
+    用完整日线补跑，订单带 post_close → 次日开盘执行。
+    """
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single(period="1d")
+    stock = "600000.SH"
+    daily_bars = [{"stime": "20260810000000", "open": 9.0, "high": 9.2,
+                   "low": 9.0, "close": 9.2, "volume": 10000, "amount": 92000.0}]
+    rec = _Recorder(respond=_respond_quote_bars(stock, daily_bars))
+    disp, _ = _make_dispatcher(rec)
+    synth = _SynthStub({})
+    from core.tq.formula import TQFormula
+    engine = _make_advance_engine(
+        disp, factory, port, stock, synth, [date(2026, 8, 10)],
+        tq_formula=TQFormula(), formula_by_strategy={1: "MA_CROSS"},
+    )
+    engine._tq_formula.compute = MagicMock(return_value={})
+    engine._tq_formula.compute_injected_batch = MagicMock(return_value=None)
+    engine._closer._advance_done_loaded = True
+    engine._closer.last_advance_close_date = None  # 提前轮次未成功
+    seen = []
+    orig_on_bar = port.on_bar
+
+    def spy(bar, **kwargs):
+        seen.append((bar.period, getattr(bar, "post_close", False)))
+        return orig_on_bar(bar, **kwargs)
+
+    port.on_bar = spy
+
+    engine._maybe_daily_bars(now=datetime(2026, 8, 10, 15, 5))
+
+    assert seen == [("1d", True)]  # 补跑 1d，且标记为收盘落定轮次
+
+
+def test_maybe_daily_bars_period_end_drives_1w_1mon():
+    """默认口径：非周期末只驱动 1d；月/周末才追加 1mon / 1w。
+
+    2026-08-31 为周一（本月最后一个交易日，但不是本周最后一个交易日）→ 1d + 1mon。
+    """
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single(period="1d")
+    stock = "600000.SH"
+    daily_bars = [{"stime": "20260831000000", "open": 9.0, "high": 9.2,
+                   "low": 9.0, "close": 9.2, "volume": 10000, "amount": 92000.0}]
+    rec = _Recorder(respond=_respond_quote_bars(stock, daily_bars))
+    disp, _ = _make_dispatcher(rec)
+    engine = _make_engine_formula_portfolio(disp, factory, port, {1: "MA_CROSS"})
+    engine._tq_formula.compute = MagicMock(return_value={})
+    engine._tq_formula.compute_injected_batch = MagicMock(return_value=None)
+    seen_periods = []
+    orig_on_bar = port.on_bar
+
+    def spy(bar, **kwargs):
+        seen_periods.append(bar.period)
+        return orig_on_bar(bar, **kwargs)
+
+    port.on_bar = spy
+
+    engine._maybe_daily_bars(now=datetime(2026, 8, 31, 15, 5))
+
+    assert seen_periods == ["1d", "1mon"]
 
 
 # ---- 1w/1mon 通达信注入 C6(C) ----
@@ -2592,23 +4005,23 @@ def test_inject_startup_periods_fills_signal_cache():
 
 
 def test_maybe_daily_bars_drives_1w_from_prefilled_cache():
-    """C6(C)：1w 策略日终驱动命中启动预填信号，不拉桥注入（compute_injected 不调）。"""
+    """C6(C)：1w 策略在周期末（周五）收盘落定轮次命中启动预填信号，不拉桥注入。"""
     factory, _ = _db_factory()
     port, _ = _portfolio_single(period="1w")
     stock = "600000.SH"
-    daily_bars = [{"stime": "20260810000000", "open": 9.0, "high": 9.3, "low": 9.0, "close": 9.2, "volume": 10000, "amount": 92000.0}]
+    daily_bars = [{"stime": "20260814000000", "open": 9.0, "high": 9.3, "low": 9.0, "close": 9.2, "volume": 10000, "amount": 92000.0}]
     rec = _Recorder(respond=_respond_quote_bars(stock, daily_bars))
     disp, _ = _make_dispatcher(rec)
     engine = _make_engine_formula_portfolio(disp, factory, port, {1: "MA_CROSS"})
-    daily_time = datetime(2026, 8, 10, 0, 0)
+    daily_time = datetime(2026, 8, 14, 0, 0)
     engine.signal_cache[(1, stock, daily_time)] = [{"name": "open_sig", "value": 1}]
     engine._tq_formula.compute_injected_batch =MagicMock(return_value=None)
 
-    engine._maybe_daily_bars(now=datetime(2026, 8, 10, 14, 30))
+    engine._maybe_daily_bars(now=datetime(2026, 8, 14, 15, 5))
 
     # B-1：1w 信号当日 deferred，次日首 bar 放行后落单
     assert len(engine._signal_bar_deferred) == 1
-    engine._handle_bar(port, _bar(stock, "9.2", datetime(2026, 8, 11, 9, 31)))
+    engine._handle_bar(port, _bar(stock, "9.2", datetime(2026, 8, 17, 9, 31)))
     db = factory()
     orders = db.query(LiveOrder).all()
     assert len(orders) == 1 and orders[0].strategy_id == 1
@@ -2621,25 +4034,25 @@ def test_maybe_daily_bars_day_rollover_reinjects_1w():
     factory, _ = _db_factory()
     port, _ = _portfolio_single(period="1w")
     stock = "600000.SH"
-    daily_bars = [{"stime": "20260811000000", "open": 9.0, "high": 9.3, "low": 9.0, "close": 9.2, "volume": 10000, "amount": 92000.0}]
+    daily_bars = [{"stime": "20260814000000", "open": 9.0, "high": 9.3, "low": 9.0, "close": 9.2, "volume": 10000, "amount": 92000.0}]
     rec = _Recorder(respond=_respond_quote_bars(stock, daily_bars))
     disp, _ = _make_dispatcher(rec)
     engine = _make_engine_formula_portfolio(disp, factory, port, {1: "MA_CROSS"})
-    # 启动注入在 08-10，日终落在 08-11 → 新 daily_time cache miss
-    old_daily_time = datetime(2026, 8, 10, 0, 0)
-    new_daily_time = datetime(2026, 8, 11, 0, 0)
+    # 启动注入在 08-13，日终落在 08-14 → 新 daily_time cache miss
+    old_daily_time = datetime(2026, 8, 13, 0, 0)
+    new_daily_time = datetime(2026, 8, 14, 0, 0)
     engine.signal_cache[(1, stock, old_daily_time)] = [{"name": "open_sig", "value": 1}]
     engine._tq_formula.compute = lambda *a, **kw: {
-        stock: {"open_sig": [{"Date": "20260811", "Value": 1}], "ErrorId": 0}
+        stock: {"open_sig": [{"Date": "20260814", "Value": 1}], "ErrorId": 0}
     }
 
-    engine._maybe_daily_bars(now=datetime(2026, 8, 11, 14, 30))
+    engine._maybe_daily_bars(now=datetime(2026, 8, 14, 15, 5))
 
     # 日切补注入：新 daily_time 的 cache 已填
     assert (1, stock, new_daily_time) in engine.signal_cache
     # B-1：1w 信号当日 deferred，次日首 bar 放行后落单
     assert len(engine._signal_bar_deferred) == 1
-    engine._handle_bar(port, _bar(stock, "9.2", datetime(2026, 8, 12, 9, 31)))
+    engine._handle_bar(port, _bar(stock, "9.2", datetime(2026, 8, 17, 9, 31)))
     db = factory()
     orders = db.query(LiveOrder).all()
     assert len(orders) == 1 and orders[0].strategy_id == 1
@@ -3061,7 +4474,101 @@ def test_on_bar_dispatches_boundary_once_for_same_bar_time():
     assert len(_period_quotes("5m")) == five_after_first
 
 
-# ---------------- 预热 + 增量拼接（拉取优化）----------------
+# ---------------- 周期边界新鲜度闸（gate=period_bar_freshness）----------------
+def test_dispatch_period_bar_skips_stale_bar_and_emits_risk():
+    """5m 最新完成 bar 停在上一交易日 → 不派发（绝不用旧 bar 触发）+ WARNING/risk 事件。"""
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single(period="5m")
+    stock = "600000.SH"
+    boundary = datetime(2026, 8, 12, 10, 5)
+    stale_bars = [
+        {"stime": "20260811145500", "open": 9.0, "high": 9.3, "low": 9.0,
+         "close": 9.2, "volume": 10000, "amount": 92000.0},
+        {"stime": "20260811150000", "open": 9.0, "high": 9.3, "low": 9.0,
+         "close": 9.2, "volume": 10000, "amount": 92000.0},
+    ]
+    rec = _Recorder(respond=_respond_quote_bars(stock, stale_bars))
+    disp, _ = _make_dispatcher(rec)
+    engine = _make_engine_formula_portfolio(disp, factory, port, {1: "MA_CROSS"})
+    events = []
+    engine._emit = lambda et, payload: events.append((et, payload))
+
+    status = engine._dispatch_period_bar("5m", boundary)
+
+    assert status == "stale"            # 引擎据此挂待补偿，不登记 boundary
+    assert _count_quote(rec)            # 拉过（判断数据陈旧必须看数据）
+    db = factory()
+    assert db.query(LiveOrder).all() == []
+    db.close()
+    risk = [p for t, p in events if t == "risk"]
+    assert len(risk) == 1
+    assert risk[0]["gate"] == "period_bar_freshness"
+    assert risk[0]["period"] == "5m"
+    assert risk[0]["bar_date"] == "2026-08-11"
+    assert stock in risk[0]["codes"]
+    assert risk[0]["stale_count"] == 1
+
+
+def test_on_bar_stale_boundary_pending_then_compensated():
+    """闸拦下的 boundary 不登记、挂 pending；后续 1m bar 拿到当日 bar 后补偿派发一次。"""
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single(period="5m")
+    stock = "600000.SH"
+    boundary = datetime(2026, 8, 12, 10, 5)
+    stale_bars = [
+        {"stime": "20260811145500", "open": 9.0, "high": 9.3, "low": 9.0,
+         "close": 9.2, "volume": 10000, "amount": 92000.0},
+        {"stime": "20260811150000", "open": 9.0, "high": 9.3, "low": 9.0,
+         "close": 9.2, "volume": 10000, "amount": 92000.0},
+    ]
+    rec = _Recorder(respond=_respond_quote_bars(stock, stale_bars))
+    disp, _ = _make_dispatcher(rec)
+    engine = _make_engine_formula_portfolio(disp, factory, port, {1: "MA_CROSS"})
+    engine._tq_formula.compute_injected_batch = lambda **kw: {"ErrorId": "0"}
+
+    bar = _bar(stock, "9.3", boundary)
+    bar.period = "1m"
+    engine._on_bar(bar)
+
+    # 跳过而非吞掉：boundary 未登记为已分发，改挂待补偿
+    assert boundary not in engine._dispatched_boundaries
+    assert engine._pending_boundaries.get(boundary) == {"5m"}
+
+    # TQ 刷新出当日 bar：下一根 1m（10:06 非边界）先补偿 pending boundary
+    today_bars = [
+        {"stime": "20260812100000", "open": 9.0, "high": 9.3, "low": 9.0,
+         "close": 9.2, "volume": 10000, "amount": 92000.0},
+        {"stime": "20260812100500", "open": 9.0, "high": 9.3, "low": 9.0,
+         "close": 9.2, "volume": 10000, "amount": 92000.0},
+    ]
+    rec._respond = _respond_quote_bars(stock, today_bars)
+    bar2 = _bar(stock, "9.3", datetime(2026, 8, 12, 10, 6))
+    bar2.period = "1m"
+    engine._on_bar(bar2)
+
+    five = [r for r in rec.requests
+            if r.url.path == "/quote" and "period=5m" in str(r.url)]
+    assert len(five) >= 2               # 首轮拉取（判定陈旧）+ 补偿拉取
+    assert boundary not in engine._pending_boundaries
+
+
+def test_retry_pending_boundary_expires_after_ttl():
+    """待补偿边界超 TTL（15 分钟）→ 放弃且不再拉取（旧 bar 不触发）。"""
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single(period="5m")
+    rec = _Recorder()
+    disp, _ = _make_dispatcher(rec)
+    engine = _make_engine_formula_portfolio(disp, factory, port, {1: "MA_CROSS"})
+    boundary = datetime(2026, 8, 12, 10, 5)
+    engine._pending_boundaries[boundary] = {"5m"}
+
+    engine._retry_pending_boundaries(datetime(2026, 8, 12, 10, 21))
+
+    assert boundary not in engine._pending_boundaries
+    assert _count_quote(rec) == []
+
+
+
 def test_preheat_pulls_each_code_period_once_with_code_period_count():
     """预热：遍历 _code_period_count，每 (code,period) 拉一次 code_period_count 根，
     跳过 1d/1w/1mon。按需不浪费——只拉实际有策略的 (code,period)。"""
@@ -3393,6 +4900,70 @@ def test_recover_restores_risk_state_even_with_zero_trigger_count():
     assert rm.peak_value == Decimal("900000")
 
 
+def test_recover_keeps_breaker_when_triggered_today():
+    """当日触发 max_drawdown 后重启 → 熔断态保持（次日恢复语义，不得静默解除）。"""
+    factory, _ = _db_factory()
+    engine, port = _breaker_engine(factory)
+    rm = port.risk_manager
+    rm.circuit_breaker_active = True
+    rm.breaker_trigger_date = now_shanghai().date()
+    engine._breaker.persist_risk_state(port)
+
+    rm.circuit_breaker_active = False
+    rm.breaker_trigger_date = None
+
+    db = factory()
+    engine.recover(db)
+    db.close()
+    assert rm.circuit_breaker_active is True
+    assert rm.is_trading_halted() is True
+
+
+def test_recover_clears_breaker_when_trigger_date_passed():
+    """触发日早于今天 → 重启时按次日恢复解除熔断（与盘中跨日恢复一致）。"""
+    factory, _ = _db_factory()
+    engine, port = _breaker_engine(factory)
+    rm = port.risk_manager
+    rm.circuit_breaker_active = True
+    rm.breaker_trigger_date = now_shanghai().date() - timedelta(days=1)
+    engine._breaker.persist_risk_state(port)
+
+    rm.circuit_breaker_active = False
+    rm.breaker_trigger_date = None
+
+    db = factory()
+    engine.recover(db)
+    db.close()
+    assert rm.circuit_breaker_active is False
+
+
+def test_restore_risk_state_ignores_money_fields_from_v1_payload():
+    """旧口径（无 schema 键）的 peak/prev_close 不还原：继承仓市值未扣现金前
+    写下的峰值偏高，沿用会把升级后的正常净值误判成回撤 → 启动即误触熔断。"""
+    from types import SimpleNamespace
+    from core.engine.live.breaker import BreakerService
+
+    rm = SimpleNamespace(
+        peak_value=Decimal("0"),
+        prev_close_value=None,
+        daily_pause_active=False,
+        circuit_breaker_active=False,
+        breaker_trigger_date=None,
+        daily_loss_trigger_date=None,
+    )
+    raw = json.dumps({
+        "peak_value": "1200000",
+        "prev_close_value": "1180000",
+        "daily_pause_active": True,
+        "breaker_trigger_date": "2026-10-23",
+    })
+    assert BreakerService._restore_risk_state(rm, raw) is True
+    assert rm.peak_value == Decimal("0")          # 金额类不还原
+    assert rm.prev_close_value is None
+    assert rm.daily_pause_active is True          # 日期/开关类仍还原
+    assert rm.breaker_trigger_date == date(2026, 10, 23)
+
+
 def test_restore_risk_state_bad_date_does_not_partially_apply():
     """risk_state 日期字段损坏时整体放弃恢复，不能留下「半恢复」的峰值/暂停态。"""
     from types import SimpleNamespace
@@ -3672,6 +5243,20 @@ def test_deals_loop_polls_deals_at_own_interval():
 
     asyncio.run(run_a_bit())
     assert len(calls) >= 3
+
+
+def test_deals_poll_interval_backs_off_on_slow_round_and_recovers():
+    """自适应节拍：慢一轮按实测耗时退避（上限 30s），快返回回落 5s。"""
+    factory, _ = _db_factory()
+    disp, _ = _make_dispatcher(_Recorder())
+    port, _ = _portfolio_single()
+    engine = _make_engine(disp, factory, port)
+
+    assert engine._deals_poll_interval == 5.0
+    assert engine._deals_next_interval(0.4) == 5.0                       # 快返回 → 5s
+    assert engine._deals_next_interval(13.2) == pytest.approx(13.2)      # 掘金慢轮 → 退避
+    assert engine._deals_next_interval(45.0) == 30.0                     # 上限 30s
+    assert engine._deals_next_interval(0) == 5.0                         # 非法值 → 下限
 
 
 # ---------------- D3 对账（虚拟持仓 vs 桥实际，仅告警不修正）----------------
@@ -3961,10 +5546,11 @@ def test_handle_bar_price_limit_enabled_rejects_buy_at_limit_up():
 
 
 def test_handle_bar_price_limit_pass_through_submits():
-    """Fix1：开启校验但 check_price_limit 返回 None（通过）→ 照常发单。"""
+    """Fix1：类默认开（直接构造 Portfolio 即开启）+ check_price_limit 返回
+    None（通过）→ 照常发单。"""
     factory, _ = _db_factory()
     port, _ = _portfolio_single()
-    port.price_limit_check_enabled = True
+    assert port.price_limit_check_enabled is True  # 默认开，无需显式置位
     stock = "600000.SH"
     bar_time = datetime(2026, 8, 5, 10, 0)
     engine, disp, rec = _limit_check_engine(factory, port, None)
@@ -3980,10 +5566,10 @@ def test_handle_bar_price_limit_pass_through_submits():
 
 
 def test_handle_bar_price_limit_disabled_skips_check():
-    """Fix1：配置关闭（直接构造 Portfolio 默认关）→ 完全不调校验（与回测门控一致）。"""
+    """Fix1：用户显式关闭（组合表 False）→ 完全不调校验（与回测门控一致）。"""
     factory, _ = _db_factory()
     port, _ = _portfolio_single()
-    assert port.price_limit_check_enabled is False
+    port.price_limit_check_enabled = False
     stock = "600000.SH"
     bar_time = datetime(2026, 8, 5, 10, 0)
     engine, disp, rec = _limit_check_engine(
@@ -4431,7 +6017,7 @@ def test_maybe_daily_bars_skips_non_trading_day():
     engine = _make_engine_formula_portfolio(disp, factory, port, {1: "MA_CROSS"})
     engine._calendar = TradingCalendar(lambda: [date(2026, 8, 24)])
 
-    engine._maybe_daily_bars(now=datetime(2026, 10, 1, 14, 30))  # 国庆
+    engine._maybe_daily_bars(now=datetime(2026, 10, 1, 15, 5))  # 国庆
 
     db = factory()
     assert db.query(LiveOrder).count() == 0  # 非交易日不落单
@@ -5407,12 +6993,13 @@ def test_poll_deals_does_not_reject_when_deals_has_remark_fill():
 # ---------------------------------------------------------------------------
 
 def _order_with_ref(ref="ref-cancel-1", status=54, traded_volume=0, volume=600,
-                    remark=_TEST_REMARK, direction=48):
+                    remark=_TEST_REMARK, direction=48, traded_price=None):
     """构造一笔 /orders 返回的 BRIDGE 委托字典（含 m_nOrderStatus）。"""
     return {
         "source": "BRIDGE", "instrument": "600000", "exchange": "SH",
         "direction": direction, "volume": volume, "order_ref": ref,
-        "traded_volume": traded_volume, "status": status, "remark": remark,
+        "traded_volume": traded_volume, "traded_price": traded_price,
+        "status": status, "remark": remark,
         "insert_date": "20260805", "insert_time": "100000",
     }
 
@@ -5560,6 +7147,79 @@ def test_poll_deals_inflight_status_stays_submitted():
     lo2 = db.get(LiveOrder, lo.id)
     assert lo2.status == "submitted"
     db.close()
+
+
+def test_deals_down_filled_order_advances_from_orders_row():
+    """缺陷3：/deals 连续失败时，56 全成改按 /orders 的成交量+成交价复核回填。
+
+    /deals 一挂，旧实现只等成交回报 → 订单整天停在 submitted（柜台已成、账本没有）。
+    兜底判据：/deals 连续失败 ≥2 轮 + /orders status=56 + traded_volume/traded_price。
+    """
+    factory, _ = _db_factory()
+    port, ctx = _portfolio_single()
+    rec = _Recorder(fail_paths={"/deals"})
+    _mock_orders_deals(rec, orders=[
+        _order_with_ref(ref="ref-56", status=56, traded_volume=600,
+                        traded_price=9.24)], deals=[])
+    disp, _ = _make_dispatcher(rec)
+    engine = _make_engine(disp, factory, port)
+    db = factory()
+    lo = _place_order_with_ref(db, "ref-56", quantity=600)
+    db.commit()
+    db.close()
+
+    engine._poll_deals()  # 第 1 轮：/deals 失败 1 次，未达阈值 → 不动
+    db = factory()
+    assert db.get(LiveOrder, lo.id).status == "submitted"
+    db.close()
+
+    engine._poll_deals()  # 第 2 轮：连续失败 2 次 → 按 /orders 复核全成
+
+    db = factory()
+    lo2 = db.get(LiveOrder, lo.id)
+    assert lo2.status == "filled"
+    assert lo2.filled_quantity == 600
+    assert lo2.filled_price == Decimal("9.24")
+    trades = db.query(LiveTrade).all()
+    assert len(trades) == 1 and trades[0].quantity == 600
+    db.close()
+    assert ctx.positions["600000.SH"].quantity == 600  # 正常 apply
+
+
+def test_deals_down_unconfirmable_fill_alerts_and_stays_submitted():
+    """缺陷3：/orders 报 56 但缺成交价 → 不假装成交：一次性 risk 告警 + 保持 submitted。"""
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single()
+    rec = _Recorder(fail_paths={"/deals"})
+    _mock_orders_deals(rec, orders=[
+        _order_with_ref(ref="ref-56", status=56, traded_volume=600,
+                        traded_price=None)], deals=[])
+    disp, _ = _make_dispatcher(rec)
+    engine = _make_engine(disp, factory, port)
+    q = asyncio.Queue()
+    engine._stream_subscribers.append(q)
+    db = factory()
+    lo = _place_order_with_ref(db, "ref-56", quantity=600)
+    db.commit()
+    db.close()
+
+    engine._poll_deals()
+    engine._poll_deals()   # 第 2 轮触发兜底，但确认不了成交
+    engine._poll_deals()   # 第 3 轮：告警不刷屏
+
+    db = factory()
+    lo2 = db.get(LiveOrder, lo.id)
+    assert lo2.status == "submitted"          # 绝不假装成交
+    assert lo2.filled_quantity == 0
+    assert (lo2.error_message or "").startswith("bridge_deals_stale:")
+    assert db.query(LiveTrade).count() == 0
+    db.close()
+    rules = []
+    while not q.empty():
+        ev = q.get_nowait()
+        if ev.get("type") == "risk":
+            rules.append(ev.get("rule"))
+    assert rules.count("bridge_deals_stale") == 1
 
 
 def test_poll_deals_status_55_part_succ_stays_alive():
@@ -5736,6 +7396,78 @@ def test_backfill_filled_logs_info(caplog):
     db.close()
     assert any("backfill" in m and "600000.SH" in m and "filled" in m
                for m in _log_msgs(caplog)), _log_msgs(caplog)
+
+
+def test_fill_price_deviation_emits_risk_event():
+    """P0-3：桥通道成交价偏离审批价超阈值 → risk/fill_price_deviation（含三价）。"""
+    factory, _ = _db_factory()
+    db = factory()
+    lo = LiveOrder(
+        live_session_id=1, portfolio_strategy_id=1, strategy_id=1, stock_code="600000.SH",
+        trade_type="buy", order_type="limit", price=Decimal("9.0"), quantity=1000,
+        filled_quantity=1000, filled_price=Decimal("9.5"), status="filled",
+        signal_name="open_sig", signal_type="OPEN",
+        bar_time=datetime(2026, 8, 5, 10, 0), order_ref="ref-dev",
+    )
+    db.add(lo)
+    db.commit()
+    db.close()
+
+    port, _ = _portfolio_single()
+    engine, _ = _ss_engine(factory, port)
+    engine._fill_price_deviation_pct = Decimal("1.0")
+    events = []
+    engine._emit = lambda et, payload: events.append((et, payload))
+
+    engine._check_fill_price_deviation()
+    risks = [p for et, p in events if et == "risk"]
+    assert len(risks) == 1, events
+    assert risks[0]["gate"] == "fill_price_deviation"
+    assert risks[0]["rule"] == "fill_price_deviation"
+    assert risks[0]["approval_price"] == 9.0
+    assert risks[0]["fill_price"] == 9.5
+    assert risks[0]["deviation_pct"] == 5.5556
+    assert risks[0]["threshold_pct"] == 1.0
+    assert risks[0]["stock_code"] == "600000.SH"
+
+    # 同一单（同 filled_quantity）重复扫描不重复报
+    engine._check_fill_price_deviation()
+    assert len([p for et, p in events if et == "risk"]) == 1
+
+
+def test_fill_price_deviation_skips_ui_channels_and_small_deviation():
+    """P0-3：TDX/THS（supports_remark=False）不纳入；偏离未超阈值不发。"""
+    factory, _ = _db_factory()
+    db = factory()
+    db.add(LiveOrder(
+        live_session_id=1, portfolio_strategy_id=1, strategy_id=1, stock_code="600000.SH",
+        trade_type="buy", order_type="limit", price=Decimal("9.0"), quantity=1000,
+        filled_quantity=1000, filled_price=Decimal("9.05"), status="filled",
+        signal_name="open_sig", signal_type="OPEN",
+        bar_time=datetime(2026, 8, 5, 10, 0), order_ref="ref-small",
+    ))
+    db.commit()
+    db.close()
+
+    port, _ = _portfolio_single()
+    engine, _ = _ss_engine(factory, port)
+    engine._fill_price_deviation_pct = Decimal("1.0")
+    events = []
+    engine._emit = lambda et, payload: events.append((et, payload))
+
+    engine._check_fill_price_deviation()          # 0.56% < 1%
+    assert events == []
+
+    engine._dispatcher.supports_remark = False    # UI 自动化通道
+    db = factory()
+    row = db.query(LiveOrder).filter_by(order_ref="ref-small").first()
+    row.price = Decimal("9.0")
+    row.filled_price = Decimal("9.5")
+    db.commit()
+    db.close()
+    engine._fill_dev_checked.clear()
+    engine._check_fill_price_deviation()
+    assert events == []
 
 
 def test_backfill_same_partial_does_not_spam_log(caplog):
@@ -5976,13 +7708,13 @@ def test_maybe_daily_close_logs_info(caplog):
 
 
 def test_maybe_daily_bars_logs_info(caplog):
-    """14:30 日线驱动成功 -> logger.info（此前成功路径无痕）。"""
+    """15:05 日线驱动成功 -> logger.info（此前成功路径无痕）。"""
     import logging
     factory, _ = _db_factory()
     port, _ = _portfolio_single(period="1d")
     stock = "600000.SH"
     rec = _Recorder(respond=_respond_quote_bars(stock, [
-        {"stime": "20260822000000", "open": 9.0, "high": 9.3, "low": 9.0,
+        {"stime": "20260824000000", "open": 9.0, "high": 9.3, "low": 9.0,
          "close": 9.2, "volume": 10000, "amount": 92000.0},
     ]))
     disp, _ = _make_dispatcher(rec)
@@ -5991,7 +7723,7 @@ def test_maybe_daily_bars_logs_info(caplog):
         stock: {"ErrorId": 0},
     }
     with caplog.at_level(logging.INFO, logger="core.engine.live.daily_closer"):
-        engine._maybe_daily_bars(now=datetime(2026, 8, 24, 14, 30))
+        engine._maybe_daily_bars(now=datetime(2026, 8, 24, 15, 5))
     assert any("daily bar" in m for m in _log_msgs(caplog)), _log_msgs(caplog)
 
 
@@ -6820,6 +8552,54 @@ def test_cancel_unfilled_failure_alerts_risk_once(monkeypatch):
     db.close()
 
 
+def test_cancel_unfilled_pending_is_unconfirmed_not_canceled(monkeypatch):
+    """缺陷2：桥撤单返回 pending（复查后仍未确认）→ 记「撤单未确认」，不判已撤。
+
+    判据：dispatcher.last_cancel_result == "pending"。订单保持 submitted 且下一轮
+    仍会重试撤单（error_message 打 cancel_unconfirmed 标记而非 cancel_requested），
+    并发一次性 risk 告警（人工可见），绝不静默当收工。
+    """
+    monkeypatch.setattr("core.engine.live.order_machine.load_config", _cfg_minutes(3))
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single()
+
+    class _PendingCancelDispatcher(FakeTdxDispatcher):
+        def cancel_order(self, ref, code):
+            self.cancel_calls.append((ref, code))
+            self.last_cancel_result = "pending"
+            return False
+
+    disp = _PendingCancelDispatcher(orders=[_bridge_row("W001")])
+    engine = _make_engine(disp, factory, port)
+    q = asyncio.Queue()
+    engine._stream_subscribers.append(q)
+    db = factory()
+    lo = _pending_order_with_ref(db)
+    lo_id = lo.id
+    db.commit()
+    db.close()
+
+    for _ in range(2):  # 两轮都 pending
+        db = factory()
+        engine._cancel_unfilled_orders(db)
+        db.commit()
+        db.close()
+
+    assert len(disp.cancel_calls) == 2  # pending 不算收工，下一轮继续重试
+    db = factory()
+    lo2 = db.get(LiveOrder, lo_id)
+    assert lo2.status == "submitted"  # 绝不判已撤
+    assert (lo2.error_message or "").startswith("cancel_unconfirmed:")
+    assert not (lo2.error_message or "").startswith(_CANCEL_TAG)
+    db.close()
+    risks = []
+    while not q.empty():
+        ev = q.get_nowait()
+        if ev.get("type") == "risk":
+            risks.append(ev)
+    assert [r.get("rule") for r in risks] == ["cancel_unconfirmed"]  # 只告警一次
+
+
 def test_close_sweep_cancels_real_order_before_marking(monkeypatch):
     """A-3：收盘清扫标 canceled 前 best-effort 撤真实单。"""
     factory, _ = _db_factory()
@@ -7025,29 +8805,45 @@ def test_defer_source_keeps_different_keys():
     assert len(engine._signal_bar_deferred) == 3
 
 
-def test_recover_drops_stale_deferred_keeps_yesterday_and_today():
-    """C 陈旧清理：早于昨日的 deferred 置 canceled 留审计；昨日/今日转入内存队列。"""
+def test_recover_drops_stale_deferred_keeps_prev_trading_day_and_today(monkeypatch):
+    """C 陈旧清理：早于「上一交易日」置 canceled 留审计；上一交易日/当日转内存。
+
+    2026-11-09 修正：阈值从「日历天 -1」改为「上一交易日」——周五 defer、
+    周一启动不再被误判陈旧（旧实现 Friday < Sunday 直接丢）。
+    """
+    from core.engine.trading_calendar import TradingCalendar
     factory, _ = _db_factory()
     engine, port = _breaker_engine(factory)
-    today = now_shanghai().date()
-    stale_day = today - timedelta(days=2)
-    yday = today - timedelta(days=1)
+    # 固定「今天」= 2026-08-24（周一），让上一交易日确定为 8-21（周五）
+    monkeypatch.setattr(
+        "core.engine.live_engine.now_shanghai",
+        lambda: datetime(2026, 8, 24, 9, 0),
+    )
+    engine._calendar = TradingCalendar(
+        lambda: [date(2026, 8, 20), date(2026, 8, 21), date(2026, 8, 24)]
+    )
+    stale_day = date(2026, 8, 20)   # 周四：早于上一交易日 → 陈旧
+    prev_day = date(2026, 8, 21)    # 周五：上一交易日 → 保留（跨周末修复点）
+    today = date(2026, 8, 24)
     db = factory()
     _add_deferred_row(db, "600000.SH", datetime.combine(stale_day, datetime.min.time()))
-    _add_deferred_row(db, "600519.SH", datetime.combine(yday, datetime.min.time()))
+    _add_deferred_row(db, "600519.SH", datetime.combine(prev_day, datetime.min.time()))
     _add_deferred_row(db, "000001.SZ", datetime.combine(today, datetime.min.time()))
     db.commit()
     engine.recover(db)
     db.close()
 
     db = factory()
-    rows = db.query(LiveOrder).all()
+    rows = db.query(LiveOrder).order_by(LiveOrder.id).all()
     db.close()
-    assert len(rows) == 1                          # 仅陈旧行留在 DB（保留审计）
-    assert rows[0].status == "canceled"
+    assert len(rows) == 3                          # 三行都保留（DB 为权威足迹）
+    assert rows[0].status == "canceled"            # 仅陈旧行 canceled 留审计
     assert "stale_restart" in (rows[0].error_message or "")
     assert rows[0].stock_code == "600000.SH"
-    assert len(engine._signal_bar_deferred) == 2   # 昨日 + 今日转内存队列
+    assert [r.status for r in rows[1:]] == ["deferred", "deferred"]
+    assert len(engine._signal_bar_deferred) == 2   # 上一交易日 + 今日转内存队列
+    assert all(getattr(o, "_deferred_row_id", None)
+               for o in engine._signal_bar_deferred)  # 行 id 已挂上（放行时收尾）
 
     bar = _bar("600519.SH", "9.3",
                datetime.combine(today, datetime.min.time()).replace(hour=9, minute=31))
@@ -7108,8 +8904,14 @@ def test_recover_alerts_on_duplicate_deferred_rows(monkeypatch):
     assert risk[0]["stock_code"] == "600888.SH"
     assert risk[0]["quantity"] == 900
     assert "人工确认" in risk[0]["message"]
-    # 重复行不静默去重（告警全文提示人工确认），但仍逐行重建进内存队列
-    assert len(engine._signal_bar_deferred) == 2
+    # 启动恢复同键去重：保留首行进队列，重复行置 canceled（不再两笔都放行）
+    assert len(engine._signal_bar_deferred) == 1
+    db = factory()
+    rows = db.query(LiveOrder).order_by(LiveOrder.id).all()
+    db.close()
+    assert len(rows) == 2
+    assert [r.status for r in rows] == ["deferred", "canceled"]
+    assert "duplicate_deferred" in (rows[1].error_message or "")
 
 
 # ===========================================================================
@@ -8019,6 +9821,36 @@ def test_handle_bar_risk_timing_immediate_skips_deferred():
     assert any(r.url.path == "/order" for r in rec.requests)  # 已发桥
 
 
+def test_handle_bar_post_close_forces_deferred_even_immediate():
+    """15:05 收盘落定轮次（post_close=True）：immediate 策略也必须 defer 到次日。
+
+    收盘后报单报不进交易所，只会成为待报/废单，故 post_close 无条件 defer。
+    """
+    factory, _ = _db_factory()
+    port, ctx = _portfolio_single(period="1d")
+    ctx.risk_timing = "immediate"
+    stock = "600000.SH"
+    bar_time = datetime(2026, 8, 24, 0, 0)
+    rec = _Recorder()
+    disp, _ = _make_dispatcher(rec)
+    engine = _calendar_engine(
+        factory, port, disp, [date(2026, 8, 24), date(2026, 8, 25)], stock
+    )
+    engine.signal_cache = {(1, stock, bar_time): [{"name": "open_sig", "value": 1}]}
+    bar = _bar(stock, "9.3", bar_time)
+    bar.period = "1d"
+    bar.post_close = True
+
+    engine._handle_bar(port, bar)
+
+    assert len(engine._signal_bar_deferred) == 1
+    db = factory()
+    row = db.query(LiveOrder).first()
+    assert row is not None and row.status == "deferred"
+    db.close()
+    assert not any(r.url.path == "/order" for r in rec.requests)
+
+
 def test_handle_bar_risk_timing_next_day_keeps_deferred():
     """risk_timing=next_day（默认）：维持 B-1 现行为——当日 deferred，次日放行。"""
     factory, _ = _db_factory()
@@ -8301,7 +10133,6 @@ class _StubSignalSource:
 
     def __init__(self, signals=None):
         self._signals = list(signals or [])
-        self._seen_codes = set()
         self.reset_calls = 0
 
     def read_new_signals(self):
@@ -8375,23 +10206,25 @@ def test_process_external_signal_formula_match_runs_full_pipeline():
     assert engine.signal_cache[(1, "600000.SH", _EXT_SIG["time"])] == [
         {"name": "open_sig", "value": 1},
     ]
-    # 处理成功后记入 seen_codes（同代码同日去重）
-    assert engine._signal_source._seen_codes == {"600000"}
+    # 处理成功后占本日「买入方向」去重名额（同代码同方向只认第一条）
+    assert engine._ext_seen == {("600000.SH", "buy")}
 
 
-def test_process_external_signal_dedup_by_seen_codes():
-    """代码已在 seen_codes → 跳过（不重复处理/下单）。"""
+def test_process_external_signal_dedup_by_direction():
+    """同代码同方向已消费 → 跳过；卖出方向独立，不受买入已消费影响。"""
     factory, _ = _db_factory()
     port, ctx = _portfolio_external()
     engine = _external_engine(factory, port)
     engine._signal_source = _StubSignalSource()
-    engine._signal_source._seen_codes.add("600000")
+    engine._ext_seen.add(("600000.SH", "buy"))
 
     engine._process_external_signal(dict(_EXT_SIG))
 
     db = factory()
     assert db.query(LiveOrder).count() == 0
     db.close()
+    # 买入方向被去重后，卖出方向未消费但该策略无卖出信号配置 → 无注入
+    assert ("600000.SH", "sell") not in engine._ext_seen
 
 
 def test_process_external_signal_max_positions_full_blocks(monkeypatch):
@@ -8400,6 +10233,7 @@ def test_process_external_signal_max_positions_full_blocks(monkeypatch):
     port, ctx = _portfolio_external(max_positions=1)
     pos = Position("000001.SZ")
     pos.quantity = 100
+    pos.platform_quantity = 100  # 平台买入的持仓才占槽位
     pos.avg_cost = Decimal("10")
     ctx.positions["000001.SZ"] = pos
     engine = _external_engine(factory, port)
@@ -8413,8 +10247,8 @@ def test_process_external_signal_max_positions_full_blocks(monkeypatch):
     db = factory()
     assert db.query(LiveOrder).count() == 0
     db.close()
-    # 已尝试处理 → 占去重名额
-    assert engine._signal_source._seen_codes == {"600000"}
+    # 满槽被闸门拦截 → 未实际注入，不占本日方向名额
+    assert engine._ext_seen == set()
 
 
 def test_process_external_signal_already_holding_blocks(monkeypatch):
@@ -8438,6 +10272,220 @@ def test_process_external_signal_already_holding_blocks(monkeypatch):
     db.close()
 
 
+# ---- 外部信号买卖双向放行（卖出类不做仓位/资金检查，但不得卖空、不越过 T+1）----
+
+def _portfolio_external_multi(signal_types, formula_name="分时突击",
+                              period="1m", max_positions=5,
+                              reduce_ratio=Decimal("0.3")):
+    """单组合单策略：按 signal_types 配公式信号，ctx.formula_name 指向预警公式。"""
+    pm = PortfolioRiskManager(max_drawdown=Decimal("0.2"), daily_loss_limit=Decimal("0.05"))
+    port = Portfolio(portfolio_id=1, initial_capital=Decimal("100000"), risk_manager=pm)
+    ctx = StrategyContext(
+        strategy_id=1, period=period,
+        capital_ratio=Decimal("0.6"), max_positions=max_positions,
+        single_open_ratio=Decimal("0.1"),
+        reduce_position_ratio=reduce_ratio,
+    )
+    ctx.formula_signals = [
+        {"signal_name": "sig_" + st.value.lower(), "signal_type": st,
+         "trigger_value": 1}
+        for st in signal_types
+    ]
+    ctx.formula_name = formula_name
+    ctx.strategy_risk = StrategyRiskManager(
+        stop_loss_ratio=Decimal("0.05"),
+        take_profit_ratio=Decimal("0.2"),
+        trailing_stop_ratio=Decimal("0"),
+    )
+    port.strategies.append(ctx)
+    return port, ctx
+
+
+def _external_engine_with(factory, port, available=None):
+    """带 /positions 可用量应答的外部信号引擎（available=None → 空仓应答）。"""
+    rec = _Recorder()
+
+    def respond(request):
+        path = request.url.path
+        if path == "/positions":
+            data = [] if available is None else [{
+                "instrument": "600000", "exchange": "SH",
+                "available": available, "volume": 1000,
+                "yesterday_volume": available, "on_road_volume": 0,
+            }]
+            return httpx.Response(200, json={"ok": True, "data": data})
+        if path == "/order":
+            return httpx.Response(200, json={"ok": True})
+        if path == "/ping":
+            return httpx.Response(200, json={"ok": True})
+        if path == "/quote":
+            return httpx.Response(200, json={"ok": True, "data": {}})
+        return httpx.Response(404, json={"ok": False, "error": "unknown"})
+
+    rec._respond = respond
+    disp, _ = _make_dispatcher(rec)
+    from core.engine.bar_poller import BarPoller
+    poller = BarPoller(disp, ["600000.SH"], period="1m", count=10)
+    engine = LiveEngine(
+        session_id=1, portfolios=[port], dispatcher=disp,
+        bar_poller=poller, db_session_factory=factory,
+    )
+    engine._signal_source = _StubSignalSource()
+    return engine, rec
+
+
+def _hold(ctx, stock="600000.SH", qty=1000, price="9.0"):
+    pos = Position(stock)
+    pos.buy(qty, Decimal(price), datetime(2026, 10, 29, 9, 30))  # 昨仓，T+1 可卖
+    ctx.positions[stock] = pos
+
+
+def test_external_sell_signal_allowed_with_position_and_t1_available():
+    """卖出类放行：有持仓 + 桥可用=1000 → CLOSE 提交 SELL 1000。"""
+    factory, _ = _db_factory()
+    port, ctx = _portfolio_external_multi([SignalType.CLOSE])
+    _hold(ctx)
+    engine, rec = _external_engine_with(factory, port, available=1000)
+
+    engine._process_external_signal(dict(_EXT_SIG))
+
+    db = factory()
+    orders = db.query(LiveOrder).all()
+    db.close()
+    assert len(orders) == 1
+    assert orders[0].trade_type == "sell"
+    assert orders[0].signal_name == "sig_close"
+    assert orders[0].quantity == 1000
+    assert ("600000.SH", "sell") in engine._ext_seen
+
+
+def test_external_sell_signal_blocked_when_t1_available_zero():
+    """卖出类不越过 T+1：有持仓但桥可用=0 → 拒单（t1_insufficient），不发 /order。"""
+    factory, _ = _db_factory()
+    port, ctx = _portfolio_external_multi([SignalType.CLOSE])
+    _hold(ctx)
+    engine, rec = _external_engine_with(factory, port, available=0)
+
+    engine._process_external_signal(dict(_EXT_SIG))
+
+    db = factory()
+    assert db.query(LiveOrder).count() == 0
+    db.close()
+    assert not any(r.url.path == "/order" for r in rec.requests)
+
+
+def test_external_sell_signal_rejected_without_position(monkeypatch):
+    """无持仓不卖（不得卖空）：不构造合成 bar、不下单，也不占卖出名额。"""
+    factory, _ = _db_factory()
+    port, ctx = _portfolio_external_multi([SignalType.CLOSE])
+    engine, rec = _external_engine_with(factory, port, available=1000)
+    calls = []
+    monkeypatch.setattr(engine, "_handle_bar", lambda *a, **k: calls.append(a))
+
+    engine._process_external_signal(dict(_EXT_SIG))
+
+    assert calls == []
+    assert ("600000.SH", "sell") not in engine._ext_seen
+    db = factory()
+    assert db.query(LiveOrder).count() == 0
+    db.close()
+    assert not any(r.url.path == "/order" for r in rec.requests)
+
+
+def test_external_buy_then_sell_same_day_not_swallowed():
+    """同代码同日先买后卖：买入占 buy 名额，卖出仍独立放行（不被吞）。"""
+    factory, _ = _db_factory()
+    port, ctx = _portfolio_external_multi([SignalType.OPEN, SignalType.CLOSE])
+    engine, rec = _external_engine_with(factory, port, available=600)
+
+    engine._process_external_signal(dict(_EXT_SIG))  # 09:50 买入
+    _hold(ctx, qty=600)  # 模拟买入回填成交
+    sell_sig = dict(_EXT_SIG)
+    sell_sig["time"] = datetime(2026, 10, 30, 10, 30)
+    engine._process_external_signal(sell_sig)  # 10:30 卖出
+
+    db = factory()
+    orders = db.query(LiveOrder).order_by(LiveOrder.id).all()
+    db.close()
+    assert [o.trade_type for o in orders] == ["buy", "sell"]
+    assert engine._ext_seen == {("600000.SH", "buy"), ("600000.SH", "sell")}
+
+
+def test_external_same_direction_duplicates_only_first(monkeypatch):
+    """同方向重复推送只认第一条（买入/卖出各自只执行一次）。"""
+    factory, _ = _db_factory()
+    port, ctx = _portfolio_external_multi([SignalType.OPEN, SignalType.CLOSE])
+    engine, rec = _external_engine_with(factory, port, available=600)
+
+    engine._process_external_signal(dict(_EXT_SIG))  # 09:50 买
+    engine._process_external_signal(dict(_EXT_SIG))  # 重复买 → 忽略
+    _hold(ctx, qty=600)
+    sell_sig = dict(_EXT_SIG)
+    sell_sig["time"] = datetime(2026, 10, 30, 10, 30)
+    engine._process_external_signal(sell_sig)  # 卖
+    sell_sig2 = dict(sell_sig)
+    sell_sig2["time"] = datetime(2026, 10, 30, 10, 35)
+    engine._process_external_signal(sell_sig2)  # 重复卖 → 忽略
+
+    db = factory()
+    orders = db.query(LiveOrder).all()
+    db.close()
+    assert [o.trade_type for o in orders] == ["buy", "sell"]
+
+
+def test_external_reduce_without_ratio_clears_position():
+    """REDUCE 无比例（预警文件无比例列）→ 按清仓执行 + 显式 risk 事件。"""
+    factory, _ = _db_factory()
+    port, ctx = _portfolio_external_multi(
+        [SignalType.REDUCE], reduce_ratio=Decimal("0.3"))
+    _hold(ctx, qty=1000)
+    engine, rec = _external_engine_with(factory, port, available=1000)
+    q = asyncio.Queue()
+    engine._stream_subscribers.append(q)
+
+    engine._process_external_signal(dict(_EXT_SIG))
+
+    db = factory()
+    orders = db.query(LiveOrder).all()
+    db.close()
+    # 不是 30% (300 股)，而是清仓 1000 股
+    assert len(orders) == 1 and orders[0].quantity == 1000
+    # 注入缓存以 CLOSE 覆盖动作（同一套 _signal_to_order 清仓路径）
+    assert engine.signal_cache[(1, "600000.SH", _EXT_SIG["time"])] == [
+        {"name": "sig_reduce", "value": 1, "signal_type": "CLOSE"},
+    ]
+    ev = q.get_nowait()
+    assert ev["type"] == "risk"
+    assert ev["rule"] == "external_reduce_no_ratio"
+    assert "按清仓执行" in ev["message"]
+
+
+def test_external_unknown_action_ignored_with_throttled_warning(caplog, monkeypatch):
+    """不可解析动作（未知 signal_type）→ 丢弃 + 每 50 条 warning 一次，不猜方向。"""
+    factory, _ = _db_factory()
+    port, ctx = _portfolio_external_multi([])
+    # 直接注入未知动作配置（模拟脏配置/未来新增动作）
+    ctx.formula_signals = [
+        {"signal_name": "sig_weird", "signal_type": "SIDEWAYS", "trigger_value": 1},
+    ]
+    engine, rec = _external_engine_with(factory, port, available=1000)
+    calls = []
+    monkeypatch.setattr(engine, "_handle_bar", lambda *a, **k: calls.append(a))
+
+    with caplog.at_level(logging.WARNING, logger="core.engine.live_engine"):
+        for _ in range(60):
+            engine._process_external_signal(dict(_EXT_SIG))
+
+    assert calls == []  # 绝不猜方向、不默认买入
+    assert engine._ext_seen == set()
+    assert engine._ext_unparseable_count == 60
+    warns = [r for r in caplog.records if "unparseable action" in r.getMessage()]
+    assert len(warns) == 2  # 第 1 条与第 51 条
+    db = factory()
+    assert db.query(LiveOrder).count() == 0
+    db.close()
+
+
 def test_process_external_signal_formula_mismatch_drops(monkeypatch):
     """公式名无匹配策略 → 信号丢弃（不占去重名额，换匹配公式后可再触发）。"""
     factory, _ = _db_factory()
@@ -8450,7 +10498,7 @@ def test_process_external_signal_formula_mismatch_drops(monkeypatch):
     engine._process_external_signal(dict(_EXT_SIG))
 
     assert calls == []
-    assert engine._signal_source._seen_codes == set()
+    assert engine._ext_seen == set()
     db = factory()
     assert db.query(LiveOrder).count() == 0
     db.close()
@@ -8476,9 +10524,9 @@ def test_tick_external_signals_dispatches_and_noops_without_source(monkeypatch):
 def test_tick_external_signals_resets_source_on_day_change(monkeypatch):
     """跨日检测（audit Fix1）：now_shanghai 日期 != _ext_sig_last_date → reset_daily()。
 
-    源的 _seen_codes 是「本日已处理代码」——长跑会话跨日不重置则同代码次日
-    起被 read_new_signals 静默去重丢弃。日期变更轮：先重置源（清去重 + 游标
-    归位当前时间）并更新记账日期，再读信号注入。
+    方向去重集合是「本日已消费 (代码, 方向)」——长跑会话跨日不重置则同代码次日
+    买卖两方向都被误判已消费。日期变更轮：先重置源（游标归位当前时间）+ 清空
+    方向去重集合并更新记账日期，再读信号注入。
     """
     factory, _ = _db_factory()
     port, ctx = _portfolio_external()
@@ -8486,6 +10534,7 @@ def test_tick_external_signals_resets_source_on_day_change(monkeypatch):
     stub = _StubSignalSource([dict(_EXT_SIG)])
     engine._signal_source = stub
     engine._ext_sig_last_date = date(2026, 10, 30)
+    engine._ext_seen.add(("600000.SH", "buy"))
     monkeypatch.setattr(
         "core.engine.live_engine.now_shanghai",
         lambda: datetime(2026, 10, 31, 9, 31))
@@ -8495,18 +10544,20 @@ def test_tick_external_signals_resets_source_on_day_change(monkeypatch):
     engine._tick_external_signals()
 
     assert stub.reset_calls == 1
+    assert engine._ext_seen == set()  # 跨日清空方向去重
     assert engine._ext_sig_last_date == date(2026, 10, 31)
     assert len(processed) == 1
 
 
 def test_tick_external_signals_same_day_keeps_dedup_state(monkeypatch):
-    """同日 tick（audit Fix1）：不调 reset_daily，当日 _seen_codes 去重状态保持。"""
+    """同日 tick（audit Fix1）：不调 reset_daily，当日方向去重状态保持。"""
     factory, _ = _db_factory()
     port, ctx = _portfolio_external()
     engine = _external_engine(factory, port)
     stub = _StubSignalSource([dict(_EXT_SIG)])
     engine._signal_source = stub
     engine._ext_sig_last_date = date(2026, 10, 31)
+    engine._ext_seen.add(("600000.SH", "buy"))
     monkeypatch.setattr(
         "core.engine.live_engine.now_shanghai",
         lambda: datetime(2026, 10, 31, 10, 0))
@@ -8516,6 +10567,7 @@ def test_tick_external_signals_same_day_keeps_dedup_state(monkeypatch):
     engine._tick_external_signals()
 
     assert stub.reset_calls == 0
+    assert engine._ext_seen == {("600000.SH", "buy")}
     assert engine._ext_sig_last_date == date(2026, 10, 31)
     assert len(processed) == 1
 
@@ -8595,6 +10647,48 @@ def test_external_signal_injection_survives_tq_recalc(monkeypatch):
     assert orders[0].signal_name == "open_sig"
 
 
+def test_external_mode_skips_tq_formula_fill(monkeypatch):
+    """信号来源互斥：配置外部信号文件后 _handle_bar 不再跑 TQ 公式计算。
+
+    否则 TQ 路径会另按自己的 bar_time 出信号，与预警文件路径形成双触发。
+    未配置（留空）时仍照常填充（正反对照）。
+    """
+    factory, _ = _db_factory()
+    port, ctx = _portfolio_external()
+    rec = _Recorder()
+    disp, _ = _make_dispatcher(rec)
+    from core.engine.bar_poller import BarPoller
+    poller = BarPoller(disp, ["600000.SH"], period="1m", count=10)
+    bar = BarEvent(
+        stocks={"600000.SH": {
+            "open": Decimal("9.30"), "high": Decimal("9.30"),
+            "low": Decimal("9.30"), "close": Decimal("9.30"), "volume": 0,
+        }},
+        bar_time=datetime(2026, 10, 30, 9, 51), period="1m",
+    )
+
+    on_engine = LiveEngine(
+        session_id=1, portfolios=[port], dispatcher=disp,
+        bar_poller=poller, db_session_factory=factory,
+        formula_by_strategy={1: "分时突击"},
+        signal_file_path="D:/ths/alert.txt",
+    )
+    calls = []
+    monkeypatch.setattr(on_engine, "_fill_signal_cache", lambda *a, **k: calls.append(a))
+    on_engine._handle_bar(port, bar)
+    assert calls == []
+
+    off_engine = LiveEngine(
+        session_id=1, portfolios=[port], dispatcher=disp,
+        bar_poller=poller, db_session_factory=factory,
+        formula_by_strategy={1: "分时突击"},
+    )
+    calls_off = []
+    monkeypatch.setattr(off_engine, "_fill_signal_cache", lambda *a, **k: calls_off.append(a))
+    off_engine._handle_bar(port, bar)
+    assert len(calls_off) == 1
+
+
 # ---------------- 批次1：先卖后买 + 槽位/排重闸（_handle_bar 提交链）----------------
 
 _BT = datetime(2026, 8, 5, 10, 0)
@@ -8660,7 +10754,7 @@ def test_handle_bar_submits_sell_before_buy(monkeypatch):
     submitted = []
     monkeypatch.setattr(
         engine, "_submit_one_order",
-        lambda db, p, o, period, emit_signal=True: submitted.append(
+        lambda db, p, o, period, emit_signal=True, **kw: submitted.append(
             o.trade_type.value))
     sell = _order("000001.SZ", TradeType.SELL, SignalType.STOP_LOSS, "stop_loss")
     buy = _order("600000.SH", TradeType.BUY, SignalType.OPEN, "open_sig")
@@ -8707,6 +10801,156 @@ def test_submit_one_order_allows_buy_when_slot_free():
     # 3 持仓 + 1 在途 = 4 < 5 → 新 BUY 提交（预置 + 新单共 2 笔）
     assert db.query(LiveOrder).count() == 2
     assert any(r.url.path == "/order" for r in rec.requests)
+    db.close()
+
+
+# ---- 槽位闸（方案 A）：只数平台自己买入成交过的持仓 + max_positions 取策略自身参数 ----
+def _platform_pos(stock, qty=100):
+    """平台买入成交过的持仓（apply_trade = 成交回填 / recover 重放的同一入口）。"""
+    pos = Position(stock)
+    pos.apply_trade(TradeEvent(
+        strategy_id=1, portfolio_id=1, stock_code=stock,
+        trade_type=TradeType.BUY, price=Decimal("9.0"), quantity=qty,
+        amount=Decimal("9.0") * qty, commission=Decimal("0"),
+        stamp_duty=Decimal("0"), trade_time=_BT, signal_type=SignalType.OPEN,
+    ))
+    return pos
+
+
+def _external_pos(stock, qty=100):
+    """外部/手工导入仓（桥快照镜面导入）：platform_quantity 恒 0 → 不占槽位。"""
+    pos = Position(stock)
+    pos.mirror_bridge(qty, qty, Decimal("9.0"), _BT.date())
+    return pos
+
+
+def test_slot_gate_external_positions_do_not_occupy_slots():
+    """外部/手工导入仓不占名额：5 只外部仓 + max_positions=5 仍可开新仓。"""
+    factory, _ = _db_factory()
+    port, ctx = _portfolio_single()  # max_positions=5
+    for i in range(5):
+        ctx.positions["5100%02d.SH" % i] = _external_pos("5100%02d.SH" % i)
+    db = factory()
+    engine, rec = _gate_engine(factory, port)
+
+    engine._submit_one_order(db, port, _order("600006.SH", TradeType.BUY), "1m")
+
+    assert engine._platform_held_count(ctx) == 0
+    assert db.query(LiveOrder).count() == 1  # 新 BUY 落库
+    assert any(r.url.path == "/order" for r in rec.requests)
+    db.close()
+
+
+def test_slot_gate_platform_positions_occupy_slots():
+    """平台买入的持仓占名额：5 只平台仓 + max_positions=5 → 拦截 + position_full。"""
+    factory, _ = _db_factory()
+    port, ctx = _portfolio_single()
+    for i in range(5):
+        ctx.positions["60001%d.SH" % i] = _platform_pos("60001%d.SH" % i)
+    db = factory()
+    engine, rec = _gate_engine(factory, port)
+
+    engine._submit_one_order(db, port, _order("600020.SH", TradeType.BUY), "1m")
+    engine._drain_decisions(db, port)
+
+    assert engine._platform_held_count(ctx) == 5
+    assert db.query(LiveOrder).count() == 0
+    assert not any(r.url.path == "/order" for r in rec.requests)
+    rows = _decision_rows(factory)
+    assert [(r.gate, r.action) for r in rows] == [("position_full", "block")]
+    db.close()
+
+
+def test_slot_gate_reoccupies_after_external_sell_then_platform_buy():
+    """外部仓卖出后平台再买入 → 重新占位（mirror 全平清零、成交回填重新累加）。"""
+    factory, _ = _db_factory()
+    port, ctx = _portfolio_single()
+    pos = _external_pos("510050.SH")
+    ctx.positions["510050.SH"] = pos
+    engine, _rec = _gate_engine(factory, port)
+
+    assert engine._platform_held_count(ctx) == 0  # 手工仓不占位
+    pos.mirror_bridge(0, 0, None, _BT.date())      # 外部仓被卖出（柜台无持仓）
+    assert engine._platform_held_count(ctx) == 0
+    pos.apply_trade(TradeEvent(                     # 平台随后买入
+        strategy_id=1, portfolio_id=1, stock_code="510050.SH",
+        trade_type=TradeType.BUY, price=Decimal("3.0"), quantity=100,
+        amount=Decimal("300"), commission=Decimal("0"), stamp_duty=Decimal("0"),
+        trade_time=_BT, signal_type=SignalType.OPEN,
+    ))
+    assert engine._platform_held_count(ctx) == 1  # 重新占位
+
+
+def test_slot_gate_uses_each_strategy_own_max_positions():
+    """两个组合策略各自的 max_positions 分别生效（策略 A=1 满、策略 B=3 有位）。"""
+    from core.engine.bar_poller import BarPoller
+
+    factory, _ = _db_factory()
+    port1, ctx1 = _portfolio_single()
+    ctx1.max_positions = 1
+    ctx1.positions["600001.SH"] = _platform_pos("600001.SH")
+
+    pm = PortfolioRiskManager(max_drawdown=Decimal("0.2"), daily_loss_limit=Decimal("0.05"))
+    port2 = Portfolio(portfolio_id=2, initial_capital=Decimal("100000"), risk_manager=pm)
+    ctx2 = StrategyContext(
+        strategy_id=2, period="1m",
+        capital_ratio=Decimal("0.6"), max_positions=3,
+        single_open_ratio=Decimal("0.1"),
+    )
+    ctx2.formula_signals = []
+    ctx2.strategy_risk = StrategyRiskManager(
+        stop_loss_ratio=Decimal("0.05"), take_profit_ratio=Decimal("0.2"),
+        trailing_stop_ratio=Decimal("0"),
+    )
+    ctx2.positions["600002.SH"] = _platform_pos("600002.SH")
+    port2.strategies.append(ctx2)
+
+    rec = _Recorder()
+    disp, _ = _make_dispatcher(rec)
+    poller = BarPoller(disp, ["600000.SH"], period="1m", count=10)
+    engine = LiveEngine(
+        session_id=1, portfolios=[port1, port2], dispatcher=disp,
+        bar_poller=poller, db_session_factory=factory,
+    )
+    assert engine._slot_limit(port1, ctx1) == 1
+    assert engine._slot_limit(port2, ctx2) == 3
+
+    def _buy(pid, sid, code):
+        return OrderEvent(
+            strategy_id=sid, portfolio_id=pid, stock_code=code,
+            trade_type=TradeType.BUY, signal_type=SignalType.OPEN,
+            quantity=100, price=Decimal("9.3"),
+            bar_time=_BT, signal_name="open_sig",
+        )
+
+    db = factory()
+    engine._submit_one_order(db, port1, _buy(1, 1, "600010.SH"), "1m")  # 1 >= 1 → 拦
+    engine._submit_one_order(db, port2, _buy(2, 2, "600011.SH"), "1m")  # 1 < 3 → 放行
+
+    rows = db.query(LiveOrder).all()
+    assert [(r.portfolio_strategy_id, r.stock_code) for r in rows] == [(2, "600011.SH")]
+    db.close()
+
+
+def test_slot_gate_skips_when_max_positions_missing(caplog):
+    """max_positions 缺失（None）→ 跳过槽位闸（不限）+ WARNING，不回落默认 5。"""
+    import logging
+
+    factory, _ = _db_factory()
+    port, ctx = _portfolio_single()
+    ctx.max_positions = None
+    for i in range(5):
+        ctx.positions["60003%d.SH" % i] = _platform_pos("60003%d.SH" % i)
+    db = factory()
+    engine, rec = _gate_engine(factory, port)
+
+    with caplog.at_level(logging.WARNING, logger="core.engine.live_engine"):
+        engine._submit_one_order(db, port, _order("600040.SH", TradeType.BUY), "1m")
+
+    assert engine._slot_limit(port, ctx) is None
+    assert db.query(LiveOrder).count() == 1  # 不设上限 → 放行
+    assert any(r.url.path == "/order" for r in rec.requests)
+    assert "max_positions 缺失" in caplog.text
     db.close()
 
 
@@ -9296,3 +11540,617 @@ def test_close_sweep_and_daily_closer_still_run_when_polling_paused(monkeypatch)
     assert [r for r in rec.requests if "period=1m" in str(r.url)] == []
 
 
+# ===========================================================================
+# 2026-11-10 盘中实证收口：在途集合 detached+expired 打断整批提交
+# ===========================================================================
+def test_pending_orders_readable_after_session_close():
+    """在途集合必须是「已加载的 detached 对象」：commit 后不摘出 session 会
+    expired+detached，下一根 bar 读属性抛 DetachedInstanceError（2026-11-10 实证：
+    `_reserved_buy_cash` 读 trade_type 抛错 → 整批 deferred 只放出 1 笔）。"""
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single()
+    stock = "600000.SH"
+    bar_time = datetime(2026, 8, 5, 10, 0)
+    disp, _ = _make_dispatcher(_Recorder())
+    from core.engine.bar_poller import BarPoller
+    poller = BarPoller(disp, [stock], period="1m", count=10)
+    engine = LiveEngine(
+        session_id=1, portfolios=[port], dispatcher=disp,
+        bar_poller=poller, db_session_factory=factory,
+    )
+    engine.signal_cache = {(1, stock, bar_time): [{"name": "open_sig", "value": 1}]}
+
+    engine._handle_bar(port, _bar(stock, "9.3", bar_time))
+    assert len(engine._pending_orders) == 1
+
+    # _handle_bar 内的 session 已 close：读在途单属性不得抛 DetachedInstanceError
+    lo = next(iter(engine._pending_orders.values()))
+    assert lo.trade_type == "buy"
+    assert lo.status == "submitted"
+    assert lo.stock_code == stock
+    assert engine._reserved_buy_cash(1) > Decimal("0")
+
+
+def test_handle_bar_batch_isolates_single_submit_failure(monkeypatch, caplog):
+    """单笔提交异常只影响该笔：同批其它单照常提交（2026-11-10 实证整批中断，
+    300286/300415 两笔 deferred 完全未提交）。"""
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single()
+    s1, s2 = "600000.SH", "600001.SH"
+    bt = datetime(2026, 8, 5, 10, 0)
+    disp, _ = _make_dispatcher(_Recorder())
+    from core.engine.bar_poller import BarPoller
+    poller = BarPoller(disp, [s1, s2], period="1m", count=10)
+    engine = LiveEngine(
+        session_id=1, portfolios=[port], dispatcher=disp,
+        bar_poller=poller, db_session_factory=factory,
+    )
+    engine.signal_cache = {
+        (1, s1, bt): [{"name": "open_sig", "value": 1}],
+        (1, s2, bt): [{"name": "open_sig", "value": 1}],
+    }
+    calls = []
+    real = engine._submit_one_order
+
+    def flaky_submit(db, portfolio, order, period, **kwargs):
+        calls.append(order.stock_code)
+        if len(calls) == 1:
+            raise RuntimeError("boom")
+        return real(db, portfolio, order, period, **kwargs)
+
+    monkeypatch.setattr(engine, "_submit_one_order", flaky_submit)
+
+    bar = BarEvent(stocks={
+        code: {"open": Decimal("9.0"), "high": Decimal("9.3"),
+               "low": Decimal("9.0"), "close": Decimal("9.3"), "volume": 10000}
+        for code in (s1, s2)
+    }, bar_time=bt)
+    with caplog.at_level(logging.ERROR):
+        engine._handle_bar(port, bar)
+
+    assert len(calls) == 2                      # 第二笔没有被第一笔异常拦住
+    db = factory()
+    rows = db.query(LiveOrder).all()
+    db.close()
+    assert [r.stock_code for r in rows] == [calls[1]]
+    assert any("batch continues" in r.message for r in caplog.records)
+
+
+# ===========================================================================
+# 次日盘前（集合竞价）执行日线信号单（config.tq_trade.pre_open_auction*）
+# 默认关闭 → 行为不变；开启 → 交易日 09:15–end 把当日 due 的 deferred 日线单
+# 直接报进集合竞价，at-most-once（盘前已报出的单 09:31 不再重报）。
+# ===========================================================================
+
+
+def _pre_open_engine(factory, port, disp, trading_dates, stock, **cfg):
+    """带盘前竞价开关的引擎（默认开启，可按需覆盖 end_time/bias）。"""
+    from core.engine.trading_calendar import TradingCalendar
+    from core.engine.bar_poller import BarPoller
+    poller = BarPoller(disp, [stock], period="1m", count=10)
+    cal = TradingCalendar(lambda: list(trading_dates))
+    conf = {"pre_open_auction_enabled": True}
+    conf.update(cfg)
+    return LiveEngine(
+        session_id=1, portfolios=[port], dispatcher=disp,
+        bar_poller=poller, db_session_factory=factory,
+        trading_calendar=cal, pre_open_auction=conf,
+    )
+
+
+def _seed_sellable(ctx, stock, qty=300, price="9.0"):
+    ctx.positions[stock] = Position(stock)
+    ctx.positions[stock].buy(qty, Decimal(price), datetime(2026, 8, 24, 9, 30))
+
+
+def test_pre_open_window_boundaries():
+    """窗口 09:15 ≤ now < 09:20（左闭右开），非法结束时间回退默认。"""
+    from core.engine.live_engine import PreOpenAuctionConfig
+    conf = PreOpenAuctionConfig(enabled=True)
+    assert conf.is_open(datetime(2026, 8, 25, 9, 15))
+    assert conf.is_open(datetime(2026, 8, 25, 9, 19, 59))
+    assert not conf.is_open(datetime(2026, 8, 25, 9, 14, 59))
+    assert not conf.is_open(datetime(2026, 8, 25, 9, 20))
+    # 默认关闭
+    assert not PreOpenAuctionConfig().is_open(datetime(2026, 8, 25, 9, 16))
+    # 非法值回退默认 09:20；负数让价归零
+    bad = PreOpenAuctionConfig(enabled=True, end_time="25:99", price_bias_pct=-3)
+    assert bad.end_time == (9, 20)
+    assert bad.price_bias_pct == Decimal("0")
+
+
+def test_pre_open_disabled_keeps_old_behavior():
+    """开关关闭：deferred 队列/DB 行/发桥全部不动，只由 09:31 首根 bar 放行。"""
+    factory, _ = _db_factory()
+    port, ctx = _portfolio_single(period="1d")
+    stock = "600000.SH"
+    d1, d2 = date(2026, 8, 24), date(2026, 8, 25)
+    _seed_sellable(ctx, stock)
+    rec = _Recorder()
+    disp, _ = _make_dispatcher(rec)
+    engine = _calendar_engine(factory, port, disp, [d1, d2], stock)
+
+    db = factory()
+    engine._submit_one_order(db, port, _deferred_order(stock, d1), "1d")
+    db.close()
+    assert len(engine._signal_bar_deferred) == 1
+
+    engine._maybe_pre_open_auction(datetime(2026, 8, 25, 9, 16))
+
+    assert len(engine._signal_bar_deferred) == 1          # 队列不动
+    assert not any(r.url.path == "/order" for r in rec.requests)
+    db = factory()
+    assert db.query(LiveOrder).filter_by(status="deferred").count() == 1
+    db.close()
+
+
+def test_pre_open_releases_only_due_daily_orders_at_window():
+    """只命中「当日 due」的 deferred 日线单；未到 due 的留在队列。"""
+    factory, _ = _db_factory()
+    port, ctx = _portfolio_single(period="1d")
+    due_stock, later_stock = "600000.SH", "600001.SH"
+    d1, d2, d3 = date(2026, 8, 24), date(2026, 8, 25), date(2026, 8, 26)
+    _seed_sellable(ctx, due_stock)
+    _seed_sellable(ctx, later_stock)
+    rec = _Recorder()
+    disp, _ = _make_dispatcher(rec)
+    engine = _pre_open_engine(
+        factory, port, disp, [d1, d2, d3], due_stock)
+
+    db = factory()
+    engine._submit_one_order(db, port, _deferred_order(due_stock, d1), "1d")
+    engine._submit_one_order(db, port, _deferred_order(later_stock, d2), "1d")
+    db.close()
+    assert len(engine._signal_bar_deferred) == 2
+
+    engine._maybe_pre_open_auction(datetime(2026, 8, 25, 9, 16))
+
+    assert len(engine._signal_bar_deferred) == 1          # 只有 due 单被摘走
+    assert engine._signal_bar_deferred[0].stock_code == later_stock
+    orders = [r for r in rec.requests if r.url.path == "/order"]
+    assert len(orders) == 1                              # 只报出一笔
+    db = factory()
+    submitted = db.query(LiveOrder).filter_by(status="submitted").all()
+    deferred = db.query(LiveOrder).filter_by(status="deferred").all()
+    db.close()
+    assert [r.stock_code for r in submitted] == [due_stock]
+    assert [r.stock_code for r in deferred] == [later_stock]
+
+
+def test_pre_open_idempotent_single_submission_across_ticks():
+    """窗口内多轮 tick 只报一次（同一逻辑单不重复报出）。"""
+    factory, _ = _db_factory()
+    port, ctx = _portfolio_single(period="1d")
+    stock = "600000.SH"
+    d1, d2 = date(2026, 8, 24), date(2026, 8, 25)
+    _seed_sellable(ctx, stock)
+    rec = _Recorder()
+    disp, _ = _make_dispatcher(rec)
+    engine = _pre_open_engine(factory, port, disp, [d1, d2], stock)
+
+    db = factory()
+    engine._submit_one_order(db, port, _deferred_order(stock, d1), "1d")
+    db.close()
+
+    for minute in (16, 17, 18, 19):
+        engine._maybe_pre_open_auction(datetime(2026, 8, 25, 9, minute))
+
+    assert len([r for r in rec.requests if r.url.path == "/order"]) == 1
+    assert engine._signal_bar_deferred == []
+    # 09:31 首根 bar 也不会重报
+    engine._handle_bar(port, _bar(stock, "9.3", datetime(2026, 8, 25, 9, 31)))
+    assert len([r for r in rec.requests if r.url.path == "/order"]) == 1
+
+
+def test_pre_open_blocked_order_falls_back_to_first_bar_path():
+    """盘前被闸门拦截（无持仓审批不过）→ 保持 deferred，09:31 首根 bar 兜底报出。"""
+    factory, _ = _db_factory()
+    port, ctx = _portfolio_single(period="1d")
+    stock = "600000.SH"
+    d1, d2 = date(2026, 8, 24), date(2026, 8, 25)
+    rec = _Recorder()
+    disp, _ = _make_dispatcher(rec)
+    engine = _pre_open_engine(factory, port, disp, [d1, d2], stock)
+
+    db = factory()
+    engine._submit_one_order(db, port, _deferred_order(stock, d1), "1d")
+    db.close()
+
+    # 无虚拟持仓 → SELL 审批不过（cap_quantity=None），盘前不报出
+    engine._maybe_pre_open_auction(datetime(2026, 8, 25, 9, 16))
+    assert not any(r.url.path == "/order" for r in rec.requests)
+    assert len(engine._signal_bar_deferred) == 1
+    db = factory()
+    assert db.query(LiveOrder).filter_by(status="deferred").count() == 1
+    db.close()
+
+    # 09:31 首根完成 1m bar：同一笔单走常规放行路径报出（只报一次）
+    _seed_sellable(ctx, stock)
+    engine._handle_bar(port, _bar(stock, "9.3", datetime(2026, 8, 25, 9, 31)))
+    assert len([r for r in rec.requests if r.url.path == "/order"]) == 1
+    assert engine._signal_bar_deferred == []
+    db = factory()
+    assert db.query(LiveOrder).filter_by(status="submitted").count() == 1
+    db.close()
+
+
+def test_pre_open_price_bias_and_limit_clamp():
+    """委托价 = 信号价 ± bias%，并夹进当日涨跌停（各收 1 跳）。"""
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single(period="1d")
+    disp, _ = _make_dispatcher(_Recorder())
+    engine = _pre_open_engine(
+        factory, port, disp, [date(2026, 8, 25)], "600000.SH",
+        pre_open_auction_price_bias_pct=2,
+    )
+    # 昨收 9.00 / 涨停 9.05 / 跌停 8.90
+    engine._price_limit_bounds = lambda code: (9.0, 9.05, 8.90)
+    buy = OrderEvent(
+        strategy_id=1, portfolio_id=1, stock_code="600000.SH",
+        trade_type=TradeType.BUY, signal_type=SignalType.OPEN,
+        quantity=100, price=Decimal("9.0"), bar_time=datetime(2026, 8, 24),
+        signal_name="open_sig", signal_bar_date=date(2026, 8, 24),
+    )
+    # 9.00 × 1.02 = 9.18 → 被涨停−1 跳夹到 9.04
+    assert engine._pre_open_price(buy) == Decimal("9.04")
+
+    sell = OrderEvent(
+        strategy_id=1, portfolio_id=1, stock_code="000001.SZ",
+        trade_type=TradeType.SELL, signal_type=SignalType.CLOSE,
+        quantity=100, price=Decimal("9.0"), bar_time=datetime(2026, 8, 24),
+        signal_name="stop_loss", signal_bar_date=date(2026, 8, 24),
+    )
+    # 9.00 × 0.98 = 8.82 → 被跌停+1 跳夹到 8.91
+    assert engine._pre_open_price(sell) == Decimal("8.91")
+    # 无涨跌停数据（fail-open）→ 只按让价
+    engine._price_limit_bounds = lambda code: None
+    assert engine._pre_open_price(sell) == Decimal("8.82")
+
+
+def test_pre_open_skips_non_trading_day_and_weekly_orders():
+    """非交易日不执行；1w/1mon 周期单不走盘前（仍由首根 1m bar 放行）。"""
+    stock = "600000.SH"
+    d1, d2 = date(2026, 8, 24), date(2026, 8, 25)
+    saturday = date(2026, 8, 29)   # 周六：周末硬规则非交易日（不依赖日历覆盖）
+
+    # ① 非交易日（周六）不执行
+    factory, _ = _db_factory()
+    port, ctx = _portfolio_single(period="1d")
+    _seed_sellable(ctx, stock)
+    rec = _Recorder()
+    disp, _ = _make_dispatcher(rec)
+    engine = _pre_open_engine(factory, port, disp, [d1], stock)
+    db = factory()
+    engine._submit_one_order(db, port, _deferred_order(stock, d1), "1d")
+    db.close()
+    engine._maybe_pre_open_auction(datetime.combine(saturday, datetime.min.time())
+                                   .replace(hour=9, minute=16))
+    assert not any(r.url.path == "/order" for r in rec.requests)
+    assert len(engine._signal_bar_deferred) == 1
+
+    # ② 1w 周期单不在盘前放行
+    factory2, _ = _db_factory()
+    port2, ctx2 = _portfolio_single(period="1w")
+    _seed_sellable(ctx2, stock)
+    rec2 = _Recorder()
+    disp2, _ = _make_dispatcher(rec2)
+    engine2 = _pre_open_engine(factory2, port2, disp2, [d1, d2], stock)
+    db = factory2()
+    engine2._submit_one_order(db, port2, _deferred_order(stock, d1), "1w")
+    db.close()
+    engine2._maybe_pre_open_auction(datetime(2026, 8, 25, 9, 16))
+    assert not any(r.url.path == "/order" for r in rec2.requests)
+    assert len(engine2._signal_bar_deferred) == 1
+
+    # 首根 1m bar 照常放行
+    engine2._handle_bar(port2, _bar(stock, "9.3", datetime(2026, 8, 25, 9, 31)))
+    assert any(r.url.path == "/order" for r in rec2.requests)
+
+
+def test_pre_open_bridge_rejection_requeues_deferred_then_first_bar_retries():
+    """桥明确拒单：重落 deferred 行（原 signal bar_time）+ 回队，09:31 只报一次。"""
+    state = {"reject": True}
+
+    def respond(request):
+        path = request.url.path
+        if path == "/order":
+            if state["reject"]:
+                return httpx.Response(
+                    200, json={"ok": False, "error": "price out of limit"})
+            return httpx.Response(200, json={"ok": True})
+        if path == "/ping":
+            return httpx.Response(200, json={"ok": True})
+        return httpx.Response(404, json={"ok": False})
+
+    factory, _ = _db_factory()
+    port, ctx = _portfolio_single(period="1d")
+    stock = "600000.SH"
+    d1, d2 = date(2026, 8, 24), date(2026, 8, 25)
+    _seed_sellable(ctx, stock)
+    rec = _Recorder(respond=respond)
+    disp, _ = _make_dispatcher(rec)
+    engine = _pre_open_engine(factory, port, disp, [d1, d2], stock)
+    db = factory()
+    engine._submit_one_order(db, port, _deferred_order(stock, d1), "1d")
+    db.close()
+
+    engine._maybe_pre_open_auction(datetime(2026, 8, 25, 9, 16))
+
+    # 拒绝行留痕 + 重落 deferred 行；回队且恢复原 signal bar_time（recover 仍 due 今日）
+    db = factory()
+    assert db.query(LiveOrder).filter_by(status="rejected").count() == 1
+    deferred_rows = db.query(LiveOrder).filter_by(status="deferred").all()
+    db.close()
+    assert len(deferred_rows) == 1
+    assert deferred_rows[0].bar_time.date() == d1
+    assert len(engine._signal_bar_deferred) == 1
+    assert engine._signal_bar_deferred[0].bar_time.date() == d1
+
+    # 09:31 首根完成 1m bar：常规路径重报（唯一一笔成功单）
+    state["reject"] = False
+    engine._handle_bar(port, _bar(stock, "9.3", datetime(2026, 8, 25, 9, 31)))
+    assert len([r for r in rec.requests if r.url.path == "/order"]) == 2  # 1 拒 + 1 成
+    db = factory()
+    assert db.query(LiveOrder).filter_by(status="submitted").count() == 1
+    db.close()
+
+
+def test_pre_open_emits_audit_decision_events():
+    """放行有可观测事件（工作台可见）：gate=pre_open_auction / action=release。"""
+    factory, _ = _db_factory()
+    port, ctx = _portfolio_single(period="1d")
+    stock = "600000.SH"
+    d1, d2 = date(2026, 8, 24), date(2026, 8, 25)
+    _seed_sellable(ctx, stock)
+    disp, _ = _make_dispatcher(_Recorder())
+    engine = _pre_open_engine(factory, port, disp, [d1, d2], stock)
+    db = factory()
+    engine._submit_one_order(db, port, _deferred_order(stock, d1), "1d")
+    db.close()
+
+    engine._maybe_pre_open_auction(datetime(2026, 8, 25, 9, 16))
+
+    db = factory()
+    evs = db.query(LiveDecisionEvent).filter_by(gate="pre_open_auction").all()
+    db.close()
+    assert any(e.action == "release" and stock in (e.stock_code or "") for e in evs)
+
+
+# ===========================================================================
+# 价格归属处置：QMT 盘前「桥能力闸」（指定价可确认才放行）/ 通达信认领价差转 risk
+# / 盘前价格模式声明
+# ===========================================================================
+
+def _pre_open_bridge(rec, price_type=None):
+    """真实 HttpBridgeDispatcher（MockTransport）+ 显式 price_type。"""
+    client = httpx.Client(transport=httpx.MockTransport(rec.handler))
+    return HttpBridgeDispatcher(
+        base_url="http://127.0.0.1:8790", client=client, price_type=price_type)
+
+
+def _bridge_ping(endpoints, order_reply=None):
+    """responder：/ping 带 endpoints 自述，/order 返回受理应答（默认回显 limit）。"""
+    def _respond(request):
+        path = request.url.path
+        if path == "/ping":
+            return httpx.Response(
+                200, json={"ok": True, "endpoints": list(endpoints)})
+        if path == "/order":
+            return httpx.Response(
+                200, json=order_reply or {"ok": True, "price_type": "limit"})
+        return httpx.Response(404, json={"ok": False, "error": "unknown"})
+    return _respond
+
+
+def _iquant_pre_open_engine(factory, port, disp, trading_dates, stock):
+    """盘前开关打开的 QMT 会话（engine=iquant）。"""
+    engine = _pre_open_engine(factory, port, disp, trading_dates, stock)
+    engine._engine_key = "iquant"
+    return engine
+
+
+def _pre_open_fixture(price_type=None, endpoints=("/ping", "/order", "/price_limit"),
+                      order_reply=None):
+    """(factory, port, ctx, rec, disp, engine) 的公共装配（单组合 1d + 一只可卖票）。"""
+    factory, _ = _db_factory()
+    port, ctx = _portfolio_single(period="1d")
+    stock = "600000.SH"
+    d1, d2 = date(2026, 8, 24), date(2026, 8, 25)
+    _seed_sellable(ctx, stock)
+    rec = _Recorder(respond=_bridge_ping(endpoints, order_reply=order_reply))
+    disp = _pre_open_bridge(rec, price_type=price_type)
+    engine = _iquant_pre_open_engine(factory, port, disp, [d1, d2], stock)
+    db = factory()
+    engine._submit_one_order(db, port, _deferred_order(stock, d1), "1d")
+    db.close()
+    return factory, port, ctx, rec, disp, engine, stock
+
+
+def test_pre_open_iquant_releases_when_bridge_supports_limit_price():
+    """price_type=limit + 桥自述支持 → 放行；委托价是盘前限价（prType=11 原价）。"""
+    factory, port, _, rec, _, engine, stock = _pre_open_fixture(
+        price_type="limit")
+
+    engine._maybe_pre_open_auction(datetime(2026, 8, 25, 9, 16))
+
+    orders = [r for r in rec.requests if r.url.path == "/order"]
+    assert len(orders) == 1
+    payload = json.loads(orders[0].content.decode("utf-8"))
+    assert payload["price_type"] == "limit"      # 桥按指定价下发，不被回退
+    assert payload["pr_type"] == 14              # 兼容老桥的历史字段，新桥以 price_type 为准
+    assert payload["price"] > 0                  # 盘前算出的限价，非对手价 0
+    assert engine._signal_bar_deferred == []
+    db = factory()
+    assert db.query(LiveOrder).filter_by(status="submitted").count() == 1
+    assert db.query(LiveOrder).filter_by(status="deferred").count() == 0
+    evs = db.query(LiveDecisionEvent).filter_by(
+        gate="pre_open_auction", action="release").all()
+    db.close()
+    assert [e.stock_code for e in evs] == [stock]
+
+
+def test_pre_open_iquant_per_order_limit_even_if_config_opponent():
+    """会话配 opponent 也不拦：盘前单按单带 price_type=limit，盘中单仍用配置默认。"""
+    factory, port, _, rec, _, engine, stock = _pre_open_fixture(price_type="opponent")
+
+    engine._maybe_pre_open_auction(datetime(2026, 8, 25, 9, 16))
+
+    orders = [r for r in rec.requests if r.url.path == "/order"]
+    assert len(orders) == 1
+    payload = json.loads(orders[0].content.decode("utf-8"))
+    assert payload["price_type"] == "limit"   # 按单覆盖，不受会话级 opponent 影响
+    assert payload["pr_type"] == 14
+    assert payload["price"] > 0
+    assert engine._signal_bar_deferred == []
+    assert engine._pre_open_echo_bad is None
+
+
+def test_http_bridge_place_order_price_type_per_order_override():
+    """盘中不带覆盖 → 配置默认 opponent；盘前显式 limit 按单覆盖，其它调用点不变。"""
+    rec = _Recorder(respond=_bridge_ping(("/ping", "/order", "/price_limit")))
+    disp = _pre_open_bridge(rec, price_type="opponent")
+    order = OrderEvent(
+        strategy_id=1, portfolio_id=1, stock_code="600000.SH",
+        trade_type=TradeType.BUY, signal_type=SignalType.OPEN,
+        quantity=100, price=Decimal("9.0"),
+        bar_time=datetime(2026, 8, 25, 9, 40))
+    disp.place_order(order)
+    disp.place_order(order, price_type="limit")
+    payloads = [json.loads(r.content.decode("utf-8"))
+                for r in rec.requests if r.url.path == "/order"]
+    assert [p["price_type"] for p in payloads] == ["opponent", "limit"]
+    assert [p["pr_type"] for p in payloads] == [14, 14]
+
+
+def test_pre_open_iquant_blocked_when_bridge_lacks_price_type_capability():
+    """桥自述无指定价能力（未升级：prType 固定 14）→ 拦截，绝不静默降级对手价。"""
+    factory, _, _, rec, _, engine, _ = _pre_open_fixture(
+        price_type="limit", endpoints=("/ping", "/order"))
+    events = []
+    engine._emit = lambda et, payload: events.append((et, payload))
+
+    engine._maybe_pre_open_auction(datetime(2026, 8, 25, 9, 16))
+
+    assert not any(r.url.path == "/order" for r in rec.requests)
+    assert len(engine._signal_bar_deferred) == 1
+    ev = [p for et, p in events if et == "risk"][0]
+    assert ev["gate"] == "pre_open_auction" and ev["action"] == "block"
+    assert "桥不支持指定价" in ev["message"]
+    assert "盘前限价不可控" in ev["message"]
+
+
+def test_pre_open_iquant_blocked_when_bridge_echoed_opponent():
+    """盘前单 /order 回显 opponent（桥未采纳 limit）→ 当日后续盘前单拦截。"""
+    factory, _, _, rec, _, engine, _ = _pre_open_fixture(
+        price_type="opponent", order_reply={"ok": True, "price_type": "opponent"})
+
+    engine._maybe_pre_open_auction(datetime(2026, 8, 25, 9, 16))
+
+    # 首单已报出（闸无法预知回显），但回显异常被记录 → 后续盘前单整日拦截
+    assert any(r.url.path == "/order" for r in rec.requests)
+    assert engine._pre_open_echo_bad == "opponent"
+    reason = engine._pre_open_price_block_reason()
+    assert reason and "回显" in reason and "limit" in reason
+
+
+@pytest.mark.parametrize("engine_key", ["tdx", "ths", "goldminer"])
+def test_pre_open_non_iquant_channels_unaffected(engine_key):
+    """非 QMT 通道（通达信 PRICE_MY / 同花顺强制 approval / 掘金 OrderType_Limit）
+    委托价本就由平台决定，不看 price_type，盘前行为不变。"""
+    factory, port, _, rec, _, engine, _ = _pre_open_fixture(price_type="opponent")
+    engine._engine_key = engine_key
+    events = []
+    engine._emit = lambda et, payload: events.append((et, payload))
+
+    engine._maybe_pre_open_auction(datetime(2026, 8, 25, 9, 16))
+
+    assert len([r for r in rec.requests if r.url.path == "/order"]) == 1
+    assert engine._signal_bar_deferred == []
+    assert not [p for et, p in events if p.get("action") == "block"]
+
+
+def test_on_claim_anomaly_emits_risk_event():
+    """通道认领异常（TDX 价差不符）→ risk 事件，补 session_id/engine。"""
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single(period="1d")
+    disp, _ = _make_dispatcher(_Recorder())
+    engine = _calendar_engine(factory, port, disp, [date(2026, 8, 24)], "600000.SH")
+    events = []
+    engine._emit = lambda et, payload: events.append((et, payload))
+
+    engine._on_claim_anomaly({
+        "gate": "claim_price_mismatch", "stock_code": "600000.SH",
+        "expected_price": 9.0, "expire_in_seconds": 180})
+
+    assert len(events) == 1
+    et, payload = events[0]
+    assert et == "risk"
+    assert payload["gate"] == "claim_price_mismatch"
+    assert payload["session_id"] == engine.session_id
+    assert payload["engine"] == engine._engine_key
+
+
+def test_announce_pre_open_price_mode_emits_decision():
+    """盘前强制 approval：启动时发 decision（gate=pre_open_price_mode/forced）。"""
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single(period="1d")
+    disp, _ = _make_dispatcher(_Recorder())
+    engine = _calendar_engine(factory, port, disp, [date(2026, 8, 24)], "600000.SH")
+    engine._dispatcher.price_mode_forced_pre_open = True
+    engine._dispatcher.ths_price_mode = "approval"
+    events = []
+    engine._emit = lambda et, payload: events.append((et, payload))
+
+    engine._announce_pre_open_price_mode()
+
+    assert len(events) == 1
+    et, payload = events[0]
+    assert et == "decision"
+    assert payload["gate"] == "pre_open_price_mode"
+    assert payload["action"] == "forced"
+    assert payload["price_mode"] == "approval"
+    assert "价格由平台键入" in payload["message"]
+
+
+
+
+def test_dedupe_inflight_sells_skips_duplicate_and_narrows_partial():
+    """B2：同票同向在途卖单去重（按未结单状态，不按当日标记）。
+
+    - 在途 5300 未成交 + 新单 5300 → 整单跳过（skip 事件）；
+    - 在途 5300 已成交 3000（剩 2300）+ 新目标 5300 → 收窄为 3000；
+    - 其它票 / 买单不受影响；今天在途清完后明天可照常再卖（状态判据）。
+    """
+    import threading
+    from types import SimpleNamespace
+    from core.engine.live_engine import LiveEngine
+    from tq_iquant_shared.constants import TradeType
+
+    eng = object.__new__(LiveEngine)
+    eng._book_lock = threading.RLock()
+    calls = []
+    eng._rec_live = lambda *a, **kw: calls.append((a, kw))
+
+    portfolio = SimpleNamespace(portfolio_id=1)
+    pending = SimpleNamespace(
+        trade_type="SELL", portfolio_strategy_id=1, strategy_id=2,
+        stock_code="601827.SH", quantity=5300, filled_quantity=0)
+    eng._order_machine = SimpleNamespace(pending_orders={"a": pending})
+    sell = lambda qty=5300, code="601827.SH": SimpleNamespace(
+        trade_type=TradeType.SELL, strategy_id=2, stock_code=code, quantity=qty)
+
+    assert eng._dedupe_inflight_sells(portfolio, [sell()]) == []
+    assert calls and calls[-1][0][0] == "inflight_sell" and calls[-1][0][1] == "skip"
+
+    # 部分成交：剩 2300 在途 → 新单目标 5300 收窄为 3000
+    pending.filled_quantity = 3000
+    kept = eng._dedupe_inflight_sells(portfolio, [sell()])
+    assert len(kept) == 1 and kept[0].quantity == 3000
+    assert calls[-1][0][1] == "reduce"
+
+    # 其它票 / 买单不受影响
+    fake_buy = SimpleNamespace(trade_type=TradeType.BUY, strategy_id=2,
+                               stock_code="601827.SH", quantity=1000)
+    kept2 = eng._dedupe_inflight_sells(portfolio, [sell(code="300174.SZ"), fake_buy])
+    assert [o.stock_code for o in kept2] == ["300174.SZ", "601827.SH"]
+    assert kept2[1].quantity == 1000

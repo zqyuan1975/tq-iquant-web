@@ -430,6 +430,93 @@ def test_tick_deals_receipt_matches_by_entry_shape_fallback(tmp_path):
     disp.close()
 
 
+# ---------------- P0-1：accepted 回执按真实提交量修正账本 ----------------
+
+def _enqueue_accept(disp, entry, ref="300001", final_qty=300):
+    """模拟内置执行器成功：accepted 回执（ref + 钳量后的 final_qty）待引擎消费。"""
+    with disp._rejects_lock:
+        disp._file_accepts[str(entry["order_id"])] = {
+            "ref": ref,
+            "final_qty": final_qty,
+            "ts": now_shanghai().isoformat(timespec="seconds"),
+            "entry": dict(entry),
+        }
+
+
+def test_tick_deals_accept_receipt_applies_final_qty(tmp_path):
+    """accepted 回执 final_qty(300) ≠ 审批量(600) → 订单委托量改写为 300、
+    保持 submitted、记 risk(channel_qty_clamped)；随后成交回填按 300 判 filled
+    并更新持仓/虚拟现金（按成交成本），不再「引擎以为没买、实际已买」。"""
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single()
+    engine, disp = _ths_engine(factory, port, tmp_path)
+    engine.signal_cache = {(1, STOCK, BAR_TIME): [{"name": "open_sig", "value": 1}]}
+    engine._handle_bar(port, _bar(STOCK, "9.3", BAR_TIME))
+
+    db = factory()
+    lo = db.query(LiveOrder).one()
+    assert lo.quantity == 600
+    oid, lo_id = lo.bridge_order_id, lo.id
+    db.close()
+
+    _enqueue_accept(disp, {
+        "order_id": oid, "stock_code": STOCK, "direction": "BUY",
+        "quantity": 600, "price": 9.3,
+    }, final_qty=300)
+
+    q = _drain_order_events(engine)
+    engine._tick_deals()
+
+    db = factory()
+    lo = db.query(LiveOrder).filter(LiveOrder.id == lo_id).one()
+    assert lo.quantity == 300        # 以真实提交量为准
+    assert lo.status == "submitted"
+    assert lo.order_ref == "300001"  # 回执自带合同编号 → 免再走模糊认领
+    db.close()
+    assert engine._pending_orders[lo_id].quantity == 300  # 在途闸按真实量占用
+
+    events = []
+    while not q.empty():
+        events.append(q.get_nowait())
+    risk = [e for e in events if e.get("type") == "risk"]
+    assert len(risk) == 1
+    assert risk[0]["rule"] == "channel_qty_clamped"
+    assert risk[0]["engine_quantity"] == 600
+    assert risk[0]["final_quantity"] == 300
+    disp.close()
+
+
+def test_tick_deals_accept_receipt_matches_claimed_order(tmp_path):
+    """accepted 回执晚于认领到达（order_ref 已非空）仍能匹配并修正数量。"""
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single()
+    engine, disp = _ths_engine(factory, port, tmp_path)
+    engine.signal_cache = {(1, STOCK, BAR_TIME): [{"name": "open_sig", "value": 1}]}
+    engine._handle_bar(port, _bar(STOCK, "9.3", BAR_TIME))
+
+    db = factory()
+    lo = db.query(LiveOrder).one()
+    oid, lo_id = lo.bridge_order_id, lo.id
+    lo.order_ref = "EARLY-REF"
+    db.commit()
+    db.close()
+
+    _enqueue_accept(disp, {
+        "order_id": oid, "stock_code": STOCK, "direction": "BUY",
+        "quantity": 600, "price": 9.3,
+    }, ref="EARLY-REF", final_qty=300)
+
+    engine._tick_deals()
+
+    db = factory()
+    lo = db.query(LiveOrder).filter(LiveOrder.id == lo_id).one()
+    assert lo.quantity == 300
+    assert lo.order_ref == "EARLY-REF"   # 不覆盖既有认领结果
+    assert lo.status == "submitted"
+    db.close()
+    disp.close()
+
+
 def test_tick_deals_no_receipts_noop(tmp_path):
     """无回执：deals 轮询零开销，在途单不受影响。"""
     factory, _ = _db_factory()

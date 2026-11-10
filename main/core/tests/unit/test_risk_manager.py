@@ -324,6 +324,8 @@ def _pos_with_high(qty=1000, high="10"):
     pos = Position("000001.SZ")
     pos.quantity = qty
     pos.highest_price = Decimal(high)
+    # B5：成本未知（avg_cost<=0）时风控整体跳过，ratio 覆盖用例需给出有效成本基准
+    pos.avg_cost = Decimal("9")
     return pos
 
 
@@ -349,3 +351,22 @@ def test_trailing_stop_ratio_none_falls_back_to_instance():
     assert rm.check_trailing_stop(pos, Decimal("9.5"), ratio=Decimal("0.03")) is True
     # 覆盖 0 同样视为禁用（与实例阈值 0 语义一致）
     assert rm.check_trailing_stop(pos, Decimal("9.5"), ratio=Decimal("0")) is False
+
+
+def test_risk_skipped_when_cost_unknown():
+    """B5：柜台成本为负/未知（avg_cost<=0）时止损/止盈/移动止损一律跳过。
+
+    成本未知再用阈值判断只会误杀（或形同失效），口径是整票不参与风控，
+    由人工指定成本基准。
+    """
+    rm = StrategyRiskManager(
+        stop_loss_ratio=Decimal("0.05"), take_profit_ratio=Decimal("0.2"),
+        trailing_stop_ratio=Decimal("0.03"),
+    )
+    pos = Position("300413.SZ")
+    pos.quantity = 20
+    pos.avg_cost = Decimal("0")          # 柜台负成本 → 未知标记
+    pos.highest_price = Decimal("40")
+    assert rm.check_stop_loss(pos, Decimal("1")) is False
+    assert rm.check_take_profit(pos, Decimal("999")) is False
+    assert rm.check_trailing_stop(pos, Decimal("10")) is False

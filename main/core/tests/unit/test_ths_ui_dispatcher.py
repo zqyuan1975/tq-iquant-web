@@ -20,7 +20,7 @@ from core.engine.http_bridge_dispatcher import (
     BridgeUnavailableError,
 )
 from core.engine.live.order_machine import OrderStateMachine
-from core.engine.ths_ui_dispatcher import ThsUiDispatcher
+from core.engine.ths_ui_dispatcher import ThsPriceNotApplied, ThsUiDispatcher
 from tq_iquant_shared.constants import SignalType, TradeType
 
 
@@ -153,6 +153,21 @@ def test_query_quote_forwards_tq_bars(monkeypatch):
     assert [b["stime"] for b in bars] == ["20261023093000", "20261023093100"]
     assert bars[0]["close"] == pytest.approx(10.1)
     assert bars[1]["volume"] == 2000
+
+
+def test_check_price_limit_delegates_to_tdx(monkeypatch):
+    """ths 涨跌停校验委托 TdxTqDispatcher（与日历/行情同模式）：拒单原因原样透传。"""
+    calls = []
+
+    def _fake(self, stock_code, direction, price):
+        calls.append((stock_code, direction, str(price)))
+        return "涨停拦截（测试）"
+
+    monkeypatch.setattr(
+        "core.engine.tdx_tq_dispatcher.TdxTqDispatcher.check_price_limit", _fake)
+    assert ThsUiDispatcher().check_price_limit(
+        "000001.SZ", "buy", Decimal("11")) == "涨停拦截（测试）"
+    assert calls == [("000001.SZ", "buy", "11")]
 
 
 def test_query_calendar_delegates_to_tdx_authority(monkeypatch):
@@ -488,6 +503,139 @@ def test_execution_receipts_direct_mode_returns_empty(tmp_path):
     assert d.execution_receipts() == []
 
 
+# ---------------- P0-2：执行前终态/入队年龄前置闸 ----------------
+
+def _fresh_entry(oid, age_seconds=0):
+    """orders.jsonl 指令行（ts = 入队时刻，上海 naive ISO，与 append_order 同口径）。"""
+    from core.engine.live.timing import now_shanghai
+    ts = (now_shanghai() - timedelta(seconds=age_seconds)).isoformat(timespec="seconds")
+    return {"order_id": oid, "stock_code": "000001.SZ", "direction": "BUY",
+            "quantity": 100, "price": 10.0, "ts": ts, "session_id": 42}
+
+
+def test_executor_skips_terminal_order_before_ui(tmp_path, monkeypatch):
+    """DB 已是终态（rejected/canceled/filled）→ 不驱动 UI，落 skipped 回执 +
+    done 表（推进后未执行同样可在 results.jsonl 观察）。"""
+    d = _file_dispatcher(tmp_path)
+    oid = "oid-terminal"
+    monkeypatch.setattr(d, "_lookup_db_order_status",
+                        lambda o, s: ("canceled", True))
+    called = []
+    monkeypatch.setattr(d, "_execute_via_ui", lambda o: called.append(o))
+
+    d._execute_entry(_fresh_entry(oid))
+
+    assert called == []                       # 未驱动 UI（不是先下单再自查）
+    results = _jsonl(d._handoff.results_path)
+    assert results[0]["order_id"] == oid
+    assert results[0]["status"] == "skipped"
+    assert results[0]["reason"] == "order_terminal"
+    assert results[0]["db_status"] == "canceled"
+    assert oid in d._handoff.cursor["done"]
+    assert d._file_rejects == {}              # skipped 不是拒单，不进引擎回执通道
+
+
+def test_executor_skips_stale_queue_entry_before_ui(tmp_path, monkeypatch):
+    """入队年龄超阈值（执行器崩溃/积压）→ 不执行，skipped 回执带年龄与阈值。"""
+    d = _file_dispatcher(tmp_path)
+    oid = "oid-stale"
+    monkeypatch.setattr(d, "_lookup_db_order_status",
+                        lambda o, s: (None, False))
+    monkeypatch.setattr(d, "_queue_age_limit_seconds", lambda: 180.0)
+    called = []
+    monkeypatch.setattr(d, "_execute_via_ui", lambda o: called.append(o))
+
+    d._execute_entry(_fresh_entry(oid, age_seconds=600))
+
+    assert called == []
+    results = _jsonl(d._handoff.results_path)
+    assert results[0]["status"] == "skipped"
+    assert results[0]["reason"] == "queue_age_exceeded"
+    assert results[0]["queue_age_seconds"] >= 599
+    assert results[0]["limit_seconds"] == 180.0
+    assert oid in d._handoff.cursor["done"]
+
+
+def test_executor_runs_legacy_entry_when_db_row_missing(tmp_path, monkeypatch, caplog):
+    """查不到 DB 行（历史遗留指令）→ 按原行为执行，仅 WARNING（不一律丢弃）。"""
+    import logging
+
+    d = _file_dispatcher(tmp_path)
+    oid = "oid-legacy"
+    monkeypatch.setattr(d, "_lookup_db_order_status",
+                        lambda o, s: (None, False))
+
+    def _fake_ui(o):
+        d._last_submit_ref = "300003"
+        return object()
+
+    monkeypatch.setattr(d, "_execute_via_ui", _fake_ui)
+    with caplog.at_level(logging.WARNING):
+        d._execute_entry(_fresh_entry(oid))
+
+    assert _jsonl(d._handoff.results_path)[0]["status"] == "accepted"
+    assert any("not found in live_orders" in r.message for r in caplog.records)
+
+
+def test_executor_runs_when_db_lookup_unavailable(tmp_path, monkeypatch):
+    """DB 不可用（查询异常）→ 返回未知，不拦执行（不能因读库失败全面停单）。"""
+    d = _file_dispatcher(tmp_path)
+    monkeypatch.setattr(d, "_lookup_db_order_status",
+                        lambda o, s: (None, None))
+    called = []
+    monkeypatch.setattr(d, "_execute_via_ui",
+                        lambda o: called.append(o) or object())
+
+    d._execute_entry(_fresh_entry("oid-no-db"))
+
+    assert len(called) == 1
+    assert _jsonl(d._handoff.results_path)[0]["status"] == "accepted"
+
+
+def test_lookup_db_order_status_by_bridge_order_id(db_session, monkeypatch):
+    """真实查询：按 (session_id, bridge_order_id) 命中 latest 行并返回状态。"""
+    import core.db as db_mod
+    from core.models.live_order import LiveOrder
+
+    db_session.add(LiveOrder(
+        live_session_id=42, portfolio_strategy_id=1, strategy_id=1,
+        stock_code="000001.SZ", trade_type="buy", order_type="limit",
+        price=Decimal("10.0"), quantity=100, status="filled",
+        bridge_order_id="oid-db-1"))
+    db_session.commit()
+    monkeypatch.setattr(db_mod, "SessionLocal", lambda: db_session)
+
+    d = ThsUiDispatcher(execute_mode="direct")
+    assert d._lookup_db_order_status("oid-db-1", 42) == ("filled", True)
+    # session 不匹配 = 查不到（历史遗留指令口径）
+    assert d._lookup_db_order_status("oid-db-1", 7) == (None, False)
+
+
+def test_queue_age_limit_config_precedence(monkeypatch):
+    """阈值解析：ths_ui.executor_max_queue_age_seconds > live.execution_stall_seconds
+    > 默认 180s；构造参数优先于配置。"""
+    import core.config as config_mod
+
+    d = ThsUiDispatcher(execute_mode="direct")
+    monkeypatch.setattr(config_mod, "load_config",
+                        lambda: {"ths_ui": {"executor_max_queue_age_seconds": 45}})
+    assert d._queue_age_limit_seconds() == 45.0
+
+    d2 = ThsUiDispatcher(execute_mode="direct")
+    monkeypatch.setattr(config_mod, "load_config",
+                        lambda: {"live": {"execution_stall_seconds": 90}})
+    assert d2._queue_age_limit_seconds() == 90.0
+
+    d3 = ThsUiDispatcher(execute_mode="direct")
+    monkeypatch.setattr(config_mod, "load_config", lambda: {})
+    assert d3._queue_age_limit_seconds() == 180.0
+
+    d4 = ThsUiDispatcher(execute_mode="direct", max_queue_age_seconds=30)
+    monkeypatch.setattr(config_mod, "load_config",
+                        lambda: {"ths_ui": {"executor_max_queue_age_seconds": 45}})
+    assert d4._queue_age_limit_seconds() == 30.0
+
+
 def test_order_dispatcher_default_execution_receipts_empty():
     """基类默认无回执（TdxTqDispatcher 等无需实现）。"""
     from core.engine.execution_engine import SimulatedDispatcher
@@ -551,7 +699,8 @@ class _FakeField:
 
 def test_execute_via_ui_calibrated_click_flow_buy_and_sell(monkeypatch):
     """校准点击流断言：F1/F2 方向；代码框点击=rect 左起 8px（避开下拉按钮）、
-    价格/数量中心点击；键入 kb_send 序（^a 清空 + 值）；显式价格（限价语义）。"""
+    价格/数量中心点击；键入 kb_send 序（^a 清空 + 值）；显式价格（限价语义）；
+    价格键入后回读（END + Shift+Home，不重复点击价格框）。"""
     d = ThsUiDispatcher(captcha_ocr=True, execute_mode="direct")
     d._connected = True
     clicks = []
@@ -582,6 +731,10 @@ def test_execute_via_ui_calibrated_click_flow_buy_and_sell(monkeypatch):
     # 数量读回钳制：mock 剪贴板读取（auto_price/auto_qty 读不到 → 引擎量兜底）
     monkeypatch.setattr(d, "_clipboard_copy_float", lambda: None)
     monkeypatch.setattr(d, "_clipboard_copy_int", lambda: None)
+    # 事前价格拦截会清空剪贴板：注入假 pyperclip，隔离真实剪贴板
+    monkeypatch.setattr(
+        "core.engine.ths_ui_dispatcher.pyperclip",
+        SimpleNamespace(copy=lambda v: None, paste=lambda: ""))
 
     d._execute_via_ui(_order(stock_code="600519.SH", quantity=100,
                              price=Decimal("1700.55")))
@@ -601,6 +754,7 @@ def test_execute_via_ui_calibrated_click_flow_buy_and_sell(monkeypatch):
         "{END}",                                # 重锚代码框后光标归位
         "{TAB}", "{TAB}",
         "{END}", "{BACKSPACE}" * 12, "1700.55",              # 显式价格限价
+        "{END}", "+{HOME}",                     # 事前价格拦截：回读全选（不重复点击）
         "{END}", "{BACKSPACE}" * 12, "100",
         "{ENTER}",
     ]
@@ -619,6 +773,7 @@ def test_execute_via_ui_calibrated_click_flow_buy_and_sell(monkeypatch):
         "{END}",
         "{TAB}", "{TAB}",
         "{END}", "{BACKSPACE}" * 12, "9.99",
+        "{END}", "+{HOME}",
         "{END}", "{BACKSPACE}" * 12, "300",
         "{ENTER}",
     ]
@@ -782,6 +937,12 @@ def _ui_mocked_dispatcher(monkeypatch, found_row):
     monkeypatch.setattr(d, "_find_order",
                         lambda code, direction, vol, since=None: found_row)
     monkeypatch.setattr(d, "_get_ocr_engine", lambda: object())
+    # 事前价格拦截的回读：剪贴板读不到 → 不拦（本组用例校验的是提交后价差撤单）
+    monkeypatch.setattr(d, "_clipboard_copy_float", lambda: None)
+    monkeypatch.setattr(d, "_clipboard_copy_int", lambda: None)
+    monkeypatch.setattr(
+        "core.engine.ths_ui_dispatcher.pyperclip",
+        SimpleNamespace(copy=lambda v: None, paste=lambda: ""))
     return d
 
 
@@ -1101,6 +1262,56 @@ def test_account_reuses_recent_position_rows(monkeypatch):
     assert first[0]["total_asset"] == 5000.0
 
 
+def test_account_fund_read_failure_returns_none(monkeypatch):
+    """持仓可读但 F4 资金标签一个都没识别到 → None（不得退化成
+    「总资产 = 持仓市值」的假数字），并记录 _last_error。"""
+    d = ThsUiDispatcher(captcha_ocr=True, execute_mode="direct")
+    d._connected = True
+    monkeypatch.setattr(d, "_gui_guard", lambda: True)
+    monkeypatch.setattr(d, "_select_page", lambda name: True)
+    monkeypatch.setattr(d, "_read_fund_values", lambda: {})
+    monkeypatch.setattr(d, "_copy_grid", lambda required=(): (
+        "证券代码\t证券名称\t股票余额\t可用余额\t成本价\t市价\t市值\n"
+        "002745\t木林森\t5300\t0\t10.221\t10.55\t55915\n"
+    ))
+
+    assert d.get_account() is None
+    assert "资金" in d.last_error
+
+
+def test_account_without_cash_fields_returns_none(monkeypatch):
+    """只读到市值、无任何现金字段 → None（用市值补算总资产即假数字）。"""
+    d = ThsUiDispatcher(captcha_ocr=True, execute_mode="direct")
+    d._connected = True
+    monkeypatch.setattr(d, "_gui_guard", lambda: True)
+    monkeypatch.setattr(d, "_select_page", lambda name: True)
+    monkeypatch.setattr(d, "_read_fund_values", lambda: {"market_value": 55915.0})
+    monkeypatch.setattr(d, "_copy_grid", lambda required=(): (
+        "证券代码\t证券名称\t股票余额\t可用余额\t成本价\t市价\t市值\n"
+        "002745\t木林森\t5300\t0\t10.221\t10.55\t55915\n"
+    ))
+
+    assert d.get_account() is None
+    assert "资金" in d.last_error
+
+
+def test_account_partial_fund_computes_total_from_cash(monkeypatch):
+    """有资金余额但缺总资产列 → 用「资金余额 + 市值」补算（正常口径）。"""
+    d = ThsUiDispatcher(captcha_ocr=True, execute_mode="direct")
+    d._connected = True
+    monkeypatch.setattr(d, "_gui_guard", lambda: True)
+    monkeypatch.setattr(d, "_select_page", lambda name: True)
+    monkeypatch.setattr(d, "_read_fund_values",
+                        lambda: {"balance": 10000.0, "available": 9000.0})
+    monkeypatch.setattr(d, "_copy_grid", lambda required=(): (
+        "证券代码\t证券名称\t股票余额\t可用余额\t成本价\t市价\t市值\n"
+        "002745\t木林森\t5300\t0\t10.221\t10.55\t55915\n"
+    ))
+
+    acc = d.get_account()
+    assert acc[0]["total_asset"] == 10000.0 + 55915.0
+
+
 def _order_row_dict(ref, time_hm="173429", price=20.0, volume=100,
                     direction="buy", status=50):
     """_parse_orders 的真实行形状：只有 time 文本（无 insert_date/insert_time）。"""
@@ -1315,3 +1526,173 @@ def test_execute_via_ui_aborts_when_switch_fails(monkeypatch):
                                  price=Decimal("10.0")))
     assert "切页失败" in str(ei.value) or "切换失败" in str(ei.value)
     assert clicks == []
+
+
+# ===========================================================================
+# P0-1：钳量后的真实提交量（final_qty）随 accepted 回执回传引擎
+# ===========================================================================
+def test_execute_via_ui_records_final_quantity_after_clamp(monkeypatch):
+    """UI 实时可买 300 < 引擎审批 600 → 键入 300 且 _last_final_qty=300
+    （accepted 回执 final_qty 的唯一来源）。"""
+    d = _ui_mocked_dispatcher(monkeypatch, {"order_id": "200001"})
+    monkeypatch.setattr(d, "_clipboard_copy_float", lambda: None)
+    monkeypatch.setattr(d, "_clipboard_copy_int", lambda: 300)  # THS 实时可买
+    typed = []
+    monkeypatch.setattr(d, "kb_send", lambda k: typed.append(k))
+
+    d._execute_via_ui(_order(stock_code="600519.SH", quantity=600,
+                             price=Decimal("1700.55")))
+
+    assert d._last_final_qty == 300
+    assert "300" in typed            # 真实键入量 = 钳量后的 300
+    assert "600" not in typed
+
+
+def test_execute_entry_accept_receipt_carries_final_qty(tmp_path, monkeypatch):
+    """file 模式执行成功：accepted 回执（内存队列 + results.jsonl）都带
+    ref 与 final_qty，供引擎按真实提交量修正账本。"""
+    d = _file_dispatcher(tmp_path)
+    oid = "oid-clamped"
+    monkeypatch.setattr(d, "_lookup_db_order_status", lambda o, s: (None, False))
+
+    def _fake_ui(o):
+        d._last_submit_ref = "300001"
+        d._last_final_qty = 300
+
+    monkeypatch.setattr(d, "_execute_via_ui", _fake_ui)
+
+    d._execute_entry(_fresh_entry(oid))
+
+    receipts = d.execution_receipts()
+    assert len(receipts) == 1
+    assert receipts[0]["order_id"] == oid
+    assert receipts[0]["status"] == "accepted"
+    assert receipts[0]["ref"] == "300001"
+    assert receipts[0]["final_qty"] == 300
+    results = _jsonl(d._handoff.results_path)
+    assert results[0]["status"] == "accepted"
+    assert results[0]["final_qty"] == 300
+    assert d.pending_receipt_count == 0  # 已弹出
+
+
+# ===========================================================================
+# 价格归属四条处置：同花顺事前价格拦截 / 盘前强制 approval
+# ===========================================================================
+def test_price_matches_cent_rounds_to_cent():
+    """按分比对：尾差（4.153 vs 4.15）视为已生效，真错价（4.415）必须拦。"""
+    assert ThsUiDispatcher._price_matches_cent("4.153", "4.15") is True
+    assert ThsUiDispatcher._price_matches_cent(Decimal("9.99"), 9.99) is True
+    assert ThsUiDispatcher._price_matches_cent("4.153", "4.415") is False
+    # 不可解析 → 不拦（交给提交后委托价校验 + 自动撤单兜底）
+    assert ThsUiDispatcher._price_matches_cent(None, "4.15") is True
+
+
+def test_readback_price_key_sequence_without_reclick(monkeypatch):
+    """回读按键：END + Shift+Home 全选，读前清空剪贴板，且不重复点击价格框。"""
+    d = ThsUiDispatcher(execute_mode="direct")
+    kb, clicks, copied = [], [], []
+    monkeypatch.setattr(d, "kb_send", lambda k: kb.append(k))
+    monkeypatch.setattr(d, "_click_field", lambda *a, **kw: clicks.append(a))
+    monkeypatch.setattr(d, "_clipboard_copy_float", lambda: 4.15)
+    monkeypatch.setattr(
+        "core.engine.ths_ui_dispatcher.pyperclip",
+        SimpleNamespace(copy=lambda v: copied.append(v), paste=lambda: "4.15"))
+
+    assert d._readback_price(object()) == pytest.approx(4.15)
+    assert kb == ["{END}", "+{HOME}"]
+    assert clicks == []          # 焦点仍在价格框，不得重复点击（会触发跟价刷新）
+    assert copied == [""]        # 读前清空，避免残留值
+
+
+def test_execute_via_ui_blocks_submit_when_price_not_applied(monkeypatch):
+    """回读价 ≠ 审批价 → 抛 ThsPriceNotApplied，绝不按 ENTER、不提交。"""
+    d = ThsUiDispatcher(captcha_ocr=True, execute_mode="direct")
+    d._connected = True
+    kb = []
+    fake_fields = {
+        "code": _FakeField(1032, 316, 141, 121),
+        "price": _FakeField(1033, 316, 205, 98),
+        "quantity": _FakeField(1034, 316, 301, 98),
+    }
+    monkeypatch.setattr(d, "_gui_guard", lambda: True)
+    monkeypatch.setattr(d, "_ensure_topmost", lambda x, y: True)
+    monkeypatch.setattr(d, "_switch", lambda k: True)
+    monkeypatch.setattr(d, "_uia_window", lambda: object())
+    monkeypatch.setattr(d, "_uia_field", lambda w, kind: fake_fields[kind])
+    d._PRICE_FOLLOW_WAIT = 0
+    import pywinauto.mouse as ths_mouse
+    monkeypatch.setattr(ths_mouse, "click", lambda coords: None)
+    monkeypatch.setattr(d, "kb_send", lambda k: kb.append(k))
+    monkeypatch.setattr(d, "_snapshot_hwnds", lambda: set())
+    monkeypatch.setattr(d, "_confirm_dialog", lambda before, buttons: True)
+    find_calls = []
+    monkeypatch.setattr(d, "_find_order",
+                        lambda *a, **kw: find_calls.append(a) or {"order_id": "200001"})
+    monkeypatch.setattr(d, "_get_ocr_engine", lambda: object())
+    monkeypatch.setattr(d, "_clipboard_copy_float", lambda: None)
+    monkeypatch.setattr(d, "_clipboard_copy_int", lambda: None)
+    monkeypatch.setattr(
+        "core.engine.ths_ui_dispatcher.pyperclip",
+        SimpleNamespace(copy=lambda v: None, paste=lambda: ""))
+    # 回读被 THS 异步跟价覆盖：键入 4.153，回读 4.415
+    monkeypatch.setattr(d, "_readback_price", lambda field: 4.415)
+
+    with pytest.raises(ThsPriceNotApplied) as ei:
+        d._execute_via_ui(_order(stock_code="000001.SZ", quantity=300,
+                                 price=Decimal("4.153")))
+
+    assert "{ENTER}" not in kb              # 未提交
+    assert find_calls == []                 # 未走到回查认领
+    assert d._last_submit_ref == ""         # 无委托号（未报柜台）
+    assert ei.value.expected_price == pytest.approx(4.153)
+    assert ei.value.readback_price == pytest.approx(4.415)
+
+
+def test_execute_entry_price_not_applied_writes_structured_reject(tmp_path, monkeypatch):
+    """file 模式回读失败：不报柜台 → rejected 回执带 price_not_applied 双价 →
+    写 done 表（at-most-once，不重试）。"""
+    d = _file_dispatcher(tmp_path)
+    oid = "oid-price-not-applied"
+    monkeypatch.setattr(d, "_lookup_db_order_status", lambda o, s: (None, False))
+
+    def _boom(o):
+        raise ThsPriceNotApplied(Decimal("4.153"), 4.415)
+
+    monkeypatch.setattr(d, "_execute_via_ui", _boom)
+
+    d._execute_entry(_fresh_entry(oid))
+
+    results = _jsonl(d._handoff.results_path)
+    assert len(results) == 1
+    assert results[0]["order_id"] == oid
+    assert results[0]["status"] == "rejected"
+    assert results[0]["reason"] == "price_not_applied"
+    assert results[0]["expected_price"] == pytest.approx(4.153)
+    assert results[0]["readback_price"] == pytest.approx(4.415)
+    # done 表已写 → 游标不再消费该指令（不重试）
+    assert oid in d._handoff.cursor["done"]
+    # 未入队执行/未报柜台：无委托号、无已知 ref、无 accepted 回执
+    assert d._last_submit_ref == ""
+    assert d._known_refs == set()
+    receipts = d.execution_receipts()
+    assert len(receipts) == 1
+    assert receipts[0]["status"] == "rejected"
+    assert receipts[0]["reason"] == "price_not_applied"
+    assert receipts[0]["expected_price"] == pytest.approx(4.153)
+    assert receipts[0]["readback_price"] == pytest.approx(4.415)
+
+
+def test_price_mode_forced_approval_in_pre_open_window(monkeypatch):
+    """盘前窗口（09:15–09:20）内启动：latest 被强制为 approval 并打标；
+    非盘前保持配置原值。"""
+    monkeypatch.setattr(
+        ThsUiDispatcher, "_pre_open_window_now", staticmethod(lambda: True))
+    d = ThsUiDispatcher(price_mode="latest", execute_mode="direct")
+    assert d.ths_price_mode == "approval"
+    assert d.price_mode_forced_pre_open is True
+
+    monkeypatch.setattr(
+        ThsUiDispatcher, "_pre_open_window_now", staticmethod(lambda: False))
+    d2 = ThsUiDispatcher(price_mode="latest", execute_mode="direct")
+    assert d2.ths_price_mode == "latest"
+    assert d2.price_mode_forced_pre_open is False

@@ -569,15 +569,20 @@ def test_close_swallows_unsubscribe_error(fake, monkeypatch):
 # Fix1 口径统一：校验从 place_order 内联上移为公共方法（引擎按
 # price_limit_check_enabled 门控调用，四通道同签名），place_order 不再内联校验。
 
-def _raw_1d_close(symbol, closes):
+def _raw_1d_close(symbol, closes, days=10):
     """1d 原始行情（仅 Close 帧，prev_close 计算够用）。
 
     最新 bar 固定为今日（新鲜度校验要求最新 bar == 今天，写死历史日期会被
-    当成数据滞后跳过校验）。
+    当成数据滞后跳过校验）。默认补到 10 根：涨跌停推算多取几根判「上市交易日序」
+    （新股上市初期无涨跌幅限制），只有 2 根会被当成新股而整段跳过校验。
     """
     today = now_shanghai().date()
-    idx = [pd.Timestamp(today - timedelta(days=1)), pd.Timestamp(today)]
-    return {"1d": {"Close": pd.DataFrame({symbol: closes}, index=idx)}}
+    values = list(closes)
+    if len(values) < days:
+        values = [values[0]] * (days - len(values)) + values
+    idx = [pd.Timestamp(today - timedelta(days=days - 1 - i))
+           for i in range(days)]
+    return {"1d": {"Close": pd.DataFrame({symbol: values}, index=idx)}}
 
 
 def _limit_order(code="000001", trade_type=TradeType.BUY, price=Decimal("11.00")):
@@ -715,6 +720,176 @@ def test_check_price_limit_fresh_bar_still_blocks_limit_up(fake, monkeypatch):
     assert reason is not None
     assert "涨停价" in reason
     assert not [c for c in fake.calls if c[0] == "order_stock"]
+
+
+# ---------------- 涨跌停推算：板块 + ST + 新股上市初期（core.engine.price_limit）----------------
+
+def _bars(symbol, closes):
+    """指定收盘序列的 1d 原始行情（末日 = 今天），用于构造上市日数/新股场景。"""
+    today = now_shanghai().date()
+    n = len(closes)
+    idx = [pd.Timestamp(today - timedelta(days=n - 1 - i)) for i in range(n)]
+    return {"1d": {"Close": pd.DataFrame({symbol: list(closes)}, index=idx)}}
+
+
+def _patch_name(monkeypatch, name):
+    monkeypatch.setattr(
+        TdxTqDispatcher, "_stock_name", lambda self, symbol: name)
+
+
+def test_check_price_limit_main_st_uses_5pct(fake, monkeypatch):
+    """主板 ST 幅度 5%（不是 10%）：10.50 = 前收 10 × 1.05 → 拦；10.49 放行。"""
+    monkeypatch.setattr(
+        "core.tq.data.TQData",
+        lambda: FakeQuoteData(_raw_1d_close("600000.SH", [10.0, 10.0])))
+    _patch_name(monkeypatch, "ST浦发")
+    d = TdxTqDispatcher()
+    reason = d.check_price_limit("600000", "buy", Decimal("10.50"))
+    assert reason is not None
+    assert "涨停价" in reason
+    assert "source=name_st" in reason and "confidence=high" in reason
+    assert d.check_price_limit("600000", "buy", Decimal("10.49")) is None
+
+
+def test_check_price_limit_chinext_st_keeps_20pct(fake, monkeypatch):
+    """创业板 ST 不降档（仍 20%）：11.50 放行，12.00 才拦（旧实现按 10% 会误拦）。"""
+    monkeypatch.setattr(
+        "core.tq.data.TQData",
+        lambda: FakeQuoteData(_raw_1d_close("300750.SZ", [10.0, 10.0])))
+    _patch_name(monkeypatch, "*ST宁德")
+    d = TdxTqDispatcher()
+    assert d.check_price_limit("300750", "buy", Decimal("11.50")) is None
+    reason = d.check_price_limit("300750", "buy", Decimal("12.00"))
+    assert reason is not None and "12.00" in reason
+
+
+def test_check_price_limit_star_20pct(fake, monkeypatch):
+    """科创板 20%（ST 同样 20%）：11.99 放行、12.00 拦。"""
+    monkeypatch.setattr(
+        "core.tq.data.TQData",
+        lambda: FakeQuoteData(_raw_1d_close("688981.SH", [10.0, 10.0])))
+    _patch_name(monkeypatch, "*ST中芯")
+    d = TdxTqDispatcher()
+    assert d.check_price_limit("688981", "buy", Decimal("11.99")) is None
+    assert d.check_price_limit("688981", "buy", Decimal("12.00")) is not None
+
+
+def test_check_price_limit_bse_30pct(fake, monkeypatch):
+    """北交所 30%：12.99 放行、13.00 拦（旧实现对 8 开头已正确，此处锁定不回归）。"""
+    monkeypatch.setattr(
+        "core.tq.data.TQData",
+        lambda: FakeQuoteData(_raw_1d_close("830799.BJ", [10.0, 10.0])))
+    _patch_name(monkeypatch, "艾融软件")
+    d = TdxTqDispatcher()
+    assert d.check_price_limit("830799", "buy", Decimal("12.99")) is None
+    reason = d.check_price_limit("830799", "buy", Decimal("13.00"))
+    assert reason is not None and "board=bse" in reason
+
+
+def test_check_price_limit_new_listing_first_5_days_skips(fake, monkeypatch):
+    """主板/创业板/科创板新股前 5 个交易日无涨跌幅限制 → 本地不拦（fail-open）。
+
+    5 根日线 = 今日为上市第 5 个交易日（前收那根之前仅 4 根）→ 仍在窗口内。
+    """
+    monkeypatch.setattr(
+        "core.tq.data.TQData",
+        lambda: FakeQuoteData(_bars("600001.SH", [10.0] * 5)))
+    _patch_name(monkeypatch, "新股甲")
+    d = TdxTqDispatcher()
+    # 11.50 超过 10% 幅度，若是老股必拦；新股窗口内应放行（交柜台）
+    assert d.check_price_limit("600001", "buy", Decimal("11.50")) is None
+
+
+def test_check_price_limit_new_listing_window_ends_on_day6(fake, monkeypatch):
+    """第 6 个交易日恢复 10%：6 根日线（前收前 5 根）→ 11.00 涨停价照常拦。"""
+    monkeypatch.setattr(
+        "core.tq.data.TQData",
+        lambda: FakeQuoteData(_bars("600001.SH", [10.0] * 6)))
+    _patch_name(monkeypatch, "新股甲")
+    d = TdxTqDispatcher()
+    reason = d.check_price_limit("600001", "buy", Decimal("11.00"))
+    assert reason is not None and "涨停价" in reason
+
+
+def test_check_price_limit_stale_local_bars_not_treated_as_new_listing(fake, monkeypatch):
+    """本地日线残缺（仅 3 根但最早一根在 100 天前）→ 不判新股，按板块默认幅度。"""
+    today = now_shanghai().date()
+    idx = [pd.Timestamp(today - timedelta(days=d)) for d in (100, 60, 0)]
+    raw = {"1d": {"Close": pd.DataFrame({"600002.SH": [10.0, 10.0, 10.0]},
+                                       index=idx)}}
+    monkeypatch.setattr("core.tq.data.TQData", lambda: FakeQuoteData(raw))
+    _patch_name(monkeypatch, "老股乙")
+    d = TdxTqDispatcher()
+    reason = d.check_price_limit("600002", "buy", Decimal("11.00"))
+    assert reason is not None and "board=main" in reason
+
+
+def test_check_price_limit_fund_skips_local_check(fake, monkeypatch):
+    """ETF 幅度随标的（10%/20%）仅凭代码不可定档 → fail-open 交柜台。"""
+    monkeypatch.setattr(
+        "core.tq.data.TQData",
+        lambda: FakeQuoteData(_raw_1d_close("510050.SH", [10.0, 10.0])))
+    _patch_name(monkeypatch, "50ETF")
+    d = TdxTqDispatcher()
+    assert d.check_price_limit("510050", "buy", Decimal("11.00")) is None
+
+
+def test_check_price_limit_name_unknown_uses_board_default(fake, monkeypatch):
+    """名称取不到 → 按板块默认幅度推（主板 10%）并标注 name_unknown/medium。"""
+    monkeypatch.setattr(
+        "core.tq.data.TQData",
+        lambda: FakeQuoteData(_raw_1d_close("000001.SZ", [10.0, 10.0])))
+    _patch_name(monkeypatch, None)
+    d = TdxTqDispatcher()
+    reason = d.check_price_limit("000001", "buy", Decimal("11.00"))
+    assert reason is not None
+    assert "source=board_default_name_unknown" in reason
+    assert "confidence=medium" in reason
+
+
+def test_price_limit_bounds_main_st_5pct(fake, monkeypatch):
+    """盘前涨跌停：主板 ST → 前收 10 的 10.50 / 9.50。"""
+    monkeypatch.setattr(
+        "core.tq.data.TQData",
+        lambda: FakeQuoteData(_raw_1d_close("600000.SH", [10.0])))
+    _patch_name(monkeypatch, "ST浦发")
+    d = TdxTqDispatcher()
+    assert d.price_limit_bounds("600000") == (10.0, 10.5, 9.5)
+
+
+def test_price_limit_bounds_new_listing_returns_none(fake, monkeypatch):
+    """新股无涨跌幅限制 → 不夹价（None）。"""
+    monkeypatch.setattr(
+        "core.tq.data.TQData", lambda: FakeQuoteData(_bars("300999.SZ", [10.0] * 3)))
+    _patch_name(monkeypatch, "新股丙")
+    d = TdxTqDispatcher()
+    assert d.price_limit_bounds("300999") is None
+
+
+def test_price_limit_bounds_fund_returns_none(fake, monkeypatch):
+    """ETF 无可靠幅度 → 不夹价（None）。"""
+    monkeypatch.setattr(
+        "core.tq.data.TQData",
+        lambda: FakeQuoteData(_raw_1d_close("510050.SH", [10.0])))
+    _patch_name(monkeypatch, "50ETF")
+    d = TdxTqDispatcher()
+    assert d.price_limit_bounds("510050") is None
+
+
+def test_stock_name_cached_per_day(fake, monkeypatch):
+    """名称按日缓存：同一天第二次调用不再打 TQ 信息接口。"""
+    calls = []
+
+    class _Info(FakeQuoteData):
+        def get_market_snapshot_batch(self, stocks, fields):
+            calls.append(list(stocks))
+            return {stocks[0]: {"Name": "ST测试"}}
+
+    monkeypatch.setattr("core.tq.data.TQData", lambda: _Info({}))
+    d = TdxTqDispatcher()
+    assert d._stock_name("600000.SH") == "ST测试"
+    assert d._stock_name("600000.SH") == "ST测试"
+    assert len(calls) == 1
 
 
 # ---------------- TQ 1.3.1：批量行情 query_quotes_batch ----------------
@@ -995,3 +1170,102 @@ def test_match_legacy_fuzzy_rejects_fabricated_row():
     }
     assert OrderStateMachine.match_legacy_fuzzy(live_order, [fabricated], set()) is None
     assert OrderStateMachine.match_legacy_fuzzy(live_order, [real], set()) == "W200"
+
+
+# ---------------- 价格归属处置：PRICE_MY 认领价差风险事件（observe-only） ----------------
+
+def test_resolve_price_mismatch_emits_claim_anomaly(fake):
+    """认领彻底失败且存在同码/同向/同量、仅 WtPrice 不符的委托 → 发
+    claim_price_mismatch（含期望价/柜台价/倒计时），认领结果仍为空。"""
+    events = []
+    d = _connected_dispatcher(on_claim_anomaly=events.append)
+    fake.orders = [_order(price=10.6, ref="W901")]
+    ref = d._resolve_order_id("000001.SZ", "buy", 10.5, 1000, attempts=1)
+
+    assert ref == ""                       # 不按价差绑单
+    assert "W901" not in d._claimed_refs
+    assert len(events) == 1
+    ev = events[0]
+    assert ev["gate"] == "claim_price_mismatch"
+    assert ev["rule"] == "claim_price_mismatch"
+    assert ev["stock_code"] == "000001.SZ"
+    assert ev["direction"] == "buy"
+    assert ev["volume"] == 1000
+    assert ev["expected_price"] == pytest.approx(10.5)
+    assert ev["expire_in_seconds"] == 180
+    assert ev["candidates"] == [{
+        "order_ref": "W901", "counter_price": 10.6, "diff": 0.1}]
+    assert "W901" in ev["message"]
+
+
+def test_resolve_price_mismatch_compares_by_cent(fake):
+    """按分比对：柜台价 10.5001 与审批价 10.5 同分 → 不算价差，正常认领。"""
+    events = []
+    d = _connected_dispatcher(on_claim_anomaly=events.append)
+    fake.orders = [_order(price=10.5001, ref="W902")]
+    ref = d._resolve_order_id("000001.SZ", "buy", 10.5, 1000, attempts=1)
+    assert ref == "W902"
+    assert events == []
+
+
+def test_resolve_price_match_does_not_emit_claim_anomaly(fake):
+    """价符一致正常认领 → 不发价差事件。"""
+    events = []
+    d = _connected_dispatcher(on_claim_anomaly=events.append)
+    fake.orders = [_order(price=10.5, ref="W903")]
+    assert d._resolve_order_id("000001.SZ", "buy", 10.5, 1000, attempts=1) == "W903"
+    assert events == []
+
+
+def test_resolve_price_mismatch_without_callback_is_silent(fake):
+    """未挂回调（旧调用方）→ 仅 WARNING，不抛异常。"""
+    d = _connected_dispatcher()
+    fake.orders = [_order(price=10.6, ref="W904")]
+    assert d._resolve_order_id("000001.SZ", "buy", 10.5, 1000, attempts=1) == ""
+
+
+def test_query_deals_side_from_order_bsflag(fake):
+    """B8：委托行带 BSFlag 时 query_deals 透出 side，_deal_trade_type 可判方向。"""
+    from core.engine.live.order_machine import _deal_trade_type
+    fake.orders = [_order(code="601827", flag=1, status=3, filled=5300, ref="W1")]
+    d = TdxTqDispatcher(account="123456")
+    deal = d.query_deals()[0]
+    assert deal["side"] == "sell"
+    assert deal["side_source"] == "order_lookup"
+    assert _deal_trade_type(deal) == "sell"
+
+
+def test_query_deals_side_from_contract_lookup(fake):
+    """B8：成交行缺方向字段时，按合同编号回查同批委托列表取方向。
+
+    分笔成交共用同一合同编号 → 归回同一委托；这里用「有方向的委托行 +
+    无方向的成交行」模拟。
+    """
+    deal_row = {"Wtbh": "W1", "Code": "688543", "Status": 3, "WtPrice": 30.0,
+                "WtVol": 1000, "CjVol": 1000, "CjPrice": 30.0, "Htbh": "H123"}
+    order_row = {"Wtbh": "W0", "Code": "688543", "BSFlag": 1, "Status": 1,
+                 "WtPrice": 30.0, "WtVol": 1000, "CjVol": 0, "Htbh": "H123"}
+    fake.orders = [deal_row, order_row]
+    d = TdxTqDispatcher(account="123456")
+    deal = d.query_deals()[0]
+    assert deal["order_ref"] == "W1"
+    assert deal["side"] == "sell"
+    assert deal["side_source"] == "order_lookup"
+
+
+def test_query_deals_side_from_position_delta(fake, caplog):
+    """B8：委托/合同编号都查不到方向 → 持仓增量推断（买=增），并打 WARNING。"""
+    fake.orders = [{"Wtbh": "W1", "Code": "300174", "Status": 3, "WtPrice": 20.0,
+                    "WtVol": 500, "CjVol": 500, "CjPrice": 20.0}]
+    fake.positions = [{"Code": "300174", "TotalVol": 1000,
+                       "CanUseVol": 1000, "Cbj": 20.0}]
+    d = TdxTqDispatcher(account="123456")
+    first = d.query_deals()[0]
+    assert "side" not in first  # 首次无基线，不凭空推断
+    fake.positions = [{"Code": "300174", "TotalVol": 1500,
+                       "CanUseVol": 1500, "Cbj": 20.0}]
+    with caplog.at_level(logging.WARNING):
+        second = d.query_deals()[0]
+    assert second["side"] == "buy"
+    assert second["side_source"] == "position_delta"
+    assert "position delta" in caplog.text

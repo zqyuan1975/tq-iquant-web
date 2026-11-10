@@ -15,6 +15,7 @@ from core.engine.execution_engine import OrderDispatcher
 from core.engine.http_bridge_dispatcher import (
     BridgeUnavailableError,
     BridgeOrderRejected,
+    BridgeOrderIdError,
     HttpBridgeDispatcher,
 )
 from tq_iquant_shared.constants import SignalType, TradeType
@@ -114,6 +115,62 @@ def test_place_order_sends_prtype_14():
     disp, rec = _make_dispatcher(_Recorder())
     disp.place_order(_make_order())
     assert _last_json(rec)["pr_type"] == 14
+
+
+# ---------------- price_type（P0-3） ----------------
+def test_place_order_default_price_type_is_opponent():
+    """默认（配置缺省/opponent）→ 下发的 price_type 仍是旧语义对手价。"""
+    disp, rec = _make_dispatcher(_Recorder())
+    disp.place_order(_make_order())
+    payload = _last_json(rec)
+    assert payload["price_type"] == "opponent"
+    assert payload["pr_type"] == 14
+
+
+def test_place_order_price_type_from_config(monkeypatch):
+    """config.iquant_bridge.price_type=limit → payload 带 limit 且 price=审批价。"""
+    import core.engine.http_bridge_dispatcher as hbd
+
+    monkeypatch.setattr(hbd, "load_config",
+                        lambda: {"iquant_bridge": {"price_type": "limit"}})
+    disp, rec = _make_dispatcher(_Recorder())
+    disp.place_order(_make_order(price=Decimal("9.87")))
+    payload = _last_json(rec)
+    assert payload["price_type"] == "limit"
+    assert payload["price"] == 9.87
+
+
+def test_place_order_price_type_explicit_overrides_config(monkeypatch):
+    import core.engine.http_bridge_dispatcher as hbd
+
+    monkeypatch.setattr(hbd, "load_config",
+                        lambda: {"iquant_bridge": {"price_type": "limit"}})
+    rec = _Recorder()
+    client = httpx.Client(transport=httpx.MockTransport(rec.handler))
+    disp = HttpBridgeDispatcher(
+        base_url="http://127.0.0.1:8790", client=client, price_type="market_best5")
+    disp.place_order(_make_order())
+    assert _last_json(rec)["price_type"] == "market_best5"
+
+
+def test_place_order_goldminer_channel_omits_price_type():
+    """掘金桥自身已走限价：payload 不得新增字段（保持零变化）。"""
+    rec = _Recorder()
+    client = httpx.Client(transport=httpx.MockTransport(rec.handler))
+    disp = HttpBridgeDispatcher(base_url="http://127.0.0.1:7801", client=client,
+                                channel="goldminer_bridge")
+    disp.place_order(_make_order())
+    assert "price_type" not in _last_json(rec)
+
+
+def test_place_order_unknown_price_type_falls_back_to_opponent(monkeypatch):
+    import core.engine.http_bridge_dispatcher as hbd
+
+    monkeypatch.setattr(hbd, "load_config",
+                        lambda: {"iquant_bridge": {"price_type": "best5x"}})
+    disp, rec = _make_dispatcher(_Recorder())
+    disp.place_order(_make_order())
+    assert _last_json(rec)["price_type"] == "opponent"
 
 
 def test_place_order_sends_remark_oid_prefix():
@@ -270,6 +327,57 @@ def test_place_order_read_timeout_returns_none_as_inflight(caplog):
     assert "在途" in (disp.last_unconfirmed_message or "")
     assert any("in-flight" in r.message for r in caplog.records), \
         "超时转在途必须留可回读线索（warning）"
+
+
+# ---------------- 桥 HTTP 超时：读 15s / 建连 3s ----------------
+def test_bridge_client_timeout_defaults(monkeypatch):
+    """默认读/写/池 15s、建连 3s（掘金桥 /ping 实测 5~8s，10s 易误判断链）。"""
+    from core.engine import http_bridge_dispatcher as mod
+    monkeypatch.setattr(mod, "load_config", lambda: {"live": {}})
+    disp = HttpBridgeDispatcher(base_url="http://127.0.0.1:8790")
+    t = disp._client.timeout
+    assert t.read == 15.0
+    assert t.write == 15.0
+    assert t.pool == 15.0
+    assert t.connect == 3.0
+    disp._client.close()
+
+
+def test_bridge_client_timeout_from_config(monkeypatch):
+    """config.live.bridge_read/connect_timeout_seconds 可调（不改代码）。"""
+    from core.engine import http_bridge_dispatcher as mod
+    monkeypatch.setattr(mod, "load_config", lambda: {
+        "live": {"bridge_read_timeout_seconds": 20,
+                 "bridge_connect_timeout_seconds": 2},
+    })
+    disp = HttpBridgeDispatcher(base_url="http://127.0.0.1:8790")
+    t = disp._client.timeout
+    assert t.read == 20.0
+    assert t.connect == 2.0
+    disp._client.close()
+
+
+def test_bridge_client_timeout_explicit_override_beats_config(monkeypatch):
+    """显式 timeout（通道级 request_timeout_seconds）优先；建连不跟着读超时放大。"""
+    from core.engine import http_bridge_dispatcher as mod
+    monkeypatch.setattr(mod, "load_config", lambda: {
+        "live": {"bridge_read_timeout_seconds": 15,
+                 "bridge_connect_timeout_seconds": 3},
+    })
+    disp = HttpBridgeDispatcher(base_url="http://127.0.0.1:8790", timeout=30.0)
+    t = disp._client.timeout
+    assert t.read == 30.0
+    assert t.connect == 3.0
+    disp._client.close()
+
+
+def test_bridge_client_connect_timeout_never_exceeds_read():
+    """读超时配得比建连还小时，建连被夹到读超时（不留悬空连接）。"""
+    disp = HttpBridgeDispatcher(base_url="http://127.0.0.1:8790", timeout=2.0)
+    t = disp._client.timeout
+    assert t.connect == 2.0
+    assert t.read == 2.0
+    disp._client.close()
 
 
 def test_place_order_connection_interrupted_returns_none_as_inflight():
@@ -783,3 +891,270 @@ def test_query_quote_non_json_body_warns_and_returns_empty(caplog):
     assert rows == []
     assert any("non-JSON" in r.message for r in caplog.records), \
         "桥返回非 JSON 应触发 warning，不应静默"
+
+
+# ---------------- check_price_limit（GET /price_limit，fail-open） ----------------
+def _price_responder(data, status=200, ok=True):
+    def respond(request):
+        if request.url.path == "/price_limit":
+            return httpx.Response(status, json={"ok": ok, "data": data})
+        return httpx.Response(404)
+    return respond
+
+
+def test_check_price_limit_blocks_buy_at_up_limit():
+    """买价 ≥ 交易所涨停价 → 返回拒绝文案（口径与 TDX/THS 一致）。"""
+    disp, rec = _make_dispatcher(_Recorder(respond=_price_responder(
+        {"code": "600000.SH", "pre_close": 10.0,
+         "up_limit": 11.0, "down_limit": 9.0})))
+    reason = disp.check_price_limit("600000.SH", "buy", Decimal("11.00"))
+    assert reason and "涨停" in reason
+    req = rec.requests[-1]
+    assert req.method == "GET" and req.url.path == "/price_limit"
+    assert req.url.params["code"] == "600000.SH"
+
+
+def test_check_price_limit_blocks_sell_at_down_limit():
+    disp, _ = _make_dispatcher(_Recorder(respond=_price_responder(
+        {"code": "600000.SH", "pre_close": 10.0,
+         "up_limit": 11.0, "down_limit": 9.0})))
+    reason = disp.check_price_limit("600000.SH", "sell", Decimal("9.00"))
+    assert reason and "跌停" in reason
+    assert disp.check_price_limit("600000.SH", "buy", Decimal("10.50")) is None
+
+
+def test_check_price_limit_derives_limits_from_pre_close():
+    """桥只回前收（涨跌停价 null）→ 按板块比例推出：创业板 20%。"""
+    disp, _ = _make_dispatcher(_Recorder(respond=_price_responder(
+        {"code": "300001.SZ", "pre_close": 10.0,
+         "up_limit": None, "down_limit": None})))
+    assert disp.check_price_limit("300001.SZ", "buy", Decimal("11.50")) is None
+    reason = disp.check_price_limit("300001.SZ", "buy", Decimal("12.00"))
+    assert reason and "涨停" in reason
+
+
+def test_check_price_limit_fail_open():
+    """老桥无端点（404）/ 无有效价格 → 一律放行，绝不阻断下单。"""
+    disp, _ = _make_dispatcher(_Recorder())          # 默认 respond：/price_limit → 404
+    assert disp.check_price_limit("600000.SH", "buy", Decimal("999")) is None
+
+    disp2, _ = _make_dispatcher(_Recorder(respond=_price_responder(
+        {"code": "600000.SH", "pre_close": None,
+         "up_limit": None, "down_limit": None})))
+    assert disp2.check_price_limit("600000.SH", "buy", Decimal("999")) is None
+
+    off, _ = _make_dispatcher(_Recorder(fail=True))   # 桥离线
+    assert off.check_price_limit("600000.SH", "buy", Decimal("9.5")) is None
+
+
+def test_price_limit_uses_channel_timeout_not_hardcoded_3s():
+    """/price_limit 走通道解析后的读超时（旧实现硬编码 3.0s，掘金桥 8~13s 必然超时）。"""
+    captured = []
+
+    class _Resp:
+        status_code = 200
+
+        @staticmethod
+        def json():
+            return {"ok": True, "data": {"code": "600000.SH", "pre_close": 10.0,
+                                         "up_limit": 11.0, "down_limit": 9.0}}
+
+    client = httpx.Client(transport=httpx.MockTransport(lambda r: httpx.Response(404)))
+    disp = HttpBridgeDispatcher(base_url="http://127.0.0.1:7801", client=client,
+                                timeout=45.0, channel="goldminer_bridge")
+
+    def fake_do_request(method, path, **kwargs):
+        captured.append((method, path, kwargs))
+        return _Resp()
+
+    disp._do_request = fake_do_request
+    assert disp.check_price_limit("600000.SH", "buy", Decimal("10.50")) is None
+    assert disp.price_limit_bounds("600000.SH") is not None
+
+    assert len(captured) == 2
+    for method, path, kwargs in captured:
+        assert method == "GET" and path.startswith("/price_limit")
+        assert kwargs["timeout"] == 45.0        # 通道读超时
+        assert kwargs["timeout"] != 3.0         # 不再是旧硬编码
+
+
+def test_check_price_limit_skips_market_order_without_request():
+    disp, rec = _make_dispatcher(_Recorder())
+    assert disp.check_price_limit("600000.SH", "buy", None) is None
+    assert disp.check_price_limit("600000.SH", "buy", 0) is None
+    assert rec.requests == []
+
+
+# ---------------- cancel_order（POST /cancel，老桥 404 降级） ----------------
+def test_cancel_order_posts_ref_and_returns_true():
+    def respond(request):
+        if request.url.path == "/cancel":
+            return httpx.Response(200, json={
+                "ok": True, "data": {"result": "canceled", "status": 54}})
+        return httpx.Response(404)
+
+    disp, rec = _make_dispatcher(_Recorder(respond=respond))
+    assert disp.cancel_order("cl-123", "600000.SH") is True
+    req = rec.requests[-1]
+    assert req.method == "POST"
+    payload = json.loads(req.content)
+    assert payload["order_ref"] == "cl-123"
+    assert payload["cl_ord_id"] == "cl-123"
+    assert payload["code"] == "600000.SH"
+    assert disp.last_cancel_result == "canceled"
+
+
+def test_cancel_order_already_canceled_is_idempotent_success():
+    """已处于撤销态（ok:false + result:canceled）→ 按成功处理，不刷失败重试。"""
+    disp, _ = _make_dispatcher(_Recorder(respond=lambda r: httpx.Response(
+        200, json={"ok": False,
+                   "error": "cannot cancel: 委托已终态（Canceled）",
+                   "data": {"result": "canceled", "status": "Canceled"}})))
+    assert disp.cancel_order("cl-9") is True
+
+
+def test_cancel_order_not_found_and_rejected_return_false():
+    for result, err in (("not_found", "order not found: cl-x"),
+                        ("rejected", "cannot cancel: order already final")):
+        disp, _ = _make_dispatcher(_Recorder(respond=lambda r, res=result, e=err:
+            httpx.Response(200, json={"ok": False, "error": e,
+                                      "data": {"result": res}})))
+        assert disp.cancel_order("cl-x") is False
+        assert disp.last_cancel_result == result
+        assert err.split(":")[0] in (disp.last_error or "")
+
+
+def test_cancel_order_old_bridge_404_disables_cancel():
+    """老版本桥无 /cancel（HTTP 404）→ 一次失败后 supports_cancel=False。"""
+    disp, _ = _make_dispatcher(_Recorder())          # 默认 respond：/cancel → 404
+    assert disp.supports_cancel is True
+    assert disp.cancel_order("cl-1") is False
+    assert disp.supports_cancel is False
+    assert "不支持撤单" in (disp.last_error or "")
+
+
+def test_cancel_order_requires_ref():
+    disp, rec = _make_dispatcher(_Recorder())
+    assert disp.cancel_order("", "") is False
+    assert rec.requests == []
+
+
+def test_cancel_order_pending_then_canceled_is_confirmed():
+    """缺陷2：桥先回 pending，复查拿到 canceled 才算成功（pending 不是终态）。"""
+    bodies = [
+        {"ok": True, "data": {"result": "pending", "status": 52}},
+        {"ok": True, "data": {"result": "canceled", "status": 54}},
+    ]
+    state = {"i": 0}
+
+    def respond(request):
+        if request.url.path == "/cancel":
+            body = bodies[min(state["i"], len(bodies) - 1)]
+            state["i"] += 1
+            return httpx.Response(200, json=body)
+        return httpx.Response(404)
+
+    disp, rec = _make_dispatcher(_Recorder(respond=respond))
+    disp._cancel_recheck_interval = 0
+    assert disp.cancel_order("cl-p1", "600000.SH") is True
+    assert len([r for r in rec.requests if r.url.path == "/cancel"]) == 2
+    assert disp.last_cancel_result == "canceled"
+
+
+def test_cancel_order_pending_exhausted_is_not_canceled():
+    """缺陷2：复查仍是 pending → 不判已撤：False + last_cancel_result=pending +
+    可读的「撤单未确认」，由调用方保留在途/超时兜底。"""
+    disp, rec = _make_dispatcher(_Recorder(respond=lambda r: httpx.Response(
+        200, json={"ok": True, "data": {"result": "pending"}})))
+    disp._cancel_recheck_interval = 0
+    disp._cancel_recheck_attempts = 2
+    assert disp.cancel_order("cl-p2") is False
+    assert len([r for r in rec.requests if r.url.path == "/cancel"]) == 2  # 有限复查
+    assert disp.last_cancel_result == "pending"
+    assert "撤单未确认" in (disp.last_error or "")
+
+
+def test_cancel_order_pending_then_rejected_keeps_semantics():
+    """缺陷2：复查从 pending 转 rejected（柜台拒撤）→ 语义不变（False + rejected）。"""
+    bodies = [
+        {"ok": True, "data": {"result": "pending"}},
+        {"ok": False, "error": "cannot cancel: order already final",
+         "data": {"result": "rejected"}},
+    ]
+    state = {"i": 0}
+
+    def respond(request):
+        if request.url.path == "/cancel":
+            body = bodies[min(state["i"], len(bodies) - 1)]
+            state["i"] += 1
+            return httpx.Response(200, json=body)
+        return httpx.Response(404)
+
+    disp, _ = _make_dispatcher(_Recorder(respond=respond))
+    disp._cancel_recheck_interval = 0
+    assert disp.cancel_order("cl-p3") is False
+    assert disp.last_cancel_result == "rejected"
+
+
+# ---------------- bridge_order_id / remark 认领键护栏 ----------------
+def test_order_id_len_and_remark_key_len():
+    """确定性 ID 32 位；认领键（柜台 m_strRemark）恒 20 位，不改既有格式。"""
+    oid = HttpBridgeDispatcher.order_id(_make_order())
+    assert len(oid) == 32
+    assert len(oid) <= 32  # live_orders.bridge_order_id String(32)
+    claim = HttpBridgeDispatcher.remark_of(oid)
+    assert claim == oid[:20]
+    assert len(claim) == HttpBridgeDispatcher.REMARK_MAX_LEN == 20
+
+
+def test_order_id_consecutive_orders_differ_same_order_stable():
+    """两笔不同单（数量不同）ID/认领键必不同；同订单重生成恒等（幂等）。"""
+    o1 = _make_order(quantity=100)
+    o2 = _make_order(quantity=200)
+    oid1, oid2 = (HttpBridgeDispatcher.order_id(o) for o in (o1, o2))
+    assert oid1 != oid2
+    assert HttpBridgeDispatcher.remark_of(oid1) != HttpBridgeDispatcher.remark_of(oid2)
+    assert HttpBridgeDispatcher.order_id(_make_order(quantity=100)) == oid1
+
+
+def test_place_order_rejects_short_order_id_without_truncating(monkeypatch, caplog):
+    """规则退化生成 <20 位 ID → 抛错拒单，绝不静默压成短 remark 键。"""
+    import logging
+
+    rec = _Recorder()
+    disp, _ = _make_dispatcher(rec)
+    monkeypatch.setattr(disp, "order_id", lambda order: "short-id-15chr")
+    with caplog.at_level(logging.ERROR, logger="core.engine.http_bridge_dispatcher"):
+        with pytest.raises(BridgeOrderIdError):
+            disp.place_order(_make_order())
+    assert rec.requests == []  # 未发出 /order
+    assert any("too short" in r.message for r in caplog.records)
+
+
+def test_place_order_rejects_remark_collision(monkeypatch, caplog):
+    """两笔不同单前 20 位相同（>20 位后才分叉）→ 第二笔拒绝下单（不重生成）。"""
+    import logging
+
+    rec = _Recorder(respond=lambda req: httpx.Response(200, json={"ok": True}))
+    disp, _ = _make_dispatcher(rec)
+
+    def fake_order_id(order):
+        # 22 位，前 20 位恒同，仅尾部随数量分叉 → remark 撞单
+        return "0123456789abcdef0123" + ("x" if order.quantity == 100 else "y")
+
+    monkeypatch.setattr(disp, "order_id", fake_order_id)
+    disp.place_order(_make_order(quantity=100))
+    with caplog.at_level(logging.ERROR, logger="core.engine.http_bridge_dispatcher"):
+        with pytest.raises(BridgeOrderIdError):
+            disp.place_order(_make_order(quantity=200))
+    assert len([r for r in rec.requests if r.url.path == "/order"]) == 1
+    assert any("collision" in r.message for r in caplog.records)
+
+
+def test_place_order_same_order_retry_allowed():
+    """同一订单重复提交（引擎重试/桥按 order_id 去重）不被护栏误拦。"""
+    rec = _Recorder(respond=lambda req: httpx.Response(200, json={"ok": True}))
+    disp, _ = _make_dispatcher(rec)
+    disp.place_order(_make_order())
+    disp.place_order(_make_order())  # 同 oid 同 claim → 放行
+    assert len([r for r in rec.requests if r.url.path == "/order"]) == 2
