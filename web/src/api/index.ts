@@ -1789,11 +1789,20 @@ export interface TqTradeConfig {
   pre_open_auction_price_bias_pct: number // 盘前委托价相对信号价的让价幅度（%）
 }
 
+export interface BackupConfig {
+  enabled: boolean      // 每日自动备份开关
+  daily_at: string      // 执行时点 HH:MM（Asia/Shanghai，默认 15:10）
+  keep: number          // 自动备份保留份数（手动备份不参与自动清理）
+  min_free_mb: number   // 磁盘保护阈值：剩余空间低于该值跳过备份
+  dir: string           // 备份目录（相对 main/ 解析，默认 data/backup）
+}
+
 export interface SystemConfig {
   tdx_path: string
   iquant_path: string
   max_concurrent_backtest: number
   database: { sqlite_path: string }
+  backup: BackupConfig
   iquant_bridge: {
     simulation: { base_url: string }
     live: { base_url: string }
@@ -1805,6 +1814,29 @@ export interface SystemConfig {
   }
   ths_ui: ThsUiConfig
   tq_trade: TqTradeConfig
+}
+
+export interface BackupRecord {
+  id: number | null
+  kind: 'auto' | 'manual'
+  status: 'success' | 'skipped' | 'failed'
+  filename: string | null
+  path: string | null
+  size_bytes: number | null
+  message: string | null
+  started_at: string | null   // Asia/Shanghai naive ISO
+  finished_at: string | null
+}
+
+export interface BackupStatus {
+  enabled: boolean
+  daily_at: string
+  keep: number
+  min_free_mb: number
+  backup_dir: string
+  last_auto: BackupRecord | null
+  last_manual: BackupRecord | null
+  auto_done_today: boolean
 }
 
 export interface LiveChannelEngine {
@@ -1864,5 +1896,16 @@ export async function getSystemConfigs() {
 
 export async function updateSystemConfigs(cfg: SystemConfig) {
   const res = await api.put<ApiResponse<null>>('/system/configs', cfg)
+  return res.data.data
+}
+
+export async function getBackupStatus() {
+  const res = await api.get<ApiResponse<BackupStatus>>('/system/backup')
+  return res.data.data
+}
+
+/** 立即备份（手动）。失败时后端返回非 0 code，前端拦截器会 reject。 */
+export async function createBackup() {
+  const res = await api.post<ApiResponse<BackupRecord>>('/system/backup')
   return res.data.data
 }
