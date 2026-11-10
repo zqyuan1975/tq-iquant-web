@@ -1,49 +1,103 @@
 #!/usr/bin/env python
-"""Nuitka 编译 + 后处理脚本"""
+"""Nuitka standalone(onedir) 构建 + 产物整理。
+
+三种模式（避免每次小改动都走完整 Nuitka 构建）：
+- 默认：保留并复用 Nuitka 的导入分析缓存（省依赖扫描几分钟）；注意 Nuitka 4.2.2
+  **没有真正的增量 C 编译**，改后端仍需完整构建，后端出包集中在稳定节点/夜间。
+- --clean：清空模块缓存与上次编译中间目录后全量重编；正式出包/缓存可疑时用。
+- --web-only：不跑 Nuitka，只把 web/dist 刷新进已有 dist/tq-iquant；只改前端用这条（秒级）。
+
+产物：<仓库根>/dist/tq-iquant/（含 exe、_internal/、web/dist、alembic、config 模板）
+安装器：packaging/installer.iss（全量包）/ packaging/installer_web.iss（前端补丁包，约 3 MB）
+
+注意：
+- 旧版打包产物 main/dist/tq-iquant 已废弃并删除，不再维护。
+- 桥脚本（live/bridge/*.py）**不编译进 exe**，由安装器以明文放到 <安装目录>\\bridge\\。
+- 版本号单一来源：packaging/app-version.iss（本脚本与两个 Inno 脚本共用）。
+"""
+import argparse
+import datetime
+import json
 import os
+import re
 import shutil
 import subprocess
 import sys
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parent          # main/
-WEB_DIST = ROOT.parent / "web" / "dist"
-CONFIG_YAML = ROOT.parent / "config.yaml"
-OUTPUT_DIR = ROOT / "dist" / "tq-iquant"
+ROOT = Path(__file__).resolve().parent            # main/
+REPO = ROOT.parent                                # 仓库根
+WEB_DIST = REPO / "web" / "dist"
+DIST_OUT = REPO / "dist" / "tq-iquant"            # 最终分发目录
+BUILD_OUT = REPO / "dist" / "build"               # Nuitka 输出中转
+NIGHT_BUILD_DIR = REPO / "dist" / "build" / "nuitka-build"
+ENTRY = ROOT / "desktop.py"
+ICON = REPO / "packaging" / "icon" / "app.ico"
+CONFIG_TEMPLATE = REPO / "packaging" / "config.template.yaml"
+VERSION_FILE = REPO / "packaging" / "app-version.iss"
 
-def run_cmd(cmd, cwd=None):
-    print(f"\n>>> {' '.join(cmd)}")
-    result = subprocess.run(cmd, cwd=cwd, capture_output=False)
+
+def read_version() -> str:
+    """从 packaging/app-version.iss 读取版本号（唯一来源，避免两处写死不一致）。"""
+    if not VERSION_FILE.exists():
+        sys.exit(f"缺少版本号文件：{VERSION_FILE}")
+    text = VERSION_FILE.read_text(encoding="utf-8-sig")
+    match = re.search(r'#define\s+AppVersion\s+"([^"]+)"', text)
+    if not match:
+        sys.exit(f"无法从 {VERSION_FILE} 解析 AppVersion（期望格式：#define AppVersion \"1.0.1\"）")
+    return match.group(1)
+
+
+VERSION = read_version()
+
+
+def run(cmd, cwd=None, env=None):
+    print(f"\n>>> {' '.join(cmd)}", flush=True)
+    result = subprocess.run(cmd, cwd=cwd, env=env)
     if result.returncode != 0:
-        print(f"FAILED: {cmd}")
+        print(f"FAILED: {cmd}", flush=True)
         sys.exit(1)
 
-def purge_nuitka_cache():
-    """编译前清空并重定向 Nuitka 模块缓存到项目内。
 
-    本机对 %LOCALAPPDATA%\\Nuitka 的缓存写入不稳定（多次 PermissionError），
-    故用 NUITKA_CACHE_DIR 改到项目内目录。只清 module-cache：该目录存放
-    依赖分析结果，属加速项；Cache 根下的 Dependency Walker 等工具需保留。
+def prepare_cache_dir():
+    """缓存重定向到项目内：本机 %LOCALAPPDATA%\\Nuitka 写入不稳定（PermissionError）。
+
+    只做重定向，不清理——清理会让模块缓存归零，下一次必然全量重编。
     """
-    cache = ROOT / ".nuitka-cache"
-    os.environ["NUITKA_CACHE_DIR"] = str(cache)
-    module_cache = cache / "module-cache"
+    NIGHT_BUILD_DIR.mkdir(parents=True, exist_ok=True)
+    os.environ["NUITKA_CACHE_DIR"] = str(NIGHT_BUILD_DIR)
+
+
+def purge_nuitka_cache():
+    """--clean 模式：清空模块缓存 + 上次编译中间目录，恢复全量重编。"""
+    prepare_cache_dir()
+    module_cache = NIGHT_BUILD_DIR / "module-cache"
     if module_cache.exists():
         shutil.rmtree(module_cache, ignore_errors=True)
         print(f"已清空 Nuitka 模块缓存：{module_cache}")
+    build_dir = BUILD_OUT / "desktop.build"
+    if build_dir.exists():
+        shutil.rmtree(build_dir, ignore_errors=True)
+        print(f"已清空 Nuitka 中间目录：{build_dir}")
 
 
-def main():
-    print("=== Step 1: Nuitka 编译 ===")
-    purge_nuitka_cache()
-    venv_python = ROOT / ".venv" / "Scripts" / "python.exe"
-    python_exe = str(venv_python) if venv_python.exists() else sys.executable
-    nuitka_cmd = [
+def cache_stats() -> str:
+    module_cache = NIGHT_BUILD_DIR / "module-cache"
+    if not module_cache.exists():
+        return "模块缓存为空（本次为全量编译）"
+    files = [f for f in module_cache.rglob("*") if f.is_file()]
+    size_mb = sum(f.stat().st_size for f in files) / 1024 / 1024
+    return f"Nuitka 模块缓存：{len(files)} 个文件 / {size_mb:.1f} MB（命中即跳过重编）"
+
+
+def nuitka_cmd(python_exe: str):
+    cmd = [
         python_exe, "-m", "nuitka",
         "--standalone",
         "--low-memory",
+        "--enable-plugin=anti-bloat",
         "--include-package=core",
-        "--include-package-data=core",  # tdx_formula/data/tdx_funcs.json 等包内数据文件
+        "--include-package-data=core",   # tdx_formula 等包内数据
         "--include-package=tq_iquant_shared",
         "--include-package=sqlalchemy",
         "--include-package=fastapi",
@@ -56,205 +110,217 @@ def main():
         "--include-package=openpyxl",
         "--include-package=yaml",
         "--include-package=alembic",
-        # 同花顺 UI 下单通道（可选）：pywinauto 窗口自动化 + 剪贴板 + 验证码截图
+        # 同花顺 UI 下单通道：pywinauto 窗口自动化 + 剪贴板 + 截图
         "--include-package=pywinauto",
         "--include-package=pyperclip",
         "--include-package=PIL",
-        # Windows 内置 OCR（同花顺复制验证码）：WinRT 扩展 + 运行时 DLL
+        # 验证码 OCR：ddddocr（onnxruntime 推理 + 内置 onnx 模型）
+        "--include-package=ddddocr",
+        "--include-package-data=ddddocr",
+        "--include-package=onnxruntime",
+        "--include-package=cv2",
+        # Windows 内置 OCR 兜底（WinRT）
         "--include-package=winrt",
         "--include-package-data=winrt",
-        # 排除第三方包自带的测试/校验代码：--include-package 会连 `pandas.tests`
-        # 等上千个测试模块一起编译，实测使编译时间成倍增加，且运行时毫无用处。
+        # 桌面壳：pywebview + WebView2（pythonnet/clr）；加载失败时启动器自动回退浏览器
+        # 注意：webview 交给 Nuitka 内置 pywebview 插件处理平台分支，
+        # 显式 --include-package=webview 会与插件的平台模块决策冲突（FATAL）。
+        "--include-package=pythonnet",
+        "--include-package-data=pythonnet",
+        "--include-package=clr_loader",
+        "--include-package-data=clr_loader",
+        "--include-module=clr",
+        # 排除第三方包自带测试代码（--include-package 会连测试一起编译，极慢且无用）
         "--nofollow-import-to=*.tests",
         "--nofollow-import-to=*.testing",
         "--nofollow-import-to=alembic.testing",
-        # 杀软实时扫描会在 Nuitka 写入 %LOCALAPPDATA%\Nuitka 缓存 JSON 的瞬间锁定
-        # 文件（两次均在同一 sqlalchemy.dialects.oracle 缓存上 PermissionError），
-        # 缓存对本机编译只是加速项，禁用换取确定性。
-        "--disable-cache=all",
-        # 启动即写 updates\update-check-*.json，失败会直接中断编译；本机该目录写入
-        # 不稳定，离线打包场景也不需要版本检查。
         "--update-check=never",
-        # 非交互环境默认拒绝下载 Dependency Walker，会直接 FATAL；
-        # 该项目仅用于分析扩展模块依赖，允许自动下载并缓存。
         "--assume-yes-for-downloads",
-        "--windows-disable-console",
+        "--windows-console-mode=disable",
+        f"--windows-icon-from-ico={ICON}",
+        "--company-name=创懿私募基金",
+        "--product-name=创懿基金量化投资平台",
+        f"--file-version={VERSION}",
+        f"--product-version={VERSION}",
         "--output-filename=tq-iquant",
-        "--output-dir=" + str(ROOT / "dist" / "tq-iquant"),
+        f"--output-dir={BUILD_OUT}",
+        str(ENTRY),
     ]
-    icon_path = ROOT.parent / "web" / "public" / "favicon.ico"
-    if icon_path.exists():
-        nuitka_cmd.append("--windows-icon-from-ico=" + str(icon_path))
-    else:
-        print(f"  WARNING: {icon_path} not found, skipping icon")
-    nuitka_cmd.append("core/main.py")
-    env = os.environ.copy()
-    env["PYTHONPATH"] = str(ROOT.parent / "shared") + os.pathsep + env.get("PYTHONPATH", "")
-    print(f"  PYTHONPATH={env['PYTHONPATH']}")
-    result = subprocess.run(nuitka_cmd, cwd=str(ROOT), env=env)
-    if result.returncode != 0:
-        print(f"FAILED: {nuitka_cmd}")
-        sys.exit(1)
+    return cmd
 
-    dist_dir = OUTPUT_DIR / "main.dist"
 
-    print("\n=== Step 2: 复制前端静态文件 ===")
+def copy_web(dist_dir: Path):
+    """把最新 web/dist 刷进分发目录（先清旧目录，避免旧 hash chunk 残留）。"""
+    if not WEB_DIST.exists():
+        sys.exit(f"缺少前端构建产物：{WEB_DIST}（先在 web/ 下执行 npm run build）")
+
     dest_web = dist_dir / "_internal" / "web" / "dist"
+    if dest_web.exists():
+        shutil.rmtree(dest_web)
     dest_web.parent.mkdir(parents=True, exist_ok=True)
-    if WEB_DIST.exists():
-        shutil.copytree(WEB_DIST, dest_web, dirs_exist_ok=True)
-        print(f"  copied web/dist -> {dest_web}")
+    shutil.copytree(WEB_DIST, dest_web)
+
+    # 证据：前端产物时间 + 文件数，确认打进包的是最新构建
+    web_mtime = datetime.datetime.fromtimestamp((WEB_DIST / "index.html").stat().st_mtime)
+    web_count = sum(1 for _ in WEB_DIST.rglob("*") if _.is_file())
+    print(f"  web/dist -> {dest_web}")
+    print(f"  web/dist 构建时间：{web_mtime:%Y-%m-%d %H:%M:%S}（{web_count} 个文件）")
+
+
+def copy_assets(dist_dir: Path):
+    print("\n=== 复制运行期资源 ===")
+    copy_web(dist_dir)
+
+    # core/main.py 打包版按 <exe>/_internal/web/dist 定位静态资源，此处不再额外复制。
+
+    echarts = REPO / "web" / "node_modules" / "echarts" / "dist" / "echarts.min.js"
+    if echarts.exists():
+        shutil.copy2(echarts, dist_dir / "echarts.min.js")
+        print("  echarts.min.js（离线报告内联运行时）")
     else:
-        print(f"  WARNING: {WEB_DIST} not found, run 'npm run build' first")
+        print("  WARNING: 未找到 echarts.min.js，离线报告导出将失败")
 
-    print("\n=== Step 2b: 复制 echarts.min.js（离线报告内联运行时）===")
-    echarts_src = ROOT.parent / "web" / "node_modules" / "echarts" / "dist" / "echarts.min.js"
-    if echarts_src.exists():
-        shutil.copy2(echarts_src, dist_dir / "echarts.min.js")
-        print(f"  copied echarts.min.js -> {dist_dir.name}/echarts.min.js")
-    else:
-        print(f"  WARNING: {echarts_src} not found, 离线报告导出将失败")
+    if CONFIG_TEMPLATE.exists():
+        shutil.copy2(CONFIG_TEMPLATE, dist_dir / "config.template.yaml")
+        print("  config.template.yaml（首次启动生成用户 config.yaml）")
 
-    print("\n=== Step 3: 复制 config.yaml ===")
-    if CONFIG_YAML.exists():
-        shutil.copy2(CONFIG_YAML, dist_dir / "config.yaml")
-        print(f"  copied config.yaml")
+    alembic_src = ROOT / "alembic"
+    if not alembic_src.exists():
+        sys.exit("缺少 main/alembic，无法在目标机自动建库/升级")
+    shutil.copytree(alembic_src, dist_dir / "alembic", dirs_exist_ok=True)
+    print("  alembic/（首次启动自动迁移）")
 
-    print("\n=== Step 4: 创建 data/ 和 logs/ 目录 ===")
     (dist_dir / "data").mkdir(parents=True, exist_ok=True)
     (dist_dir / "logs").mkdir(parents=True, exist_ok=True)
+    # 数据目录只占位，安装器不覆盖用户已有 data/
 
-    print("\n=== Step 5: 复制 alembic 迁移目录 ===")
-    alembic_src = ROOT / "alembic"
-    if alembic_src.exists():
-        dest_alembic = dist_dir / "alembic"
-        shutil.copytree(alembic_src, dest_alembic, dirs_exist_ok=True)
-        print(f"  copied alembic -> {dest_alembic}")
-    else:
-        print(f"  WARNING: {alembic_src} not found, 数据库迁移将无法执行")
+    # 桥脚本明文随包：QMT(8790 股票账户) + 掘金(7801) 两个生产桥 + 部署说明。
+    # 信用账户腿 iquant_bridge_live.py（8791）不进安装包。
+    bridge_dir = dist_dir / "bridge"
+    bridge_dir.mkdir(parents=True, exist_ok=True)
+    for name in ("iquant_bridge.py", "goldminer_bridge.py"):
+        src = REPO / "live" / "bridge" / name
+        if not src.exists():
+            sys.exit(f"缺少桥脚本：{src}")
+        shutil.copy2(src, bridge_dir / name)
+    deploy = REPO / "packaging" / "bridge-deploy.txt"
+    if deploy.exists():
+        shutil.copy2(deploy, bridge_dir / "bridge-deploy.txt")
+    print("  bridge/（两个生产桥明文 + 部署说明）")
 
-    print("\n=== Step 6: 创建启动.bat ===")
-    bat = dist_dir / "启动.bat"
-    # 必须以 GBK(ANSI) 编码保存：cmd 对 UTF-8 bat 的中文行会按字节错位解析
-    # （即使 chcp 65001），chcp 936 保证在任意父代码页下中文提示均正常。
-    bat_lines = [
-        "@echo off",
-        "chcp 936 >nul",
-        "setlocal",
-        'cd /d "%~dp0"',
-        "title 创懿私募基金量化投资平台",
-        "",
-        "rem ===== 1. 程序已在运行（8888端口监听中）则直接打开浏览器 =====",
-        'netstat -ano -p TCP | findstr /C:":8888 " | findstr /C:"LISTENING" >nul 2>nul',
-        "if %errorlevel%==0 goto already",
-        "",
-        "rem ===== 2. 启动主程序（不阻塞，后台运行）=====",
-        "echo 正在启动创懿私募基金量化投资平台，请稍候...",
-        'start "" "tq-iquant.exe"',
-        "",
-        "rem ===== 3. 等待服务就绪，最多约30秒 =====",
-        "set n=0",
-        ":wait",
-        "set /a n+=1",
-        "if %n% gtr 30 goto fail",
-        "ping -n 2 127.0.0.1 >nul",
-        'netstat -ano -p TCP | findstr /C:":8888 " | findstr /C:"LISTENING" >nul 2>nul',
-        "if %errorlevel%==0 goto ready",
-        "goto wait",
-        "",
-        ":ready",
-        "echo 启动成功，正在打开浏览器...",
-        'start "" "http://127.0.0.1:8888"',
-        "exit /b 0",
-        "",
-        ":already",
-        "echo 程序已在运行中，正在打开浏览器...",
-        'start "" "http://127.0.0.1:8888"',
-        "ping -n 3 127.0.0.1 >nul",
-        "exit /b 0",
-        "",
-        ":fail",
-        "echo.",
-        "echo ============================================================",
-        "echo [错误] 启动失败：等待30秒后服务仍未就绪",
-        "echo.",
-        "echo 请按以下顺序排查：",
-        "echo   1. 端口8888是否被其他程序占用，关闭后重试",
-        "echo   2. 杀毒软件/安全卫士是否拦截，请添加信任",
-        "echo   3. 请保持本程序目录完整，不要单独移动exe",
-        "echo.",
-        "echo 需要技术支持时，请将本窗口截图发送",
-        "echo ============================================================",
-        "echo.",
-        "pause",
-        "exit /b 1",
-        "",
-    ]
-    bat.write_text("\r\n".join(bat_lines), encoding="gbk")
+    # VC++ 运行库：Nuitka 只搬它找到的几个，msvcp140_1.dll 常在构建机被漏掉，
+    # 目标机若无 VC++ 2015-2022 Redistributable 会直接启动失败 → 从 System32 补齐。
+    system32 = Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32"
+    for dll in ("msvcp140.dll", "msvcp140_1.dll", "vcruntime140.dll", "vcruntime140_1.dll"):
+        if (dist_dir / dll).exists() or not (system32 / dll).exists():
+            continue
+        shutil.copy2(system32 / dll, dist_dir / dll)
+        print(f"  {dll}（VC++ 运行库补齐）")
 
-    print("\n=== Step 7: 创建 README-分发说明.txt ===")
-    readme = dist_dir / "README-分发说明.txt"
-    readme.write_text(
-        "创懿私募基金量化投资平台 — 分发说明\r\n"
-        "========================\r\n"
-        "\r\n"
-        "1. 双击「启动.bat」运行程序\r\n"
-        "2. 浏览器自动打开 http://127.0.0.1:8888\r\n"
-        "3. 首次启动会自动创建数据库\r\n"
-        "\r\n"
-        "注意事项：\r\n"
-        "- 需要安装通达信客户端并运行才能获取实时行情\r\n"
-        "- config.yaml 可配置通达信路径\r\n"
-        "- data/ 目录存放 SQLite 数据库\r\n"
-        "- logs/ 目录存放运行日志\r\n"
-        "- 端口 8888 被占用时请先关闭占用程序\r\n",
-        encoding='utf-8'
+
+def _git_info():
+    try:
+        commit = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=str(REPO), capture_output=True, text=True, timeout=10,
+        ).stdout.strip()
+        dirty = bool(subprocess.run(
+            ["git", "status", "--porcelain"],
+            cwd=str(REPO), capture_output=True, text=True, timeout=30,
+        ).stdout.strip())
+        return commit, dirty
+    except Exception:
+        return "", False
+
+
+def write_build_info(dist_dir: Path, mode: str):
+    """分发目录内留一份构建档案：装到目标机后可直接看版本/来源，便于核对与回滚。"""
+    index = WEB_DIST / "index.html"
+    commit, dirty = _git_info()
+    info = {
+        "app_version": VERSION,
+        "build_mode": mode,
+        "build_time": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "git_commit": commit,
+        "git_dirty": dirty,
+        "frontend_dist_mtime": (
+            datetime.datetime.fromtimestamp(index.stat().st_mtime).strftime("%Y-%m-%d %H:%M:%S")
+            if index.exists() else ""
+        ),
+    }
+    (dist_dir / "build-info.json").write_text(
+        json.dumps(info, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
     )
+    print(f"  build-info.json（{info['build_mode']} / {info['app_version']} / {commit or 'no-git'}）")
 
-    print("\n=== Step 8: 整理最终分发目录 ===")
-    # Nuitka standalone 产物为 <output-dir>/main.dist；将其提升为最终的 tq-iquant 目录。
-    # 同时保留旧包中的用户数据库（data/）与用户配置（config.yaml），
-    # 避免一次干净构建覆盖掉用户的实盘数据。
-    built = dist_dir
-    staging = OUTPUT_DIR.parent / "_tq_new"
-    if staging.exists():
-        shutil.rmtree(staging)
-    shutil.move(str(built), str(staging))
 
-    old_data = OUTPUT_DIR / "data"
-    if old_data.exists():
-        if (staging / "data").exists():
-            shutil.rmtree(staging / "data")
-        shutil.copytree(old_data, staging / "data")
-        print("  保留旧包 data/（用户数据库）")
-    old_cfg = OUTPUT_DIR / "config.yaml"
-    if old_cfg.exists():
-        shutil.copy2(old_cfg, staging / "config.yaml")
-        print("  保留旧包 config.yaml（用户配置）")
+def web_only():
+    """只刷新前端产物：不跑 Nuitka，几秒完成；随后用 installer_web.iss 出几 MB 补丁包。"""
+    if not (DIST_OUT / "tq-iquant.exe").exists():
+        sys.exit(f"未找到已有分发目录：{DIST_OUT}（先跑一次完整构建：python main\\build_package.py）")
+    print("=== 仅刷新前端（--web-only） ===")
+    copy_web(DIST_OUT)
+    write_build_info(DIST_OUT, "web-only")
+    print(f"\n=== 完成：{DIST_OUT}（仅前端已更新） ===")
 
-    # 只清空 OUTPUT_DIR 的内容、保留目录本身：IDE/工具宿主可能以该目录为当前工作目录，
-    # 删除目录本身会 WinError 32。带重试以容忍杀毒软件瞬时扫描占用。
-    import time
-    for attempt in range(5):
-        entries = list(OUTPUT_DIR.iterdir())
-        if not entries:
-            break
-        try:
-            for entry in entries:
-                if entry.is_dir() and not entry.is_symlink():
-                    shutil.rmtree(entry)
-                else:
-                    entry.unlink()
-        except OSError:
-            if attempt == 4:
-                raise
-            time.sleep(2)
 
-    for entry in staging.iterdir():
-        shutil.move(str(entry), str(OUTPUT_DIR / entry.name))
-    shutil.rmtree(staging)
+def main():
+    parser = argparse.ArgumentParser(description="Nuitka onedir 构建（默认保留导入分析缓存）")
+    parser.add_argument(
+        "--clean", action="store_true",
+        help="清空 Nuitka 模块缓存与中间目录后全量重编（正式出包/缓存可疑时用）",
+    )
+    parser.add_argument(
+        "--web-only", action="store_true",
+        help="不跑 Nuitka，只把 web/dist 刷新进已有 dist/tq-iquant（只改前端时用）",
+    )
+    args = parser.parse_args()
 
-    print(f"\n=== 完成！分发目录: {OUTPUT_DIR} ===")
+    if args.web_only:
+        web_only()
+        return
+
+    if not ENTRY.exists():
+        sys.exit(f"缺少桌面入口：{ENTRY}")
+    if not ICON.exists():
+        sys.exit(f"缺少图标：{ICON}（先运行 packaging/icon/build_icon.py）")
+
+    if args.clean:
+        purge_nuitka_cache()
+        mode = "full-clean"
+    else:
+        prepare_cache_dir()
+        mode = "full-incremental"
+
+    print(f"版本：{VERSION}　模式：{mode}")
+    print(f"缓存：{cache_stats()}")
+
+    venv_python = ROOT / ".venv" / "Scripts" / "python.exe"
+    python_exe = str(venv_python) if venv_python.exists() else sys.executable
+    print(f"Python: {python_exe}")
+
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(REPO / "shared") + os.pathsep + env.get("PYTHONPATH", "")
+    run(nuitka_cmd(python_exe), cwd=str(ROOT), env=env)
+
+    built = BUILD_OUT / "tq-iquant.dist"
+    if not built.exists():
+        candidates = list(BUILD_OUT.glob("*.dist"))
+        if not candidates:
+            sys.exit(f"未找到 Nuitka 产物目录：{BUILD_OUT}")
+        built = candidates[0]
+
+    if DIST_OUT.exists():
+        shutil.rmtree(DIST_OUT)
+    shutil.move(str(built), str(DIST_OUT))
+    print(f"\n=== Nuitka 产物 -> {DIST_OUT} ===")
+
+    copy_assets(DIST_OUT)
+    write_build_info(DIST_OUT, mode)
+
+    size_mb = sum(f.stat().st_size for f in DIST_OUT.rglob("*") if f.is_file()) / 1024 / 1024
+    print(f"\n=== 完成：{DIST_OUT}（{size_mb:.1f} MB） ===")
+
 
 if __name__ == "__main__":
     main()
