@@ -116,12 +116,23 @@
 # Endpoints (all JSON, unchanged -- Core's HttpBridgeDispatcher depends on them):
 #   GET  /ping                 heartbeat + bridge status
 #   POST /order                place order (idempotent order_id + whitelist + rate limit)
+#                              optional body field price_type:
+#                                "opponent" (default, prType 14 -- legacy),
+#                                "limit"    (prType 11 -- Core's price used VERBATIM),
+#                                "market_best5" (prType 42 SH / 47 SZ, by code suffix).
+#                              Missing field = old behaviour. Explicit unknown value
+#                              is rejected (ok:false). Every reply echoes pr_type +
+#                              price_type actually used, so Core can reconcile the
+#                              backfilled fill price against the approval price.
 #   GET  /positions            positions
 #   GET  /account              account funds
 #   GET  /orders?order_id=     order query
 #   GET  /deals?order_id=      deal query
 #   GET  /quote?code=&period=&count=   1m/5m/1d bars (cached, ContextInfo; xtdata fallback)
 #   GET  /calendar?market=SH    trading dates ["YYYYMMDD", ...] (cached, ContextInfo; xtdata fallback)
+#   GET  /price_limit?code=     pre close + up/down limit (null when unknown)
+#   POST /cancel               cancel one order (order_ref; result distinguishes
+#                              canceled / pending / not_found / rejected / failed)
 #   GET  /shutdown             release the port (used by the next instance's init
 #                              to take over after a strategy restart)
 #
@@ -196,7 +207,8 @@ MAX_REQUEST_BYTES = 1048576       # drop a connection whose request buffer excee
 CONN_IDLE_TIMEOUT = 30            # drop a half-open/idle connection after N seconds
 SEND_TIMEOUT = 5.0                # per-response send timeout (seconds)
 ENDPOINTS = ("/ping", "/order", "/positions", "/account",
-             "/orders", "/deals", "/quote", "/calendar", "/shutdown")
+             "/orders", "/deals", "/quote", "/calendar",
+             "/price_limit", "/cancel", "/shutdown")
 # ==========================================
 
 _CTX = None
@@ -387,8 +399,9 @@ def _log_order(oid, op, code, volume, result, dup=False):
 
     Replaces the old two-line output (a pre-passorder [BRIDGE-LIVE] order line plus a
     raw [AUDIT-LIVE] JSON dump) with a single line: oid + direction + code + size +
-    result. prType/price/account are omitted: prType is fixed at 14, price is
-    ignored for opposite-best orders, account is fixed at startup.
+    result. prType is NOT printed here: it comes from the optional price_type
+    field (default 14 = opponent, which ignores price) and every /order reply
+    already echoes the price type actually used; account is fixed at startup.
     """
     if result.get("ok"):
         if result.get("dry_run"):
@@ -422,7 +435,7 @@ def _confirm_order_arrival(remark, account):
     concurrency issue (same as query_orders).
 
     *** DUAL-BRIDGE MIRROR *** -- identical logic must exist in
-    iquant_bridge.py _confirm_order_arrival. Hand-sync on any change.
+    iquant_bridge_live.py _confirm_order_arrival. Hand-sync on any change.
     """
     fn = _iq("get_trade_detail_data")
     if fn is None:
@@ -440,11 +453,77 @@ def _confirm_order_arrival(remark, account):
     return False
 
 
+# ---------------- price type (passorder prType) ----------------
+# Values taken from the QMT client itself:
+#   D:\iquant\bin.x64\Lib\site-packages\xtquant\xtconstant.py
+#     FIX_PRICE                    = 11  (fixed/limit price -- the price arg is used)
+#     MARKET_SH_CONVERT_5_CANCEL   = 42  (best-5 immediate-or-cancel, SH)
+#     MARKET_SZ_CONVERT_5_CANCEL   = 47  (best-5 immediate-or-cancel, SZ)
+# 14 is NOT a stock quote type in xtconstant (14 = FUTURE_OPEN there), but this
+# bridge has used 14 since slice 4 and on the real client it behaves as
+# "opposite best price" (BUY takes sell1, SELL takes buy1, price is ignored).
+# It stays the DEFAULT so a request WITHOUT price_type is byte-for-byte the old
+# behaviour. 44 (MARKET_PEER_PRICE_FIRST) is the exchange-side peer-best type;
+# it is NOT used here because it has not been verified on this client.
+#
+# SCOPE: price_type=limit exists to make THIS channel price-controlled by the
+# platform too (TDX already sends PRICE_MY with a pre-submit OCR price check;
+# the goldminer bridge already passes the limit price verbatim; THS in the
+# current `latest` mode does not type any price at all, so its +/- bias is a
+# no-op). It is NOT a generic slippage guard. When limit is selected the price
+# from Core (the approval price) is passed to passorder VERBATIM -- this bridge
+# never re-prices, never chases the order book and never rounds.
+PRICE_TYPE_DEFAULT = 14
+PRICE_TYPE_FIX = 11
+PRICE_TYPE_SH_MARKET_BEST5 = 42
+PRICE_TYPE_SZ_MARKET_BEST5 = 47
+
+
+def _price_type_name(pr_type):
+    """prType -> canonical request name (echoed back in every /order reply)."""
+    if pr_type == PRICE_TYPE_FIX:
+        return "limit"
+    if pr_type in (PRICE_TYPE_SH_MARKET_BEST5, PRICE_TYPE_SZ_MARKET_BEST5):
+        return "market_best5"
+    return "opponent"
+
+
+def _resolve_price_type(raw, code):
+    """Map the optional request field price_type -> (prType, price_is_used, err).
+
+    Missing/empty -> legacy default (14): an old Core payload is unchanged, and
+    that default is echoed back as price_type="opponent" so Core can reconcile
+    the fill price afterwards.
+    An EXPLICIT unknown value is rejected instead of silently falling back --
+    on a typo the order must not trade at a price nobody selected.
+    """
+    name = str(raw or "").strip().lower()
+    if not name:
+        return PRICE_TYPE_DEFAULT, False, None
+    if name in ("opponent", "opposite"):
+        return PRICE_TYPE_DEFAULT, False, None
+    if name in ("limit", "fix", "fixed"):
+        return PRICE_TYPE_FIX, True, None
+    if name in ("market_best5", "best5"):
+        suffix = str(code or "").rsplit(".", 1)[-1].upper()
+        if suffix == "SH":
+            return PRICE_TYPE_SH_MARKET_BEST5, False, None
+        if suffix == "SZ":
+            return PRICE_TYPE_SZ_MARKET_BEST5, False, None
+        return 0, False, "market_best5 requires a .SH or .SZ code suffix"
+    return 0, False, "unknown price_type: %s" % name
+
+
 def _do_place(params):
     code = params.get("code")
     op = params.get("op", "buy")                  # buy / sell
     volume = params.get("volume", 100)
-    price = params.get("price", 0)                # 0=latest price, >0=limit price
+    # price meaning depends on price_type: used verbatim only for limit (11),
+    # ignored (0 placeholder) for opponent / market_best5.
+    try:
+        price = float(params.get("price") or 0)
+    except (TypeError, ValueError):
+        price = 0.0
     account = params.get("account", ACCOUNT)
     # userOrderId -> m_strRemark: Core's deterministic order_id prefix (ASCII hex).
     # Lets Core match the returned order/deal back to exactly this order (precise
@@ -454,17 +533,26 @@ def _do_place(params):
     remark = str(params.get("remark") or "")[:20]
 
     op_type = 23 if op == "buy" else 24           # passorder opType: 23 buy, 24 sell
-    # prType=14 = opposite best price (client-side orderbook-price limit order):
-    #   BUY takes sell1 price, SELL takes buy1 price -> immediate fill.
-    #   NOT an exchange market order, so no market-order symbol/session limits.
-    #   price param has no effect for prType!=11; pass 0 as placeholder.
-    #   Real fill price is backfilled from /deals in a later slice.
-    pr_type = 14
-
+    # prType comes from the optional price_type field; missing -> 14 (opponent),
+    # i.e. exactly the behaviour this bridge had before the field existed.
+    # Every reply echoes the price type actually used so Core can reconcile the
+    # backfilled fill price against the approval price.
+    pr_type, use_price, pt_err = _resolve_price_type(params.get("price_type"), code)
+    if pt_err:
+        return {"ok": False, "error": pt_err}
+    if pr_type == PRICE_TYPE_FIX and (price != price or price <= 0):
+        # limit without a usable price is a Core bug: reject instead of silently
+        # trading opponent-best at a price nobody approved.
+        return {"ok": False, "error": "price_type=limit requires price > 0"}
+    price_type_name = _price_type_name(pr_type)
+    price_arg = price if use_price else 0.0
     if DRY_RUN:
         return {"ok": True, "dry_run": True,
+                "pr_type": pr_type, "price_type": price_type_name,
                 "params": {"code": code, "op": op, "volume": volume,
-                           "price": price, "pr_type": pr_type, "remark": remark}}
+                           "price": price, "price_arg": price_arg,
+                           "pr_type": pr_type, "price_type": price_type_name,
+                           "remark": remark}}
 
     fn = _iq("passorder")
     if fn is None:
@@ -481,13 +569,17 @@ def _do_place(params):
         # it from the strategy's trade properties. A CREDIT account (the 8791
         # leg) therefore needs "account type = credit" selected there, otherwise
         # the counter rejects the order. No code change, only the client setting.
-        result = fn(op_type, 1101, account, code, pr_type, float(price), float(volume),
+        result = fn(op_type, 1101, account, code, pr_type, price_arg, float(volume),
                     "iquant_bridge_live", 2, remark, _CTX)
-        # 0 = accepted (verified on real client). Any other value means the
-        # broker/client rejected the order -- must report ok=False so Core marks
-        # it rejected instead of holding a submitted order whose order_ref never
-        # appears.
-        if result != 0:
+        # Official API doc (P90, passorder entry) states: "return: none". The
+        # documented contract therefore has NO return value; older builds happen
+        # to return 0. Treating None as a rejection was a real bug: the counter
+        # had already accepted the order, the bridge said ok=false, Core marked
+        # it rejected, and a live order was left orphaned at the counter.
+        # Reject ONLY on an explicit non-zero numeric code; None (and any
+        # non-numeric value) means "no error reported" and falls through to the
+        # arrival check below, which is the real evidence that an order exists.
+        if isinstance(result, (int, float)) and int(result) != 0:
             return {"ok": False, "error": "passorder rejected (code=%s)" % result}
         # Arrival check: passorder accepted does NOT guarantee an order record was
         # created (accept-then-drop, real-machine 2026-08-14 id36-39). Re-query the
@@ -495,10 +587,14 @@ def _do_place(params):
         # immediately instead of waiting 180s for order_ref that will never appear.
         if not _confirm_order_arrival(remark, account):
             return {"ok": False,
-                    "error": "passorder accepted but no order record (dropped)"}
-        return {"ok": True, "passorder_result": str(result)}
+                    "error": "passorder accepted but no order record (dropped)",
+                    "pr_type": pr_type, "price_type": price_type_name}
+        return {"ok": True, "passorder_result": str(result),
+                "pr_type": pr_type, "price_type": price_type_name,
+                "price": price_arg}
     except Exception as e:
-        return {"ok": False, "error": "passorder raised: %s" % e}
+        return {"ok": False, "error": "passorder raised: %s" % e,
+                "pr_type": pr_type, "price_type": price_type_name}
 
 
 # ---------------- query endpoints ----------------
@@ -805,6 +901,325 @@ def query_deals(params):
         return {"ok": True, "data": rows}
     except Exception as e:
         return {"ok": False, "error": "query_deals: %s" % e}
+
+
+# ---------------- price limit (pre close / up / down) ----------------
+# GET /price_limit?code=600000.SH ->
+#   {"ok": true, "data": {"code": .., "pre_close": f|null,
+#                         "up_limit": f|null, "down_limit": f|null}}
+# Source: get_instrument_detail (globals first, then ContextInfo, then the
+# client-bundled xtdata), which carries PreClose / UpStopPrice / DownStopPrice.
+# A missing field is emitted as null; Core then either derives the limits from
+# pre_close or fails open (no check). Never guess a limit ratio here (ST 5% vs
+# main board 10% vs STAR/ChiNext 20% vs BSE 30%) -- a wrong guess would block
+# legitimate orders.
+# Standard library only: xtdata ships with the QMT client and is imported
+# lazily, exactly like the calendar fallback above (never a pip dependency).
+PRICE_LIMIT_CACHE_TTL = 30        # seconds; limits are static within a trading day
+CANCEL_VERIFY_ATTEMPTS = 3        # post-cancel re-reads of the ORDER table
+CANCEL_VERIFY_INTERVAL = 0.3      # seconds between those re-reads
+# m_nOrderStatus (doc P192 enum_EEntrustStatus): 48 not reported / 49 pending
+# report / 50 reported / 51 pending cancel / 52 partial-filled pending cancel
+# / 53 partial canceled / 54 canceled / 55 partially filled / 56 filled
+# / 57 rejected (invalid order) / 86 confirmed. 86 is IN FLIGHT -- the order
+# exists at the counter and stays cancellable, NEVER a terminal state.
+_ORDER_FINAL_CANCELED = (53, 54)
+_ORDER_FINAL_OTHER = (56, 57)
+_CAN_CANCEL_STATUS = (48, 49)     # not reported / pending report: not at the counter
+_price_limit_cache = {}           # code -> (ts, payload)
+
+
+def _pick_num(source, names):
+    """First positive finite number among attribute/dict keys, else None."""
+    for name in names:
+        try:
+            if isinstance(source, dict):
+                value = source.get(name)
+            else:
+                value = getattr(source, name, None)
+        except Exception:
+            continue
+        value = _safe_num(value)
+        if value is None:
+            continue
+        try:
+            value = float(value)
+        except (TypeError, ValueError):
+            continue
+        if value > 0:
+            return value
+    return None
+
+
+def _instrument_detail(code):
+    """Instrument detail dict/object, or None when no data source has it."""
+    fn = _iq("get_instrument_detail")
+    if fn is not None:
+        try:
+            detail = fn(code)
+            if detail:
+                return detail
+        except Exception:
+            pass
+    try:
+        from xtquant import xtdata
+        detail = xtdata.get_instrument_detail(code)
+        if detail:
+            return detail
+    except Exception:
+        pass
+    return None
+
+
+def get_price_limit(params):
+    """Pre close + exchange price limits for one instrument (null when unknown)."""
+    code = params.get("code")
+    if not code:
+        return {"ok": False, "error": "missing code"}
+    now = time.time()
+    cached = _price_limit_cache.get(code)
+    if cached is not None and now - cached[0] <= PRICE_LIMIT_CACHE_TTL:
+        return cached[1]
+    detail = _instrument_detail(code)
+    payload = {
+        "code": code,
+        "pre_close": _pick_num(detail, ("PreClose", "PreClosePrice", "LastClose")),
+        "up_limit": _pick_num(detail, ("UpStopPrice", "LimitUpPrice")),
+        "down_limit": _pick_num(detail, ("DownStopPrice", "LimitDownPrice")),
+    }
+    result = {"ok": True, "data": payload,
+              "source": "unavailable" if detail is None else "instrument_detail"}
+    _price_limit_cache[code] = (now, result)
+    return result
+
+
+# ---------------- cancel ----------------
+# POST /cancel {"order_ref": "..."} (bridge order ref = m_strOrderRef; the
+# cl_ord_id / order_id aliases are accepted too). The ref only LOCATES the order
+# row; the cancel itself is issued with that row's m_strOrderSysID. Official API
+# doc P179: m_strOrderSysID = contract/order number, m_strOrderRef = internal
+# order ref; P99: "the order number in the order list and the deal list is the
+# same m_strOrderSysID value". Passing the ref to cancel() canceled nothing
+# whenever the two differ, so sys id is used first and the ref is only a
+# fallback (unreported rows / old clients may have no sys id yet).
+# Answer data.result:
+#   "canceled"  already canceled, or cancel confirmed by the ORDER table
+#               (53/54, or the row disappeared after a SUCCESSFUL re-read)
+#   "pending"   cancel request sent, terminal state not observed within ~0.9s;
+#               also used when the order has not reached the counter yet
+#   "not_found" no such order in today's ORDER table
+#   "rejected"  order already filled / rejected, nothing to cancel
+#   "failed"    local failure (no cancel API, call raised, query failed,
+#               cancel() returned False = request never issued)
+# ok is true only for "canceled"/"pending": a failure is NEVER reported as
+# success. Core only needs ok; data.result keeps the outcome unambiguous.
+def _order_row_by_ref(account, ref):
+    """(row, ok); ok=False means the query failed -- NOT "no such order"."""
+    fn = _iq("get_trade_detail_data")
+    if fn is None:
+        return None, False
+    try:
+        rows = fn(account, ACCOUNT_TYPE, "ORDER") or []
+    except Exception:
+        return None, False
+    for o in rows:
+        if str(getattr(o, "m_strOrderRef", "") or "").strip() == ref:
+            return o, True
+    return None, True
+
+
+def _order_sys_id(order_obj):
+    """m_strOrderSysID (contract / order number) as str, "" when absent.
+
+    This is the id the counter's cancel API expects (doc P99 + P179), not
+    m_strOrderRef. Rows that never reached the counter, and old clients, may
+    have no sys id yet -- callers fall back to the ref.
+    """
+    try:
+        return str(getattr(order_obj, "m_strOrderSysID", "") or "").strip()
+    except Exception:
+        return ""
+
+
+def _row_status(order_obj):
+    """m_nOrderStatus as int, or None when absent/unparseable."""
+    value = _safe_num(getattr(order_obj, "m_nOrderStatus", None))
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _cancel_log(msg):
+    """One audit line per cancel step.
+
+    cancel_order used to be completely silent, so after the fact there was no
+    way to tell who canceled which order, with which id, through which branch.
+    Fixed few lines per request (entry / branch / call / close), never per poll.
+    """
+    print("[BRIDGE] %s CANCEL %s" % (_ts(), msg))
+
+
+def cancel_order(params):
+    ref = str(params.get("order_ref") or params.get("cl_ord_id")
+              or params.get("order_id") or "").strip()
+    if not ref:
+        _cancel_log("ref=<empty> -> failed reason=missing order_ref")
+        return {"ok": False,
+                "error": "cancel requires order_ref (bridge order ref)",
+                "data": {"result": "failed"}}
+    account = params.get("account", ACCOUNT)
+    row, query_ok = _order_row_by_ref(account, ref)
+    if not query_ok:
+        _cancel_log("ref=%s -> failed reason=order query failed" % ref)
+        return {"ok": False, "error": "cancel: order query failed",
+                "data": {"order_ref": ref, "result": "failed"}}
+    if row is None:
+        _cancel_log("ref=%s -> failed reason=order not found" % ref)
+        return {"ok": False, "error": "order not found: %s" % ref,
+                "data": {"order_ref": ref, "result": "not_found"}}
+    status = _row_status(row)
+    sys_id = _order_sys_id(row)
+    order_id = sys_id or ref        # cancel() wants the contract/order number
+    ins = str(getattr(row, "m_strInstrumentID", "") or "")
+    _cancel_log("%s ref=%s sysid=%s status=%s"
+                % (ins, ref, sys_id or "none", status))
+    if status in _ORDER_FINAL_CANCELED:
+        _cancel_log("branch=already-final status=%s -> %s status=%s"
+                    % (status, "partial_canceled" if status == 53 else "canceled",
+                       status))
+        return {"ok": True, "data": {"order_ref": ref, "order_sys_id": sys_id or None,
+                                     "result": "canceled",
+                                     "status": status, "verified": True}}
+    if status in _ORDER_FINAL_OTHER:
+        _cancel_log("branch=final-not-cancelable status=%s -> failed status=%s"
+                    % (status, status))
+        return {"ok": False,
+                "error": "cannot cancel: order already final (status=%s)" % status,
+                "data": {"order_ref": ref, "order_sys_id": sys_id or None,
+                         "result": "rejected",
+                         "status": status, "verified": True}}
+    # Pre-check (doc P98-99): can_cancel_order(orderId, accountId, accountType,
+    # ContextInfo) -> bool. For "not reported"/"pending report" rows nothing has
+    # reached the counter yet, so it answers False -- skip the doomed cancel
+    # round-trip and report pending. Guarded lookup: older clients do not ship
+    # this API, in which case the pre-check is skipped and behaviour is
+    # unchanged.
+    if status in _CAN_CANCEL_STATUS:
+        can_fn = _iq("can_cancel_order")
+        if can_fn is None:
+            _cancel_log("branch=not-reported precheck=unavailable status=%s"
+                        % status)
+        else:
+            try:
+                verdict = can_fn(order_id, account, ACCOUNT_TYPE, _CTX)
+            except Exception:
+                verdict = None
+            _cancel_log("branch=not-reported precheck=can_cancel_order(%s)=%s status=%s"
+                        % (order_id, verdict, status))
+            if verdict is False:
+                _cancel_log("precheck says no -> pending status=%s" % status)
+                return {"ok": True,
+                        "data": {"order_ref": ref, "order_sys_id": sys_id or None,
+                                 "result": "pending", "status": status,
+                                 "verified": False,
+                                 "note": "not yet reported to the counter, "
+                                         "nothing to cancel"}}
+    else:
+        _cancel_log("branch=normal status=%s sending cancel(%s)"
+                    % (status, order_id))
+    fn = _iq("cancel")
+    if fn is None:
+        _cancel_log("call cancel(%s) -> failed reason=cancel API missing"
+                    % order_id)
+        return {"ok": False, "error": "cancel not found in strategy namespace",
+                "data": {"order_ref": ref, "order_sys_id": sys_id or None,
+                         "result": "failed", "status": status}}
+    # QMT reference signature: cancel(orderId, accountId, accountType, ContextInfo).
+    # orderId is an int on some builds and a str on others, so try both; shorter
+    # signatures are a last resort. A TypeError means the call never happened, so
+    # walking down the list is safe (cancel is idempotent).
+    variants = [int(order_id)] if order_id.isdigit() else []
+    variants.append(order_id)
+    called = False
+    cancel_ret = None
+    last_exc = None
+    call_sig = "none"
+    for oid in variants:
+        for args in ((oid, account, ACCOUNT_TYPE, _CTX),
+                     (oid, account, ACCOUNT_TYPE),
+                     (oid,)):
+            try:
+                cancel_ret = fn(*args)
+                called = True
+                call_sig = "%s/%darg" % (type(oid).__name__, len(args))
+                break
+            except TypeError as e:
+                last_exc = e
+                continue
+            except Exception as e:
+                _cancel_log("call cancel(%s) raised %s: %s -> failed status=%s"
+                            % (order_id, type(e).__name__, e, status))
+                return {"ok": False, "error": "cancel raised: %s" % e,
+                        "data": {"order_ref": ref, "order_sys_id": sys_id or None,
+                                 "result": "failed", "status": status}}
+        if called:
+            break
+    if not called:
+        _cancel_log("call cancel(%s) sig=none ret=none (%s) -> failed status=%s"
+                    % (order_id, last_exc, status))
+        return {"ok": False,
+                "error": "cancel signature mismatch: %s" % last_exc,
+                "data": {"order_ref": ref, "order_sys_id": sys_id or None,
+                         "result": "failed", "status": status}}
+    _cancel_log("call cancel(%s) sig=%s ret=%s"
+                % (order_id, call_sig, cancel_ret))
+    # Doc P99: cancel() returns a bool meaning "cancel request issued", not the
+    # cancel result -- terminal state still has to be read back from the ORDER
+    # table below. False = the request never went out, so report failure instead
+    # of polling for a state change that cannot happen. True / None = issued.
+    if cancel_ret is False:
+        _cancel_log("cancel returned False -> failed status=%s" % status)
+        return {"ok": False, "error": "cancel returned False",
+                "data": {"order_ref": ref, "order_sys_id": sys_id or None,
+                         "result": "failed", "status": status,
+                         "reason": "cancel returned False"}}
+    for _ in range(CANCEL_VERIFY_ATTEMPTS):
+        time.sleep(CANCEL_VERIFY_INTERVAL)
+        row2, query_ok2 = _order_row_by_ref(account, ref)
+        if not query_ok2:
+            continue
+        if row2 is None:
+            _cancel_log("verify row gone -> canceled status=none")
+            return {"ok": True, "data": {"order_ref": ref,
+                                         "order_sys_id": sys_id or None,
+                                         "result": "canceled",
+                                         "status": None, "verified": True}}
+        status2 = _row_status(row2)
+        if status2 in _ORDER_FINAL_CANCELED:
+            _cancel_log("verify -> %s status=%s"
+                        % ("partial_canceled" if status2 == 53 else "canceled",
+                           status2))
+            return {"ok": True, "data": {"order_ref": ref,
+                                         "order_sys_id": sys_id or None,
+                                         "result": "canceled",
+                                         "status": status2, "verified": True}}
+        if status2 in _ORDER_FINAL_OTHER:
+            _cancel_log("verify -> failed status=%s (became final)" % status2)
+            return {"ok": False,
+                    "error": "cannot cancel: order became final (status=%s)"
+                             % status2,
+                    "data": {"order_ref": ref, "order_sys_id": sys_id or None,
+                             "result": "rejected",
+                             "status": status2, "verified": True}}
+        if status2 is not None:
+            status = status2
+    _cancel_log("verify timeout -> pending status=%s" % status)
+    return {"ok": True, "data": {"order_ref": ref, "order_sys_id": sys_id or None,
+                                 "result": "pending",
+                                 "status": status, "verified": False}}
 
 
 # ---------------- quotes (get_market_data_ex pull + cache) ----------------
@@ -1388,6 +1803,14 @@ def _handle(method, path, headers, body):
         return _json(get_quote(params))
     if method == "GET" and path == "/calendar":
         return _json(get_calendar(params))
+    if method == "GET" and path == "/price_limit":
+        return _json(get_price_limit(params))
+    if method == "POST" and path == "/cancel":
+        try:
+            p = json.loads(body.decode("utf-8"))
+        except Exception as e:
+            return _json({"ok": False, "error": "bad body: %s" % e}, 400)
+        return _json(cancel_order(p))
     if method == "GET" and path == "/shutdown":
         # Ack first, release later: the answer below is sent by _serve_once and
         # only after that does tick() close the listening socket, so this

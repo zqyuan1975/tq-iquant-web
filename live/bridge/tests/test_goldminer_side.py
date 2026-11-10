@@ -18,7 +18,7 @@ _BRIDGE_DIR = pathlib.Path(__file__).resolve().parents[1]
 
 _GM_API_NAMES = ("set_token", "set_account_id", "order_volume", "order_cancel", "run",
                  "get_cash", "get_position", "get_execution_reports", "get_orders",
-                 "get_trading_dates", "history_n", "MODE_LIVE")
+                 "get_trading_dates", "history_n", "get_instruments", "MODE_LIVE")
 _GM_ENUM_NAMES = ("OrderSide_Buy", "OrderSide_Sell", "OrderType_Limit",
                   "PositionEffect_Open", "PositionEffect_Close")
 

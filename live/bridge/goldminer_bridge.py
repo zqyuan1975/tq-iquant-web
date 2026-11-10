@@ -12,8 +12,10 @@
   GET  /deals     当日成交（支持 ?order_id=）
   GET  /quote     实时 bar
   GET  /calendar  交易日历（end 缺省=今天）
+  GET  /price_limit 前收 + 涨跌停价（合约信息取不到时回 null，平台 fail-open）
   POST /order     下单，返回真实委托结果（cl_ord_id / accepted / rejected / status / reason）
   POST /cancel    撤单（入参 cl_ord_id，兼容 order_id），返回撤单结果
+                  （data.result: canceled / pending / not_found / rejected / failed）
   POST /shutdown  自行退出桥进程（须 {"confirm": true}），替代 taskkill 强杀
 
 部署（掘金终端内）：
@@ -34,7 +36,8 @@ from urllib.parse import parse_qs
 
 from gm.api import (set_token, set_account_id, order_volume, order_cancel, run,
                     get_cash, get_position, get_execution_reports, get_orders,
-                    get_trading_dates, history_n, MODE_LIVE)
+                    get_trading_dates, history_n, get_instruments,
+                    MODE_LIVE)
 from gm.enum import (OrderSide_Buy, OrderSide_Sell, OrderType_Limit,
                      PositionEffect_Open, PositionEffect_Close)
 
@@ -63,6 +66,11 @@ _GM_LOCK = threading.RLock()
 _BRIDGE_START = datetime.datetime.now()
 # /quote 结果缓存：(code, period, count) -> (时间戳, rows)；55s 过期与节拍对齐
 _QUOTE_CACHE = {}
+# 非空结果 TTL（秒）：与 BarPoller 60s 轮询节拍对齐，同一节拍内只打一次云端。
+_QUOTE_CACHE_TTL = 55.0
+# 空结果 TTL（秒）：停牌 / 错码 / 云端返回空同样缓存 10 秒，避免每次请求都打云端；
+# 取 10s 而非 55s，是为了让「停牌恢复 / 代码补数」最多 10 秒就能拿到新数据。
+_QUOTE_CACHE_EMPTY_TTL = 10.0
 
 # ---------------- gm 健康可见性（/ping 只读回显，零 gm 调用） ----------------
 # SDK 的连接类故障（1200/1201 行情、1100/1101 交易消息）只打到 on_error 与控制台，
@@ -110,6 +118,8 @@ _ORDER_STATUS_IQ = {
 }
 # 已终态（不可撤单 / 不再变化）
 _FINAL_STATUS = ("Filled", "Canceled", "Rejected", "Expired", "DoneForDay", "Stopped")
+# 终态里「委托已不在场」的几种（撤单按幂等成功处理，不算失败）
+_CANCEL_FINAL_CANCELED = ("Canceled", "Expired", "DoneForDay", "Stopped")
 # gm ExecType 数值：15=成交（pb_to_dict 默认枚举转 int，兼容旧版文本 "Trade"）
 _EXEC_TYPE_TRADE = (15, "Trade", "15")
 
@@ -126,10 +136,26 @@ def to_gm_symbol(code):
 
 def _s(obj, *names, default=None):
     for n in names:
-        v = getattr(obj, n, None)
+        if isinstance(obj, dict):
+            v = obj.get(n)
+        else:
+            v = getattr(obj, n, None)
         if v is not None:
             return v
     return default
+
+
+def _num(v):
+    """正数（价格类）→ float；None / 0 / 负数 / nan / 不可解析 → None。"""
+    if v is None:
+        return None
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return None
+    if f != f or f <= 0:
+        return None
+    return f
 
 
 def _now_str():
@@ -534,6 +560,13 @@ def cancel_order(p):
     gm 签名：order_cancel(wait_cancel_orders)，入参 [{"cl_ord_id":..., "account_id":...}]，
     返回 None，失败抛 GmError（含 status/message/function 原文）。
     终态（已成/已撤/已拒/过期）在撤单前直接拒绝并说明，不做无意义调用。
+
+    data.result 区分撤单结局（平台只看 ok，失败绝不误报成功）：
+      canceled  已处于撤销态（已撤/过期/废单到期），或撤单后复查到 Canceled
+      pending   撤单请求已受理，复查窗口内未回读到终态
+      not_found 桥台账与柜台当日委托里都查不到该 cl_ord_id
+      rejected  委托已成交/已拒/其它终态，不可撤
+      failed    本地失败（gm 调用异常且委托仍存在、查询失败等）
     """
     cl = str(p.get("cl_ord_id") or "").strip()
     oid = str(p.get("order_id") or "").strip()
@@ -543,15 +576,18 @@ def cancel_order(p):
             cl = str(rec.get("cl_ord_id") or "")
     if not cl:
         return {"ok": False,
-                "error": "cancel requires cl_ord_id (or an order_id known to bridge)"}
+                "error": "cancel requires cl_ord_id (or an order_id known to bridge)",
+                "data": {"result": "not_found"}}
 
     rec = _ledger_get(cl) or {}
     status_text = rec.get("status_text") or ""
     if status_text in _FINAL_STATUS:
+        canceled = status_text in _CANCEL_FINAL_CANCELED
         return {"ok": False,
                 "error": "cannot cancel: 委托已终态（%s）%s"
                          % (status_text, ("；" + rec["reason"]) if rec.get("reason") else ""),
                 "data": {"cl_ord_id": cl, "status": status_text,
+                         "result": "canceled" if canceled else "rejected",
                          "reason": rec.get("reason") or ""}}
 
     try:
@@ -559,33 +595,56 @@ def cancel_order(p):
             _gm_call(order_cancel, [{"cl_ord_id": cl, "account_id": ACCOUNT}])
     except Exception as e:
         # 撤单不存在 / 已成交 / 已拒：gm 以 GmError 原文返回（status/message/function），
-        # 原样透出，不做二次猜测。
+        # 原样透出，不做二次猜测。仅在「查询成功且确实没有该委托」时判 not_found。
         msg = str(e)
+        query_ok, found, status_after = _verify_cancel(cl)
+        result = "not_found" if (query_ok and not found) else "failed"
         return {"ok": False, "error": "order_cancel raised: %s" % msg,
-                "data": {"cl_ord_id": cl, "status": status_text or "Unknown"}}
+                "data": {"cl_ord_id": cl, "result": result,
+                         "status": status_after or status_text or "Unknown"}}
 
-    verified, status_after = _verify_cancel(cl)
+    _query_ok, verified, status_after = _verify_cancel(cl)
     if status_after == "Canceled":
         _ledger_update(cl, status_text="Canceled", status=_iq_status("Canceled"),
                        accepted=True, rejected=False)
+        return {"ok": True,
+                "data": {"cl_ord_id": cl, "cancel_requested": True,
+                         "result": "canceled", "verified": True,
+                         "status": "Canceled"}}
+    if status_after in _CANCEL_FINAL_CANCELED:
+        _ledger_update(cl, status_text=status_after,
+                       status=_iq_status(status_after))
+        return {"ok": True,
+                "data": {"cl_ord_id": cl, "cancel_requested": True,
+                         "result": "canceled", "verified": True,
+                         "status": status_after}}
+    if status_after == "Filled":
+        return {"ok": False,
+                "error": "cannot cancel: 委托已成交（Filled）",
+                "data": {"cl_ord_id": cl, "result": "rejected",
+                         "verified": True, "status": "Filled"}}
     return {"ok": True,
             "data": {"cl_ord_id": cl, "cancel_requested": True,
-                     "verified": verified,
+                     "result": "pending", "verified": verified,
                      "status": status_after or "PendingCancel"}}
 
 
 def _verify_cancel(cl_ord_id):
-    """撤单后复查委托状态（一次 get_orders）。返回 (是否回读到, 状态文本)。"""
+    """撤单后复查委托状态（一次 get_orders）。
+
+    返回 (query_ok, found, status_text)：query_ok=False 表示查询本身失败（此时
+    found/status 无意义），调用方不得据此判定「委托不存在」。
+    """
     try:
         with _GM_LOCK:
             rows = _gm_call(get_orders) or []
     except Exception:  # noqa: BLE001
-        return False, ""
+        return False, False, ""
     for o in rows:
         if str(_s(o, "cl_ord_id", default="") or "") != cl_ord_id:
             continue
-        return True, _status_text(_s(o, "status", default=None))
-    return False, ""
+        return True, True, _status_text(_s(o, "status", default=None))
+    return True, False, ""
 
 
 def query_positions(p):
@@ -864,8 +923,12 @@ def query_deals(p):
 
 
 def get_quote(p):
-    """当日实时 bar（掘金 history_n 含当日）。带 55s 结果缓存——
-    BarPoller 60s 节拍内重复 /quote 直接复用，gm 云端查询只打一次。"""
+    """当日实时 bar（掘金 history_n 含当日）。带结果缓存——
+
+    非空结果缓存 55s（与 BarPoller 60s 节拍对齐），空结果缓存 10s（停牌/错码/
+    云端返回空也不反复打云端）；异常不缓存。应答带 `cached` 布尔标记：命中缓存
+    为 true、实际打云端为 false，便于一条 curl 判断命中情况。
+    """
     code = p.get("code", "")
     period = p.get("period", "1m")
     count = int(p.get("count", 10))
@@ -876,8 +939,10 @@ def get_quote(p):
     ck = (code, period, count)
     now = time.time()
     hit = _QUOTE_CACHE.get(ck)
-    if hit and now - hit[0] < 55:
-        return {"ok": True, "data": {code: hit[1]}}
+    if hit:
+        ttl = _QUOTE_CACHE_TTL if hit[1] else _QUOTE_CACHE_EMPTY_TTL
+        if now - hit[0] < ttl:
+            return {"ok": True, "cached": True, "data": {code: hit[1]}}
     try:
         bars = _gm_call(history_n, symbol=to_gm_symbol(code), frequency=freq,
                         count=count + 2, fields="eob,open,high,low,close,volume",
@@ -892,9 +957,9 @@ def get_quote(p):
                 "low": b.get("low"), "close": b.get("close"),
                 "volume": b.get("volume"), "amount": 0,
             })
-        if rows:
-            _QUOTE_CACHE[ck] = (now, rows)
-        return {"ok": True, "data": {code: rows}}
+        # 空结果同样缓存（10s），结构与非空一致：data[code] 为空列表，不伪造行
+        _QUOTE_CACHE[ck] = (now, rows)
+        return {"ok": True, "cached": False, "data": {code: rows}}
     except Exception as e:
         return {"ok": False, "error": "quote: %s" % e}
 
@@ -910,6 +975,105 @@ def _norm_date(v):
         except ValueError:
             continue
     raise ValueError("invalid date %r (expect YYYY-MM-DD)" % s)
+
+
+# /price_limit 结果缓存：code -> (时间戳, payload)；涨跌停当日不变，30s 足够
+_PRICE_LIMIT_CACHE = {}
+_PRICE_LIMIT_TTL = 30.0
+# get_instruments 显式字段（缩小返回体积）；字符串按逗号拆分（gm param_convert_iter_to_list）
+_GM_PRICE_FIELDS = "symbol,pre_close,upper_limit,lower_limit"
+
+
+def _read_instrument(sym):
+    """取单只标的最新日频信息（含前收与交易所涨跌停价），取不到返回 None。
+
+    为什么不用 get_instrumentinfos：它返回的 InstrumentInfo 只有 symbol / 名称 /
+    sec_type / price_tick 等静态字段，**没有 pre_close / upper_limit /
+    lower_limit**，涨跌停必须走 get_instruments（返回 Instrument，含这三个字段）。
+
+    fields 显式声明减少返回体积；skip_st / skip_suspended 置 False——默认 True 会把
+    ST 与停牌标的过滤掉导致空列表。首轮带 fields 失败/为空时退回不带 fields 再查一次。
+    """
+    attempts = (
+        {"symbols": [sym], "skip_st": False, "skip_suspended": False,
+         "fields": _GM_PRICE_FIELDS},
+        {"symbols": [sym], "skip_st": False, "skip_suspended": False},
+    )
+    for kwargs in attempts:
+        try:
+            with _GM_LOCK:
+                rows = _gm_call(get_instruments, **kwargs) or []
+        except Exception:  # noqa: BLE001
+            rows = []
+        for row in rows:
+            if row:
+                return row
+    return None
+
+
+def get_price_limit(p):
+    """前收 + 交易所涨跌停价（平台下单前做涨跌停校验）。
+
+    数据源：gm get_instruments（pre_close / upper_limit / lower_limit，交易所口径）。
+    缺字段时用日线倒数第二根收盘补前收（当日 bar 尚未收盘，不能当前收）。仍取不到
+    的字段回 null——平台侧据此 fail-open，桥不猜涨跌幅比例。
+    """
+    code = str(p.get("code") or "").strip()
+    if not code:
+        return {"ok": False, "error": "missing code"}
+    now = time.time()
+    hit = _PRICE_LIMIT_CACHE.get(code)
+    if hit and now - hit[0] < _PRICE_LIMIT_TTL:
+        return hit[1]
+
+    sym = to_gm_symbol(code)
+    pre_close = up = down = None
+    source = "unavailable"
+    info = _read_instrument(sym)
+    if info is not None:
+        pre_close = _num(_s(info, "pre_close"))
+        up = _num(_s(info, "upper_limit", "limit_up", "up_limit"))
+        down = _num(_s(info, "lower_limit", "limit_down", "down_limit"))
+        if pre_close or up or down:
+            source = "instrument_info"
+
+    # 涨跌停价任一缺失时平台都需要前收来推导，才值得多打一次日线
+    if pre_close is None and (up is None or down is None):
+        try:
+            with _GM_LOCK:
+                bars = _gm_call(history_n, symbol=sym, frequency="1d", count=3,
+                                fields="eob,close", adjust=0, df=False) or []
+        except Exception:  # noqa: BLE001
+            bars = []
+        closes = []
+        for b in bars:
+            close = _num(b.get("close") if isinstance(b, dict)
+                         else getattr(b, "close", None))
+            if close is None:
+                continue
+            eob = b.get("eob") if isinstance(b, dict) else getattr(b, "eob", None)
+            closes.append((eob, close))
+        if closes:
+            today = datetime.date.today()
+            last_dt = closes[-1][0]
+            last_date = last_dt.date() if hasattr(last_dt, "date") else None
+            if last_date == today:
+                # 末根是当日未收盘 bar → 前收取倒数第二根
+                if len(closes) >= 2:
+                    pre_close = closes[-2][1]
+            elif last_date is not None:
+                pre_close = closes[-1][1]
+            elif len(closes) >= 2:
+                pre_close = closes[-2][1]
+            if pre_close is not None and source == "unavailable":
+                source = "daily_close"
+
+    result = {"ok": True,
+              "data": {"code": code, "pre_close": pre_close,
+                       "up_limit": up, "down_limit": down},
+              "source": source}
+    _PRICE_LIMIT_CACHE[code] = (now, result)
+    return result
 
 
 def get_calendar(p):
@@ -932,7 +1096,8 @@ def get_calendar(p):
 
 # /ping 回显的端点清单（部署后用 GET /ping 核对新增端点是否生效）
 ENDPOINTS = ["/ping", "/positions", "/account", "/orders", "/deals",
-             "/quote", "/calendar", "/order", "/cancel", "/shutdown"]
+             "/quote", "/calendar", "/price_limit", "/order", "/cancel",
+             "/shutdown"]
 
 
 def ping_payload():
@@ -971,17 +1136,58 @@ def request_shutdown(p):
     return {"ok": True, "data": {"shutdown": True}}
 
 
+def is_client_gone(e):
+    """是否为「客户端提前断开」类错误（属正常断连，不是桥故障）。
+
+    Core 的 httpx 读超时 / 会话停止 / 后端重启会先关连接，桥随后写回包即触发
+    WinError 10054（对端重置）/ 10053（本端中止）/ 10038（非套接字）。
+    """
+    if isinstance(e, (ConnectionResetError, BrokenPipeError,
+                      ConnectionAbortedError)):
+        return True
+    return isinstance(e, OSError) and getattr(e, "winerror", None) in (
+        10053, 10054, 10038)
+
+
 class _Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         pass   # 静默访问日志（掘金日志面板不刷屏）
 
     def _respond(self, obj, code=200):
+        """写回包；对端已断开时静默返回 False，绝不抛异常、绝不二次写。
+
+        写失败只打一行日志（`client closed early`），避免 BaseHTTPRequestHandler
+        打整段 traceback 刷屏；置 `_write_failed` 让外层不再尝试写 500 响应
+        （同一个已断 socket 上二次写只会再抛一串 traceback）。
+        """
         body = json.dumps(obj).encode("utf-8")
-        self.send_response(code)
-        self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
+        path = self.path.partition("?")[0]
+        try:
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return True
+        except OSError as e:
+            self._write_failed = True
+            if is_client_gone(e):
+                print("[GM-BRIDGE] client closed early path=%s (%s)"
+                      % (path, e), flush=True)
+            else:
+                print("[GM-BRIDGE] respond failed path=%s (%s)"
+                      % (path, e), flush=True)
+            return False
+
+    def _fail_response(self, path, e):
+        """处理异常时的兜底回包；回包已写失败 / 对端已断开则直接放弃。"""
+        if getattr(self, "_write_failed", False):
+            return False
+        if is_client_gone(e):
+            print("[GM-BRIDGE] client closed early path=%s (%s)"
+                  % (path, e), flush=True)
+            return False
+        return self._respond({"ok": False, "error": "handler: %s" % e}, 500)
 
     def do_GET(self):
         path, _, query = self.path.partition("?")
@@ -1002,9 +1208,11 @@ class _Handler(BaseHTTPRequestHandler):
                 return self._respond(get_quote(q))
             if path == "/calendar":
                 return self._respond(get_calendar(q))
+            if path == "/price_limit":
+                return self._respond(get_price_limit(q))
             return self._respond({"ok": False, "error": "unknown path %s" % path}, 404)
         except Exception as e:
-            return self._respond({"ok": False, "error": "handler: %s" % e}, 500)
+            return self._fail_response(path, e)
 
     def do_POST(self):
         path, _, _ = self.path.partition("?")
@@ -1021,7 +1229,7 @@ class _Handler(BaseHTTPRequestHandler):
                 return self._respond(request_shutdown(p))
             return self._respond({"ok": False, "error": "unknown path %s" % path}, 404)
         except Exception as e:
-            return self._respond({"ok": False, "error": "handler: %s" % e}, 500)
+            return self._fail_response(path, e)
 
 
 # ---------------- 掘金策略入口（标准格式） ----------------
