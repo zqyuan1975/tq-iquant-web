@@ -461,14 +461,16 @@ def test_item07_live_gate_follows_portfolio_switch_and_bridge_fail_open():
     assert _make_dispatcher(_Recorder()).check_price_limit(
         STOCK, "buy", Decimal("999")) is None
 
-    # 组合开关 ON：dispatcher 拒绝 → 落 rejected 且原因可见；OFF：不调用
+    # 组合开关 ON：dispatcher 拒绝 → P1-3 现行契约「可重排拒单」回 deferred
+    # （error_message 带 deferred_retry:n=<k> 计数），不再一次性落终态 rejected；
+    # OFF：不调用校验，正常 submitted。
     calls = []
 
     def _reject(code, direction, price):
         calls.append((code, direction, price))
         return "涨跌停拦截（测试）"
 
-    for enabled, expect_rejected in ((True, True), (False, False)):
+    for enabled, expect_deferred in ((True, True), (False, False)):
         factory2, _ = _db_factory()
         ctx = _risk_ctx()
         port = _portfolio(ctx)
@@ -482,9 +484,14 @@ def test_item07_live_gate_follows_portfolio_switch_and_bridge_fail_open():
         rows = db.query(LiveOrder).all()
         db.close()
         assert len(rows) == 1
-        assert (rows[0].status == "rejected") is expect_rejected
-        if expect_rejected:
+        if expect_deferred:
+            assert rows[0].status == "deferred"
+            assert "deferred_retry:n=1" in (rows[0].error_message or "")
             assert "涨跌停" in (rows[0].error_message or "")
+            # 回 deferred 队列，等待下一交易日 due 窗口/09:31 首根 bar 重试
+            assert any(o.stock_code == STOCK for o in eng._signal_bar_deferred)
+        else:
+            assert rows[0].status == "submitted"
     assert len(calls) == 1  # OFF 分支完全不调用校验
 
 

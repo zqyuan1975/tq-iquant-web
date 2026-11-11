@@ -26,6 +26,7 @@ from typing import Callable, Dict, List, Optional
 
 from ..event import BarEvent
 from ..http_bridge_dispatcher import BridgeUnavailableError
+from ...tq.utils import TDXLockTimeout
 from ..bar_poller import parse_bar_time, to_ohlcv, latest_completed_bar
 from ..portfolio import Portfolio
 from .context import EngineContext
@@ -417,7 +418,9 @@ class MarketDataService:
         """
         try:
             rows = self.ctx.dispatcher.query_positions()
-        except BridgeUnavailableError:
+        except (BridgeUnavailableError, TDXLockTimeout):
+            # P2-7：TQ 锁等待超时同「桥离线」处理——空表 → 全量放行（券商端
+            # T+1 兜底），绝不因取数被占用而中断本根 bar 的风控评估。
             self._set_available_map({})
             return
         m: Dict[str, int] = {}

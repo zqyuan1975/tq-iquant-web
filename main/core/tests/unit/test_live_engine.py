@@ -3856,6 +3856,43 @@ def _make_advance_engine(disp, factory, port, stock, synth, trading_dates,
     return engine
 
 
+def test_advance_close_skipped_on_half_day_market():
+    """半日市（P2-10）：14:52 已收盘，提前收盘价轮次不得再下单。
+
+    半日市当天 1d 信号由 15:05 收盘落定轮次按完整日线补跑（次日开盘执行），
+    这里断言提前轮次完全不动（不取价、不驱动 on_bar、不落幂等标记、不下单）。
+    """
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single(period="1d")
+    stock = "600000.SH"
+    daily_bars = [{"stime": "20261231000000", "open": 9.0, "high": 9.2,
+                   "low": 9.0, "close": 9.2, "volume": 10000, "amount": 92000.0}]
+    rec = _Recorder(respond=_respond_quote_bars(stock, daily_bars))
+    disp, _ = _make_dispatcher(rec)
+    synth = _SynthStub({stock: [
+        {"stime": "20261231145100", "open": 9.3, "high": 9.4,
+         "low": 9.2, "close": 9.6, "volume": 500, "amount": 4800.0},
+    ]})
+    engine = _make_advance_engine(disp, factory, port, stock, synth,
+                                  [date(2026, 12, 31)])
+    from core.engine.trading_calendar import TradingCalendar
+    engine._calendar = TradingCalendar(
+        lambda: [date(2026, 12, 31)],
+        half_day_provider=lambda year: ["2026-12-31"],
+    )
+    engine.signal_cache = {
+        (1, stock, datetime(2026, 12, 31, 0, 0)): [{"name": "open_sig", "value": 1}]
+    }
+
+    engine._maybe_advance_daily_close(now=datetime(2026, 12, 31, 14, 52))
+
+    assert synth.calls == 0
+    assert engine._last_advance_close_date is None
+    db = factory()
+    assert db.query(LiveOrder).count() == 0
+    db.close()
+
+
 def test_advance_close_drives_1d_with_1450_close_price():
     """功能二：14:51 用快照合成 14:50 1m bar 收盘价（9.6）驱动 1d 信号+风控。
 
@@ -12208,6 +12245,84 @@ def test_pre_open_no_cancel_when_open_not_crossed():
 
     assert engine._pre_open_open_checks == []
     assert not any(r.url.path == "/cancel" for r in rec.requests)
+
+
+def test_pre_open_open_check_retries_when_bar_missing_open():
+    """P2-4：首根 bar 缺 open（停牌/合成器丢采样）不得写死每日标记，下一根 bar 重试。
+
+    旧实现先 `_pre_open_open_check_day = today` 再比对 → 首根 bar 缺价即当天永久漏撤。
+    """
+    factory, _ = _db_factory()
+    port, ctx = _portfolio_single(period="1d")
+    stock = "600000.SH"
+    d1, d2 = date(2026, 8, 24), date(2026, 8, 25)
+    _seed_sellable(ctx, stock)
+    rec = _Recorder(respond=_bridge_ping(
+        ("/ping", "/order", "/price_limit", "/cancel")))
+    disp, _ = _make_dispatcher(rec)
+    engine = _pre_open_engine(factory, port, disp, [d1, d2], stock)
+    db = factory()
+    engine._submit_one_order(db, port, _deferred_order(stock, d1), "1d")
+    row = db.query(LiveOrder).order_by(LiveOrder.id.desc()).first()
+    row.order_ref = "TEST-REF-RETRY"
+    row.status = "submitted"
+    db.commit()
+    db.close()
+
+    engine._pre_open_open_checks.append({
+        "day": d2, "code": stock, "side": TradeType.SELL,
+        "limit": Decimal("10.5"), "strategy_id": 1,
+    })
+    # 首根 bar：open=0（不可信，停牌/缺价）
+    bar = _bar(stock, "9.3", datetime(2026, 8, 25, 9, 31))
+    bar.period = "1m"
+    bar.stocks[stock]["open"] = Decimal("0")
+    engine._check_pre_open_orders_at_open(bar)
+
+    assert len(engine._pre_open_open_checks) == 1          # 保留登记
+    assert engine._pre_open_open_check_day is None         # 未置「当日完成」
+    assert not any(r.url.path == "/cancel" for r in rec.requests)
+
+    # 下一根 bar：可信开盘价 10.0 < 卖限价 10.5 → 越价，撤单并解决
+    bar2 = _bar(stock, "9.3", datetime(2026, 8, 25, 9, 32))
+    bar2.period = "1m"
+    bar2.stocks[stock]["open"] = Decimal("10.0")
+    engine._check_pre_open_orders_at_open(bar2)
+
+    assert engine._pre_open_open_checks == []
+    assert engine._pre_open_open_check_day == d2
+    assert any(r.url.path == "/cancel" for r in rec.requests)
+
+
+def test_pre_open_open_check_stops_after_deadline_and_emits_event(monkeypatch):
+    """P2-4：到 10:00 仍缺可信开盘价 → 停止重试、清登记并记 risk 事件（不静默）。"""
+    factory, _ = _db_factory()
+    port, ctx = _portfolio_single(period="1d")
+    stock = "600000.SH"
+    d1, d2 = date(2026, 8, 24), date(2026, 8, 25)
+    _seed_sellable(ctx, stock)
+    rec = _Recorder(respond=_bridge_ping(("/ping", "/order", "/price_limit")))
+    disp, _ = _make_dispatcher(rec)
+    engine = _pre_open_engine(factory, port, disp, [d1, d2], stock)
+    events = []
+    monkeypatch.setattr(engine, "_emit", lambda kind, payload: events.append((kind, payload)))
+    engine._pre_open_open_checks.append({
+        "day": d2, "code": stock, "side": TradeType.SELL,
+        "limit": Decimal("10.5"), "strategy_id": 1,
+    })
+    bar = _bar(stock, "9.3", datetime(2026, 8, 25, 10, 5))
+    bar.period = "1m"
+    bar.stocks[stock]["open"] = Decimal("0")
+    engine._check_pre_open_orders_at_open(bar)
+
+    assert engine._pre_open_open_checks == []
+    assert engine._pre_open_open_check_day == d2
+    assert any(
+        kind == "risk" and payload.get("rule") == "open_check_timeout"
+        and payload.get("action") == "skip"
+        and stock in (payload.get("codes") or [])
+        for kind, payload in events
+    ), events
 
 
 def test_pre_open_disabled_keeps_old_behavior():

@@ -125,6 +125,10 @@ def _defaults() -> dict:
         "tdx_path": "",
         "iquant_path": "",
         "max_concurrent_backtest": 1,
+        # P2-7：TQ 全局锁（_tdx_lock）获取超时（秒）。通达信卡住/长任务占用时，
+        # 拿不到锁的调用方不再无限等待，超时抛 TDXLockTimeout 并跳过本轮 TQ 操作；
+        # <=0 表示退回旧行为（无限阻塞）。改动需重启生效（进程内缓存）。
+        "tq_lock_timeout_seconds": 30,
         "database": {
             "sqlite_path": "data/dev.db",
         },

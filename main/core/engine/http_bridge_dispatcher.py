@@ -112,6 +112,9 @@ class HttpBridgeDispatcher(OrderDispatcher):
     #: （与 TDX/THS 的 supports_remark=False 相对）。订单超窗无法追溯时按「保持
     #: pending + risk 事件」处理，不自动驳回（柜台当日委托查询不含废单）。
     supports_remark = True
+    #: P2-6：/quote 返回柜台 K 线，断线恢复后可按更大 count 回补错过的历史 bar
+    #: （快照合成源没有该能力，BarPoller 据此区分「可补派」与「只能记缺口」）。
+    supports_historical_quote = True
 
     #: 下单请求「已发出但结果未知」的异常（超时/连接中断/协议中断）。
     #: 与连接被拒（ConnectError/ConnectTimeout，请求从未发出）区分：
@@ -1138,6 +1141,13 @@ class HttpBridgeDispatcher(OrderDispatcher):
         桥 GET /quote?code=&period=&count= 返回
         {"ok": True, "data": {code: [bar, ...]}}，每 bar 含 stime/open/high/low/close/volume。
         返回该 code 的 bar dict 列表（空数据 → 空列表）。
+
+        复权口径（P2-9）：桥侧一律返回**不复权**原始价——掘金桥
+        ``/quote`` 用 ``adjust=0``；QMT 桥 ``dividend_type="follow"`` 经
+        ContextInfo 解析为 ``this.dividend_type``（初始化空串）= 默认不复权。
+        当日分钟 bar 与实时价一致，下单/涨跌停/风控不受影响；但与 tdx/ths
+        的日线前复权口径不同，1d/1w/1mon 的公式回看段在除权日附近可能有差异
+        （只影响信号可比性，不影响下单）。桥支持按请求指定复权前，平台侧无法统一。
         """
         path = "/quote?code=%s&period=%s&count=%s" % (code, period, count)
         try:

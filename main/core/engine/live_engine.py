@@ -110,6 +110,7 @@ from core.models import (
     LiveDecisionEvent, LiveBarOrderMark, LiveOrder, LiveSignal, LiveTrade,
 )
 from core.tq.formula import TQFormula
+from core.tq.utils import TDXLockTimeout
 from tq_iquant_shared.constants import SignalType, TradeType
 
 logger = logging.getLogger(__name__)
@@ -128,6 +129,15 @@ _PRE_OPEN_BRIDGE_MARGIN = 30
 _PRE_OPEN_UI_MARGIN_MIN = 120
 _PRE_OPEN_UI_MARGIN_MAX = 240
 _PRE_OPEN_UI_PER_ORDER = 25
+# P2-4：盘前单「开盘越价校验」的重试截止（上海时间）。首根 1m bar 迟到、个别标的
+# 缺 open、撤单一时未收敛时保留后续 1m bar 的重试机会；10:00 之后开盘价对撤单决策
+# 已无意义，停止重试并记 risk 事件（action=skip/rule=open_check_timeout）。
+_PRE_OPEN_OPEN_CHECK_DEADLINE = (10, 0)
+# P2-6：桥离线恢复补派的拉取根数区间。断线 3 分钟 → ~8 根；30 分钟 → ~35 根；
+# 上午断到下午（跨午休）按墙钟分钟放大但超过 240 根（约一个交易日）就封顶，
+# 更早的 bar 不再尝试（跨日缺口直接不做补派，见 _plan_gap_recovery）。
+_GAP_BACKFILL_MIN_BARS = 10
+_GAP_BACKFILL_MAX_BARS = 240
 # 日线及以上周期（与 Portfolio._DAILY_PERIODS 同口径）：这类轮次驱动日线策略，
 # 峰值更新允许；盘中的分钟 bar 对「全为日线策略」的组合只是噪声（P1-2）。
 _DAILY_PERIODS = ("1d", "1w", "1mon")
@@ -186,6 +196,27 @@ def _allocate_proportional(weights: list, total: int) -> list:
     for i in range(remainder):
         alloc[order[i % len(order)]] += 1
     return alloc
+
+
+def _expected_minute_labels(start: Optional[datetime],
+                            end: Optional[datetime]) -> List[datetime]:
+    """(start, end] 内属于 A 股连续竞价时段的 1m bar 标签（P2-6 缺口审计用）。
+
+    bar 标签是分钟**终点**（09:31 表示 09:30–09:31 这根）：只统计
+    09:30 < t ≤ 11:30 与 13:00 < t ≤ 15:00。跨日返回空（跨日缺口不做逐分钟
+    期望，调用方按「跨日」语义记录起止即可）。上限 300 根防异常输入死循环。
+    """
+    if start is None or end is None or start.date() != end.date():
+        return []
+    labels: List[datetime] = []
+    t = start.replace(second=0, microsecond=0) + timedelta(minutes=1)
+    stop = end.replace(second=0, microsecond=0)
+    while t <= stop and len(labels) <= 300:
+        hm = (t.hour, t.minute)
+        if (9, 30) < hm <= (11, 30) or (13, 0) < hm <= (15, 0):
+            labels.append(t)
+        t += timedelta(minutes=1)
+    return labels
 
 
 def _position_code(row) -> str:
@@ -526,14 +557,21 @@ class LiveEngine:
         self._bar_poller = bar_poller
         # 行情轮询窗口：窗口外整轮停行情拉取（账户快照/成交回填/收盘清扫不受影响）
         self._quote_polling = QuotePollingWindow.from_config(quote_polling)
+        # P2-10：轮询窗口收盘端跟随日历——半日市 11:30 收盘后不再空拉快照
+        # （常态日日历给 15:00，加原 5 分钟缓冲 = 15:05，旧行为逐字不变）。
+        self._quote_polling.close_time_provider = (
+            lambda d: self._calendar.session_close_time(d))
         # 盘前竞价执行窗口（默认开启）+ 当日已尝试集合（at-most-once 幂等）
         self._pre_open = PreOpenAuctionConfig.from_config(pre_open_auction)
         # 错周期 bar 风控（False=只更新价格快照，对齐回测）
         self._intraday_mismatched_risk = bool(intraday_mismatched_risk_enabled)
         # 09:31 deferred 兜底放行定价：False=首根 1m open 限价；True=对手价保成交
         self._deferred_release_ensure_fill = bool(deferred_release_ensure_fill)
-        # 盘前已报出单（开盘后越价校验用）：[(row_id, code, side, limit_price, day)]
-        self._pre_open_open_checks: List[tuple] = []
+        # 盘前已报出单（开盘后越价校验用）：[{day, code, side, limit, strategy_id, order}]
+        self._pre_open_open_checks: List[dict] = []
+        # 越价校验「当日已完成」标记：P2-4 起只在**真正完成比对**（每单有开盘价、
+        # 撤单已收敛）或到达重试截止（10:00）后才置位；缺价/取数失败不置位，
+        # 保留后续 1m bar 的重试机会（旧实现先置位后比对，首根 bar 迟到即漏撤）。
         self._pre_open_open_check_day: Optional[date] = None
         self._pre_open_day: Optional[date] = None
         self._pre_open_attempted: Set[tuple] = set()
@@ -787,7 +825,7 @@ class LiveEngine:
             # 日历以 provider 注入：测试在构造后替换 engine._calendar，需读到最新值。
             calendar_provider=lambda: self._calendar,
             emit=self._emit,
-            set_bridge_offline=lambda: setattr(self, "_bridge_online", False),
+            set_bridge_offline=lambda: self._mark_bridge_offline(now_shanghai()),
             # 外部信号文件模式：日终 1w/1mon 通达信补注入同样停用（信号只来自文件）。
             external_signals_only=self._signal_source is not None,
             # 14:50 提前收盘价：仅 auto 模式生效（预警模式不下单，无意义）。
@@ -853,6 +891,15 @@ class LiveEngine:
         # None = 尚未 start（直接同步调 _emit 的旧测试路径 → 直接 put_nowait）。
         self._loop_ref: Optional[asyncio.AbstractEventLoop] = None
         self._bridge_online = True
+        # P2-6：桥离线起点（只记第一次，供恢复时计算缺口与补派 count；恢复成功后清空）
+        self._offline_since: Optional[datetime] = None
+        # 恢复首轮的补派计划（count/gap_start）与待消费的放大 count（P2-6）
+        self._gap_recovery_plan: Optional[dict] = None
+        self._pending_backfill_count: int = 0
+        # P2-8：上一轮各段耗时（ms）与最近一次饱和告警时间（工作台/日志可观测）
+        self._last_tick_profile: Dict[str, int] = {}
+        self._tick_profile_total_ms: int = 0
+        self._tick_saturation_warned_at: Optional[datetime] = None
         # 掘金「桥 1m 放行探测」辅助状态（默认行情源仍是快照合成，桥只辅助）：
         # 本会话已借桥 bar 放行过的 code（不再重复探）+ 失败退避截止时间。
         self._bridge_probe_released_codes: set = set()
@@ -1461,6 +1508,7 @@ class LiveEngine:
         不再被 60s 拉 bar / 桥超时阻塞，HTTP 请求与 SSE 流不再冻结。
         """
         while self._running:
+            started = time.monotonic()
             try:
                 await asyncio.get_running_loop().run_in_executor(
                     self._executor, self._tick_main
@@ -1470,7 +1518,21 @@ class LiveEngine:
             except Exception:  # noqa: BLE001
                 # _tick_main 内部已兜底各类异常并记日志；此处的 executor 层异常兜底防漏
                 logger.exception("live loop executor error")
-            await asyncio.sleep(self._poll_interval)
+            # P2-8：按「轮次起点对齐」睡眠——旧实现每轮固定再睡满 poll_interval，
+            # 实际节拍 = 轮次耗时 + 60s（真机 50-57s 拉行情 → 约 110s 一轮），
+            # 1m bar 信号延迟被放大近一倍且行情一抖就顺延。现在补足剩余时间，
+            # 让轮次起点稳定在 ~60s；轮次本身超时（>interval）时只留 1s 让出，
+            # 下一轮立即开始（超时告警由 _record_tick_profile 记事件）。
+            interval = max(0.0, float(self._poll_interval or 0))
+            if interval <= 0:
+                delay = 0.0
+            else:
+                delay = interval - (time.monotonic() - started)
+                if delay < 0:
+                    # 轮次已超时：生产节拍（≥10s）留 1s 让出；测试/极短节拍
+                    # （0.01s 级）不额外减速，保持原「连续轮」语义
+                    delay = min(1.0, interval) if interval >= 10 else 0.0
+            await asyncio.sleep(delay)
 
     # ---------------- 行情轮询窗口（收盘后停拉行情）----------------
     def _quote_poll_active(self, now: datetime) -> bool:
@@ -1550,11 +1612,168 @@ class LiveEngine:
             try:
                 fn()
             except BridgeUnavailableError as e:
-                self._bridge_online = False
+                self._mark_bridge_offline(now_shanghai())
                 logger.warning("%s skipped: bridge unavailable: %s (session %s)",
                                name, e, self.session_id)
             except Exception:  # noqa: BLE001 — 单段失败不阻断其余段与下一轮
                 logger.exception("%s error (session %s)", name, self.session_id)
+
+    # ---------------- P2-6 桥离线缺口恢复 ----------------
+    def _mark_bridge_offline(self, now: datetime) -> None:
+        """置离线状态并只记录**首次**离线时点（缺口审计/补派起点）。"""
+        self._bridge_online = False
+        if self._offline_since is None:
+            self._offline_since = now
+
+    def _plan_gap_recovery(self, now: datetime) -> Optional[dict]:
+        """离线恢复时决定「补派 / 放弃 + 审计」的处置计划（P2-6）。
+
+        - 行情源支持历史回补（QMT/掘金桥 /quote）且缺口在同一天、轮询窗口内 →
+          ``action=replay``，按缺口墙钟分钟数放大 count（封顶 240 根）；
+        - 快照合成源（tdx/ths/alert/goldminer）→ ``unrecoverable``：断线期的 bar
+          客观不存在，只能记缺口起止 + 缺口根数，不能静默；
+        - 跨日 / 已过轮询窗口 → ``skip``：不补派（跨日旧 bar 补派 = 用昨日价格
+          驱动今日下单），同样记审计事件。
+        """
+        gap_start = self._bar_poller.last_completed_stime or self._offline_since
+        if gap_start is None:
+            return None
+        plan = {"gap_start": gap_start, "gap_end": now}
+        if not getattr(self._bar_poller, "supports_backfill", False):
+            plan.update(action="unrecoverable", reason="snapshot_source")
+            return plan
+        if gap_start.date() != now.date():
+            plan.update(action="skip", reason="cross_day")
+            return plan
+        if not self._quote_poll_active(now):
+            plan.update(action="skip", reason="quote_window_closed")
+            return plan
+        span_min = max(1, int((now - gap_start).total_seconds() // 60))
+        count = min(_GAP_BACKFILL_MAX_BARS, max(_GAP_BACKFILL_MIN_BARS, span_min + 5))
+        plan.update(action="replay", reason="bridge_recovered", count=count)
+        return plan
+
+    def _recover_after_offline(self, now: datetime) -> None:
+        """离线→在线转场：按处置计划补派或重建基线，并落缺口审计（P2-6）。"""
+        plan = self._plan_gap_recovery(now)
+        if plan is not None and plan.get("count"):
+            self._pending_backfill_count = int(plan["count"])
+            self._gap_recovery_plan = plan
+            logger.info(
+                "[bar-gap] bridge back online: backfill %d bars (%s → %s) (session %s)",
+                plan["count"], plan["gap_start"], now, self.session_id,
+            )
+        else:
+            # 不可补派：沿用旧行为重建基线（离线期 bar 不触发），但必须留痕
+            self._bar_poller.reset_baseline()
+            if plan is not None:
+                expected = _expected_minute_labels(
+                    plan["gap_start"], plan["gap_end"])
+                self._emit_gap_event(
+                    plan, plan.get("action", "unrecoverable"),
+                    expected=len(expected), replayed=0,
+                    missing=expected)
+        # 预热缓存 last_stime 已过期，增量拉 10 根可能接不上（断档超 10 根）：
+        # 清空后下次 _get_bars_with_increment 走"缓存未命中"全量拉重建。
+        self._preheat_cache.clear()
+        # 快照合成器同步重置：丢弃断线期 forming 态与差分基线
+        if self._snapshot_synth is not None:
+            self._snapshot_synth.reset()
+        # 桥恢复 → 清退避，下一轮即可再试放行探测
+        self._bridge_probe_next_at = None
+        self._offline_since = None
+
+    def _audit_gap_recovery(self, now: datetime,
+                            triggered: List[BarEvent]) -> None:
+        """补派后记录实际覆盖情况：完整 / 部分（桥 count 上限截断）（P2-6）。"""
+        plan = self._gap_recovery_plan
+        self._gap_recovery_plan = None
+        if not plan:
+            return
+        expected = _expected_minute_labels(plan["gap_start"], plan["gap_end"])
+        replayed_times = {b.bar_time for b in triggered}
+        missing = [t for t in expected if t not in replayed_times]
+        replayed = len(expected) - len(missing)
+        self._emit_gap_event(
+            plan, "replay" if not missing else "partial",
+            expected=len(expected), replayed=replayed, missing=missing)
+
+    def _emit_gap_event(self, plan: dict, action: str, *, expected: int,
+                        replayed: int, missing: List[datetime]) -> None:
+        """缺口审计事件（gate=bar_gap）：起止时间、缺口/补派根数、缺口首末。
+
+        只写日志与 SSE 风险事件，不参与任何交易判断、不改账本。
+        """
+        gap_start = plan.get("gap_start")
+        gap_end = plan.get("gap_end")
+        reason = plan.get("reason") or ""
+        payload = {
+            "session_id": self.session_id,
+            "engine": self._engine_key,
+            "gate": "bar_gap",
+            "action": action,
+            "rule": reason or action,
+            "gap_start": gap_start.isoformat() if gap_start else None,
+            "gap_end": gap_end.isoformat() if gap_end else None,
+            "gap_bars": expected,
+            "replayed_bars": replayed,
+            "missing_bars": len(missing),
+        }
+        if missing:
+            payload["missing_first"] = missing[0].isoformat()
+            payload["missing_last"] = missing[-1].isoformat()
+        text = (
+            "行情缺口处置 action=%s reason=%s 起=%s 止=%s 应有 %d 根 补派 %d 根 缺 %d 根"
+            % (action, reason or "-",
+               gap_start.strftime("%Y-%m-%d %H:%M:%S") if gap_start else "-",
+               gap_end.strftime("%Y-%m-%d %H:%M:%S") if gap_end else "-",
+               expected, replayed, len(missing))
+        )
+        payload["message"] = text
+        if action == "replay":
+            logger.info("[bar-gap] %s (session %s)", text, self.session_id)
+        else:
+            logger.warning("[bar-gap] %s (session %s)", text, self.session_id)
+        self._emit("risk", payload)
+
+    def _record_tick_profile(self, now: datetime, prof: Dict[str, int],
+                             t_round: float) -> None:
+        """记录本轮分段耗时（P2-8 观测）；轮次贴近/超过轮询间隔时告警 + 风险事件。
+
+        - ``self._last_tick_profile`` 供测试/排查读取（最近一轮各段 ms）；
+        - 阈值 = 轮询间隔的 85%（60s 间隔 → 51s），命中后每 5 分钟最多告警一次，
+          避免每轮刷屏；``gate=loop_saturation`` 让工作台能看到「主循环饱和」。
+        本方法只观测，不改变任何交易决策。
+        """
+        total = int((time.monotonic() - t_round) * 1000)
+        prof["total"] = total
+        self._last_tick_profile = prof
+        self._tick_profile_total_ms = total
+        interval = max(1.0, float(self._poll_interval or 0))
+        if total < interval * 1000 * 0.85:
+            return
+        if (self._tick_saturation_warned_at is not None
+                and (now - self._tick_saturation_warned_at).total_seconds() < 300):
+            return
+        self._tick_saturation_warned_at = now
+        top = sorted(((k, v) for k, v in prof.items() if k != "total"),
+                     key=lambda kv: kv[1], reverse=True)[:3]
+        detail = ", ".join("%s=%dms" % (k, v) for k, v in top)
+        logger.warning(
+            "[tick-slow] round %dms ≥85%% of %ss interval (%s) (session %s)",
+            total, self._poll_interval, detail or "-", self.session_id)
+        self._emit("risk", {
+            "session_id": self.session_id,
+            "engine": self._engine_key,
+            "gate": "loop_saturation",
+            "action": "notice",
+            "rule": "tick_too_slow",
+            "round_ms": total,
+            "interval_s": self._poll_interval,
+            "top_segments": detail,
+            "message": "主循环单轮耗时 %dms 已贴近轮询间隔 %ss（%s）"
+                       % (total, self._poll_interval, detail or "-"),
+        })
 
     def _tick_main(self) -> None:
         """_loop 单轮同步体（在 worker 线程执行）：心跳 → poll → 日终。
@@ -1564,14 +1783,25 @@ class LiveEngine:
         """
         now = now_shanghai()
         self._last_tick_at = now  # 存活心跳（进程内 watchdog 读）
+        # P2-8：分段耗时画像（ms）。只观测不改执行顺序——风控/对账/清扫一律保留。
+        t_round = time.monotonic()
+        prof: Dict[str, int] = {}
+
+        def _seg(name: str, fn):
+            t0 = time.monotonic()
+            try:
+                return fn()
+            finally:
+                prof[name] = prof.get(name, 0) + int((time.monotonic() - t0) * 1000)
+
         try:
             if self.execution_mode == "alert":
-                self._tick_alert(now)
+                _seg("alert", lambda: self._tick_alert(now))
                 return
             # E8：心跳前的在线状态，用于离线→在线转场时重建基线
             was_online = self._bridge_online
-            if not self._dispatcher.heartbeat():
-                self._bridge_online = False
+            if not _seg("heartbeat", self._dispatcher.heartbeat):
+                self._mark_bridge_offline(now)
                 logger.warning("bridge offline, pause trading (session %s)", self.session_id)
                 # P1（2026-11-09）：桥离线 ≠ 当日收盘任务可跳过。日终估值与日线级别
                 # 轮次只依赖本地快照/DB（tdx/ths/预警走 TQ 本地数据），照常执行，
@@ -1580,21 +1810,10 @@ class LiveEngine:
                 return
             self._bridge_online = True
             if not was_online:
-                # E8：离线恢复 → 重建基线，跳过离线期间错过的 bar（不补触发）
-                self._bar_poller.reset_baseline()
-                # 清预热缓存：离线期间缓存 last_stime 已过期，增量拉 10 根可能接不上
-                # （断档超 10 根）。清空后下次 _get_bars_with_increment 走"缓存未命中"
-                # 全量拉 code_period_count 根重建——异常路径自愈，不污染正常增量路径。
-                self._preheat_cache.clear()
-                # 快照合成器同步重置：丢弃断线期 forming 态与差分基线
-                if self._snapshot_synth is not None:
-                    self._snapshot_synth.reset()
-                # 桥恢复 → 清退避，下一轮即可再试放行探测
-                self._bridge_probe_next_at = None
-                logger.info(
-                    "bridge back online, reset poller baseline + preheat cache (session %s)",
-                    self.session_id,
-                )
+                # E8：离线恢复。P2-6：行情源可回补历史 bar 时**不**重建基线，改为
+                # 按缺口长度放大 count 幂等补派（见 _plan_gap_recovery）；快照合成源
+                # 客观取不到断线期 bar，仍重建基线并记可审计缺口事件。
+                self._recover_after_offline(now)
             # 次日盘前（集合竞价）执行日线信号单（默认关闭）：必须在行情 poll
             # 之前——09:15 一开窗就把昨日 deferred 日线单报进集合竞价。关闭时
             # 方法首行 return，队列/DB/价格/事件一律不动（旧行为逐字不变）。
@@ -1611,10 +1830,21 @@ class LiveEngine:
                 # 掘金通道：桥 1m「今日已完成 bar」探测 → 立即放行 deferred，
                 # 不等快照合成的首根完成 bar（其它通道该方法直接 return）
                 self._maybe_bridge_deferred_release(now)
-                self._bar_poller.poll()
+                if self._pending_backfill_count:
+                    # P2-6：断线恢复首轮，用放大后的 count 一次取回缺口 bar，按
+                    # per-code 水位补派；补派同样走 _on_bar 全套闸门（新鲜度/时段/
+                    # bar 级幂等键），不绕过任何检查。
+                    count = self._pending_backfill_count
+                    self._pending_backfill_count = 0
+                    triggered = _seg(
+                        "poll_backfill",
+                        lambda: self._bar_poller.poll(backfill_count=count))
+                    self._audit_gap_recovery(now, triggered)
+                else:
+                    _seg("poll", self._bar_poller.poll)
                 # 0011 外部信号注入：poll 之后增量读取通达信条件预警文件，公式名匹配
                 # 策略的信号逐条注入（同样走 _handle_bar 全套，与 bar 驱动同闸门链）。
-                self._tick_external_signals()
+                _seg("external_signals", self._tick_external_signals)
             elif not self._quote_poll_paused:
                 self._quote_poll_paused = True
                 self._enter_quote_poll_pause(now)
@@ -1625,7 +1855,7 @@ class LiveEngine:
             # 的 db session 模式；_expire_stale_orders 自身不 commit，由本块负责。
             db_tick = self._db_session_factory()
             try:
-                self._sweep_timeout_orders(db_tick)
+                _seg("sweep_timeout", lambda: self._sweep_timeout_orders(db_tick))
             except Exception:  # noqa: BLE001
                 db_tick.rollback()
                 logger.exception("expire stale orders error (session %s)", self.session_id)
@@ -1633,18 +1863,21 @@ class LiveEngine:
                 db_tick.close()
             # E5/E6 日终估值 + 15:05 日线级别轮次 + B 14:52 提前收盘价轮次，
             # 合并为心跳门控外的调度段（见 _run_daily_schedule：单段失败不影响其余段）。
-            self._run_daily_schedule()
+            _seg("daily_schedule", self._run_daily_schedule)
             # 15:05 收盘清扫：交易日收盘后对仍未完结的单做确定性兜底（成交回填 +
             # 终态同步 + 剩余按 A 股收盘未成交=撤单标 canceled）。实时轮询的权威收口。
-            self._maybe_close_sweep()
+            _seg("close_sweep", self._maybe_close_sweep)
             # I-7（audit）：收盘流程完成后每交易日一次对账复查（虚拟 vs 桥实际）——
             # 此时在途单已终态收敛、成交已回填，差异最可信。
-            self._maybe_reconcile_after_close()
+            _seg("reconcile_after_close", self._maybe_reconcile_after_close)
         except BridgeUnavailableError as e:
-            self._bridge_online = False
+            self._mark_bridge_offline(now)
             logger.warning("bridge unavailable: %s, skip this round", e)
         except Exception:  # noqa: BLE001
             logger.exception("live loop unexpected error")
+        finally:
+            # P2-8：记录本轮耗时画像/超时告警（观测，不改变本轮已执行内容）
+            self._record_tick_profile(now, prof, t_round)
 
     def _maybe_pre_open_auction(self, now: datetime) -> None:
         """次日盘前（集合竞价）执行「当日 due」的 deferred 日线信号单（默认关闭）。
@@ -2020,8 +2253,16 @@ class LiveEngine:
 
         时点：开盘后首根**完成** 1m bar（≥09:30）。09:15–09:20 可撤、**09:20–09:25
         是交易所集合竞价的不可撤单窗口**、09:25–09:30 无成交也无开盘价，因此本
-        校验绝不在 09:25 前执行；只认 ≤09:32 的首根 bar，错过则放弃当日校验。
-        每日只跑一次。
+        校验绝不在 09:25 前执行。
+
+        P2-4（2026-11-11）：旧实现「先写每日完成标记，再比对」，首根 1m bar 迟到、
+        或某只票在该 bar 里缺 open（停牌/停牌复牌首日/合成器丢采样）时，标记已被
+        写死 → 当天永久漏撤。现在改为**逐单解决、完成才置位**：
+        - 缺开盘价 → 保留登记，下一根 1m bar 重试；
+        - 撤单未收敛（pending/failed）→ 保留登记重试；
+        - 已比对（未越价 / 撤单确认 / 无在途可撤）→ 该单解决；
+        - 全部解决才写完成标记；否则继续重试到 10:00（`_PRE_OPEN_OPEN_CHECK_DEADLINE`），
+          到点仍未解决的按「无价可判」跳过并记 risk 事件（action=skip），不再无限重试。
         """
         if str(getattr(bar, "period", "")) != "1m":
             return
@@ -2035,13 +2276,11 @@ class LiveEngine:
                    if e.get("day") == today]
         if not entries:
             return
-        self._pre_open_open_check_day = today
-        if (bt.hour, bt.minute) > (9, 32):
-            # 会话启动太晚/行情断档：拿不到可信开盘价，放弃当日校验
-            self._pre_open_open_checks = [
-                e for e in self._pre_open_open_checks if e.get("day") != today]
-            return
+        # 重试截止：10:00 之后不再校验（开盘价对撤单决策已无意义）
+        deadline = (bt.hour, bt.minute) > _PRE_OPEN_OPEN_CHECK_DEADLINE
         stocks = getattr(bar, "stocks", None) or {}
+        remaining: List[dict] = []
+        unresolved_codes: List[str] = []
         for entry in entries:
             stock = stocks.get(entry["code"])
             open_px = getattr(stock, "open", None)
@@ -2049,28 +2288,66 @@ class LiveEngine:
                 open_px = stock.get("open")
             try:
                 open_px = Decimal(str(open_px))
-            except Exception:  # noqa: BLE001 缺价/停牌 → 不判
-                continue
-            if open_px <= 0:
+            except Exception:  # noqa: BLE001 缺价/停牌
+                open_px = None
+            if open_px is None or open_px <= 0:
+                # 该 bar 里没有这只票的可信开盘价：留到下一根 1m bar 重试
+                if not deadline:
+                    remaining.append(entry)
+                else:
+                    unresolved_codes.append(entry["code"])
                 continue
             limit = entry["limit"]
             crossed = (open_px > limit if entry["side"] == TradeType.BUY
                        else open_px < limit)
             if not crossed:
-                continue
-            self._cancel_pre_open_order(entry, open_px)
+                continue  # 未越价：已解决
+            if self._cancel_pre_open_order(entry, open_px):
+                continue  # 撤单已收敛（含无在途可撤）：已解决
+            # 撤单未收敛（pending/failed/异常）：保留登记，下一根 bar 再试
+            if not deadline:
+                remaining.append(entry)
+            else:
+                unresolved_codes.append(entry["code"])
+        # 写回今日剩余登记（其它日期不动）：全部解决才置完成标记，否则下根 bar 重试
         self._pre_open_open_checks = [
-            e for e in self._pre_open_open_checks if e.get("day") != today]
+            e for e in self._pre_open_open_checks if e.get("day") != today
+        ] + remaining
+        if remaining:
+            return
+        self._pre_open_open_check_day = today
+        if unresolved_codes:
+            msg = ("开盘越价校验到 %02d:%02d 截止仍未完成（缺可信开盘价或撤单未收敛）：%s"
+                   % (_PRE_OPEN_OPEN_CHECK_DEADLINE[0],
+                      _PRE_OPEN_OPEN_CHECK_DEADLINE[1],
+                      "、".join(sorted(set(unresolved_codes)))))
+            logger.warning("[pre-open] %s (session %s)", msg, self.session_id)
+            self._emit("risk", {
+                "session_id": self.session_id,
+                "engine": self._engine_key,
+                "gate": "pre_open_auction",
+                "action": "skip",
+                "rule": "open_check_timeout",
+                "codes": sorted(set(unresolved_codes)),
+                "message": msg,
+            })
 
-    def _cancel_pre_open_order(self, entry: dict, open_price: Decimal) -> None:
-        """撤掉「开盘即越过限价」的盘前单；通道不支持撤单/无在途行则跳过。"""
+    def _cancel_pre_open_order(self, entry: dict, open_price: Decimal) -> bool:
+        """撤掉「开盘即越过限价」的盘前单。
+
+        返回 **该登记单是否已解决**（P2-4，供调用方决定「当天校验是否完成」）：
+        - True：已比对完成——通道不支持撤单 / 无在途行 / 撤单确认 canceled
+          （含撤单后成功回 deferred）；
+        - False：撤单未收敛（pending/failed/异常），旧单可能仍在柜台撮合，
+          需保留登记由下一根 1m bar 重试；绝不在此状态重排（防双份委托）。
+        """
         cancel = getattr(self._dispatcher, "cancel_order", None)
         if not callable(cancel):
-            return
+            return True
         # 老桥（无 /cancel 端点）404 后 dispatcher 会置 supports_cancel=False：
         # 之后逐单再发只会刷失败日志，直接按「通道不支持撤单」跳过。
         if getattr(self._dispatcher, "supports_cancel", True) is False:
-            return
+            return True
         db = self._db_session_factory()
         try:
             row = (
@@ -2089,7 +2366,8 @@ class LiveEngine:
                 .first()
             )
             if row is None or not getattr(row, "order_ref", None):
-                return
+                # 已无在途可撤（已成交/已撤/已终态）：该登记单无需再处理
+                return True
             # 撤单结果判定（P1-4 安全阀）：只有**确认撤成**才允许重排。
             # accepted（桥受理但未观测到终态）/pending/failed 一律不重排——旧单可能
             # 仍在柜台撮合，重排会变成双份委托（真金白银）。last_cancel_result 先清空，
@@ -2104,8 +2382,13 @@ class LiveEngine:
                 logger.exception(
                     "[pre-open] cancel crossed order failed: ref=%s %s "
                     "(session %s)", row.order_ref, row.stock_code, self.session_id)
-                return
+                # 撤单异常：柜台状态未知 → 保留登记重试（绝不在此状态重排）
+                return False
             outcome = getattr(self._dispatcher, "last_cancel_result", None)
+            if getattr(self._dispatcher, "supports_cancel", True) is False:
+                # 本次尝试才发现通道不支持撤单（老桥 404）：再试只会刷失败日志，
+                # 登记直接解决，退回 180s 超时 expire 兜底（与旧行为一致）
+                return True
             confirmed = cancel_ok and outcome in (None, "canceled")
             logger.warning(
                 "[pre-open] 开盘价 %s 越过限价 %s，撤单 %s %s ref=%s "
@@ -2118,7 +2401,7 @@ class LiveEngine:
                 requeued = self._requeue_open_crossed_order(
                     db, entry, row, open_price)
             if requeued:
-                return
+                return True
             self._emit("risk", {
                 "session_id": self.session_id,
                 "engine": self._engine_key,
@@ -2133,6 +2416,10 @@ class LiveEngine:
                 "message": ("开盘价已越过盘前限价，判定必然未成交，主动撤单；"
                             "撤单未确认或重排次数用尽 → 不重报"),
             })
+            # 撤单已确认但未重排（次数用尽/无订单对象）→ 旧单已撤，登记解决；
+            # 撤单未确认（pending/failed/传输失败）→ 保留登记下一根 bar 再试。
+            # not_found/rejected 视为已解决：柜台已无此单或明确拒撤，再试也无意义。
+            return bool(cancel_ok) or outcome in ("not_found", "rejected")
         finally:
             db.close()
 
@@ -3506,8 +3793,9 @@ class LiveEngine:
                     pos.mirror_bridge(qty, sell, cost, query_date)
                     if cost <= 0:
                         # B5：柜台成本为负/未知 → avg_cost 已被 mirror_bridge 置 0
-                        # （未知标记），该票风控整体跳过；一次性 risk 事件提示人工
-                        # 指定成本基准（同会话同票去重）。
+                        # （未知标记），止损/止盈阈值判断跳过（移动止损仍生效，
+                        # 只看持仓期最高价）；一次性 risk 事件提示人工指定成本基准
+                        # （同会话同票去重）。
                         self._note_cost_unknown(code, qty)
                     # 真实数量超出虚拟账本的部分 = 继承仓/外部手工增仓，其市值
                     # 已包含在资金基准（账户总资产）里 → 扣等额虚拟现金，避免双计。
@@ -3652,7 +3940,10 @@ class LiveEngine:
 
         B5（2026-11-10）：cost<=0 不再用「市值÷数量」（=现价）冒充成本——
         那会让盈亏恒 0、风控形同失效且成本随价格每轮漂移。现在 Position.avg_cost
-        保持 0（未知），风控（止损/止盈/移动止损）对该票整体跳过，由人指定成本基准。
+        保持 0（未知）。
+        2026-11-11 文案校正：跳过的是**止损/止盈的阈值判断**（无成本基准）；
+        **移动止损仍生效**——它只依赖「持仓期最高价」这条价格序列，不看成本
+        （`risk_manager.check_trailing_stop`），是负成本/未知成本仓唯一的保护。
         展示侧同样按「成本未知」呈现，不显示漂移的现价。
         """
         if code in self._no_cost_warned:
@@ -3660,8 +3951,8 @@ class LiveEngine:
         self._no_cost_warned.add(code)
         logger.warning(
             "position %s x%d has negative/unknown broker cost — stop-loss / "
-            "take-profit / trailing-stop skipped for this holding "
-            "(set a cost basis manually; session %s)",
+            "take-profit skipped (trailing-stop still active); set a cost basis "
+            "manually; session %s",
             code, volume, self.session_id)
         self._emit("risk", {
             "rule": "position_cost_unknown",
@@ -3669,7 +3960,8 @@ class LiveEngine:
             "quantity": int(volume),
             "session_id": self.session_id,
             "message": ("持仓 %s 柜台成本为负/未知（送转分红后常见），"
-                        "该票不参与止损/止盈/移动止损阈值判断，请人工指定成本基准"
+                        "该票不参与止损/止盈阈值判断，移动止损仍生效，"
+                        "请人工指定成本基准"
                         % code),
         })
 
@@ -4668,8 +4960,10 @@ class LiveEngine:
                     df_cache=df_cache, raw_cache=raw_cache,
                 )
             except BridgeUnavailableError as e:
-                # 下单时桥离线：标记并中断本 bar（循环下一轮心跳会暂停）
-                self._bridge_online = False
+                # 下单时桥离线：标记并中断本 bar（循环下一轮心跳会暂停）。
+                # P2-6：走 _mark_bridge_offline 记录离线起点——下单路径发觉的断线
+                # 未必伴随心跳失败（心跳在前、/order 在后），不记起点就丢缺口审计。
+                self._mark_bridge_offline(now_shanghai())
                 logger.warning("bridge unavailable on bar %s: %s", bar.bar_time, e)
                 return
             except Exception:  # noqa: BLE001
@@ -4685,7 +4979,7 @@ class LiveEngine:
         try:
             self._retry_pending_boundaries(bar.bar_time)
         except BridgeUnavailableError as e:
-            self._bridge_online = False
+            self._mark_bridge_offline(now_shanghai())  # P2-6：记录缺口起点
             logger.warning("bridge unavailable on pending boundary %s: %s", bar.bar_time, e)
             return
         if bar.bar_time not in self._dispatched_boundaries:
@@ -4695,7 +4989,7 @@ class LiveEngine:
                 try:
                     status = self._dispatch_period_bar(period, bar.bar_time)
                 except BridgeUnavailableError as e:
-                    self._bridge_online = False
+                    self._mark_bridge_offline(now_shanghai())  # P2-6：记录缺口起点
                     logger.warning(
                         "bridge unavailable on %s boundary %s: %s", period, bar.bar_time, e
                     )
@@ -5051,10 +5345,28 @@ class LiveEngine:
         # TQ 路径会按其它 bar_time 另行出信号，与文件路径形成双触发。风控仍按本
         # bar 价照常执行（不依赖 signal_cache），回到「除信号来源外其余不变」。
         if self._signal_source is None and not baseline:
-            self._fill_signal_cache(
-                portfolio, bar, bars_by_code=bars_by_code,
-                df_cache=df_cache, raw_cache=raw_cache,
-            )
+            # P2-7：TQ 全局锁等待超时 → 本轮公式信号缺失，但风控（止损/止盈/
+            # 移动止损）不依赖 signal_cache，必须继续执行，不能因取数被占用而
+            # 丢掉保护。超时记 WARNING + risk 事件（不静默）。
+            try:
+                self._fill_signal_cache(
+                    portfolio, bar, bars_by_code=bars_by_code,
+                    df_cache=df_cache, raw_cache=raw_cache,
+                )
+            except TDXLockTimeout as e:
+                logger.warning(
+                    "[tq-lock] formula injection skipped: %s (session %s, bar %s)",
+                    e, self.session_id, bar.bar_time)
+                self._emit("risk", {
+                    "session_id": self.session_id,
+                    "engine": self._engine_key,
+                    "gate": "tq_lock_timeout",
+                    "action": "skip",
+                    "rule": "formula_injection",
+                    "bar_time": (bar.bar_time.isoformat()
+                                 if bar.bar_time else None),
+                    "message": "通达信锁等待超时，本轮公式信号跳过（风控照常执行）",
+                })
         if self._signal_monitor is not None and not baseline:
             self._signal_monitor.evaluate(
                 portfolio,
@@ -6064,7 +6376,8 @@ class LiveEngine:
             # 桥离线：标 rejected + 置离线暂停（_on_bar 上层心跳循环据此暂停下单）
             live_order.status = "rejected"
             live_order.error_message = "bridge unavailable"
-            self._bridge_online = False
+            # P2-6：下单时才发觉的断线也要记缺口起点（心跳在本轮开头可能还是通的）
+            self._mark_bridge_offline(now_shanghai())
             self._rec_live(
                 "bridge_unavailable", "reject", portfolio, order,
                 message="桥离线（dispatcher 不可达）",
