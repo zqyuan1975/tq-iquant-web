@@ -38,6 +38,7 @@ from core.models import (
     IncrementalBacktestDay,
     IncrementalBacktestValidation,
     LiveAccountSnapshot,
+    LiveAccountPositionSnapshot,
     LiveSessionPortfolio,
     LiveTrade,
     PortfolioStrategy,
@@ -407,14 +408,28 @@ def capture_seam(db: Session, session_id: int, engine, today: Optional[date] = N
         .all()
     )
     ports = {p.portfolio_id: p for p in (getattr(engine, "portfolios", None) or [])}
-    # 接缝时刻之前的最近一份账户快照：实盘引擎跨重启正是从这里恢复移动止损
-    # 峰值（LiveEngine._capture_account_snapshot）。接缝若只用成本种下，会把
-    # 平台已掌握的历史高点丢掉 → 续跑侧移动止损基准低于实盘，同一只票出现
-    # 「实盘止损、回测不止损」。capture_seam 在引擎首轮 tick 之前执行，库里
-    # 最新快照必然来自上一次运行，不存在把接缝后的价格泄漏进起账状态。
+    # 接缝时刻之前的最近一份**含有效持仓**的账户快照：实盘引擎跨重启正是从这里
+    # 恢复移动止损峰值（LiveEngine._capture_account_snapshot）。接缝若只用成本
+    # 种下，会把平台已掌握的历史高点丢掉 → 续跑侧移动止损基准低于实盘，同一只
+    # 票出现「实盘止损、回测不止损」。capture_seam 在引擎首轮 tick 之前执行，
+    # 库里最新快照必然来自上一次运行，不存在把接缝后的价格泄漏进起账状态。
+    #
+    # 不能直接取「最近一份」快照：会话停牌/停用后桥可能只回现金（实测 2026-11-11
+    # 12:08 那份 market_value=0、持仓行为空），取到它会得到空 snap_peaks，峰值
+    # 退化成成本价，等于峰值种植白做。故用 JOIN 在 SQL 里跳过无有效持仓行的快照，
+    # 由近到远取第一份「quantity>0 且 highest_price>0」的快照。
+    # 不用「最近 N 份里找」的分页上限：该查询走 live_session_id + captured_at
+    # 索引并在 SQL 侧 LIMIT 1，命中即停，不会物化全历史持仓表；若一段长停牌期
+    # 每天若干份空快照，固定 N 反而可能漏到成本价退化。
     snap = (
         db.query(LiveAccountSnapshot)
-        .filter(LiveAccountSnapshot.live_session_id == session_id)
+        .join(LiveAccountPositionSnapshot,
+              LiveAccountPositionSnapshot.snapshot_id == LiveAccountSnapshot.id)
+        .filter(
+            LiveAccountSnapshot.live_session_id == session_id,
+            LiveAccountPositionSnapshot.quantity > 0,
+            LiveAccountPositionSnapshot.highest_price > 0,
+        )
         .order_by(LiveAccountSnapshot.captured_at.desc(),
                   LiveAccountSnapshot.id.desc())
         .first()
@@ -428,6 +443,28 @@ def capture_seam(db: Session, session_id: int, engine, today: Optional[date] = N
             hp = Decimal(str(row.highest_price))
             if hp > 0:
                 snap_peaks[row.stock_code] = hp
+    else:
+        # 全历史都没有含持仓的快照 → 峰值只能按成本价种下，必须留痕可审计。
+        # 区分「一份快照都没有」与「有快照但都是空仓」两种成因。
+        total = (
+            db.query(LiveAccountSnapshot)
+            .filter(LiveAccountSnapshot.live_session_id == session_id)
+            .count()
+        )
+        latest = (
+            db.query(LiveAccountSnapshot)
+            .filter(LiveAccountSnapshot.live_session_id == session_id)
+            .order_by(LiveAccountSnapshot.captured_at.desc(),
+                      LiveAccountSnapshot.id.desc())
+            .first()
+        )
+        logger.warning(
+            "[seam] 会话 %s 无任何含有效持仓的账户快照（快照总数=%s，最近一份 "
+            "id=%s captured_at=%s market_value=%s），接缝峰值退化为成本价种下",
+            session_id, total,
+            getattr(latest, "id", None), getattr(latest, "captured_at", None),
+            getattr(latest, "market_value", None),
+        )
     changed = False
     for link in links:
         if link.seam_date is not None:

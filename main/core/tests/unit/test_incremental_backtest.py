@@ -1,5 +1,6 @@
 """接缝续跑增量回测：状态序列化 / 接缝锚定 / 续跑等价 / 补跑断档 / 双跑校验 单元测试。"""
 import json
+import logging
 from datetime import date, datetime, timedelta
 from decimal import Decimal
 
@@ -199,6 +200,57 @@ def test_capture_seam_ignores_stale_snapshot_peak(db_session):
     db_session.refresh(link)
     seeded = json.loads(link.seam_positions_json)
     assert Decimal(seeded[0]["highest_price"]) == Decimal("10")
+
+
+def _add_empty_snapshot(db, sess, captured_at, market_value=0):
+    """桥只回现金、持仓行为空的快照（会话停止后的典型形态）。"""
+    snap = LiveAccountSnapshot(
+        live_session_id=sess.id, engine="tdx", captured_at=captured_at,
+        total_asset=Decimal(str(market_value)),
+        available_cash=Decimal(str(market_value)),
+        market_value=Decimal(str(market_value)))
+    db.add(snap)
+    db.commit()
+    return snap
+
+
+def test_capture_seam_skips_empty_snapshot_for_prior_peak(db_session):
+    """最近一份快照持仓为空时，跳过它、取上一份含持仓快照的峰值种下。
+
+    回归：2026-11-11 12:08 那份快照 market_value=0 且无持仓行，若按「最近一份」
+    取 snapshot，snap_peaks 为空 → 峰值退化成成本价，峰值种植白做。
+    """
+    sess, ps, link = _seed_live_link(db_session)
+    _add_snapshot(db_session, sess, "000001.SZ", Decimal("10.83"),
+                  datetime(2026, 1, 5, 11, 29))
+    _add_empty_snapshot(db_session, sess, datetime(2026, 1, 5, 12, 8))
+    port = _make_portfolio(cash="80000", strategy_id=1)
+    pos = Position("000001.SZ")
+    pos.buy(1000, Decimal("10"), trade_time=datetime(2026, 1, 5))
+    port.strategies[0].positions["000001.SZ"] = pos
+
+    ib.capture_seam(db_session, sess.id, _FakeEngine([port]))
+    db_session.refresh(link)
+    seeded = json.loads(link.seam_positions_json)
+    assert Decimal(seeded[0]["highest_price"]) == Decimal("10.83")
+
+
+def test_capture_seam_falls_back_to_cost_with_warning(db_session, caplog):
+    """全历史都没有含持仓的快照 → 峰值退回成本价，且必须留 WARNING 留痕。"""
+    sess, ps, link = _seed_live_link(db_session)
+    _add_empty_snapshot(db_session, sess, datetime(2026, 1, 5, 12, 8))
+    port = _make_portfolio(cash="80000", strategy_id=1)
+    pos = Position("000001.SZ")
+    pos.buy(1000, Decimal("10"), trade_time=datetime(2026, 1, 5))
+    port.strategies[0].positions["000001.SZ"] = pos
+
+    with caplog.at_level(logging.WARNING):
+        ib.capture_seam(db_session, sess.id, _FakeEngine([port]))
+    db_session.refresh(link)
+    seeded = json.loads(link.seam_positions_json)
+    assert Decimal(seeded[0]["highest_price"]) == Decimal("10")
+    assert any("无任何含有效持仓的账户快照" in r.getMessage()
+               for r in caplog.records)
 
 
 # ---------------------------------------------------------------- 3. 续跑等价
