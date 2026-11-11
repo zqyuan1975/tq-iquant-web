@@ -187,8 +187,15 @@ def copy_assets(dist_dir: Path):
     alembic_src = ROOT / "alembic"
     if not alembic_src.exists():
         sys.exit("缺少 main/alembic，无法在目标机自动建库/升级")
-    shutil.copytree(alembic_src, dist_dir / "alembic", dirs_exist_ok=True)
-    print("  alembic/（首次启动自动迁移）")
+    # 排除 __pycache__/*.pyc：构建机的字节码缓存与目标机解释器/时间戳无关，
+    # 打进包只会残留过期副本（曾是 alembic\versions\__pycache__\*.cpython-313.pyc）。
+    shutil.copytree(
+        alembic_src,
+        dist_dir / "alembic",
+        dirs_exist_ok=True,
+        ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
+    )
+    print("  alembic/（首次启动自动迁移，已排除 __pycache__/*.pyc）")
 
     (dist_dir / "data").mkdir(parents=True, exist_ok=True)
     (dist_dir / "logs").mkdir(parents=True, exist_ok=True)
