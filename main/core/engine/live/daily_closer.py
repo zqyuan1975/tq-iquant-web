@@ -13,6 +13,20 @@
 避免每轮 60s tick 重复触发。时间走注入 clock（默认 now_shanghai，上海时区实盘固有时点）。
 非交易日（周末/节假日）三件套全部跳过，避免陈旧 bar/快照误估值或误触熔断。
 
+**半日市（P2-10）时点结论：14:30/15:05 均不前移。**
+- 14:30 日终估值：半日市当天 11:30 后已无新价，14:30 估的即当日最终价（最后已知价
+  跨日持久），提前到 11:30 反而与「日终」语义冲突且无收益，故不动；
+- 15:05 日线轮次：半日市当天 1d bar 在 11:30 就定型，但行情源（TQ/桥）对当日日线的
+  落盘/校验在 15:00 后统一完成，15:05 取数**仍满足「最新日线日期 == 今日」新鲜度
+  校验**；前移到 11:35 会撞上数据未落盘（触发 daily_bar_freshness 跳过）风险，故不前移；
+- 15:05 收盘清扫：清扫是「收盘后权威收口」，只比较柜台 /orders、/deals 与本地状态，
+  不依赖行情仍在跳动；半日市当天 11:30 后不会再有新成交，15:05 执行仍然正确（只是
+  兜底时点偏晚 3.5 小时，不影响终态可收敛）。前移到 11:35 则可能撞上柜台当日委托
+  状态尚未收敛（券商日终处理在 15:00 后），故保持 15:05；
+- 唯一必须动的是 14:52「提前收盘价」轮次（B）：半日市当天该时点已收盘，属收盘后
+  下单，故直接跳过（见 maybe_advance_daily_close），1d 信号交由 15:05 轮次补跑。
+- 盘前集合竞价（09:15–09:20，LiveEngine 路径）在半日市当天照常，不经过本服务。
+
 本服务不反向 import LiveEngine：经 EngineContext 读 portfolios/session_id/dispatcher/db 工厂，
 协作者（market_data/breaker/orders）与 on_bar、set_bridge_offline、emit 回调由构造注入。
 逻辑原样搬移，仅 self.xxx → 注入对象。
@@ -408,6 +422,11 @@ class DailyCloser:
             return
         today = now.date()
         if not self._calendar.is_trading_day(today):
+            return
+        # 半日市（P2-10）：当日 11:30 已收盘，14:52 提前轮次属"收盘后下单"，必须跳过。
+        # 此时 1d 信号改由 15:05 收盘落定轮次按完整日线补跑（次日开盘执行），
+        # 与 B 开启但提前轮次未执行时的口径一致，不丢信号。
+        if self._calendar.is_half_day(today):
             return
         if self._advance_done(today):
             return
