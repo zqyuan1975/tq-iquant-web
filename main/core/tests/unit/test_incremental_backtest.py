@@ -14,8 +14,9 @@ from core.engine.position import Position
 from core.engine.risk_manager import PortfolioRiskManager
 from core.engine.strategy_context import StrategyContext
 from core.models import (
-    Base, FormulaSignal, LiveSession, LiveSessionPortfolio,
-    PortfolioStrategy, StockPool, StockPoolStock, Strategy,
+    Base, FormulaSignal, LiveAccountPositionSnapshot, LiveAccountSnapshot,
+    LiveSession, LiveSessionPortfolio, PortfolioStrategy, StockPool,
+    StockPoolStock, Strategy,
 )
 from tq_iquant_shared.constants import SignalType, TradeType
 
@@ -155,6 +156,49 @@ def test_capture_seam_writes_baseline_once(db_session):
     ib.capture_seam(db_session, sess.id, _FakeEngine([port]))
     db_session.refresh(link)
     assert Decimal(str(link.seam_cash)) == Decimal("80000")
+
+
+def _add_snapshot(db, sess, code, highest, captured_at, cost="10"):
+    snap = LiveAccountSnapshot(
+        live_session_id=sess.id, engine="tdx", captured_at=captured_at)
+    snap.positions.append(LiveAccountPositionSnapshot(
+        stock_code=code, quantity=1000, cost_price=Decimal(cost),
+        current_price=Decimal(cost), highest_price=highest))
+    db.add(snap)
+    db.commit()
+
+
+def test_capture_seam_seeds_peak_from_prior_snapshot(db_session):
+    """接缝前快照已记录的持仓期最高价必须带入起账状态（否则续跑侧移动止损
+    基准低于实盘，实盘止损、回测不止损）。"""
+    sess, ps, link = _seed_live_link(db_session)
+    _add_snapshot(db_session, sess, "000001.SZ", Decimal("10.83"),
+                  datetime(2026, 1, 5, 15, 5))
+    port = _make_portfolio(cash="80000", strategy_id=1)
+    pos = Position("000001.SZ")
+    pos.buy(1000, Decimal("10"), trade_time=datetime(2026, 1, 5))
+    port.strategies[0].positions["000001.SZ"] = pos
+
+    ib.capture_seam(db_session, sess.id, _FakeEngine([port]))
+    db_session.refresh(link)
+    seeded = json.loads(link.seam_positions_json)
+    assert Decimal(seeded[0]["highest_price"]) == Decimal("10.83")
+
+
+def test_capture_seam_ignores_stale_snapshot_peak(db_session):
+    """快照早于本笔建仓（同代码先清仓再重开）→ 上一轮高点不得复活。"""
+    sess, ps, link = _seed_live_link(db_session)
+    _add_snapshot(db_session, sess, "000001.SZ", Decimal("12"),
+                  datetime(2026, 1, 2, 15, 5))
+    port = _make_portfolio(cash="80000", strategy_id=1)
+    pos = Position("000001.SZ")
+    pos.buy(1000, Decimal("10"), trade_time=datetime(2026, 1, 5))
+    port.strategies[0].positions["000001.SZ"] = pos
+
+    ib.capture_seam(db_session, sess.id, _FakeEngine([port]))
+    db_session.refresh(link)
+    seeded = json.loads(link.seam_positions_json)
+    assert Decimal(seeded[0]["highest_price"]) == Decimal("10")
 
 
 # ---------------------------------------------------------------- 3. 续跑等价

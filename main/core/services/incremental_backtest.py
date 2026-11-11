@@ -37,6 +37,7 @@ from core.models import (
     IncrementalBacktestCheckpoint,
     IncrementalBacktestDay,
     IncrementalBacktestValidation,
+    LiveAccountSnapshot,
     LiveSessionPortfolio,
     LiveTrade,
     PortfolioStrategy,
@@ -406,6 +407,27 @@ def capture_seam(db: Session, session_id: int, engine, today: Optional[date] = N
         .all()
     )
     ports = {p.portfolio_id: p for p in (getattr(engine, "portfolios", None) or [])}
+    # 接缝时刻之前的最近一份账户快照：实盘引擎跨重启正是从这里恢复移动止损
+    # 峰值（LiveEngine._capture_account_snapshot）。接缝若只用成本种下，会把
+    # 平台已掌握的历史高点丢掉 → 续跑侧移动止损基准低于实盘，同一只票出现
+    # 「实盘止损、回测不止损」。capture_seam 在引擎首轮 tick 之前执行，库里
+    # 最新快照必然来自上一次运行，不存在把接缝后的价格泄漏进起账状态。
+    snap = (
+        db.query(LiveAccountSnapshot)
+        .filter(LiveAccountSnapshot.live_session_id == session_id)
+        .order_by(LiveAccountSnapshot.captured_at.desc(),
+                  LiveAccountSnapshot.id.desc())
+        .first()
+    )
+    snap_at = getattr(snap, "captured_at", None)
+    snap_peaks: Dict[str, Decimal] = {}
+    if snap is not None:
+        for row in (snap.positions or []):
+            if row.highest_price is None:
+                continue
+            hp = Decimal(str(row.highest_price))
+            if hp > 0:
+                snap_peaks[row.stock_code] = hp
     changed = False
     for link in links:
         if link.seam_date is not None:
@@ -418,14 +440,23 @@ def capture_seam(db: Session, session_id: int, engine, today: Optional[date] = N
             for code, pos in ctx.positions.items():
                 if not pos.quantity or pos.quantity <= 0:
                     continue
+                # 起账峰值 = max(账本峰值/成本, 接缝前快照记录的历史最高价)。
+                # 快照必须早于本笔持仓建仓（同 live_engine 的 stale-peak 口径：
+                # 先清仓再重开时，上一轮持仓的高点不得复活）；建仓时间未知时
+                # 仍信快照，与导入路径一致。
+                seed_hp = pos.highest_price or pos.avg_cost
+                prev_hp = snap_peaks.get(code)
+                if (prev_hp is not None
+                        and (pos.buy_time is None or snap_at is None
+                             or pos.buy_time <= snap_at)):
+                    seed_hp = max(seed_hp, prev_hp)
                 positions.append({
                     "strategy_id": ctx.strategy_id,
                     "stock_code": code,
                     "quantity": int(pos.quantity),
                     "avg_cost": str(pos.avg_cost),
                     "buy_date": _dt(pos.buy_time.date() if pos.buy_time else None),
-                    # 起账时 highest_price 按成本种下（无持仓期价格序列可依）
-                    "highest_price": str(pos.highest_price or pos.avg_cost),
+                    "highest_price": str(seed_hp),
                 })
         link.seam_date = today
         link.seam_cash = port.account.cash
@@ -768,6 +799,11 @@ def _run_incremental_locked(db: Session, session_id: int,
         state is not None and handoff is not None and as_of is not None
         and as_of < today and set(periods) == {"1d"}
     )
+    # 只有结束日志时，卡在取数/回测段无法定位（fast=False = 当日没有
+    # DailyCloser 15:05 日线交接，本节自己向 TQ 取数）。
+    logger.info(
+        "incremental backtest start (session %s, ps %s): as_of=%s today=%s "
+        "fast=%s", session_id, ps_id, as_of, today, fast_path)
 
     gap_dates: List[date] = []
     if fast_path:
