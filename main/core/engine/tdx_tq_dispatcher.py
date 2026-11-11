@@ -737,7 +737,13 @@ class TdxTqDispatcher(OrderDispatcher):
         return out
 
     def query_quote(self, code: str, period: str = "1m", count: int = 10) -> list:
-        """行情复用 Core 同进程内嵌的 TQ 模块（与回测取数口径一致）。"""
+        """行情复用 Core 同进程内嵌的 TQ 模块（与回测取数口径一致）。
+
+        复权口径（P2-9）：显式取**前复权**（TQ 默认值，写死防止默认值变更后静默漂移）。
+        当日分钟 bar 的前复权值与不复权实时价相同（前复权锚定最新价），故下单价、
+        涨跌停夹取、风控阈值均不受影响；历史段连续无除权缺口，与回测
+        ``dividend_mode=front`` / ``dual`` 的信号口径一致。
+        """
         tq_code = normalize_symbol(code)
         code6 = re.sub(r"\D", "", str(code or ""))[:6]
         if len(code6) != 6:
@@ -745,7 +751,8 @@ class TdxTqDispatcher(OrderDispatcher):
         try:
             from core.tq.data import TQData
             raw = TQData().get_history_raw(
-                [tq_code], [period], count=max(int(count or 10), 2))
+                [tq_code], [period], dividend_type="front",
+                count=max(int(count or 10), 2))
         except Exception as e:
             self._last_error = "quote unavailable: %s" % e
             return []
@@ -777,7 +784,8 @@ class TdxTqDispatcher(OrderDispatcher):
                 return {}
             from core.tq.data import TQData
             raw = TQData().get_history_raw(
-                [tq for _, tq in pairs], [period], count=max(int(count or 10), 2))
+                [tq for _, tq in pairs], [period], dividend_type="front",
+                count=max(int(count or 10), 2))
             converted = self._raw_to_bars(raw, period)
             return {orig: converted.get(tq, []) for orig, tq in pairs}
         except Exception as e:
@@ -936,10 +944,16 @@ class TdxTqDispatcher(OrderDispatcher):
 
         多取几根是为了同时拿到「上市交易日序」（新股判定）与最早 bar 日期，
         供 ``core.engine.price_limit.resolve_limit_rule`` 判板块/ST/新股。
+
+        复权口径（P2-9）：显式取**前复权**日线。除权日的前复权收盘即交易所的
+        「除权后参考价」（涨跌停基准），若改用不复权原始前收，除权日会把
+        ±10%/±20% 带算偏 → 夹价错误。此序列只用于前收/板块/ST/上市日序判定，
+        不做持仓或净值口径用途。
         """
         try:
             from core.tq.data import TQData
-            raw = TQData().get_history_raw([symbol], ["1d"], count=count)
+            raw = TQData().get_history_raw(
+                [symbol], ["1d"], dividend_type="front", count=count)
             close = (raw.get("1d") or {}).get("Close")
             if close is None or getattr(close, "empty", True):
                 return None

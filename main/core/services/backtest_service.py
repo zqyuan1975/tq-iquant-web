@@ -2369,6 +2369,10 @@ def _persist_result(
 
     # ---- 决策闸门事件（止损/止盈/熔断/资金不足/超仓…逐触发一条，调参可观测性）----
     for d in result.get("decisions") or []:
+        # message 是纯自由文本（标的/门槛/数值/方向都在独立列），列宽 String(200)。
+        # 实测 9.7 万条决策事件最长 74 字，从未触顶；这里只在超限时截断并留省略号，
+        # 避免静默丢尾巴（扩列宽需迁移，暂不为此改表）。
+        msg = d.get("message") or ""
         db.add(BacktestDecisionEvent(
             backtest_record_id=record_id,
             gate=d["gate"],
@@ -2383,7 +2387,7 @@ def _persist_result(
             actual_value=d.get("actual_value"),
             requested_qty=d.get("requested_qty"),
             final_qty=d.get("final_qty"),
-            message=(d.get("message") or "")[:200],
+            message=msg if len(msg) <= 200 else msg[:199] + "…",
         ))
 
 

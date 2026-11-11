@@ -1941,6 +1941,9 @@ class ThsUiDispatcher(OrderDispatcher):
 
         同花顺只负责交易执行，不提供行情；BarPoller 需要 stime/OHLCV 形状。
         TQ 返回 {field: DataFrame(index=时间, columns=[code])}，这里转成 bar dict。
+
+        复权口径（P2-9）：显式前复权，与 tdx 通道一致（见
+        ``TdxTqDispatcher.query_quote`` 的口径说明）；当日 bar 与不复权实时价相同。
         """
         text = str(code or "").strip()
         code6 = re.sub(r"\D", "", text)[:6]
@@ -1951,7 +1954,8 @@ class ThsUiDispatcher(OrderDispatcher):
         try:
             from core.tq.data import TQData
             raw = TQData().get_history_raw(
-                [tq_code], [period], count=max(int(count or 10), 2))
+                [tq_code], [period], dividend_type="front",
+                count=max(int(count or 10), 2))
         except Exception as e:
             self._last_error = "quote unavailable: %s" % e
             return []
