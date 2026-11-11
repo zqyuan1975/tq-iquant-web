@@ -795,6 +795,37 @@ def test_query_trades_history(client, mock_bridge):
     assert body["data"][1]["amount"] == 1050.0
 
 
+def test_query_trades_history_date_filter(client, mock_bridge):
+    """GET /trades?start_date=&end_date= 按北京自然日过滤；缺省仍全量（向后兼容）。"""
+    c, Session = client
+    sid = _create_session(c, portfolio_ids=())
+    db = Session()
+    lo = _add_order(db, sid)
+    db.add(lo)
+    db.flush()
+    db.add_all([
+        _add_trade(db, sid, order=lo, trade_time=datetime(2026, 8, 4, 14, 50)),
+        _add_trade(db, sid, order=lo, trade_time=datetime(2026, 8, 5, 10, 35)),
+        _add_trade(db, sid, order=lo, trade_type="SELL", qty=100, price="11.0",
+                   trade_time=datetime(2026, 8, 6, 9, 31)),
+    ])
+    db.commit()
+    db.close()
+
+    url = "/api/live/sessions/%d/trades" % sid
+    # 单日闭区间：只回 8 月 5 日那一笔
+    body = c.get(url + "?start_date=2026-08-05&end_date=2026-08-05").json()
+    assert body["code"] == 0
+    assert len(body["data"]) == 1
+    assert body["data"][0]["trade_time"].startswith("2026-08-05")
+    # 只给起点 → 下界过滤（8/5 起两笔）
+    assert len(c.get(url + "?start_date=2026-08-05").json()["data"]) == 2
+    # 缺省 → 全量，与旧行为一致（不删除任何成交）
+    assert len(c.get(url).json()["data"]) == 3
+    # 非法日期格式 → 400
+    assert c.get(url + "?start_date=2026/08/05").json()["code"] == 400
+
+
 def test_query_positions_when_stopped_aggregates_from_trades(client, mock_bridge):
     """未运行 → /positions 从 live_trades 重放聚合（BUY 加、SELL 减，均价加权）。
 
@@ -816,8 +847,10 @@ def test_query_positions_when_stopped_aggregates_from_trades(client, mock_bridge
     assert body["code"] == 0
     row = next(p for p in body["data"] if p["stock_code"] == "600000.SH")
     assert row["quantity"] == 700
-    assert row["avg_cost"] == 10.5
-    assert row["market_value"] == pytest.approx(700 * 10.5)
+    # 重建口径含柜台真实费用（2026-11-11 起与实盘一致）：
+    # (600*10 + 200*12 + 2×0.5 佣金) / 800 = 10.50125 → 10.501
+    assert row["avg_cost"] == pytest.approx(10.501, abs=1e-6)
+    assert row["market_value"] == pytest.approx(7350.88, abs=0.01)  # 700×10.50125 四舍五入到分
     # 归属：_add_trade 恒为 portfolio_strategy_id=1/strategy_id=1
     assert row["portfolio_id"] == 1
     assert row["strategy_id"] == 1
@@ -1019,9 +1052,11 @@ def test_create_session_rejects_non_positive_live_capital(client, mock_bridge):
         assert "实盘资金基准须大于 0" in body["message"]
 
 
-def test_build_engine_applies_live_capital_override(client, monkeypatch, caplog):
-    """build_engine 把 session.live_capital 传给 assemble_portfolio：
-    override 生效 → Account 以基准资金起账；未设置 → 组合初始资金（现行为）。"""
+def test_build_engine_keeps_per_portfolio_capital(client, monkeypatch, caplog):
+    """build_engine 的 live_capital 只作真实侧总闸，不覆盖组合起账（P1-①）。
+
+    分账不分池：每个组合虚拟起账 = 该组合配置资金；会话级 live_capital 仅作为
+    真实侧额度兜底上限（引擎 `_account_total_capital`）。"""
     import logging
     c, Session = client
     db = Session()
@@ -1042,9 +1077,12 @@ def test_build_engine_applies_live_capital_override(client, monkeypatch, caplog)
     try:
         with caplog.at_level(logging.INFO, logger="core.services.live_service"):
             engine = live_api._build_engine(sid, db2, "simulation")
-        assert engine.portfolios[0].account.initial_capital == Decimal("500000")
-        assert engine.portfolios[0].account.cash == Decimal("500000")
-        assert any("实盘资金基准" in r.getMessage() for r in caplog.records)
+        # 组合仍以自身配置资金起账（100000），不被账户总资产覆盖
+        assert engine.portfolios[0].account.initial_capital == Decimal("100000")
+        assert engine.portfolios[0].account.cash == Decimal("100000")
+        # 会话真实账户总资产作为引擎真实侧兜底上限
+        assert engine._account_total_capital == Decimal("500000")
+        assert any("虚拟起账资金" in r.getMessage() for r in caplog.records)
     finally:
         db2.close()
 

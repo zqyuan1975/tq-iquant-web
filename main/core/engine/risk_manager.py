@@ -71,6 +71,11 @@ class PortfolioRiskManager:
         self.breaker_trigger_date: Optional[date] = None
         self.daily_pause_active = False
         self.daily_loss_trigger_date: Optional[date] = None
+        # 暂停解除门槛日（含当日在内的「最后被暂停日」，P1-1）：仅实盘 14:30 触发时
+        # 由调用方显式推到**次一交易日**——让「当日尾盘触发的日亏暂停」延续到次日
+        # 整日，D+2 首 bar 才恢复（对齐回测：用上一日收盘净值判日亏 → 暂停次日全天）。
+        # None = 旧语义（触发日次日即恢复），回测/历史 payload 走这条，行为不变。
+        self.daily_pause_resume_after: Optional[date] = None
         # 可选（默认关）：daily_loss 分母用「上一交易日收盘净值」而非初始资金。
         # 关闭 = 原口径（阈值固定为 initial_capital × limit，历史结果不变）。
         self.daily_loss_on_equity_enabled = False
@@ -128,6 +133,7 @@ class PortfolioRiskManager:
     def daily_reset(self) -> None:
         """旧接口保留：清日级暂停。"""
         self.daily_pause_active = False
+        self.daily_pause_resume_after = None
 
     def is_trading_halted(self) -> bool:
         """是否暂停新开仓（熔断或日内亏损暂停任一为真）。SELL 类不受影响。"""
@@ -231,20 +237,31 @@ class PortfolioRiskManager:
     def update_daily(
         self, total_value: Decimal, current_date: date, initial_capital: Decimal,
         recovery_date: Optional[date] = None,
+        resume_after: Optional[date] = None,
     ) -> None:
         """日终一次调用（实盘 14:30 / 回测跨日补算）：算日内盈亏、检测 daily_loss 暂停 + 次日恢复。
 
         日内盈亏 daily_pnl = total_value - prev_close_value（昨日收盘基准，由 update_peak 跨日刷新）。
         recovery_date 用于次日恢复判断：回测跨日补算时传当日（current_date 是上一日），
         实盘 14:30 调用时默认 = current_date（当日）。同一日期不重复评估（_last_daily_date 守卫）。
+
+        resume_after（P1-1）：触发时把「解除门槛」显式推到该日（含当日仍暂停），
+        仅实盘 14:30 传入**次一交易日**——14:30 触发的暂停因此延续次日整日、D+2
+        首 bar 才恢复（对齐回测「上一日收盘判日亏 → 暂停次日全天」）。None = 旧语义
+        （触发日次日恢复），回测与历史调用逐字不变。
         """
         if recovery_date is None:
             recovery_date = current_date
 
-        # 1. 次日恢复（用 recovery_date 判断，而非 current_date）
+        # 1. 次日恢复（用 recovery_date 判断，而非 current_date）；
+        #    解除门槛优先用显式 resume_after（实盘尾盘触发），否则回落到触发日
         if self.daily_pause_active:
-            if self.daily_loss_trigger_date is not None and recovery_date > self.daily_loss_trigger_date:
+            gate = self.daily_pause_resume_after
+            if gate is None:
+                gate = self.daily_loss_trigger_date
+            if gate is not None and recovery_date > gate:
                 self.daily_pause_active = False
+                self.daily_pause_resume_after = None
                 self._record_recover(
                     "daily_loss 日内亏损暂停次日恢复（触发日 %s）" % self.daily_loss_trigger_date,
                     recovery_date,
@@ -272,12 +289,15 @@ class PortfolioRiskManager:
                 )
                 self.daily_pause_active = True
                 self.daily_loss_trigger_date = current_date
+                # P1-1：实盘 14:30 传 resume_after=次一交易日 → 暂停覆盖次日整日
+                self.daily_pause_resume_after = resume_after
                 self._record_halt(
                     "daily_loss", "daily_loss_limit", self.daily_loss_limit, loss,
                     current_date,
-                    "日内盈亏 %s（基准 %s%s）亏损 %s 触发当日暂停" % (
+                    "日内盈亏 %s（基准 %s%s）亏损 %s 触发暂停%s" % (
                         fmt_money(daily_pnl), fmt_money(base),
                         "，昨日收盘净值" if self.daily_loss_on_equity_enabled else "，初始资金",
                         fmt_pct(loss),
+                        "，延续至次日（D+2 恢复）" if resume_after is not None else "当日暂停",
                     ),
                 )

@@ -23,11 +23,15 @@ const liveSessions = ref<LiveSessionItem[]>([])
 
 /** 通道卡片三态：loading（占位）/timeout（5s 未回，先占位）/error/ok */
 type ChannelState = 'loading' | 'ok' | 'timeout' | 'error'
-interface ChannelItem { key: string; label: string; online: boolean | null; state: ChannelState }
+interface ChannelItem {
+  key: string; label: string; online: boolean | null; state: ChannelState
+  detail: string; checkedAt: string | null
+}
 const CHANNEL_DEFS = [
   { key: 'tdx', label: '通达信 TQ' },
   { key: 'ths', label: '同花顺' },
   { key: 'goldminer', label: '掘金量化' },
+  { key: 'iquant', label: 'QMT 通道' },
 ] as const
 /** 通道探活独立分块：5s 内没回就出占位文案，不再卡整页 */
 const CHANNEL_TIMEOUT_MS = 5000
@@ -57,6 +61,7 @@ function loadChannels() {
   const seq = ++channelSeq
   channels.value = CHANNEL_DEFS.map((c) => ({
     key: c.key, label: c.label, online: null, state: 'loading' as ChannelState,
+    detail: '', checkedAt: null,
   }))
   CHANNEL_DEFS.forEach((c, i) => {
     let settled = false
@@ -71,6 +76,7 @@ function loadChannels() {
         if (seq !== channelSeq) return
         channels.value[i] = {
           key: c.key, label: p.label || c.label, online: p.online, state: 'ok',
+          detail: p.detail || '', checkedAt: p.checked_at || null,
         }
       })
       .catch(() => {
@@ -117,9 +123,36 @@ async function load() {
 
 function channelText(c: ChannelItem): string {
   if (c.state === 'loading') return '加载中…'
-  if (c.state === 'timeout') return '通道状态超时，稍后自动重试'
-  if (c.state === 'error') return '通道状态获取失败'
-  return c.online === true ? '在线' : c.online === false ? '离线' : '未检测（会话未启动）'
+  // 状态词只有「在线 / 离线」：探测超时/失败/旧接口未回一律按离线展示（红），
+  // 不另造第三种词，也不靠会话是否启动推断。
+  if (c.state !== 'ok') return '离线'
+  return c.online === true ? '在线' : '离线'
+}
+
+/** 状态色：在线绿 / 离线红（四通道同一套）；加载中灰 */
+function channelClass(c: ChannelItem): string {
+  if (c.state === 'loading') return 'idle'
+  return c.state === 'ok' && c.online === true ? 'ok' : 'bad'
+}
+
+/** 次要信息主体：去掉 http(s):// 协议头——200px 列宽下带协议头必被省略号切掉 */
+function channelDetail(c: ChannelItem): string {
+  if (c.state === 'loading') return ''
+  return (c.detail || '').replace(/https?:\/\//gi, '').replace(/\s+/g, ' ').trim()
+}
+
+/** 次要信息第二行：最近心跳；探测失败时改为「按离线显示」的原因（整行完整可见） */
+function channelSub(c: ChannelItem): string {
+  if (c.state === 'loading') return ''
+  if (c.state === 'timeout') return '探测超时，按离线显示'
+  if (c.state === 'error') return '探测失败，按离线显示'
+  const hb = c.checkedAt && c.checkedAt.length >= 19 ? c.checkedAt.slice(11, 19) : ''
+  return hb ? `心跳 ${hb}` : ''
+}
+
+/** 悬浮提示：两行合并成一条，鼠标悬停可看完整原文 */
+function channelMeta(c: ChannelItem): string {
+  return [channelDetail(c), channelSub(c)].filter(Boolean).join(' · ')
 }
 
 function fmtDate(d: string | null): string {
@@ -234,12 +267,18 @@ onMounted(load)
         <span class="frame-title">交易通道</span>
       </div>
       <div class="frame-body">
-        <div class="metric-grid channel-grid">
-          <div v-for="c in channels" :key="c.key" class="metric-card channel-card">
-            <span class="metric-label">{{ c.label }}</span>
-            <span class="metric-value" :style="{ fontSize: '15px' }">
-              {{ channelText(c) }}
-            </span>
+        <div class="channel-wrap">
+          <div class="metric-grid channel-grid">
+            <div v-for="c in channels" :key="c.key" class="metric-card channel-card">
+              <span class="metric-label">{{ c.label }}</span>
+              <span class="metric-value channel-status" :class="channelClass(c)" :style="{ fontSize: '15px' }">
+                {{ channelText(c) }}
+              </span>
+              <span class="channel-meta" :title="channelMeta(c)">
+                <span class="meta-line">{{ channelDetail(c) || '—' }}</span>
+                <span v-if="channelSub(c)" class="meta-line meta-sub">{{ channelSub(c) }}</span>
+              </span>
+            </div>
           </div>
         </div>
       </div>
@@ -302,15 +341,54 @@ onMounted(load)
 .dash-hero-stats b { font-family: var(--font-serif); font-size: 18px; font-weight: 800; color: var(--ink); margin-right: 5px; font-variant-numeric: tabular-nums }
 .dash-hero-stats .db-accent { color: var(--red) }
 .dash-hero-actions { flex-shrink: 0 }
-/* 交易通道三张卡：按内容留足宽度，避免「未检测（会话未启动）」与
-   「同花顺独立交易（UI 自动化）」这类全角中文在卡内折行；窄屏自动减列
-   （每列最低 240px，放不下就换行成 2+1），不会横向溢出。 */
+/* 交易通道四卡：只允许「4 列一行」「2 列」「1 列」三种排布，永不出现 3+1 孤行。
+   判据用容器查询按「内容宽」判定（侧栏展开/收起时媒体查询会出现 1280 反而 3 列的怪相）：
+   · ≥ 836px（4×200 + 3×12）→ 4 列一行
+   · ≥ 416px（2×200 + 12，留 4px 余量）→ 2 列
+   · 更窄 → 1 列（<416px 时两列每卡不足 200px，文字会碎成多行，单列更舒服） */
+.channel-wrap { container-type: inline-size; }
 .channel-grid {
-  grid-template-columns: repeat(auto-fit, minmax(min(100%, 240px), 1fr));
+  grid-template-columns: minmax(0, 1fr);
   gap: 12px;
   margin-bottom: 0;
 }
+@container (min-width: 416px) {
+  .channel-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+@container (min-width: 836px) {
+  .channel-grid { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+}
 .channel-card { min-width: 0 }
-.channel-card .metric-label,
-.channel-card .metric-value { white-space: nowrap }
+/* 名称/状态允许折行（窄卡不裁切）；通道名最长「同花顺独立交易（UI 自动化）」 */
+.channel-card .metric-label {
+  white-space: normal;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+}
+.channel-status {
+  white-space: normal;
+  line-height: 1.3;
+  overflow-wrap: anywhere;
+}
+.channel-status.ok { color: var(--green) }
+.channel-status.bad { color: var(--red) }
+.channel-status.idle { color: var(--ink-soft) }
+/* 次要信息（桥地址 / 账号 / 心跳）：强制两行——主体一行、心跳或降级原因一行，
+   200px 最小列宽下两条都能完整显示，不再依赖省略号或 line-clamp 截断。 */
+.channel-meta {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  font-size: 11px;
+  line-height: 1.35;
+  min-height: 2.7em;
+  color: var(--ink-soft);
+  overflow-wrap: anywhere;
+  font-variant-numeric: tabular-nums;
+}
+.meta-line { display: block }
+.meta-sub { color: var(--ink-faint) }
+@media (max-width: 1100px) {
+  .dash-hero { flex-wrap: wrap; align-items: center; row-gap: 10px; padding-bottom: 12px; margin-bottom: 14px; }
+}
 </style>

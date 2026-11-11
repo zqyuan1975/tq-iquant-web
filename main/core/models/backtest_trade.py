@@ -20,6 +20,8 @@ class BacktestTrade(Base):
     amount = Column(Numeric(15, 2), nullable=False)
     commission = Column(Numeric(10, 2), nullable=False)
     stamp_duty = Column(Numeric(10, 2), nullable=False)
+    # 过户费（双向，2026-11-11）：历史行为 0；新回测按组合 transfer_fee_rate 计。
+    transfer_fee = Column(Numeric(10, 2), nullable=False, server_default="0")
     bar_time = Column(DateTime, nullable=False)
     created_at = Column(DateTime, server_default=func.now())
 

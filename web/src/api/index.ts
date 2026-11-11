@@ -86,6 +86,7 @@ export interface PortfolioItem {
   buy_commission_rate: number | null
   sell_commission_rate: number | null
   stamp_duty_rate: number | null
+  transfer_fee_rate: number | null  // 过户费率（买卖双向，默认 0.00001=0.001%）
   slippage: number | null
   trading_session: string  // full|am|pm
   price_limit_check_enabled: boolean  // #1 涨跌停校验（回测成交 + 实盘下单前置，默认开）
@@ -173,6 +174,7 @@ export interface BacktestEvaluationItem {
   volatility: number | null
   sharpe_ratio: number | null
   sortino_ratio: number | null
+  downside_volatility: number | null
   calmar_ratio: number | null
   win_rate: number | null
   profit_factor: number | null
@@ -195,6 +197,7 @@ export interface BacktestEvaluationItem {
   up_capture_ratio: number | null
   down_capture_ratio: number | null
   excess_max_drawdown: number | null
+  excess_calmar_ratio: number | null
   // 磨损/仓位/结构 6 指标
   annual_turnover: number | null
   total_cost_ratio: number | null
@@ -853,6 +856,7 @@ export interface PortfolioRequest {
   buy_commission_rate: number
   sell_commission_rate: number
   stamp_duty_rate: number
+  transfer_fee_rate?: number  // 过户费率（买卖双向，默认 0.00001=0.001%）
   slippage: number
   trading_session: string  // full|am|pm
   price_limit_check_enabled?: boolean  // #1 涨跌停校验；None=新建默认开启（实盘仅 TDX/THS 生效，QMT/掘金桥恒放行）/编辑不动
@@ -1611,8 +1615,15 @@ export async function getLiveOrders(sessionId: number, status?: string) {
   return res.data.data
 }
 
-export async function getLiveTrades(sessionId: number) {
-  const res = await api.get<ApiResponse<LiveTradeItem[]>>(`/live/sessions/${sessionId}/trades`)
+/** 成交历史。可选 start_date/end_date（YYYY-MM-DD，北京自然日闭区间）服务端预筛；
+ *  不传=全量（与旧行为一致，向后兼容）。 */
+export async function getLiveTrades(
+  sessionId: number,
+  range?: { start_date?: string; end_date?: string },
+) {
+  const params = range && (range.start_date || range.end_date) ? range : {}
+  const res = await api.get<ApiResponse<LiveTradeItem[]>>(
+    `/live/sessions/${sessionId}/trades`, { params })
   return res.data.data
 }
 
@@ -1695,6 +1706,8 @@ export interface LiveSessionItem {
   advance_close_enabled?: boolean  // 14:50 提前收盘价（B 可选增强，仅 1d）是否开启
   advance_close_time?: string      // 提前收盘价轮次时点（默认 14:51，实际不早于 14:52）
   advance_close_done_date?: string | null  // 提前收盘价轮次已执行日期（幂等标记）
+  // 错周期风控三态（原始值）：null=跟随全局 / true=强制开启 / false=强制关闭
+  intraday_mismatched_risk_enabled?: boolean | null
 }
 
 // I-7（audit）：对账差异摘要（LiveEngine._reconcile_positions 产出）
@@ -1723,6 +1736,9 @@ export interface LiveSessionCreate {
   signal_file_path?: string | null  // 外部信号文件路径；空=null=走 TQ 公式计算
   advance_close_enabled?: boolean  // B 可选增强，仅 1d：14:50 定信号、14:52 bar 开盘价报单、当日尾盘成交；默认 false（1d/1w/1mon 均 15:05 收盘落定后算、次日执行）
   advance_close_time?: string      // 执行时点 HH:MM；默认 14:51，限定 14:51–14:59，实际轮次不早于 14:52
+  // 错周期风控三态：null=跟随全局（tq_trade.intraday_mismatched_risk_enabled，默认 False=对齐回测）/
+  // true=强制开启（任意 bar 都跑风控，旧行为）/ false=强制关闭
+  intraday_mismatched_risk_enabled?: boolean | null
 }
 
 export async function getLiveSession(sessionId: number) {
@@ -1814,6 +1830,7 @@ export interface SystemConfig {
   }
   ths_ui: ThsUiConfig
   tq_trade: TqTradeConfig
+  incremental_backtest?: IncrementalBacktestConfig
 }
 
 export interface BackupRecord {
@@ -1853,6 +1870,11 @@ export interface LiveChannelInfo {
   label: string
   online: boolean | null
   engine_running?: boolean  // 无运行引擎时为 false（此时 online=null，不做在线判定）
+  online_source?: 'engine' | 'probe' | 'none'
+  checked_at?: string | null
+  stale?: boolean
+  configured?: boolean
+  detail?: string
   engines: LiveChannelEngine[]
   ths_ui: ThsUiConfig
   bridge: { simulation: string; live: string }
@@ -1907,5 +1929,112 @@ export async function getBackupStatus() {
 /** 立即备份（手动）。失败时后端返回非 0 code，前端拦截器会 reject。 */
 export async function createBackup() {
   const res = await api.post<ApiResponse<BackupRecord>>('/system/backup')
+  return res.data.data
+}
+
+// ---------------------------------------------------------------------------
+// 接缝续跑式增量回测（GET /incremental/summary、POST /incremental/validate）
+// ---------------------------------------------------------------------------
+
+export interface IncrementalBacktestConfig {
+  enabled: boolean
+  daily_at: string              // 每日续跑时点（Asia/Shanghai），默认 15:10
+  max_catchup_days: number      // 补跑上限（交易日），超过标「断档」
+  anchor_on_live_start: boolean // 接缝锚定：用实盘起账状态重锚回测
+  validate_weekday: number      // 双跑校验星期（0=周一 … 5=周六）
+  validate_at: string           // 双跑校验时点
+  dividend_mode: string         // front|back|dual
+  tolerances: {
+    max_net_dev_pct: number
+    mean_net_dev_pct: number
+    trade_count_match_ratio: number
+    direction_match_ratio: number
+    max_drawdown_dev_pct: number
+  }
+}
+
+export interface IncrementalDayRow {
+  trade_date: string
+  inc_total_value: string | null
+  inc_cash: string | null
+  inc_market_value: string | null
+  live_total_value: string | null
+  live_cash: string | null
+  live_market_value: string | null
+  net_dev_pct: number | null
+  inc_trades_count: number | null
+  live_trades_count: number | null
+  direction_match: boolean | null
+  status: 'ok' | 'warn' | 'gap'
+  tags: string[]
+}
+
+export interface IncrementalCheckpointInfo {
+  seam_date: string
+  as_of_date: string
+  params_hash: string
+  schema_version: number
+  updated_at: string | null
+}
+
+export interface IncrementalValidationInfo {
+  id: number
+  from_date: string
+  to_date: string
+  status: 'pass' | 'fail' | 'error'
+  max_net_dev_pct: number | null
+  mean_net_dev_pct: number | null
+  trade_count_match_ratio: number | null
+  direction_match_ratio: number | null
+  max_drawdown_dev_pct: number | null
+  first_divergence_date: string | null
+  criteria: Record<string, any>
+  created_at: string | null
+}
+
+export interface IncrementalSummary {
+  supported: boolean
+  reason: string
+  seam_date: string | null
+  seam_cash: string | null
+  checkpoint: IncrementalCheckpointInfo | null
+  days: IncrementalDayRow[]
+  latest_validation: IncrementalValidationInfo | null
+  config: {
+    enabled: boolean
+    daily_at: string
+    max_catchup_days: number
+    tolerances: IncrementalBacktestConfig['tolerances']
+  }
+}
+
+export async function getIncrementalSummary(sessionId: number, portfolioStrategyId: number) {
+  const res = await api.get<ApiResponse<IncrementalSummary>>('/incremental/summary', {
+    params: { session_id: sessionId, portfolio_strategy_id: portfolioStrategyId },
+  })
+  return res.data.data
+}
+
+export async function runIncrementalValidation(
+  sessionId: number, portfolioStrategyId: number,
+  fromDate?: string | null, toDate?: string | null,
+) {
+  const res = await api.post<ApiResponse<{
+    status: 'pass' | 'fail' | 'error'
+    max_net_dev_pct: number | null
+    mean_net_dev_pct: number | null
+    trade_count_match_ratio: number | null
+    direction_match_ratio: number | null
+    max_drawdown_dev_pct: number | null
+    first_divergence_date: string | null
+    dates_count: number
+    from_date: string
+    to_date: string
+  }>>('/incremental/validate', {
+    session_id: sessionId,
+    portfolio_strategy_id: portfolioStrategyId,
+    from_date: fromDate ?? null,
+    to_date: toDate ?? null,
+  })
   return res.data.data
 }

@@ -19,12 +19,13 @@ start_session 只返回构造好、heartbeat 通过、recover 已执行但尚未
 纯重构，行为不变。
 """
 
+import json
 import logging
 import math
 import re
 import threading
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Dict, List, Optional, Tuple
 
@@ -35,7 +36,7 @@ from core.db import SessionLocal
 from core.models import (
     LiveSession, LiveSessionPortfolio, PortfolioStrategy, Strategy,
     StockPoolStock, Formula, FormulaSignal, LiveOrder, LiveTrade, LiveDecisionEvent,
-    LiveSignal, LiveAccountSnapshot,
+    LiveSignal, LiveAccountSnapshot, LiveCashFlow,
 )
 from core.engine.portfolio_builder import assemble_portfolio
 try:
@@ -52,6 +53,7 @@ except Exception:
     TdxTqDispatcher = None  # type: ignore
 from core.engine.bar_poller import BarPoller
 from core.engine.live_engine import LiveEngine
+from core.engine.live.breaker import manual_reset_reanchor_enabled
 from core.engine.position import Position
 from core.engine.format import dec_money
 from core.engine.decision import summarize_decisions
@@ -421,6 +423,73 @@ def _engine_state_freshness(engine) -> Tuple[Optional[str], bool]:
     return last_tick.strftime("%Y-%m-%d %H:%M:%S"), stale
 
 
+#: 本机客户端窗口探针（tdx/ths）：EnumWindows + 映像名关键词匹配，纯用户态、
+#: 毫秒级。**刻意不碰 TQ / 同花顺 UI**——AGENTS.md 明确 TQ 调用会冻结通达信客户端，
+#: 状态卡刷新不得触发；同花顺 connect 会做登录页 OCR（秒级），也不适合页面请求。
+#: 判据与既有弹窗归属识别（win_dialog_scope）同一套映像名：tdx / xiadan|hexin。
+_WINDOW_KEYWORDS = {"tdx": ("tdx",), "ths": ("xiadan", "hexin")}
+
+
+def _window_present(engine_key: str) -> bool:
+    """该通道客户端是否有可见顶层窗口（进程映像名匹配）。失败一律判不在。"""
+    keywords = _WINDOW_KEYWORDS.get(engine_key)
+    if not keywords:
+        return False
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        from core.engine.live.win_dialog_scope import window_image_name
+
+        found = []
+        user32 = ctypes.windll.user32
+        enum_proc = ctypes.WINFUNCTYPE(
+            wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+
+        def _cb(hwnd, _lparam):
+            try:
+                if user32.IsWindowVisible(hwnd):
+                    pid = wintypes.DWORD()
+                    user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+                    name = window_image_name(pid.value)
+                    if any(k in name for k in keywords):
+                        found.append(True)
+                        return False
+            except Exception:  # noqa: BLE001 - 单个窗口读失败不影响整体
+                pass
+            return True
+
+        user32.EnumWindows(enum_proc(_cb), 0)
+        return bool(found)
+    except Exception:  # noqa: BLE001 - 非 Windows/ctypes 异常 → 判不在
+        return False
+
+
+class _WindowProbe:
+    """把「客户端窗口是否存在」包装成 heartbeat()，复用探活 TTL/超时机制。"""
+
+    def __init__(self, engine_key: str):
+        self._engine_key = engine_key
+
+    def heartbeat(self) -> bool:
+        return _window_present(self._engine_key)
+
+
+def _probe_dispatcher_for(engine_key: Optional[str]):
+    """无运行引擎时该通道的探针对象；依赖缺失/未支持返回 None。
+
+    - tdx / ths：本机客户端窗口存在性（不碰 TQ / UI 自动化）；
+    - goldminer / iquant：对应 HTTP 桥 /ping（常驻服务，与会话无关）。
+    """
+    if engine_key in ("tdx", "ths"):
+        return _WindowProbe(engine_key)
+    if engine_key == "goldminer" and HttpBridgeDispatcher is not None:
+        return HttpBridgeDispatcher(base_url=goldminer_config()["base_url"])
+    if engine_key == "iquant" and HttpBridgeDispatcher is not None:
+        return HttpBridgeDispatcher(base_url=iquant_config()["simulation"])
+    return None
+
+
 def _probe_online_quick(engine_key: str, dispatcher) -> Tuple[Optional[bool], bool]:
     """兜底探活：30s TTL 缓存 + 1s 硬超时，返回 (online, stale)。
 
@@ -466,10 +535,11 @@ def channel_status(engine: Optional[LiveEngine] = None,
       耗时 7.7s，其余接口 2–86ms）。
     - 引擎没有已知状态（无 ``bridge_online`` 的替身/旧实现）才回退到探活：30s
       TTL 缓存 + 1s 硬超时，超时沿用上一次已知值并置 ``stale=True``。
-    - **没有运行引擎** → ``online=None``（未检测/待启动），并置
-      ``engine_running=False``。此前无引擎时会另建一个 dispatcher 做 TQ 心跳
-      探测——只要通达信客户端开着就返回 True，工作台因此把「引擎未运行」误显示
-      成「在线」（后端重启后尤其明显，实证 2026-11-04）。
+    - **没有运行引擎**（``engine_key`` 显式传入）→ 仍按通道真实探测，状态词只有
+      在线/离线：tdx/ths 看客户端窗口是否存在（不碰 TQ/UI，避免冻结客户端），
+      goldminer 探 7801、iquant 探 8790 的 HTTP 桥 /ping；探不到判离线。
+      显式 ``engine_key`` 为 None（旧调用）才保留 ``online=None``。
+      ``engine_running`` 单独输出，供前端说明「会话未启动」——不参与在线判定。
 
     新增可选字段：``online_source``（engine/probe/none）、``checked_at``（引擎
     最近一次心跳时点，未知为 None）、``stale``（状态可能已过期）。
@@ -493,11 +563,41 @@ def channel_status(engine: Optional[LiveEngine] = None,
             # 兜底探活（仅无引擎状态的替身/旧实现）：TTL 缓存 + 1s 硬超时。
             online, stale = _probe_online_quick(engine_key or "", running.dispatcher)
             source = "probe"
+    elif engine_key is not None:
+        # 无运行引擎也必须真实探测——「在线/离线」不能靠会话是否启动推断，更不能
+        # 默认亮绿。tdx/ths 看客户端窗口是否在，goldminer/iquant 探对应 HTTP 桥；
+        # 探不到（依赖缺失/异常）一律判离线。复用 30s TTL + 1s 硬超时，不新起轮询。
+        try:
+            probe = _probe_dispatcher_for(engine_key)
+        except Exception:  # noqa: BLE001 - 配置读取失败只影响在线展示
+            probe = None
+        if probe is not None:
+            online, stale = _probe_online_quick(engine_key, probe)
+        else:
+            online, stale = False, False
+        source = "probe"
     data["engine_running"] = running is not None
     data["online"] = online
     data["online_source"] = source
     data["checked_at"] = checked_at
     data["stale"] = stale
+
+    # 四通道卡片统一口径：configured + 一行次要信息（端口/账号/窗口）
+    key = engine_key or data.get("engine")
+    meta = next(
+        (it for it in data.get("engines", []) if it.get("key") == key), None)
+    data["configured"] = bool(meta.get("configured")) if meta else False
+    detail = ""
+    if key == "tdx":
+        detail = "TQ 资金账号 %s" % (tq_trade_config()["account"] or "未配置")
+    elif key == "ths":
+        detail = ths_ui_config()["window_title"] or "同花顺下单窗口"
+    elif key == "goldminer":
+        detail = goldminer_config()["base_url"]
+    elif key == "iquant":
+        # 只报生产的 8790 仿真桥；8791 信用腿非生产、未启用，不进状态卡
+        detail = "HTTP 桥 %s" % iquant_config()["simulation"]
+    data["detail"] = detail
     return data
 
 
@@ -756,6 +856,7 @@ def build_engine(
     signal_file_path: Optional[str] = None,
     advance_close_enabled: Optional[bool] = None,
     advance_close_time: Optional[str] = None,
+    session_mismatch_risk: Optional[bool] = None,
 ) -> LiveEngine:
     """组装一个 session 的 LiveEngine：各组合 Portfolio + dispatcher + BarPoller。
 
@@ -807,9 +908,9 @@ def build_engine(
         .filter(LiveSessionPortfolio.session_id == session_id)
         .all()
     )
-    # 会话级实盘资金基准（账户总资产口径）：非 None 时所有组合以该值起账
-    # （比率配置等比缩放）；None=各组合用自身 initial_capital（现行为）。
-    # 继承持仓的市值由 LiveEngine 从起账现金中扣除，避免与基准重复计入。
+    # 会话级「真实账户总资产」：只作真实侧总闸的兜底上限（桥快照缺失时），
+    # **不**再覆盖各组合起账——分账不分池（2026-11-11 P1-①）：每个组合虚拟现金
+    # 起账 = 该组合配置的 initial_capital，与回测的单组合资金口径一致。
     session_row = db.query(LiveSession).filter(LiveSession.id == session_id).first()
     live_capital = getattr(session_row, "live_capital", None)
     # 外部信号注入（0011）：参数优先；未传回退 session.signal_file_path（会话级配置）
@@ -844,14 +945,13 @@ def build_engine(
             continue
         strategies = db.query(Strategy).filter_by(portfolio_id=ps.id).order_by(Strategy.id).all()
         port = assemble_portfolio(
-            ps, strategies, db, initial_capital_override=live_capital,
+            ps, strategies, db,
             sell_scope=sell_scope,
         )
-        if live_capital is not None:
-            logger.info(
-                "实盘资金基准 %s（组合 %s 配置初始资金 %s）",
-                live_capital, ps.id, ps.initial_capital,
-            )
+        logger.info(
+            "组合 %s 虚拟起账资金 %s（会话真实账户总资产 %s，仅作总闸上限）",
+            ps.id, ps.initial_capital, live_capital,
+        )
         portfolios.append(port)
         benchmark_codes[ps.id] = getattr(ps, "benchmark_index", None) or DEFAULT_BENCHMARK_CODE
         pool_codes = resolve_stock_codes(db, ps.id)
@@ -968,6 +1068,13 @@ def build_engine(
     # 交易日历多源回退链：主源=当前通道 query_calendar；非掘金会话再挂掘金桥
     # /calendar 作备用源（内置官方休市表 BUILTIN_CLOSURES 为末级兜底）。
     from core.engine.live.calendar import TradingCalendar, goldminer_calendar_provider
+    _tq_cfg = load_config().get("tq_trade") or {}
+    if not isinstance(_tq_cfg, dict):
+        _tq_cfg = {}
+    # 错周期 bar 风控：会话三态 NULL → 跟随全局默认（默认 False，对齐回测）
+    if session_mismatch_risk is None:
+        session_mismatch_risk = bool(
+            _tq_cfg.get("intraday_mismatched_risk_enabled", False))
     _calendar_fallbacks = []
     if _engine_key != "goldminer":
         _calendar_fallbacks.append(("goldminer_bridge", goldminer_calendar_provider))
@@ -1000,9 +1107,18 @@ def build_engine(
         # 行情轮询窗口（config.live.quote_polling）：缺键时引擎侧回落安全默认
         # （交易日 09:15–15:05 之外不轮询，收盘后停对桥/TQ 的行情拉取）
         quote_polling=(load_config().get("live") or {}).get("quote_polling"),
-        # 次日盘前（集合竞价）执行日线信号单：config.tq_trade.pre_open_auction*
-        # 缺键/未开启 → 引擎侧 PreOpenAuctionConfig 默认关闭（旧行为逐字不变）
-        pre_open_auction=(load_config().get("tq_trade") or {}),
+        # 次日盘前（集合竞价）执行日线级信号单：config.tq_trade.pre_open_auction*
+        # 缺键 → 引擎侧 PreOpenAuctionConfig 默认开启（对齐回测次日开盘执行）
+        pre_open_auction=(_tq_cfg),
+        # 错周期 bar 风控（会话三态：NULL=跟随全局默认；0/1=显式覆盖）
+        intraday_mismatched_risk_enabled=(
+            bool(session_mismatch_risk)
+        ),
+        # 09:31 deferred 放行「保证成交」开关（默认关=首根 open 限价）
+        deferred_release_ensure_fill=bool(
+            _tq_cfg.get("deferred_release_ensure_fill", False)),
+        # 真实账户总资产（live_capital）：只作真实侧总闸兜底上限，不覆盖组合起账
+        account_total_capital=live_capital,
     )
     # 桥慢响应告警接引擎事件流（risk/bridge_slow，dispatcher 侧已按 endpoint
     # 冷却去重）；仅 HTTP 桥 dispatcher 有 on_slow 钩子，其它通道不受影响。
@@ -1047,6 +1163,9 @@ def list_sessions(db: Session, engines: Optional[Dict[int, LiveEngine]] = None) 
             "advance_close_enabled": bool(s.advance_close_enabled),
             "advance_close_time": s.advance_close_time or "14:51",
             "advance_close_done_date": s.advance_close_done_date,
+            # 错周期 bar 风控（三态原始值：None=跟随全局，true/false=会话覆盖）
+            "intraday_mismatched_risk_enabled":
+                s.intraday_mismatched_risk_enabled,
             "status": s.status,
             # 引擎是否真的在本进程注册表中运行（工作台据此区分「状态陈旧」与
             # 真正运行中：status=running 但 engine_running=false = 后端重启后
@@ -1118,6 +1237,24 @@ def normalize_advance_close(data: dict) -> tuple:
     return enabled, raw
 
 
+def normalize_mismatched_risk(value) -> Optional[bool]:
+    """错周期风控三态归一：None/auto → NULL（跟随全局）；0/1/true/false 显式覆盖。"""
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    text = str(value).strip().lower()
+    if text in ("", "null", "none", "auto", "global"):
+        return None
+    if text in ("1", "true", "yes", "on"):
+        return True
+    if text in ("0", "false", "no", "off"):
+        return False
+    return None
+
+
 def create_session(db: Session, data: dict, mode: str) -> dict:
     """创建 session。新会话默认 alert；老会话由迁移保持 auto。"""
     execution_mode = data.get("execution_mode") or "alert"
@@ -1136,6 +1273,9 @@ def create_session(db: Session, data: dict, mode: str) -> dict:
         # 14:50 提前收盘价（仅 1d）：默认关 + 14:51
         advance_close_enabled=advance_close_enabled,
         advance_close_time=advance_close_time,
+        # 错周期 bar 风控（三态）：NULL=跟随全局默认，0/1=会话覆盖
+        intraday_mismatched_risk_enabled=normalize_mismatched_risk(
+            data.get("intraday_mismatched_risk_enabled")),
     )
     db.add(session)
     db.flush()
@@ -1157,6 +1297,8 @@ def get_session(db: Session, session_id: int, engine: Optional[LiveEngine] = Non
         .filter(LiveSessionPortfolio.session_id == session_id)
         .all()
     )
+    # ③ 外部现金流累计净流入（一次查询，供各组合展示）
+    net_map = cash_flow_net_inflow(db, session_id)
     data = {
         "id": session.id,
         "name": session.name,
@@ -1171,12 +1313,21 @@ def get_session(db: Session, session_id: int, engine: Optional[LiveEngine] = Non
         "advance_close_enabled": bool(session.advance_close_enabled),
         "advance_close_time": session.advance_close_time or "14:51",
         "advance_close_done_date": session.advance_close_done_date,
+        # 错周期 bar 风控（三态原始值：None=跟随全局，true/false=会话覆盖）
+        "intraday_mismatched_risk_enabled":
+            session.intraday_mismatched_risk_enabled,
         "status": session.status,
         "started_at": session.started_at,
         "stopped_at": session.stopped_at,
         "portfolio_ids": sorted(p.portfolio_strategy_id for p in portfolios),
         "portfolios": [
-            {"portfolio_id": p.portfolio_strategy_id, "status": p.status}
+            {
+                "portfolio_id": p.portfolio_strategy_id,
+                "status": p.status,
+                # ③ 外部现金流累计净流入（>0 净入金）：净值/回撤按剔除该值计算
+                "net_inflow": str(
+                    net_map.get(p.portfolio_strategy_id, Decimal("0"))),
+            }
             for p in portfolios
         ],
     }
@@ -1205,9 +1356,203 @@ def get_session(db: Session, session_id: int, engine: Optional[LiveEngine] = Non
     # 账户全貌对齐：最新真实账户快照（总资产/可用资金/市值/持仓明细）。
     # 运行中优先取引擎内存最近一次快照组装（与采集同源），否则查表最近一行。
     data["account_snapshot"] = _latest_account_snapshot(db, session_id, engine)
+    # ⑥ 真实账户总资产 vs 虚拟净值：运行中由引擎在账户采集时比对（偏差 >20%
+    # 每会话告警一次）；未运行无法重算虚拟净值，只回真实侧最后快照。
+    check = getattr(engine, "_latest_equity_check", None) if engine is not None else None
+    if check is None:
+        snap_total = (data.get("account_snapshot") or {}).get("total_asset")
+        check = {
+            "real_total": None if snap_total is None else str(snap_total),
+            "out_of_pool_value": None,
+            "expected_total": None,
+            "virtual_total": None,
+            "deviation_pct": None,
+            "computed_at": None,
+            "note": "会话未运行：虚拟净值需启动后计算",
+        }
+    data["equity_check"] = check
     # 序列化兜底：任何路径混进来的 inf/-inf/nan 在这里归一为 None，
     # 保证 GET /api/live/sessions/{id} 不会因一个脏字段整接口 500。
     return _json_safe(data)
+
+
+# ---------------------------------------------------------------------------
+# 外部现金流台账（③）
+# ---------------------------------------------------------------------------
+# 入金/出金/分红/其他。金额落库为**有符号**：>0 流入，<0 流出；调用方对
+# deposit/dividend/withdraw 只需给正数（符号由类型决定），other 按给定符号判向。
+CASH_FLOW_TYPES = ("deposit", "withdraw", "dividend", "other")
+_CASH_FLOW_SIGN = {"deposit": 1, "withdraw": -1, "dividend": 1}
+
+
+def cash_flow_net_inflow(db: Session, session_id: int) -> Dict[int, Decimal]:
+    """各组合累计外部净流入（正=净入金）。recover 与展示共用同一口径。
+
+    迁移未执行（无 live_cash_flows 表）时降级返回空 dict——现金流是增量能力，
+    不能让会话详情/起账因缺表整体失败。
+    """
+    try:
+        rows = (
+            db.query(LiveCashFlow)
+            .filter(LiveCashFlow.live_session_id == session_id)
+            .all()
+        )
+    except Exception:  # noqa: BLE001
+        db.rollback()
+        logger.warning(
+            "cash_flow_net_inflow: live_cash_flows 读取失败（是否未执行迁移？）"
+            " → 按无外部现金流处理 (session %s)", session_id)
+        return {}
+    out: Dict[int, Decimal] = {}
+    for r in rows:
+        try:
+            amt = Decimal(str(r.amount or 0))
+        except (TypeError, ValueError):
+            continue
+        out[r.portfolio_strategy_id] = (
+            out.get(r.portfolio_strategy_id, Decimal("0")) + amt)
+    return out
+
+
+def record_cash_flow(
+    db: Session,
+    session_id: int,
+    portfolio_id: int,
+    flow_type: str,
+    amount,
+    flow_date=None,
+    note: Optional[str] = None,
+    engine: Optional[LiveEngine] = None,
+) -> Tuple[Optional[dict], Optional[str]]:
+    """登记一笔外部现金流并计入虚拟账本（③）。
+
+    虚拟现金随台账增减（入金加、出金减），同时累计净流入同增——净值/收益率/
+    回撤按「总市值 − 累计净流入」计算，入金/出金不会污染业绩口径（回测无外部
+    现金流，净流入恒 0，两端可比）。
+
+    运行中引擎立即应用（内存态）；未运行只落台账，下次启动 recover 重放。
+    返回 (row_dict, error)。error 非 None 时未落库。
+    """
+    if flow_type not in CASH_FLOW_TYPES:
+        return None, "flow_type 非法，仅支持 %s" % " / ".join(CASH_FLOW_TYPES)
+    try:
+        raw = Decimal(str(amount))
+    except (ArithmeticError, TypeError, ValueError):
+        return None, "金额非法"
+    sign = _CASH_FLOW_SIGN.get(flow_type)
+    # deposit/dividend/withdraw：符号由类型决定（调用方给正数即可）；other 保留符号
+    amt = abs(raw) * sign if sign is not None else raw
+    # 台账落库是 Numeric(15,2)：先量化到分，返回/记账与库内口径一致
+    amt = amt.quantize(Decimal("0.01"))
+    if amt == 0:
+        return None, "金额不能为 0"
+    if flow_date is None:
+        flow_day = now_shanghai().date()
+    elif isinstance(flow_date, date):
+        flow_day = flow_date
+    else:
+        try:
+            flow_day = date.fromisoformat(str(flow_date))
+        except ValueError:
+            return None, "flow_date 须为 YYYY-MM-DD"
+
+    session = db.query(LiveSession.id).filter(LiveSession.id == session_id).first()
+    if session is None:
+        return None, "资源不存在"
+    link = (
+        db.query(LiveSessionPortfolio)
+        .filter_by(session_id=session_id, portfolio_strategy_id=portfolio_id)
+        .first()
+    )
+    if link is None:
+        return None, "组合未关联本会话"
+
+    row = LiveCashFlow(
+        live_session_id=session_id,
+        portfolio_strategy_id=portfolio_id,
+        flow_type=flow_type,
+        amount=amt,
+        flow_date=flow_day,
+        note=(note or None),
+    )
+    db.add(row)
+    try:
+        db.commit()
+        db.refresh(row)
+    except Exception:  # noqa: BLE001 — 多为未执行迁移（无表）
+        db.rollback()
+        logger.exception("record_cash_flow: 台账写入失败 (session %s)", session_id)
+        return None, "现金流台账不可用：请先执行数据库迁移（alembic upgrade head）"
+    applied = False
+    if engine is not None:
+        try:
+            applied = engine.apply_cash_flow(portfolio_id, amt)
+        except Exception:  # noqa: BLE001 — 账已落库，内存应用失败由重启重放兜底
+            logger.exception(
+                "cash flow apply to engine failed (session %s, portfolio %s)",
+                session_id, portfolio_id)
+    net = cash_flow_net_inflow(db, session_id).get(portfolio_id, Decimal("0"))
+    logger.info(
+        "cash flow: session %s 组合 %s %s %s（累计净流入 %s，engine_applied=%s）",
+        session_id, portfolio_id, flow_type, amt, net, applied)
+    return {
+        "id": row.id,
+        "session_id": session_id,
+        "portfolio_id": portfolio_id,
+        "flow_type": flow_type,
+        "amount": str(amt),
+        "flow_date": flow_day.isoformat(),
+        "note": row.note,
+        "net_inflow": str(net),
+        "engine_applied": applied,
+    }, None
+
+
+def list_cash_flows(
+    db: Session, session_id: int, portfolio_id: Optional[int] = None,
+    limit: int = 200,
+) -> Optional[dict]:
+    """外部现金流台账（按日期倒序）+ 各组合累计净流入。session 不存在返回 None。"""
+    session = db.query(LiveSession.id).filter(LiveSession.id == session_id).first()
+    if session is None:
+        return None
+    q = db.query(LiveCashFlow).filter(LiveCashFlow.live_session_id == session_id)
+    if portfolio_id is not None:
+        q = q.filter(LiveCashFlow.portfolio_strategy_id == portfolio_id)
+    try:
+        rows = (
+            q.order_by(LiveCashFlow.flow_date.desc(), LiveCashFlow.id.desc())
+            .limit(max(1, min(int(limit), 1000)))
+            .all()
+        )
+    except Exception:  # noqa: BLE001 — 未执行迁移（无表）→ 空台账 + 提示
+        db.rollback()
+        rows = []
+        logger.warning(
+            "list_cash_flows: live_cash_flows 不可读（是否未执行迁移？）(session %s)",
+            session_id)
+    net = cash_flow_net_inflow(db, session_id)
+    return {
+        "flows": [
+            {
+                "id": r.id,
+                "portfolio_id": r.portfolio_strategy_id,
+                "flow_type": r.flow_type,
+                "amount": str(r.amount),
+                "flow_date": r.flow_date.isoformat() if r.flow_date else None,
+                "note": r.note,
+                "created_at": (
+                    r.created_at.strftime("%Y-%m-%d %H:%M:%S")
+                    if r.created_at else None),
+            }
+            for r in rows
+        ],
+        "net_inflow": [
+            {"portfolio_id": pid, "net_inflow": str(amt)}
+            for pid, amt in sorted(net.items())
+        ],
+        "total_net_inflow": str(sum(net.values(), Decimal("0"))),
+    }
 
 
 def _finite_or_none(value):
@@ -1385,6 +1730,8 @@ def start_session(
             advance_close_enabled=bool(
                 getattr(session, "advance_close_enabled", False)),
             advance_close_time=getattr(session, "advance_close_time", None),
+            session_mismatch_risk=getattr(
+                session, "intraday_mismatched_risk_enabled", None),
         )
     except RuntimeError as e:
         # make_dispatcher 对未知引擎键/依赖缺失（pywinauto 等）/路径账号未配置
@@ -1442,6 +1789,15 @@ def start_session(
     if execution_mode != "alert":
         # 重启恢复：从 live_trades 重放虚拟持仓/虚拟现金（alert 无下单/成交）
         engine.recover(db)
+        # 接缝日锚定：首次启动时把该组合的起账状态（虚拟现金/存量仓）显式落库，
+        # 供增量回测「同起点同分母」续跑。已写定则不覆盖；失败不阻断启动。
+        try:
+            from core.services.incremental_backtest import capture_seam
+            capture_seam(db, session_id, engine)
+        except Exception:  # noqa: BLE001
+            logger.warning(
+                "incremental backtest: 接缝日捕获失败 (session %s)",
+                session_id, exc_info=True)
     return engine, session, None
 
 
@@ -1498,6 +1854,19 @@ def recover_breaker(
         # 未运行：只改 DB（下次 start → recover 只在 count>=3 转手动；count=0 不补挂）
         link.circuit_breaker_count = 0
         link.status = "active"
+        # ⑤ 峰值口径与运行路径一致：默认不重锚（risk_state 里 peak 原样保留，
+        # 回撤基准不变）；仅当配置显式开启时把峰值重锚到最近一次估值。
+        if manual_reset_reanchor_enabled() and link.risk_state:
+            try:
+                state = json.loads(link.risk_state)
+                last = state.get("last_bar_total_value")
+                if last not in (None, 0, "0"):
+                    state["peak_value"] = last
+                    link.risk_state = json.dumps(state, ensure_ascii=False)
+            except (TypeError, ValueError):
+                logger.warning(
+                    "recover_breaker: risk_state 解析失败，峰值保持原值 (session %s, "
+                    "portfolio %s)", session_id, portfolio_id)
         db.commit()
     return True, None
 
@@ -1829,17 +2198,26 @@ def session_orders(db: Session, session_id: int, status: Optional[str] = None) -
     return [serialize_order(o) for o in rows]
 
 
-def session_trades(db: Session, session_id: int) -> Optional[List[dict]]:
-    """成交历史，按 trade_time 倒序。session 不存在返回 None。"""
+def session_trades(
+    db: Session, session_id: int,
+    start_date: Optional[date] = None, end_date: Optional[date] = None,
+) -> Optional[List[dict]]:
+    """成交历史，按 trade_time 倒序。session 不存在返回 None。
+
+    start_date/end_date（上海自然日，闭区间）只做**查询过滤**，不删除任何记录；
+    缺省不过滤，与旧行为一致。trade_time 为上海墙钟 naive，故用同日 00:00 比较。
+    """
     session = db.query(LiveSession).filter(LiveSession.id == session_id).first()
     if not session:
         return None
-    rows = (
-        db.query(LiveTrade)
-        .filter(LiveTrade.live_session_id == session_id)
-        .order_by(LiveTrade.trade_time.desc(), LiveTrade.id.desc())
-        .all()
-    )
+    q = db.query(LiveTrade).filter(LiveTrade.live_session_id == session_id)
+    if start_date is not None:
+        q = q.filter(LiveTrade.trade_time >= datetime(
+            start_date.year, start_date.month, start_date.day))
+    if end_date is not None:
+        q = q.filter(LiveTrade.trade_time < datetime(
+            end_date.year, end_date.month, end_date.day) + timedelta(days=1))
+    rows = q.order_by(LiveTrade.trade_time.desc(), LiveTrade.id.desc()).all()
     return [serialize_trade(t) for t in rows]
 
 

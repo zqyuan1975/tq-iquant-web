@@ -9,8 +9,14 @@ from .evaluator import Evaluator
 from .event import BarEvent, OrderEvent, TradeEvent
 from .decision import DecisionRecorder
 # 涨跌停幅度口径迁至 market_rules（实盘 TdxTqDispatcher 涨跌停前置校验共用）；
-# 此处 re-export 保持既有 import 路径不破。
-from .market_rules import _limit_ratio_for, session_allows, session_allows_bar  # noqa: F401
+# 此处 re-export 保持既有 import 路径不破。回测改用 limit_rule_for：与实盘
+# price_limit.resolve_limit_rule 同源（ST 5% / 创业板 20% / 北交所 30%）。
+from .market_rules import (  # noqa: F401
+    _limit_ratio_for,
+    limit_rule_for,
+    session_allows,
+    session_allows_bar,
+)
 from tq_iquant_shared.constants import TradeType
 
 
@@ -32,6 +38,8 @@ class BacktestEngine:
         benchmark_data: object = None,
         regime_tracker=None,
         daily_close_peak_enabled: bool = False,
+        initial_pending_orders: Optional[List[OrderEvent]] = None,
+        stock_names: Optional[dict] = None,
     ) -> dict:
         """逐 bar 回测主链路。
 
@@ -43,6 +51,11 @@ class BacktestEngine:
         daily_close_peak_enabled：可选保护（默认关）。开启后 peak/max_drawdown 只在
         当日最后一根 bar 更新，避免混合周期粗 bar 的周期末 close（未来价）污染峰值；
         跨日 prev_close/daily_loss bookkeeping 仍每 bar 更新。纯 1d 行为不变。
+        initial_pending_orders：增量续跑用（默认 None=原行为）。上一段区间末遗留的
+        在途单，拷贝进本次 pending 队列，在本段首根可成交 bar 上按原语义成交。
+        stock_names：{stock_code: 证券名称}（默认 None=无名称）。涨跌停幅度与实盘
+        同源（``price_limit.resolve_limit_rule``）：名称含 ST/*ST 的股票按 5%（主板）
+        判定，缺名称时按板块常规幅度（偏宽）。回测无可靠上市日期，新股窗口不生效。
         """
         klines = klines or {}
         signal_cache = signal_cache if signal_cache is not None else {}
@@ -55,7 +68,7 @@ class BacktestEngine:
 
         times = self._build_timeline(klines)
         price_index = self._build_price_index(klines)
-        pending_orders: List[OrderEvent] = []
+        pending_orders: List[OrderEvent] = list(initial_pending_orders or [])
         trades: List[TradeEvent] = []
         snapshots: List[dict] = []
         # #2：已记过 no_market_data 决策事件的订单 id（仅首次延后记 1 条，长停牌不刷屏）
@@ -164,7 +177,13 @@ class BacktestEngine:
                         prev_close = prev_close_map.get((order.stock_code, order.period))
                         if prev_close is not None and prev_close >= Decimal("1"):
                             open_px = bar_open_prices[order.stock_code]
-                            ratio = _limit_ratio_for(order.stock_code)
+                            # 与实盘同源：resolve_limit_rule（ST 5% / 创业板 20% /
+                            # 北交所 30%）；无可靠档位（ETF/转债/未知）回落板块常规幅度。
+                            rule = limit_rule_for(
+                                order.stock_code,
+                                name=(stock_names or {}).get(order.stock_code),
+                            )
+                            ratio = rule.ratio
                             limit_up = (prev_close * (1 + ratio)).quantize(
                                 Decimal("0.01"), rounding=ROUND_HALF_UP)
                             limit_down = (prev_close * (1 - ratio)).quantize(
@@ -180,12 +199,12 @@ class BacktestEngine:
                                         strategy_id=order.strategy_id,
                                         stock_code=order.stock_code,
                                         bar_time=t,
-                                        message="涨跌停约束：%s 开盘价 %s %s（前收 %s ×%s），订单延后至下一 bar 重试"
+                                        message="涨跌停约束：%s 开盘价 %s %s（前收 %s ×%s，%s），订单延后至下一 bar 重试"
                                                 % ("涨停买不进" if is_buy else "跌停卖不出",
                                                    open_px,
                                                    ("≥ 涨停价 %s" % limit_up) if is_buy
                                                    else ("≤ 跌停价 %s" % limit_down),
-                                                   prev_close, ratio),
+                                                   prev_close, ratio, rule.source),
                                     )
                                 deferred.append(order)
                                 continue
@@ -379,6 +398,8 @@ class BacktestEngine:
             "strategy_evaluations": strategy_evaluations,
             # 决策闸门事件（止损/止盈/熔断/资金不足/超仓…逐触发一条），供落库与调参统计
             "decisions": [ev.to_dict() for ev in recorder.drain()],
+            # 段末仍未成交的在途单（增量续跑写入 checkpoint，下一段继续尝试）
+            "pending_orders": pending_orders,
         }
 
     def _exposure_kwargs(self, portfolio: Portfolio, ctx) -> dict:

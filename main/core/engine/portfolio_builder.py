@@ -68,6 +68,11 @@ def assemble_portfolio(
             "buy_commission_rate": Decimal(str(ps.buy_commission_rate)),
             "sell_commission_rate": Decimal(str(ps.sell_commission_rate)),
             "stamp_duty_rate": Decimal(str(ps.stamp_duty_rate)),
+            # 过户费（双向，2026-11-11）：缺键会让 SimulatedDispatcher 恒用构造默认
+            # 0.00001，用户把组合费率置 0 不生效；资金预留 setter 也读同一键。
+            "transfer_fee_rate": Decimal(str(
+                ps.transfer_fee_rate
+                if getattr(ps, "transfer_fee_rate", None) is not None else 0.00001)),
             "slippage": Decimal(str(ps.slippage)),
         },
     )

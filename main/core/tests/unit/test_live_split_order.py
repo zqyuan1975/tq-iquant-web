@@ -89,7 +89,9 @@ class _FakeTdxDispatcher:
     def place_order(self, order):
         if self.reject_next:
             self.reject_next = False
-            raise BridgeOrderRejected("fake reject")
+            # 终态类拒单（资金不足）：P1-3 起「价格闸/涨跌停」类拒单会回 deferred 重排，
+            # 本 fake 用于验证「子单真拒 → 整队中止」，必须走不可重排的终态分支。
+            raise BridgeOrderRejected("可用资金不足")
         self._ref_seq += 1
         ref = "REF%03d" % self._ref_seq
         now = now_shanghai()

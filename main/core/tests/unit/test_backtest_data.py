@@ -457,6 +457,117 @@ def test_convert_market_data_drops_nonpositive_prices():
     assert df["datetime"].to_list() == [ts[0]]
 
 
+# ---------------------------------------------------------------------------
+# _build_polars_kline：向量化实现 vs 原逐格实现 —— 逐值等价性
+# 原实现逐格 df.loc[ts, code] 取值（52 只标的约 2.69s，占回测 1/3），改为按列
+# 一次取值后必须保持完全相同的输出（列名/列顺序/dtype/行序/行数/逐值）。
+# 下面这份 _legacy_* 是原实现的冻结副本，仅作测试基准，勿在生产代码使用。
+# ---------------------------------------------------------------------------
+def _legacy_build_polars_kline(raw, code, timestamps):
+    """原实现（逐格索引 + 逐格 Decimal），作为等价性基准。"""
+    col_data: dict = {"datetime": []}
+    has_any = False
+    for field in svc._OHLCV_FIELDS:
+        col_data[field] = []
+    for ts in timestamps:
+        row_ok = True
+        for field in svc._OHLCV_FIELDS:
+            df = raw.get(field)
+            if df is None or code not in getattr(df, "columns", []):
+                row_ok = False
+                break
+        if not row_ok:
+            continue
+        o = svc._to_decimal(raw["Open"].loc[ts, code])
+        c = svc._to_decimal(raw["Close"].loc[ts, code])
+        if o <= 0 or c <= 0 or c < svc._MIN_TRADE_PRICE:
+            continue
+        has_any = True
+        col_data["datetime"].append(ts)
+        for field in svc._OHLCV_FIELDS:
+            val = raw[field].loc[ts, code]
+            if field == "Volume":
+                col_data[field].append(svc._to_int(val))
+            else:
+                col_data[field].append(svc._to_decimal(val))
+    if not has_any:
+        return None
+    return pl.DataFrame(col_data)
+
+
+def _equivalence_raw():
+    """等价性对比用原始行情：混合 dtype（float/int/str/Decimal/NaN）+ 各类伪影行 + 多股票。
+
+    000001.SZ 第 3 行 Open=0（零价伪影）；第 4 行 Close=0.005（近零价伪影）；
+    第 2 行 Close=-1.0（负价伪影）；600519.SH 第 4 行全 NaN（停牌）。
+    """
+    import pandas as pd
+    ts = [datetime(2026, 7, 29), datetime(2026, 7, 30),
+          datetime(2026, 7, 31), datetime(2026, 8, 3)]
+    base = {
+        "Open": {
+            "000001.SZ": [10.0, 10.2, 0.0, 9.5],
+            "600519.SH": [Decimal("1600.00"), 1610.0, 1595.0, float("nan")],
+        },
+        "High": {
+            "000001.SZ": [10.3, 10.5, 9.2, 9.8],
+            "600519.SH": [1610.0, 1620.5, 1605.0, float("nan")],
+        },
+        "Low": {
+            "000001.SZ": [9.9, 8.9, 8.8, 9.1],
+            "600519.SH": [1590.0, 1600.0, 1590.0, float("nan")],
+        },
+        "Close": {
+            "000001.SZ": [10.2, -1.0, 0.005, 9.6],
+            "600519.SH": [1605.0, 1615.0, 1600.0, float("nan")],
+        },
+        "Volume": {
+            "000001.SZ": ["1000", 1200, 1300, float("nan")],
+            "600519.SH": [200, 210, 180, 190],
+        },
+        "Amount": {
+            "000001.SZ": [10200.0, "9000", 9100.0, 9500.5],
+            "600519.SH": [Decimal("321000"), 339150.0, 288000.0, 300000.0],
+        },
+    }
+    return {field: pd.DataFrame(cols, index=ts) for field, cols in base.items()}
+
+
+@pytest.mark.parametrize("code", ["000001.SZ", "600519.SH", "999999.XX"])
+def test_build_polars_kline_matches_legacy(code):
+    """向量化实现与原逐格实现输出必须逐值等价（含股票缺失 → None）。"""
+    raw = _equivalence_raw()
+    timestamps = list(raw["Close"].index)
+    legacy = _legacy_build_polars_kline(raw, code, timestamps)
+    new = svc._build_polars_kline(raw, code, timestamps)
+    if legacy is None:
+        assert new is None, "原实现返回 None（无有效 bar），新实现也必须返回 None"
+        return
+    assert new is not None
+    assert new.columns == legacy.columns, "列名/列顺序必须一致"
+    assert new.dtypes == legacy.dtypes, "逐列 dtype 必须一致"
+    assert new.height == legacy.height, "行数必须一致"
+    for col in legacy.columns:
+        assert new[col].to_list() == legacy[col].to_list(), f"列 {col} 逐值/行序不一致"
+    assert new.equals(legacy)
+
+
+def test_build_polars_kline_matches_legacy_missing_field():
+    """任一字段整体缺失 → 原实现所有行跳过返回 None，新实现必须一致。"""
+    raw = _equivalence_raw()
+    del raw["Amount"]
+    timestamps = list(raw["Close"].index)
+    assert _legacy_build_polars_kline(raw, "000001.SZ", timestamps) is None
+    assert svc._build_polars_kline(raw, "000001.SZ", timestamps) is None
+
+
+def test_build_polars_kline_matches_legacy_empty_timestamps():
+    """空时间轴 → 两者均返回 None。"""
+    raw = _equivalence_raw()
+    assert _legacy_build_polars_kline(raw, "000001.SZ", []) is None
+    assert svc._build_polars_kline(raw, "000001.SZ", []) is None
+
+
 def test_build_klines_passes_dividend_mode_through(db_session, monkeypatch):
     """dividend_mode='back' → get_history_raw 主段/预热段均传 dividend_type='back'。"""
     import pandas as pd

@@ -145,7 +145,7 @@ def test_run_backtest_happy_path_marks_completed_and_persists(db_session, monkey
         signal_type=SimpleNamespace(value="OPEN"), stock_code="000001.SZ",
         trade_type=SimpleNamespace(value="buy"), price=Decimal("10"),
         quantity=100, amount=Decimal("1000"), commission=Decimal("5"),
-        stamp_duty=Decimal("0"), trade_time=datetime(2026, 7, 30),
+        stamp_duty=Decimal("0"), transfer_fee=Decimal("0"), trade_time=datetime(2026, 7, 30),
     )
     snapshots = [
         {"snap_date": date(2026, 7, 29), "total_value": Decimal("100000"),
@@ -403,7 +403,7 @@ def test_get_record_detail_returns_full_payload(db_session, monkeypatch):
         signal_type=SimpleNamespace(value="OPEN"), stock_code="000001.SZ",
         trade_type=SimpleNamespace(value="buy"), price=Decimal("10"),
         quantity=100, amount=Decimal("1000"), commission=Decimal("5"),
-        stamp_duty=Decimal("0"), trade_time=datetime(2026, 7, 30),
+        stamp_duty=Decimal("0"), transfer_fee=Decimal("0"), trade_time=datetime(2026, 7, 30),
     )
     fake_result = {
         "trades": [trade],
@@ -450,7 +450,7 @@ def test_delete_record_removes_record_and_children(db_session, monkeypatch):
         signal_type=SimpleNamespace(value="OPEN"), stock_code="000001.SZ",
         trade_type=SimpleNamespace(value="buy"), price=Decimal("10"),
         quantity=100, amount=Decimal("1000"), commission=Decimal("5"),
-        stamp_duty=Decimal("0"), trade_time=datetime(2026, 7, 30),
+        stamp_duty=Decimal("0"), transfer_fee=Decimal("0"), trade_time=datetime(2026, 7, 30),
     )
     fake_result = {
         "trades": [trade],
@@ -1843,7 +1843,7 @@ def test_detail_oos_ignores_running_walk_forward(db_session):
 _SNAPSHOT_KEYS = {
     "benchmark_index", "initial_capital", "max_drawdown", "daily_loss_limit",
     "max_holdings", "min_commission", "buy_commission_rate",
-    "sell_commission_rate", "stamp_duty_rate", "slippage", "trading_session",
+    "sell_commission_rate", "stamp_duty_rate", "transfer_fee_rate", "slippage", "trading_session",
     "stock_pool_id", "dividend_mode", "position_sizing",
     "price_limit_check_enabled", "volume_limit_enabled", "volume_limit_ratio",
     "adaptive_slippage_enabled", "slippage_impact_coef",

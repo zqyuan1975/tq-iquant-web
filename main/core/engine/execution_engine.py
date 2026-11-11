@@ -43,6 +43,7 @@ class SimulatedDispatcher(OrderDispatcher):
         buy_commission_rate: Decimal = Decimal("0.00025"),
         sell_commission_rate: Decimal = Decimal("0.00025"),
         stamp_duty_rate: Decimal = Decimal("0.0005"),
+        transfer_fee_rate: Decimal = Decimal("0.00001"),
         slippage: Decimal = Decimal("0"),
         bar_volumes: dict = None,
         slippage_impact_coef: Optional[Decimal] = None,
@@ -59,6 +60,9 @@ class SimulatedDispatcher(OrderDispatcher):
         self.buy_commission_rate = buy_commission_rate
         self.sell_commission_rate = sell_commission_rate
         self.stamp_duty_rate = stamp_duty_rate
+        # 过户费（双向，2026-11-11 补齐）：A 股现行按成交额 0.001% 双边收取。
+        # 默认值与非零，历史回测需重跑才与新口径可比。
+        self.transfer_fee_rate = transfer_fee_rate
         self.slippage = slippage
         self.bar_volumes = bar_volumes
         self.slippage_impact_coef = slippage_impact_coef
@@ -94,6 +98,8 @@ class SimulatedDispatcher(OrderDispatcher):
         rate = self.sell_commission_rate if is_sell else self.buy_commission_rate
         commission = max(self.min_commission, amount * rate)
         stamp_duty = amount * self.stamp_duty_rate if is_sell else Decimal("0")
+        # 过户费：买卖双向按成交额计（组合 transfer_fee_rate，默认 0.001%）
+        transfer_fee = amount * self.transfer_fee_rate
         return TradeEvent(
             strategy_id=order.strategy_id,
             portfolio_id=order.portfolio_id,
@@ -104,6 +110,7 @@ class SimulatedDispatcher(OrderDispatcher):
             amount=amount,
             commission=commission,
             stamp_duty=stamp_duty,
+            transfer_fee=transfer_fee,
             trade_time=order.bar_time,
             signal_type=order.signal_type,
             signal_name=order.signal_name,
@@ -363,12 +370,15 @@ class ExecutionEngine:
             )
         if min_commission is None:
             min_commission = getattr(self._dispatcher, "min_commission", Decimal("5"))
+        # 过户费（双向）：资金拟合必须与成交计费同口径，否则末手可能超现金
+        transfer_rate = getattr(
+            self._dispatcher, "transfer_fee_rate", Decimal("0"))
         for q in (quantity, quantity - lot_size):
             if q < lot_size:
                 continue
             amount = price * q
             commission = max(min_commission, amount * buy_rate)
-            if amount + commission <= cash:
+            if amount + commission + amount * transfer_rate <= cash:
                 return q
         return 0
 
@@ -473,7 +483,10 @@ class ExecutionEngine:
         # 跳空高开时实际成本 > 审批金额，不加此守卫则 deduct_cash 后现金为负。
         if apply and order.trade_type == TradeType.BUY:
             buy_lot = self._lot(order.stock_code)
-            cost = trade.amount + trade.commission + trade.stamp_duty
+            # P2-1：判据必须与 account.apply_trade 的扣款口径一致（含过户费）。
+            # 漏 transfer_fee 时「现金刚好够佣金+印花税」的单会扣出极小负现金。
+            cost = (trade.amount + trade.commission + trade.stamp_duty
+                    + trade.transfer_fee)
             # R2：二次审批触发条件 = 实际成本超现金 或 超策略敞口余量（capital_ratio ×
             # 初始资金 − 策略持仓市值）。跳空高开后实际成交价 > 审批价，即使现金充足，
             # 也可能突破策略级敞口上限——不加该条件则 exposure_cap 被绕过。
@@ -527,7 +540,9 @@ class ExecutionEngine:
             # 费用可覆盖的最大整手倍数；不足一手拒单。
             if order.trade_type == TradeType.BUY:
                 fee_lot = self._lot(order.stock_code)
-                cost = trade.amount + trade.commission + trade.stamp_duty
+                # P2-1：同口径含过户费（account.apply_trade 会扣 transfer_fee）
+                cost = (trade.amount + trade.commission + trade.stamp_duty
+                        + trade.transfer_fee)
                 if cost > account.cash:
                     fit_qty = self._fit_buy_qty_to_cash(
                         trade.price, account.cash, order.quantity, fee_lot
@@ -553,11 +568,17 @@ class ExecutionEngine:
                         trade = self._place(order, price_type)
                         if not trade:
                             return None
-                        cost = trade.amount + trade.commission + trade.stamp_duty
-            # 统一用 apply_trade 更新账户和持仓
-            account.apply_trade(trade)
+                        cost = (trade.amount + trade.commission + trade.stamp_duty
+                                + trade.transfer_fee)
+            # 统一用 apply_trade 更新账户和持仓。顺序固定为「先持仓、后现金」：
+            # 持仓返回**实际扣减量**（卖出可能少于成交数量），现金按该量缩放后的
+            # 成交额入账，避免持仓不足时现金凭空增加（P0-1）。
+            applied = trade.quantity
             if position is not None:
-                position.apply_trade(trade)
+                applied = position.apply_trade(trade)
+                if applied != trade.quantity:
+                    trade = trade.scaled_to(applied)
+            account.apply_trade(trade)
 
         return trade
 

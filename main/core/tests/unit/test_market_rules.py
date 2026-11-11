@@ -7,7 +7,13 @@ _limit_ratio_for 原属 backtest_engine，1.3.1 迁到 core.engine.market_rules 
 from decimal import Decimal
 
 from core.engine.backtest_engine import _limit_ratio_for as from_backtest
-from core.engine.market_rules import _limit_ratio_for, tick_size
+from core.engine.market_rules import (
+    _limit_ratio_for,
+    limit_ratio_for,
+    limit_rule_for,
+    tick_size,
+)
+from core.engine.price_limit import resolve_limit_rule
 
 
 def test_main_board_ten_percent():
@@ -37,6 +43,39 @@ def test_plain_code_without_suffix():
 def test_backtest_engine_reexport_kept():
     """迁移后 backtest_engine 既有导入路径不破（re-export 同一函数）。"""
     assert from_backtest is _limit_ratio_for
+
+
+def test_limit_rule_for_st_main_board_is_five_percent():
+    """回测与实盘同源：名称含 ST 的主板股票 5%。"""
+    rule = limit_rule_for("000001.SZ", name="*ST某某")
+    assert rule.ratio == Decimal("0.05")
+    assert rule.source == "name_st"
+    assert limit_ratio_for("600000.SH", name="ST甲") == Decimal("0.05")
+
+
+def test_limit_rule_for_matches_live_resolver():
+    """同一只票：回测入口与实盘 resolve_limit_rule 逐值一致（有名称时）。"""
+    cases = [
+        ("000001.SZ", "平安银行"),
+        ("000001.SZ", "ST某某"),
+        ("300750.SZ", "宁德时代"),
+        ("688981.SH", "中芯国际"),
+        ("830799.BJ", "艾融软件"),
+    ]
+    for code, name in cases:
+        live = resolve_limit_rule(code, name=name)
+        backtest = limit_rule_for(code, name=name)
+        assert backtest.ratio == live.ratio, (code, name)
+        assert backtest.board == live.board, (code, name)
+
+
+def test_limit_rule_for_unresolved_ratio_falls_back_to_board_ratio():
+    """ETF/转债/未知：resolve 给不出可靠幅度时回落板块常规幅度（保持回测旧口径）。"""
+    for code in ("510300.SH", "113537.SH", "abcdef"):
+        rule = limit_rule_for(code)
+        assert rule.ratio == Decimal("0.10"), code
+        assert rule.source.endswith("_board_fallback"), code
+        assert rule.unlimited is False
 
 
 def test_tick_size_etf_is_one_milli():

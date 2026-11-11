@@ -230,14 +230,14 @@ def _defaults() -> dict:
             "default_engine": "tdx",
             # A-2：在途单超时未成交自动撤单（分钟）；<=0 = 禁用。
             "cancel_unfilled_minutes": 3,
-            # 次日盘前（集合竞价）执行日线信号单：默认关闭。
-            # 关闭 → 行为与旧版完全一致（deferred 单等次一交易日首根完成 1m bar
-            # ——约 09:31——放行，用首根 bar 价格报单）。
+            # 次日盘前（集合竞价）执行日线级信号单：默认开启（对齐回测「次日开盘
+            # 执行」口径）。关闭 → 行为与旧版一致（deferred 单等次一交易日首根完成
+            # 1m bar——约 09:31——放行，用首根 bar 价格报单）。
             # 开启 → 交易日 09:15–09:20（end_time 可配，左闭右开）把「当日 due 的
             # deferred 日线信号单」直接报进集合竞价（柜台接受竞价期委托，实测
             # 竞价期可成交/可撤单）。不依赖任何 1 分钟 bar，不需要快照合成。
             # 价位规则见 live_engine.pre_open_auction_price_bias_pct 注释。
-            "pre_open_auction_enabled": False,
+            "pre_open_auction_enabled": True,
             "pre_open_auction_end_time": "09:20",
             # 盘前委托价相对「信号价（前一日 deferred 单记录的 price，即信号 bar
             # 收盘价）」的让价幅度（%）：买 +bias / 卖 −bias，再夹到当日涨跌停
@@ -252,6 +252,48 @@ def _defaults() -> dict:
             #                 gate=sell_scope 决策事件。买入侧不受影响。
             # 阈值判定（止损/止盈/回撤）仍按整仓成本，本项只收窄卖出数量。
             "live_sell_scope": "full",
+            # 错周期 bar 是否跑风控（全局默认，会话可用
+            # live_sessions.intraday_mismatched_risk_enabled 三态覆盖）：
+            # False（默认，对齐回测）→ 风控只在策略自身周期 bar 上评估：1m/5m 等
+            # 错周期 bar 不再触发止损/止盈/移动止损（周线/月线同样只在自身边界）。
+            # True → 旧行为：任何 bar 都按收盘价评估持仓风险。
+            "intraday_mismatched_risk_enabled": False,
+            # 09:31 deferred 兜底放行的「保证成交」开关：False（默认，可复现优先）
+            # → 限价 = 当日首根 1m bar 开盘价（夹涨跌停、quantize 到分）；True →
+            # 不按首根 open 定价，改用通道默认对手价，优先成交而非价格可复现。
+            "deferred_release_ensure_fill": False,
+        },
+        # 接缝续跑式增量回测：组合策略从接缝日（进入实盘那天）接着往后延，
+        # 每天只跑新交易日，与实盘逐日对照；结果按特征级容差与全量重跑对齐。
+        "incremental_backtest": {
+            "enabled": True,
+            # 每日续跑触发时刻（Asia/Shanghai）：晚于 DailyCloser 的 15:05 日线取数，
+            # 直接复用那轮已取到的日线，不再额外卡通达信行情。
+            "daily_at": "15:10",
+            # 后端某天没开/续跑失败时，下次启动从最后 checkpoint 逐日补齐的上限
+            # （交易日）。超过上限标「断档」并在对照表标红，同时从接缝日重建。
+            "max_catchup_days": 5,
+            # 接缝锚定（默认开）：回测用实盘该组合的起账状态重锚——现金=虚拟起账
+            # 现金、存量仓按成本注入、highest_price 按成本种下，两边同起点同分母。
+            # 关闭 → 用回测自身在接缝日的状态（空账户从接缝日起跑）。
+            "anchor_on_live_start": True,
+            # 每周双跑校验：0=周一 … 5=周六（默认）。到点后从接缝日全量重算对账。
+            "validate_weekday": 5,
+            "validate_at": "18:00",
+            # 续跑复权口径（front/back/dual），默认 dual（前复权信号 + 后复权记账）。
+            # 该值参与参数快照哈希，变更即作废 checkpoint 并从接缝日重跑。
+            "dividend_mode": "dual",
+            # 双跑校验的特征级容差（判据依据见 incremental_backtest 服务注释）。
+            "tolerances": {
+                # 逐日净值相对偏差（%）上限：取整/费用/过户费/T+1 边界噪声远小于此
+                "max_net_dev_pct": 0.5,
+                "mean_net_dev_pct": 0.2,
+                # 逐日成交笔数一致率 / 方向一致率下限（允许极少数边界单跨日漂移）
+                "trade_count_match_ratio": 0.9,
+                "direction_match_ratio": 0.9,
+                # 最大回撤偏差（百分点）：回撤是路径极值，对单日噪声更敏感
+                "max_drawdown_dev_pct": 1.0,
+            },
         },
     }
 

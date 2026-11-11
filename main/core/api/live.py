@@ -1,7 +1,7 @@
 import asyncio
 import json
 import logging
-from datetime import datetime
+from datetime import date, datetime
 from typing import Dict, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Request
@@ -135,6 +135,17 @@ def create_session(data: dict, db: Session = Depends(get_db)):
     if not (14 * 60 + 51 <= minutes <= 14 * 60 + 59):
         return err(400, "advance_close_time 仅支持 14:51–14:59（14:50 bar 闭合后、收盘前）")
     data["advance_close_time"] = advance_close_time
+    # 错周期 bar 风控（nullable 三态）：null/缺省=跟随全局默认；true/false=会话覆盖。
+    mismatch = data.get("intraday_mismatched_risk_enabled")
+    if mismatch is None:
+        data["intraday_mismatched_risk_enabled"] = None
+    elif isinstance(mismatch, bool):
+        pass
+    elif isinstance(mismatch, int) and mismatch in (0, 1):
+        data["intraday_mismatched_risk_enabled"] = bool(mismatch)
+    else:
+        return err(400,
+                   "intraday_mismatched_risk_enabled 仅支持 null / true / false")
     # 组合关联预校验：重复/不存在的 portfolio_id 此前会由 FK/唯一约束抛
     # IntegrityError 变成 500，这里统一拦截成 400 并给出具体 id。
     pids = data.get("portfolio_ids") or []
@@ -322,9 +333,23 @@ def session_orders(session_id: int, status: Optional[str] = None, db: Session = 
 
 
 @router.get("/sessions/{session_id}/trades")
-def session_trades(session_id: int, db: Session = Depends(get_db)):
-    """B4b：成交历史，按 trade_time 倒序。"""
-    rows = svc.session_trades(db, session_id)
+def session_trades(
+    session_id: int,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    db: Session = Depends(get_db),
+):
+    """B4b：成交历史，按 trade_time 倒序。
+
+    可选 ?start_date=YYYY-MM-DD&end_date=YYYY-MM-DD（Asia/Shanghai 自然日，闭区间）；
+    缺省不过滤，返回与旧版一致的全量列表（向后兼容，未删任何成交记录）。
+    """
+    try:
+        start = date.fromisoformat(start_date) if start_date else None
+        end = date.fromisoformat(end_date) if end_date else None
+    except ValueError:
+        return err(400, "start_date/end_date 需为 YYYY-MM-DD")
+    rows = svc.session_trades(db, session_id, start, end)
     if rows is None:
         return err(404, "资源不存在")
     return ok(rows)
@@ -339,6 +364,52 @@ def session_positions(session_id: int, db: Session = Depends(get_db)):
     if rows is None:
         return err(404, "资源不存在")
     return ok(rows)
+
+
+@router.get("/sessions/{session_id}/cash-flows")
+def session_cash_flows(
+    session_id: int,
+    portfolio_id: Optional[int] = None,
+    limit: int = 200,
+    db: Session = Depends(get_db),
+):
+    """外部现金流台账（入金/出金/分红/其他）+ 各组合累计净流入（③）。
+
+    虚拟现金随台账增减，但净值/收益率/回撤按「总市值 − 累计净流入」计算，
+    与回测（无外部现金流）口径一致。
+    """
+    data = svc.list_cash_flows(db, session_id, portfolio_id=portfolio_id, limit=limit)
+    if data is None:
+        return err(404, "资源不存在")
+    return ok(data)
+
+
+@router.post("/sessions/{session_id}/cash-flows")
+def create_cash_flow(session_id: int, data: dict, db: Session = Depends(get_db)):
+    """登记一笔外部现金流（③）。运行中会话立即计入虚拟账本，停止时下次启动重放。
+
+    body: portfolio_id / flow_type(deposit|withdraw|dividend|other) / amount /
+          flow_date(可选 YYYY-MM-DD，默认今天) / note(可选)。
+    deposit/dividend/withdraw 传正数即可（符号由类型决定）；other 按符号判方向。
+    """
+    raw_pid = data.get("portfolio_id", data.get("portfolio_strategy_id"))
+    try:
+        portfolio_id = int(raw_pid)
+    except (TypeError, ValueError):
+        return err(400, "portfolio_id 必填且为整数")
+    row, error = svc.record_cash_flow(
+        db, session_id, portfolio_id,
+        str(data.get("flow_type") or ""),
+        data.get("amount"),
+        flow_date=data.get("flow_date"),
+        note=data.get("note"),
+        engine=_ENGINES.get(session_id),
+    )
+    if error == "资源不存在":
+        return err(404, error)
+    if error is not None:
+        return err(400, error)
+    return ok(row)
 
 
 @router.get("/sessions/{session_id}/decisions")

@@ -2008,6 +2008,12 @@ function buildMetrics(m: BacktestEvaluationItem | null | undefined): MetricRow[]
     { label: '夏普比率', value: num(m.sharpe_ratio, 2), cls: 'text-blue', hint: SHARPE_HINT },
     { label: '卡玛比率', value: num(m.calmar_ratio, 2), cls: 'text-blue' },
     { label: '索提诺比率', value: num(m.sortino_ratio, 2), cls: 'text-blue' },
+    {
+      label: '年化下行波动率',
+      value: pct(m.downside_volatility),
+      cls: 'text-orange',
+      hint: '口径：仅取日收益 < 0 的样本求均方根 × √252（无风险利率不参与），与索提诺比率分母同口径；越低表示下行风险越小',
+    },
     { label: 'VaR (95%)', value: pct(m.var_95), cls: 'text-red' },
     { label: 'CVaR (95%)', value: pct(m.cvar_95), cls: 'text-red' },
     { label: '收益/波动比', value: num(retVolRatio, 2), cls: 'text-blue' },
@@ -2037,6 +2043,12 @@ function buildMetrics(m: BacktestEvaluationItem | null | undefined): MetricRow[]
       hint: '上行捕获率 ÷ Beta：每 1 份市场敞口捕获的上涨幅度倍数。>1 表示持仓个股平均强于指数（超额来自选股）；<1 表示弹性弱于指数',
     },
     { label: '超额最大回撤', value: pct(m.excess_max_drawdown), cls: valueClass(m.excess_max_drawdown) },
+    {
+      label: '超额卡玛比率',
+      value: num(m.excess_calmar_ratio, 2),
+      cls: 'text-blue',
+      hint: '口径：年化超额收益 ÷ |超额最大回撤|；超额最大回撤为 0 时无意义（显示 —）。>1 表示年化超额足以覆盖其自身回撤',
+    },
 
     _group('磨损与仓位'),
     { label: '年化换手率（双边）', value: m.annual_turnover == null ? '—' : `${num(m.annual_turnover, 2)}×/年`, cls: 'text-blue' },
@@ -3053,7 +3065,9 @@ watch(theme, () => {
               <div class="field-row field-span-2">
                 <span class="field-label"></span>
                 <span class="form-hint" style="margin:0">
-                  长周期回测建议用后复权/dual，避免前复权加性压缩导致的近零价假收益
+                  长周期回测建议用后复权/dual，避免前复权加性压缩导致的近零价假收益。
+                  回测成本为模型口径（佣金含最低 5 元、卖出印花税、双边过户费）；实盘成本取柜台
+                  真实值（含费、含送转摊薄，可能为负或未知），<b>两者不可逐日对比</b>。
                 </span>
               </div>
             </div>
@@ -3178,6 +3192,9 @@ watch(theme, () => {
             <div class="guide-block">
               <p class="guide-step"><b>复权模式</b>：front=前复权（默认，历史价被压缩）；back=后复权；
                 <b>dual=前复权信号+后复权记账（推荐）</b>，信号与真实价成交口径一致。</p>
+              <p class="guide-step"><b>成本口径</b>：回测按模型计费（佣金含最低 5 元 / 卖出印花税 /
+                买卖双向过户费），实盘成本取柜台真实成交成本（含费、含送转摊薄，可能为负或未知），
+                <b>两者不可逐日对比</b>；2026-11-11 前发起的历史回测需在新过户费口径下重跑才严格可比。</p>
               <p class="guide-step"><b>评估口径</b>：absolute=绝对收益（年化/回撤/卡玛）；relative=相对收益
                 （信息比率/超额/下行捕获）。仅影响验收块。</p>
             </div>
@@ -3325,7 +3342,7 @@ watch(theme, () => {
           <tr v-for="c in acceptance.checks" :key="c.metric">
             <td>{{ c.label }}</td>
             <td>{{ c.op }} {{ (c.metric.includes('return') || c.metric.includes('drawdown')) ? (c.threshold * 100).toFixed(2) + '%' : c.threshold }}</td>
-            <td>{{ c.value === null ? '—' : (c.metric.includes('return') || c.metric.includes('drawdown')) ? (c.value * 100).toFixed(2) + '%' : c.value.toFixed(4) }}</td>
+            <td>{{ c.value === null ? '—' : (c.metric.includes('return') || c.metric.includes('drawdown')) ? (c.value * 100).toFixed(2) + '%' : c.value.toFixed(2) }}</td>
             <td><span class="badge" :class="c.pass === true ? 'badge-green' : c.pass === false ? 'badge-red' : 'badge-gray'">{{ c.pass === true ? '过' : c.pass === false ? '未过' : '—' }}</span></td>
           </tr>
         </tbody>
@@ -5675,5 +5692,21 @@ watch(theme, () => {
   .summary-section { grid-template-columns: 1fr; }
   .risk-metrics { grid-template-columns: 1fr; }
   .ca-kpi-grid { grid-template-columns: 1fr; }
+}
+/* 小尺寸笔记本（1366×768 / 1280×720，125% 缩放后可视宽约 1093px）：
+   报告页不再限宽居中留白，标题区左对齐避免「返回」按钮压住标题 */
+@media (max-width: 1180px) {
+  .report-page { max-width: 100%; }
+  .report-header { text-align: left; padding-top: 4px; }
+  .back-link { position: static; display: inline-block; margin-bottom: 8px; }
+  .ca-hit-row { grid-template-columns: 1fr; }
+  .chart-container { height: 320px; }
+}
+/* 视口高度不足时收敛图表高度，详情页首屏仍能看到指标而不是只剩一张图 */
+@media (max-height: 820px) {
+  .chart-container { height: 300px; }
+  .ca-chart { min-height: 320px; }
+  .report-header { margin-bottom: 16px; }
+  .section-title { margin: 18px 0 10px; }
 }
 </style>

@@ -166,4 +166,17 @@ describe('formatEvent decision', () => {
     expect(text).toContain('持股数达上限 600000.SH')
     expect(text).toContain('阈值5 实际5')
   })
+
+  it('formats manual_intervention (人工干预) as backend message, not blocked qty', () => {
+    const message = '人工干预：600000.SH 虚拟=1000 真实=600 差额=-400 方向=减少'
+      + ' 原因=柜台少于虚拟台账（人工卖出/转出）（bridge_mirror）'
+    expect(gateLabel('manual_intervention')).toBe('人工干预')
+    const text = formatEvent('decision', {
+      gate: 'manual_intervention', layer: 'live_gate', action: 'notice',
+      stock_code: '600000.SH', requested_qty: 1000, final_qty: 600, message,
+    })
+    // 不得渲染成「需1000股/实发600股」（那不是被拦的委托量）
+    expect(text).toBe(message)
+    expect(text).not.toContain('股被拦')
+  })
 })

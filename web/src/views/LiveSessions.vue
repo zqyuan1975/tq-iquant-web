@@ -7,6 +7,7 @@ import {
   upsertPositionRows, positionHistoryToRows, prependCapped,
   decisionEventToRow, decisionHistoryToRows,
   filterRowsByRange, summarizeDecisionRows, beijingNowHms, TIME_RANGE_OPTIONS,
+  beijingDayKey, rangeStartTs,
   positionRowKey,
   type OrderRow, type TradeRow, type PositionRow, type DecisionRow, type TimeRange,
 } from '../utils/liveWorkbench'
@@ -62,6 +63,10 @@ const form = ref({
   // 提前收盘价轮次时点 HH:MM（默认 14:51，限定 14:51–14:59；委托价需要 14:52
   // 起始 1m bar 的开盘价，故实际轮次不早于 14:52）
   advance_close_time: '14:51' as string,
+  // 错周期风控三态：null=跟随全局（tq_trade.intraday_mismatched_risk_enabled，默认
+  // False=对齐回测：错周期 bar 只更新价格快照，不评估止损/止盈/移动止损）/
+  // true=强制开启（任意 bar 都跑风控）/ false=强制关闭
+  intraday_mismatched_risk_enabled: null as boolean | null,
 })
 
 /** live_capital 归一化：空串/未填 → null（用组合初始资金），否则转数值透传。 */
@@ -149,6 +154,11 @@ const LOG_CAP = 200
 
 // ---- B4b: 工作台（持仓/委托/成交/决策拦截/预警信号）----
 const positions = ref<PositionRow[]>([])
+// 池外仓单列（②「池外（不参与业绩）」）：out_of_pool=true 的柜台外部仓只进展示/对账，
+// 不进虚拟现金、不进净值、不进回撤分母——与参与业绩的策略持仓分表渲染，避免市值被
+// 误读为组合净值的一部分。
+const poolPositions = computed(() => positions.value.filter((p) => p.out_of_pool !== true))
+const outOfPoolPositions = computed(() => positions.value.filter((p) => p.out_of_pool === true))
 const orders = ref<OrderRow[]>([])
 const trades = ref<TradeRow[]>([])
 const decisions = ref<DecisionRow[]>([])
@@ -156,6 +166,10 @@ const decisions = ref<DecisionRow[]>([])
 const orderRange = ref<TimeRange>('today')
 const decRange = ref<TimeRange>('today')
 const filteredOrders = computed(() => filterRowsByRange(orders.value, orderRange.value))
+// 成交默认只看今日（前一交易日的成交仍在库里、切「全部」可查——历史用于重启后
+// 重放重算虚拟持仓/现金，平台不删除任何成交记录）
+const tradeRange = ref<TimeRange>('today')
+const filteredTrades = computed(() => filterRowsByRange(trades.value, tradeRange.value))
 const filteredDecisions = computed(() => filterRowsByRange(decisions.value, decRange.value))
 // 成交转化与决策聚合使用同一筛选区间（decRange），不跟随委托表的 orderRange
 const decRangeOrders = computed(() => filterRowsByRange(orders.value, decRange.value))
@@ -167,6 +181,8 @@ const signalsTotal = ref(0)
 const accountSnapshots = ref<Record<number, any>>({})
 // 交易日历来源/退化状态（详情接口 trading_calendar；仅聚焦会话拉取，不额外轮询）
 const calendarStatus = ref<Record<number, any>>({})
+// 真实账户总资产 vs 虚拟净值（详情接口 equity_check；>20% 后端已告警一次）
+const equityChecks = ref<Record<number, any>>({})
 
 /** 单年日历摘要：正常=来源/交易日数/覆盖区间；退化=来源+标记。 */
 function calendarYearText(year: string, y: any): string {
@@ -354,11 +370,29 @@ function applyToWorkbench(type: string, data: Record<string, unknown>, time: str
   else if (type === 'signal') scheduleSignalsRefresh()
 }
 
+/** 成交区间 → 接口日期参数（今日/近N日只传起点；「全部」不传=服务端全量）。 */
+function tradeDateParams(): { start_date?: string } {
+  const start = rangeStartTs(tradeRange.value)
+  return start == null ? {} : { start_date: beijingDayKey(start) }
+}
+
+/** 成交页签切区间：按新区间重拉。老后端忽略未知查询参数时，仍由前端
+ *  filterRowsByRange 兜底，历史照样能看（不会因后端未重启而丢失入口）。 */
+async function reloadTrades() {
+  const id = activeSessionId
+  if (id === null) return
+  try {
+    const trd = await getLiveTrades(id, tradeDateParams())
+    if (activeSessionId !== id) return
+    trades.value = tradeHistoryToRows(trd)
+  } catch { /* 保持现状 */ }
+}
+
 async function loadHistory(id: number) {
   workbenchEventsSinceLoad = 0
   try {
     const [pos, ord, trd, dec, sig] = await Promise.all([
-      getLivePositions(id), getLiveOrders(id), getLiveTrades(id),
+      getLivePositions(id), getLiveOrders(id), getLiveTrades(id, tradeDateParams()),
       getLiveDecisions(id).catch(() => null),
       getLiveSignals(id, { limit: 200 }).catch(() => null),
     ])
@@ -379,6 +413,7 @@ async function loadHistory(id: number) {
         if (activeSessionId !== id) return
         accountSnapshots.value = { ...accountSnapshots.value, [id]: d?.account_snapshot ?? null }
         calendarStatus.value = { ...calendarStatus.value, [id]: d?.trading_calendar ?? null }
+        equityChecks.value = { ...equityChecks.value, [id]: d?.equity_check ?? null }
       }).catch(() => {})
     } catch { /* api 缺失等 → 辅助卡静默 */ }
     // 竞态补拉（audit C1）：五请求在途期间 SSE 已推过 position/order/trade 时，
@@ -387,7 +422,7 @@ async function loadHistory(id: number) {
     if (workbenchEventsSinceLoad > 0) {
       workbenchEventsSinceLoad = 0
       const [pos2, ord2, trd2] = await Promise.all([
-        getLivePositions(id), getLiveOrders(id), getLiveTrades(id),
+        getLivePositions(id), getLiveOrders(id), getLiveTrades(id, tradeDateParams()),
       ])
       // 补拉同样先验会话未切换（同上）
       if (activeSessionId !== id) return
@@ -526,7 +561,7 @@ async function load() {
 }
 
 function openCreate() {
-  form.value = { name: '', mode: 'simulation', engine: defaultEngineKey(), execution_mode: 'alert', portfolio_ids: [], live_capital: null, signal_file_path: '', advance_close_enabled: false, advance_close_time: '14:51' }
+  form.value = { name: '', mode: 'simulation', engine: defaultEngineKey(), execution_mode: 'alert', portfolio_ids: [], live_capital: null, signal_file_path: '', advance_close_enabled: false, advance_close_time: '14:51', intraday_mismatched_risk_enabled: null }
   showCreate.value = true
 }
 
@@ -538,7 +573,7 @@ async function create() {
   try {
     await createLiveSession({ ...form.value, live_capital: normalizedLiveCapital() })
     showCreate.value = false
-    form.value = { name: '', mode: 'simulation', engine: defaultEngineKey(), execution_mode: 'alert', portfolio_ids: [], live_capital: null, signal_file_path: '', advance_close_enabled: false, advance_close_time: '14:51' }
+    form.value = { name: '', mode: 'simulation', engine: defaultEngineKey(), execution_mode: 'alert', portfolio_ids: [], live_capital: null, signal_file_path: '', advance_close_enabled: false, advance_close_time: '14:51', intraday_mismatched_risk_enabled: null }
     load()
   } catch (e: any) {
     // 后端参数校验失败（名称空/资金≤0 等）返回 code!==0 → 拦截器 reject，
@@ -764,13 +799,28 @@ onUnmounted(closeEventStreams)
               采集于 {{ accountSnapshots[s.id].captured_at }}；BUY 审批额度 = min(虚拟现金, 真实可用 × 0.98)
             </p>
           </template>
-          <p v-else style="margin:4px 0 0;color:var(--ink-soft);font-size:12px">
+          <div
+            v-if="equityChecks[s.id] && equityChecks[s.id].virtual_total"
+            data-test="equity-check"
+            style="display:flex;gap:16px;flex-wrap:wrap;margin-top:4px;font-size:13px"
+          >
+            <span>虚拟净值 <b>{{ equityChecks[s.id].virtual_total }}</b></span>
+            <span>真实总资产 <b>{{ equityChecks[s.id].real_total ?? '—' }}</b></span>
+            <span
+              v-if="equityChecks[s.id].deviation_pct !== null"
+              :style="{ color: Math.abs(Number(equityChecks[s.id].deviation_pct)) > 0.2 ? 'var(--red)' : 'var(--ink-soft)' }"
+            >偏差 <b>{{ (Number(equityChecks[s.id].deviation_pct) * 100).toFixed(2) }}%</b></span>
+            <span style="color:var(--ink-soft)">
+              （真实侧已剔除池外 {{ equityChecks[s.id].out_of_pool_value ?? '—' }}；偏差 &gt;20% 需人工核对账本）
+            </span>
+          </div>
+          <p v-if="!accountSnapshots[s.id]" style="margin:4px 0 0;color:var(--ink-soft);font-size:12px">
             账户快照采集中…（{{ snapshotHint(s.engine) }}）
           </p>
         </div>
       </div>
       <p style="margin:8px 0 0;color:var(--ink-soft);font-size:12px">
-        外部持仓（柜台原有）已自动导入对应会话的虚拟账本纳入风控；不同引擎=不同账户，持仓/资金按会话隔离。
+        池内原有持仓已自动导入对应会话的虚拟账本纳入风控；池外持仓只展示/对账（下表单列「池外（不参与业绩）」）。不同引擎=不同账户，持仓/资金按会话隔离。
       </p>
     </div>
 
@@ -779,7 +829,7 @@ onUnmounted(closeEventStreams)
       <table>
         <thead><tr><th>序号</th><th>组合策略</th><th>子策略</th><th>代码</th><th>数量</th><th>成本价</th><th>市值</th><th>来源</th></tr></thead>
         <tbody>
-          <tr v-for="(p, i) in positions" :key="positionRowKey(p)">
+          <tr v-for="(p, i) in poolPositions" :key="positionRowKey(p)">
             <td style="color:var(--ink-soft)">{{ i + 1 }}</td>
             <td>{{ p.portfolio_id !== null && p.portfolio_id !== undefined ? portfolioName(p.portfolio_id) : '—' }}</td>
             <td>{{ strategyName(p.portfolio_id, p.strategy_id) }}</td>
@@ -796,10 +846,35 @@ onUnmounted(closeEventStreams)
           </tr>
         </tbody>
       </table>
-      <div v-if="positions.length === 0" class="empty-state">
+      <div v-if="poolPositions.length === 0" class="empty-state">
         <p>暂无持仓</p>
         <p>账户原有持仓（非策略买入）以灰色标注为原有持仓；属于本会话股票池的已导入虚拟账本并按真实成本纳入风控，池外外部仓仅展示/对账、不进风控、不占槽位、不代卖；成本 ≤0 显示「成本未知」且不参与风控。</p>
       </div>
+    </div>
+
+    <!-- 池外（不参与业绩）：柜台有仓但代码不在任何组合股票池 → 不进虚拟账本、
+         不进虚拟现金/净值/回撤分母，仅展示与对账 -->
+    <div v-if="wbTab === 'positions' && outOfPoolPositions.length > 0" class="table-wrap">
+      <p style="margin:0 0 8px;font-weight:600">池外（不参与业绩）</p>
+      <table>
+        <thead><tr><th>序号</th><th>代码</th><th>数量</th><th>成本价</th><th>市值（参考）</th><th>说明</th></tr></thead>
+        <tbody>
+          <tr v-for="(p, i) in outOfPoolPositions" :key="positionRowKey(p)">
+            <td style="color:var(--ink-soft)">{{ i + 1 }}</td>
+            <td>{{ p.stock_code }}</td><td>{{ p.quantity }}</td><td>{{ fmtCost(p.avg_cost) }}</td><td>{{ fmtMoney(p.market_value) }}</td>
+            <td>
+              <span class="badge badge-orange"
+                    title="池外外部仓：只进持仓展示与对账，不进虚拟现金/净值/回撤分母，不进风控、不占槽位、不代卖（每日一条 out_of_pool_position 汇总事件）">
+                池外·不参与业绩
+              </span>
+            </td>
+          </tr>
+        </tbody>
+      </table>
+      <p style="margin:8px 0 0;color:var(--ink-soft);font-size:12px">
+        这些代码不在本会话任何组合股票池：不计入虚拟净值、不参与风控、不占槽位、平台不代卖。
+        如需纳入策略管理，请把代码加入对应组合股票池。
+      </p>
     </div>
 
     <!-- 委托 -->
@@ -833,18 +908,32 @@ onUnmounted(closeEventStreams)
 
     <!-- 成交 -->
     <div v-if="wbTab === 'trades'" class="table-wrap">
+      <div style="display:flex;align-items:center;gap:8px;margin:0 0 8px">
+        <span style="font-size:12px;color:var(--ink-soft)">时间范围</span>
+        <select v-model="tradeRange" style="font-size:12px;padding:2px 6px"
+                aria-label="成交时间范围" @change="reloadTrades">
+          <option v-for="opt in TIME_RANGE_OPTIONS" :key="opt.value" :value="opt.value">{{ opt.label }}</option>
+        </select>
+        <span style="font-size:12px;color:var(--ink-faint)">
+          按北京时间自然日 · 默认只看今日 · 共 {{ filteredTrades.length }} 条（历史成交保留，不删除）
+        </span>
+      </div>
       <table>
         <thead><tr><th>时间（北京时间）</th><th>方向</th><th>代码</th><th>价格</th><th>数量</th><th>金额</th></tr></thead>
         <tbody>
-          <tr v-for="t in trades" :key="t.key">
-            <td style="color:var(--ink-soft)">{{ t.time }}</td>
+          <tr v-for="t in filteredTrades" :key="t.key">
+            <td style="color:var(--ink-soft)">
+              <span v-if="t.day" style="color:var(--ink-faint)">{{ t.day }} </span>{{ t.time }}
+            </td>
             <td>{{ tradeTypeLabel(t.trade_type) }}</td>
             <td>{{ t.stock_code }}</td>
             <td>{{ t.price }}</td><td>{{ t.quantity }}</td><td>{{ t.amount }}</td>
           </tr>
         </tbody>
       </table>
-      <div v-if="trades.length === 0" class="empty-state"><p>暂无成交</p></div>
+      <div v-if="filteredTrades.length === 0" class="empty-state">
+        <p>{{ tradeRange === 'today' ? '今日暂无成交（历史成交请切「全部」查看）' : '该时间范围暂无成交' }}</p>
+      </div>
     </div>
 
     <!-- 决策/拦截（调参可观测性：闸门触发聚合 + 逐事件流） -->
@@ -1000,9 +1089,9 @@ onUnmounted(closeEventStreams)
         </span>
       </p>
       <label>实盘资金基准（元）</label>
-      <input v-model="form.live_capital" type="number" min="0" placeholder="留空 = 用组合初始资金" />
+      <input v-model="form.live_capital" type="number" min="0" placeholder="留空 = 只用桥账户快照（不用此兜底）" />
       <p style="font-size:12px;color:var(--ink-faint);margin:2px 0 12px">
-        请填账户「总资产」（可用资金 + 持仓市值）：会话内所有组合以该资金起账，资金占比/单仓/敞口等比率配置等比缩放；多组合各自独立记账。启动后继承的存量持仓市值会从起账现金中扣除，避免与基准重复计入（只填可用资金会低估总资产）。组合资金与实盘差异过大时，高价股可能受一手(100股)约束。
+        请填账户「总资产」（可用资金 + 持仓市值）：它只作<b>真实侧总闸</b>上限（合计下单+在途 ≤ 真实可用，不足时按各组合配置资金占比缩量），<b>不</b>覆盖各组合的虚拟起账；每个组合虚拟现金起账 = 该组合配置的 initial_capital（与回测单组合资金口径一致），多组合各自独立记账。启动后池内继承的存量持仓市值会从该组合起账现金中扣除，避免与基准重复计入；池外持仓（代码不在任何组合股票池）只展示/对账，不进虚拟现金与净值。
       </p>
       <label>外部信号文件路径（通达信条件预警输出，可选）</label>
       <input v-model="form.signal_file_path" placeholder="留空 = 走 TQ 公式计算信号；填写完整文件路径" />
@@ -1033,6 +1122,15 @@ onUnmounted(closeEventStreams)
           <strong>勾选后（仅 1d 提前）</strong>：14:50 用快照合成 1m bar 的收盘价定信号，<strong>委托价取 14:52 起始 1m bar 的开盘价</strong>（考虑报价时延，取不到回退 14:51 起始 bar 的开盘价并推送 fallback 风控事件；两者都取不到则该股本日不下单），该轮 1d 信号<strong>当日尾盘提交成交</strong>（不受 risk_timing=next_day 的次日顺延）。<strong>周线/月线不受影响</strong>（仍收盘落定 + 次日执行）。数量/资金/仓位仍按 14:50 收盘价计算；成本价以柜台成交回填为准。外部信号文件模式下 1d 信号仍来自文件，本时点只补跑日线风控。仅自动模式、仅实盘；当日只执行一次（重启不重复）；会话须在 14:50 前启动。
         </p>
       </template>
+      <label>错周期风控</label>
+      <select v-model="form.intraday_mismatched_risk_enabled" data-field="intraday_mismatched_risk_enabled">
+        <option :value="null">跟随全局（默认关闭，对齐回测）</option>
+        <option :value="true">强制开启（任意 bar 都跑风控）</option>
+        <option :value="false">强制关闭</option>
+      </select>
+      <p style="font-size:12px;color:var(--ink-faint);margin:2px 0 12px">
+        关闭时（全局默认）止损/止盈/移动止损只在策略<strong>自身周期</strong>的边界 bar 上评估：1m/5m 等错周期 bar 只更新价格快照，周线/月线同样只在自身边界评估——与回测口径一致。开启则任何 bar 到达都按收盘价评估持仓风险（旧行为，盘中反应更早但回测无法复现）。历史会话（未设置）恒跟随全局。
+      </p>
       <label>组合策略（可多选）</label>
       <div class="portfolio-check-list">
         <label v-for="p in portfolios" :key="p.id" class="portfolio-check">
@@ -1118,12 +1216,21 @@ onUnmounted(closeEventStreams)
             <p class="guide-note">· <b>卖出范围</b>（tq_trade.live_sell_scope）：full＝按整仓卖（默认，含外部仓）；
               platform_only＝只卖平台自建仓，纯外部仓不代卖并记一条 gate=sell_scope / action=skip。
               本机 platform_only；买入侧不受影响。</p>
-            <p class="guide-note">· <b>次日盘前集合竞价</b>（tq_trade.pre_open_auction_*）：enabled 默认 false（本机 true）、
-              end_time 默认 09:20、price_bias_pct 默认 2.0。窗口 09:15 ≤ now &lt; end_time；仅当日 due 的日线
-              deferred 单生效（1w/1mon 不走盘前）；价＝信号价×(1±bias%) 并夹进当日涨跌停；每单每日至多一次
-              （at-most-once），09:31 首根 1m bar 兜底且已报出的单不重报。盘前单<b>按单</b>下发 price_type=limit，
+            <p class="guide-note">· <b>次日盘前集合竞价</b>（tq_trade.pre_open_auction_*）：enabled 默认 <b>true</b>、
+              end_time 默认 09:20、price_bias_pct 默认 2.0。窗口 09:15 ≤ now &lt; end_time；当日 due 的
+              <b>1d/1w/1mon</b> deferred 单统一生效（due 判定 = signal_bar_date 的下一交易日）；价＝信号价×(1±bias%)
+              并夹进当日涨跌停；每单每日至多一次（at-most-once）。未报出的单由 09:31 首根 1m bar 兜底：
+              <b>限价 = 当日首根 1m 开盘价</b>（取不到退回实时 close 并记 deferred_release/fallback 事件，
+              夹涨跌停后 quantize 到分）；tq_trade.deferred_release_ensure_fill（默认 false）开启才改对手价
+              「保证成交」。开盘后若开盘价已越过限价（买限价 &lt; 开盘价 / 卖限价 &gt; 开盘价）即判必然未成交 →
+              <b>主动撤单</b>并记 pre_open_auction/cancel（09:20–09:25 为交易所不可撤窗口，该段内不发撤单，
+              顺延到 09:30 之后）。盘前单<b>按单</b>下发 price_type=limit，
               <b>无需</b>会话级或 config.yaml 里的 price_type=limit；HTTP 桥通道的闸门判据为桥 /ping 自述支持 limit 或提供
               /price_limit（通达信/同花顺按各自通道能力），若本会话盘前单 /order 回显非 limit 则直接拦下该单。</p>
+            <p class="guide-note">· <b>错周期风控</b>（会话三态 intraday_mismatched_risk_enabled / 全局
+              tq_trade.intraday_mismatched_risk_enabled，默认 false＝对齐回测）：关闭时止损/止盈/移动止损只在
+              策略自身周期的边界 bar 上评估，1m/5m 等错周期 bar 只更新价格快照（周线/月线同样只在自身边界评估）；
+              会话置 true 可恢复「任意 bar 都跑风控」的旧行为。会话级 NULL＝跟随全局。</p>
             <p class="guide-note">· <b>桥超时</b>：live.bridge_read_timeout_seconds=15（单次读取）、
               bridge_connect_timeout_seconds=3（建连）、bridge_timeout_seconds=90（持续离线判死阈值，语义不同）；
               iquant_bridge.request_timeout_seconds 默认 15，掘金保持 30（/quote 首次走云端历史服务慢）。</p>
@@ -1140,8 +1247,9 @@ onUnmounted(closeEventStreams)
               （tdx/iquant/goldminer/ths 同理，同引擎双会话会双份记账交易同一账户；同花顺另有键鼠独占）。</p>
             <p class="guide-step"><b>复制交易</b>：同一组合挂多个会话需选<b>不同引擎</b>（= 不同账户），
               各会话独立记账、同一信号各账户各执行一次（执行偏差自担）；
-              资金基准 live_capital 按各账户「总资产」设置（可用资金 + 持仓市值；继承持仓市值会在起账时扣除；
-              留空则用组合 initial_capital）。</p>
+              live_capital 按各账户「总资产」设置（可用资金 + 持仓市值），只作真实侧总闸上限
+              （桥快照缺失时兜底，不足时按各组合配置资金占比缩量）；各组合虚拟起账恒取自身
+              initial_capital，继承持仓市值从该组合起账现金扣除。</p>
             <p class="guide-note" style="color:var(--red)"><b>禁止</b>：同一资金账号挂两个会话（资金竞争）。</p>
             <p class="guide-step"><b>日线级别默认口径（1d/1w/1mon）</b>：都等<b>周期收盘价落定</b>后
               在 15:05 轮次用完整 bar 算信号，<b>次一交易日开盘执行</b>；14:30 只做日终估值 /

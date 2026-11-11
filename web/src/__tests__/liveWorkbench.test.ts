@@ -4,7 +4,7 @@ import {
   tradeEventToRow, tradeHistoryToRows,
   upsertPositionRows, positionHistoryToRows, prependCapped, positionRowKey,
   parseBeijingTime, beijingDayKey, filterRowsByRange, summarizeDecisionRows,
-  rangeStartTs,
+  rangeStartTs, tradeDayLabel,
 } from '../utils/liveWorkbench'
 
 describe('liveWorkbench', () => {
@@ -71,6 +71,18 @@ describe('liveWorkbench', () => {
       price: 10.5, quantity: 600, amount: 6300, trade_time: '2026-08-05T10:31:00' } as any])
     expect(rows[0].time).toBe('10:31:00')
     expect(rows[0].amount).toBe(6300)
+  })
+
+  it('tradeDayLabel：今天 / 昨天 / MM-DD，无时区旧数据降级为空', () => {
+    const now = Date.parse('2026-11-11T10:00:00+08:00')
+    expect(tradeDayLabel(now, now)).toBe('今天')
+    expect(tradeDayLabel(now - 86400000, now)).toBe('昨天')
+    expect(tradeDayLabel(now - 5 * 86400000, now)).toBe('11-06')
+    expect(tradeDayLabel(null, now)).toBe('')
+    // 带时区的历史行 → 行上带日期标注（今天/昨天/MM-DD，不依赖运行日断言具体值）
+    const rows = tradeHistoryToRows([{ id: 2, stock_code: '600000.SH', trade_type: 'BUY',
+      price: 10, quantity: 100, amount: 1000, trade_time: '2026-11-11T09:31:00+08:00' } as any])
+    expect(rows[0].day).toMatch(/^(今天|昨天|\d{2}-\d{2})$/)
   })
 
   describe('upsertPositionRows', () => {

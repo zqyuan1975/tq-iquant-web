@@ -1,6 +1,7 @@
 from typing import List, Dict, Optional
 from decimal import Decimal
 from datetime import date, datetime, time
+from contextlib import nullcontext
 import logging
 
 from .account import Account
@@ -116,6 +117,14 @@ class Portfolio:
         self.recorder = recorder or NULL_RECORDER
         self.risk_manager.recorder = self.recorder
         self.risk_manager.portfolio_id = portfolio_id
+        # 实盘账本锁（P0-2，默认 None=回测无锁）：LiveEngine 装配时注入引擎级
+        # _book_lock（RLock）。deals 回填池在另一线程插入新仓/镜像 quantity·avg_cost
+        # 时持同一把锁；本类所有「遍历 positions + 读数量/成本」的短临界区经
+        # _book_guard() 取锁 → 不会撞上 dict changed size during iteration，
+        # 止损/减仓数量也取自一致快照（不会读到半更新持仓）。
+        # 注意：只包内存读写的短段（风控判定/额度计算/市值合计），绝不包公式
+        # 求值或任何 I/O —— deals 回填不能被阻塞。
+        self.book_lock = None
         # 卖出范围口径（config.tq_trade.live_sell_scope）：full=按整仓卖（默认，
         # 与改动前逐字一致）；platform_only=只卖 Position.platform_quantity 那部分，
         # 纯外部仓不下单（记 gate=sell_scope 决策事件）。回测不读配置 → 恒 full；
@@ -128,7 +137,16 @@ class Portfolio:
         # 实盘分钟 bar 只含本轮新完成的股票；停牌股整天无 bar。估值必须对所有
         # 持仓用最近已知价，不能把缺席持仓当 0（否则组合总市值瞬间塌掉误触发
         # max_drawdown 熔断，见 2026-08-25 对账）。每根 bar 用其有效 close 刷新。
+        # 跨日不清理（=「最后已知价，跨日持久」，P1-8 三级兜底第一级）。
         self._price_snapshot: Dict[str, Decimal] = {}
+        # 前收快照（P1-8 三级兜底第三级）：跨日滚动时把上一交易日结束时的最新价
+        # 拷进来，仅当「最后已知价 → 成本」两级都取不到时使用。
+        self._prev_close_snapshot: Dict[str, Decimal] = {}
+        self._valuation_date: Optional[date] = None
+        # 本轮无法估值的持仓代码（三级全缺 → 按 0 计市值）：引擎据此记 WARNING +
+        # risk 事件（gate=valuation_missing_price），避免「零估值就地静默」。
+        self._unpriced_codes: set = set()
+        self._unpriced_warned: set = set()
         # 交易成本参数（来自组合表），供 BacktestEngine 构建 dispatcher 时透传
         self.cost_params: Dict = cost_params or {}
         # B5 市场状态闸：当前市场状态标签，由引擎在 on_bar 前注入（None=无状态，
@@ -170,12 +188,40 @@ class Portfolio:
         # am=09:30–11:30、pm=13:00–15:00、full=不筛（默认）。回测按 bar 时间、
         # 实盘按墙钟过滤（窗口定义见 market_rules.session_allows）。
         self.trading_session: str = "full"
+        # 累计外部净流入（③，正=净入金）：入金/出金/分红/其他流水之和。
+        # 虚拟现金随台账增减（入金加现金），但净值/收益率/回撤必须剔除外部
+        # 现金流 → 风险口径统一用 risk_value()/risk_equity()（总市值 − 本值）。
+        # 回测无外部现金流，恒 0，行为与改动前逐字一致。
+        self.external_net_inflow: Decimal = Decimal("0")
 
     def set_recorder(self, recorder) -> None:
         """注入决策采集器（回测/实盘引擎在装配后调用），同步给 risk_manager。"""
         self.recorder = recorder or NULL_RECORDER
         self.risk_manager.recorder = self.recorder
         self.risk_manager.portfolio_id = self.portfolio_id
+
+    def _book_guard(self):
+        """账本锁上下文（P0-2）：实盘返回注入的 RLock，回测返回 nullcontext。
+
+        只用于包裹「遍历 positions + 读持仓字段」的短临界区；公式求值、下单、
+        决策事件落库一律在锁外，避免阻塞 deals 回填。
+        """
+        lock = self.book_lock
+        return lock if lock is not None else nullcontext()
+
+    def _iter_positions(self, ctx: StrategyContext):
+        """并发安全的持仓键值快照（P0-2）。
+
+        实盘 deals 池在另一线程插入新仓/镜面数量，直接迭代 dict 会抛
+        ``RuntimeError: dictionary changed size during iteration``（被 _on_bar 的
+        宽 except 吞成一行 handle_bar error，整批信号与风控丢失）。持账本锁拷
+        ``list(...)`` 拿稳定视图；回测无锁时只做拷贝（开销与原来同量级）。
+        """
+        lock = self.book_lock
+        if lock is None:
+            return list(ctx.positions.items())
+        with lock:
+            return list(ctx.positions.items())
 
     @property
     def fee_reserve_enabled(self) -> bool:
@@ -195,8 +241,12 @@ class Portfolio:
             buy_rate = self.cost_params.get("buy_commission_rate")
             if min_comm is not None and buy_rate is not None:
                 self.account.buy_fee_cfg = (min_comm, buy_rate)
+                # 过户费（双向）与成交计费同口径，避免审批额度少算费用
+                self.account.buy_transfer_fee_rate = Decimal(str(
+                    self.cost_params.get("transfer_fee_rate", 0) or 0))
         else:
             self.account.buy_fee_cfg = None
+            self.account.buy_transfer_fee_rate = Decimal("0")
 
     def _lot(self, stock_code: str) -> int:
         """本组合当前配置下该标的的交易手数（转债 10 张 / 股票 100 股）。"""
@@ -261,8 +311,12 @@ class Portfolio:
         _pending_orders 注入）。OPEN 闸门把在途单也计入 max_positions；
         回测不传（上一 bar 队列已在成交步全部落账/丢弃），本 bar 内
         排队的 OPEN 由内部累计跟踪。
-        mismatched_risk：14:51 提前收盘价轮次专用——False 时周期不匹配的策略
-        整段跳过（周线/月线不得被 1d 提前轮次顺带触发风控）；默认 True 保持原行为。
+        mismatched_risk：错周期 bar 是否跑风控。False 时周期不匹配的策略只更新
+        价格快照，不评估止损/止盈/移动止损（周线/月线同样只在自身周期边界评估）。
+        来源：14:51 提前收盘价轮次显式传 False；实盘其余轮次由会话三态
+        `live_sessions.intraday_mismatched_risk_enabled`（NULL 跟随全局
+        `tq_trade.intraday_mismatched_risk_enabled`，默认 False）解析后传入；
+        默认 True 保持回测/旧调用原行为。
         """
         # 工作副本：本 bar 处理过程中每排一个 OPEN 就地登记，同 bar 后续信号可见
         inflight: Dict[int, set] = {
@@ -412,7 +466,25 @@ class Portfolio:
         return orders
 
     def _check_risks(self, ctx: StrategyContext, bar: BarEvent) -> List[SignalEvent]:
-        """对策略持仓检查止损/止盈/移动止损，返回风控 SignalEvent。"""
+        """风控检查入口：整段持组合账本锁（P0-2）。
+
+        风控判定读 ``quantity/avg_cost/highest_price`` 并写 ``update_high``，必须
+        与 deals 回填的镜面更新互斥——否则可能读到半更新持仓（数量已改、成本未改），
+        算出的止损卖出数量与账本不一致。本段纯内存计算（无 I/O、无公式求值），
+        持锁时间微秒级，不会阻塞回填。
+        """
+        with self._book_guard():
+            return self._check_risks_locked(ctx, bar)
+
+    def _check_risks_locked(self, ctx: StrategyContext, bar: BarEvent) -> List[SignalEvent]:
+        """对策略持仓检查止损/止盈/移动止损，返回风控 SignalEvent。
+
+        口径固化（2026-11-11）：峰值 ``highest_price`` 更新与三类风控判定
+        **一律只用 ``bar.stocks[code].close``**（缺价则跳过该票）。禁止改成
+        high/low/均价：high 是影线极值，会把「持仓期最高价」抬高并放大回撤，
+        让移动止损/止损在 close 未触及时误触发；low 反之会漏触发。回测与实盘
+        共用本函数，改口径等于同时改两端历史结果，必须走独立评审。
+        """
         risk_manager = getattr(ctx, "strategy_risk", None)
         if risk_manager is None:
             # #29：风控未注入不能静默跳过（止损/止盈/移动止损全失效无痕迹）。
@@ -430,7 +502,7 @@ class Portfolio:
             )
             return []
         risks: List[SignalEvent] = []
-        for stock_code, pos in ctx.positions.items():
+        for stock_code, pos in self._iter_positions(ctx):
             if pos.quantity == 0 or stock_code not in bar.stocks:
                 continue
             close = bar.stocks[stock_code]["close"]
@@ -646,7 +718,7 @@ class Portfolio:
             # max_holdings<=0 视为未启用（直接构造 Portfolio 默认不限）。
             port_codes = {
                 code for c in self.strategies
-                for code, p in c.positions.items() if p.quantity > 0
+                for code, p in self._iter_positions(c) if p.quantity > 0
             }
             if self.max_holdings and len(port_codes) >= self.max_holdings:
                 self._rec("max_holdings", "portfolio", "block", ctx, sig, bar,
@@ -667,7 +739,7 @@ class Portfolio:
             # （platform_quantity>0）。回测所有持仓都来自平台成交，与原来数 quantity>0
             # 完全等价（行为不变）；实盘的外部/手工导入仓（platform_quantity=0）不占名额。
             held_positions = {
-                c: p for c, p in ctx.positions.items()
+                c: p for c, p in self._iter_positions(ctx)
                 if p.quantity > 0 and getattr(p, "platform_quantity", 0) > 0
             }
             held = len(held_positions)
@@ -832,7 +904,7 @@ class Portfolio:
         weakest_mom: Optional[Decimal] = None
         cleared = cleared or set()
         bar_date = bar.bar_time.date()
-        for code, p in ctx.positions.items():
+        for code, p in self._iter_positions(ctx):
             if p.quantity == 0 or code == sig.stock_code or code in cleared:
                 continue
             w_close = bar.stocks.get(code, {}).get("close")
@@ -946,7 +1018,7 @@ class Portfolio:
         if master is None:
             return []
         follow_orders: List[OrderEvent] = []
-        for stock_code, pos in slave.positions.items():
+        for stock_code, pos in self._iter_positions(slave):
             if pos.quantity == 0 or stock_code in already_sold:
                 continue
             if self._has_position(master, stock_code):
@@ -995,41 +1067,100 @@ class Portfolio:
         """用本根 bar 的有效 close(>0) 刷新持仓最新价快照。
 
         close=0 是 TQ NaN 规整而来（停牌/无数据），不得采用、不得覆盖已有快照。
+        跨日滚动：新交易日第一次刷新时把上一交易日的最后已知价复制为「前收」
+        （P1-8 三级兜底第三级）。
         """
+        self._roll_valuation_date(bar.bar_time.date())
         for code, ohlcv in bar.stocks.items():
             close = ohlcv.get("close")
             if close is not None and close > 0:
                 self._price_snapshot[code] = close
 
+    def _roll_valuation_date(self, day: date) -> None:
+        """估值日滚动：进入新交易日时把当前最新价快照冻结为「前收」。"""
+        if self._valuation_date is None:
+            self._valuation_date = day
+            return
+        if day <= self._valuation_date:
+            return
+        self._prev_close_snapshot = {
+            code: px for code, px in self._price_snapshot.items() if px > 0}
+        self._valuation_date = day
+
+    def _resolve_price(self, code: str, pos: Position) -> Optional[Decimal]:
+        """持仓估值价三级兜底（P1-8）：最后已知价 → 成本 → 前收。
+
+        旧实现只有「最后已知价 → avg_cost」两级，而成本未知（继承仓桥侧未给
+        cost，avg_cost=0）时会算出市值 0 → 组合净值瞬间塌掉 = 假回撤/假日亏，
+        还会误触 max_drawdown 熔断。三级全缺才返回 None（调用方按 0 计并告警，
+        由引擎记 risk 事件），**绝不把 avg_cost<=0 当成「价格 0」**。
+        """
+        price = self._price_snapshot.get(code)
+        if price is not None and price > 0:
+            return price
+        if pos.avg_cost is not None and pos.avg_cost > 0:
+            return pos.avg_cost
+        prior = self._prev_close_snapshot.get(code)
+        if prior is not None and prior > 0:
+            return prior
+        return None
+
     def _holdings_value(self, ctx: Optional[StrategyContext] = None) -> Decimal:
         """持仓按最近已知价的市值合计（不含现金）。须在 _refresh_price_snapshot 之后调。
 
-        - 有快照价用快照价；从未报过价的回退 avg_cost（持仓成本）；price<=0 同样回退。
+        - 估值价走 ``_resolve_price`` 三级兜底（最后已知价 → 成本 → 前收，P1-8）。
+        - 三级全缺 → 该仓按 0 计并登记到 ``_unpriced_codes``（组合层调用时），
+          引擎据此记 WARNING + risk 事件；同一代码只在首次出现时 WARNING 一次。
         - ctx=None 合计全部策略；否则只算该策略持仓（供回测策略层净值，保证与组合层
           同一口径、Σ策略市值 == 组合市值）。
         """
         market_value = Decimal("0")
         contexts = (ctx,) if ctx is not None else self.strategies
-        for c in contexts:
-            for code, pos in c.positions.items():
-                if pos.quantity == 0:
-                    continue
-                price = self._price_snapshot.get(code)
-                if price is None or price <= 0:
-                    price = pos.avg_cost
-                market_value += price * pos.quantity
+        unpriced: set = set()
+        # 净值/回撤分母的取数口：持账本锁取值，避免与 deals 镜像并发时读到
+        # 半更新持仓（P0-2）。
+        with self._book_guard():
+            for c in contexts:
+                for code, pos in self._iter_positions(c):
+                    if pos.quantity == 0:
+                        continue
+                    price = self._resolve_price(code, pos)
+                    if price is None:
+                        unpriced.add(code)
+                        continue
+                    market_value += price * pos.quantity
+            if ctx is None:
+                self._unpriced_codes = unpriced
+            new_codes = unpriced - self._unpriced_warned
+            self._unpriced_warned &= unpriced
+        for code in sorted(new_codes):
+            self._unpriced_warned.add(code)
+            logger.warning(
+                "估值缺价：%s 无最后已知价/成本未知/无前收，按 0 计市值"
+                "（组合 %s；净值将偏低，已记 risk 事件）",
+                code, self.portfolio_id,
+            )
         return market_value
 
     def holdings_value(self, ctx: StrategyContext) -> Decimal:
         """单策略持仓按最近已知价的市值（回测策略层快照用，口径同 total_value）。"""
         return self._holdings_value(ctx)
 
+    def unpriced_codes(self) -> set:
+        """最近一次组合层估值中「三级兜底全缺、按 0 计市值」的代码（P1-8）。
+
+        引擎每根 bar 估值后取一次，转成 ``gate=valuation_missing_price`` 的
+        risk 事件，让工作台能看见「净值为什么偏低」，而不是静默按 0 估值。
+        """
+        with self._book_guard():
+            return set(self._unpriced_codes)
+
     def positions_detail(self, snap_date: date, ctx: Optional[StrategyContext] = None) -> list:
         """当日持仓明细（供回测快照 positions_json；实盘不调用）。
 
         - ctx=None：组合层，跨策略按 stock_code 聚合（数量/可卖/市值/成本相加）；
           ctx 指定：仅该策略持仓（策略层快照）。
-        - 估值价与 total_value/holdings_value 同口径（最近已知价，无效价回退 avg_cost）。
+        - 估值价与 total_value/holdings_value 同口径（三级兜底，P1-8）。
         - sellable_quantity 走 Position T+1 分桶（snap_date 前买入的份额）。
         - Decimal 字段序列化为字符串，保证 json.dumps 安全；按股票代码升序确定输出。
         """
@@ -1039,9 +1170,7 @@ class Portfolio:
             for code, pos in c.positions.items():
                 if pos.quantity == 0:
                     continue
-                price = self._price_snapshot.get(code)
-                if price is None or price <= 0:
-                    price = pos.avg_cost
+                price = self._resolve_price(code, pos) or Decimal("0")
                 slot = agg.get(code)
                 if slot is None:
                     slot = {
@@ -1082,6 +1211,20 @@ class Portfolio:
     def total_value(self, bar: BarEvent) -> Decimal:
         """组合总市值 = 现金 + 所有策略持仓按最近已知价的市值（回测/实盘共用，审计 #25 去重）。"""
         return self.account.cash + self._refresh_and_value_holdings(bar)
+
+    def risk_value(self, bar: BarEvent) -> Decimal:
+        """风险口径净值 = 总市值 − 累计外部净流入（③，熔断/日亏/回撤的唯一分母）。
+
+        入金/出金/分红会让总市值跳动，但那是外部现金流不是策略表现；回测没有
+        这类流水，实盘若直接用总市值，入金当天会被当成「暴涨」重锚峰值、出金
+        当天被当成回撤触发熔断。剔除净流入后两端口径一致（回测净流入恒 0）。
+        仓位分配/资金审批仍用 ``total_value``（实际购买力，入金理应可用）。
+        """
+        return self.total_value(bar) - self.external_net_inflow
+
+    def risk_equity(self) -> Decimal:
+        """无 bar 时的风险口径净值（日终/重启用）= 现金 + 持仓市值 − 累计净流入。"""
+        return self.account.cash + self._holdings_value() - self.external_net_inflow
 
     def _find_strategy_by_id(self, strategy_id: Optional[int]) -> Optional[StrategyContext]:
         """按 strategy_id 在本组合策略列表中找上下文。"""

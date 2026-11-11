@@ -39,6 +39,10 @@ logger = logging.getLogger("core.engine.live.calendar")
 # A 股连续竞价时段（下单总闸用，与 live_engine 的收盘守卫一致）
 _MARKET_OPEN = time(9, 30)
 _MARKET_CLOSE = time(15, 0)
+# 午休（P2-5）：11:30–13:00 交易所不受理委托。旧实现只判 09:30–15:00，
+# 11:30 边界 bar 触发的单会报进午休（TDX 排队到 13:00、QMT 可能直接拒单）。
+_LUNCH_START = time(11, 30)
+_LUNCH_END = time(13, 0)
 
 _SHANGHAI_TZ = timezone(timedelta(hours=8))
 
@@ -311,11 +315,17 @@ class TradingCalendar:
         return True
 
     def is_trading_allowed(self, now: datetime) -> bool:
-        """是否允许在 ``now`` 时刻下单：交易日 且 09:30–15:00（左闭右开）。"""
+        """是否允许在 ``now`` 时刻下单：交易日 且 09:30–11:30 / 13:00–15:00（左闭右开）。
+
+        P2-5：午休 11:30–13:00 禁报（交易所不受理；11:30 边界 bar 的单不再排进
+        TDX / 被 QMT 拒）。13:00 起正常放行，不影响下午派发。
+        """
         if not self.is_trading_day(now.date()):
             return False
         t = now.time()
-        return _MARKET_OPEN <= t < _MARKET_CLOSE
+        if not (_MARKET_OPEN <= t < _MARKET_CLOSE):
+            return False
+        return not (_LUNCH_START <= t < _LUNCH_END)
 
     # ---------------- 可观测性 ----------------
 

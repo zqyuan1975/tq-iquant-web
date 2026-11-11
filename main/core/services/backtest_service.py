@@ -104,38 +104,44 @@ def _build_polars_kline(raw: dict, code: str, timestamps: list):
 
     TQ 真机返回的 Volume/Amount 可能是 str（如 "1000"），polars 构造时若混入
     str 会 panic。故数值列统一规整：价/金额→Decimal，成交量→int。
+
+    性能：按列一次取值（`df.loc[timestamps, code]` → list），不再逐格索引——原逐格
+    `.loc` 在 52 只标的约 2.69s（占回测总耗时 1/3），是纯 CPU 的取数后转换瓶颈。
+    伪影过滤改为对整列做掩码，输出仍与原实现逐值等价（见 test_backtest_data.py）。
     """
-    col_data: dict = {"datetime": []}
-    has_any = False
+    frames: dict = {}
     for field in _OHLCV_FIELDS:
-        col_data[field] = []
-    for ts in timestamps:
-        row_ok = True
-        for field in _OHLCV_FIELDS:
-            df = raw.get(field)
-            if df is None or code not in getattr(df, "columns", []):
-                row_ok = False
-                break
-        if not row_ok:
-            continue
-        # 伪影过滤：Open/Close ≤0（负价/零价）或 Close 近零（<1分）——前复权加性压缩产物，
-        # 会放大收益/巨量股数，直接丢弃该 bar（不进信号/成交/估值）。
-        o = _to_decimal(raw["Open"].loc[ts, code])
-        c = _to_decimal(raw["Close"].loc[ts, code])
-        if o <= 0 or c <= 0 or c < _MIN_TRADE_PRICE:
-            continue
-        has_any = True
-        col_data["datetime"].append(ts)
-        for field in _OHLCV_FIELDS:
-            val = raw[field].loc[ts, code]
-            if field == "Volume":
-                # 成交量统一规整为 int（TQ 可能返回 str）
-                col_data[field].append(_to_int(val))
-            else:
-                # 价/金额列转 Decimal
-                col_data[field].append(_to_decimal(val))
-    if not has_any:
+        df = raw.get(field)
+        # 任一字段缺失该股票 → 整只股票都无有效 bar（原逐行实现的结果一致）
+        if df is None or code not in getattr(df, "columns", []):
+            return None
+        frames[field] = df
+    if not timestamps:
         return None
+    # 按列一次取值：保持按 timestamps 对齐的口径（原实现逐格 .loc[ts, code] 同义）
+    cols = {
+        field: frames[field].loc[timestamps, code].tolist()
+        for field in _OHLCV_FIELDS
+    }
+    # 数值规整：价/金额→Decimal，成交量→int（TQ 可能返回 str）
+    converted = {
+        field: [
+            _to_int(v) if field == "Volume" else _to_decimal(v)
+            for v in cols[field]
+        ]
+        for field in _OHLCV_FIELDS
+    }
+    # 伪影过滤：Open/Close ≤0（负价/零价）或 Close 近零（<1分）——前复权加性压缩产物，
+    # 会放大收益/巨量股数，直接丢弃该 bar（不进信号/成交/估值）。
+    keep = [
+        o > 0 and c > 0 and c >= _MIN_TRADE_PRICE
+        for o, c in zip(converted["Open"], converted["Close"])
+    ]
+    if not any(keep):
+        return None
+    col_data: dict = {"datetime": [ts for ts, k in zip(timestamps, keep) if k]}
+    for field in _OHLCV_FIELDS:
+        col_data[field] = [v for v, k in zip(converted[field], keep) if k]
     return pl.DataFrame(col_data)
 
 
@@ -426,6 +432,8 @@ PARAMS_SNAPSHOT_FIELDS = (
     "buy_commission_rate",
     "sell_commission_rate",
     "stamp_duty_rate",
+    # 过户费（双向，2026-11-11）：影响成本/盈亏，必须冻结进快照才可复现
+    "transfer_fee_rate",
     "slippage",
     "trading_session",
     "stock_pool_id",
@@ -1053,6 +1061,7 @@ def compute_and_store_robustness(
         trades=[
             {"stock_code": t.stock_code, "trade_type": t.trade_type, "amount": t.amount,
              "commission": t.commission, "stamp_duty": t.stamp_duty,
+             "transfer_fee": t.transfer_fee,
              "price": t.price, "quantity": t.quantity, "bar_time": t.bar_time}
             for t in trades
         ],
@@ -1302,6 +1311,7 @@ def recompute_persistence(
         "bar_time": t.bar_time.date(),
         "trade_type": t.trade_type,
         "amount": t.amount, "commission": t.commission, "stamp_duty": t.stamp_duty,
+        "transfer_fee": t.transfer_fee,
         "price": t.price, "quantity": t.quantity,
         "strategy_id": t.strategy_id, "stock_code": t.stock_code,
     } for t in db.query(BacktestTrade).filter_by(backtest_record_id=record_id).all()]
@@ -1339,6 +1349,7 @@ def ensure_pool_clone(
         daily_loss_limit=src.daily_loss_limit, max_holdings=src.max_holdings,
         min_commission=src.min_commission, buy_commission_rate=src.buy_commission_rate,
         sell_commission_rate=src.sell_commission_rate, stamp_duty_rate=src.stamp_duty_rate,
+        transfer_fee_rate=getattr(src, "transfer_fee_rate", None),
         slippage=src.slippage, trading_session=src.trading_session,
     )
     # 可选项/容量/滑点/口径等其余字段逐项照抄 —— 换池对比必须"只有股票池不同"，
@@ -1451,13 +1462,13 @@ def _f_val(v):
 # 评估指标落库字段（运行落库与离线重算共用，避免两处漂移）
 _EVALUATION_FIELDS = (
     "total_return", "annual_return", "max_drawdown", "volatility",
-    "sharpe_ratio", "sortino_ratio", "calmar_ratio", "win_rate",
+    "sharpe_ratio", "sortino_ratio", "downside_volatility", "calmar_ratio", "win_rate",
     "profit_factor", "total_trades", "closed_trades", "benchmark_return", "avg_holding_days",
     "var_95", "cvar_95", "avg_recovery_days", "max_recovery_days",
     "ulcer_index", "return_stability",
     "beta", "jensen_alpha", "excess_annual_return", "tracking_error",
     "information_ratio", "up_capture_ratio", "down_capture_ratio",
-    "excess_max_drawdown",
+    "excess_max_drawdown", "excess_calmar_ratio",
     "annual_turnover", "total_cost_ratio", "avg_position_utilization",
     "empty_days_ratio", "max_single_weight", "hhi",
     "max_consecutive_loss_days", "max_consecutive_profit_days",
@@ -1520,6 +1531,7 @@ def recompute_evaluation(db: Session, record_id: int) -> Optional[dict]:
             amount=t.amount,
             commission=t.commission,
             stamp_duty=t.stamp_duty,
+            transfer_fee=getattr(t, "transfer_fee", 0),
             trade_time=t.bar_time,
         )
         for t in trades
@@ -2183,6 +2195,30 @@ def _pool_stocks(ps, db: Session) -> list:
     return seen
 
 
+def _pool_stock_names(ps, db: Session) -> dict:
+    """回测股票池的 {stock_code: stock_name}（供涨跌停规则识别 ST）。
+
+    与 `_pool_stocks` 同一池并集口径（组合级 ∪ 策略级）；名称缺失的标的不进
+    字典，引擎按板块常规幅度兜底（偏宽）。db 为 None 时返回空。
+    """
+    if db is None:
+        return {}
+    pool_ids = {ps.stock_pool_id}
+    for s in _portfolio_strategies(ps, db):
+        if s.stock_pool_id is not None:
+            pool_ids.add(s.stock_pool_id)
+    if not pool_ids:
+        return {}
+    rows = db.query(StockPoolStock).filter(
+        StockPoolStock.pool_id.in_(pool_ids)
+    ).all()
+    names: dict = {}
+    for r in rows:
+        if r.stock_name and r.stock_code not in names:
+            names[r.stock_code] = r.stock_name
+    return names
+
+
 def _strategy_periods(ps, db: Session) -> list:
     """所有策略的 period 去重（保持顺序）。"""
     if db is None:
@@ -2272,6 +2308,7 @@ def _persist_result(
             amount=trade.amount,
             commission=trade.commission,
             stamp_duty=trade.stamp_duty,
+            transfer_fee=trade.transfer_fee,
             bar_time=trade.trade_time,
         ))
     for snap in _with_returns(_dedup_daily_by_date(result["snapshots"])):
@@ -2410,6 +2447,7 @@ def _serialize_trade(t: BacktestTrade) -> dict:
         "amount": _f(t.amount),
         "commission": _f(t.commission),
         "stamp_duty": _f(t.stamp_duty),
+        "transfer_fee": _f(t.transfer_fee),
         "bar_time": t.bar_time.isoformat() if t.bar_time else None,
     }
 
@@ -2467,6 +2505,7 @@ def _serialize_evaluation(e: BacktestEvaluation) -> dict:
         "volatility": _f(e.volatility),
         "sharpe_ratio": _f(e.sharpe_ratio),
         "sortino_ratio": _f(e.sortino_ratio),
+        "downside_volatility": _f(e.downside_volatility),
         "calmar_ratio": _f(e.calmar_ratio),
         "win_rate": _f(e.win_rate),
         "profit_factor": _f(e.profit_factor),
@@ -2488,6 +2527,7 @@ def _serialize_evaluation(e: BacktestEvaluation) -> dict:
         "up_capture_ratio": _f(e.up_capture_ratio),
         "down_capture_ratio": _f(e.down_capture_ratio),
         "excess_max_drawdown": _f(e.excess_max_drawdown),
+        "excess_calmar_ratio": _f(e.excess_calmar_ratio),
         "annual_turnover": _f(e.annual_turnover),
         "total_cost_ratio": _f(e.total_cost_ratio),
         "avg_position_utilization": _f(e.avg_position_utilization),
@@ -3502,6 +3542,7 @@ def run_backtest(db: Session, ps: PortfolioStrategy, req,
             benchmark_data=benchmark_data,
             regime_tracker=regime_tracker,
             daily_close_peak_enabled=daily_close_peak_enabled,
+            stock_names=_pool_stock_names(ps, db),
         )
         t7 = datetime.now()
         _log_timing(f"[回测#{record_id}] 引擎逐bar回测: {(t7-t6).total_seconds():.1f}s")

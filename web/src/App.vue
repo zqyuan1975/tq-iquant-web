@@ -10,7 +10,7 @@ const { theme, toggle: toggleTheme } = useTheme()
 
 const titles: Record<string, string> = {
   'dashboard': '状态总览', 'stock-pools': '备选股池', 'formulas': '公式管理', 'portfolios': '组合策略',
-  'backtest': '回测管理', 'backtest-analysis': '回归验证', 'live': '实盘交易', 'system': '系统配置',
+  'backtest': '回测管理', 'backtest-analysis': '回归验证', 'incremental': '增量回测', 'live': '实盘交易', 'system': '系统配置',
 }
 
 interface NavEntry { to: string; label: string; icon: string }
@@ -33,6 +33,7 @@ const NAV_GROUPS: NavGroup[] = [
     items: [
       { to: '/backtest', label: '回测管理', icon: 'backtest' },
       { to: '/backtest/analysis', label: '回归验证', icon: 'backtest' },
+      { to: '/incremental', label: '增量回测', icon: 'backtest' },
       { to: '/live', label: '实盘交易', icon: 'live' },
     ],
   },
@@ -46,6 +47,8 @@ const NAV_GROUPS: NavGroup[] = [
 
 const status = ref<SystemStatus | null>(null)
 const statusFailed = ref(false)
+/** 小屏（≤1100px）侧栏抽屉开关；宽屏下该状态不影响布局 */
+const drawerOpen = ref(false)
 let statusTimer: number | null = null
 let heartbeatTimer: number | null = null
 
@@ -88,6 +91,12 @@ watch(
   { immediate: true },
 )
 
+// 小屏抽屉：路由切换后自动收起，避免挡住内容
+watch(
+  () => route.fullPath,
+  () => { drawerOpen.value = false },
+)
+
 onMounted(() => {
   refreshStatus()
   statusTimer = window.setInterval(refreshStatus, 30000)
@@ -105,7 +114,7 @@ onUnmounted(() => {
 
 <template>
   <div class="app-layout">
-    <aside class="sidebar">
+    <aside class="sidebar" :class="{ 'drawer-open': drawerOpen }">
       <div class="sidebar-header">
         <div class="sidebar-brand">
           <h1 class="sidebar-title">创懿私募基金</h1>
@@ -159,8 +168,16 @@ onUnmounted(() => {
         <button class="btn btn-sm" @click="exitApp" title="退出：关闭后台服务并释放端口">退出</button>
       </div>
     </aside>
+    <div v-if="drawerOpen" class="sidebar-backdrop" @click="drawerOpen = false" />
     <div class="main-container">
       <header class="topbar">
+        <button class="btn btn-sm nav-toggle" @click.stop="drawerOpen = !drawerOpen"
+                :aria-label="drawerOpen ? '收起导航' : '展开导航'" :aria-expanded="drawerOpen">
+          <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+               stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M4 6h16M4 12h16M4 18h16" />
+          </svg>
+        </button>
         <h1 class="app-banner"><span class="wb-1">创懿私募基金</span><span class="wb-2">量化投资平台</span></h1>
       </header>
       <main class="content"><router-view /></main>

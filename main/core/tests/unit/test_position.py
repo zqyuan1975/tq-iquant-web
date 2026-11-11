@@ -25,6 +25,24 @@ def test_is_convertible_bond_prefixes():
     assert is_convertible_bond("510300.SH") is False
 
 
+def test_position_buy_cost_includes_fees():
+    """买入费用（佣金+过户费）摊入持仓成本：与实盘柜台合并均价同口径。"""
+    pos = Position("600000.SH")
+    pos.buy(1000, Decimal("10"), fees=Decimal("7"))
+    assert pos.avg_cost == Decimal("10.007")
+    # 最高价仍按成交价（费用不进价格序列）
+    assert pos.highest_price == Decimal("10")
+
+
+def test_position_sell_pnl_deducts_fees():
+    """卖出盈亏扣佣金+印花税+过户费。"""
+    pos = Position("600000.SH")
+    pos.buy(1000, Decimal("10"))
+    pnl, amount = pos.sell(1000, Decimal("11"), fees=Decimal("11.5"))
+    assert amount == Decimal("11000")
+    assert pnl == Decimal("988.5")
+
+
 def test_lot_size_for():
     """转债 10 张取整开关：关=全部100（原行为）；开=转债10/股票100。"""
     assert lot_size_for("111024.SH", False) == 100

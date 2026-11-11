@@ -16,8 +16,8 @@ partial 不 apply、F7 在途门、I4 命门窗口），本步为**纯搬移**�
 from __future__ import annotations
 
 import logging
-import time
-from datetime import datetime, timezone, timedelta
+import time as _time_mod
+from datetime import date, datetime, time, timedelta, timezone
 from decimal import Decimal
 from typing import Callable, Dict, Optional
 
@@ -82,6 +82,32 @@ _ORDER_STATUS_TERMINAL_REJECTED = (57,)
 # 不加模型列——DB 持久化，Core 重启后仍可识别（区别于进程内 set）。
 _CANCEL_REQUESTED_TAG = "超时撤单请求中："
 
+# 盘前集合竞价单（2026-11-11）：盘前放行路径提交时把 order.bar_time 置为「本次报单
+# 时点」（09:15–09:30 之间），正常路径只会有 ≥09:31 的 bar 时间 —— 据此从 DB 行识别
+# 盘前单，不新增模型列、重启后仍成立（内存 set 重启会丢）。
+# 盘前单的最早撤单时刻 = **09:30 + 阈值分钟**，而不是「提交时刻 + 阈值」：提交可能
+# 发生在 09:16，按提交+3min 会在 09:19 就发撤单，正撞集合竞价不可撤段必被拒。
+_PRE_OPEN_BAR_START = time(9, 15)
+_PRE_OPEN_BAR_END = time(9, 30)
+_PRE_OPEN_CANCEL_BASE = time(9, 30)
+# 交易所不可撤时段（左闭右开）：09:20–09:25 不接受撤单；09:25–09:30 不接受申报与撤单。
+# 处于窗口内的盘前单一律不下发撤单（避免必拒请求 + 失败重试噪声），顺延到 09:30 之后。
+_NON_CANCEL_WINDOWS = ((time(9, 20), time(9, 25)), (time(9, 25), time(9, 30)))
+
+
+def is_pre_open_order(lo) -> bool:
+    """该单是否由盘前集合竞价路径报出（bar_time 落在 09:15–09:30）。"""
+    bar_time = getattr(lo, "bar_time", None)
+    if bar_time is None:
+        return False
+    return _PRE_OPEN_BAR_START <= bar_time.time() < _PRE_OPEN_BAR_END
+
+
+def in_non_cancel_window(now: datetime) -> bool:
+    """now 是否落在交易所不可撤单时段。"""
+    t = now.time()
+    return any(start <= t < end for start, end in _NON_CANCEL_WINDOWS)
+
 # HTTP 桥超长兜底窗口（秒）：超过该窗口仍无法在委托表/成交表追溯 → 收口为 rejected
 # （账务层面的最终结论：这单到底有没有成交，不再等它）。
 # 基准恒为提交时间（created_at），不随重复检查顺延；可用
@@ -97,6 +123,12 @@ _UNTRACEABLE_PENDING_MARKER = "bridge_order_untraceable:"
 _UNTRACEABLE_EXPIRED_MARKER = "bridge_order_untraceable_expired:"
 # 迟到回填纠正后的 error_message 前缀（审计用：该单曾被收口但柜台迟到成交）。
 _LATE_FILL_MARKER = "late_fill_after_untraceable:"
+# 人工核对标记（2026-11-11）：桥通道超过 grace 仍无法在柜台追溯的单**不再判 rejected**
+# ——柜台当日委托查询不含废单、桥重启会丢内存台账，"查不到"不等于"不存在"。判 rejected
+# 会释放同向门，旧单若仍在柜台挂着就会再报一张 → 双份成交（真金白银）。改为保持
+# submitted + 打本标记，并由 _submit_one_order 的同向门禁止该
+# (组合策略, 策略, 代码, 方向) 的自动重报，直到人工核对或柜台回读终态。
+_MANUAL_REVIEW_MARKER = "bridge_order_manual_review:"
 # 在途闸口径（2026-11-10 统一）：同股同向在途门只看「确实还在途」的单。
 # 桥通道 180s（=_ORDER_REF_MATCH_TIMEOUT）后仍无法追溯 → error_message 打
 # _UNTRACEABLE_MARKER 标记，**立即不再占用同股同向门**（止损卖单不被压 10 分钟）；
@@ -222,6 +254,8 @@ class OrderStateMachine:
         # A-2：在途单超时撤单的连续失败计数与已告警标记（进程内，重启归零可接受）。
         self._cancel_fail_counts: Dict[int, int] = {}
         self._cancel_alerted: set = set()
+        # 盘前单「不可撤时段跳过撤单」的当日去重（每天只报一条日志/决策事件）。
+        self._pre_open_cancel_skip_day: Optional[date] = None
         # 已记账成交量（key=LiveOrder.id）：成交回填/撤单收割/收盘清扫多路径可能对
         # 同一单重复调 apply_filled_trade（主池与 deals 池真并发），按累积量做差
         # 只记增量，杜绝虚拟持仓/现金双计。重启 recover 重放后由 seed_applied 回填。
@@ -238,7 +272,7 @@ class OrderStateMachine:
         # 未知方向外部成交的告警抑制表：key=(code, direction, order_ref)
         # → {"first_at": 首次时刻, "count": 当前窗口计数, "last_log_at": 上次聚合时点}
         self._unknown_deal_dirs: Dict[tuple, dict] = {}
-        self._unknown_deal_dir_clock = time.monotonic
+        self._unknown_deal_dir_clock = _time_mod.monotonic
 
     # ------------------------------------------------------------------
     # 持久化 / 匹配
@@ -1348,34 +1382,59 @@ class OrderStateMachine:
                             int(age.total_seconds()),
                         )
                         continue
-                    # 确实毫无踪迹：收口 rejected，释放同股同向在途门（不生成成交、不动账）
-                    self.pending_orders.pop(lo.id, None)
-                    lo.status = "rejected"
-                    lo.error_message = _UNTRACEABLE_EXPIRED_MARKER + (
+                    # 更安全的收口（2026-11-11）：**不判 rejected**。柜台当日委托查询
+                    # 不含废单、桥进程重启会丢内存台账——"查不到"不等于"不存在"。判
+                    # rejected 会释放同向门，旧单若仍在柜台挂着就会再报一张 → 双份成交。
+                    # 这里保持 submitted（不生成成交、不动账），打人工核对标记，并由
+                    # _submit_one_order 的同向门禁止同向自动重报，直到人工核对或回读终态。
+                    # 防御性撤单：本循环入口已跳过带 order_ref 的单（恒为 None），若将来
+                    # 放开条件/已被 probe 认领 ref，先强制撤一次，确认 canceled 才收口。
+                    if lo.order_ref and getattr(
+                            self._ctx.dispatcher, "supports_cancel", True):
+                        try:
+                            canceled = self._ctx.dispatcher.cancel_order(
+                                str(lo.order_ref), lo.stock_code)
+                        except Exception as exc:  # noqa: BLE001
+                            canceled = False
+                            logger.error(
+                                "expire: order %s cancel attempt failed: %r",
+                                lo.id, exc)
+                        self._emit("order", {
+                            "portfolio_id": lo.portfolio_strategy_id,
+                            "order_id": lo.id,
+                            "status": "cancel_requested" if canceled else "submitted",
+                            "stock_code": lo.stock_code,
+                            "trade_type": (lo.trade_type or "").upper(),
+                            "quantity": lo.quantity,
+                            "bar_time": lo.bar_time.isoformat() if lo.bar_time else None,
+                            "message": "过期前强制撤单：%s"
+                                       % ("已确认" if canceled else "未确认"),
+                        })
+                        if canceled:
+                            self.pending_orders.pop(lo.id, None)
+                            lo.status = "canceled"
+                            lo.error_message = _CANCEL_REQUESTED_TAG + "过期前强制撤单已确认"
+                            continue
+                    already = str(lo.error_message or "").startswith(
+                        _MANUAL_REVIEW_MARKER)
+                    lo.error_message = _MANUAL_REVIEW_MARKER + (
                         "超过 %d 分钟无法在柜台查询到该委托（平台单号 %s / 柜台单号 %s），"
-                        "已置已拒以释放同股同向在途门，请人工核对柜台"
+                        "无法确认柜台是否仍挂着该单；已保留在途并阻止同向自动重报，"
+                        "请人工核对柜台后再决定补录或撤单"
                         % (max(1, grace // 60), lo.bridge_order_id or lo.id,
                            lo.order_ref or "-")
                     )
-                    logger.warning(
+                    if already:
+                        continue
+                    logger.error(
                         "expire: order %s %s %s untraceable_expired (age %ds >= grace "
-                        "%ds) — rejected to release in-flight gate",
+                        "%ds) — keep pending for manual review, block auto re-post",
                         lo.id, lo.trade_type, lo.stock_code,
                         int(age.total_seconds()), grace,
                     )
-                    self._emit("order", {
-                        "portfolio_id": lo.portfolio_strategy_id,
-                        "order_id": lo.id,
-                        "status": "rejected",
-                        "stock_code": lo.stock_code,
-                        "trade_type": (lo.trade_type or "").upper(),
-                        "quantity": lo.quantity,
-                        "bar_time": lo.bar_time.isoformat() if lo.bar_time else None,
-                        "error_message": lo.error_message,
-                    })
                     self._emit("risk", {
                         "session_id": session_id,
-                        "rule": "bridge_order_untraceable_expired",
+                        "rule": "bridge_order_manual_review",
                         "order_id": lo.id,
                         "bridge_order_id": lo.bridge_order_id,
                         "broker_order_id": lo.order_ref,
@@ -1387,8 +1446,8 @@ class OrderStateMachine:
                         "grace_seconds": grace,
                         "message": (
                             "委托超过 %d 分钟仍无法在柜台追溯（平台单号 %s，柜台单号 %s，"
-                            "%s %s %s 股，提交于 %s），已收口为已拒以释放同股同向在途门；"
-                            "迟到成交将自动纠正，请人工核对柜台"
+                            "%s %s %s 股，提交于 %s）。已保留在途并禁止同向自动重报，"
+                            "避免旧单仍在柜台时重复下单；请人工核对柜台后补录或撤单"
                             % (max(1, grace // 60), lo.id, lo.order_ref or "-",
                                lo.stock_code, (lo.trade_type or "").upper(), lo.quantity,
                                lo.created_at.isoformat() if lo.created_at else "-")
@@ -1465,6 +1524,35 @@ class OrderStateMachine:
         except Exception:  # noqa: BLE001 — 配置读取故障不阻断主 tick
             return 3
 
+    def _note_non_cancelable_skip(self, now: datetime, count: int) -> None:
+        """盘前单落在不可撤时段（09:20–09:30）→ 跳过撤单，每日一条日志 + 决策事件。
+
+        进程内存去重（重启归零可接受：只是多一条同日提示，不会多发撤单请求）。
+        """
+        if self._pre_open_cancel_skip_day == now.date():
+            return
+        self._pre_open_cancel_skip_day = now.date()
+        logger.warning(
+            "cancel_unfilled: %d pre-open order(s) at %s — 不可撤时段（09:20–09:25 "
+            "不接受撤单、09:25–09:30 不接受申报与撤单），撤单顺延到 09:30 之后",
+            count, now.strftime("%H:%M:%S"),
+        )
+        self._emit("decision", {
+            "session_id": self._ctx.session_id,
+            "gate": "pre_open_auction",
+            "layer": "live_gate",
+            "action": "skip",
+            "rule": "non_cancelable_window",
+            "param_name": "skipped_orders",
+            "param_value": count,
+            "time": now.isoformat(),
+            "message": (
+                "盘前单撤单跳过：%s 处于交易所不可撤时段（09:20–09:25 不接受撤单、"
+                "09:25–09:30 不接受申报与撤单），撤单顺延到 09:30 之后"
+                % now.strftime("%H:%M:%S")
+            ),
+        })
+
     def cancel_unfilled_orders(self, db: Session, pending: Optional[list] = None) -> None:
         """A-2（I-4 + C-1 主路径）：在途单超时未成交 → 真实撤单（每轮主 tick 调用）。
 
@@ -1512,15 +1600,35 @@ class OrderStateMachine:
                 )
                 .all()
             )
-        now_utc = datetime.now(timezone.utc).replace(tzinfo=None)
+        # 时钟统一走 now_shanghai：盘前单的撤单基准是「09:30 这个墙上时刻」，只能用
+        # 本地时间判断；created_at 仍是 UTC naive，按 -8h 换算后参与非盘前单比较。
+        now_local = now_shanghai()
+        now_utc = now_local - timedelta(hours=8)
         threshold = timedelta(minutes=minutes)
-        targets = [
-            lo for lo in pending
-            if lo.status in ("submitted", "partial")
-            and lo.order_ref is not None
-            and lo.created_at is not None
-            and (now_utc - lo.created_at) >= threshold
-        ]
+        targets = []
+        skipped_immovable = 0
+        for lo in pending:
+            if lo.status not in ("submitted", "partial"):
+                continue
+            if lo.order_ref is None or lo.created_at is None:
+                continue
+            if is_pre_open_order(lo):
+                # 盘前单：09:20–09:30 交易所不受理撤单 → 绝不发请求、不记失败（顺延）。
+                if in_non_cancel_window(now_local):
+                    skipped_immovable += 1
+                    continue
+                # 最早撤单时刻 = 09:30 + 阈值（而非提交时刻 + 阈值）。
+                due_at = (
+                    datetime.combine(lo.bar_time.date(), _PRE_OPEN_CANCEL_BASE)
+                    + threshold
+                )
+                if now_local < due_at:
+                    continue
+                targets.append(lo)
+            elif (now_utc - lo.created_at) >= threshold:
+                targets.append(lo)
+        if skipped_immovable:
+            self._note_non_cancelable_skip(now_local, skipped_immovable)
         if not targets:
             return []
         # 已请求撤单的单：委托表已查不到该 ref（撤单且无成交）→ 直接标 canceled；
@@ -1562,14 +1670,18 @@ class OrderStateMachine:
             if ok:
                 self._cancel_fail_counts.pop(lo.id, None)
                 self._cancel_alerted.discard(lo.id)
+                pre_open = is_pre_open_order(lo)
                 lo.error_message = (
-                    _CANCEL_REQUESTED_TAG + "超时未成交已撤单（阈值 %d 分钟）" % minutes
+                    _CANCEL_REQUESTED_TAG
+                    + ("盘前单超时未成交已撤单（自 09:30 起计时 %d 分钟）" % minutes
+                       if pre_open else
+                       "超时未成交已撤单（阈值 %d 分钟）" % minutes)
                 )
                 logger.info(
                     "cancel_unfilled: order %s %s %s cancel requested (ref=%s, "
-                    "age>=%dmin, filled=%s)",
+                    "age>=%dmin, filled=%s, pre_open=%s)",
                     lo.id, lo.trade_type, lo.stock_code, lo.order_ref, minutes,
-                    int(lo.filled_quantity or 0),
+                    int(lo.filled_quantity or 0), pre_open,
                 )
                 # 实现取简：cancel 成功即按既有 backfill 收割一次已成交量（撤单前可能
                 # 已有部分成交）；剩余量按委托表状态（53部撤/54全撤）由 5s 轮询
@@ -1730,6 +1842,43 @@ class OrderStateMachine:
         detach_loaded(db, *remaining)
         self.pending_orders = {lo.id: lo for lo in remaining}
 
+    def _commission_for(self, live_order: LiveOrder, amount: Decimal) -> Decimal:
+        """佣金缺省时按组合费率补算（附加核查：/orders 全成兜底合成的成交没有佣金）。
+
+        桥正常 /deals 会给真实佣金（含最低佣金），此时调用方不进来；只有
+        ``_backfill_from_orders``（/deals 断流，用 /orders 的成交量/成交价兜底）
+        合成的 deal 佣金恒 0。不补算会让虚拟现金比回测多出整笔佣金（回测
+        SimulatedDispatcher 按 max(amount×rate, min_commission) 计佣，买卖双向），
+        日积月累与回测对照时系统性偏高。
+
+        口径与回测/买入审批一致：佣金 = max(amount × 费率, 最低佣金)，费率按
+        方向取 sell/buy_commission_rate；组合缺失或费率缺省 → 0（宁宽勿错）。
+        """
+        if amount is None or amount <= 0:
+            return Decimal("0")
+        portfolio = next(
+            (p for p in self._ctx.portfolios
+             if p.portfolio_id == live_order.portfolio_strategy_id), None)
+        if portfolio is None:
+            return Decimal("0")
+        params = getattr(portfolio, "cost_params", None) or {}
+        is_sell = (live_order.trade_type or "").lower() == "sell"
+        rate = params.get("sell_commission_rate" if is_sell else "buy_commission_rate")
+        if rate is None:
+            rate = params.get("commission_rate")
+        if not rate:
+            return Decimal("0")
+        try:
+            comm = amount * Decimal(str(rate))
+            min_comm = params.get("min_commission")
+            if min_comm is not None:
+                mc = Decimal(str(min_comm))
+                if mc > 0 and comm < mc:
+                    comm = mc
+        except (ArithmeticError, TypeError, ValueError):
+            return Decimal("0")
+        return comm
+
     def _stamp_duty_for(self, live_order: LiveOrder, amount: Decimal) -> Decimal:
         """SELL 印花税补记：按组合 stamp_duty_rate × 成交额（买入恒 0）。
 
@@ -1768,6 +1917,10 @@ class OrderStateMachine:
             return  # 无实际成交（可能已撤），下轮重查
         total_amount = sum(Decimal(str(d.get("amount") or 0)) for d in matched_deals)
         total_commission = sum(Decimal(str(d.get("commission") or 0)) for d in matched_deals)
+        # 附加核查：/orders 全成兜底合成的 deal 佣金恒 0（/deals 断流时），按组合
+        # 费率补算，避免虚拟现金比回测多出一整笔佣金；桥给了真实佣金（>0）则原样用。
+        if total_commission <= 0:
+            total_commission = self._commission_for(live_order, total_amount)
         avg_price = total_amount / Decimal(total_qty)
 
         # 5s 轮询会对同一 partial 反复调本方法；先记旧值，只在量增或状态变化时记日志，避免刷屏。
@@ -1962,18 +2115,29 @@ class OrderStateMachine:
             pos = Position(live_order.stock_code)
             ctx.positions[live_order.stock_code] = pos
         elif pos is None and trade.trade_type == TradeType.SELL:
-            # 虚拟持仓缺失却收到卖出成交：现金会按成交额增加但持仓无从扣减，
-            # 两者口径不一致（对账只能告警）。记日志便于事后定位（手工卖出/
-            # live_trades 回放缺 BUY 等），不阻断记账以免与真实账户现金背离。
+            # 虚拟持仓缺失却收到卖出成交：**不入现金**（P0-1）。虚拟账本里没有可卖
+            # 的份额，按成交额加现金等于凭空增加净值/回撤分母（继承仓重放只有 SELL、
+            # 人工先减仓后若在途单成交、手工卖出都会走到这里）。柜台现金口径由每日
+            # 对账（cash_diff）兜底告警，不在这里补记。
             logger.warning(
                 "live trade: SELL without virtual position (portfolio %s, strategy %s, "
-                "code %s, qty %s, order %s) — cash credited but no position deducted",
+                "code %s, qty %s, order %s) — cash NOT credited (P0-1)",
                 live_order.portfolio_strategy_id, live_order.strategy_id,
                 live_order.stock_code, qty, live_order.id,
             )
-        portfolio.account.apply_trade(trade)
         if pos is not None:
-            pos.apply_trade(trade)
+            # 先持仓、后现金：持仓返回**实际扣减量**（虚拟量可能小于成交数量），
+            # 现金按该量缩放后的成交额入账，两端口径一致（P0-1）。
+            applied = pos.apply_trade(trade)
+            if applied != trade.quantity:
+                logger.warning(
+                    "live trade: fill qty %s exceeds virtual holding, applied %s "
+                    "(portfolio %s, code %s, order %s) — cash scaled to applied (P0-1)",
+                    trade.quantity, applied, live_order.portfolio_strategy_id,
+                    live_order.stock_code, live_order.id,
+                )
+                trade = trade.scaled_to(applied)
+            portfolio.account.apply_trade(trade)
             # B5：持仓变化推送（filled 后真实持仓/成本；pnl 无市价标记暂为 0）
             self._emit("position", {
                 "portfolio_id": live_order.portfolio_strategy_id,

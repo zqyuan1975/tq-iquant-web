@@ -34,7 +34,8 @@ const strategyForm = ref<Record<string, any>>(emptyStrategyForm())
 
 // ===== 枚举 =====
 // 周期取 TQ 公式支持 ∩ QMT 桥 xtdata 交集（open-questions Q4）+ C6 三段式：
-// 1m/5m/15m/30m/1h 走桥 BarPoller + 边界分发；1d 走 14:30 快照；1w/1mon 走通达信注入。
+// 1m/5m/15m/30m/1h 走桥 BarPoller + 边界分发；1d 走 15:05 收盘落定轮次（B 开启时
+// 14:50 定信号 + 14:52 bar 开盘价报单）；1w/1mon 走通达信注入（仅周期末）。
 // 60m 两端都不认。
 const PERIODS = ['1m', '5m', '15m', '30m', '1h', '1d', '1w', '1mon']
 // 基准指数可选集（TQ 指数日线可取，与回测页基准 guard 同集合；默认沪深300）
@@ -86,7 +87,7 @@ const RISK_TIMINGS = [
 // 百分比字段集合（后台存小数，前台输入/显示百分比，提交时 ÷100 转回小数）
 const PORTFOLIO_RATIO_FIELDS = new Set([
   'max_drawdown', 'daily_loss_limit',
-  'buy_commission_rate', 'sell_commission_rate', 'stamp_duty_rate', 'slippage',
+  'buy_commission_rate', 'sell_commission_rate', 'stamp_duty_rate', 'transfer_fee_rate', 'slippage',
   'volume_limit_ratio', 'cash_enhance_position_ratio_threshold',
   'slippage_impact_coef',
 ])
@@ -136,13 +137,14 @@ const PORTFOLIO_GROUPS: { title: string; fields: FieldMeta[] }[] = [
     { key: 'buy_commission_rate', label: '买佣金率', span: 1, type: 'percent', placeholder: '0.025' },
     { key: 'sell_commission_rate', label: '卖佣金率', span: 1, type: 'percent', placeholder: '0.025' },
     { key: 'stamp_duty_rate', label: '印花税率', span: 1, type: 'percent', placeholder: '0.05' },
-    { key: 'slippage', label: '滑点', span: 2, type: 'percent', placeholder: '0' },
+    { key: 'transfer_fee_rate', label: '过户费率', span: 1, type: 'percent', placeholder: '0.001', hint: '买卖双向按成交额计收，A 股现行 0.001%' },
+    { key: 'slippage', label: '滑点', span: 1, type: 'percent', placeholder: '0', hint: '按成交额比例的单边滑点成本，0 表示不模拟' },
   ]},
   { title: '交易时段', fields: [
     { key: 'trading_session', label: '交易时段', span: 2, type: 'select', options: 'sessions' },
   ]},
   { title: '执行真实感', fields: [
-    { key: 'price_limit_check_enabled', label: '涨跌停约束', span: 1, type: 'switch', hint: '涨停买不进/跌停卖不出，延后重试' },
+    { key: 'price_limit_check_enabled', label: '涨跌停校验', span: 1, type: 'switch', hint: '默认开启。回测：涨停买不进/跌停卖不出，延后重试；实盘：下单前拦截并落拒单事件（通达信 TQ / 同花顺生效，QMT/掘金桥无前收数据恒放行）' },
     { key: 'volume_limit_enabled', label: '成交量约束', span: 1, type: 'switch', hint: '按 bar 成交量占比封顶' },
     { key: 'volume_limit_ratio', label: '成交量占比上限', span: 2, type: 'percent', placeholder: '10', showIf: { key: 'volume_limit_enabled', equals: true } },
     { key: 'adaptive_slippage_enabled', label: '自适应滑点', span: 1, type: 'switch', hint: '滑点随订单量占 bar 成交量比例上浮（市场冲击成本）' },
@@ -193,7 +195,7 @@ const STRATEGY_GROUPS: { title: string; hint?: string; fields: FieldMeta[] }[] =
     { key: 'trend_max_positions', label: '趋势最大持仓', span: 1, type: 'number', placeholder: '5', showIf: { key: 'regime_filter_enabled', equals: true } },
     { key: 'exposure_cap_enabled', label: '策略级敞口上限', span: 2, type: 'switch', hint: '总持仓市值 ≤ capital_ratio × 初始资金' },
   ]},
-  { title: '实盘预警调度', hint: '实盘预警（alert 半自动）按此调度推送；每日收盘后发信号请设 15:05，次日开盘操作。', fields: [
+  { title: '实盘预警调度（信号推送时机）', hint: '实盘预警（alert 半自动）按此调度推送；每日收盘后发信号请设 15:05，次日开盘操作。注意：本组只管「什么时候推送信号」，不决定信号算出来后什么时候下单（下单时点见下方「执行控制」的风控执行时点）。', fields: [
     { key: 'signal_frequency', label: '信号频率', span: 1, type: 'select', options: 'signalFrequencies' },
     { key: 'signal_at', label: '推送时点', span: 1, type: 'text', placeholder: 'HH:MM，按频率默认（如 15:05）' },
     { key: 'signal_weekday', label: '周几推送', span: 1, type: 'number', placeholder: '1-5（仅 1w，默认周一）' },
@@ -201,11 +203,11 @@ const STRATEGY_GROUPS: { title: string; hint?: string; fields: FieldMeta[] }[] =
   ]},
   { title: '执行控制', hint: '单笔最大金额=回测/实盘双端生效；重下/拆单/风控时点=仅实盘生效（回测忽略）。重下=撤单后有限追价重下；拆单=TDX 大额拆单。', fields: [
     { key: 'max_order_amount', label: '单笔最大金额（元）', span: 1, type: 'number', placeholder: '留空=不限', hint: 'BUY 审批金额超此值缩量到整手股数（回测/实盘双端生效）' },
-    { key: 'requote_enabled', label: '撤单追价重下', span: 1, type: 'switch', hint: '超时撤单成功后剩余量按 1 个最小报价单位追价重下（限次数）' },
-    { key: 'requote_max_attempts', label: '重试次数', span: 1, type: 'number', placeholder: '2', hint: '追价重下次数上限 0-10' },
+    { key: 'requote_enabled', label: '撤单追价重下', span: 1, type: 'switch', hint: '超时撤单成功后剩余量按 1 个最小报价单位追价重下（买 +1 tick / 卖 −1 tick）。仅当引擎按 cancel_unfilled_minutes 主动超时撤单、且该单收敛为 canceled 才触发；GUI 手动撤单、收盘自动撤单不触发' },
+    { key: 'requote_max_attempts', label: '追价重下次数', span: 1, type: 'number', placeholder: '2', hint: '对应 requote_max_attempts（0–10，默认 2）。与「撤单追价重下」是同一套参数的两个字段（开关 + 次数上限），不是「撤单重试次数」' },
     { key: 'split_order_enabled', label: '大额拆单', span: 1, type: 'switch', hint: '单笔金额超阈值时拆单（TDX 通道，批次2 接线）' },
     { key: 'split_order_threshold', label: '拆单阈值（元）', span: 1, type: 'number', placeholder: '500000' },
-    { key: 'risk_timing', label: '风控执行时点', span: 2, type: 'select', options: 'riskTimings', hint: 'next_day=当日信号次日执行（回测对齐）；immediate=当日确认立即执行' },
+    { key: 'risk_timing', label: '风控执行时点', span: 2, type: 'select', options: 'riskTimings', hint: '按子策略生效（不是全局），仅实盘生效、回测不读该键。next_day=次一交易日执行：盘前集合竞价开启时优先在 09:15–09:20（截止 pre_open_auction_end_time）报出，未报成才回落到首根分钟 bar（约 09:31）；immediate=当 bar 即提交。只有 1d/1w/1mon 且 bar_time 为 00:00 的日线信号才进这道闸——分钟周期策略的风控单 signal_bar_date 为空，两种取值没有差别' },
   ]},
 ]
 
@@ -235,7 +237,7 @@ function emptyPortfolioForm(): Record<string, any> {
     initial_capital: 500000, max_drawdown: 0.2, daily_loss_limit: 0.05,
     max_holdings: 10,
     min_commission: 5, buy_commission_rate: 0.00025, sell_commission_rate: 0.00025,
-    stamp_duty_rate: 0.0005, slippage: 0,
+    stamp_duty_rate: 0.0005, transfer_fee_rate: 0.00001, slippage: 0,
     trading_session: 'full', status: 'active',
     price_limit_check_enabled: true, volume_limit_enabled: false, volume_limit_ratio: 0.1,
     adaptive_slippage_enabled: false, slippage_impact_coef: 0.1,
@@ -390,7 +392,8 @@ function validatePortfolioPayload(p: Record<string, unknown>): string | null {
   }
   if ((num(p.min_commission) ?? 0) < 0) return '最低佣金不能为负'
   for (const [k, label] of [['buy_commission_rate', '买入佣金率'], ['sell_commission_rate', '卖出佣金率'],
-                            ['stamp_duty_rate', '印花税率'], ['slippage', '滑点']] as const) {
+                            ['stamp_duty_rate', '印花税率'], ['transfer_fee_rate', '过户费率'],
+                            ['slippage', '滑点']] as const) {
     const n = num(p[k])
     if (n !== null && !(n >= 0 && n <= 0.5)) return `${label} 须在 [0, 0.5]`
   }
@@ -436,7 +439,7 @@ function validateStrategyPayload(p: Record<string, unknown>): string | null {
   if (wd !== null && !(wd >= 1 && wd <= 5)) return '周几推送须为 1-5'
   // 实盘执行（批次1，与后端 _validate_execution_config 同口径）
   const rma = num(p.requote_max_attempts)
-  if (rma !== null && !(rma >= 0 && rma <= 10)) return '重试次数须在 [0,10]'
+  if (rma !== null && !(rma >= 0 && rma <= 10)) return '追价重下次数须在 [0,10]（requote_max_attempts）'
   const moa = num(p.max_order_amount)
   if (moa !== null && moa <= 0) return '单笔最大金额须大于 0'
   const sot = num(p.split_order_threshold)
@@ -476,6 +479,7 @@ async function openEditPortfolio(p: PortfolioItem) {
     buy_commission_rate: detail.buy_commission_rate ?? 0.00025,
     sell_commission_rate: detail.sell_commission_rate ?? 0.00025,
     stamp_duty_rate: detail.stamp_duty_rate ?? 0.0005,
+    transfer_fee_rate: detail.transfer_fee_rate ?? 0.00001,
     slippage: detail.slippage ?? 0,
     trading_session: detail.trading_session, status: detail.status,
     price_limit_check_enabled: detail.price_limit_check_enabled,
@@ -822,8 +826,8 @@ onMounted(loadPortfolios)
                       <td>动态=按当前净值分配资金（复利）；固定=按初始资金（保守）。</td></tr>
                   <tr><td>容量上限</td><td>仓位与现金管理</td><td>不设上限</td>
                       <td>动态仓位的资金封顶；净值超上限后仓位不再放大（模拟超容量撤回/封盘）。</td></tr>
-                  <tr><td>涨跌停约束</td><td>执行真实感</td><td>开</td>
-                      <td>涨停买不进/跌停卖不出，延后重试。</td></tr>
+                  <tr><td>涨跌停校验</td><td>执行真实感</td><td>开</td>
+                      <td>默认开启。回测：涨停买不进/跌停卖不出，延后重试；实盘：下单前拦截（拒单 + 决策事件），仅通达信 TQ / 同花顺通道可校验，QMT/掘金桥无前收数据恒放行。</td></tr>
                   <tr><td>成交量约束</td><td>执行真实感</td><td>关</td>
                       <td>单笔成交 ≤ 当日成交量 × 占比，超限缩量或延后。</td></tr>
                   <tr><td>自适应滑点</td><td>执行真实感</td><td>关</td>
@@ -951,7 +955,7 @@ onMounted(loadPortfolios)
                 轮动动量窗口=看多少根 bar 的涨幅。</p>
               <p class="guide-step"><b>市场状态闸（B5）</b>：基准周线 bull 态时用 trend_* 覆盖移动止损/最大持仓，
                 其余状态回落原参数。</p>
-              <p class="guide-step"><b>敞口上限</b>：仅回测——BUY 审批卡策略总持仓市值 ≤ 资金占比 × 组合初始资金。</p>
+              <p class="guide-step"><b>敞口上限</b>：回测/实盘均生效——BUY 审批卡策略总持仓市值 ≤ 资金占比 × 组合初始资金。</p>
             </div>
           </div>
           <div class="form-group">
@@ -974,4 +978,9 @@ onMounted(loadPortfolios)
 
 <style scoped>
 .group-hint { margin-left: 8px; font-size: 11px; font-weight: 400; color: var(--ink-faint); }
+/* 小屏：子策略行内容与操作按钮换行，避免按钮被行内长文本挤出可视区 */
+@media (max-width: 1100px) {
+  .sub-strategy-row { flex-wrap: wrap; row-gap: 4px; }
+  .sub-strategy-actions { margin-left: 0; width: 100%; justify-content: flex-end; }
+}
 </style>

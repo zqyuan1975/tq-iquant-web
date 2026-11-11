@@ -37,8 +37,14 @@ _AM_CLOSE = time(11, 30)
 _PM_OPEN = time(13, 0)
 _PM_CLOSE = time(15, 0)
 
-# 每 code 保留的已完成 bar 上限（count 窗口最大 10 + 余量；防跨日无限增长）
-_MAX_COMPLETED_BARS = 30
+# 每 code 保留的已完成 1m bar 上限。1h 聚合需要连续 60 根，取 130 留两个完整
+# 1h 桶余量（count 窗口仍由调用方截断，1m 取数行为不变；每会话内存约
+# code 数 × 130 个小 dict，量级可忽略）。
+_MAX_COMPLETED_BARS = 130
+
+#: 需要用快照合成 1m 聚合的周期 → 每个周期内含的 1m 根数。
+#: 键与实盘周期口径一致（``1h``，不是回测的 ``60m``）。
+AGGREGATED_PERIOD_MINUTES = {"5m": 5, "15m": 15, "30m": 30, "1h": 60}
 
 FetchSnapshot = Callable[[List[str]], dict]
 SessionGate = Callable[[datetime], bool]
@@ -76,6 +82,73 @@ def _to_bar_dict(b: dict) -> dict:
         "close": b["close"],
         "volume": int(b["volume"]),
     }
+
+
+def _bucket_end(label: datetime, minutes: int) -> Optional[datetime]:
+    """1m bar（label=分钟终点）所属 ``minutes`` 分钟桶的终点；跨时段/非法 → None。
+
+    桶按**交易时段对齐**（与 TDX 原生分钟线一致）：上午从 09:30、下午从 13:00
+    起算，5m→09:35…11:30 / 13:05…15:00；30m→10:00/10:30/11:00/11:30…；
+    1h→10:30/11:30/14:00/15:00。桶终点超出收盘 → None（不产出跨界桶）。
+    """
+    start = label - timedelta(minutes=1)
+    t = start.time()
+    if _AM_OPEN <= t < _AM_CLOSE:
+        session_open, session_close = _AM_OPEN, _AM_CLOSE
+    elif _PM_OPEN <= t < _PM_CLOSE:
+        session_open, session_close = _PM_OPEN, _PM_CLOSE
+    else:
+        return None
+    anchor = start.replace(
+        hour=session_open.hour, minute=session_open.minute, second=0, microsecond=0)
+    offset = int((start - anchor).total_seconds() // 60)
+    if offset < 0:
+        return None
+    end = anchor + timedelta(minutes=(offset // minutes + 1) * minutes)
+    close_at = start.replace(
+        hour=session_close.hour, minute=session_close.minute, second=0, microsecond=0)
+    return end if end <= close_at else None
+
+
+def _aggregate_completed(
+    bars: List[dict], minutes: int, period: str, count: int,
+) -> List[dict]:
+    """已完成 1m bar → ``minutes`` 分钟聚合 bar（只输出**完整桶**）。
+
+    完整性判据：桶内 1m bar 数量 == ``minutes``，且标签从「桶起点+1min」到桶终点
+    逐分钟连续。缺任何一分钟（采样停摆/取数失败/开盘中途启动）整桶丢弃——绝不
+    用残缺数据冒充周期 bar（与新鲜度闸 fail-safe 同口径）。
+
+    OHLCV：open=首根 open、close=末根 close、high/low=极值、volume=累加。
+    输出带 ``source=aggregated_1m`` / ``period`` 标记，便于事后区分「聚合」与
+    「TQ 原生」。
+    """
+    buckets: Dict[datetime, List[dict]] = {}
+    for b in bars:
+        end = _bucket_end(b["label"], minutes)
+        if end is None:
+            continue
+        buckets.setdefault(end, []).append(b)
+    out: List[dict] = []
+    for end in sorted(buckets):
+        group = sorted(buckets[end], key=lambda x: x["label"])
+        if len(group) != minutes:
+            continue
+        first = end - timedelta(minutes=minutes)
+        expected = [first + timedelta(minutes=i + 1) for i in range(minutes)]
+        if [g["label"] for g in group] != expected:
+            continue
+        out.append({
+            "stime": end.strftime("%Y%m%d%H%M%S"),
+            "open": group[0]["open"],
+            "high": max(g["high"] for g in group),
+            "low": min(g["low"] for g in group),
+            "close": group[-1]["close"],
+            "volume": int(sum(int(g.get("volume") or 0) for g in group)),
+            "source": "aggregated_1m",
+            "period": period,
+        })
+    return out[-int(count or 10):]
 
 
 class SnapshotBarSynthesizer:
@@ -157,6 +230,30 @@ class SnapshotBarSynthesizer:
                 bars = self._completed.get(code, [])[-int(count or 10):]
                 out[code] = [_to_bar_dict(b) for b in bars]
             return out
+
+    def aggregated_bars(
+        self, codes: Optional[List[str]] = None, period: str = "5m",
+        count: int = 10,
+    ) -> Dict[str, List[dict]]:
+        """已完成 1m bar → 5m/15m/30m/1h 聚合 bar（TQ 原生分钟线过期时的兜底）。
+
+        数据全部来自本进程内存（``_completed``），不触 TQ；只输出完整桶
+        （见 ``_aggregate_completed``）。返回与 ``query_quotes_batch`` 同构：
+        ``{code: [bar, ...]}`` 升序，取末 ``count`` 根；不支持的周期返回空。
+        聚合 bar 带 ``source=aggregated_1m``，供调用方在事件/日志中标注来源。
+        """
+        key = str(period or "")
+        minutes = AGGREGATED_PERIOD_MINUTES.get(key)
+        if not minutes:
+            return {}
+        want = list(codes) if codes else list(self._codes)
+        n = max(int(count or 10), 1)
+        with self._lock:
+            return {
+                code: _aggregate_completed(
+                    self._completed.get(code) or [], minutes, key, n)
+                for code in want
+            }
 
     def latest_price(self, code: str) -> Optional[Tuple[float, datetime]]:
         """最近一次快照采样：(价格, 采样所属分钟终点)；无样本 → None。
@@ -271,8 +368,9 @@ class SnapshotBarSynthesizer:
 
 class SnapshotQuoteDispatcher:
     """BarPoller 行情适配器：把合成器已完成 bar 以 ``query_quotes_batch``
-    同构格式暴露（``supports_batch_quote=True``）。仅支持 1m（其余周期
-    返回空 → BarPoller 视为无数据，与桥离线路径一致）。"""
+    同构格式暴露（``supports_batch_quote=True``）。1m 返回原生合成 bar；
+    5m/15m/30m/1h 返回由 1m 聚合的 bar（``source=aggregated_1m``）；其余
+    周期返回空 → BarPoller 视为无数据，与桥离线路径一致。"""
 
     supports_batch_quote = True
     #: 本适配器返回的每一根都已是闭合 bar：``completed_bars`` 只吐
@@ -284,13 +382,22 @@ class SnapshotQuoteDispatcher:
     def __init__(self, synthesizer: SnapshotBarSynthesizer):
         self._synth = synthesizer
 
+    @property
+    def synthesizer(self) -> SnapshotBarSynthesizer:
+        """底层合成器（MarketDataService 自动发现聚合兜底能力用）。"""
+        return self._synth
+
     def query_quotes_batch(
         self, codes, period: str = "1m", count: int = 10,
     ) -> Dict[str, list]:
-        if str(period) != "1m":
-            return {}
-        return self._synth.completed_bars(
-            [str(c) for c in (codes or [])], count=max(int(count or 10), 2))
+        key = str(period)
+        want = [str(c) for c in (codes or [])]
+        n = max(int(count or 10), 2)
+        if key == "1m":
+            return self._synth.completed_bars(want, count=n)
+        if key in AGGREGATED_PERIOD_MINUTES:
+            return self._synth.aggregated_bars(want, period=key, count=n)
+        return {}
 
     def query_quote(self, code: str, period: str = "1m", count: int = 10) -> list:
         return self.query_quotes_batch([code], period, count).get(str(code), [])

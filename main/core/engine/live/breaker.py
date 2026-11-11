@@ -36,10 +36,29 @@ from sqlalchemy.orm import Session
 from ...models import LiveSessionPortfolio
 from ..portfolio import Portfolio
 from ..format import fmt_money, fmt_pct
+from ...config import load_config
 from .context import EngineContext
 from .timing import now_shanghai
 
 logger = logging.getLogger("core.engine.live.breaker")
+
+
+def manual_reset_reanchor_enabled() -> bool:
+    """⑤ `tq_trade.breaker_manual_reset_reanchor_peak`（默认 false）。
+
+    false（默认，对齐回测）：手动恢复只清计数/解除停新开仓，**峰值保持**——
+    回撤基准不变，再次跌到阈值仍会触发（属预期）。true：把峰值重锚到最近
+    一次估值，此后回撤从当前净值重新计算（用于确认"历史高点不再代表当前
+    资金规模"的场景，例如大额出金后）。
+    """
+    try:
+        raw = ((load_config() or {}).get("tq_trade") or {}).get(
+            "breaker_manual_reset_reanchor_peak", False)
+    except Exception:  # noqa: BLE001 — 配置读取失败按默认（不重锚）处理
+        return False
+    if isinstance(raw, str):
+        return raw.strip().lower() in ("1", "true", "yes", "on")
+    return bool(raw)
 
 
 class BreakerService:
@@ -59,7 +78,8 @@ class BreakerService:
 
     # ---------------- 每 bar：max_drawdown ----------------
     def on_bar_update(
-        self, portfolio: Portfolio, total_value: Decimal, bar_date: date
+        self, portfolio: Portfolio, total_value: Decimal, bar_date: date,
+        allow_peak_update: bool = True,
     ) -> None:
         """每 bar 推进峰值/回撤 + max_drawdown 次日自动恢复检测 + 计数持久化。
 
@@ -67,11 +87,16 @@ class BreakerService:
         update_peak 可能触发 max_drawdown（计数+1），随后 persist_count 落库。
         max_drawdown 次日自动恢复（非手动恢复）此前在 risk_manager 内静默置 False，
         这里补日志。
+
+        allow_peak_update（P1-2）：回测按策略自身 bar 频率更新峰值（日线策略=每日
+        一次），实盘日线策略每根 1m bar 都抬峰会让回撤分母偏大、更易熔断。引擎对
+        「组合内全是日线及以上策略」的盘中 1m bar 传 False（只刷新 last_bar/prev_close
+        与次日恢复判断，不抬峰）；分钟策略与日线收盘轮次仍传 True。
         """
         rm = portfolio.risk_manager
         was_broken = rm.circuit_breaker_active
         was_manual = rm.manual_recovery
-        rm.update_peak(total_value, bar_date)
+        rm.update_peak(total_value, bar_date, allow_peak_update=allow_peak_update)
         # max_drawdown 次日自动恢复（非手动恢复）此前在 risk_manager 内静默置 False，这里补日志
         if was_broken and not rm.circuit_breaker_active and not was_manual:
             logger.info(
@@ -191,6 +216,7 @@ class BreakerService:
             "circuit_breaker_active": bool(rm.circuit_breaker_active),
             "breaker_trigger_date": _day(rm.breaker_trigger_date),
             "daily_loss_trigger_date": _day(rm.daily_loss_trigger_date),
+            "daily_pause_resume_after": _day(getattr(rm, "daily_pause_resume_after", None)),
             "last_bar_date": _day(getattr(rm, "_last_bar_date", None)),
             "last_bar_total_value": _num(getattr(rm, "_last_bar_total_value", None)),
         }, ensure_ascii=False)
@@ -220,6 +246,8 @@ class BreakerService:
             breaker_d = date.fromisoformat(bd) if bd else None
             dd = d.get("daily_loss_trigger_date")
             daily_d = date.fromisoformat(dd) if dd else None
+            dra = d.get("daily_pause_resume_after")
+            daily_resume_d = date.fromisoformat(dra) if dra else None
             lbd = d.get("last_bar_date")
             last_bar_d = date.fromisoformat(lbd) if lbd else None
             lbtv = d.get("last_bar_total_value")
@@ -234,6 +262,8 @@ class BreakerService:
                 rm.peak_value = peak_v
             rm.prev_close_value = prev_v
         rm.daily_pause_active = pause_v
+        # P1-1：暂停解除门槛随暂停态一起还原，否则重启后次日 enter_day 会提前恢复
+        rm.daily_pause_resume_after = daily_resume_d if pause_v else None
         rm.breaker_trigger_date = breaker_d
         rm.daily_loss_trigger_date = daily_d
         # 熔断在挂标志（v2+ 才有）：当日重启保持暂停，次日恢复由 restore_counts 判定
@@ -280,6 +310,16 @@ class BreakerService:
         rm.circuit_breaker_active = False
         rm.manual_recovery = False
         rm.breaker_trigger_date = None
+        # ⑤ 峰值口径：默认不重锚（回撤基准不变 → 再次触发属预期，与回测一致，
+        # 回测的峰值同样只增不减）；仅当配置显式开启重锚时，把峰值改到最近
+        # 一次估值，回撤从当前净值重新计算。
+        reanchored: Optional[Decimal] = None
+        old_peak = rm.peak_value
+        if manual_reset_reanchor_enabled():
+            last = getattr(rm, "_last_bar_total_value", None)
+            if last is not None and last > 0 and last != rm.peak_value:
+                rm.peak_value = Decimal(last)
+                reanchored = rm.peak_value
         # 同步已落库计数，否则下一 bar persist_count 比对 old==count 跳过回写
         self.counts_written[portfolio_id] = 0
         db = self._ctx.db_session_factory()
@@ -299,13 +339,25 @@ class BreakerService:
             logger.exception("recover_breaker persist failed: portfolio %s", portfolio_id)
         finally:
             db.close()
+        if reanchored is not None:
+            message = ("熔断已手动恢复（计数清零）；峰值已按配置重锚为 %s，回撤基准"
+                       "从当前净值重新计算" % fmt_money(reanchored))
+        else:
+            peak_txt = fmt_money(old_peak) if old_peak is not None else "—"
+            message = ("熔断已手动恢复（计数清零）；峰值保持 %s 不变（回撤基准不变），"
+                       "若净值再次回撤到阈值仍会触发，属预期" % peak_txt)
         self._emit("risk", {
             "portfolio_id": portfolio_id, "rule": "max_drawdown",
-            "triggered": False, "count": 0, "message": "熔断已手动恢复（计数清零）",
+            "triggered": False, "count": 0,
+            "peak_value": str(rm.peak_value) if rm.peak_value is not None else None,
+            "reanchored_peak": str(reanchored) if reanchored is not None else None,
+            "message": message,
         })
         logger.info(
-            "circuit breaker: portfolio %s 手动恢复（计数清零，解除停新开仓）(session %s)",
-            portfolio_id, self._ctx.session_id,
+            "circuit breaker: portfolio %s 手动恢复（计数清零，解除停新开仓；"
+            "峰值 %s，重锚=%s）(session %s)",
+            portfolio_id, fmt_money(rm.peak_value) if rm.peak_value is not None else "—",
+            reanchored is not None, self._ctx.session_id,
         )
         return True
 
@@ -371,20 +423,30 @@ class BreakerService:
                 )
 
     # ---------------- 日终（14:30）：daily_loss ----------------
-    def on_daily_update(self, portfolio: Portfolio, today: date) -> None:
+    def on_daily_update(
+        self, portfolio: Portfolio, today: date,
+        resume_after: Optional[date] = None,
+    ) -> None:
         """日终对单个组合推进日内亏损：update_daily + daily_loss 触发/次日恢复 + risk 事件。
 
         搬自 _maybe_daily_close 的 per-portfolio 循环体。日终总市值用组合最新现金 + 持仓市值
         （无最新 bar 时以当前持仓成本近似；有 bar 由 on_bar_update(update_peak) 已覆盖）。
+
+        resume_after（P1-1）：14:30 触发时把暂停解除门槛推到**次一交易日**，让尾盘
+        触发的日亏暂停延续次日整日（D+2 首 bar 才恢复），与回测「上一日收盘判日亏 →
+        暂停次日全天」一致。None 保持旧语义（次日恢复）。
         """
         try:
             # R1：日终总市值改用市值口径（现金 + 持仓按最近已知价市值），与
             # prev_close_value（市值）一致，避免"成本市值 vs 昨收市值"口径错配
             # 造成 daily_loss 误触（浮盈/浮亏持仓按成本算会漏算/虚高当日盈亏）。
-            total = portfolio.account.cash + portfolio._holdings_value()
+            # ③ 再剔除累计外部净流入（入金/出金/分红不是当日盈亏），与
+            # Portfolio.risk_value 的 bar 路径同口径（回测净流入恒 0）。
+            total = portfolio.risk_equity()
             was_paused = portfolio.risk_manager.daily_pause_active
             portfolio.risk_manager.update_daily(
-                total, today, portfolio.account.initial_capital
+                total, today, portfolio.account.initial_capital,
+                resume_after=resume_after,
             )
             now_paused = portfolio.risk_manager.daily_pause_active
             # B5：日内亏损熔断刚触发（daily_pause_active 变 True）→ 推送风控事件

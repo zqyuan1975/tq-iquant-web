@@ -179,7 +179,7 @@ describe('LiveSessions.vue 工作台(B4b)', () => {
 
     expect(getLivePositions).toHaveBeenCalledWith(7)
     expect(getLiveOrders).toHaveBeenCalledWith(7)
-    expect(getLiveTrades).toHaveBeenCalledWith(7)
+    expect(getLiveTrades).toHaveBeenCalledWith(7, expect.objectContaining({ start_date: expect.any(String) }))
 
     // 默认展示持仓表历史行
     expect(w.text()).toContain('600000.SH')
@@ -209,6 +209,36 @@ describe('LiveSessions.vue 工作台(B4b)', () => {
     const tradesTab = w.findAll('button').find((b) => b.text().includes('成交'))!
     await tradesTab.trigger('click')
     expect(w.text()).toContain('1100')
+    w.unmount()
+  })
+
+  it('成交页签默认只看今日（时间列标日期，切「全部」可查看历史成交）', async () => {
+    ;(getLiveSessions as any).mockResolvedValue([runningSession])
+    const todayIso = new Date().toISOString()
+    const yestIso = new Date(Date.now() - 86400000).toISOString()
+    ;(getLiveTrades as any).mockResolvedValue([
+      { id: 11, stock_code: '600519.SH', trade_type: 'BUY', price: 10,
+        quantity: 100, amount: 1000, trade_time: todayIso },
+      { id: 12, stock_code: '601318.SH', trade_type: 'SELL', price: 20,
+        quantity: 100, amount: 2000, trade_time: yestIso },
+    ])
+    const w = mount(LiveSessions)
+    await flushPromises()
+
+    await w.findAll('button').find((b) => b.text().includes('成交'))!.trigger('click')
+
+    // 默认今日：只显示今天的成交，且时间列带「今天」日期标注
+    expect(w.text()).toContain('600519.SH')
+    expect(w.text()).not.toContain('601318.SH')
+    expect(w.text()).toContain('今天')
+    // 默认请求带 start_date（服务端预筛；不删任何记录）
+    expect(getLiveTrades).toHaveBeenCalledWith(7, expect.objectContaining({ start_date: expect.any(String) }))
+
+    // 切「全部」→ 历史成交仍可查看，时间列标「昨天」
+    await w.find('select[aria-label="成交时间范围"]').setValue('all')
+    await flushPromises()
+    expect(w.text()).toContain('601318.SH')
+    expect(w.text()).toContain('昨天')
     w.unmount()
   })
 
@@ -306,7 +336,7 @@ describe('LiveSessions.vue 工作台(B4b)', () => {
     w.unmount()
   })
 
-  it('持仓 tab 池外仓徽标：out_of_pool 行显示「池外·不参与风控」，池内/缺字段不显示', async () => {
+  it('持仓 tab 池外仓单列「池外（不参与业绩）」：池外行不再混在策略持仓表里', async () => {
     ;(getLiveSessions as any).mockResolvedValue([runningSession])
     ;(getLivePositions as any).mockResolvedValue([
       { stock_code: '600000.SH', quantity: 300, avg_cost: 10, market_value: 3000,
@@ -321,20 +351,27 @@ describe('LiveSessions.vue 工作台(B4b)', () => {
     const w = mount(LiveSessions)
     await flushPromises()
 
+    // 主表（参与业绩）：只剩两行，池外行不在这里
     const posTable = w.findAll('table').find((t) => t.text().includes('来源'))!
     const rows = posTable.findAll('tbody tr')
-    expect(rows.length).toBe(3)
-    expect(rows[0].text()).not.toContain('池外')
-    expect(rows[2].text()).not.toContain('池外')
+    expect(rows.length).toBe(2)
+    expect(posTable.text()).not.toContain('002745.SZ')
 
-    expect(rows[1].text()).toContain('池外·不参与风控')
-    const badge = rows[1].findAll('.badge').find((b) => b.text().includes('池外'))!
+    // 池外单表：标题 + 一行池外仓 + 橙标「池外·不参与业绩」
+    expect(w.text()).toContain('池外（不参与业绩）')
+    const oopTable = w.findAll('table').find((t) => t.text().includes('市值（参考）'))!
+    const oopRows = oopTable.findAll('tbody tr')
+    expect(oopRows.length).toBe(1)
+    expect(oopRows[0].text()).toContain('002745.SZ')
+    expect(oopRows[0].text()).toContain('5300')
+    const badge = oopRows[0].findAll('.badge').find((b) => b.text().includes('池外'))!
+    expect(badge.text()).toBe('池外·不参与业绩')
     expect(badge.classes()).toContain('badge-orange')
-    expect(badge.attributes('title')).toContain('不进风控')
+    expect(badge.attributes('title')).toContain('不进虚拟现金/净值/回撤分母')
     expect(badge.attributes('title')).toContain('不占槽位')
     expect(badge.attributes('title')).toContain('不代卖')
-    // 池外仓仍是外部行：灰色「原有持仓」徽章 + 组合/子策略列显示 —
-    expect(rows[1].find('.badge').text()).toBe('原有持仓')
+    // 说明文案点明不计入虚拟净值
+    expect(w.text()).toContain('不计入虚拟净值')
     w.unmount()
   })
 
@@ -605,6 +642,30 @@ describe('LiveSessions.vue 新建实盘选组合', () => {
     w.unmount()
   })
 
+  it('错周期风控默认跟随全局（提交 null），三态选项齐全', async () => {
+    ;(getLiveSessions as any).mockResolvedValue([stoppedSession])
+    ;(getPortfolios as any).mockResolvedValue(mockPortfolios)
+    const w = mount(LiveSessions)
+    await flushPromises()
+
+    await w.findAll('button').find((b) => b.text().includes('新建实盘'))!.trigger('click')
+    await flushPromises()
+    const sel = w.find('select[data-field="intraday_mismatched_risk_enabled"]')
+    expect(sel.exists()).toBe(true)
+    expect(sel.text()).toContain('跟随全局')
+    expect(sel.text()).toContain('强制开启')
+    expect(sel.text()).toContain('强制关闭')
+
+    await w.findAll('input[data-portfolio-check]')[0].setValue(true)
+    await w.findAll('button').find((b) => b.text().includes('确认'))!.trigger('click')
+    await flushPromises()
+
+    expect(createLiveSession).toHaveBeenCalledWith(expect.objectContaining({
+      intraday_mismatched_risk_enabled: null,
+    }))
+    w.unmount()
+  })
+
   it('选实盘模式提交 → 带 mode: live', async () => {
     ;(getLiveSessions as any).mockResolvedValue([stoppedSession])
     ;(getPortfolios as any).mockResolvedValue(mockPortfolios)
@@ -688,10 +749,14 @@ describe('LiveSessions.vue 实盘资金基准（live_capital）', () => {
 
     const capInput = w.findAll('input').find((i) => (i.element as HTMLInputElement).type === 'number')
     expect(capInput).toBeTruthy()
-    expect((capInput!.element as HTMLInputElement).placeholder).toContain('留空 = 用组合初始资金')
+    expect((capInput!.element as HTMLInputElement).placeholder).toContain('留空 = 只用桥账户快照')
     expect(w.text()).toContain('实盘资金基准（元）')
-    expect(w.text()).toContain('比率配置等比缩放')
+    // ①：live_capital 只作真实侧总闸，不再覆盖各组合虚拟起账
+    expect(w.text()).toContain('真实侧总闸')
+    expect(w.text()).toContain('每个组合虚拟现金起账 = 该组合配置的 initial_capital')
     expect(w.text()).toContain('多组合各自独立记账')
+    // ②：池外持仓只展示/对账，不进虚拟现金与净值
+    expect(w.text()).toContain('池外持仓（代码不在任何组合股票池）只展示/对账，不进虚拟现金与净值')
     w.unmount()
   })
 

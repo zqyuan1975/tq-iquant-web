@@ -821,6 +821,54 @@ def test_price_limit_blocks_buy_at_limit_up():
     assert events[0]["action"] == "defer" and events[0]["stock_code"] == stock
 
 
+def test_price_limit_st_main_board_blocks_at_five_percent_with_names():
+    """涨跌停与实盘同源：ST 主板 5%，open +8% 即买不进（旧口径 10% 会放行）。
+
+    bar2(7/30) open=10.8 较前收 10 上涨 8%（ST 涨停价 10.5）→ 延后；
+    bar3(7/31) open=10.6（前收 10.7，ST 涨停价 11.235）→ 成交 10.6。
+    """
+    stock = "600000.SH"
+    klines = _limit_klines(stock, [
+        (datetime(2026, 7, 29), Decimal("10"), Decimal("10.3"), Decimal("9.9"), Decimal("10"), 1000),
+        (datetime(2026, 7, 30), Decimal("10.8"), Decimal("10.8"), Decimal("10.4"), Decimal("10.7"), 1000),
+        (datetime(2026, 7, 31), Decimal("10.6"), Decimal("10.9"), Decimal("10.4"), Decimal("10.8"), 1000),
+    ])
+    port, ctx = _limit_portfolio(enabled=True)
+    cache = {
+        (1, stock, datetime(2026, 7, 29)): [{"name": "open_sig", "value": 1}],
+        (1, stock, datetime(2026, 7, 30)): [{"name": "open_sig", "value": -1}],
+        (1, stock, datetime(2026, 7, 31)): [{"name": "open_sig", "value": -1}],
+    }
+    result = BacktestEngine().run(
+        port, klines=klines, signal_cache=cache,
+        stock_names={stock: "*ST测试"})
+
+    trades = result["trades"]
+    assert len(trades) == 1
+    assert trades[0].trade_time == datetime(2026, 7, 31)
+    assert trades[0].price == Decimal("10.6")
+    events = [d for d in result["decisions"] if d["gate"] == "price_limit"]
+    assert len(events) == 1 and events[0]["action"] == "defer"
+    assert "name_st" in events[0]["message"]
+
+
+def test_price_limit_st_without_names_uses_board_ratio():
+    """未传名称：无法识别 ST，按板块 10% 放行（与旧行为一致，不误拦）。"""
+    stock = "600000.SH"
+    klines = _limit_klines(stock, [
+        (datetime(2026, 7, 29), Decimal("10"), Decimal("10.3"), Decimal("9.9"), Decimal("10"), 1000),
+        (datetime(2026, 7, 30), Decimal("10.8"), Decimal("10.8"), Decimal("10.4"), Decimal("10.7"), 1000),
+    ])
+    port, ctx = _limit_portfolio(enabled=True)
+    cache = {(1, stock, datetime(2026, 7, 29)): [{"name": "open_sig", "value": 1}]}
+    result = BacktestEngine().run(port, klines=klines, signal_cache=cache)
+
+    trades = result["trades"]
+    assert len(trades) == 1
+    assert trades[0].trade_time == datetime(2026, 7, 30)
+    assert trades[0].price == Decimal("10.8")
+
+
 def test_price_limit_blocks_sell_at_limit_down():
     """开启涨跌停约束：SELL 在跌停 bar（open ≤ 前收×0.9）延后，下一未跌停 bar 成交。
 

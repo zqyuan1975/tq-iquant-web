@@ -42,6 +42,11 @@ class LiveSession(Base):
     # 幂等标记：该交易日 15:05「收盘落定」日线级别轮次（1d/1w/1mon）已执行
     # （YYYY-MM-DD，跨重启不重复跑；B 开启时只用于 1w/1mon 周期末轮次）
     daily_bars_done_date = Column(String(10), nullable=True)
+    # 错周期 bar 是否跑风控（nullable 三态，2026-11-11）：
+    #   NULL = 跟随全局 config.tq_trade.intraday_mismatched_risk_enabled（默认 False）
+    #   0/1  = 本会话显式覆盖（关闭时错周期 bar 一律只更新价格快照、不跑风控）
+    # 历史会话为 NULL → 立即跟随新默认（对齐回测：风控只在自身周期 bar 上评估）。
+    intraday_mismatched_risk_enabled = Column(Boolean, nullable=True)
     status = Column(String(10), nullable=False)
     created_at = Column(DateTime, server_default=func.now())
     updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())

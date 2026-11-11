@@ -24,6 +24,9 @@ class PortfolioStrategy(Base):
     buy_commission_rate = Column(Numeric(8, 6), default=0.000250, server_default="0.000250", nullable=False)
     sell_commission_rate = Column(Numeric(8, 6), default=0.000250, server_default="0.000250", nullable=False)
     stamp_duty_rate = Column(Numeric(8, 6), default=0.000500, server_default="0.000500", nullable=False)
+    # 过户费（双向，2026-11-11）：A 股现行按成交额 0.001% 双边收取，默认 0.000010。
+    # 回测买卖两侧都计入（买入摊入成本、卖出从盈亏扣），与实盘柜台成本同口径。
+    transfer_fee_rate = Column(Numeric(8, 6), default=0.000010, server_default="0.000010", nullable=False)
     slippage = Column(Numeric(8, 6), default=0, server_default="0", nullable=False)
     trading_session = Column(String(10), default="full", server_default="full", nullable=False)
     # #1 涨跌停约束（回测成交步）：True=涨停买不进/跌停卖不出（延后重试）。

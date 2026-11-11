@@ -68,7 +68,13 @@ class Position:
     def market_value(self) -> Decimal:
         return self.avg_cost * self.quantity
 
-    def buy(self, quantity: int, price: Decimal, trade_time: Optional[datetime] = None, is_add: bool = False) -> None:
+    def buy(self, quantity: int, price: Decimal, trade_time: Optional[datetime] = None,
+            is_add: bool = False, fees: Decimal = Decimal("0")) -> None:
+        """买入建/加仓。
+
+        fees（2026-11-11）：本次买入的佣金+过户费，**摊入持仓成本**——回测成本
+        因此与实盘柜台合并均价（含费）同口径，止损/止盈阈值对比不再系统性偏低。
+        """
         # 平台自己买入的股数（槽位闸口径）：只有平台成交（apply_trade）走到这里，
         # 外部/手工导入仓由 mirror_bridge 直接覆盖数量，不经过 buy → 保持 0。
         self.platform_quantity += quantity
@@ -78,7 +84,8 @@ class Position:
             self.add_count += 1
         elif self.quantity == 0:
             self.add_count = 0
-        total_cost = self.avg_cost * self.quantity + price * quantity
+        total_cost = (self.avg_cost * self.quantity + price * quantity
+                      + (fees or Decimal("0")))
         self.quantity += quantity
         self.avg_cost = total_cost / self.quantity
         # 新开仓重置最高价（避免沿用上一笔持仓的旧高点）；加仓时只升不降
@@ -94,12 +101,17 @@ class Position:
         if price > self.highest_price:
             self.highest_price = price
 
-    def sell(self, quantity: int, price: Decimal, trade_time: Optional[datetime] = None) -> tuple:
+    def sell(self, quantity: int, price: Decimal, trade_time: Optional[datetime] = None,
+             fees: Decimal = Decimal("0")) -> tuple:
+        """卖出减仓，返回 (已实现盈亏, 卖出金额)。
+
+        fees（2026-11-11）：本次卖出的佣金+印花税+过户费，从盈亏中扣除。
+        """
         if quantity > self.quantity:
             quantity = self.quantity
         sell_amount = price * quantity
         cost_amount = self.avg_cost * quantity
-        pnl = sell_amount - cost_amount
+        pnl = sell_amount - cost_amount - (fees or Decimal("0"))
         self.quantity -= quantity
         # 平台自己买入的股数同步扣减（卖出可能包含外部仓份额，按上限夹到 0）
         self.platform_quantity = max(0, self.platform_quantity - quantity)
@@ -121,14 +133,29 @@ class Position:
             self._lots = {d: q for d, q in self._lots.items() if q > 0}
         return pnl, sell_amount
 
-    def apply_trade(self, trade: TradeEvent) -> None:
-        """成交后统一更新持仓（买入加权均价+最高价，卖出减仓）。"""
+    def apply_trade(self, trade: TradeEvent) -> int:
+        """成交后统一更新持仓（买入加权均价+最高价，卖出减仓）。返回**实际入账数量**。
+
+        费用（佣金/印花税/过户费）摊入买入成本、并从卖出盈亏中扣除。
+
+        返回值（P0-1）：卖出会把数量夹到当前虚拟持仓（``sell`` 内 clamp），调用方
+        **必须**按本返回值推算现金变动（``TradeEvent.scaled_to`` + ``Account.
+        apply_trade``），不能直接用原始 ``trade.amount``。否则「持仓不足却全额入账」
+        会让虚拟现金凭空增加：① 继承仓重启重放只有 SELL 没有 BUY；② 人工先减仓
+        （镜面已按成本回补现金）后在途卖单成交 → 同一批股票补偿两次；③ 缺虚拟仓
+        卖出。买入恒返回 ``trade.quantity``。
+        """
+        fees = ((trade.commission or Decimal("0"))
+                + (trade.stamp_duty or Decimal("0"))
+                + (getattr(trade, "transfer_fee", Decimal("0")) or Decimal("0")))
         self.note_strategy_trade(trade)
         if trade.trade_type == TradeType.BUY:
-            is_add = trade.signal_type == SignalType.ADD
-            self.buy(trade.quantity, trade.price, trade.trade_time, is_add=is_add)
-        else:
-            self.sell(trade.quantity, trade.price, trade.trade_time)
+            self.buy(trade.quantity, trade.price, trade.trade_time,
+                     is_add=trade.signal_type == SignalType.ADD, fees=fees)
+            return int(trade.quantity)
+        before = self.quantity
+        self.sell(trade.quantity, trade.price, trade.trade_time, fees=fees)
+        return before - self.quantity
 
     def note_strategy_trade(self, trade: TradeEvent) -> None:
         """归因专用：只更新策略自身成交的加权成本，不改数量与风控基准成本。
@@ -138,7 +165,11 @@ class Position:
         """
         if trade.trade_type == TradeType.BUY:
             # 策略自身成交成本（含分摊费用）单独累计，仅归因展示，不做风控基准
-            added_cost = (trade.amount or Decimal("0")) + (trade.commission or Decimal("0"))
+            added_cost = ((trade.amount or Decimal("0"))
+                          + (trade.commission or Decimal("0"))
+                          + (trade.stamp_duty or Decimal("0"))
+                          + (getattr(trade, "transfer_fee", Decimal("0"))
+                             or Decimal("0")))
             total = self.strategy_cost * self.strategy_quantity + added_cost
             self.strategy_quantity += trade.quantity
             if self.strategy_quantity > 0:

@@ -16,6 +16,9 @@ REL_METRIC_KEYS = (
     "excess_max_drawdown",
 )
 
+# 评估落库用完整相对指标键序（REL_METRIC_KEYS + 派生：超额卡玛）
+EVAL_REL_KEYS = REL_METRIC_KEYS + ("excess_calmar_ratio",)
+
 
 def compute_relative_metrics_core(
     rs: List[float], rb: List[float],
@@ -220,6 +223,8 @@ class Evaluator:
             "volatility": Decimal(str(volatility)).quantize(Decimal("0.0001")),
             "sharpe_ratio": Decimal(str(sharpe)).quantize(Decimal("0.0001")),
             "sortino_ratio": Decimal(str(sortino)).quantize(Decimal("0.0001")),
+            # 年化下行波动率：与索提诺分母同口径（负收益日均方根 × √252）
+            "downside_volatility": Decimal(str(downside_dev)).quantize(Decimal("0.0001")),
             "calmar_ratio": Decimal(str(calmar)).quantize(Decimal("0.0001")) if calmar is not None else None,
             "win_rate": trade_metrics["win_rate"],
             "profit_factor": trade_metrics["profit_factor"],
@@ -323,10 +328,12 @@ class Evaluator:
                 fifo[key] = deque()
 
             if tr.trade_type.value == "BUY":
-                buy_cost_ps = ((tr.commission or 0) + (tr.stamp_duty or 0)) / tr.quantity
+                buy_cost_ps = ((tr.commission or 0) + (tr.stamp_duty or 0)
+                               + (getattr(tr, "transfer_fee", 0) or 0)) / tr.quantity
                 fifo[key].append((tr.price, tr.quantity, tr.trade_time, buy_cost_ps))
             elif tr.trade_type.value == "SELL":
-                sell_cost_ps = ((tr.commission or 0) + (tr.stamp_duty or 0)) / tr.quantity
+                sell_cost_ps = ((tr.commission or 0) + (tr.stamp_duty or 0)
+                                + (getattr(tr, "transfer_fee", 0) or 0)) / tr.quantity
                 remaining = tr.quantity
                 while remaining > 0 and fifo[key]:
                     buy_price, buy_qty, buy_time, buy_cost_ps = fifo[key][0]
@@ -439,10 +446,18 @@ class Evaluator:
             return Decimal(str(x)).quantize(Decimal("0.0001")) if x is not None else None
 
         if len(rs) < MIN_REL_SAMPLE_DAYS:
-            return {k: None for k in REL_METRIC_KEYS}
+            return {k: None for k in EVAL_REL_KEYS}
         days = (pairs[-1][0] - pairs[0][0]).days
         core = compute_relative_metrics_core(
             rs, rb, pairs[0][1], pairs[-1][1], pairs[0][2], pairs[-1][2], days)
+        # 超额卡玛 = 年化超额收益 / |超额最大回撤|；超额回撤为 0 → None（无意义）
+        ex_annual = core.get("excess_annual_return")
+        ex_dd = core.get("excess_max_drawdown")
+        core["excess_calmar_ratio"] = (
+            ex_annual / ex_dd
+            if ex_annual is not None and ex_dd is not None and ex_dd > 0
+            else None
+        )
         return {k: q(v) for k, v in core.items()}
 
     # ========================================================================
@@ -465,6 +480,7 @@ class Evaluator:
             total_amount += Decimal(str(getattr(t, "amount", 0) or 0))
             total_cost += Decimal(str(getattr(t, "commission", 0) or 0))
             total_cost += Decimal(str(getattr(t, "stamp_duty", 0) or 0))
+            total_cost += Decimal(str(getattr(t, "transfer_fee", 0) or 0))
 
         n_rows = len(daily_rows)
         avg_total = (

@@ -130,6 +130,18 @@ def test_trading_blocked_at_and_after_close():
     assert cal.is_trading_allowed(datetime(2026, 8, 24, 15, 30)) is False
 
 
+def test_trading_blocked_during_lunch_break():
+    """P2-5：11:30–13:00 午休禁报（11:30 边界 bar 的单不再排进 TDX/被 QMT 拒）。"""
+    cal = TradingCalendar(_provider([date(2026, 8, 24)]))
+    assert cal.is_trading_allowed(datetime(2026, 8, 24, 11, 29)) is True
+    assert cal.is_trading_allowed(datetime(2026, 8, 24, 11, 30)) is False
+    assert cal.is_trading_allowed(datetime(2026, 8, 24, 12, 0)) is False
+    assert cal.is_trading_allowed(datetime(2026, 8, 24, 12, 59)) is False
+    # 13:00 起恢复正常派发
+    assert cal.is_trading_allowed(datetime(2026, 8, 24, 13, 0)) is True
+    assert cal.is_trading_allowed(datetime(2026, 8, 24, 14, 0)) is True
+
+
 def test_trading_blocked_on_weekend_even_at_session_time():
     # 周六 10:00 —— 时段对但非交易日，禁止
     cal = TradingCalendar(_provider([]))

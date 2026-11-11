@@ -48,11 +48,11 @@ describe('App.vue — 图标渲染', () => {
     localStorage.clear()
   })
 
-  it('侧边栏 8 个导航项各渲染一个内联 SVG 图标（非 Emoji 文本节点）', async () => {
+  it('侧边栏 9 个导航项各渲染一个内联 SVG 图标（非 Emoji 文本节点）', async () => {
     const w = mount(App)
     await flushPromises()
     const items = w.findAll('.sidebar-nav .nav-item')
-    expect(items).toHaveLength(8)
+    expect(items).toHaveLength(9)
     items.forEach((it) => {
       const svg = it.find('svg.icon')
       expect(svg.exists()).toBe(true)

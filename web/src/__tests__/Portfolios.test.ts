@@ -146,6 +146,7 @@ describe('Portfolios.vue — 组合列表（树状）', () => {
     expect(w.text()).toContain('买佣金率')
     expect(w.text()).toContain('卖佣金率')
     expect(w.text()).toContain('印花税率')
+    expect(w.text()).toContain('过户费率')
     expect(w.text()).toContain('滑点')
   })
 
@@ -164,6 +165,9 @@ describe('Portfolios.vue — 组合列表（树状）', () => {
     // min_commission 是金额 → 显示 5，不转百分比
     const minCommInput = w.find('input[data-field="min_commission"]')
     expect(Number((minCommInput.element as HTMLInputElement).value)).toBe(5)
+    // transfer_fee_rate=0.00001 → 显示 0.001（百分比）
+    const transferInput = w.find('input[data-field="transfer_fee_rate"]')
+    expect(Number((transferInput.element as HTMLInputElement).value)).toBeCloseTo(0.001, 6)
 
     await w.find('input[data-field="name"]').setValue('ROUND_TRIP')
     await w.find('select[data-field="stock_pool_id"]').setValue('1')
@@ -175,6 +179,7 @@ describe('Portfolios.vue — 组合列表（树状）', () => {
     expect(arg.max_drawdown).toBeCloseTo(0.2)
     expect(arg.buy_commission_rate).toBeCloseTo(0.00025, 6)
     expect(arg.stamp_duty_rate).toBeCloseTo(0.0005, 6)
+    expect(arg.transfer_fee_rate).toBeCloseTo(0.00001, 8)
     // 金额不转
     expect(arg.min_commission).toBe(5)
     expect(arg.initial_capital).toBe(500000)
@@ -476,7 +481,8 @@ describe('Portfolios.vue — 执行真实感与策略增强', () => {
     await w.find('button.btn-primary').trigger('click')  // +新建组合
 
     expect(w.text()).toContain('执行真实感')
-    expect(w.text()).toContain('涨跌停')
+    expect(w.text()).toContain('涨跌停校验')
+    expect(w.text()).toContain('默认开启')  // 说明文案同步
     // 默认 price_limit_check_enabled=true
     const plInput = w.find('input[data-field="price_limit_check_enabled"]')
     expect((plInput.element as HTMLInputElement).checked).toBe(true)
@@ -804,7 +810,7 @@ describe('Portfolios.vue — 实盘执行（批次1 配置分组）', () => {
 
     expect(w.text()).toContain('执行控制')
     expect(w.text()).toContain('撤单追价重下')
-    expect(w.text()).toContain('重试次数')
+    expect(w.text()).toContain('追价重下次数')
     expect(w.text()).toContain('大额拆单')
     expect(w.text()).toContain('拆单阈值')
     expect(w.text()).toContain('风控执行时点')

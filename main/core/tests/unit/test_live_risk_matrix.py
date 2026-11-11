@@ -847,10 +847,16 @@ def test_item16_deferred_released_next_day_frozen_qty_and_price_refresh():
     original_qty = deferred.quantity
     assert original_qty == 600
 
-    # 价格刷新钩子被调用（模拟实时最新价），数量保持冻结
+    # 价格刷新钩子被调用（模拟实时最新价），数量保持冻结。
+    # 返回价格来源标签（契约是 str，_refresh_release_price 会把它拼进返回串）。
     seen = {}
-    eng._refresh_submit_price = lambda o: (
-        seen.setdefault("qty", o.quantity), setattr(o, "price", Decimal("10.2")))
+
+    def _refresh(o):
+        seen["qty"] = o.quantity
+        o.price = Decimal("10.2")
+        return "quote"
+
+    eng._refresh_submit_price = _refresh
 
     eng.signal_cache = {}
     eng._handle_bar(port, _bar(STOCK, "10.2", day2))

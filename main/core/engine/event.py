@@ -1,4 +1,4 @@
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, date
 from decimal import Decimal
 from typing import Dict, Optional
@@ -86,3 +86,40 @@ class TradeEvent:
     signal_type: Optional[SignalType] = None
     # 触发该成交的信号名，由 OrderEvent 透传（供交易明细定位来源）
     signal_name: str = ""
+    # 过户费（双向，2026-11-11）：回测由 SimulatedDispatcher 按组合
+    # transfer_fee_rate 计算；实盘柜台已并入真实费用，缺省 0。
+    transfer_fee: Decimal = Decimal("0")
+
+    def scaled_to(self, quantity: int) -> "TradeEvent":
+        """按**实际入账数量**重算金额与费用，供现金入账与持仓扣减同口径（P0-1）。
+
+        卖出成交可能大于虚拟持仓（继承仓重启重放只有 SELL、人工先减仓后若在途
+        卖单成交、缺虚拟仓卖出）。``Position.apply_trade`` 会把数量夹到实际扣减量
+        并返回该量；调用方随后必须用本方法把 amount/各项费用等比缩到该量再交给
+        ``Account.apply_trade``——否则按原始成交额全额入账会让虚拟现金凭空增加
+        （净值/回撤分母被污染，且重启重放与在线不一致）。
+
+        quantity 与自身相同 → 返回自身（不产生新对象，保回测零开销）。
+        """
+        if quantity == self.quantity:
+            return self
+        qty = max(0, int(quantity))
+        if qty == 0:
+            return replace(
+                self, quantity=0, amount=Decimal("0"),
+                commission=Decimal("0"), stamp_duty=Decimal("0"),
+                transfer_fee=Decimal("0"),
+            )
+        ratio = Decimal(qty) / Decimal(self.quantity)
+
+        def _scale(value) -> Decimal:
+            return ((value or Decimal("0")) * ratio).quantize(Decimal("0.01"))
+
+        return replace(
+            self,
+            quantity=qty,
+            amount=self.price * qty,
+            commission=_scale(self.commission),
+            stamp_duty=_scale(self.stamp_duty),
+            transfer_fee=_scale(self.transfer_fee),
+        )

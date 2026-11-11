@@ -85,6 +85,7 @@ def serialize_portfolio(db: Session, p: PortfolioStrategy) -> dict:
         "buy_commission_rate": float(p.buy_commission_rate) if p.buy_commission_rate is not None else None,
         "sell_commission_rate": float(p.sell_commission_rate) if p.sell_commission_rate is not None else None,
         "stamp_duty_rate": float(p.stamp_duty_rate) if p.stamp_duty_rate is not None else None,
+        "transfer_fee_rate": float(p.transfer_fee_rate) if p.transfer_fee_rate is not None else 0.00001,
         "slippage": float(p.slippage) if p.slippage is not None else None,
         "trading_session": p.trading_session,
         "price_limit_check_enabled": bool(p.price_limit_check_enabled) if p.price_limit_check_enabled is not None else True,
@@ -122,6 +123,12 @@ def _apply_portfolio_fields(p: PortfolioStrategy, req) -> None:
     p.buy_commission_rate = req.buy_commission_rate
     p.sell_commission_rate = req.sell_commission_rate
     p.stamp_duty_rate = req.stamp_duty_rate
+    # 过户费：None=请求未填 → 默认 0.001%/边；显式 0 是合法配置，必须原样落库
+    p.transfer_fee_rate = (
+        0.00001
+        if getattr(req, "transfer_fee_rate", None) is None
+        else req.transfer_fee_rate
+    )
     p.slippage = req.slippage
     p.trading_session = req.trading_session
     p.status = req.status

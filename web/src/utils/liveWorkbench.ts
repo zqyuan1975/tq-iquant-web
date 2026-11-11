@@ -28,6 +28,8 @@ export interface OrderRow {
 export interface TradeRow {
   key: number
   time: string
+  /** 北京日期标注：今天 / 昨天 / MM-DD；旧数据无时区 → ''（只显示时分秒）。 */
+  day?: string
   ts?: number | null
   stock_code: string
   trade_type: string
@@ -135,6 +137,15 @@ export function beijingDayKey(ts: number): string {
   const parts = BJ_DAY.formatToParts(new Date(ts))
   const v = (t: string) => parts.find((p) => p.type === t)?.value ?? ''
   return `${v('year')}-${v('month')}-${v('day')}`
+}
+
+/** 成交日期标注：今天 / 昨天 / MM-DD；ts 不可解析（旧数据无时区）→ ''（只显示时分秒）。 */
+export function tradeDayLabel(ts?: number | null, nowTs: number = Date.now()): string {
+  if (ts == null) return ''
+  const day = beijingDayKey(ts)
+  if (day === beijingDayKey(nowTs)) return '今天'
+  if (day === beijingDayKey(nowTs - 86400000)) return '昨天'
+  return day.slice(5)
 }
 
 /** 区间起点 epoch：今日=北京当日 00:00；近N日=含今日往前 N-1 天的 00:00；全部=null。 */
@@ -300,10 +311,12 @@ export function orderHistoryToRows(items: LiveOrderItem[]): OrderRow[] {
 
 /** SSE trade 事件 → 成交行。 */
 export function tradeEventToRow(ev: Ev, liveTime = ''): TradeRow {
+  const ts = liveTime ? Date.now() : null
   return {
     key: nextEventId(),
     time: liveTime,
-    ts: liveTime ? Date.now() : null,
+    day: tradeDayLabel(ts),
+    ts,
     stock_code: (ev.stock_code as string) || '',
     trade_type: (ev.trade_type as string) || '',
     price: (ev.price as number) ?? 0,
@@ -319,6 +332,7 @@ export function tradeHistoryToRows(items: LiveTradeItem[]): TradeRow[] {
     return {
       key: -i.id,
       time: t.text,
+      day: tradeDayLabel(t.ts),
       ts: t.ts,
       stock_code: i.stock_code,
       trade_type: i.trade_type,

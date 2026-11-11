@@ -108,6 +108,8 @@ class PortfolioCreate(BaseModel):
     buy_commission_rate: float = 0.00025
     sell_commission_rate: float = 0.00025
     stamp_duty_rate: float = 0.0005
+    # 过户费（双向，默认 A 股现行 0.001%/边）；None=请求未填 → 落默认，显式 0 原样落库
+    transfer_fee_rate: float | None = 0.00001
     slippage: float = 0
     trading_session: str = "full"
     # #1 涨跌停校验（回测成交 + 实盘下单前置）：None=新建默认开启/编辑不动；显式 bool=按值设置
@@ -238,10 +240,15 @@ def _validate_portfolio_numerics(req) -> str | None:
         return f"max_holdings 须 ≥ 1，收到 {req.max_holdings}"
     if req.min_commission < 0:
         return f"min_commission 不能为负，收到 {req.min_commission}"
-    for field in ("buy_commission_rate", "sell_commission_rate", "stamp_duty_rate", "slippage"):
+    for field in ("buy_commission_rate", "sell_commission_rate", "stamp_duty_rate",
+                  "slippage"):
         val = getattr(req, field)
         if not (0 <= val <= 0.5):
             return f"{field} 须在 [0, 0.5]，收到 {val}"
+    # 过户费：None=未填（落默认 0.00001），显式值（含 0）按值校验
+    tf = getattr(req, "transfer_fee_rate", None)
+    if tf is not None and not (0 <= tf <= 0.5):
+        return f"transfer_fee_rate 须在 [0, 0.5]，收到 {tf}"
     if req.benchmark_index and not re.fullmatch(r"\d{6}\.[A-Za-z]{2,4}", req.benchmark_index):
         return f"benchmark_index 格式须为 6 位代码.市场（如 000300.SH），收到 {req.benchmark_index!r}"
     return None

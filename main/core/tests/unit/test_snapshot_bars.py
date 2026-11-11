@@ -3,7 +3,7 @@
 TQ 盘中 K 线缓存只到上一交易日（实测+手册 refresh_kline 限制），
 实盘 bar 流改由 get_market_snapshot_batch 实时快照按分钟聚合合成。
 """
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import pytest
 
@@ -241,7 +241,9 @@ def test_adapter_batch_and_single_and_period_guard():
     assert set(out) == {"000001.SZ", "999999.SZ"}
     assert len(out["000001.SZ"]) == 1
     assert out["999999.SZ"] == []
-    assert ada.query_quotes_batch(["000001.SZ"], "5m", 10) == {}
+    # 5m 现由 1m 聚合服务（桶未满 → 该 code 空列表，而非整体空 dict）
+    assert ada.query_quotes_batch(["000001.SZ"], "5m", 10) == {"000001.SZ": []}
+    assert ada.query_quotes_batch(["000001.SZ"], "2m", 10) == {}
     one = ada.query_quote("000001.SZ", period="1m", count=10)
     assert len(one) == 1 and one[0]["stime"] == D1 + "105100"
 
@@ -277,3 +279,88 @@ def test_bar_poller_triggers_synthesized_bar_end_to_end():
     assert float(ev.stocks["000001.SZ"]["close"]) == pytest.approx(10.2)
 
     assert poller.poll() == []                    # 窗口重复 → 不重复触发
+
+
+# --- 5m/15m/30m/1h 聚合（TQ 原生分钟线过期时的兜底）---
+
+def _inject_completed(s, code, start, n, base=10.0):
+    """直接注入已完成 1m bar（label=分钟终点），便于构造多分钟桶。"""
+    bars = [{
+        "label": start + timedelta(minutes=i),
+        "open": base + i * 0.1,
+        "high": base + 0.2 + i * 0.1,
+        "low": base - 0.1 + i * 0.1,
+        "close": base + 0.1 + i * 0.1,
+        "volume": 100 + i,
+    } for i in range(n)]
+    with s._lock:
+        s._completed[code] = bars
+    return bars
+
+
+def test_aggregated_bars_5m_ohlcv_and_source_marker():
+    s = _mk({"000001.SZ": {"Now": "10.0", "Volume": "0"}})
+    _inject_completed(s, "000001.SZ", datetime(2026, 11, 3, 9, 31), 5)
+    bars = s.aggregated_bars(["000001.SZ"], period="5m", count=10)["000001.SZ"]
+    assert len(bars) == 1
+    b = bars[0]
+    assert b["stime"] == D1 + "093500"           # 桶终点（09:30–09:35）
+    assert b["open"] == pytest.approx(10.0)      # 首根 open
+    assert b["close"] == pytest.approx(10.5)     # 末根 close
+    assert b["high"] == pytest.approx(10.6)      # 极值
+    assert b["low"] == pytest.approx(9.9)
+    assert b["volume"] == 510                    # 100+101+102+103+104
+    assert b["source"] == "aggregated_1m"
+    assert b["period"] == "5m"
+
+
+def test_aggregated_bars_skips_incomplete_bucket():
+    """不足一个完整桶（4 根）不输出——绝不用残缺数据冒充周期 bar。"""
+    s = _mk({"000001.SZ": {"Now": "10.0", "Volume": "0"}})
+    _inject_completed(s, "000001.SZ", datetime(2026, 11, 3, 9, 31), 4)
+    assert s.aggregated_bars(["000001.SZ"], period="5m")["000001.SZ"] == []
+
+
+def test_aggregated_bars_drops_bucket_with_middle_gap():
+    """中间缺一分钟（标签不连续）整桶丢弃。"""
+    s = _mk({"000001.SZ": {"Now": "10.0", "Volume": "0"}})
+    bars = _inject_completed(s, "000001.SZ", datetime(2026, 11, 3, 9, 31), 5)
+    with s._lock:
+        s._completed["000001.SZ"] = [b for b in bars if b["label"].minute != 33]
+    assert s.aggregated_bars(["000001.SZ"], period="5m")["000001.SZ"] == []
+
+
+def test_aggregated_bars_1h_from_real_sampling_pipeline():
+    """真实采样 61 分钟 → 1h 桶（09:31–10:30）可聚合（需保留 ≥60 根 1m）。"""
+    s = _mk({"000001.SZ": {"Now": "10.0", "Volume": "0"}})
+    base = datetime(2026, 11, 3, 9, 30, 30)
+    for i in range(61):
+        s.sample(base + timedelta(minutes=i))
+    bars = s.aggregated_bars(["000001.SZ"], period="1h")["000001.SZ"]
+    assert len(bars) == 1
+    assert bars[0]["stime"] == D1 + "103000"
+    assert bars[0]["source"] == "aggregated_1m"
+
+
+def test_aggregated_bars_afternoon_session_alignment():
+    """下午从 13:00 起算：13:01–13:05 归 13:05 桶，不与上午连桶。"""
+    s = _mk({"000001.SZ": {"Now": "10.0", "Volume": "0"}})
+    _inject_completed(s, "000001.SZ", datetime(2026, 11, 3, 13, 1), 5)
+    bars = s.aggregated_bars(["000001.SZ"], period="5m")["000001.SZ"]
+    assert len(bars) == 1 and bars[0]["stime"] == D1 + "130500"
+
+
+def test_aggregated_bars_unsupported_or_unknown_codes():
+    s = _mk({"000001.SZ": {"Now": "10.0", "Volume": "0"}})
+    assert s.aggregated_bars(["000001.SZ"], period="2m") == {}
+    assert s.aggregated_bars(["999999.SZ"], period="5m") == {"999999.SZ": []}
+
+
+def test_adapter_serves_aggregated_periods_and_exposes_synthesizer():
+    s = _mk({"000001.SZ": {"Now": "10.0", "Volume": "0"}})
+    _inject_completed(s, "000001.SZ", datetime(2026, 11, 3, 9, 31), 5)
+    ada = SnapshotQuoteDispatcher(s)
+    assert ada.synthesizer is s
+    out = ada.query_quotes_batch(["000001.SZ"], "5m", 10)
+    assert out["000001.SZ"][0]["stime"] == D1 + "093500"
+    assert out["000001.SZ"][0]["source"] == "aggregated_1m"

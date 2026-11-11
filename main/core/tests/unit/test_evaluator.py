@@ -389,6 +389,33 @@ def test_relative_metrics_linear_series():
     # rb=-2% 日 active return = -0.97% → 超额曲线有回撤
     assert result["excess_max_drawdown"] is not None
     assert result["excess_max_drawdown"] > 0
+    # 超额卡玛 = 年化超额 / |超额最大回撤|
+    assert result["excess_calmar_ratio"] is not None
+    assert abs(
+        float(result["excess_calmar_ratio"])
+        - 0.0756 / float(result["excess_max_drawdown"])
+    ) < 0.01
+
+
+def test_downside_volatility_matches_sortino_denominator():
+    """年化下行波动率 = 负收益日均方根 × √252（与索提诺分母同口径）。"""
+    import math
+    snaps = [
+        _snap(100000, date(2024, 1, 2)),
+        _snap(110000, date(2024, 1, 3)),   # +10%
+        _snap(99000, date(2024, 1, 4)),    # -10%
+        _snap(108900, date(2024, 1, 5)),   # +10%
+    ]
+    result = Evaluator().evaluate(snaps)
+    expected = Decimal(str(math.sqrt(0.01 * 252))).quantize(Decimal("0.0001"))
+    assert result["downside_volatility"] == expected
+    # 无负收益日 → 0（与索提诺分母的 0 保护一致）
+    up_only = Evaluator().evaluate([
+        _snap(100000, date(2024, 1, 2)),
+        _snap(101000, date(2024, 1, 3)),
+        _snap(102000, date(2024, 1, 4)),
+    ])
+    assert up_only["downside_volatility"] == Decimal("0")
 
 
 def test_relative_metrics_short_sample_is_none():
@@ -397,6 +424,7 @@ def test_relative_metrics_short_sample_is_none():
     result = Evaluator().evaluate(snaps)
     for k in REL_KEYS:
         assert result[k] is None, k
+    assert result["excess_calmar_ratio"] is None
 
 
 def test_relative_metrics_without_benchmark_values_is_none():
@@ -444,6 +472,7 @@ def test_relative_metrics_flat_benchmark_guards():
     assert result["tracking_error"] == Decimal("0.0000")
     assert result["excess_annual_return"] == Decimal("0.2520")
     assert result["excess_max_drawdown"] == Decimal("0.0000")
+    assert result["excess_calmar_ratio"] is None   # 超额回撤 0 → 无意义，不出数
 
 
 # ===========================================================================

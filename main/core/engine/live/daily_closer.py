@@ -109,6 +109,8 @@ class DailyCloser:
         # daily_bars_done_date 跨重启幂等）
         self.last_daily_bar_date = None
         self._daily_bars_done_loaded = False
+        # P2-11：日线取数非当日 / 取数为空 的 risk 事件节流（每交易日一条）
+        self._daily_freshness_noted_date = None
         # 15:05 收盘清扫已执行的日期标记（每日一次，确定性兜底未成交单）
         self.last_close_sweep_date = None
         # 14:52 提前收盘价轮次已执行日期（内存 + DB advance_close_done_date 跨重启幂等）
@@ -138,6 +140,19 @@ class DailyCloser:
     def _calendar(self):
         return self._get_calendar()
 
+    def _next_trading_day(self, today: date) -> date:
+        """次一交易日（跳过周末 + 日历非交易日，最多探 15 天）。
+
+        仅用于 P1-1 日亏暂停解除门槛：日历离线时 fail-open 按工作日判，
+        最坏退化为「跳过周末」，不会因日历缺失把暂停无限延长。
+        """
+        d = today + timedelta(days=1)
+        for _ in range(15):
+            if d.weekday() < 5 and self._calendar.is_trading_day(d):
+                return d
+            d += timedelta(days=1)
+        return today + timedelta(days=1)
+
     # ---------------- 日终估值（E5/E6）----------------
     def maybe_daily_close(self, now: Optional[datetime] = None) -> None:
         """本机时间 ≥ 14:30 且当日未算过 → 对每个组合调一次 update_daily。
@@ -158,10 +173,14 @@ class DailyCloser:
         if self.last_daily_date == today:
             return
         self.last_daily_date = today
+        # P1-1：14:30 触发的日亏暂停延长到**次一交易日**整日，D+2 首 bar 才恢复
+        # （回测是「上一日收盘净值判日亏 → 暂停次日全天」，实盘 14:30 当场判若仍按
+        # 「触发日次日恢复」就只停了当日 30 分钟）。见 RiskManager.update_daily。
+        resume_after = self._next_trading_day(today)
         for portfolio in self._ctx.portfolios:
             # per-portfolio 日终估值 + update_daily + daily_loss 触发/恢复 + risk 事件
             # 归 BreakerService.on_daily_update（0010 步骤 4）；时点判断/幂等留本方法。
-            self._breaker.on_daily_update(portfolio, today)
+            self._breaker.on_daily_update(portfolio, today, resume_after=resume_after)
             # W2 现金管理增强（预留触发点，默认关）：命中阈值仅记决策事件，不产生订单。
             # 设计定案：实盘在 14:30 日终（与 daily_loss 同点）触发。估值口径与
             # on_daily_update 一致（现金 + 持仓按最近已知价市值），bar_time 取日终时点
@@ -178,6 +197,38 @@ class DailyCloser:
         )
 
     # ---------------- 15:05 日线级别轮次（1d/1w/1mon，收盘落定后）----------------
+    def _note_daily_freshness_skip(self, today, *, stale: int, total: int) -> None:
+        """P2-11：日线轮次因「取数为空 / 最新日线非当日」跳过时记 risk 事件。
+
+        旧实现只打一行 WARNING，工作台上完全看不出「今天日线策略没跑」（既没有
+        信号也没有风控）。这里每交易日只发一条 ``gate=daily_bar_freshness``，
+        后续分钟级重试成功则照常驱动。
+        """
+        if self._daily_freshness_noted_date == today:
+            return
+        self._daily_freshness_noted_date = today
+        if total == 0:
+            message = "日线取数为空（桥/TQ 未就绪或通道不支持日线），本交易日日线轮次暂未执行"
+        else:
+            message = ("最新日线非当日 %d/%d 只（日线未落盘），本交易日日线轮次暂未执行；"
+                       "不会用昨日 bar 冒充今日收盘，等待落盘后重试" % (stale, total))
+        logger.warning("daily bar freshness skip: %s (session %s)",
+                       message, self._ctx.session_id)
+        try:
+            self._emit("risk", {
+                "session_id": self._ctx.session_id,
+                "gate": "daily_bar_freshness",
+                "action": "skip",
+                "rule": "daily_bar_not_today",
+                "period": "1d",
+                "stale_count": stale,
+                "total_count": total,
+                "message": message,
+            })
+        except Exception:  # noqa: BLE001 — 事件推送失败不影响轮次重试
+            logger.warning("daily_bar_freshness 事件推送失败 (session %s)",
+                           self._ctx.session_id, exc_info=True)
+
     def maybe_daily_bars(self, now: Optional[datetime] = None) -> None:
         """15:05 日线级别轮次：等周期收盘价落定后，用**完整 bar**驱动 1d/1w/1mon。
 
@@ -232,10 +283,13 @@ class DailyCloser:
         md = self._market_data
         bars_by_code = self._fetch_1d_bars()
         if not bars_by_code:
+            # P2-11：取数为空同样意味着「今天日线策略没跑」，补事件让工作台可见。
+            self._note_daily_freshness_skip(today, stale=0, total=0)
             return
         # 完成性校验：最后一根 1d bar 必须是「今天」，否则说明日线还没落盘
         # （桥/TQ 滞后）——跳过该 code，绝不用昨日完成 bar 冒充今日收盘。
         stale = 0
+        total = len(bars_by_code)
         fresh: Dict[str, list] = {}
         for code, rows in bars_by_code.items():
             last_st = parse_bar_time(rows[-1]) if rows else None
@@ -248,9 +302,20 @@ class DailyCloser:
                 "daily bars: %d code(s) 最新日线不是今日（日线未落盘？），本次跳过 "
                 "(session %s)", stale, self._ctx.session_id,
             )
+            # P2-11：旧实现只打 WARNING → 工作台看不出「今天日线策略没跑」。
+            self._note_daily_freshness_skip(today, stale=stale, total=total)
         bars_by_code = fresh
         if not bars_by_code:
             return
+        # 增量回测交接：把本轮已取到的完整日线（含公式预热窗口）留给 15:10 的
+        # 接缝续跑复用，避免为续跑额外卡通达信行情。交接失败不影响实盘。
+        try:
+            from core.services.incremental_backtest import record_daily_bars
+            record_daily_bars(self._ctx.session_id, today, bars_by_code)
+        except Exception:  # noqa: BLE001
+            logger.warning(
+                "incremental backtest: 日线交接失败 (session %s)",
+                self._ctx.session_id, exc_info=True)
         # daily_time = 任一 code 最新 1d bar 的 stime（交易日 00:00）；解析失败用今日零点兜底
         daily_time = parse_bar_time(next(iter(bars_by_code.values()))[-1])
         if daily_time is None:

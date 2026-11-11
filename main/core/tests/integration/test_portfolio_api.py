@@ -1274,6 +1274,7 @@ def test_create_portfolio_numeric_range_rejected(client):
         {"max_holdings": 0},
         {"min_commission": -5},
         {"buy_commission_rate": -0.001},
+        {"transfer_fee_rate": -0.001},
         {"slippage": -0.01},
         {"slippage": 0.6},
         {"benchmark_index": "bad idx"},
@@ -1286,8 +1287,71 @@ def test_create_portfolio_numeric_range_rejected(client):
     ok = c.post("/api/portfolios", json=_create_payload(
         initial_capital=1, max_holdings=1, min_commission=0,
         buy_commission_rate=0, sell_commission_rate=0, stamp_duty_rate=0, slippage=0,
+        transfer_fee_rate=0,
     )).json()
     assert ok["code"] == 0
+
+    # 过户费率缺省 → 组合落库 0.000010（回测成本含费新默认）
+    created = c.post("/api/portfolios", json=_create_payload(name="TF_DEFAULT")).json()
+    assert created["code"] == 0
+    detail = c.get(f"/api/portfolios/{created['data']['id']}").json()
+    assert detail["data"]["transfer_fee_rate"] == 0.00001
+
+
+def test_portfolio_transfer_fee_rate_zero_and_none(client):
+    """过户费：显式 0 原样落库；未传/传 None 落默认 0.00001；非法值仍拒（create/update 同口径）。"""
+    c, Session = client
+    db = Session()
+    _seed_pool(db); _seed_formula(db)
+    db.close()
+
+    # create：显式 0 → 0
+    created = c.post("/api/portfolios", json=_create_payload(
+        name="TF_ZERO", transfer_fee_rate=0,
+    )).json()
+    assert created["code"] == 0
+    pid = created["data"]["id"]
+    assert c.get(f"/api/portfolios/{pid}").json()["data"]["transfer_fee_rate"] == 0
+
+    # create：显式 None → 默认 0.00001
+    created = c.post("/api/portfolios", json=_create_payload(
+        name="TF_NONE", transfer_fee_rate=None,
+    )).json()
+    assert created["code"] == 0
+    assert c.get(
+        f"/api/portfolios/{created['data']['id']}"
+    ).json()["data"]["transfer_fee_rate"] == 0.00001
+
+    # create：不传 → 默认 0.00001
+    payload = _create_payload(name="TF_OMIT")
+    payload.pop("transfer_fee_rate", None)
+    created = c.post("/api/portfolios", json=payload).json()
+    assert created["code"] == 0
+    assert c.get(
+        f"/api/portfolios/{created['data']['id']}"
+    ).json()["data"]["transfer_fee_rate"] == 0.00001
+
+    # update：显式 0 → 0；显式 None → 默认 0.00001
+    body = c.put(f"/api/portfolios/{pid}", json=_create_payload(
+        name="TF_ZERO", transfer_fee_rate=0.00005,
+    )).json()
+    assert body["code"] == 0 and body["data"]["transfer_fee_rate"] == 0.00005
+    body = c.put(f"/api/portfolios/{pid}", json=_create_payload(
+        name="TF_ZERO", transfer_fee_rate=0,
+    )).json()
+    assert body["code"] == 0 and body["data"]["transfer_fee_rate"] == 0
+    body = c.put(f"/api/portfolios/{pid}", json=_create_payload(
+        name="TF_ZERO", transfer_fee_rate=None,
+    )).json()
+    assert body["code"] == 0 and body["data"]["transfer_fee_rate"] == 0.00001
+
+    # 非法值仍被拒（create + update）
+    assert c.post("/api/portfolios", json=_create_payload(
+        name="TF_BAD", transfer_fee_rate=-0.001,
+    )).json()["code"] == 400
+    assert c.put(f"/api/portfolios/{pid}", json=_create_payload(
+        name="TF_ZERO", transfer_fee_rate=-0.001,
+    )).json()["code"] == 400
 
 
 def test_create_portfolio_batch_strategy_numeric_rejected(client):

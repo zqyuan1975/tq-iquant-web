@@ -67,6 +67,7 @@ const GROUPS = [
   { key: 'base', label: '基础环境' },
   { key: 'ths', label: '同花顺通道' },
   { key: 'tq', label: '通达信 TQ 通道' },
+  { key: 'preopen', label: '盘前集合竞价' },
   { key: 'misc', label: '回测与数据' },
   { key: 'backup', label: '数据备份' },
 ] as const
@@ -393,19 +394,30 @@ function testTdx() { return testChannel('tdx_tq') }
               />
               <p class="cfg-hint">&gt;0：在途单超时未成交自动撤单并释放同向闸；0=禁用</p>
             </div>
+            <div class="cfg-test">
+              <button @click="testTdx" class="btn btn-sm" :disabled="testing !== ''">
+                {{ testing === 'tdx_tq' ? '测试中…' : '测试连接（只读）' }}
+              </button>
+              <span v-if="testResults.tdx_tq" :style="{ color: testResults.tdx_tq.ok ? 'var(--green)' : 'var(--red)', fontSize: '13px' }">
+                {{ testResults.tdx_tq.text }}
+              </span>
+            </div>
+          </section>
+
+          <section v-show="activeGroup === 'preopen'">
+            <h3 class="cfg-h">盘前集合竞价（全引擎生效）</h3>
+            <p class="cfg-desc">
+              对通达信 TQ / 同花顺 / 掘金 / QMT 四条交易通道均生效，与各通道自身参数相互独立。
+              默认开启；关闭后行为与旧版一致（次日首根完成 1m bar 约 09:31 放行）。
+              开启后在交易日 09:15–结束时间 把「当日 due」的 deferred 日线信号单直接
+              报进集合竞价，不依赖 1 分钟 bar；未报成/闸门拦截的单回 deferred 队列，
+              由 09:31 首根 bar 路径兜底重试（同一单不会两次报出）。
+            </p>
             <div class="field">
-              <label>
-                <input
-                  v-model="config.tq_trade!.pre_open_auction_enabled"
-                  type="checkbox" style="margin-right:8px"
-                />次日盘前（集合竞价）执行日线信号单
+              <label class="cfg-check">
+                <input v-model="config.tq_trade!.pre_open_auction_enabled" type="checkbox" />
+                启用盘前集合竞价
               </label>
-              <p class="cfg-hint">
-                默认关闭（关闭时行为与旧版一致：次日首根完成 1m bar 约 09:31 放行）。
-                开启后在交易日 09:15–结束时间 把「当日 due」的 deferred 日线信号单直接
-                报进集合竞价，不依赖 1 分钟 bar；未报成/闸门拦截的单回 deferred 队列，
-                由 09:31 首根 bar 路径兜底重试（同一单不会两次报出）。
-              </p>
             </div>
             <div class="field">
               <label>盘前执行结束时间</label>
@@ -425,14 +437,6 @@ function testTdx() { return testChannel('tdx_tq') }
                 委托价 = 信号价 × (1 ± 幅度)，并夹进当日涨跌停（涨停−1 跳 / 跌停+1 跳）。
                 买向上让价提高竞价成交率，卖向下让价；不推到涨跌停（避免余量挂板追价）
               </p>
-            </div>
-            <div class="cfg-test">
-              <button @click="testTdx" class="btn btn-sm" :disabled="testing !== ''">
-                {{ testing === 'tdx_tq' ? '测试中…' : '测试连接（只读）' }}
-              </button>
-              <span v-if="testResults.tdx_tq" :style="{ color: testResults.tdx_tq.ok ? 'var(--green)' : 'var(--red)', fontSize: '13px' }">
-                {{ testResults.tdx_tq.text }}
-              </span>
             </div>
           </section>
 

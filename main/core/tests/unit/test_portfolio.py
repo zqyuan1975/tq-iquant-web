@@ -1586,6 +1586,23 @@ def test_intraday_bar_triggers_stop_loss_for_daily_strategy():
     assert orders[0].signal_type == SignalType.STOP_LOSS
 
 
+def test_check_risks_uses_close_only_not_high_low():
+    """口径固化（2026-11-11）：峰值与三类风控只用 close，high/low 不得参与。
+
+    成本 10、移动止损 10%：high=20 若被用于 update_high → 峰值 20、回撤 48%
+    误触移动止损；只用 close=10.4 → 峰值 10.4、回撤 0，不触发。
+    """
+    port, _ctx, pos = _portfolio_1d_with_holdings(
+        stop_loss=Decimal("0.5"), trailing=Decimal("0.1"))
+    bar = BarEvent(stocks={"000001.SZ": {
+        "open": Decimal("10"), "high": Decimal("20"),
+        "low": Decimal("5"), "close": Decimal("10.4"), "volume": 1000,
+    }}, bar_time=datetime(2026, 7, 30, 0, 0))
+    orders = port.on_bar(bar, signal_cache={}, period="1d")
+    assert orders == []
+    assert pos.highest_price == Decimal("10.4")
+
+
 def test_mismatched_risk_false_skips_weekly_strategy_on_advance_daily_bar():
     """14:51 提前收盘价轮次（mismatched_risk=False）：1w/1mon 策略不被 1d bar 触发风控。
 
@@ -1670,3 +1687,49 @@ def test_intraday_trailing_stop_uses_realtime_high():
     orders = port.on_bar(bar, signal_cache={}, period="1m")
     assert len(orders) == 1
     assert orders[0].signal_type == SignalType.TRAILING_STOP
+
+
+# ---------------- P1-8 估值三级兜底（最后已知价 → 成本 → 前收）----------------
+def _holding_port(cost, stock="600000.SH", quantity=1000):
+    """单策略 + 单持仓（无任何 bar 价，成本可控）。"""
+    port, ctx = _portfolio_with_strategy(stock, [])
+    pos = Position(stock)
+    pos.quantity = quantity
+    pos.avg_cost = Decimal(cost)
+    ctx.positions[stock] = pos
+    return port, ctx, pos
+
+
+def test_valuation_falls_back_to_cost_when_no_price():
+    """成本已知但无 bar → 按成本估值（不是 0，不制造假回撤）。"""
+    port, _ctx, _pos = _holding_port("10")
+    assert port._holdings_value() == Decimal("10000")
+    assert port.unpriced_codes() == set()
+
+
+def test_valuation_uses_prev_close_when_cost_unknown():
+    """成本未知（avg_cost=0，继承仓）且无当日 bar → 退回前收，绝不按 0 估值。"""
+    port, _ctx, _pos = _holding_port("0")
+    port._prev_close_snapshot["600000.SH"] = Decimal("12")
+    assert port._holdings_value() == Decimal("12000")
+    assert port.unpriced_codes() == set()
+
+
+def test_valuation_zero_and_reported_when_all_levels_missing():
+    """三级全缺 → 按 0 计并登记 unpriced（引擎据此记 WARNING + risk 事件）。"""
+    port, _ctx, _pos = _holding_port("0")
+    assert port._holdings_value() == Decimal("0")
+    assert port.unpriced_codes() == {"600000.SH"}
+
+
+def test_valuation_prefers_last_known_price_over_cost_across_days():
+    """最后已知价跨日持久：昨日收盘 12 > 成本 10，停牌当日仍按 12 估值。"""
+    port, _ctx, _pos = _holding_port("10")
+    port._refresh_price_snapshot(
+        _bar("600000.SH", "12", datetime(2026, 7, 30, 15, 0)))
+    assert port._holdings_value() == Decimal("12000")
+    # 次日无该股 bar（停牌）：快照沿用，且已滚动为「前收」
+    port._refresh_price_snapshot(
+        _bar("000001.SZ", "9", datetime(2026, 7, 31, 10, 0)))
+    assert port._prev_close_snapshot["600000.SH"] == Decimal("12")
+    assert port._holdings_value() == Decimal("12000")

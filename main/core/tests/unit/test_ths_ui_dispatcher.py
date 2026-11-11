@@ -207,10 +207,13 @@ def test_try_match_order_ref_uses_legacy_fuzzy_when_channel_has_no_remark():
 
     om = OrderStateMachine.__new__(OrderStateMachine)
     om._ctx = SimpleNamespace(dispatcher=Disp())
+    # 假单需覆盖 try_match_order_ref 会读写的全部 LiveOrder 列：该方法按
+    # 「柜台认领成功后清 trash 标记」的语义访问 error_message（真实对象恒有该列），
+    # 漏掉它不是实现缺陷，而是夹具没把契约补齐。
     lo = SimpleNamespace(
         stock_code="600000.SH", trade_type="buy", quantity=600,
         created_at=datetime(2026, 10, 23, 1, 30, 0),  # UTC
-        bridge_order_id="deadbeef", order_ref=None,
+        bridge_order_id="deadbeef", order_ref=None, error_message=None,
     )
     orders = [{
         "source": "BRIDGE", "remark": "", "order_ref": "ref-1",
@@ -1682,17 +1685,72 @@ def test_execute_entry_price_not_applied_writes_structured_reject(tmp_path, monk
     assert receipts[0]["readback_price"] == pytest.approx(4.415)
 
 
-def test_price_mode_forced_approval_in_pre_open_window(monkeypatch):
-    """盘前窗口（09:15–09:20）内启动：latest 被强制为 approval 并打标；
-    非盘前保持配置原值。"""
+def test_price_mode_pre_open_forced_at_execution_not_construction(monkeypatch):
+    """盘前判定推迟到执行期（2026-11-11）：构造期不再改写 ths_price_mode。
+
+    旧写法在构造期把 latest 改成 approval（09:16 启动的会话整天锁死 approval），
+    09:00 前启动的会话又整场 latest 不键价。现在构造只留启动公告标记，由
+    `_effective_price_mode()` 在下单执行期逐单判定窗口。
+    """
     monkeypatch.setattr(
         ThsUiDispatcher, "_pre_open_window_now", staticmethod(lambda: True))
     d = ThsUiDispatcher(price_mode="latest", execute_mode="direct")
-    assert d.ths_price_mode == "approval"
-    assert d.price_mode_forced_pre_open is True
+    assert d.ths_price_mode == "latest"             # 构造期不再改写
+    assert d.price_mode_forced_pre_open is True     # 启动公告标记（同一判据）
+    assert d._effective_price_mode() == "approval"  # 执行期：窗口内走 approval
 
     monkeypatch.setattr(
         ThsUiDispatcher, "_pre_open_window_now", staticmethod(lambda: False))
     d2 = ThsUiDispatcher(price_mode="latest", execute_mode="direct")
     assert d2.ths_price_mode == "latest"
     assert d2.price_mode_forced_pre_open is False
+    assert d2._effective_price_mode() == "latest"
+    # 显式配置 approval 与窗口无关，始终 approval
+    d3 = ThsUiDispatcher(price_mode="approval", execute_mode="direct")
+    assert d3._effective_price_mode() == "approval"
+
+
+def test_execute_via_ui_types_platform_price_in_pre_open_window(monkeypatch):
+    """price_mode=latest + 盘前窗口内 → 仍走 approval 路径键入平台价（1033）。
+
+    09:00 前启动、配置 latest 的会话，盘前集合竞价必须报平台算的价，而不是 THS
+    自动跟出的最新价（真机实证：代码键入后 4s THS 会用最新价覆盖价格框）。
+    """
+    monkeypatch.setattr(
+        ThsUiDispatcher, "_pre_open_window_now", staticmethod(lambda: True))
+    d = ThsUiDispatcher(price_mode="latest", execute_mode="direct", captcha_ocr=True)
+    assert d.ths_price_mode == "latest"      # 配置未被改写
+    d._connected = True
+    kb_transcript = []
+    fake_fields = {
+        "code": _FakeField(1032, 316, 141, 121),
+        "price": _FakeField(1033, 316, 205, 98),
+        "quantity": _FakeField(1034, 316, 301, 98),
+    }
+
+    monkeypatch.setattr(d, "_gui_guard", lambda: True)
+    monkeypatch.setattr(d, "_ensure_topmost", lambda x, y: True)
+    monkeypatch.setattr(d, "_switch", lambda k: True)
+    monkeypatch.setattr(d, "_uia_window", lambda: object())
+    monkeypatch.setattr(d, "_uia_field", lambda w, kind: fake_fields[kind])
+    d._PRICE_FOLLOW_WAIT = 0
+    import pywinauto.mouse as ths_mouse
+    monkeypatch.setattr(ths_mouse, "click", lambda coords: None)
+    monkeypatch.setattr(d, "kb_send", lambda k: kb_transcript.append(k))
+    monkeypatch.setattr(d, "_snapshot_hwnds", lambda: set())
+    monkeypatch.setattr(d, "_confirm_dialog", lambda before, buttons: True)
+    monkeypatch.setattr(d, "_find_order",
+                        lambda code, direction, vol, since=None: {"order_id": "200001"})
+    monkeypatch.setattr(d, "_get_ocr_engine", lambda: object())
+    monkeypatch.setattr(d, "_clipboard_copy_float", lambda: None)
+    monkeypatch.setattr(d, "_clipboard_copy_int", lambda: None)
+    monkeypatch.setattr(
+        "core.engine.ths_ui_dispatcher.pyperclip",
+        SimpleNamespace(copy=lambda v: None, paste=lambda: ""))
+
+    d._execute_via_ui(_order(stock_code="600519.SH", quantity=100,
+                             price=Decimal("1700.55")))
+
+    # 价格键入序列存在（approval 路径），不是 latest 的「不碰价格框」
+    assert "1700.55" in kb_transcript
+    assert d._last_submit_ref == "200001"

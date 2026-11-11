@@ -106,13 +106,15 @@ def test_execute_buy_approves_and_updates_account_position():
 
     # Account 扣款
 
-    assert acc.cash == Decimal("100000") - (trade.amount + trade.commission + trade.stamp_duty)
+    assert acc.cash == Decimal("100000") - (trade.amount + trade.commission + trade.stamp_duty + trade.transfer_fee)
 
     # Position 更新
 
     assert pos.quantity == 1000
 
-    assert pos.avg_cost == Decimal("10.5")
+    # 买入费用（佣金+过户费）摊入成本 → 与实盘柜台合并均价同口径
+    assert pos.avg_cost == ((trade.amount + trade.commission + trade.stamp_duty
+                             + trade.transfer_fee) / 1000)
 
     assert pos.buy_time == datetime(2026, 7, 29, 15, 0)
 
@@ -394,7 +396,7 @@ def test_execute_sell_next_day_succeeds():
 
     # 卖出回款
 
-    assert acc.cash == Decimal("100000") + (trade.amount - trade.commission - trade.stamp_duty)
+    assert acc.cash == Decimal("100000") + (trade.amount - trade.commission - trade.stamp_duty - trade.transfer_fee)
 
 
 
@@ -833,7 +835,7 @@ def test_normal_buy_no_gap_no_recheck():
 
     assert trade.price == Decimal("10")
 
-    assert acc.cash == Decimal("100000") - (trade.amount + trade.commission + trade.stamp_duty)
+    assert acc.cash == Decimal("100000") - (trade.amount + trade.commission + trade.stamp_duty + trade.transfer_fee)
 
 
 
@@ -1161,3 +1163,49 @@ def test_fit_buy_qty_to_cash_explicit_fee_overrides():
         buy_rate=Decimal("0.001"), min_commission=Decimal("5"),
     )
     assert qty == 900
+
+
+def test_dispatcher_charges_transfer_fee_both_sides():
+    """过户费双向（2026-11-11）：1000 股 @10、0.001%/边 → 买卖各 0.10 元。"""
+    dispatcher = SimulatedDispatcher(
+        open_prices={"000001.SZ": Decimal("10")},
+        min_commission=Decimal("5"),
+        buy_commission_rate=Decimal("0.00025"),
+        sell_commission_rate=Decimal("0.00025"),
+        stamp_duty_rate=Decimal("0.0005"),
+        transfer_fee_rate=Decimal("0.00001"),
+    )
+    buy = dispatcher.place_order(
+        _order_open("000001.SZ", TradeType.BUY, 1000, "10"))
+    assert buy.transfer_fee == Decimal("0.100")
+    sell = dispatcher.place_order(
+        _order_open("000001.SZ", TradeType.SELL, 1000, "10"))
+    assert sell.transfer_fee == Decimal("0.100")
+    # 卖出另计印花税（0.05% = 10000 × 0.0005）
+    assert sell.stamp_duty == Decimal("5.0000")
+
+
+def test_buy_fee_guard_counts_transfer_fee_no_negative_cash():
+    """P2-1：成交前费用兜底判据必须含过户费，与 account.apply_trade 扣款同口径。
+
+    现金 10005 恰好够「成交额 10000 + 佣金 5」，但加上过户费 0.10 就超了。
+    旧判据（amount+commission+stamp）判为「不超」→ 全额成交 → 现金 -0.10；
+    修复后判为超支 → 缩量到 900 股（9000+5+0.09），现金非负。
+    """
+    acc = Account(Decimal("10005"))
+    pos = Position("000001.SZ")
+    dispatcher = SimulatedDispatcher(
+        open_prices={"000001.SZ": Decimal("10")},
+        min_commission=Decimal("5"),
+        buy_commission_rate=Decimal("0.00025"),
+        transfer_fee_rate=Decimal("0.00001"),
+    )
+    engine = ExecutionEngine(dispatcher, SimulatedT1Checker())
+    order = _order(TradeType.BUY, "000001.SZ", 1000, "10")
+
+    trade = engine.execute(order, acc, pos)
+
+    assert trade is not None
+    assert trade.quantity == 900
+    assert acc.cash >= Decimal("0")
+    assert trade.transfer_fee > 0

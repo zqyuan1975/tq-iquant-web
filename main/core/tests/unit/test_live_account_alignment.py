@@ -582,6 +582,39 @@ def test_out_of_pool_position_not_attributed(caplog):
     assert [p for p in events if p.get("rule") == "out_of_pool_position"] == []
 
 
+def test_out_of_pool_position_not_deducted_from_virtual_cash():
+    """②（2026-11-11）：池外仓不进虚拟现金/净值/回撤分母。
+
+    起账现金 = 组合配置资金；只有**池内**继承仓的市值从虚拟现金扣除（账户总资产
+    口径的继承仓），池外仓（代码不在任何组合股票池）一分钱都不动——它们只出现在
+    展示层（out_of_pool=True）与对账，不参与 total_value（回撤分母）。
+    """
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single()
+    disp = _AcctDispatcher(positions=[])
+    engine = _mk_engine(disp, factory, port,
+                        pool_codes_by_portfolio={1: {"600000.SH"}})
+    pos = [
+        # 池内继承仓：市值 1000 → 从起账现金扣除（不双计）
+        {"symbol": "600000.SH", "volume": 100, "available": 100,
+         "cost": 10.0, "market_value": 1000.0},
+        # 池外仓：市值 47700 → 不进虚拟账本、不扣现金
+        {"symbol": "002745.SZ", "volume": 5300, "available": 5300,
+         "cost": 9.0, "market_value": 47700.0},
+    ]
+    account = port.account
+    assert account.cash == Decimal("100000")
+    with factory() as db:
+        engine._import_external_positions(db, pos, now_shanghai())
+
+    ctx = engine.ctx.portfolios[0].strategies[0]
+    assert "002745.SZ" not in ctx.positions
+    assert account.cash == Decimal("99000")          # 只扣池内继承仓 1000
+    assert port._holdings_value() == Decimal("1000")  # 净值只含池内持仓
+    # 组合净值 = 99000 + 1000 = 100000（池外 47700 完全没有进入分子/分母）
+    assert account.cash + port._holdings_value() == Decimal("100000")
+
+
 def test_external_positions_snapshot_keeps_out_of_pool_rows_for_display():
     """池外仓不进虚拟账本，但必须留在引擎外部持仓快照里（/positions 展示来源）。
 
@@ -1658,5 +1691,186 @@ def test_recover_imports_bridge_shape_positions():
     assert ctx.positions["002745.SZ"].quantity == 5300
     assert ctx.positions["600888.SH"].quantity == 900
     assert engine.reconcile_mismatches == []
+
+
+# ---- ③ 外部现金流台账：虚拟现金随台账变化、净值/回撤剔除净流入 ----
+
+def test_apply_cash_flow_adds_cash_but_keeps_risk_equity():
+    """入金加虚拟现金（购买力），但风险口径净值不变（入金不是业绩）。"""
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single()
+    engine = _mk_engine(_AcctDispatcher(), factory, port)
+
+    before = port.risk_equity()
+    assert before == Decimal("100000")
+    assert engine.apply_cash_flow(1, Decimal("10000")) is True
+    assert port.account.cash == Decimal("110000")
+    assert port.external_net_inflow == Decimal("10000")
+    assert port.risk_equity() == before      # 净流入同增 → 风险净值不变
+    # 出金同理：现金减少、净流入减少，风险净值仍不变
+    assert engine.apply_cash_flow(1, Decimal("-25000")) is True
+    assert port.account.cash == Decimal("85000")
+    assert port.external_net_inflow == Decimal("-15000")
+    assert port.risk_equity() == before
+    # 不存在的组合 → 未应用（DB 台账仍会在下次 recover 重放）
+    assert engine.apply_cash_flow(999, Decimal("1")) is False
+
+
+def test_daily_loss_ignores_external_withdrawal():
+    """出金不得被当成当日亏损：日终按「现金+市值−净流入」判 daily_loss。"""
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single()
+    engine = _mk_engine(_AcctDispatcher(), factory, port)
+    rm = port.risk_manager
+    rm.prev_close_value = Decimal("100000")
+    rm.peak_value = Decimal("100000")
+
+    engine.apply_cash_flow(1, Decimal("-20000"))
+    assert port.risk_equity() == Decimal("100000")   # 剔除出金后无当日盈亏
+
+    engine._breaker.on_daily_update(port, now_shanghai().date())
+    assert rm.daily_pause_active is False
+
+
+def test_record_cash_flow_persists_and_applies_to_running_engine():
+    """登记流水：落台账 + 运行中引擎立即记账；入金/出金符号由类型决定。"""
+    from core.models import LiveSession, LiveSessionPortfolio
+    from core.services import live_service
+
+    factory, _ = _db_factory()
+    db = factory()
+    db.add(LiveSession(id=1, name="cf", mode="live", engine="tdx",
+                       status="running", execution_mode="auto"))
+    db.add(LiveSessionPortfolio(session_id=1, portfolio_strategy_id=1,
+                                circuit_breaker_count=0))
+    db.commit()
+    port, _ = _portfolio_single()
+    engine = _mk_engine(_AcctDispatcher(), factory, port)
+
+    row, error = live_service.record_cash_flow(
+        db, 1, 1, "deposit", "5000", note="追加资金", engine=engine)
+    assert error is None and row["engine_applied"] is True
+    assert row["amount"] == "5000.00"
+    assert port.account.cash == Decimal("105000.00")
+    assert port.external_net_inflow == Decimal("5000.00")
+
+    # 出金：调用方给正数，符号由类型决定
+    row2, error = live_service.record_cash_flow(
+        db, 1, 1, "withdraw", 2000, engine=engine)
+    assert error is None and row2["amount"] == "-2000.00"
+    assert port.account.cash == Decimal("103000.00")
+    assert port.external_net_inflow == Decimal("3000.00")
+
+    # 非法类型 / 0 金额 / 未关联组合 → 400 语义，不落库
+    assert live_service.record_cash_flow(db, 1, 1, "bonus", "1")[1] is not None
+    assert live_service.record_cash_flow(db, 1, 1, "deposit", "0")[1] is not None
+    assert live_service.record_cash_flow(db, 1, 99, "deposit", "1")[1] is not None
+
+    listed = live_service.list_cash_flows(db, 1)
+    assert [f["flow_type"] for f in listed["flows"]] == ["withdraw", "deposit"]
+    assert listed["total_net_inflow"] == "3000.00"
+    assert live_service.list_cash_flows(db, 999) is None
+    db.close()
+
+
+def test_recover_replays_cash_flows():
+    """重启重放：初始资金 + 成交流水 + 台账净流入，净流入进风险口径。"""
+    from core.models import LiveCashFlow
+
+    factory, _ = _db_factory()
+    db = factory()
+    db.add(LiveCashFlow(
+        live_session_id=1, portfolio_strategy_id=1, flow_type="deposit",
+        amount=Decimal("5000"), flow_date=now_shanghai().date()))
+    db.commit()
+    port, _ = _portfolio_single()
+    engine = _mk_engine(_AcctDispatcher(), factory, port)
+
+    engine.recover(db)
+    db.close()
+
+    assert port.account.cash == Decimal("105000.00")
+    assert port.external_net_inflow == Decimal("5000.00")
+    assert port.risk_equity() == Decimal("100000")
+
+
+def test_cash_diff_alerts_once_per_window_without_touching_cash():
+    """柜台现金 vs 虚拟现金偏差只告警不改账，10 分钟节流。"""
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single()
+    engine = _mk_engine(_AcctDispatcher(), factory, port)
+    events = []
+    engine._emit = lambda ev, data: events.append((ev, data))
+
+    engine._note_cash_diff(Decimal("150000"))   # 虚拟 10 万，实时 15 万 → 偏差
+    engine._note_cash_diff(Decimal("150000"))   # 节流窗口内 → 不重复
+    hits = [d for ev, d in events
+            if ev == "risk" and d.get("rule") == "cash_diff"]
+    assert len(hits) == 1
+    assert hits[0]["action"] == "notice"
+    assert hits[0]["diff"] == "50000"
+    assert port.account.cash == Decimal("100000")   # 绝不改账
+    assert port.external_net_inflow == Decimal("0")
+
+    # 窗口内大幅偏差亦不重复（节流），窗口外恢复告警
+    engine._last_cash_diff_at = 0.0
+    engine._note_cash_diff(Decimal("150000"))
+    assert len([d for ev, d in events
+                if ev == "risk" and d.get("rule") == "cash_diff"]) == 2
+    # 小偏差（< max(1000, 1%)）不告警
+    engine._last_cash_diff_at = 0.0
+    engine._note_cash_diff(Decimal("100500"))
+    assert len([d for ev, d in events
+                if ev == "risk" and d.get("rule") == "cash_diff"]) == 2
+
+
+# ---- ⑥ 真实账户总资产 vs 虚拟净值：>20% 每会话告警一次，池外仓剔除后比对 ----
+
+def test_equity_deviation_warns_once_and_only_when_over_threshold():
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single()
+    engine = _mk_engine(_AcctDispatcher(), factory, port)
+    events = []
+    engine._emit = lambda ev, data: events.append((ev, data))
+
+    # 虚拟净值 10 万；真实 10.5 万 → 5% 偏差，不告警但结果可展示
+    engine._note_equity_deviation(Decimal("105000"), [])
+    assert engine._latest_equity_check["virtual_total"] == "100000"
+    assert engine._latest_equity_check["deviation_pct"] is not None
+    assert events == []
+
+    # 真实 13 万 → 30% 偏差，告警一次；再采集不重复告警
+    engine._note_equity_deviation(Decimal("130000"), [])
+    engine._note_equity_deviation(Decimal("130000"), [])
+    hits = [d for ev, d in events
+            if ev == "risk" and d.get("rule") == "equity_deviation"]
+    assert len(hits) == 1
+    assert hits[0]["action"] == "notice"
+    assert hits[0]["virtual_total"] == "100000"
+    assert hits[0]["real_total"] == "130000"
+    # 只告警不改账
+    assert port.account.cash == Decimal("100000")
+
+
+def test_equity_deviation_excludes_out_of_pool_positions():
+    """池外仓按设计不进虚拟账本（②），比对真实侧须剔除，否则恒告警。"""
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single()
+    engine = _mk_engine(_AcctDispatcher(), factory, port)
+    engine._pool_codes_by_portfolio = {1: {"600000.SH"}}
+    events = []
+    engine._emit = lambda ev, data: events.append((ev, data))
+    positions = [
+        {"symbol": "999999.SH", "volume": 2000, "cost": 5.0,
+         "market_value": 10000.0},   # 池外：1 万
+    ]
+    # 真实 11 万，剔除池外 1 万 → 与虚拟 10 万一致，不告警
+    engine._note_equity_deviation(Decimal("110000"), positions)
+    check = engine._latest_equity_check
+    assert Decimal(check["out_of_pool_value"]) == Decimal("10000")
+    assert Decimal(check["expected_total"]) == Decimal("100000")
+    assert events == []
+
+
 
 

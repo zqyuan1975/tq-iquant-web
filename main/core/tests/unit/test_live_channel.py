@@ -191,22 +191,38 @@ def test_channel_status_uses_session_engine(monkeypatch):
     assert data["label"].startswith("通达信")
 
 
-def test_channel_no_running_engine_reports_undetected(monkeypatch):
-    """引擎未运行 → online=None + engine_running=False，且不再做客户端探活。
+def test_channel_tdx_no_engine_probes_client_window(monkeypatch):
+    """引擎未运行也要真实探测：tdx 看客户端窗口，不在 → 离线（不默绿）。
 
-    历史缺陷（2026-11-04）：无引擎时 `_probe_channel_online` 另建 dispatcher
-    做 TQ 心跳，只要通达信客户端开着就返回 True，后端重启后工作台仍显示「在线」。
+    探针只做窗口存在性判断，不构造 TdxTqDispatcher（TQ 调用会冻结客户端）。
     """
     monkeypatch.setattr(svc, "load_config", lambda: _cfg(False))
+    monkeypatch.setattr(svc, "_window_present", lambda key: False)
 
     class _Boom:
         def __init__(self, **kw):
-            raise AssertionError("引擎未运行不应构造 dispatcher 探活")
+            raise AssertionError("窗口探针不得构造 dispatcher")
 
     monkeypatch.setattr(svc, "TdxTqDispatcher", _Boom)
+    svc._PROBE_CACHE.clear()
     data = svc.channel_status(engine_key="tdx", engines={})
-    assert data["online"] is None
+    assert data["online"] is False
+    assert data["online_source"] == "probe"
     assert data["engine_running"] is False
+
+
+def test_channel_ths_no_engine_probes_client_window(monkeypatch):
+    """同花顺：xiadan/hexin 窗口在 → 在线；同一套 online 布尔语义。"""
+    monkeypatch.setattr(svc, "load_config", lambda: _cfg(False))
+    monkeypatch.setattr(svc, "_window_present", lambda key: key == "ths")
+    svc._PROBE_CACHE.clear()
+    data = svc.channel_status(engine_key="ths", engines={})
+    assert data["online"] is True
+    assert data["online_source"] == "probe"
+    svc._PROBE_CACHE.clear()
+    monkeypatch.setattr(svc, "_window_present", lambda key: False)
+    data = svc.channel_status(engine_key="ths", engines={})
+    assert data["online"] is False
 
 
 def test_channel_running_engine_reports_real_heartbeat(monkeypatch):
@@ -261,16 +277,117 @@ def test_channel_running_iquant_engine_reports_running(monkeypatch):
     assert data["online"] is True
 
 
-def test_channel_goldminer_no_running_engine_stays_undetected(monkeypatch):
-    """无掘金引擎在跑时保持原语义：engine_running=False、online=None（未检测）。"""
+def test_channel_goldminer_no_running_engine_probes_bridge(monkeypatch):
+    """无掘金引擎在跑时也探 7801 桥：不可达 → 离线（不再有「未检测」第三态）。"""
     import types
 
     monkeypatch.setattr(svc, "load_config", lambda: _cfg(False))
+    seen = {}
+
+    class FakeBridge:
+        def __init__(self, base_url=None, **kw):
+            seen["base_url"] = base_url
+
+        def heartbeat(self):
+            return False
+
+    monkeypatch.setattr(svc, "HttpBridgeDispatcher", FakeBridge)
     tdx = types.SimpleNamespace(
         dispatcher=types.SimpleNamespace(channel="tdx_tq", heartbeat=lambda: True))
+    svc._PROBE_CACHE.clear()
     data = svc.channel_status(engine_key="goldminer", engines={1: tdx})
     assert data["engine_running"] is False
-    assert data["online"] is None
+    assert data["online"] is False
+    assert data["online_source"] == "probe"
+    assert seen["base_url"] == "http://127.0.0.1:7801"
+
+
+def test_channel_iquant_without_engine_probes_production_bridge(monkeypatch):
+    """无运行引擎（会话未启动）时 QMT 仍按常驻桥探活：桥可达 → 在线。
+
+    QMT 桥是常驻 HTTP 服务，可达性与会话是否启动无关；卡片必须真实反映桥
+    是否可达，不能因为「没有引擎」就一律显示未检测。
+    """
+    monkeypatch.setattr(svc, "load_config", lambda: _cfg(False))
+    seen = {}
+
+    class FakeBridge:
+        def __init__(self, base_url=None, **kw):
+            seen["base_url"] = base_url
+
+        def heartbeat(self):
+            return True
+
+    monkeypatch.setattr(svc, "HttpBridgeDispatcher", FakeBridge)
+    svc._PROBE_CACHE.clear()
+    data = svc.channel_status(engine_key="iquant", engines={})
+    assert seen["base_url"] == "http://127.0.0.1:8790"   # 只探生产仿真桥
+    assert data["engine_running"] is False
+    assert data["online"] is True
+    assert data["online_source"] == "probe"
+
+
+def test_channel_iquant_bridge_down_reports_offline_not_green(monkeypatch):
+    """桥没运行 → online=False（离线/异常），绝不默认亮绿，也不退回 None 未检测。"""
+    monkeypatch.setattr(svc, "load_config", lambda: _cfg(False))
+
+    class FakeBridge:
+        def __init__(self, base_url=None, **kw):
+            pass
+
+        def heartbeat(self):
+            return False
+
+    monkeypatch.setattr(svc, "HttpBridgeDispatcher", FakeBridge)
+    svc._PROBE_CACHE.clear()
+    data = svc.channel_status(engine_key="iquant", engines={})
+    assert data["online"] is False
+    assert data["online"] is not None
+    assert data["online_source"] == "probe"
+
+
+def test_channel_iquant_probe_exception_reports_offline(monkeypatch):
+    """探活自身异常（依赖缺失/构造失败）同样判离线，不得抛到页面请求。"""
+    monkeypatch.setattr(svc, "load_config", lambda: _cfg(False))
+
+    class BoomBridge:
+        def __init__(self, **kw):
+            raise OSError("connect failed")
+
+    monkeypatch.setattr(svc, "HttpBridgeDispatcher", BoomBridge)
+    data = svc.channel_status(engine_key="iquant", engines={})
+    assert data["online"] is False
+    assert data["online_source"] == "probe"
+
+
+def test_channel_detail_quant_reports_8790_only(monkeypatch):
+    """QMT 卡片次要信息只报生产 8790 仿真桥；8791 信用腿非生产未启用，不得出现。"""
+    monkeypatch.setattr(svc, "load_config", lambda: _cfg(False))
+    monkeypatch.setattr(svc, "HttpBridgeDispatcher", None)   # 不探活，避免真实网络
+    data = svc.channel_status(engine_key="iquant", engines={})
+    assert "http://127.0.0.1:8790" in data["detail"]
+    assert "8791" not in data["detail"]
+    assert data["configured"] is False   # 依赖缺失 → 未配置
+    assert data["online"] is False       # 探不到 → 离线，不臆造在线
+
+
+def test_channel_detail_present_and_consistent_for_all_four(monkeypatch):
+    """四通道同一套字段：configured 是布尔、detail 非空（端口/账号/窗口）。"""
+    monkeypatch.setattr(
+        svc, "load_config", lambda: _cfg(False, tq_trade={"account": "A1"}))
+    monkeypatch.setattr(svc, "HttpBridgeDispatcher", None)
+    monkeypatch.setattr(svc, "_window_present", lambda key: False)
+    details = {}
+    for key in ("tdx", "ths", "goldminer", "iquant"):
+        data = svc.channel_status(engine_key=key, engines={})
+        assert isinstance(data["configured"], bool)
+        assert data["detail"], key
+        assert isinstance(data["online"], bool)   # 四通道恒为布尔，无第三态
+        details[key] = data["detail"]
+    assert "A1" in details["tdx"]                       # 资金账号
+    assert details["ths"]                               # 窗口标题
+    assert details["goldminer"].startswith("http://")   # 掘金桥地址
+    assert details["iquant"].startswith("HTTP 桥 http://")
 
 
 def test_channel_ignores_engines_of_other_channels(monkeypatch):
@@ -278,11 +395,13 @@ def test_channel_ignores_engines_of_other_channels(monkeypatch):
     import types
 
     monkeypatch.setattr(svc, "load_config", lambda: _cfg(False))
+    monkeypatch.setattr(svc, "_window_present", lambda key: False)
     ths = types.SimpleNamespace(
         dispatcher=types.SimpleNamespace(channel="ths_ui", heartbeat=lambda: True))
+    svc._PROBE_CACHE.clear()
     data = svc.channel_status(engine_key="tdx", engines={7: ths})
     assert data["engine_running"] is False
-    assert data["online"] is None
+    assert data["online"] is False   # 别的通道的引擎不算数，按本通道真实探测判离线
 
 
 def test_channel_status_prefers_engine_state_without_probe(monkeypatch):

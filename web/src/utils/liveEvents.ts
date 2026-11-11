@@ -75,6 +75,8 @@ export const GATE_LABEL: Record<string, string> = {
   slave_master_selling: '主策略清仓禁开仓',
   cash_enhance_trigger: '现金增强触发',
   follow_master_sell: '跟随主策略平仓',
+  // 人工干预（柜台被人手动动了平台账内仓，只打标不阻断）
+  manual_intervention: '人工干预',
 }
 
 // 闸门层 → 中文
@@ -99,6 +101,9 @@ export const ACTION_LABEL: Record<string, string> = {
   shrink: '缩量',
   clamp: '钳量',
   error: '运行错误',
+  notice: '提示',
+  apply: '已修正',
+  skip: '跳过',
 }
 
 /** 闸门代码 → 中文标签（未知 gate 回退原代码）。 */
@@ -129,6 +134,7 @@ const RISK_RULE_LABEL: Record<string, string> = {
   max_drawdown: '最大回撤熔断',
   daily_loss: '日内亏损熔断',
   reconcile_mismatch: '持仓对账差异',
+  manual_intervention: '人工干预',
   quote_polling_paused: '行情轮询暂停',
   quote_polling_resumed: '行情轮询恢复',
 }
@@ -185,6 +191,12 @@ function fmtNum(v: unknown): string {
  */
 function formatDecision(data: Record<string, unknown>): string {
   const gate = String(data.gate || '')
+  // 人工干预不是「拦掉多少股」的闸门：requested/final 是虚拟/真实持仓量，
+  // 直接展示后端组好的 message（含代码、虚拟、真实、差额、方向、原因），
+  // 避免被渲染成「需0股/实发100股」误导。
+  if (gate === 'manual_intervention') {
+    return fmt(data.message) || gateLabel(gate)
+  }
   const parts: string[] = [gateLabel(gate)]
   const stock = fmt(data.stock_code)
   if (stock) parts.push(stock)

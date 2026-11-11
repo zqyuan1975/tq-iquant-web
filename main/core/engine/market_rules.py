@@ -6,23 +6,79 @@ TdxTqDispatcher 的下单前置校验共用同一函数，避免两处口径漂�
 组合交易时段（trading_session）闸同属两端口径：回测按 bar 时间、实盘按
 墙钟判定，允许窗口在此统一定义（market_rules 与涨跌停幅度同级的共享规则）。
 """
-from datetime import time as dtime
+from datetime import date, time as dtime
 from decimal import Decimal
 from typing import Optional
 
+from .price_limit import (
+    BOARD_LIMIT_RATIOS,
+    LimitRule,
+    resolve_limit_rule,
+)
+
+#: resolve_limit_rule 给出「无可靠幅度」（ETF/转债/未知/新股窗口）时的回测兜底幅度。
+#: 回测没有柜台兜底，必须有一个有限幅度才能判定涨跌停；保持旧口径 10%（宁宽勿错），
+#: 不引入「跳过校验」的行为反转。
+_FALLBACK_LIMIT_RATIO = Decimal("0.10")
+
+
+def limit_rule_for(
+    stock_code: str,
+    *,
+    name: Optional[str] = None,
+    listed_bars: Optional[int] = None,
+    earliest_bar_date: Optional[date] = None,
+    today: Optional[date] = None,
+) -> LimitRule:
+    """回测/桥兜底用的「有限幅度」涨跌停规则：**复用实盘同一份 resolve_limit_rule**。
+
+    实盘 tdx/ths 通道用 ``resolve_limit_rule`` 推导（ETF/转债/新股窗口 fail-open）；
+    回测没有柜台兜底，``ratio=None`` 时回落到板块常规幅度（``BOARD_LIMIT_RATIOS``，
+    无档位板块回落 10%），保证「同一只票、同一份规则」——ST 5%、创业板/科创板 20%、
+    北交所 30% 与实盘逐值一致。``source`` 追加 ``_board_fallback`` 便于区分「确定档位」
+    与「兜底档位」。
+
+    回测无可靠上市日期数据，``listed_bars``/``earliest_bar_date`` 默认不传 →
+    新股窗口不生效（按板块兜底，偏保守，不会误放行）。
+    """
+    rule = resolve_limit_rule(
+        stock_code, name=name, listed_bars=listed_bars,
+        earliest_bar_date=earliest_bar_date, today=today,
+    )
+    if rule.ratio is not None:
+        return rule
+    ratio = BOARD_LIMIT_RATIOS.get(rule.board, _FALLBACK_LIMIT_RATIO)
+    return LimitRule(
+        ratio=ratio,
+        unlimited=False,
+        board=rule.board,
+        source="%s_board_fallback" % rule.source,
+        confidence="low",
+    )
+
+
+def limit_ratio_for(
+    stock_code: str,
+    *,
+    name: Optional[str] = None,
+    listed_bars: Optional[int] = None,
+    earliest_bar_date: Optional[date] = None,
+    today: Optional[date] = None,
+) -> Decimal:
+    """涨跌停幅度（Decimal）：``limit_rule_for`` 的比例部分。"""
+    return limit_rule_for(
+        stock_code, name=name, listed_bars=listed_bars,
+        earliest_bar_date=earliest_bar_date, today=today,
+    ).ratio
+
 
 def _limit_ratio_for(stock_code: str) -> Decimal:
-    """A 股涨跌停幅度：创业板(300/301)/科创板(688) 20%，北交所(4/8/92 前缀) 30%，其余 10%。
+    """兼容旧入口（无名称/上市信息）：等价于板块常规幅度。
 
-    ST 5% 不特判（v1 偏宽松可接受：对 ST 股拦截区间偏宽，少拦不错拦）。
+    保留此函数是为了不破坏既有 import（回测 re-export、HTTP 桥兜底），
+    新代码请用 ``limit_ratio_for``/``limit_rule_for`` 以便传入名称识别 ST。
     """
-    prefix = stock_code.split(".")[0]
-    if prefix.startswith(("300", "301", "688")):
-        return Decimal("0.20")
-    # 北交所：4xxxxx / 8xxxxx / 92xxxx（新股段），均 30%
-    if prefix[:1] in ("4", "8") or prefix.startswith("92"):
-        return Decimal("0.30")
-    return Decimal("0.10")
+    return limit_ratio_for(stock_code)
 
 
 def tick_size(stock_code: str) -> Decimal:

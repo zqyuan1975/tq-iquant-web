@@ -13,6 +13,7 @@ from core.api.live import router as live_router
 from core.api.system import router as system_router
 from core.api.status import router as status_router
 from core.api.tdx import router as tdx_router
+from core.api.incremental import router as incremental_router
 from core.logging_config import setup_logging
 from core.services.backtest_service import (
     recover_stale_running_backtests, recover_stale_running_batch_runs,
@@ -22,6 +23,7 @@ from core.services.live_service import (
 )
 from core.engine.live.engine_watchdog import EngineWatchdog
 from core.services.backup_service import BackupScheduler
+from core.services.incremental_backtest import IncrementalBacktestScheduler
 from core.services.auto_shutdown import arm as arm_auto_shutdown
 
 
@@ -79,7 +81,22 @@ async def lifespan(app: FastAPI):
         except Exception:  # noqa: BLE001 — 备份调度失败不得阻断交易主服务
             logger.exception("数据备份调度启动失败（主服务继续运行）")
             backup_scheduler = None
+    # 接缝续跑增量回测调度（daemon 线程，每日 15:10 续跑 + 每周双跑校验）：
+    # 复用 DailyCloser 15:05 已取到的日线，不进 _BACKTEST_LOCK 队列。
+    incr_scheduler = None
+    if os.environ.get("TQ_INCREMENTAL_SCHEDULER_DISABLED") == "1":
+        logger.info("增量回测调度已禁用（TQ_INCREMENTAL_SCHEDULER_DISABLED=1）")
+    else:
+        try:
+            incr_scheduler = IncrementalBacktestScheduler()
+            incr_scheduler.start()
+            logger.info("增量回测调度已启动（进程内，每日续跑 + 每周双跑校验）")
+        except Exception:  # noqa: BLE001 — 调度失败不得阻断交易主服务
+            logger.exception("增量回测调度启动失败（主服务继续运行）")
+            incr_scheduler = None
     yield
+    if incr_scheduler is not None:
+        incr_scheduler.stop()
     if backup_scheduler is not None:
         backup_scheduler.stop()
     if watchdog is not None:
@@ -96,6 +113,7 @@ app.include_router(live_router)
 app.include_router(system_router)
 app.include_router(status_router)
 app.include_router(tdx_router)
+app.include_router(incremental_router)
 
 
 @app.exception_handler(Exception)

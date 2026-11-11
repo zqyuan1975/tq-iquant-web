@@ -193,17 +193,17 @@ class ThsUiDispatcher(OrderDispatcher):
         # （原行为）；latest=不键价格，让 THS 代码键入后自动跟出最新价（回测继承
         # 价跨日过期，日线信号次日跳空必不成交的补救），按实际委托价记账。
         self.ths_price_mode = "latest" if str(price_mode or "") == "latest" else "approval"
-        # 盘前竞价窗口（09:15–09:20）内启动的会话强制 approval：盘前没有开盘价，
-        # latest 模式会把 THS 自动跟出的价报进集合竞价——价格归属脱离平台，且竞价
-        # 成交后无法再按审批价约束。时间判定复用 live_engine.PreOpenAuctionConfig
-        # （同一份 tq_trade.pre_open_auction* 开关/窗口/结束时间），不另造一套。
-        self.price_mode_forced_pre_open = False
-        if self.ths_price_mode != "approval" and self._pre_open_window_now():
-            self.ths_price_mode = "approval"
-            self.price_mode_forced_pre_open = True
+        # 盘前竞价窗口（09:15–09:20）内的单按 approval 路径键入平台算的价：判定
+        # 推迟到**执行期**（`_effective_price_mode`），构造期不再改写 ths_price_mode
+        # ——旧写法在 09:00 前启动的会话整场 latest 不键价、在 09:16 启动的会话又会
+        # 整天锁死 approval，两种都错。这里只保留「启动时处于窗口」的标记，供引擎
+        # 启动公告使用（同一判据、同一实现，不构成第二套开关）。
+        self.price_mode_forced_pre_open = (
+            self.ths_price_mode != "approval" and self._pre_open_window_now())
+        if self.price_mode_forced_pre_open:
             logger.warning(
-                "pre-open window (09:15-09:20): THS price_mode latest -> approval "
-                "forced (price typed by platform) for the whole session")
+                "pre-open window (09:15-09:20): THS price_mode latest -> 本次启动后"
+                "的盘前单按 approval 路径键入平台价（执行期逐单判定）")
         # ---- 文件交接层双模式（file_builtin=内置执行器 / direct=同步直呼现状）----
         self.execute_mode = "file_builtin" if str(execute_mode or "") == "file_builtin" else "direct"
         self.file_handoff_enabled = self.execute_mode == "file_builtin"
@@ -2441,12 +2441,27 @@ class ThsUiDispatcher(OrderDispatcher):
         except (TypeError, ValueError):
             return None
 
+    def _effective_price_mode(self) -> str:
+        """本次下单实际使用的价格模式：盘前窗口内强制 approval（键入平台算的价）。
+
+        判定放在执行期：09:00 前启动的会话到了 09:15 必须按 approval 报（否则 THS
+        自动跟出的价报进集合竞价，价格归属脱离平台）；09:16 启动的会话过了 09:20
+        要回到配置的 latest（否则一整天都在键审批价、日线信号跨日跳空不成交）。
+        两个方向都不能靠「启动时定一次」。
+        """
+        if self.ths_price_mode == "approval":
+            return "approval"
+        if self._pre_open_window_now():
+            return "approval"
+        return "latest"
+
     @staticmethod
     def _pre_open_window_now() -> bool:
         """是否处于盘前竞价执行窗口（复用 live_engine.PreOpenAuctionConfig）。
 
-        延迟 import：本方法只在构造 dispatcher 时调用一次，避免 ths 通道与实盘
-        引擎在模块加载期互相牵连。配置/日历异常一律视为「不在窗口」，不阻断会话。
+        延迟 import：不只在构造期调用（执行期 `_effective_price_mode` 也会调），
+        避免 ths 通道与实盘引擎在模块加载期互相牵连。配置/日历异常一律视为
+        「不在窗口」，不阻断会话。
         """
         try:
             from core.config import load_config
@@ -2503,6 +2518,9 @@ class ThsUiDispatcher(OrderDispatcher):
         """
         self._last_submit_ref = ""
         self._last_submit_time = ("", "")
+        # 本次下单的价格模式在执行期定一次（盘前窗口内强制 approval），下面键入价、
+        # 价差校验、成交价记账三处都用这一个值，避免执行中途跨 09:20 前后判据漂移。
+        price_mode = self._effective_price_mode()
         # P0-1：每次执行先清零，钳量后写入真实键入量（accepted 回执 final_qty）。
         self._last_final_qty = 0
         if not self._connected:
@@ -2620,8 +2638,9 @@ class ThsUiDispatcher(OrderDispatcher):
                 # P0-1：真实键入量（钳量后）——accepted 回执 final_qty 的唯一来源，
                 # 引擎据此把账本委托量改成柜台实际委托量。
                 self._last_final_qty = int(vol)
-                if self.ths_price_mode != "latest":
-                    # approval 模式：显式键入审批价（覆盖 THS 自动跟出的最新价）
+                if price_mode != "latest":
+                    # approval 模式（含盘前窗口强制）：显式键入审批价（覆盖 THS 自动
+                    # 跟出的最新价）
                     self._click_field(price_f)
                     self.kb_send("{END}")
                     self.kb_send("{BACKSPACE}" * 12)
@@ -2695,7 +2714,7 @@ class ThsUiDispatcher(OrderDispatcher):
         # 防止以非审批价格真实成交。容差 0.001（ETF 3 位小数/股票 2 位均覆盖）。
         # latest 模式豁免：委托价=实时最新价本就 ≠ 审批价，按实际委托价记账。
         found_price = float(found.get("price") or 0)
-        if (self.ths_price_mode != "latest" and found_price > 0
+        if (price_mode != "latest" and found_price > 0
                 and abs(found_price - price) > 0.001):
             if not ref:
                 raise BridgeOrderRejected(
@@ -2718,7 +2737,7 @@ class ThsUiDispatcher(OrderDispatcher):
                 "ths 委托价格 %s ≠ 审批价 %s（输入被客户端覆盖）；"
                 "自动撤单失败，请人工处理（合同号 %s）" % (found_price, price, ref))
         # latest 模式按实际委托价记账（≈最新价）；approval 按审批价
-        if self.ths_price_mode == "latest" and found_price > 0:
+        if price_mode == "latest" and found_price > 0:
             fill_price = Decimal(str(found_price))
         else:
             fill_price = order.price if order.price is not None else Decimal(str(price))

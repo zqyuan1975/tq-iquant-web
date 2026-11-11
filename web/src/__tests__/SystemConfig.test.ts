@@ -148,6 +148,24 @@ describe('SystemConfig.vue', () => {
     w.unmount()
   })
 
+  it('盘前集合竞价独立分组：标题含「全引擎生效」、开关有「启用」字样（A-8）', async () => {
+    const w = mount(SystemConfig)
+    await flushPromises()
+
+    // 独立分组标题明确全引擎生效
+    expect(w.text()).toContain('盘前集合竞价（全引擎生效）')
+    // 勾选框有显式「启用」标签（不是裸勾选框）
+    const checkbox = w.findAll('input').find(i => i.attributes('type') === 'checkbox'
+      && ((i.element as HTMLInputElement).closest('label')?.textContent || '').includes('启用盘前集合竞价'))
+    expect(checkbox).toBeTruthy()
+    // 已从通达信 TQ 分组移出：TQ 分组内不再出现「盘前」
+    const tqSection = w.findAll('section').find(s => s.find('h3').exists()
+      && s.find('h3').text().includes('通达信 TQ 交易通道'))
+    expect(tqSection).toBeTruthy()
+    expect(tqSection!.text()).not.toContain('盘前')
+    w.unmount()
+  })
+
   it('渲染同花顺文件交接层三字段（执行模式/轮询间隔/工作目录）', async () => {
     const w = mount(SystemConfig)
     await flushPromises()

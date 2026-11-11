@@ -159,7 +159,8 @@ def _concentration(trades, last_positions=None) -> dict:
         elif price is None:
             price = amount / qty
         fee_ps = ((_f(t.get("commission")) or 0.0)
-                  + (_f(t.get("stamp_duty")) or 0.0)) / qty
+                  + (_f(t.get("stamp_duty")) or 0.0)
+                  + (_f(t.get("transfer_fee")) or 0.0)) / qty
         if ttype == "BUY":
             fifo[code].append([price, qty, fee_ps, t.get("bar_time")])
             continue
