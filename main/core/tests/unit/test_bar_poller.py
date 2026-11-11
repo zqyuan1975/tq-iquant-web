@@ -12,7 +12,7 @@
   {"ok": True, "data": {code: [bar, ...]}}
 每 bar = DataFrame reset_index().to_dict("records")。
 """
-from datetime import datetime, time
+from datetime import date, datetime, time
 from decimal import Decimal
 
 import httpx
@@ -727,6 +727,33 @@ def test_quote_polling_next_resume_skips_weekend():
     nxt = w.next_resume_at(
         datetime(2026, 8, 7, 15, 6), lambda d: d.weekday() < 5)
     assert nxt == datetime(2026, 8, 10, 9, 15)
+
+
+def test_quote_polling_window_follows_half_day_close():
+    """P2-10：半日市 11:30 收盘 → 11:35 停拉（原 15:05 缓冲保留）；常态日不变。"""
+    half_day = date(2027, 1, 1)
+    w = QuotePollingWindow.from_config(None)
+    w.close_time_provider = lambda d: time(11, 30) if d == half_day else time(15, 0)
+
+    # 常态日：15:00 + 5 分钟缓冲 = 15:05，与旧行为逐字一致
+    assert w.is_open(datetime(2026, 8, 5, 15, 4, 59)) is True
+    assert w.is_open(datetime(2026, 8, 5, 15, 5)) is False
+
+    # 半日市：11:35 之后不再空拉行情
+    assert w.is_open(datetime(2027, 1, 1, 11, 34, 59)) is True
+    assert w.is_open(datetime(2027, 1, 1, 11, 35)) is False
+    assert w.is_open(datetime(2027, 1, 1, 14, 0)) is False
+
+
+def test_quote_polling_window_calendar_failure_falls_back():
+    """日历不可用/返回非法 → 回落配置值，绝不因日历故障停掉全天行情。"""
+    def boom(_day):
+        raise RuntimeError("calendar down")
+
+    w = QuotePollingWindow.from_config(None)
+    w.close_time_provider = boom
+    assert w.is_open(datetime(2026, 8, 5, 15, 4)) is True
+    assert w.is_open(datetime(2026, 8, 5, 15, 5)) is False
 
 
 class _SeqDispatcher:

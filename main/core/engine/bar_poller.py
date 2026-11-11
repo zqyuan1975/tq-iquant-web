@@ -98,10 +98,14 @@ class QuotePollingWindow:
     """
 
     def __init__(self, enabled: Any = True, resume_time: Any = None,
-                 pause_time: Any = None):
+                 pause_time: Any = None,
+                 close_time_provider: Optional[Callable[[Any], Any]] = None):
         self.enabled = _as_bool(enabled, True)
         self.resume_time = _parse_clock(resume_time, DEFAULT_QUOTE_POLL_RESUME)
         self.pause_time = _parse_clock(pause_time, DEFAULT_QUOTE_POLL_PAUSE)
+        # P2-10：收盘端跟随交易日历（半日市 11:30 收盘 → 不再空拉下午快照）。
+        # 常态日日历返回 15:00，与原 15:05 缓冲等价 → 正常交易日行为逐字不变。
+        self.close_time_provider: Optional[Callable[[Any], Any]] = close_time_provider
 
     @classmethod
     def from_config(cls, cfg: Any = None) -> "QuotePollingWindow":
@@ -117,11 +121,36 @@ class QuotePollingWindow:
             pause_time=cfg.get("pause_time"),
         )
 
+    def _pause_time_for(self, day) -> _clock:
+        """该日实际收盘端：日历收盘时刻 + 原配置缓冲（常态 15:00+5min=15:05）。
+
+        - 无 provider / 日历异常 / 非 time 返回 → 回落配置值（fail-safe）；
+        - 若配置的 pause_time 早于常态收盘 15:00（用户主动提前停），尊重配置；
+        - 结果取 min(配置值, 日历收盘+缓冲)，半日市 11:30 → 11:35 停拉。
+        """
+        provider = self.close_time_provider
+        if provider is None:
+            return self.pause_time
+        try:
+            close = provider(day)
+        except Exception:  # noqa: BLE001 日历不可用不阻断轮询窗口判定
+            return self.pause_time
+        if not isinstance(close, _clock):
+            return self.pause_time
+        base_close = self.pause_time.replace(hour=15, minute=0, second=0, microsecond=0)
+        buffer_s = (datetime.combine(day, self.pause_time)
+                    - datetime.combine(day, base_close)).total_seconds()
+        if buffer_s < 0:
+            return self.pause_time
+        candidate = (datetime.combine(day, close)
+                     + timedelta(seconds=buffer_s)).time()
+        return min(self.pause_time, candidate)
+
     def is_open(self, now: datetime) -> bool:
         """now 是否落在轮询窗口内(不含交易日判定,由调用方叠加)。"""
         if not self.enabled:
             return True
-        return self.resume_time <= now.time() < self.pause_time
+        return self.resume_time <= now.time() < self._pause_time_for(now.date())
 
     def next_resume_at(self, now: datetime, is_trading_day: Callable[[Any], bool]
                        ) -> Optional[datetime]:
@@ -377,17 +406,37 @@ class BarPoller:
         vals = [t for t in self._last_completed.values() if t is not None]
         return max(vals) if vals else None
 
-    def _fetch_bars_by_code(self) -> Dict[str, list]:
+    @property
+    def supports_backfill(self) -> bool:
+        """行情源能否按 count 回补历史已闭合 bar（P2-6）。
+
+        QMT/掘金桥 ``/quote`` 返回的是柜台 K 线（count 窗口内的历史 bar 可取），
+        断线恢复后可按更大 count 把错过的 bar 补回来；快照合成源
+        （tdx/ths/alert/goldminer）的 bar 由本地采样合成，错过的分钟客观不存在，
+        只能记缺口审计事件，不能补派。
+        """
+        return bool(getattr(self._dispatcher, "supports_historical_quote", False))
+
+    def _fetch_bars_by_code(self, count_override: Optional[int] = None) -> Dict[str, list]:
         """一轮行情拉取：dispatcher 支持批量（supports_batch_quote，仅 TdxTqDispatcher）
         时一次 query_quotes_batch 取全部股票；否则逐只 query_quote。
+
+        ``count_override``（P2-6）：断线恢复补派时按缺口长度临时放大拉取根数
+        （不小于构造时的 count），只影响本轮窗口，不改常态节拍。
 
         返回 {code: [bar, ...]}。批量调用异常/返回空 → 回退逐只路径（与逐只
         100% 等价，QMT/ths 行为不变），warning 只记一次防刷屏。
         """
+        count = self._count
+        if count_override is not None and self.supports_backfill:
+            try:
+                count = max(self._count, int(count_override))
+            except (TypeError, ValueError):
+                count = self._count
         if getattr(self._dispatcher, "supports_batch_quote", False):
             try:
                 batch = self._dispatcher.query_quotes_batch(
-                    self._stock_codes, self._period, self._count)
+                    self._stock_codes, self._period, count)
                 if batch:
                     return batch
                 reason = "批量返回空"
@@ -399,17 +448,23 @@ class BarPoller:
         bars_by_code: Dict[str, list] = {}
         for code in self._stock_codes:
             bars_by_code[code] = self._dispatcher.query_quote(
-                code, period=self._period, count=self._count)
+                code, period=self._period, count=count)
         return bars_by_code
 
-    def poll(self) -> List[BarEvent]:
+    def poll(self, backfill_count: Optional[int] = None) -> List[BarEvent]:
         """拉一次行情,触发所有新完成的 bar,返回触发的 BarEvent 列表。
 
         无 now 参数(不依赖任何绝对时钟)。bar 完成 = 它不再是该股票最新 bar。
         多股票按 code 独立判定完成,同一时间戳的已完成 bar 合并为一根 BarEvent。
         桥不可用 → 抛 BridgeUnavailableError(交上层暂停交易,不吞异常)。
         dispatcher 支持批量时一轮一次批量拉取(TQ 1.3.1),后续处理与逐只一致。
+
+        ``backfill_count``（P2-6，断线恢复补派）：桥离线期间错过的 bar 在恢复首轮
+        用放大后的 count 一次性取回，按原有 per-code 水位（``t > last``）触发——
+        补派与正常轮次走**同一条** on_bar 管线（新鲜度闸/时段闸/bar 级幂等键全部
+        生效），因此不会把旧 bar 当新 bar 重复下单。
         """
+        backfilling = bool(backfill_count and int(backfill_count) > self._count)
         # 本轮新完成 bar,按时间合并:stime -> {code: ohlcv}
         new_by_time: Dict[datetime, Dict[str, dict]] = {}
         # 本轮各 code 拉到的原始 bar 列表(count 窗口,含 forming 最新一根)——挂到 BarEvent.
@@ -420,7 +475,7 @@ class BarPoller:
         any_data = False
 
         # 一轮行情拉取:批量或逐只(见 _fetch_bars_by_code),后续处理两条路径完全一致
-        fetched = self._fetch_bars_by_code()
+        fetched = self._fetch_bars_by_code(backfill_count)
 
         for code in self._stock_codes:
             bars = fetched.get(code, [])
@@ -473,6 +528,13 @@ class BarPoller:
                     self._last_completed[code] = max(baseline_from)
                 continue
             if last is None:
+                if backfilling:
+                    # 补派轮次的窗口可能被放大到数百根：无水位代码（断线期扩池）
+                    # 按整窗最高完成 bar 建基线，不参与补派——否则会把历史 bar 全量
+                    # 当新信号回放（与 _resume_guard 同理）。
+                    if completed:
+                        self._last_completed[code] = max(completed)
+                    continue
                 new_times = completed
             else:
                 new_times = [t for t in completed if t > last]
