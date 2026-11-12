@@ -174,6 +174,14 @@ RATE_LIMIT = 1000                 # max RATE_LIMIT orders per RATE_WINDOW second
 RATE_WINDOW = 10                  # rate-limit window (seconds)
 QUOTE_CACHE_TTL = 1               # quote cache refresh interval (seconds)
 QUOTE_COUNT = 10                  # default bar count for /quote
+# ---- /quote dividend (adjust) mode ----------------------------------------
+# Optional query params: ?dividend_type=front|back|none -- the same vocabulary
+# the platform TQ layer uses (main/core/tq/data.py: front / back / none).
+# ABSENT keeps the historical behaviour byte-for-byte: ContextInfo is called
+# with dividend_type="follow" (which the client resolves to its own default,
+# i.e. unadjusted) and the xtdata fallback passes no dividend_type at all.
+DIVIDEND_TYPES = ("front", "back", "none")
+DEFAULT_DIVIDEND_TYPE = "follow"   # historical ContextInfo value; never change implicitly
 HISTORY_DAYS = 30                 # history depth floor (calendar days) for downloads
 CTX_DAILY_DAYS = 90               # interval window for 1d reads (count is unreliable)
 # Fields requested from ContextInfo.get_market_data_ex. MUST be explicit: with
@@ -971,8 +979,53 @@ def _instrument_detail(code):
     return None
 
 
+def _daily_close_pair(code):
+    """(unadjusted close, front-adjusted close) of the newest 1d bar.
+
+    Both reads use ContextInfo (the client's in-process store, the source the
+    quote path already relies on). The two values differ exactly when the newest
+    daily bar was rewritten for a dividend / ex-rights event taking effect today
+    -- i.e. today is an ex-rights day -- and then the front-adjusted close IS the
+    exchange ex-rights reference price. Pure inference, deliberately labelled as
+    such by the caller: it cannot tell a cash dividend from a stock bonus, and a
+    thin/empty daily store returns (None, None) so the caller keeps the raw
+    previous close WITH an explicit label instead of a silent wrong value.
+    """
+    fn = _iq("get_market_data_ex")
+    if fn is None:
+        return None, None
+
+    def last_close(dividend_type):
+        try:
+            res = _ctx_read(fn, code, "1d", 2, dividend_type)
+        except Exception:                 # annotation path only, never fatal
+            return None
+        frame = (res or {}).get(code)
+        if frame is None:
+            return None
+        for bar in reversed(_df_to_bars(frame) or []):
+            try:
+                close = float(bar.get("close"))
+            except (TypeError, ValueError):
+                continue
+            if close == close and close > 0:   # finite and positive
+                return close
+        return None
+
+    return last_close("none"), last_close("front")
+
+
 def get_price_limit(params):
-    """Pre close + exchange price limits for one instrument (null when unknown)."""
+    """Pre close + exchange price limits for one instrument (null when unknown).
+
+    Ex-rights handling (2026-11-12): the exchange limit prices carried by the
+    instrument detail are authoritative and used as-is. When they are MISSING the
+    previous close is cross-checked against the front-adjusted daily close -- a
+    difference means today is an ex-rights day, and the front-adjusted close (the
+    ex-rights reference price) replaces the raw previous close. When
+    that check is impossible the raw value is kept and LABELLED via
+    ``pre_close_source`` / ``notice``; a value is never emitted silently.
+    """
     code = params.get("code")
     if not code:
         return {"ok": False, "error": "missing code"}
@@ -981,14 +1034,45 @@ def get_price_limit(params):
     if cached is not None and now - cached[0] <= PRICE_LIMIT_CACHE_TTL:
         return cached[1]
     detail = _instrument_detail(code)
+    pre_close = _pick_num(detail, ("PreClose", "PreClosePrice", "LastClose"))
+    up_limit = _pick_num(detail, ("UpStopPrice", "LimitUpPrice"))
+    down_limit = _pick_num(detail, ("DownStopPrice", "LimitDownPrice"))
+    source = "unavailable" if detail is None else "instrument_detail"
+    pre_close_source = "unavailable" if pre_close is None else source
+    ex_rights = None
+    notice = None
+    if up_limit is not None and down_limit is not None:
+        # Exchange limits already carry the ex-rights adjustment and the platform
+        # derives nothing from pre_close when both are present.
+        pre_close_source = "exchange_limit"
+    else:
+        plain, front = _daily_close_pair(code)
+        if plain is None or front is None:
+            ex_rights = None
+            notice = ("ex-rights info unavailable; pre_close may be the unadjusted"
+                      " previous close (can deviate on ex-rights days)")
+        elif abs(front - plain) >= 0.005:
+            pre_close = front
+            pre_close_source = "front_adjusted_daily_close"
+            ex_rights = True
+            notice = ("ex-rights day inferred: front-adjusted close %.4f != "
+                      "unadjusted %.4f; pre_close switched to the ex-rights "
+                      "reference price" % (front, plain))
+        else:
+            ex_rights = False
+            if pre_close is None:
+                pre_close = plain
+                pre_close_source = "daily_close"
     payload = {
         "code": code,
-        "pre_close": _pick_num(detail, ("PreClose", "PreClosePrice", "LastClose")),
-        "up_limit": _pick_num(detail, ("UpStopPrice", "LimitUpPrice")),
-        "down_limit": _pick_num(detail, ("DownStopPrice", "LimitDownPrice")),
+        "pre_close": pre_close,
+        "up_limit": up_limit,
+        "down_limit": down_limit,
     }
-    result = {"ok": True, "data": payload,
-              "source": "unavailable" if detail is None else "instrument_detail"}
+    result = {"ok": True, "data": payload, "source": source,
+              "pre_close_source": pre_close_source, "ex_rights": ex_rights}
+    if notice:
+        result["notice"] = notice
     _price_limit_cache[code] = (now, result)
     return result
 
@@ -1366,7 +1450,7 @@ def _synth_from_base(df, period):
         return None
 
 
-def _ctx_read(fn, code, period, count):
+def _ctx_read(fn, code, period, count, dividend_type=None):
     """One ContextInfo.get_market_data_ex read -> {code: DataFrame} (or None).
 
     The return shape is normalized to xtdata's before any further processing so
@@ -1377,9 +1461,14 @@ def _ctx_read(fn, code, period, count):
     returns whatever history exists. `1w/1mon` reuse this through their 1d base,
     so they inherit the window. Other periods keep the count form (1m/5m stores
     are populated).
+
+    dividend_type: None = the caller did not ask for an adjust mode -> the
+    historical "follow" value is passed unchanged (unadjusted in practice).
+    front/back/none are forwarded verbatim to the client.
     """
     kwargs = {"start_time": "", "count": count,
-              "dividend_type": "follow", "subscribe": True}
+              "dividend_type": dividend_type or DEFAULT_DIVIDEND_TYPE,
+              "subscribe": True}
     if period == "1d":
         kwargs["start_time"] = _history_start(
             max(CTX_DAILY_DAYS, _history_days("1d", max(count, 1))))
@@ -1408,7 +1497,7 @@ def _note_thin_daily(code, count, rows):
                        % (_ts(), code, count))
 
 
-def _quote_via_context(fn, code, period, count):
+def _quote_via_context(fn, code, period, count, dividend_type=None):
     """Read bars through ContextInfo.get_market_data_ex.
 
     One call usually suffices (the client synthesizes 30m/1h/1w/1mon itself).
@@ -1416,11 +1505,15 @@ def _quote_via_context(fn, code, period, count):
     locally so the period contract still holds. Both paths return the same
     {code: DataFrame} shape before aggregation. Failures walk _throttled_log
     -- silently returning None is what hid the dead fallback before.
+
+    dividend_type is forwarded to every read (including the base period) so the
+    synthesized bars are adjusted in the same mode as the requested ones.
     """
     global _ctx_quote_logged
 
     def read(p, n):
-        return _read_bars_with_retry(lambda: _ctx_read(fn, code, p, n), code, p)
+        return _read_bars_with_retry(
+            lambda: _ctx_read(fn, code, p, n, dividend_type), code, p)
 
     try:
         df = read(period, count)
@@ -1457,7 +1550,7 @@ def _quote_via_context(fn, code, period, count):
     return None
 
 
-def _fetch_quote(code, period, count):
+def _fetch_quote(code, period, count, dividend_type=None):
     # 1) ContextInfo.get_market_data_ex FIRST: the client's own in-process quote
     #    interface, no local data service required. On this machine ports
     #    58610-58620 are not listening, so every xtdata call fails with the
@@ -1465,7 +1558,7 @@ def _fetch_quote(code, period, count):
     #    fallback only.
     fn = _iq("get_market_data_ex")
     if fn is not None:
-        df = _quote_via_context(fn, code, period, count)
+        df = _quote_via_context(fn, code, period, count, dividend_type)
         if df is not None:
             return df
     else:
@@ -1489,9 +1582,14 @@ def _fetch_quote(code, period, count):
             xtdata.download_history_data(code, period,
                                          _history_start(_history_days(period, count)), "")
             _last_download[(code, period)] = now
+        # dividend_type is only added when an adjust mode was explicitly asked
+        # for; the default call keeps today's exact kwarg set (xtdata default).
+        xt_kwargs = {}
+        if dividend_type:
+            xt_kwargs["dividend_type"] = dividend_type
         df = _read_bars_with_retry(
             lambda: xtdata.get_market_data_ex(CTX_FIELDS, [code], period=period,
-                                              count=count),
+                                              count=count, **xt_kwargs),
             code, period)
         if df is not None:
             # success: counted into the rolling 60s summary, not printed per-fetch
@@ -1688,6 +1786,22 @@ def get_calendar(params):
     return {"ok": True, "data": dates, "cached": False}
 
 
+def _parse_dividend_type(params):
+    """?dividend_type= -> (mode|None, note|None).
+
+    None = the parameter was absent (keep the historical unadjusted behaviour).
+    An unknown value is IGNORED (never rejected: a bad optional param must not
+    break quote polling) and reported back in ``dividend_note``.
+    """
+    raw = str(params.get("dividend_type") or "").strip().lower()
+    if not raw:
+        return None, None
+    if raw in DIVIDEND_TYPES:
+        return raw, None
+    return None, ("unknown dividend_type %r ignored (expect %s)"
+                  % (raw, "/".join(DIVIDEND_TYPES)))
+
+
 def get_quote(params):
     code = params.get("code")
     period = params.get("period", "1m")
@@ -1697,24 +1811,58 @@ def get_quote(params):
         count = int(params.get("count", QUOTE_COUNT))
     except ValueError:
         count = QUOTE_COUNT
+    dividend, div_note = _parse_dividend_type(params)
 
     now = time.time()
-    cache_key = (code, period, count)
+    # dividend participates in the cache key: adjusted and unadjusted bars for
+    # the same (code, period, count) are different data sets.
+    cache_key = (code, period, count, dividend)
     cached = _quote_cache.get(cache_key)
     if cached is not None and now - cached[0] <= QUOTE_CACHE_TTL:
-        return {"ok": True, "data": {code: cached[1]}, "cached": True}
+        body = {"ok": True, "data": {code: cached[1]}, "cached": True}
+        body.update(cached[2])
+        return body
 
-    df = _fetch_quote(code, period, count)
+    df = _fetch_quote(code, period, count, dividend)
+    fallback = False
+    applied = dividend or "default"
+    if df is None and dividend is not None:
+        # The SDK frequently returns an empty table for an adjust mode it cannot
+        # serve (thin local store / unsupported mode). Degrade to the historical
+        # default ONCE and say so -- never answer with an unmarked empty list.
+        df = _fetch_quote(code, period, count, None)
+        if df is not None:
+            fallback = True
+            applied = "default"
+            _throttled_log(("div-fallback", code, period, dividend),
+                           "[BRIDGE] %s quote dividend_type=%s empty for %s %s,"
+                           " fell back to default (unadjusted)"
+                           % (_ts(), dividend, code, period))
     if df is None:
-        return {"ok": False, "error": "no data for %s %s" % (code, period)}
+        body = {"ok": False, "error": "no data for %s %s" % (code, period),
+                "dividend_type": applied}
+        if dividend is not None:
+            body["dividend_type_requested"] = dividend
+        if div_note:
+            body["dividend_note"] = div_note
+        return body
     bars = _df_to_bars(df)
     # Self-evidencing line for "fetched N rows but HTTP returned []": throttled,
     # prints once per code/period, so a probe right after restart shows both.
     _throttled_log(("bars", code, period),
                    "[BRIDGE] %s quote rows code=%s period=%s rows_before=%d rows_after=%d"
                    % (_ts(), code, period, len(df), len(bars)))
-    _quote_cache[cache_key] = (now, bars)
-    return {"ok": True, "data": {code: bars}, "cached": False}
+    meta = {"dividend_type": dividend if (dividend is not None and not fallback)
+            else "default"}
+    if fallback:
+        meta["dividend_type_requested"] = dividend
+        meta["dividend_fallback"] = True
+    if div_note:
+        meta["dividend_note"] = div_note
+    _quote_cache[cache_key] = (now, bars, meta)
+    body = {"ok": True, "data": {code: bars}, "cached": False}
+    body.update(meta)
+    return body
 
 
 # ---------------- HTTP ----------------

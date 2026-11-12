@@ -922,12 +922,55 @@ def query_deals(p):
         return {"ok": False, "error": "query_deals: %s" % e}
 
 
+# /quote 复权模式：与平台 TQ 层同词表（main/core/tq/data.py: front / back / none）
+# → gm history_n 的 adjust 数值（ADJUST_NONE=0 / ADJUST_PREV=1 / ADJUST_POST=2）。
+# 这里用字面量而非 gm.enum 常量：老版本 gm 常量名不保证存在，字面量零依赖。
+_ADJUST_BY_MODE = {"none": 0, "front": 1, "back": 2}
+
+
+def _parse_dividend_type(p):
+    """`?dividend_type=` → (mode|None, note|None)。
+
+    None = 未指定（保持 adjust=0 的旧口径）；非法值**忽略**并以 `dividend_note`
+    回显（可选参数写错绝不能打断行情轮询）。
+    """
+    raw = str(p.get("dividend_type") or "").strip().lower()
+    if not raw:
+        return None, None
+    if raw in _ADJUST_BY_MODE:
+        return raw, None
+    return None, ("unknown dividend_type %r ignored (expect front/back/none)" % raw)
+
+
+def _quote_bars(code, freq, count, adjust):
+    """一次 history_n 取 bar → 平台 bar dict 列表；空表返回空列表。"""
+    bars = _gm_call(history_n, symbol=to_gm_symbol(code), frequency=freq,
+                    count=count + 2, fields="eob,open,high,low,close,volume",
+                    adjust=adjust, df=False)
+    rows = []
+    for b in (bars or []):
+        eob = b.get("eob")
+        rows.append({
+            "stime": eob.strftime("%Y%m%d%H%M%S") if eob else "",
+            "time": int(eob.timestamp() * 1000) if eob else 0,
+            "open": b.get("open"), "high": b.get("high"),
+            "low": b.get("low"), "close": b.get("close"),
+            "volume": b.get("volume"), "amount": 0,
+        })
+    return rows
+
+
 def get_quote(p):
     """当日实时 bar（掘金 history_n 含当日）。带结果缓存——
 
     非空结果缓存 55s（与 BarPoller 60s 节拍对齐），空结果缓存 10s（停牌/错码/
     云端返回空也不反复打云端）；异常不缓存。应答带 `cached` 布尔标记：命中缓存
     为 true、实际打云端为 false，便于一条 curl 判断命中情况。
+
+    复权（2026-11-12）：可选 `?dividend_type=front|back|none`（取值与平台 TQ 层
+    `main/core/tq/data.py` 一致），映射到 gm 的 adjust（none=0 / front=1 / back=2）。
+    **缺省不传 → adjust=0，与改动前逐字一致**。显式模式取到空表时降级回 adjust=0
+    并在应答里标 `dividend_fallback=true`（绝不静默返回空表还假装是目标模式）。
     """
     code = p.get("code", "")
     period = p.get("period", "1m")
@@ -936,30 +979,36 @@ def get_quote(p):
             "1h": "1h", "1d": "1d"}.get(period)
     if not code or not freq:
         return {"ok": False, "error": "code/period required"}
-    ck = (code, period, count)
+    mode, div_note = _parse_dividend_type(p)
+    ck = (code, period, count, mode)
     now = time.time()
     hit = _QUOTE_CACHE.get(ck)
     if hit:
         ttl = _QUOTE_CACHE_TTL if hit[1] else _QUOTE_CACHE_EMPTY_TTL
         if now - hit[0] < ttl:
-            return {"ok": True, "cached": True, "data": {code: hit[1]}}
+            body = {"ok": True, "cached": True, "data": {code: hit[1]}}
+            body.update(hit[2])
+            return body
     try:
-        bars = _gm_call(history_n, symbol=to_gm_symbol(code), frequency=freq,
-                        count=count + 2, fields="eob,open,high,low,close,volume",
-                        adjust=0, df=False)
-        rows = []
-        for b in (bars or []):
-            eob = b.get("eob")
-            rows.append({
-                "stime": eob.strftime("%Y%m%d%H%M%S") if eob else "",
-                "time": int(eob.timestamp() * 1000) if eob else 0,
-                "open": b.get("open"), "high": b.get("high"),
-                "low": b.get("low"), "close": b.get("close"),
-                "volume": b.get("volume"), "amount": 0,
-            })
+        rows = _quote_bars(code, freq, count, _ADJUST_BY_MODE.get(mode, 0))
+        fallback = False
+        if not rows and mode is not None:
+            rows = _quote_bars(code, freq, count, 0)
+            fallback = bool(rows)
+        meta = {}
+        if fallback:
+            meta["dividend_type"] = "none"
+            meta["dividend_type_requested"] = mode
+            meta["dividend_fallback"] = True
+        else:
+            meta["dividend_type"] = mode or "none"
+        if div_note:
+            meta["dividend_note"] = div_note
         # 空结果同样缓存（10s），结构与非空一致：data[code] 为空列表，不伪造行
-        _QUOTE_CACHE[ck] = (now, rows)
-        return {"ok": True, "cached": False, "data": {code: rows}}
+        _QUOTE_CACHE[ck] = (now, rows, meta)
+        body = {"ok": True, "cached": False, "data": {code: rows}}
+        body.update(meta)
+        return body
     except Exception as e:
         return {"ok": False, "error": "quote: %s" % e}
 
@@ -1011,12 +1060,54 @@ def _read_instrument(sym):
     return None
 
 
+def _daily_closes(sym, adjust):
+    """最近 3 根日线 ``[(eob, close)]``；取不到 → ``[]``（不抛）。"""
+    try:
+        with _GM_LOCK:
+            bars = _gm_call(history_n, symbol=sym, frequency="1d", count=3,
+                            fields="eob,close", adjust=adjust, df=False) or []
+    except Exception:  # noqa: BLE001 注解路径，失败只降级不致命
+        return []
+    closes = []
+    for b in bars:
+        close = _num(b.get("close") if isinstance(b, dict)
+                     else getattr(b, "close", None))
+        if close is None:
+            continue
+        eob = b.get("eob") if isinstance(b, dict) else getattr(b, "eob", None)
+        closes.append((eob, close))
+    return closes
+
+
+def _prev_close_of(closes):
+    """从日线序列取「前收」：末根是当日未收盘 bar 时取倒数第二根。
+
+    与改动前内联逻辑逐字同义（当日 bar 尚未收盘，不能当前收）。
+    """
+    if not closes:
+        return None
+    today = datetime.date.today()
+    last_dt = closes[-1][0]
+    last_date = last_dt.date() if hasattr(last_dt, "date") else None
+    if last_date == today:
+        return closes[-2][1] if len(closes) >= 2 else None
+    if last_date is not None:
+        return closes[-1][1]
+    return closes[-2][1] if len(closes) >= 2 else None
+
+
 def get_price_limit(p):
     """前收 + 交易所涨跌停价（平台下单前做涨跌停校验）。
 
     数据源：gm get_instruments（pre_close / upper_limit / lower_limit，交易所口径）。
     缺字段时用日线倒数第二根收盘补前收（当日 bar 尚未收盘，不能当前收）。仍取不到
     的字段回 null——平台侧据此 fail-open，桥不猜涨跌幅比例。
+
+    除权日（2026-11-12）：交易所给的涨跌停价已含除权调整，直接可用；只补前收的路径
+    改为同时读不复权（adjust=0）与前复权（adjust=1）日线——两者不同即判定今日除权
+    （前复权昨收 = 除权参考价），前收改用前复权值。推断依据 = 复权因子不等于 1，无法
+    区分现金分红/送股，故应答显式标注 ``pre_close_source`` / ``ex_rights``；推断不可
+    得时保留不复权值并给 ``notice``——绝不静默给一个看起来正常的值。
     """
     code = str(p.get("code") or "").strip()
     if not code:
@@ -1029,6 +1120,9 @@ def get_price_limit(p):
     sym = to_gm_symbol(code)
     pre_close = up = down = None
     source = "unavailable"
+    pre_close_source = "unavailable"
+    ex_rights = None
+    notice = None
     info = _read_instrument(sym)
     if info is not None:
         pre_close = _num(_s(info, "pre_close"))
@@ -1036,42 +1130,41 @@ def get_price_limit(p):
         down = _num(_s(info, "lower_limit", "limit_down", "down_limit"))
         if pre_close or up or down:
             source = "instrument_info"
+            pre_close_source = "instrument_info"
 
-    # 涨跌停价任一缺失时平台都需要前收来推导，才值得多打一次日线
+    # 涨跌停价任一缺失时平台都需要前收来推导，才值得多打日线
     if pre_close is None and (up is None or down is None):
-        try:
-            with _GM_LOCK:
-                bars = _gm_call(history_n, symbol=sym, frequency="1d", count=3,
-                                fields="eob,close", adjust=0, df=False) or []
-        except Exception:  # noqa: BLE001
-            bars = []
-        closes = []
-        for b in bars:
-            close = _num(b.get("close") if isinstance(b, dict)
-                         else getattr(b, "close", None))
-            if close is None:
-                continue
-            eob = b.get("eob") if isinstance(b, dict) else getattr(b, "eob", None)
-            closes.append((eob, close))
-        if closes:
-            today = datetime.date.today()
-            last_dt = closes[-1][0]
-            last_date = last_dt.date() if hasattr(last_dt, "date") else None
-            if last_date == today:
-                # 末根是当日未收盘 bar → 前收取倒数第二根
-                if len(closes) >= 2:
-                    pre_close = closes[-2][1]
-            elif last_date is not None:
-                pre_close = closes[-1][1]
-            elif len(closes) >= 2:
-                pre_close = closes[-2][1]
-            if pre_close is not None and source == "unavailable":
-                source = "daily_close"
+        plain = _prev_close_of(_daily_closes(sym, 0))
+        front = _prev_close_of(_daily_closes(sym, 1)) if plain is not None else None
+        if plain is None:
+            ex_rights = None
+            notice = "除权信息不可得；前收未知，平台按无数据 fail-open（除权日可能偏差）"
+        elif front is None:
+            pre_close = plain
+            pre_close_source = "daily_close"
+            ex_rights = None
+            notice = "除权信息不可得；前收来源=未复权昨日收盘，除权日可能偏差"
+        elif abs(front - plain) >= 0.005:
+            pre_close = front
+            pre_close_source = "front_adjusted_daily_close"
+            ex_rights = True
+            notice = ("除权日推断：前复权昨收 %.4f 不等于不复权昨收 %.4f，"
+                      "前收改用除权参考价" % (front, plain))
+        else:
+            pre_close = plain
+            pre_close_source = "daily_close"
+            ex_rights = False
+        if source == "unavailable" and pre_close is not None:
+            source = "daily_close"
 
     result = {"ok": True,
               "data": {"code": code, "pre_close": pre_close,
                        "up_limit": up, "down_limit": down},
-              "source": source}
+              "source": source,
+              "pre_close_source": pre_close_source,
+              "ex_rights": ex_rights}
+    if notice:
+        result["notice"] = notice
     _PRICE_LIMIT_CACHE[code] = (now, result)
     return result
 
