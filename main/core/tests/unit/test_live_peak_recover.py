@@ -415,6 +415,61 @@ def test_peak_flush_upserts_and_never_lowers():
 
 
 def test_peak_flush_deletes_row_after_position_cleared():
+    """收尾清扫（allow_delete=True）在真正清仓后仍删行。"""
+    factory, _ = _db_factory()
+    port = _portfolio()
+    pos = _with_position(port)
+    engine = _engine(factory, _StubDispatcher(), port)
+    db = factory()
+
+    engine._note_peak_raised(_SID, _STOCK, Decimal("22.50"), None)
+    engine._flush_position_peaks(db, allow_delete=True)
+    db.commit()
+    assert db.query(LivePositionPeak).count() == 1
+
+    pos.quantity = 0
+    engine._flush_position_peaks(db, allow_delete=True)
+    db.commit()
+    assert db.query(LivePositionPeak).count() == 0
+    db.close()
+
+
+# ---------------- 缺陷一：补种期只 UPSERT，绝不清仓删行 ----------------
+def test_seed_first_pass_keeps_unimported_position_peak_row():
+    """继承仓尚未导入时（第一轮补种），不得把它的峰值行当「已清仓」删掉。
+
+    002745.SZ 的行存在于表里，但此刻 ctx.positions 只有 live_trades 重放出的
+    002922.SZ —— 存活集合不完整。补种期默认 allow_delete=False → 只 UPSERT。
+    """
+    factory, _ = _db_factory()
+    port = _portfolio()
+    _with_position(port)  # 只有 002922.SZ（普通持仓）
+    disp = _StubDispatcher(bars=[_bar("2026-11-10", "22.00")])
+    engine = _engine(factory, disp, port)
+    db = factory()
+    db.add(LivePositionPeak(
+        live_session_id=1, portfolio_strategy_id=_SID,
+        stock_code="002745.SZ", highest_price=Decimal("10.83"),
+        peak_bar_time=datetime(2026, 11, 10, 15, 0),
+    ))
+    db.commit()
+
+    before = db.query(LivePositionPeak).count()
+    engine._seed_position_peaks(db, {_SID: port}, {})
+    db.commit()
+    after = db.query(LivePositionPeak).count()
+
+    rows = {r.stock_code: Decimal(str(r.highest_price))
+            for r in db.query(LivePositionPeak).all()}
+    db.close()
+
+    assert before == 1 and after == 2  # 旧行保留 + 新种出 002922 行
+    assert rows["002745.SZ"] == Decimal("10.83")  # 未被误删、未被写低
+    assert rows[_STOCK] == Decimal("22.00")
+
+
+def test_flush_without_allow_delete_never_deletes_rows():
+    """默认 allow_delete=False：持仓已不在也只 UPSERT，表行数不变。"""
     factory, _ = _db_factory()
     port = _portfolio()
     pos = _with_position(port)
@@ -426,11 +481,114 @@ def test_peak_flush_deletes_row_after_position_cleared():
     db.commit()
     assert db.query(LivePositionPeak).count() == 1
 
-    pos.quantity = 0
+    pos.quantity = 0  # 该票已清仓，但此刻集合不完整 → 不许删
     engine._flush_position_peaks(db)
     db.commit()
-    assert db.query(LivePositionPeak).count() == 0
+    assert db.query(LivePositionPeak).count() == 1
     db.close()
+
+
+def test_recover_coexisting_traded_and_imported_positions():
+    """普通持仓 + 继承仓共存：两行都保留，各自峰值正确（002745 自愈到 10.83）。"""
+    factory, _ = _db_factory()
+    port = _portfolio()
+    disp = _StubDispatcher(
+        bars_by_code={
+            _STOCK: [_bar("2026-11-10", "22.00"), _bar("2026-11-11", "22.07")],
+            "002745.SZ": [_bar("2026-11-12", "10.46")],
+        },
+        positions=[{
+            "symbol": "002745.SZ", "volume": 5300, "available": 5300,
+            "cost": "10.221", "market_value": "54171.3",
+        }],
+    )
+    engine = _engine(factory, disp, port)
+    db = factory()
+    _buy_trade(db, datetime(2026, 11, 10, 9, 31, 54))
+    _snapshot(db, datetime(2026, 11, 11, 9, 32), "22.07")
+    _snapshot(db, datetime(2026, 11, 12, 15, 0), "10.83",
+              code="002745.SZ", qty=5300)
+    db.add(LivePositionPeak(
+        live_session_id=1, portfolio_strategy_id=_SID,
+        stock_code="002745.SZ", highest_price=Decimal("10.46"),
+        peak_bar_time=datetime(2026, 11, 12, 15, 0),
+    ))
+    db.commit()
+
+    engine.recover(db)
+    rows = {r.stock_code: Decimal(str(r.highest_price))
+            for r in db.query(LivePositionPeak).all()}
+    db.close()
+
+    assert rows[_STOCK] == Decimal("22.07")
+    assert rows["002745.SZ"] == Decimal("10.83")  # 第一轮没删、第二轮种出峰值
+    assert port.strategies[0].positions[_STOCK].highest_price == Decimal("22.07")
+    assert port.strategies[0].positions["002745.SZ"].highest_price == Decimal("10.83")
+
+
+# ---------------- 缺陷二：等值 UPSERT 刷新 updated_at（心跳） ----------------
+def test_peak_flush_equal_value_refreshes_updated_at_only():
+    """等值写入：highest_price / peak_bar_time 不变，updated_at 刷新（心跳）。"""
+    factory, _ = _db_factory()
+    port = _portfolio()
+    _with_position(port)
+    engine = _engine(factory, _StubDispatcher(), port)
+    db = factory()
+    old_ts = datetime(2026, 1, 1, 15, 0)
+    old_bt = datetime(2026, 11, 10, 15, 0)
+    db.add(LivePositionPeak(
+        live_session_id=1, portfolio_strategy_id=_SID, stock_code=_STOCK,
+        highest_price=Decimal("22.50"), peak_bar_time=old_bt, updated_at=old_ts,
+    ))
+    db.commit()
+
+    engine._note_peak_raised(_SID, _STOCK, Decimal("22.50"), None)  # 等值
+    engine._flush_position_peaks(db)
+    db.commit()
+
+    hp, bt, updated = (
+        db.query(LivePositionPeak.highest_price,
+                 LivePositionPeak.peak_bar_time,
+                 LivePositionPeak.updated_at).one())
+    db.close()
+
+    assert Decimal(str(hp)) == Decimal("22.50")
+    assert bt == old_bt            # 未抬高 → 来源 bar 时间保持原值
+    assert updated > old_ts        # 心跳刷新，避免被 30 交易日清理误删
+
+
+def test_peak_flush_equal_value_never_lowers_then_refreshes():
+    """更低值不写（值不变）；随后等值心跳刷新 updated_at。"""
+    factory, _ = _db_factory()
+    port = _portfolio()
+    _with_position(port)
+    engine = _engine(factory, _StubDispatcher(), port)
+    db = factory()
+    old_ts = datetime(2026, 1, 1, 15, 0)
+    db.add(LivePositionPeak(
+        live_session_id=1, portfolio_strategy_id=_SID, stock_code=_STOCK,
+        highest_price=Decimal("22.50"), updated_at=old_ts,
+    ))
+    db.commit()
+
+    # 更低值：WHERE 不命中 → 整行不写（连 updated_at 也不动）
+    engine._note_peak_raised(_SID, _STOCK, Decimal("21.00"), None)
+    engine._flush_position_peaks(db)
+    db.commit()
+    hp, updated = db.query(
+        LivePositionPeak.highest_price, LivePositionPeak.updated_at).one()
+    assert Decimal(str(hp)) == Decimal("22.50")
+    assert updated == old_ts
+
+    # 等值：刷新心跳
+    engine._note_peak_raised(_SID, _STOCK, Decimal("22.50"), None)
+    engine._flush_position_peaks(db)
+    db.commit()
+    hp2, updated2 = db.query(
+        LivePositionPeak.highest_price, LivePositionPeak.updated_at).one()
+    db.close()
+    assert Decimal(str(hp2)) == Decimal("22.50")
+    assert updated2 > old_ts
 
 
 def test_cleanup_stale_peak_rows_deletes_unheld_rows():

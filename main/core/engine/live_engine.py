@@ -25,7 +25,7 @@ from typing import (
     AsyncIterator, Callable, Dict, List, Optional, Set, Tuple,
 )
 
-from sqlalchemy import func, or_
+from sqlalchemy import case, func, or_
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.orm import Session
 from sqlalchemy.orm.exc import DetachedInstanceError
@@ -3153,7 +3153,8 @@ class LiveEngine:
                 if converged_ids:
                     self._requote_after_cancel_converged(converged_ids)
                 # 方案 E：成交回填可能已清仓 → 峰值表按「当前持仓」收敛（删已归零行）
-                self._flush_position_peaks()
+                # 此处持仓账本已按成交更新、集合完整，允许清仓删行。
+                self._flush_position_peaks(allow_delete=True)
         except Exception:  # noqa: BLE001
             logger.exception("deals loop unexpected error")
 
@@ -3655,7 +3656,8 @@ class LiveEngine:
             LiveAccountSnapshot.captured_at < now - timedelta(days=7),
         ).delete()
         # 方案 E：本轮还原/抬高的峰值随快照一并落库（清仓删行也在此收敛）
-        self._flush_position_peaks(db)
+        # 镜面/导入已完成，持仓集合完整 → 允许清仓删行。
+        self._flush_position_peaks(db, allow_delete=True)
         db.commit()
         if mirrored:
             logger.info(
@@ -5596,7 +5598,8 @@ class LiveEngine:
                     db, portfolio,
                     [o for o in released if not any(o is f for f in failed)])
             # 方案 E：本 bar 抬高的持仓峰值随本轮回合落库（只升不降；只写被抬高的行）
-            if self._flush_position_peaks(db):
+            # 本 bar 的所有信号/成交已结算，持仓集合完整 → 允许清仓删行。
+            if self._flush_position_peaks(db, allow_delete=True):
                 db.commit()
             # 决策闸门事件随本 bar 统一落库 + SSE 推送（含 orders 为空时的 halt/strip 事件）。
             self._drain_decisions(db, portfolio)
@@ -7905,8 +7908,12 @@ class LiveEngine:
         return out
 
     def _cleanup_stale_position_peaks(self, db: Session) -> None:
-        """清理超过 30 个交易日未更新的峰值行（recover 时一次），记 INFO。
+        """清理超过 30 个交易日**未写入**的峰值行（recover 时一次），记 INFO。
 
+        阈值按 ``updated_at`` 计，语义是「最后一次写入」而非「最后一次创新高」：
+        补种期对仍持有的票会做一次等值 UPSERT（只刷新 updated_at 的心跳），
+        因此长期不创新高但仍在持有的行不会被误删；只有连补种都没再写过（即该
+        会话很久没有该票、或该票已清仓）的行才会到期。
         口径按**交易日**（内置休市表）而非自然日：长假后 30 个交易日仍在持有区间
         内的行不会被误删。行被清理后，下次补种会按策略周期重算，不影响正确性。
         """
@@ -7947,17 +7954,26 @@ class LiveEngine:
                         alive.add((int(port.portfolio_id), str(code)))
         return alive
 
-    def _flush_position_peaks(self, db: Optional[Session] = None) -> bool:
-        """把缓冲的抬峰 UPSERT 进 live_position_peaks + 清仓删行。
+    def _flush_position_peaks(self, db: Optional[Session] = None,
+                              allow_delete: bool = False) -> bool:
+        """把缓冲的抬峰 UPSERT 进 live_position_peaks（清仓删行需显式开启）。
 
-        只写「峰值被抬高」的行（``ON CONFLICT ... WHERE excluded > 当前``），
-        绝不写低已有值（只升不降）；清仓（该组合该代码全部策略数量归零）时删行。
+        UPSERT 只在「新值 ≥ 当前值」时写：值更高就抬高，**等值也刷新 updated_at**
+        （时间戳心跳），绝不写低。峰值列的 ``peak_bar_time`` 只在真正抬高时更新。
+
+        清仓删行由 ``allow_delete`` 显式控制（默认 False）：
+        - False = **只 UPSERT，绝不删行**——补种阶段持仓集合还不完整（继承仓/外部
+          仓尚未导入），此时按 ``_alive_position_keys`` 删行会把它们的峰值行误判成
+          「已清仓」而删掉（002745 峰值回退的根因）；
+        - True = 追加「DB 有、当前无任何策略持有」的删行收敛——只能在**确定当前
+          完整持仓集合**的时机使用（bar 收尾 / 快照采集 / 成交回填）。
+
         ``db=None`` 时自开短事务并提交；传入会话时只执行不提交（由调用方提交），
         且吞掉异常（观测性链路不得打断交易主链路）。返回是否有写入。
         """
         own = db is None
         with self._peak_lock:
-            has_work = bool(self._peak_buffer) or bool(self._peak_rows)
+            has_work = bool(self._peak_buffer) or (allow_delete and bool(self._peak_rows))
         if own and not has_work:
             return False
         if own:
@@ -7977,21 +7993,33 @@ class LiveEngine:
                     peak_bar_time=bar_time,
                     updated_at=now,
                 )
+                # 等值（excluded == 当前）也命中 WHERE：只刷新 updated_at 心跳，
+                # 峰值与 peak_bar_time 用 CASE 保持原值 → 绝不写低、也不清空来源时间。
+                raised = LivePositionPeak.highest_price < stmt.excluded.highest_price
                 stmt = stmt.on_conflict_do_update(
                     index_elements=[
                         "live_session_id", "portfolio_strategy_id", "stock_code"],
                     set_={
-                        "highest_price": stmt.excluded.highest_price,
-                        "peak_bar_time": stmt.excluded.peak_bar_time,
+                        "highest_price": case(
+                            (raised, stmt.excluded.highest_price),
+                            else_=LivePositionPeak.highest_price),
+                        "peak_bar_time": case(
+                            (raised, stmt.excluded.peak_bar_time),
+                            else_=LivePositionPeak.peak_bar_time),
                         "updated_at": stmt.excluded.updated_at,
                     },
                     where=(
-                        LivePositionPeak.highest_price < stmt.excluded.highest_price),
+                        LivePositionPeak.highest_price <= stmt.excluded.highest_price),
                 )
                 db.execute(stmt)
                 with self._peak_lock:
                     self._peak_rows.add((pid, code))
                 changed = True
+            if not allow_delete:
+                # 补种期：只 UPSERT，绝不清仓删行（持仓集合可能不完整）
+                if own:
+                    db.commit()
+                return changed
             # 清仓删行：DB 里存在、但当前没有任何策略持有的 (组合, 代码) 一律删
             alive = self._alive_position_keys()
             rows = (
@@ -8221,7 +8249,7 @@ class LiveEngine:
                 final = max(cur, table_val[0])
                 if final > cur:
                     pos.update_high(final)
-                # 表值已是持久化峰值，回写（幂等，不会写低）以刷新 updated_at
+                # 表值已是持久化峰值，回写（幂等：等值只刷新 updated_at 心跳，不写低）
                 self._note_peak_raised(pid, code, final, table_val[1])
                 logger.info(
                     "[peak-seed:table] %s 周期=表值 表峰值=%s 快照MAX=%s 现值=%s "
@@ -8285,7 +8313,8 @@ class LiveEngine:
             )
             if period_peak is None and daily_peak is None and snap_peak is None:
                 fallback_meta.append((pid, ctx.strategy_id, code, anchor, cur))
-        # 补种结果统一落库（不提交，recover 末尾由服务层提交）
+        # 补种结果统一落库（不提交，recover 末尾由服务层提交）。
+        # 补种期持仓集合不完整（继承仓/外部仓尚未导入）→ 只 UPSERT，禁止清仓删行。
         self._flush_position_peaks(db)
         for pid, strategy_id, code, table_pk, snap_pk in recompute_meta:
             self._recorder.record(
