@@ -1544,6 +1544,40 @@ def test_pure_weekly_backtest_still_fills():
     assert trades[0].price == Decimal("10")
 
 
+def test_pending_signals_summary_when_short_range_never_fills():
+    """D9：短区间内 1w 信号永不成交 → 收尾统计 pending_order_count/summary 可识别。"""
+    stock = "000001.SZ"
+    df_w = pl.DataFrame({
+        "datetime": [datetime(2026, 7, 24)],
+        "Open": [Decimal("10")],
+        "High": [Decimal("10.2")],
+        "Low": [Decimal("9.9")],
+        "Close": [Decimal("10")],
+        "Volume": [5000],
+    })
+    klines = {stock: {"1w": df_w}}
+
+    pm = PortfolioRiskManager(max_drawdown=Decimal("0.2"), daily_loss_limit=Decimal("0.05"))
+    port = Portfolio(portfolio_id=1, initial_capital=Decimal("100000"), risk_manager=pm)
+    ctx = StrategyContext(strategy_id=1, period="1w",
+                          capital_ratio=Decimal("0.6"), max_positions=5)
+    ctx.formula_signals = [
+        {"signal_name": "open_sig", "signal_type": SignalType.OPEN, "trigger_value": 1},
+    ]
+    ctx.strategy_risk = StrategyRiskManager(
+        stop_loss_ratio=Decimal("0.5"), take_profit_ratio=Decimal("0.9"),
+        trailing_stop_ratio=Decimal("0"),
+    )
+    port.strategies.append(ctx)
+    cache = {(1, stock, datetime(2026, 7, 24)): [{"name": "open_sig", "value": 1}]}
+    result = BacktestEngine().run(port, klines=klines, signal_cache=cache)
+
+    assert result["trades"] == []
+    assert result["pending_order_count"] == 1
+    assert result["pending_order_summary"][0]["stock_code"] == stock
+    assert result["pending_order_summary"][0]["period"] == "1w"
+
+
 # ===========================================================================
 # #2 静默丢弃修复：待成交订单遇停牌/无行情不丢弃，延后至下一有价 bar 重试
 # ===========================================================================

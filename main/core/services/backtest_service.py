@@ -3563,6 +3563,23 @@ def run_backtest(db: Session, ps: PortfolioStrategy, req,
                 f"年化收益基于不足一年样本，仅供参考"
             )
 
+        # D9：回测结束时仍有未成交信号（1w/1mon 等长周期信号需要下一根同周期 bar
+        # 才能成交，短区间内可能永不触发）。显式提示，避免把「信号没做进去」误读成
+        # 「策略没出信号」。
+        pending_count = int(result.get("pending_order_count") or 0)
+        if pending_count > 0:
+            pending_summary = result.get("pending_order_summary") or []
+            detail = "、".join(
+                f"{row.get('stock_code')}({row.get('period')})"
+                for row in pending_summary[:10]
+            )
+            if len(pending_summary) > 10:
+                detail += f" 等 {len(pending_summary)} 笔"
+            warnings.append(
+                f"回测结束时仍有 {pending_count} 笔信号未成交（长周期信号需后续同周期"
+                f" bar 才能成交，短区间/末根 bar 可能永不触发）：{detail}"
+            )
+
         # 容量健康度自动预警：即使未设 equity_cap，命中"单笔>30%日均成交额 /
         # 单票权重>25%"时，在结果里明确提示"该结果含不可实现仓位"并附修复建议。
         warnings.extend(build_capacity_warnings(

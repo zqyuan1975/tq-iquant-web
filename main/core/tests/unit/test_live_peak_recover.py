@@ -15,7 +15,7 @@
 6. 日线与快照 MAX 取较大者
 7. 只升不降：重算值低于现有内存峰值时不覆盖
 """
-from datetime import datetime
+from datetime import datetime, timedelta
 from decimal import Decimal
 
 import pytest
@@ -24,6 +24,7 @@ from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
 from core.engine.bar_poller import BarPoller
+from core.engine.event import BarEvent
 from core.engine.live_engine import LiveEngine
 from core.engine.portfolio import Portfolio
 from core.engine.position import Position
@@ -31,7 +32,7 @@ from core.engine.risk_manager import PortfolioRiskManager, StrategyRiskManager
 from core.engine.strategy_context import StrategyContext
 from core.models import (
     Base, LiveAccountPositionSnapshot, LiveAccountSnapshot,
-    LiveDecisionEvent, LiveTrade,
+    LiveDecisionEvent, LivePositionPeak, LiveTrade,
 )
 from tq_iquant_shared.constants import SignalType, TradeType
 
@@ -310,3 +311,167 @@ def test_peak_seed_never_lowers_existing_peak():
     db.close()
 
     assert port.strategies[0].positions[_STOCK].highest_price == Decimal("23.00")
+
+
+# ---------------- 阶段二 A：峰值表优先于取数 ----------------
+def test_recover_prefers_persisted_peak_table_without_tq():
+    """live_position_peaks 有值 → 直接采用，**完全不调 TQ**（重启零取数）。"""
+    factory, _ = _db_factory()
+    port = _portfolio()
+    disp = _StubDispatcher(bars=[_bar("2026-11-10", "22.00")])
+    engine = _engine(factory, disp, port)
+    db = factory()
+    _buy_trade(db, datetime(2026, 11, 10, 9, 31, 54))
+    db.add(LivePositionPeak(
+        live_session_id=1,
+        portfolio_strategy_id=_SID,
+        stock_code=_STOCK,
+        highest_price=Decimal("22.63"),
+        peak_bar_time=datetime(2026, 11, 11, 15, 0),
+    ))
+    db.commit()
+
+    engine.recover(db)
+    db.close()
+
+    pos = port.strategies[0].positions[_STOCK]
+    assert pos.highest_price == Decimal("22.63")
+    assert disp.quote_calls == []
+
+
+# ---------------- 阶段二 B：按策略自身周期补种 ----------------
+def test_recover_seeds_from_strategy_period_bars():
+    """策略周期 5m → 用 5m bar close 重算（不再默认走日线）。"""
+    factory, _ = _db_factory()
+    port = _portfolio()
+    port.strategies[0].period = "5m"
+    disp = _StubDispatcher(bars=[
+        {"stime": "20261110103000", "open": "22.10", "high": "22.20",
+         "low": "22.00", "close": "22.10", "volume": 1000},
+        {"stime": "20261111103000", "open": "22.40", "high": "22.60",
+         "low": "22.30", "close": "22.50", "volume": 1000},
+        {"stime": "20261112103000", "open": "22.20", "high": "22.40",
+         "low": "22.10", "close": "22.30", "volume": 1000},
+    ])
+    engine = _engine(factory, disp, port)
+    db = factory()
+    _buy_trade(db, datetime(2026, 11, 10, 9, 31, 54))
+    engine.recover(db)
+    db.close()
+
+    assert port.strategies[0].positions[_STOCK].highest_price == Decimal("22.50")
+    assert [c[1] for c in disp.quote_calls] == ["5m"]
+
+
+def test_recover_falls_back_to_daily_when_strategy_period_empty():
+    """5m 取不到（返回空）→ 降级日线 close，日志标注实际使用周期。"""
+    factory, _ = _db_factory()
+    port = _portfolio()
+    port.strategies[0].period = "5m"
+    disp = _StubDispatcher(bars=[])
+    engine = _engine(factory, disp, port)
+    db = factory()
+    _buy_trade(db, datetime(2026, 11, 10, 9, 31, 54))
+    _snapshot(db, datetime(2026, 11, 11, 9, 32), "22.63")
+    engine.recover(db)
+    db.close()
+
+    # 5m 空 → 日线也空 → 快照 MAX 兜底
+    assert port.strategies[0].positions[_STOCK].highest_price == Decimal("22.63")
+    assert [c[1] for c in disp.quote_calls] == ["5m", "1d"]
+
+
+# ---------------- 阶段二 A：只升不降 / 清仓删行 / 超期清理 ----------------
+def _with_position(port, qty=1000):
+    pos = Position(_STOCK)
+    pos.quantity = qty
+    pos.avg_cost = Decimal("20.00")
+    pos.highest_price = Decimal("20.00")
+    port.strategies[0].positions[_STOCK] = pos
+    return pos
+
+
+def test_peak_flush_upserts_and_never_lowers():
+    factory, _ = _db_factory()
+    port = _portfolio()
+    pos = _with_position(port)
+    engine = _engine(factory, _StubDispatcher(), port)
+    db = factory()
+
+    engine._note_peak_raised(_SID, _STOCK, Decimal("22.50"), None)
+    engine._flush_position_peaks(db)
+    db.commit()
+    engine._note_peak_raised(_SID, _STOCK, Decimal("21.00"), None)
+    engine._flush_position_peaks(db)
+    db.commit()
+
+    row = db.query(LivePositionPeak).one()
+    assert Decimal(str(row.highest_price)) == Decimal("22.50")
+    db.close()
+
+
+def test_peak_flush_deletes_row_after_position_cleared():
+    factory, _ = _db_factory()
+    port = _portfolio()
+    pos = _with_position(port)
+    engine = _engine(factory, _StubDispatcher(), port)
+    db = factory()
+
+    engine._note_peak_raised(_SID, _STOCK, Decimal("22.50"), None)
+    engine._flush_position_peaks(db)
+    db.commit()
+    assert db.query(LivePositionPeak).count() == 1
+
+    pos.quantity = 0
+    engine._flush_position_peaks(db)
+    db.commit()
+    assert db.query(LivePositionPeak).count() == 0
+    db.close()
+
+
+def test_cleanup_stale_peak_rows_deletes_unheld_rows():
+    factory, _ = _db_factory()
+    port = _portfolio()
+    engine = _engine(factory, _StubDispatcher(), port)
+    db = factory()
+    db.add(LivePositionPeak(
+        live_session_id=1,
+        portfolio_strategy_id=_SID,
+        stock_code="600000.SH",
+        highest_price=Decimal("9.90"),
+        updated_at=datetime(2026, 1, 1, 15, 0),
+    ))
+    db.commit()
+
+    engine._cleanup_stale_position_peaks(db)
+    db.commit()
+    assert db.query(LivePositionPeak).count() == 0
+    db.close()
+
+
+# ---------------- 阶段二 A：Portfolio 峰值钩子只在抬峰时触发 ----------------
+def test_portfolio_peak_hook_fires_only_when_peak_raised():
+    port = _portfolio()
+    ctx = port.strategies[0]
+    ctx.period = "1d"
+    calls = []
+    port.peak_persist_hook = (
+        lambda pid, code, price, bt: calls.append(
+            (pid, code, Decimal(str(price)))))
+    _with_position(port)
+    ctx.positions[_STOCK].highest_price = Decimal("22.00")
+
+    def _bar_at(close):
+        return BarEvent(
+            stocks={_STOCK: {
+                "open": close, "high": close, "low": close,
+                "close": close, "volume": 1000,
+            }},
+            bar_time=datetime(2026, 11, 12, 9, 31),
+            period="1d",
+        )
+
+    port.on_bar(_bar_at(Decimal("21.00")), signal_cache={}, period="1d")
+    assert calls == []
+    port.on_bar(_bar_at(Decimal("23.00")), signal_cache={}, period="1d")
+    assert calls == [(_SID, _STOCK, Decimal("23.00"))]

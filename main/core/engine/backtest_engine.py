@@ -37,6 +37,11 @@ _PERIOD_ORDER: Dict[str, int] = {
     "1m": 0, "5m": 1, "15m": 2, "30m": 3, "1h": 4, "60m": 4,
     "1d": 5, "1w": 6, "1mon": 7,
 }
+# 日线及以上周期（D8）：其 bar 的 close 是「周期末价」，在时间轴上却出现在周期
+# 起点（00:00）——同一交易日里对分钟 bar 而言是未来价。混合周期回测若拿它抬净值
+# 峰值会造成前视（max_drawdown 提前/错误触发）。故这类 bar 只在「日终估值步」
+# 才允许抬峰（纯日线/周线/月线回测里该步就是日终步，行为不变）。
+_COARSE_PERIODS = ("1d", "1w", "1mon")
 
 
 class BacktestEngine:
@@ -59,8 +64,10 @@ class BacktestEngine:
         regime_tracker：B5 可选因果市场状态跟踪器（CausalRegimeTracker，默认 None
         不启用）；逐 bar 喂当日基准收盘并把标签注入 portfolio.current_regime。
         daily_close_peak_enabled：可选保护（默认关）。开启后 peak/max_drawdown 只在
-        当日最后一根 bar 更新，避免混合周期粗 bar 的周期末 close（未来价）污染峰值；
-        跨日 prev_close/daily_loss bookkeeping 仍每 bar 更新。纯 1d 行为不变。
+        当日最后一根 bar 更新；跨日 prev_close/daily_loss bookkeeping 仍每 bar 更新。
+        纯 1d 行为不变。注意：关闭时**粗周期 bar（1d/1w/1mon）也不再抬峰**——它们
+        只在日终估值步抬（见 ``_COARSE_PERIODS`` 注释，避免混合周期前视），分钟
+        bar 仍每根抬峰（保留分钟回测原有口径）。
         initial_pending_orders：增量续跑用（默认 None=原行为）。上一段区间末遗留的
         在途单，拷贝进本次 pending 队列，在本段首根可成交 bar 上按原语义成交。
         stock_names：{stock_code: 证券名称}（默认 None=无名称）。涨跌停幅度与实盘
@@ -446,9 +453,14 @@ class BacktestEngine:
 
             # 5. 熔断检测：更新峰值/检测 max_drawdown，推进熔断次日恢复时序
             #    （daily_loss 已在本 bar 起始 enter_day 补算，此处只做峰值/回撤）
-            #    可选日末保护：混合周期下粗 bar 的 close 是周期末价（对当前时点是未来），
-            #    只在日终估值步更新 peak，避免其污染组合峰值/误触熔断。
-            allow_peak_update = True
+            #    D8：粗周期（1d/1w/1mon）的 close 是周期末价，在时间轴起点（00:00）
+            #    对当时的分钟时点是未来价——混合周期下拿它抬峰 = 前视，会让
+            #    max_drawdown 提前/错误触发。故粗周期只在「日终估值步」允许抬峰；
+            #    分钟周期照旧每根抬（纯分钟/纯日线回测行为不变）。
+            #    daily_close_peak_enabled=True 时统一收紧为「只在日终步抬峰」（可选
+            #    的更严格模式，默认关）。
+            allow_peak_update = (
+                is_day_end if period in _COARSE_PERIODS else True)
             if daily_close_peak_enabled:
                 allow_peak_update = is_day_end
             portfolio.risk_manager.update_peak(
@@ -490,6 +502,18 @@ class BacktestEngine:
             strategy_evaluations[ctx.strategy_id] = Evaluator().evaluate(
                 s_snaps, benchmark_data=bench_series, trades=s_trades
             )
+        # D9：回测结束仍有未成交信号（1w/1mon 等长周期信号需后续同周期 bar 才能
+        # 成交，短区间内可能永不触发）。计数随结果返回，服务层追加到 warnings 便于
+        # 用户识别「策略信号没做进去」而不是误以为策略没出信号。
+        pending_summary = [
+            {
+                "stock_code": o.stock_code,
+                "period": o.period,
+                "signal_type": getattr(o, "signal_type", None),
+                "bar_time": getattr(o, "bar_time", None),
+            }
+            for o in pending_orders
+        ]
         return {
             "trades": trades,
             "snapshots": snapshots,
@@ -500,6 +524,9 @@ class BacktestEngine:
             "decisions": [ev.to_dict() for ev in recorder.drain()],
             # 段末仍未成交的在途单（增量续跑写入 checkpoint，下一段继续尝试）
             "pending_orders": pending_orders,
+            # D9 收尾统计：未成交信号数 + 摘要（服务层据此写 warnings）
+            "pending_order_count": len(pending_orders),
+            "pending_order_summary": pending_summary,
         }
 
     def _exposure_kwargs(self, portfolio: Portfolio, ctx) -> dict:

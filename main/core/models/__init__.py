@@ -19,6 +19,7 @@ from .live_session import LiveSession
 from .live_session_portfolio import LiveSessionPortfolio
 from .live_order import LiveOrder
 from .live_bar_order_mark import LiveBarOrderMark
+from .live_position_peak import LivePositionPeak
 from .live_trade import LiveTrade
 from .live_cash_flow import LiveCashFlow
 from .live_signal import LiveSignal
@@ -53,6 +54,7 @@ __all__ = [
     "LiveSessionPortfolio",
     "LiveOrder",
     "LiveBarOrderMark",
+    "LivePositionPeak",
     "LiveTrade",
     "LiveCashFlow",
     "LiveSignal",

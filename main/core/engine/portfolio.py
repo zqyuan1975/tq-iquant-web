@@ -1,4 +1,4 @@
-from typing import List, Dict, Optional
+from typing import Callable, List, Dict, Optional
 from decimal import Decimal
 from datetime import date, datetime, time
 from contextlib import nullcontext
@@ -201,6 +201,11 @@ class Portfolio:
         # 现金流 → 风险口径统一用 risk_value()/risk_equity()（总市值 − 本值）。
         # 回测无外部现金流，恒 0，行为与改动前逐字一致。
         self.external_net_inflow: Decimal = Decimal("0")
+        # 峰值持久化钩子（方案 E，2026-11-12）：只在实盘引擎注入
+        # ``LiveEngine._note_peak_raised``，把「持仓期最高价」在被抬高时落库
+        # （live_position_peaks），重启后 recover 优先读表。回测保持 None → 零影响。
+        # 签名：hook(portfolio_id, stock_code, highest_price, bar_time)。
+        self.peak_persist_hook: Optional[Callable] = None
 
     def set_recorder(self, recorder) -> None:
         """注入决策采集器（回测/实盘引擎在装配后调用），同步给 risk_manager。"""
@@ -577,7 +582,21 @@ class Portfolio:
                 )
                 continue
             # 移动止损基准：持仓期间最高价随每根 bar 收盘价刷新（只升不降）
+            prev_high = pos.highest_price
             pos.update_high(close)
+            # 方案 E：峰值被抬高时落库（仅实盘注入 hook；回测 None 零开销）。
+            # 只升不降语义由 hook 实现侧再校验一次（多策略同代码取 max）。
+            if self.peak_persist_hook is not None and pos.highest_price > prev_high:
+                try:
+                    self.peak_persist_hook(
+                        self.portfolio_id, stock_code, pos.highest_price,
+                        bar.bar_time,
+                    )
+                except Exception:  # noqa: BLE001
+                    logger.warning(
+                        "peak persist hook failed: portfolio=%s code=%s",
+                        self.portfolio_id, stock_code, exc_info=True,
+                    )
             # B5：移动止损阈值按市场状态解析（未开闸/非趋势态回落策略风控原值，行为不变）
             eff_trailing = ctx.effective_trailing_stop(self.current_regime)
             if risk_manager.check_stop_loss(pos, close):

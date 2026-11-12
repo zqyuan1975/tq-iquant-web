@@ -178,13 +178,56 @@ def test_daily_close_peak_guard_ignores_coarse_period_future_close():
     assert [e for e in result["decisions"] if e["gate"] == "max_drawdown"] == []
 
 
-def test_daily_close_peak_guard_default_off_preserves_existing_behavior():
-    """默认关闭：粗周期每步仍更新 peak，复现原假回撤行为（保证开关默认零变化）。"""
+def test_daily_close_peak_guard_default_off_still_ignores_coarse_future_close():
+    """默认关闭（D8，2026-11-12）：粗周期 1w 在未来时点的 close 也不得抬峰。
+
+    旧行为是「默认关闭 = 每步都抬峰」，混合周期下会被粗 bar 的周期末 close 前视
+    污染（本用例旧断言为假回撤事件存在）。阶段二 D8 判定为真缺陷并修正：粗周期
+    bar（1d/1w/1mon）只在「日终估值步」抬峰，分钟 bar 才每根抬 —— 该修正是默认
+    生效的（`daily_close_peak_enabled` 仍是可选的更严格模式，收紧为全部只在
+    日终步抬峰，默认关）。
+    """
     port, klines = _mixed_period_portfolio_with_coarse_close()
 
     result = BacktestEngine().run(port, klines=klines)
 
-    assert [e for e in result["decisions"] if e["gate"] == "max_drawdown"]
+    assert [e for e in result["decisions"] if e["gate"] == "max_drawdown"] == []
+    assert port.risk_manager.peak_value == Decimal("10000")
+
+
+def test_pure_daily_backtest_still_updates_peak_every_day():
+    """纯日线回测：唯一时间戳步即日终步，峰值仍逐日更新（D8 不影响纯日线口径）。"""
+    stock = "000001.SZ"
+    dates = [datetime(2026, 7, 27), datetime(2026, 7, 28), datetime(2026, 7, 29)]
+    df_1d = pl.DataFrame({
+        "datetime": dates,
+        "Open": [Decimal("10")] * 3,
+        "High": [Decimal("10")] * 3,
+        "Low": [Decimal("10")] * 3,
+        "Close": [Decimal("10"), Decimal("11"), Decimal("12")],
+        "Volume": [1000] * 3,
+    })
+    pm = PortfolioRiskManager(
+        max_drawdown=Decimal("0.9"), daily_loss_limit=Decimal("0.9"))
+    port = Portfolio(portfolio_id=1, initial_capital=Decimal("10000"),
+                     risk_manager=pm)
+    port.account.cash = Decimal("0")
+    ctx = StrategyContext(
+        strategy_id=1, period="1d", capital_ratio=Decimal("1.0"), max_positions=5)
+    ctx.strategy_risk = StrategyRiskManager(
+        stop_loss_ratio=Decimal("0.9"), take_profit_ratio=Decimal("9"),
+        trailing_stop_ratio=Decimal("0"))
+    pos = Position(stock)
+    pos.quantity = 1000
+    pos.avg_cost = Decimal("10")
+    pos.highest_price = Decimal("10")
+    ctx.positions[stock] = pos
+    port.strategies.append(ctx)
+
+    BacktestEngine().run(port, klines={stock: {"1d": df_1d}})
+
+    # 1000 股 × 12 = 12000，日线收盘逐日抬峰到最高 12000
+    assert port.risk_manager.peak_value == Decimal("12000")
 
 
 def test_period_order_covers_1h_and_legacy_60m_alias():
