@@ -62,15 +62,19 @@ class _StubDispatcher:
 
     channel = "tdx_tq"
 
-    def __init__(self, bars=None, exc=None):
+    def __init__(self, bars=None, exc=None, positions=None, bars_by_code=None):
         self._bars = bars if bars is not None else []
         self._exc = exc
+        self._positions = positions if positions is not None else []
+        self._bars_by_code = bars_by_code or {}
         self.quote_calls = []
 
     def query_quote(self, code, period="1m", count=10):
         self.quote_calls.append((code, period, count))
         if self._exc is not None:
             raise self._exc
+        if code in self._bars_by_code:
+            return list(self._bars_by_code[code])
         return list(self._bars)
 
     def query_calendar(self, *args, **kwargs):
@@ -80,7 +84,7 @@ class _StubDispatcher:
         raise AssertionError("recover 不应下单")
 
     def get_positions(self):
-        return []
+        return list(self._positions)
 
     def query_positions(self):
         return []
@@ -152,7 +156,7 @@ def _bar(day, close):
     }
 
 
-def _snapshot(db, when, hp):
+def _snapshot(db, when, hp, code=_STOCK, qty=2500):
     snap = LiveAccountSnapshot(
         live_session_id=1, engine="tdx", captured_at=when, total_asset=Decimal("100000"),
     )
@@ -160,8 +164,8 @@ def _snapshot(db, when, hp):
     db.flush()
     db.add(LiveAccountPositionSnapshot(
         snapshot_id=snap.id,
-        stock_code=_STOCK,
-        quantity=2500,
+        stock_code=code,
+        quantity=qty,
         cost_price=Decimal("22.003"),
         current_price=Decimal("21.32"),
         market_value=Decimal("53300"),
@@ -475,3 +479,151 @@ def test_portfolio_peak_hook_fires_only_when_peak_raised():
     assert calls == []
     port.on_bar(_bar_at(Decimal("23.00")), signal_cache={}, period="1d")
     assert calls == [(_SID, _STOCK, Decimal("23.00"))]
+
+
+# ---------------- 缺口一：继承仓（无 live_trades）导入后补种 ----------------
+def test_recover_seeds_imported_position_without_trades():
+    """无 live_trades 的继承仓：补种移到导入之后 → 快照 MAX 10.83 胜出，不退成本。"""
+    factory, _ = _db_factory()
+    port = _portfolio()
+    disp = _StubDispatcher(
+        bars_by_code={"002745.SZ": [_bar("2026-11-12", "10.46")]},
+        positions=[{
+            "symbol": "002745.SZ", "volume": 5300, "available": 5300,
+            "cost": "10.221", "market_value": "54171.3",
+        }],
+    )
+    engine = _engine(factory, disp, port)
+    db = factory()
+    _snapshot(db, datetime(2026, 11, 12, 15, 0), "10.83",
+              code="002745.SZ", qty=5300)
+    engine.recover(db)
+    db.close()
+
+    pos = port.strategies[0].positions["002745.SZ"]
+    assert pos.quantity == 5300
+    # 成本 10.221 / 日线 close 10.46 / 快照 MAX 10.83 → 取最大者，而非成本兜底
+    assert pos.highest_price == Decimal("10.83")
+    assert [c[0] for c in disp.quote_calls] == ["002745.SZ"]
+
+
+# ---------------- 缺口二：表值只作下限，先与快照 MAX 比对 ----------------
+def test_peak_table_above_snapshot_max_uses_table_without_tq():
+    """表值 22.63 ≥ 快照 MAX 22.07 → 直接采用表值，**零 TQ**。"""
+    factory, _ = _db_factory()
+    port = _portfolio()
+    disp = _StubDispatcher(bars=[_bar("2026-11-10", "22.00")])
+    engine = _engine(factory, disp, port)
+    db = factory()
+    _buy_trade(db, datetime(2026, 11, 10, 9, 31, 54))
+    _snapshot(db, datetime(2026, 11, 11, 9, 32), "22.07")
+    db.add(LivePositionPeak(
+        live_session_id=1,
+        portfolio_strategy_id=_SID,
+        stock_code=_STOCK,
+        highest_price=Decimal("22.63"),
+        peak_bar_time=datetime(2026, 11, 11, 15, 0),
+    ))
+    db.commit()
+
+    engine.recover(db)
+    events = _events(db)
+    db.close()
+
+    assert port.strategies[0].positions[_STOCK].highest_price == Decimal("22.63")
+    assert disp.quote_calls == []
+    assert events == []  # 不落 fallback / recompute
+
+
+def test_peak_table_below_snapshot_max_triggers_recompute():
+    """表值 10.46 < 快照 MAX 10.83 → 判可疑，重算并取最大者 + recompute 审计。"""
+    factory, _ = _db_factory()
+    port = _portfolio()
+    disp = _StubDispatcher(bars=[_bar("2026-11-12", "10.46")])
+    engine = _engine(factory, disp, port)
+    db = factory()
+    _buy_trade(db, datetime(2026, 11, 10, 9, 31, 54), price="10.46", qty=5300)
+    _snapshot(db, datetime(2026, 11, 11, 9, 32), "10.83", qty=5300)
+    db.add(LivePositionPeak(
+        live_session_id=1,
+        portfolio_strategy_id=_SID,
+        stock_code=_STOCK,
+        highest_price=Decimal("10.46"),
+        peak_bar_time=datetime(2026, 11, 12, 15, 0),
+    ))
+    db.commit()
+
+    engine.recover(db)
+    events = _events(db)
+    db.close()
+
+    assert port.strategies[0].positions[_STOCK].highest_price == Decimal("10.83")
+    assert [c[1] for c in disp.quote_calls] == ["1d"]  # 走了重算取数
+    assert len(events) == 1
+    assert events[0].action == "recompute"
+    assert "10.46" in events[0].message and "10.83" in events[0].message
+
+
+# ---------------- 缺口三：继承仓表值退化自愈（002745 场景） ----------------
+def test_imported_position_heals_stale_table_peak():
+    """导入仓（buy_time=今日）+ 表值 10.46（已退化）+ 11-10 快照 10.83：
+
+    锚点回退到 11-10（快照首次见到该仓）→ 表值 < 快照 MAX → 重算取 10.83，
+    退化值不因落表而永久固化。
+    """
+    factory, _ = _db_factory()
+    port = _portfolio()
+    disp = _StubDispatcher(
+        bars_by_code={"002745.SZ": [_bar("2026-11-12", "10.46")]},
+        positions=[{
+            "symbol": "002745.SZ", "volume": 5300, "available": 5300,
+            "cost": "10.221", "market_value": "54171.3",
+        }],
+    )
+    engine = _engine(factory, disp, port)
+    db = factory()
+    _snapshot(db, datetime(2026, 11, 10, 9, 32), "10.83",
+              code="002745.SZ", qty=5300)
+    db.add(LivePositionPeak(
+        live_session_id=1,
+        portfolio_strategy_id=_SID,
+        stock_code="002745.SZ",
+        highest_price=Decimal("10.46"),
+        peak_bar_time=datetime(2026, 11, 12, 15, 0),
+    ))
+    db.commit()
+
+    engine.recover(db)
+    events = _events(db)
+    db.close()
+
+    pos = port.strategies[0].positions["002745.SZ"]
+    assert pos.highest_price == Decimal("10.83")
+    assert any(e.action == "recompute" and e.stock_code == "002745.SZ"
+               for e in events)
+
+
+# ---------------- 缺口一：已在 live_trades 的票不重复补种 ----------------
+def test_recover_import_pass_does_not_reseed_traded_codes():
+    """成交重放补过的票不进第二轮 → 每只票只取数一次。"""
+    factory, _ = _db_factory()
+    port = _portfolio()
+    disp = _StubDispatcher(
+        bars_by_code={
+            _STOCK: [_bar("2026-11-10", "22.07")],
+            "002745.SZ": [_bar("2026-11-12", "10.46")],
+        },
+        positions=[{
+            "symbol": "002745.SZ", "volume": 5300, "available": 5300,
+            "cost": "10.221", "market_value": "54171.3",
+        }],
+    )
+    engine = _engine(factory, disp, port)
+    db = factory()
+    _buy_trade(db, datetime(2026, 11, 10, 9, 31, 54))
+    engine.recover(db)
+    db.close()
+
+    codes = [c[0] for c in disp.quote_calls]
+    assert codes.count(_STOCK) == 1
+    assert codes.count("002745.SZ") == 1

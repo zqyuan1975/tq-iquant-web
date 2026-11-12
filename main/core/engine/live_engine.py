@@ -8040,13 +8040,11 @@ class LiveEngine:
     def _peak_anchor_date(self, db: Session, portfolio_id: int, code: str,
                           pos: Position, first_buy_at: Dict[tuple, datetime],
                           today: date) -> Tuple[date, str]:
-        """建仓锚点（峰值统计起点）：live_trades 最早 BUY → buy_time → 最早快照 → 保守窗口。"""
+        """建仓锚点（峰值统计起点）：live_trades 最早 BUY → buy_time/最早快照 → 保守窗口。"""
         t = first_buy_at.get((portfolio_id, code))
         if t is not None:
             return t.date(), "trades"
         bt = getattr(pos, "buy_time", None)
-        if bt is not None:
-            return bt.date(), "buy_time"
         try:
             first_at = (
                 db.query(func.min(LiveAccountSnapshot.captured_at))
@@ -8062,6 +8060,14 @@ class LiveEngine:
             )
         except Exception:  # noqa: BLE001 — 锚点查询失败只影响窗口精度
             first_at = None
+        if bt is not None:
+            btd = bt.date()
+            # 继承仓（无成交记录）的 buy_time 由 mirror_bridge 写成「导入当日」，不是
+            # 真实建仓日；平台更早的账户快照才是首次见到该仓的时间。锚点钉在重启当日
+            # 会把快照 MAX / 周期取数区间截断（002745 自愈 10.83 依赖更早的锚点）。
+            if isinstance(first_at, datetime) and first_at.date() < btd:
+                return first_at.date(), "snapshot_first"
+            return btd, "buy_time"
         if isinstance(first_at, datetime):
             return first_at.date(), "snapshot_first"
         anchor = today
@@ -8158,16 +8164,25 @@ class LiveEngine:
 
     def _seed_position_peaks(self, db: Session,
                              ports_by_id: Dict[int, Portfolio],
-                             first_buy_at: Dict[tuple, datetime]) -> None:
+                             first_buy_at: Dict[tuple, datetime],
+                             skip_keys: Optional[Set[tuple]] = None,
+                             ) -> Set[tuple]:
         """recover 峰值补种（阶段二 B）：表值 → 策略周期 → 日线 → 快照 → 成本。
 
-        ① ``live_position_peaks`` 有值直接采用（**不再调 TQ**，重启零取数）；
-        ② 无表值 → 用**该策略自身周期**的 bar close 重算（1m/5m/15m/30m/1h 一律如此）；
+        ① ``live_position_peaks`` 表值**只作下限**：先用本地库查一次快照 MAX
+           （零 TQ）。表值 ≥ 快照 MAX → 直接采用，**不调 TQ**（重启零取数）；
+           表值 < 快照 MAX → 判为可疑（历史退化值已落表），走 ② 重算并取最大者，
+           落 ``gate=peak_seed / action=recompute`` 审计（避免退化值永久固化）；
+        ② 用**该策略自身周期**的 bar close 重算（1m/5m/15m/30m/1h 一律如此）；
         ③ 取不到（TQ 超时/历史不足/停牌/通道不支持）→ 降级日线 close；
         ④ 再降级 → 账户快照 highest_price 历史 MAX；
         ⑤ 最后 → 现值（成本/买入价），落 `gate=peak_seed / action=fallback` 事件。
-        各候选取 max 后 update_high（只升不降）。每票一行日志，带**实际使用的周期**。
+        ``skip_keys``：上一轮已补种的 (组合, 代码)；用于「导入继承仓之后再补一次」
+        时去重，避免对已在 live_trades 里的票重复补种、重复取数。
+        各候选取 max 后 update_high（只升不降）。返回本轮处理过的键集合。
         """
+        skip_keys = skip_keys or set()
+        done: Set[tuple] = set()
         targets: List[tuple] = []
         for pid, port in ports_by_id.items():
             for ctx in (getattr(port, "strategies", None) or []):
@@ -8176,7 +8191,7 @@ class LiveEngine:
                         continue
                     targets.append((pid, ctx, code, pos))
         if not targets:
-            return
+            return done
         today = now_shanghai().date()
         # ① 表值（一次查全量；同时登记 _peak_rows 供清仓清扫）
         table_peaks = self._load_position_peaks(db)
@@ -8185,24 +8200,46 @@ class LiveEngine:
         period_cache: Dict[tuple, Optional[Decimal]] = {}
         snap_cache: Dict[tuple, Optional[Decimal]] = {}
         fallback_meta: List[tuple] = []
+        recompute_meta: List[tuple] = []
         for pid, ctx, code, pos in targets:
+            if (pid, code) in skip_keys:
+                # 上一轮已补种（live_trades 重放路径）：不重复取数、不重复写表
+                done.add((pid, code))
+                continue
+            done.add((pid, code))
             cur = getattr(pos, "highest_price", None) or Decimal("0")
+            anchor, anchor_src = self._peak_anchor_date(
+                db, pid, code, pos, first_buy_at, today)
+            # 表值校验基准：快照 MAX 是纯本地查询，零 TQ
+            skey = (code, anchor)
+            if skey not in snap_cache:
+                snap_cache[skey] = self._snapshot_peak_max(db, code, anchor)
+            snap_peak = snap_cache[skey]
             table_val = table_peaks.get((pid, code))
-            if table_val is not None:
+            if table_val is not None and (
+                    snap_peak is None or table_val[0] >= snap_peak):
                 final = max(cur, table_val[0])
                 if final > cur:
                     pos.update_high(final)
                 # 表值已是持久化峰值，回写（幂等，不会写低）以刷新 updated_at
                 self._note_peak_raised(pid, code, final, table_val[1])
                 logger.info(
-                    "[peak-seed:table] %s 周期=表值 表峰值=%s 现值=%s 最终=%s "
-                    "（session %s, 组合 %s, 策略 %s）",
-                    code, table_val[0], cur, final,
+                    "[peak-seed:table] %s 周期=表值 表峰值=%s 快照MAX=%s 现值=%s "
+                    "最终=%s （session %s, 组合 %s, 策略 %s）",
+                    code, table_val[0], snap_peak, cur, final,
                     self.session_id, pid, ctx.strategy_id,
                 )
                 continue
-            anchor, anchor_src = self._peak_anchor_date(
-                db, pid, code, pos, first_buy_at, today)
+            if table_val is not None:
+                # 表值低于快照 MAX：历史退化值（如峰值被写成成本后又落表），
+                # 不能当权威值用，走重算并取最大者自愈。
+                logger.warning(
+                    "[peak-seed:recompute] %s 表值 %s < 快照MAX %s，判为可疑，"
+                    "重算并取最大者（session %s, 组合 %s, 策略 %s）",
+                    code, table_val[0], snap_peak, self.session_id, pid,
+                    ctx.strategy_id)
+                recompute_meta.append(
+                    (pid, ctx.strategy_id, code, table_val[0], snap_peak))
             strat_period = (getattr(ctx, "period", None) or "1m").lower()
             pkey = (code, anchor, strat_period)
             if pkey not in period_cache:
@@ -8222,12 +8259,9 @@ class LiveEngine:
                     daily_peak = period_cache[dkey]
                     if daily_peak is not None:
                         used_period = "1d(降级)"
-            skey = (code, anchor)
-            if skey not in snap_cache:
-                snap_cache[skey] = self._snapshot_peak_max(db, code, anchor)
-            snap_peak = snap_cache[skey]
             final = cur
-            for cand in (period_peak, daily_peak, snap_peak):
+            for cand in (table_val[0] if table_val is not None else None,
+                         period_peak, daily_peak, snap_peak):
                 if cand is not None and cand > final:
                     final = cand
             if period_peak is not None:
@@ -8253,27 +8287,42 @@ class LiveEngine:
                 fallback_meta.append((pid, ctx.strategy_id, code, anchor, cur))
         # 补种结果统一落库（不提交，recover 末尾由服务层提交）
         self._flush_position_peaks(db)
-        if not fallback_meta:
-            return
-        for pid, strategy_id, code, anchor, cur in fallback_meta:
-            logger.warning(
-                "[peak-seed:cost] %s 无周期/无日线/无快照峰值，沿用现有 %s（锚点 %s，session %s）",
-                code, cur, anchor.isoformat(), self.session_id)
+        for pid, strategy_id, code, table_pk, snap_pk in recompute_meta:
             self._recorder.record(
                 gate="peak_seed",
                 layer="live_gate",
-                action="fallback",
+                action="recompute",
                 portfolio_id=pid,
                 strategy_id=strategy_id,
                 stock_code=code,
                 bar_time=None,
-                message=("峰值补种无可用数据（策略周期/日线取数失败且无快照），"
-                         "沿用现有峰值 %s，移动止损基准可能偏低（锚点 %s）"
-                         % (cur, anchor.isoformat())),
+                param_value=float(table_pk) if table_pk is not None else None,
+                actual_value=float(snap_pk) if snap_pk is not None else None,
+                message=("峰值表值可疑：表值 %s < 快照MAX %s，已重算并取最大者"
+                         % (table_pk, snap_pk)),
             )
-        first_port = next(iter(ports_by_id.values()), None)
-        if first_port is not None:
-            self._drain_decisions(db, first_port)
+        if fallback_meta:
+            for pid, strategy_id, code, anchor, cur in fallback_meta:
+                logger.warning(
+                    "[peak-seed:cost] %s 无周期/无日线/无快照峰值，沿用现有 %s（锚点 %s，session %s）",
+                    code, cur, anchor.isoformat(), self.session_id)
+                self._recorder.record(
+                    gate="peak_seed",
+                    layer="live_gate",
+                    action="fallback",
+                    portfolio_id=pid,
+                    strategy_id=strategy_id,
+                    stock_code=code,
+                    bar_time=None,
+                    message=("峰值补种无可用数据（策略周期/日线取数失败且无快照），"
+                             "沿用现有峰值 %s，移动止损基准可能偏低（锚点 %s）"
+                             % (cur, anchor.isoformat())),
+                )
+        if fallback_meta or recompute_meta:
+            first_port = next(iter(ports_by_id.values()), None)
+            if first_port is not None:
+                self._drain_decisions(db, first_port)
+        return done
 
 
     # ---------------- 持仓恢复 ----------------
@@ -8487,7 +8536,8 @@ class LiveEngine:
         # 峰值补种（阶段二 A/B）：live_position_peaks 表值优先（有则不调 TQ）→ 该策略
         # 自身周期 close → 日线 → 快照 MAX → 成本，只升不降。必须在 deferred 队列重建
         # 之前（峰值只影响后续风控判定，不碰任何订单数据）。
-        self._seed_position_peaks(db, ports_by_id, first_buy_at)
+        # 本轮只补 live_trades 重放出的持仓；继承仓（无成交记录）在下方导入后再补一次。
+        seeded_keys = self._seed_position_peaks(db, ports_by_id, first_buy_at)
         # 峰值表清理：超过 30 个交易日未更新的行（已清仓但删行漏掉的残留）记 INFO。
         self._cleanup_stale_position_peaks(db)
         # 补种/清理结果立即提交：后续账户总览取不到时走不到末尾的 commit 分支，
@@ -8705,6 +8755,11 @@ class LiveEngine:
             if overview is not None:
                 _, positions = overview
                 self._import_external_positions(db, positions, now_shanghai())
+                # 继承仓（有仓无账）在上一轮补种时还不在 ctx.positions 里，三级重算
+                # 全被跳过，峰值只能靠导入路径的 prev_hp/成本兜底。导入后补一次，
+                # skip_keys 排除已补过的票（不重复取数、不重复写表）。
+                self._seed_position_peaks(
+                    db, ports_by_id, first_buy_at, skip_keys=seeded_keys)
                 # 导入会顺带落「池外仓汇总」决策事件（观测）；recover 末尾无统一
                 # commit，这里显式提交，避免事件随 Session 关闭被回滚。
                 db.commit()
