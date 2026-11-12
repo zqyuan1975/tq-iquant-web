@@ -25,7 +25,7 @@ from typing import (
     AsyncIterator, Callable, Dict, List, Optional, Set, Tuple,
 )
 
-from sqlalchemy import or_
+from sqlalchemy import func, or_
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.orm import Session
 from sqlalchemy.orm.exc import DetachedInstanceError
@@ -7807,6 +7807,197 @@ class LiveEngine:
         self._order_machine.apply_filled_trade(
             live_order, price, qty, amount, commission)
 
+    # ---------------- 峰值补种（与回测口径对齐，2026-11-12） ----------------
+    # 回测峰值 = max(建仓成交价, 建仓后该策略周期每根完成 bar 的 close)，逐根累积、
+    # 只升不降。实盘 recover 手里只有成交记录（=买入价），中间 bar 的 close 从未落盘，
+    # 峰值会退化为买入价/成本 → 移动止损基准偏低、触发更晚（保护更弱）。这里在
+    # recover 末尾用**日线 close 序列**重算一次：日线优先，取数失败退「账户快照
+    # highest_price 的历史 MAX」，再失败维持现状（成本）。全程只 update_high。
+    _PEAK_SEED_FALLBACK_DAYS = 20      # 无锚点时的保守回看窗口（交易日）
+    _PEAK_SEED_MAX_BARS = 250          # 日线取数上限（约一个交易年）
+
+    def _peak_anchor_date(self, db: Session, portfolio_id: int, code: str,
+                          pos: Position, first_buy_at: Dict[tuple, datetime],
+                          today: date) -> Tuple[date, str]:
+        """建仓锚点（峰值统计起点）：live_trades 最早 BUY → buy_time → 最早快照 → 保守窗口。"""
+        t = first_buy_at.get((portfolio_id, code))
+        if t is not None:
+            return t.date(), "trades"
+        bt = getattr(pos, "buy_time", None)
+        if bt is not None:
+            return bt.date(), "buy_time"
+        try:
+            first_at = (
+                db.query(func.min(LiveAccountSnapshot.captured_at))
+                .join(
+                    LiveAccountPositionSnapshot,
+                    LiveAccountPositionSnapshot.snapshot_id == LiveAccountSnapshot.id,
+                )
+                .filter(
+                    LiveAccountSnapshot.live_session_id == self.session_id,
+                    LiveAccountPositionSnapshot.stock_code == code,
+                )
+                .scalar()
+            )
+        except Exception:  # noqa: BLE001 — 锚点查询失败只影响窗口精度
+            first_at = None
+        if isinstance(first_at, datetime):
+            return first_at.date(), "snapshot_first"
+        anchor = today
+        for _ in range(self._PEAK_SEED_FALLBACK_DAYS):
+            anchor = self._prev_trading_day(anchor)
+        return anchor, "fallback_window"
+
+    def _daily_close_peak(self, code: str, anchor: date,
+                          today: date) -> Optional[Decimal]:
+        """锚点→今天的日线 close 最大值（复用 query_quote(period="1d")，与 DailyCloser 同款）。
+
+        取数失败/返回空 → None（调用方退快照 MAX）。只统计锚点当日及之后、今天及之前、
+        close>0 的已完成日线；今天未收盘时最新一根日线就是昨天，对盘前判定无影响。
+        """
+        query_quote = getattr(self._dispatcher, "query_quote", None)
+        if query_quote is None:
+            return None
+        count = max(30, min(self._PEAK_SEED_MAX_BARS,
+                            (today - anchor).days + 10))
+        try:
+            bars = query_quote(code, period="1d", count=count)
+        except Exception as e:  # noqa: BLE001 — 桥/TQ 超时、通道不支持都退快照
+            logger.warning("[peak-seed:daily] %s 日线取数失败（%s: %s）",
+                           code, type(e).__name__, e)
+            return None
+        peak: Optional[Decimal] = None
+        for b in bars or []:
+            bt = parse_bar_time(b)
+            if bt is None or bt.date() < anchor or bt.date() > today:
+                continue
+            try:
+                close = to_ohlcv(b).get("close") or Decimal("0")
+            except Exception:  # noqa: BLE001
+                continue
+            if close <= 0:
+                continue
+            if peak is None or close > peak:
+                peak = close
+        if peak is None:
+            logger.warning("[peak-seed:daily] %s 锚点 %s 以来无可用日线（返回空）",
+                           code, anchor.isoformat())
+        return peak
+
+    def _snapshot_peak_max(self, db: Session, code: str,
+                           anchor: date) -> Optional[Decimal]:
+        """账户快照里该票 highest_price 的历史 MAX（锚点之后，session+代码）。
+
+        快照表是**会话级**（无 portfolio_strategy_id 列），故按会话+代码聚合。取 MAX
+        而不是「最近一条」，正是为了自愈历史上的脏写（实证：峰值曾被写成成本价，
+        更早的快照里仍留着真实峰值）。
+        """
+        try:
+            value = (
+                db.query(func.max(LiveAccountPositionSnapshot.highest_price))
+                .join(
+                    LiveAccountSnapshot,
+                    LiveAccountPositionSnapshot.snapshot_id == LiveAccountSnapshot.id,
+                )
+                .filter(
+                    LiveAccountSnapshot.live_session_id == self.session_id,
+                    LiveAccountPositionSnapshot.stock_code == code,
+                    LiveAccountSnapshot.captured_at >= datetime.combine(
+                        anchor, datetime.min.time()),
+                )
+                .scalar()
+            )
+        except Exception:  # noqa: BLE001 — 快照兜底失败不阻断起账
+            logger.warning("[peak-seed:snapshot] %s 快照峰值查询失败（session %s）",
+                           code, self.session_id, exc_info=True)
+            return None
+        if value is None:
+            return None
+        try:
+            peak = Decimal(str(value))
+        except Exception:  # noqa: BLE001
+            return None
+        return peak if peak > 0 else None
+
+    def _seed_position_peaks(self, db: Session,
+                             ports_by_id: Dict[int, Portfolio],
+                             first_buy_at: Dict[tuple, datetime]) -> None:
+        """recover 峰值补种：日线 close 重算 → 快照 MAX → 现状，只升不降。
+
+        每只持仓输出一行日志（代码/锚点/重算峰值/快照MAX/最终值/来源），供开盘后核对。
+        日线与快照都取不到时落 `gate=peak_seed / action=fallback` 决策事件 + WARNING，
+        明确「该票的移动止损基准可能仍偏低」，不静默。
+        """
+        targets: List[tuple] = []
+        for pid, port in ports_by_id.items():
+            for ctx in (getattr(port, "strategies", None) or []):
+                for code, pos in (getattr(ctx, "positions", None) or {}).items():
+                    if pos is None or int(getattr(pos, "quantity", 0) or 0) <= 0:
+                        continue
+                    targets.append((pid, ctx, code, pos))
+        if not targets:
+            return
+        today = now_shanghai().date()
+        daily_cache: Dict[tuple, Optional[Decimal]] = {}
+        snap_cache: Dict[tuple, Optional[Decimal]] = {}
+        fallback_meta: List[tuple] = []
+        for pid, ctx, code, pos in targets:
+            anchor, anchor_src = self._peak_anchor_date(
+                db, pid, code, pos, first_buy_at, today)
+            dkey = (code, anchor)
+            if dkey not in daily_cache:
+                daily_cache[dkey] = self._daily_close_peak(code, anchor, today)
+            daily_peak = daily_cache[dkey]
+            skey = (code, anchor)
+            if skey not in snap_cache:
+                snap_cache[skey] = self._snapshot_peak_max(db, code, anchor)
+            snap_peak = snap_cache[skey]
+            cur = getattr(pos, "highest_price", None) or Decimal("0")
+            final = cur
+            for cand in (daily_peak, snap_peak):
+                if cand is not None and cand > final:
+                    final = cand
+            if daily_peak is not None and daily_peak >= (snap_peak or Decimal("0")):
+                source = "daily"
+            elif snap_peak is not None:
+                source = "snapshot"
+            elif daily_peak is not None:
+                source = "daily"
+            else:
+                source = "cost"
+            if final > cur:
+                pos.update_high(final)
+            logger.info(
+                "[peak-seed:%s] %s 锚点=%s(%s) 日线峰值=%s 快照MAX=%s 最终=%s "
+                "（session %s, 组合 %s, 策略 %s）",
+                source, code, anchor.isoformat(), anchor_src,
+                daily_peak, snap_peak, final,
+                self.session_id, pid, ctx.strategy_id,
+            )
+            if daily_peak is None and snap_peak is None:
+                fallback_meta.append((pid, ctx.strategy_id, code, anchor, cur))
+        if not fallback_meta:
+            return
+        for pid, strategy_id, code, anchor, cur in fallback_meta:
+            logger.warning(
+                "[peak-seed:cost] %s 无日线/无快照峰值，沿用现有 %s（锚点 %s，session %s）",
+                code, cur, anchor.isoformat(), self.session_id)
+            self._recorder.record(
+                gate="peak_seed",
+                layer="live_gate",
+                action="fallback",
+                portfolio_id=pid,
+                strategy_id=strategy_id,
+                stock_code=code,
+                bar_time=None,
+                message=("峰值补种无可用数据（日线取数失败且无快照），沿用现有峰值 %s，"
+                         "移动止损基准可能偏低（锚点 %s）"
+                         % (cur, anchor.isoformat())),
+            )
+        first_port = next(iter(ports_by_id.values()), None)
+        if first_port is not None:
+            self._drain_decisions(db, first_port)
+
     # ---------------- 持仓恢复 ----------------
     def recover(self, db: Session) -> None:
         """Core 重启后从 live_trades 重放，重建各组合虚拟持仓/虚拟现金。
@@ -7831,10 +8022,18 @@ class LiveEngine:
                 sig_type_by_order[lo.id] = lo.signal_type
                 order_type_by_order[lo.id] = lo.order_type or ""
         applied_by_order: Dict[int, tuple] = {}
+        # 峰值补种锚点：每个 (组合, 代码) 最早一笔买入的成交时间（顺路取 min，零额外查询）
+        first_buy_at: Dict[tuple, datetime] = {}
         for tr in trades:
             port = ports_by_id.get(tr.portfolio_strategy_id)
             if port is None:
                 continue
+            if (tr.trade_type or "").lower() == "buy":
+                bkey = (tr.portfolio_strategy_id, tr.stock_code)
+                prev_buy = first_buy_at.get(bkey)
+                if (prev_buy is None
+                        or (tr.trade_time is not None and tr.trade_time < prev_buy)):
+                    first_buy_at[bkey] = tr.trade_time
             # 补记单（对账发现的陌生/人工成交，order_type=external）只留痕、不记账：
             # 会话运行期 record_external_deals 就刻意不 apply（持仓由桥快照镜面覆盖）。
             # 重启重放必须同口径——否则外部卖出会被 Position.sell 截断为 0 持仓却照加
@@ -8004,6 +8203,9 @@ class LiveEngine:
         # D4：读回熔断计数（重启不丢累计次数，达 3 次转手动恢复）归 BreakerService
         # （0010 步骤 4）；预置 counts_written 避免首 bar 重复落库。
         self._breaker.restore_counts(db, ports_by_id)
+        # 峰值补种（2026-11-12）：日线 close 重算 → 快照 MAX → 现状，只升不降。
+        # 必须在 deferred 队列重建之前（峰值只影响后续风控判定，不碰任何订单数据）。
+        self._seed_position_peaks(db, ports_by_id, first_buy_at)
         # P2 持久化恢复：deferred 日线单重建内存队列，**DB 行保留**（2026-11-09
         # 起不再「转移删除」）——行 id 挂 order._deferred_row_id，放行提交成功时
         # 删旧行建 submitted 新行。这样 recover 之后到放行之前的任何时刻崩溃/
