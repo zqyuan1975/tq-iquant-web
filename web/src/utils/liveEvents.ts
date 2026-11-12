@@ -77,6 +77,40 @@ export const GATE_LABEL: Record<string, string> = {
   follow_master_sell: '跟随主策略平仓',
   // 人工干预（柜台被人手动动了平台账内仓，只打标不阻断）
   manual_intervention: '人工干预',
+  // 盘前 / 顺延 / 价格（live_engine、order_machine）
+  pre_open_auction: '盘前集合竞价',
+  pre_open_price_mode: '盘前价型不支持',
+  deferred_release: '顺延单放行',
+  submit_price: '提交价刷新',
+  // 周期线 / 日线新鲜度与兜底（market_data、daily_closer）
+  period_bar_freshness: '周期线不新鲜',
+  period_bar_fallback: '周期线聚合兜底',
+  daily_bar_freshness: '日线不新鲜',
+  signal_bar_date: '信号 bar 顺延',
+  bar_gap: '行情断档',
+  // 持仓 / 卖出范围（portfolio、live_engine）
+  inflight_sell: '在途卖单去重',
+  sell_scope: '卖出范围限制',
+  out_of_pool_position: '池外持仓',
+  // 风控 / 估值（portfolio、live_engine）
+  risk_skip_no_price: '无价格跳过风控',
+  valuation_missing_price: '估值缺价',
+  // 运行健康与账实核对（live_engine）
+  tq_lock_timeout: '通达信锁超时',
+  loop_saturation: '主循环饱和',
+  equity_deviation: '真实/虚拟净值偏差',
+  cash_share_scale: '资金占比缩量',
+  cash_diff: '现金差异',
+  cash_flow: '外部现金流',
+  fill_price_deviation: '成交价偏离',
+  claim_price_mismatch: '委托价认领不符',
+  // 下单闸门里此前未登记的中文标签（工作台不再露英文 key）
+  signal: '信号闸',
+  trading_session: '非交易时段',
+  price_limit: '涨跌停限制',
+  no_market_data: '无行情数据',
+  volume_cap_shrink: '量能上限缩量',
+  volume_cap_defer: '量能上限顺延',
 }
 
 // 闸门层 → 中文
@@ -104,6 +138,21 @@ export const ACTION_LABEL: Record<string, string> = {
   notice: '提示',
   apply: '已修正',
   skip: '跳过',
+  release: '放行',
+  defer: '顺延',
+  cancel: '撤单',
+  cancel_requeue: '撤单重排',
+  bias: '让价',
+  fallback: '兜底',
+  refresh: '刷新价格',
+  replay: '补派',
+  partial: '部分执行',
+  unrecoverable: '不可恢复',
+  timeout: '超时',
+  alert: '告警',
+  forced: '强制',
+  requeue: '重新排队',
+  scale: '缩量',
 }
 
 /** 闸门代码 → 中文标签（未知 gate 回退原代码）。 */
@@ -137,6 +186,25 @@ const RISK_RULE_LABEL: Record<string, string> = {
   manual_intervention: '人工干预',
   quote_polling_paused: '行情轮询暂停',
   quote_polling_resumed: '行情轮询恢复',
+  // 行情 / 周期线健康
+  bar_gap: '行情断档',
+  reconnect: '断线重连',
+  no_quote_capability: '行情源不可回补',
+  period_bar_fallback_aggregated: '周期线聚合兜底',
+  daily_bar_freshness: '日线不新鲜',
+  // 运行健康
+  tick_too_slow: '主循环单轮过慢',
+  formula_injection: '通达信锁超时',
+  // 估值 / 账实核对
+  price_unavailable: '估值价缺失',
+  equity_deviation: '真实/虚拟净值偏差',
+  cash_diff: '现金差异',
+  external_cash_flow: '外部现金流',
+  fill_price_deviation: '成交价偏离',
+  out_of_pool_position: '池外持仓',
+  // 盘前 / 资金
+  pre_open_price_capability: '盘前定价能力不足',
+  real_account_insufficient: '真实可用资金不足',
 }
 
 const fmt = (v: unknown): string => (v === null || v === undefined ? '' : String(v))
@@ -242,7 +310,13 @@ export function formatEvent(type: string, data: Record<string, unknown>): string
     case 'position':
       return `${fmt(data.stock_code)} ${fmt(data.quantity)}股 成本${fmtCost(data.avg_cost)} 市值${fmtMoney(data.market_value)}`
     case 'risk': {
-      const label = RISK_RULE_LABEL[String(data.rule)] || fmt(data.rule)
+      // rule 优先；rule 未登记时退回 gate 标签（同一批新增闸门的 rule 取值不唯一，
+      // 例如 bar_gap 的 rule 是断线原因），最后才显示原始 key。
+      const rule = fmt(data.rule)
+      const label =
+        RISK_RULE_LABEL[rule] ||
+        (data.gate ? gateLabel(fmt(data.gate)) : '') ||
+        rule
       return `${label}: ${fmt(data.message)}`
     }
     case 'decision':

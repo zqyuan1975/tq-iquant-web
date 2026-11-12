@@ -15,13 +15,16 @@ goldminer:
   # 掘金终端「策略」里生成的 token 与账户 ID（留空则在界面里填写）
   token: ''
   account_id: ''
-  # 桥请求超时（秒）：须 ≥30s 且 < 主循环 60s。
-  request_timeout_seconds: 30
+  # 桥请求超时（秒）：须 ≥30s 且 < 主循环 60s；默认 45s（30s 贴着实测上界，易误超时）。
+  request_timeout_seconds: 45
   slow_response_seconds: 15
   slow_warn_interval_seconds: 300
 # QMT/iQuant 客户端安装路径（留空则在界面里选择）
 iquant_path: ''
 max_concurrent_backtest: 1
+# 通达信 TQ 全局锁获取超时（秒），默认 30；<=0 退回旧行为（无限等待）。
+# 通达信卡住时拿不到锁的调用方会超时跳过本轮，避免整条实盘主循环被拖死。
+tq_lock_timeout_seconds: 30
 # 通达信安装路径（含 PYPlugins 目录，TQ 模块从这里加载 tqcenter.py）
 tdx_path: ''
 ths_ui:
