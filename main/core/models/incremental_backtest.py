@@ -65,6 +65,9 @@ class IncrementalBacktestDay(Base):
     net_dev_pct = Column(Numeric(10, 4), nullable=True)
     inc_trades_count = Column(Integer, nullable=True)
     live_trades_count = Column(Integer, nullable=True)
+    # 续跑侧当日成交方向列表 JSON（["000001.SZ:BUY", ...]），供双跑校验与
+    # 「全量重算自身成交方向」逐日比较（NULL = 旧行，该判据不参与）。
+    inc_dirs_json = Column(Text, nullable=True)
     direction_match = Column(Boolean, nullable=True)
     # ok / warn / gap
     status = Column(String(10), nullable=False, default="ok", server_default="ok")

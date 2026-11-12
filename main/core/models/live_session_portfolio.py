@@ -27,6 +27,11 @@ class LiveSessionPortfolio(Base):
     seam_cash = Column(Numeric(15, 2), nullable=True)
     # 接缝日存量仓 JSON：[{stock_code, quantity, avg_cost, buy_date, highest_price}]
     seam_positions_json = Column(Text, nullable=True)
+    # 接缝捕获时刻已计入起账状态的 live_trades.id 水位（含当日已成交）。
+    # 实盘侧重放（incremental_backtest._live_rows）只重放 id 大于该水位的成交，
+    # 防「盘中重启 → 首次锚定 → 当日已有成交」把同一笔成交算两次。NULL = 旧接缝
+    # （改动前捕获），只能按接缝日 00:00 重放并告警。
+    seam_trade_cursor = Column(Integer, nullable=True)
     # 接缝锚定开关三态：NULL=跟随全局 incremental_backtest.anchor_on_live_start
     # （默认 True）/ 0 / 1。开启时续跑回测用实盘起账状态重锚（同起点同分母）。
     seam_anchor_enabled = Column(Boolean, nullable=True)

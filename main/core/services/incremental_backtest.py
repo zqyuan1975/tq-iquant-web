@@ -11,6 +11,9 @@
   参数快照哈希、口径版本、数据截止日，全部落 checkpoint。
 - 口径版本闸：成本/成交价/复权/T+1/引擎版本任一变化 → 作废 checkpoint，
   从接缝日重跑。
+- 参数指纹闸：组合级列 + 策略数值参数/公式/角色/周期 + 策略增删 + 股票池
+  成分代码列表任一变化 → 作废 checkpoint 并从接缝日重建（日志注明变化分项）。
+- 续跑只要日线周期；缺口规划只允许「恰好今天一天」走当日交接日线的快路径。
 - 双跑校验：从接缝日全量重算并与续跑结果按特征级容差对账。
 """
 import hashlib
@@ -23,6 +26,7 @@ from typing import Dict, List, Optional
 from zoneinfo import ZoneInfo
 
 import polars as pl
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from core.config import load_config
@@ -42,6 +46,7 @@ from core.models import (
     LiveSessionPortfolio,
     LiveTrade,
     PortfolioStrategy,
+    StockPoolStock,
     Strategy,
 )
 from core.services.backtest_service import (
@@ -352,9 +357,124 @@ def schema_fingerprint(dividend_mode: str) -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
-def params_hash(ps, dividend_mode: str) -> str:
-    snapshot = build_params_snapshot(ps, dividend_mode=dividend_mode)
-    return hashlib.sha256(snapshot.encode("utf-8")).hexdigest()
+def params_hash(ps, dividend_mode: str, db: Optional[Session] = None) -> str:
+    return params_fingerprint(ps, dividend_mode, db)["hash"]
+
+
+# 参数指纹覆盖三类口径来源（任一变化都会让续跑与当前配置不一致）：
+# 1) 组合级列（build_params_snapshot：资金/费率/滑点/池 id/复权模式…）；
+# 2) 策略行——数值参数（止损/止盈/移动止损/加仓阈值/资金占比…）、公式、角色、
+#    周期、策略增删（按 id 升序，重命名不参与）；
+# 3) 股票池成分代码列表（组合级 ∪ 各策略独立池）。
+# 实盘执行配置（max_order_amount/requote/split_order 等）不影响回测，不参与。
+_FP_STRATEGY_FIELDS = (
+    "id", "formula_id", "period", "signal_frequency", "signal_at",
+    "signal_weekday", "signal_data_end", "role", "master_strategy_id",
+    "stock_pool_id", "slave_exit_mode",
+    "capital_ratio", "max_positions", "single_open_ratio",
+    "stop_loss_ratio", "take_profit_ratio", "trailing_stop_ratio",
+    "add_position_threshold", "max_add_count", "add_position_ratio",
+    "reduce_position_ratio",
+    "rotation_enabled", "rotation_momentum_bars", "rotation_hysteresis",
+    "regime_filter_enabled", "trend_trailing_stop_ratio", "trend_max_positions",
+    "exposure_cap_enabled", "risk_timing",
+)
+
+_FP_PART_LABELS = {
+    "params": "组合级参数（资金/费率/滑点/复权模式等）",
+    "strategies": "策略参数/公式/角色/周期或策略增删",
+    "pool": "股票池成分代码",
+}
+
+
+def _fp_value(v):
+    """指纹取值：Decimal/float 统一转字符串，None/bool/int/str 原样。"""
+    if v is None or isinstance(v, (str, bool, int)):
+        return v
+    return str(v)
+
+
+def _strategy_fp_rows(ps, db: Optional[Session]) -> list:
+    if db is None:
+        return []
+    rows = (
+        db.query(Strategy)
+        .filter_by(portfolio_id=ps.id)
+        .order_by(Strategy.id)
+        .all()
+    )
+    return [
+        {f: _fp_value(getattr(s, f, None)) for f in _FP_STRATEGY_FIELDS}
+        for s in rows
+    ]
+
+
+def _pool_fp(ps, db: Optional[Session]) -> dict:
+    """股票池成分指纹：{pool_id: 升序代码列表}（组合级 ∪ 各策略独立池）。"""
+    if db is None:
+        return {}
+    pool_ids = set()
+    if ps.stock_pool_id is not None:
+        pool_ids.add(int(ps.stock_pool_id))
+    rows = (
+        db.query(Strategy)
+        .filter_by(portfolio_id=ps.id)
+        .order_by(Strategy.id)
+        .all()
+    )
+    for s in rows:
+        if s.stock_pool_id is not None:
+            pool_ids.add(int(s.stock_pool_id))
+    if not pool_ids:
+        return {}
+    out = {str(pid): [] for pid in sorted(pool_ids)}
+    for r in (
+        db.query(StockPoolStock)
+        .filter(StockPoolStock.pool_id.in_(sorted(pool_ids)))
+        .order_by(StockPoolStock.pool_id, StockPoolStock.stock_code)
+        .all()
+    ):
+        out.setdefault(str(r.pool_id), []).append(r.stock_code)
+    return out
+
+
+def params_fingerprint(ps, dividend_mode: str,
+                       db: Optional[Session] = None) -> dict:
+    """参数指纹：总体哈希 + 分项哈希（用于定位「哪一类变化」作废 checkpoint）。"""
+    sections = {
+        "params": build_params_snapshot(ps, dividend_mode=dividend_mode),
+        "strategies": json.dumps(
+            _strategy_fp_rows(ps, db), sort_keys=True, ensure_ascii=False),
+        "pool": json.dumps(_pool_fp(ps, db), sort_keys=True, ensure_ascii=False),
+    }
+    payload = json.dumps(sections, sort_keys=True, ensure_ascii=False)
+    return {
+        "hash": hashlib.sha256(payload.encode("utf-8")).hexdigest(),
+        "parts": {
+            k: hashlib.sha256(v.encode("utf-8")).hexdigest()
+            for k, v in sections.items()
+        },
+    }
+
+
+def _invalidation_reasons(old_state: Optional[dict], old_schema_fp: str,
+                          old_schema_version: int, want_schema_fp: str,
+                          want_parts: dict) -> List[str]:
+    """定位 checkpoint 作废原因（落到日志，避免「检测到变化但看不到发生了什么」）。"""
+    reasons: List[str] = []
+    if int(old_schema_version) != SCHEMA_VERSION:
+        reasons.append("口径版本 SCHEMA_VERSION 变化")
+    if old_schema_fp != want_schema_fp:
+        reasons.append("口径/复权模式指纹变化")
+    old_parts = (old_state or {}).get("params_fp_parts")
+    if not isinstance(old_parts, dict):
+        reasons.append("旧 checkpoint 无分项指纹（按参数变化处理）")
+    else:
+        for key, label in _FP_PART_LABELS.items():
+            if old_parts.get(key) != want_parts.get(key):
+                reasons.append("%s变化" % label)
+    return reasons or ["参数指纹变化（未定位到具体分项）"]
+
 
 
 def checkpoint_valid(params_hash: str, schema_fp: str, schema_version: int,
@@ -396,6 +516,23 @@ def plan_resume(as_of: date, today: date, max_catchup_days: int,
         return {"dates": dates, "gap_dates": list(dates),
                 "rebuild_from_seam": True}
     return {"dates": dates, "gap_dates": [], "rebuild_from_seam": False}
+
+
+def fast_path_allowed(as_of: Optional[date], today: date, periods,
+                      handoff, max_catchup_days: int) -> bool:
+    """是否允许走「只用当日交接日线」的快路径。
+
+    快路径只拿得到 ``today`` 这一天的 15:05 交接日线，进入前必须先 ``plan_resume``
+    规划缺口：**只有缺口恰好只有 today 一天**才允许。连续多日未跑（as_of 早于上一
+    交易日）必须退回常规取数路径，由 build_klines + plan_resume 补齐中间交易日或
+    标断档；否则中间交易日的 bar 会被静默跳过（旧实现的问题）。
+    """
+    if as_of is None or handoff is None or as_of >= today:
+        return False
+    if set(periods) != {"1d"}:
+        return False
+    plan = plan_resume(as_of, today, max_catchup_days)
+    return (not plan["rebuild_from_seam"]) and plan["dates"] == [today]
 
 
 # ---------------------------------------------------------------- 接缝锚定
@@ -498,6 +635,17 @@ def capture_seam(db: Session, session_id: int, engine, today: Optional[date] = N
         link.seam_date = today
         link.seam_cash = port.account.cash
         link.seam_positions_json = json.dumps(positions, ensure_ascii=False)
+        # 起账状态来自 recover 之后的引擎（已含当日成交）；记下已计入的成交
+        # 水位，重放只补该水位之后的成交，防同一笔成交被算两次。
+        cursor = (
+            db.query(func.max(LiveTrade.id))
+            .filter(
+                LiveTrade.live_session_id == session_id,
+                LiveTrade.portfolio_strategy_id == link.portfolio_strategy_id,
+            )
+            .scalar()
+        )
+        link.seam_trade_cursor = int(cursor) if cursor is not None else 0
         changed = True
     if changed:
         db.commit()
@@ -577,7 +725,8 @@ def evaluate_alignment(inc_rows: dict, full_rows: dict, tolerances: dict) -> dic
     - 逐日净值相对偏差（最大 ≤ 0.5% / 均值 ≤ 0.2%）：日线收盘取整到分、
       费用与过户费舍入、T+1 分桶边界带来的日级噪声上界远小于 0.5%。
     - 逐日成交笔数一致率 ≥ 0.9、方向一致率 ≥ 0.9：允许极少数边界单
-      （停牌/涨跌停顺延）跨日漂移。
+      （停牌/涨跌停顺延）跨日漂移。方向按两侧**各自**的成交明细（``dirs``）
+      逐日比较；任一侧缺明细时该判据为 None（不参与判定，绝不恒真通过）。
     - 最大回撤偏差 ≤ 1.0pp：回撤是路径极值，对单日噪声更敏感，故放宽。
     """
     dates = sorted(set(inc_rows) & set(full_rows))
@@ -591,6 +740,7 @@ def evaluate_alignment(inc_rows: dict, full_rows: dict, tolerances: dict) -> dic
     devs: List[float] = []
     count_match = 0
     direction_match = 0
+    direction_eval = 0
     first_div: Optional[date] = None
     inc_series: List[Decimal] = []
     full_series: List[Decimal] = []
@@ -611,26 +761,34 @@ def evaluate_alignment(inc_rows: dict, full_rows: dict, tolerances: dict) -> dic
         same_count = ta == tb
         if same_count:
             count_match += 1
-        same_dir = bool(a.get("direction_match", True)) and bool(
-            b.get("direction_match", True))
-        if same_dir:
-            direction_match += 1
+        # 方向判据：两侧各自成交明细（dirs）逐日比较；任一侧无明细（旧行/NULL）
+        # → 该日不参与判定（返回 None），不再「缺数据即通过」。
+        inc_dirs = a.get("dirs")
+        full_dirs = b.get("dirs")
+        same_dir: Optional[bool] = None
+        if inc_dirs is not None and full_dirs is not None:
+            same_dir = list(inc_dirs) == list(full_dirs)
+            direction_eval += 1
+            if same_dir:
+                direction_match += 1
         if first_div is None and (dev > tolerances["max_net_dev_pct"]
-                                  or not same_count or not same_dir):
+                                  or not same_count
+                                  or (same_dir is not None and not same_dir)):
             first_div = d
 
     n = len(dates)
     max_dev = max(devs)
     mean_dev = sum(devs) / n
     count_ratio = count_match / n
-    dir_ratio = direction_match / n
+    dir_ratio = (direction_match / direction_eval) if direction_eval else None
     dd_dev = abs(_max_drawdown_pct(inc_series) - _max_drawdown_pct(full_series))
 
     ok = (
         max_dev <= tolerances["max_net_dev_pct"]
         and mean_dev <= tolerances["mean_net_dev_pct"]
         and count_ratio >= tolerances["trade_count_match_ratio"]
-        and dir_ratio >= tolerances["direction_match_ratio"]
+        and (dir_ratio is None
+             or dir_ratio >= tolerances["direction_match_ratio"])
         and dd_dev <= tolerances["max_drawdown_dev_pct"]
     )
     return {
@@ -638,7 +796,8 @@ def evaluate_alignment(inc_rows: dict, full_rows: dict, tolerances: dict) -> dic
         "max_net_dev_pct": round(max_dev, 4),
         "mean_net_dev_pct": round(mean_dev, 4),
         "trade_count_match_ratio": round(count_ratio, 4),
-        "direction_match_ratio": round(dir_ratio, 4),
+        "direction_match_ratio": (round(dir_ratio, 4)
+                                 if dir_ratio is not None else None),
         "max_drawdown_dev_pct": round(dd_dev, 4),
         "first_divergence_date": first_div,
         "dates_count": n,
@@ -673,17 +832,36 @@ def _live_rows(db: Session, link: LiveSessionPortfolio, dates: List[date],
         last_price[code] = Decimal(str(item.get("avg_cost") or 0))
     cash = Decimal(str(link.seam_cash or 0))
 
-    trades = (
-        db.query(LiveTrade)
-        .filter(
-            LiveTrade.live_session_id == link.session_id,
-            LiveTrade.portfolio_strategy_id == link.portfolio_strategy_id,
-            LiveTrade.trade_time >= datetime.combine(
-                link.seam_date, time(0, 0)),
-        )
-        .order_by(LiveTrade.trade_time, LiveTrade.id)
-        .all()
+    trades_q = db.query(LiveTrade).filter(
+        LiveTrade.live_session_id == link.session_id,
+        LiveTrade.portfolio_strategy_id == link.portfolio_strategy_id,
     )
+    cursor = getattr(link, "seam_trade_cursor", None)
+    if cursor is not None:
+        # 接缝基线的现金/持仓已含捕获时刻之前的成交 → 只重放之后新增的成交。
+        trades_q = trades_q.filter(LiveTrade.id > int(cursor))
+    else:
+        # 旧接缝（改动前捕获）没有水位，只能按接缝日 00:00 重放；若接缝当日
+        # 已有成交，则存在把已计入基线的成交再算一次的风险，必须留痕。
+        trades_q = trades_q.filter(LiveTrade.trade_time >= datetime.combine(
+            link.seam_date, time(0, 0)))
+        same_day = (
+            db.query(LiveTrade.id)
+            .filter(
+                LiveTrade.live_session_id == link.session_id,
+                LiveTrade.portfolio_strategy_id == link.portfolio_strategy_id,
+                LiveTrade.trade_time >= datetime.combine(link.seam_date, time(0, 0)),
+                LiveTrade.trade_time < datetime.combine(
+                    link.seam_date + timedelta(days=1), time(0, 0)),
+            )
+            .first()
+        )
+        if same_day is not None:
+            logger.warning(
+                "[seam] 会话 %s 组合 %s 的接缝无成交游标（旧版本捕获）且接缝日 "
+                "%s 已有成交：按接缝日 00:00 重放，当日成交可能重复计入基线",
+                link.session_id, link.portfolio_strategy_id, link.seam_date)
+    trades = trades_q.order_by(LiveTrade.trade_time, LiveTrade.id).all()
     ptr = 0
     out: Dict[date, dict] = {}
     for d in dates:
@@ -803,7 +981,8 @@ def _run_incremental_locked(db: Session, session_id: int,
 
     dividend_mode = cfg.get("dividend_mode", "dual")
     accounting_mode, signal_mode = _resolve_modes(dividend_mode)
-    want_params_hash = params_hash(ps, dividend_mode)
+    fp = params_fingerprint(ps, dividend_mode, db)
+    want_params_hash = fp["hash"]
     want_schema_fp = schema_fingerprint(dividend_mode)
 
     ckpt = (
@@ -812,6 +991,7 @@ def _run_incremental_locked(db: Session, session_id: int,
         .first()
     )
     state = None
+    invalidated: Optional[dict] = None
     if ckpt is not None:
         try:
             state = json.loads(ckpt.state_json)
@@ -820,6 +1000,14 @@ def _run_incremental_locked(db: Session, session_id: int,
         if not checkpoint_valid(
                 ckpt.params_hash, (state or {}).get("schema_fp", ""),
                 ckpt.schema_version, want_params_hash, want_schema_fp):
+            reasons = _invalidation_reasons(
+                state, (state or {}).get("schema_fp", ""), ckpt.schema_version,
+                want_schema_fp, fp["parts"])
+            invalidated = {"categories": reasons, "from_as_of": _dt(ckpt.as_of_date)}
+            logger.warning(
+                "[incremental] 参数/口径指纹变化 → checkpoint 作废并从接缝日重建 "
+                "(session %s, ps %s, 旧 as_of=%s)：%s",
+                session_id, ps_id, ckpt.as_of_date, "；".join(reasons))
             db.delete(ckpt)
             db.commit()
             ckpt = None
@@ -832,10 +1020,8 @@ def _run_incremental_locked(db: Session, session_id: int,
                 "days": 0, "note": "当日已续跑"}
 
     handoff = take_daily_bars(session_id, today)
-    fast_path = (
-        state is not None and handoff is not None and as_of is not None
-        and as_of < today and set(periods) == {"1d"}
-    )
+    fast_path = fast_path_allowed(
+        as_of, today, periods, handoff, int(cfg.get("max_catchup_days", 5)))
     # 只有结束日志时，卡在取数/回测段无法定位（fast=False = 当日没有
     # DailyCloser 15:05 日线交接，本节自己向 TQ 取数）。
     logger.info(
@@ -909,6 +1095,9 @@ def _run_incremental_locked(db: Session, session_id: int,
     payload = state_payload(portfolio, as_of_new,
                             pending_orders=result.get("pending_orders"))
     payload["schema_fp"] = want_schema_fp
+    # 分项指纹随 checkpoint 落盘：下次作废时据此定位「哪一类变化」（旧 checkpoint
+    # 无该字段 → 日志标注按参数变化处理）。
+    payload["params_fp_parts"] = fp["parts"]
     if ckpt is None:
         ckpt = IncrementalBacktestCheckpoint(
             session_id=session_id, portfolio_strategy_id=ps_id,
@@ -958,6 +1147,7 @@ def _run_incremental_locked(db: Session, session_id: int,
             net_dev_pct=round(dev, 4),
             inc_trades_count=len(inc_d),
             live_trades_count=len(live_d),
+            inc_dirs_json=json.dumps(inc_d, ensure_ascii=False),
             direction_match=direction_match,
             status=status,
             tags_json=json.dumps(tags, ensure_ascii=False),
@@ -975,10 +1165,34 @@ def _run_incremental_locked(db: Session, session_id: int,
         "days": len(new_dates),
         "gap_days": len(gap_dates),
         "fast_path": fast_path,
+        "checkpoint_invalidated": invalidated,
     }
 
 
 # ---------------------------------------------------------------- 双跑校验
+def _apply_validation_marks(day_rows: List[IncrementalBacktestDay],
+                            status: str,
+                            first_div: Optional[date]) -> None:
+    """把本轮校验结论写回逐日行。
+
+    先清掉上一轮的 ``validation_fail`` 标记再按本轮结论重标——旧实现只加不删，
+    一旦某次校验失败，这些行会永久标红，后续通过也消不掉（误导排查）。
+    行状态按 tags 重算（gap 优先，其次有任意 tag 即 warn）。
+    """
+    if status not in ("pass", "fail"):
+        return
+    for r in day_rows:
+        try:
+            tags = json.loads(r.tags_json or "[]")
+        except (TypeError, ValueError):
+            tags = []
+        tags = [t for t in tags if t != "validation_fail"]
+        if status == "fail" and first_div is not None and r.trade_date >= first_div:
+            tags.append("validation_fail")
+        r.tags_json = json.dumps(tags, ensure_ascii=False)
+        r.status = "gap" if "gap" in tags else ("warn" if tags else "ok")
+
+
 def run_validation(db: Session, session_id: int, ps_id: int,
                    from_date: Optional[date] = None,
                    to_date: Optional[date] = None,
@@ -1038,16 +1252,19 @@ def run_validation(db: Session, session_id: int, ps_id: int,
             db.commit()
             return {"status": "error", "reason": str(exc)}
 
+        full_trades = result.get("trades") or []
+        full_dates = [s["snap_date"] for s in (result.get("snapshots") or [])]
+        # 全量侧的方向列表必须由它自身的成交生成（旧实现硬编码 True = 该判据恒真）。
+        full_dirs = _inc_trades_by_day(full_trades, full_dates)
         full_rows: Dict[date, dict] = {}
         for snap in result.get("snapshots") or []:
             d = snap["snap_date"]
+            dirs = full_dirs.get(d, [])
             full_rows[d] = {
                 "trade_date": d,
                 "total_value": snap["total_value"],
-                "trades_count": len([
-                    t for t in (result.get("trades") or [])
-                    if t.trade_time.date() == d]),
-                "direction_match": True,
+                "trades_count": len(dirs),
+                "dirs": dirs,
             }
 
         day_rows = (
@@ -1066,7 +1283,9 @@ def run_validation(db: Session, session_id: int, ps_id: int,
                 "trade_date": r.trade_date,
                 "total_value": r.inc_total_value,
                 "trades_count": r.inc_trades_count,
-                "direction_match": bool(r.direction_match),
+                # 旧行没有方向明细（NULL）→ 该判据不参与判定，而不是恒真通过
+                "dirs": (json.loads(r.inc_dirs_json)
+                         if r.inc_dirs_json else None),
             }
 
         tol = _tolerances(cfg)
@@ -1096,16 +1315,8 @@ def run_validation(db: Session, session_id: int, ps_id: int,
                 {"dates_count": metrics["dates_count"]}, ensure_ascii=False),
         )
         db.add(row)
-        # 校验失败 → 超容差的日行标红（warn + validation_fail）
-        if metrics["status"] == "fail" and metrics["first_divergence_date"]:
-            for r in day_rows:
-                if r.trade_date >= metrics["first_divergence_date"]:
-                    tags = json.loads(r.tags_json or "[]")
-                    if "validation_fail" not in tags:
-                        tags.append("validation_fail")
-                    r.tags_json = json.dumps(tags, ensure_ascii=False)
-                    if r.status == "ok":
-                        r.status = "warn"
+        _apply_validation_marks(
+            day_rows, metrics["status"], metrics["first_divergence_date"])
         db.commit()
         return {
             "status": metrics["status"],
