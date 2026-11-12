@@ -68,7 +68,20 @@ SCHEMA_VERSION = 1
 _COST_SCHEMA = "fee_inclusive_v2"    # 成本含佣金/印花税/过户费
 _EXEC_SCHEMA = "next_bar_open_v1"    # 成交价 = 下一根 bar 开盘价
 _T1_SCHEMA = "t1_forced_v1"          # 回测强制 T+1
-_ENGINE_SCHEMA = "backtest_engine_v1"
+# v2（2026-11-12）：①同时间戳周期处理顺序改为细→粗（对齐实盘 periods_on_boundary，
+# 现金/槽位竞争先后与实盘一致）；②"1h" 周期键补齐（旧 60m 别名同权重）；③新增
+# portfolio_strategies.risk_cooldown_days（风控卖出后冷静期，默认 1）改变开仓时点；
+# ④日终估值步按「当日最后时间戳组最细周期」定义。以上任一都会改变逐日净值，
+# 旧 v1 checkpoint 一律作废重建（_invalidation_reasons 报「引擎版本变化」）。
+_ENGINE_SCHEMA = "backtest_engine_v2"
+
+# 小样本豁免阈值（修复 9）：成交笔数与方向一致率在个位数样本上没有统计意义。
+# 取 5 的依据：n=4 时任意 1 笔不一致 → 一致率 ≤ 0.75，直接击穿 0.9 容差，
+# 属纯噪声误判；n≥5 时单个离群点最多把一致率压到 0.8，与「允许极少数边界单
+# （停牌/涨跌停顺延）跨日漂移」的既有口径同量级。样本量按「两侧成交笔数之和」
+# 计（续跑 + 全量重算，只统计参与对账的日期区间）；命中时笔数/方向两项判 None
+# 不参与总体结论，净值与回撤偏差照常全量校验。常量独立便于以后调阈值。
+SMALL_SAMPLE_MIN_TRADES = 5
 
 # 仅这些周期可续跑；分钟级续跑语义未定（跨日分段时在途分钟 bar 与
 # 成交时点边界未规范化），明确不支持而不是勉强实现。
@@ -345,15 +358,20 @@ def _tolerances(cfg: Optional[dict] = None) -> dict:
     }
 
 
-def schema_fingerprint(dividend_mode: str) -> str:
-    payload = json.dumps({
+def schema_parts(dividend_mode: str) -> dict:
+    """口径指纹的组成分项（随 checkpoint 落盘，作废时据此定位**具体**哪一项变了）。"""
+    return {
         "schema": SCHEMA_VERSION,
         "cost": _COST_SCHEMA,
         "exec": _EXEC_SCHEMA,
         "t1": _T1_SCHEMA,
         "engine": _ENGINE_SCHEMA,
         "dividend_mode": dividend_mode,
-    }, sort_keys=True)
+    }
+
+
+def schema_fingerprint(dividend_mode: str) -> str:
+    payload = json.dumps(schema_parts(dividend_mode), sort_keys=True)
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
@@ -384,6 +402,16 @@ _FP_PART_LABELS = {
     "params": "组合级参数（资金/费率/滑点/复权模式等）",
     "strategies": "策略参数/公式/角色/周期或策略增删",
     "pool": "股票池成分代码",
+}
+
+# schema_parts 各分项的中文名（checkpoint 作废日志用）
+_SCHEMA_PART_LABELS = {
+    "schema": "口径版本 SCHEMA_VERSION",
+    "cost": "成本口径 _COST_SCHEMA",
+    "exec": "成交口径 _EXEC_SCHEMA",
+    "t1": "T+1 口径 _T1_SCHEMA",
+    "engine": "引擎版本 _ENGINE_SCHEMA",
+    "dividend_mode": "复权模式",
 }
 
 
@@ -459,13 +487,28 @@ def params_fingerprint(ps, dividend_mode: str,
 
 def _invalidation_reasons(old_state: Optional[dict], old_schema_fp: str,
                           old_schema_version: int, want_schema_fp: str,
-                          want_parts: dict) -> List[str]:
+                          want_parts: dict,
+                          want_schema_parts: Optional[dict] = None) -> List[str]:
     """定位 checkpoint 作废原因（落到日志，避免「检测到变化但看不到发生了什么」）。"""
     reasons: List[str] = []
     if int(old_schema_version) != SCHEMA_VERSION:
-        reasons.append("口径版本 SCHEMA_VERSION 变化")
+        reasons.append("口径版本 SCHEMA_VERSION 变化（%s → %s）"
+                       % (old_schema_version, SCHEMA_VERSION))
     if old_schema_fp != want_schema_fp:
-        reasons.append("口径/复权模式指纹变化")
+        # 旧 checkpoint 已把口径分项落盘 → 逐项报出具体变化（如引擎版本 v1→v2）；
+        # 无分项（更老的 checkpoint）退化为笼统原因，不静默。
+        old_sp = (old_state or {}).get("schema_parts")
+        want_sp = want_schema_parts or {}
+        if isinstance(old_sp, dict) and want_sp:
+            changed = [
+                "%s（%s → %s）" % (_SCHEMA_PART_LABELS.get(k, k), old_sp.get(k), want_sp.get(k))
+                for k in want_sp if old_sp.get(k) != want_sp.get(k)
+            ]
+            reasons.append(
+                "口径/复权模式指纹变化：" + ("；".join(changed) if changed else "分项未定位")
+            )
+        else:
+            reasons.append("口径/复权模式指纹变化（旧 checkpoint 无分项，无法定位具体项）")
     old_parts = (old_state or {}).get("params_fp_parts")
     if not isinstance(old_parts, dict):
         reasons.append("旧 checkpoint 无分项指纹（按参数变化处理）")
@@ -741,7 +784,9 @@ def evaluate_alignment(inc_rows: dict, full_rows: dict, tolerances: dict) -> dic
     count_match = 0
     direction_match = 0
     direction_eval = 0
+    trades_seen = 0
     first_div: Optional[date] = None
+    first_net_div: Optional[date] = None
     inc_series: List[Decimal] = []
     full_series: List[Decimal] = []
 
@@ -758,6 +803,7 @@ def evaluate_alignment(inc_rows: dict, full_rows: dict, tolerances: dict) -> dic
 
         ta = _row_trades(a)
         tb = _row_trades(b)
+        trades_seen += ta + tb
         same_count = ta == tb
         if same_count:
             count_match += 1
@@ -771,22 +817,35 @@ def evaluate_alignment(inc_rows: dict, full_rows: dict, tolerances: dict) -> dic
             direction_eval += 1
             if same_dir:
                 direction_match += 1
+        if first_net_div is None and dev > tolerances["max_net_dev_pct"]:
+            first_net_div = d
         if first_div is None and (dev > tolerances["max_net_dev_pct"]
                                   or not same_count
                                   or (same_dir is not None and not same_dir)):
             first_div = d
 
+    # 小样本豁免（修复 9）：笔数与方向一致率在个位数样本上无统计意义（见
+    # SMALL_SAMPLE_MIN_TRADES 注释）。净值/回撤偏差仍全量参与判定；此时
+    # first_divergence_date 只反映净值背离（笔数/方向不参与）。
+    small_sample = trades_seen < SMALL_SAMPLE_MIN_TRADES
+    if small_sample:
+        first_div = first_net_div
+
     n = len(dates)
     max_dev = max(devs)
     mean_dev = sum(devs) / n
-    count_ratio = count_match / n
-    dir_ratio = (direction_match / direction_eval) if direction_eval else None
+    count_ratio = None if small_sample else count_match / n
+    dir_ratio = (
+        None if small_sample or not direction_eval
+        else direction_match / direction_eval
+    )
     dd_dev = abs(_max_drawdown_pct(inc_series) - _max_drawdown_pct(full_series))
 
     ok = (
         max_dev <= tolerances["max_net_dev_pct"]
         and mean_dev <= tolerances["mean_net_dev_pct"]
-        and count_ratio >= tolerances["trade_count_match_ratio"]
+        and (count_ratio is None
+             or count_ratio >= tolerances["trade_count_match_ratio"])
         and (dir_ratio is None
              or dir_ratio >= tolerances["direction_match_ratio"])
         and dd_dev <= tolerances["max_drawdown_dev_pct"]
@@ -795,12 +854,16 @@ def evaluate_alignment(inc_rows: dict, full_rows: dict, tolerances: dict) -> dic
         "status": "pass" if ok else "fail",
         "max_net_dev_pct": round(max_dev, 4),
         "mean_net_dev_pct": round(mean_dev, 4),
-        "trade_count_match_ratio": round(count_ratio, 4),
+        "trade_count_match_ratio": (round(count_ratio, 4)
+                                    if count_ratio is not None else None),
         "direction_match_ratio": (round(dir_ratio, 4)
-                                 if dir_ratio is not None else None),
+                                  if dir_ratio is not None else None),
         "max_drawdown_dev_pct": round(dd_dev, 4),
         "first_divergence_date": first_div,
         "dates_count": n,
+        # 小样本豁免留痕：trades_seen < SMALL_SAMPLE_MIN_TRADES 时笔数/方向两项为 None
+        "small_sample": small_sample,
+        "trades_seen": trades_seen,
     }
 
 
@@ -1002,7 +1065,7 @@ def _run_incremental_locked(db: Session, session_id: int,
                 ckpt.schema_version, want_params_hash, want_schema_fp):
             reasons = _invalidation_reasons(
                 state, (state or {}).get("schema_fp", ""), ckpt.schema_version,
-                want_schema_fp, fp["parts"])
+                want_schema_fp, fp["parts"], schema_parts(dividend_mode))
             invalidated = {"categories": reasons, "from_as_of": _dt(ckpt.as_of_date)}
             logger.warning(
                 "[incremental] 参数/口径指纹变化 → checkpoint 作废并从接缝日重建 "
@@ -1095,6 +1158,9 @@ def _run_incremental_locked(db: Session, session_id: int,
     payload = state_payload(portfolio, as_of_new,
                             pending_orders=result.get("pending_orders"))
     payload["schema_fp"] = want_schema_fp
+    # 口径分项随 checkpoint 落盘：下次作废时据此定位「引擎版本/复权模式/成本口径」
+    # 具体哪一项变了（旧 checkpoint 无该字段 → 日志退化为笼统原因）。
+    payload["schema_parts"] = schema_parts(dividend_mode)
     # 分项指纹随 checkpoint 落盘：下次作废时据此定位「哪一类变化」（旧 checkpoint
     # 无该字段 → 日志标注按参数变化处理）。
     payload["params_fp_parts"] = fp["parts"]
@@ -1298,6 +1364,10 @@ def run_validation(db: Session, session_id: int, ps_id: int,
                 "trade_count_match_ratio": "允许极少数边界单（停牌/涨跌停顺延）跨日漂移",
                 "direction_match_ratio": "方向错配比笔数错配更严重，但边界单仍可能造成 1 日差异",
                 "max_drawdown_dev_pct": "回撤是路径极值，对单日噪声更敏感，放宽到 1 个百分点",
+                "small_sample": (
+                    "成交笔数（两侧之和）< %d 时笔数/方向一致率判 None 不参与结论："
+                    "个位数样本上单个边界单即可击穿 0.9 容差，属噪声误判" %
+                    SMALL_SAMPLE_MIN_TRADES),
             },
         }
         row = IncrementalBacktestValidation(
@@ -1312,7 +1382,10 @@ def run_validation(db: Session, session_id: int, ps_id: int,
             first_divergence_date=metrics["first_divergence_date"],
             criteria_json=json.dumps(criteria, ensure_ascii=False),
             detail_json=json.dumps(
-                {"dates_count": metrics["dates_count"]}, ensure_ascii=False),
+                {"dates_count": metrics["dates_count"],
+                 "small_sample": metrics.get("small_sample"),
+                 "trades_seen": metrics.get("trades_seen")},
+                ensure_ascii=False),
         )
         db.add(row)
         _apply_validation_marks(

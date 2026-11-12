@@ -949,6 +949,103 @@ def test_price_limit_disabled_keeps_old_behavior():
 
 
 # ===========================================================================
+# 修复 8：新股上市前 5 个交易日不设涨跌幅（判据只用回测数据自身）
+# ===========================================================================
+_WEEKDAYS_2026_07 = [
+    datetime(2026, 7, d) for d in (1, 2, 3, 6, 7, 8, 9, 10, 13, 14, 15, 16, 17)
+]
+
+
+def _flat_row(dt, px=Decimal("10")):
+    return (dt, px, px, px, px, 1000)
+
+
+def _merged(bucket, stock, rows):
+    bucket.update(_klines(stock, rows))
+    return bucket
+
+
+def test_new_listing_first_five_sessions_fail_open_at_limit_up():
+    """新股（数据首根 7/8，区间起点 7/1 另有老股）第 2 个交易日涨停开盘：
+
+    旧口径（一律板块 10%）会判 price_limit 延后；新股窗口 fail-open 直接成交，
+    并记 allow 事件（limit_rule=new_listing）。
+    """
+    old, new = "000001.SZ", "600001.SH"
+    klines = _merged({}, old, [_flat_row(dt) for dt in _WEEKDAYS_2026_07])
+    new_days = _WEEKDAYS_2026_07[5:]                              # 7/8 起
+    # 7/9 涨停开盘（前收 10 ×1.1 = 11）；此后维持 11，避免触发止损卖出
+    new_rows = [
+        _flat_row(dt, Decimal("10") if i == 0 else Decimal("11"))
+        for i, dt in enumerate(new_days)
+    ]
+    _merged(klines, new, new_rows)
+    port, _ctx = _limit_portfolio(enabled=True)
+    cache = {(1, new, datetime(2026, 7, 8)): [{"name": "open_sig", "value": 1}]}
+
+    result = BacktestEngine().run(port, klines=klines, signal_cache=cache)
+
+    buys = [t for t in result["trades"]
+            if t.stock_code == new and t.trade_type == TradeType.BUY]
+    assert len(buys) == 1, result["trades"]
+    assert buys[0].trade_time == datetime(2026, 7, 9)
+    assert buys[0].price == Decimal("11")
+    allow = [d for d in result["decisions"]
+             if d["gate"] == "price_limit" and d["action"] == "allow"]
+    assert len(allow) == 1
+    assert "new_listing" in allow[0]["message"]
+    # 无同票 defer 事件（旧口径会在此延后）
+    assert not [d for d in result["decisions"]
+                if d["gate"] == "price_limit" and d["action"] == "defer"
+                and d["stock_code"] == new]
+
+
+def test_new_listing_window_ends_after_five_sessions_enforced():
+    """同一新股到第 6 个交易日（listed=5）恢复板块 10%：涨停开盘被延后，次日成交。"""
+    old, new = "000001.SZ", "600001.SH"
+    klines = _merged({}, old, [_flat_row(dt) for dt in _WEEKDAYS_2026_07])
+    new_rows = [_flat_row(dt) for dt in _WEEKDAYS_2026_07[5:]]    # 7/8 起
+    new_rows[5] = (datetime(2026, 7, 15), Decimal("10"), Decimal("10"),
+                   Decimal("10"), Decimal("10"), 1000)            # 信号日 close=10
+    new_rows[6] = (datetime(2026, 7, 16), Decimal("11"), Decimal("11"),
+                   Decimal("11"), Decimal("10.5"), 1000)          # 涨停开盘
+    _merged(klines, new, new_rows)
+    port, _ctx = _limit_portfolio(enabled=True)
+    cache = {(1, new, datetime(2026, 7, 15)): [{"name": "open_sig", "value": 1}]}
+
+    result = BacktestEngine().run(port, klines=klines, signal_cache=cache)
+
+    buys = [t for t in result["trades"]
+            if t.stock_code == new and t.trade_type == TradeType.BUY]
+    assert len(buys) == 1
+    assert buys[0].trade_time == datetime(2026, 7, 17)            # 次日未涨停成交
+    assert not [d for d in result["decisions"]
+                if d["gate"] == "price_limit" and d["action"] == "allow"]
+
+
+def test_price_limit_data_start_at_range_begin_not_treated_as_new_listing(caplog):
+    """数据起点=区间起点 → 无法判断是否新股：不套宽松判定，仍按板块幅度拦，留 WARNING。"""
+    import logging
+    stock = "000001.SZ"
+    klines = _klines(stock, [
+        (datetime(2026, 7, 1), Decimal("10"), Decimal("10"), Decimal("10"), Decimal("10"), 1000),
+        (datetime(2026, 7, 2), Decimal("11"), Decimal("11"), Decimal("10.5"), Decimal("10.8"), 1000),
+        (datetime(2026, 7, 3), Decimal("10.5"), Decimal("10.9"), Decimal("10.4"), Decimal("10.7"), 1000),
+    ])
+    port, _ctx = _limit_portfolio(enabled=True)
+    cache = {(1, stock, datetime(2026, 7, 1)): [{"name": "open_sig", "value": 1}]}
+    with caplog.at_level(logging.WARNING, logger="core.engine.backtest_engine"):
+        result = BacktestEngine().run(port, klines=klines, signal_cache=cache)
+
+    assert any("无法判断是否新股" in r.getMessage() for r in caplog.records)
+    trades = result["trades"]
+    assert len(trades) == 1 and trades[0].trade_time == datetime(2026, 7, 3)
+    defer = [d for d in result["decisions"]
+             if d["gate"] == "price_limit" and d["action"] == "defer"]
+    assert len(defer) == 1
+
+
+# ===========================================================================
 # Fix2 组合级 max_holdings 接线（on_bar OPEN 路径，回测/实盘共用一处生效）
 # ===========================================================================
 def test_max_holdings_rejects_open_when_portfolio_full():

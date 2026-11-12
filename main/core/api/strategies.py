@@ -111,6 +111,9 @@ class PortfolioCreate(BaseModel):
     # 过户费（双向，默认 A 股现行 0.001%/边）；None=请求未填 → 落默认，显式 0 原样落库
     transfer_fee_rate: float | None = 0.00001
     slippage: float = 0
+    # 风控冷静期（默认 1）：止损/止盈/移动止损成交后 N 个交易日内禁止新开仓
+    # （当日算第 1 天）；0=关闭。None=请求未携带 → 新建落默认 1 / 编辑不动已有值。
+    risk_cooldown_days: int | None = None
     trading_session: str = "full"
     # #1 涨跌停校验（回测成交 + 实盘下单前置）：None=新建默认开启/编辑不动；显式 bool=按值设置
     price_limit_check_enabled: bool | None = None
@@ -289,6 +292,10 @@ def _validate_portfolio(req: PortfolioCreate, db: Session) -> str | None:
         )
     if req.equity_cap is not None and req.equity_cap <= 0:
         return f"equity_cap 必须 > 0（None=不设上限），收到 {req.equity_cap}"
+    # 风控冷静期：0=关闭；上限 60 交易日（约 3 个月，超长冷却意味着该 sign 永久失效）
+    if req.risk_cooldown_days is not None and not (0 <= req.risk_cooldown_days <= 60):
+        return (f"risk_cooldown_days 须在 [0,60]（0=关闭），"
+                f"收到 {req.risk_cooldown_days}")
     if not db.query(StockPool).filter(StockPool.id == req.stock_pool_id).first():
         return f"股票池 id={req.stock_pool_id} 不存在"
     # 子策略校验

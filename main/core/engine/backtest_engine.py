@@ -1,6 +1,7 @@
 from typing import Dict, List, Optional
 from datetime import datetime, date
 from decimal import Decimal, ROUND_HALF_UP
+import logging
 
 from .portfolio import Portfolio
 from .position import Position, is_convertible_bond, lot_size_for
@@ -14,18 +15,27 @@ from .decision import DecisionRecorder
 from .market_rules import (  # noqa: F401
     _limit_ratio_for,
     limit_rule_for,
+    resolve_limit_rule,
     session_allows,
     session_allows_bar,
+    trading_days_between,
 )
 from tq_iquant_shared.constants import TradeType
 
+logger = logging.getLogger(__name__)
+
 
 # W4 按周期路由：同一时间戳可能同时存在多个周期（1d/1w/1mon 均为 00:00）。
-# 固定处理顺序（粗 → 细）：1mon > 1w > 1d > 60m > 30m > 15m > 5m > 1m。
+# 固定处理顺序（细 → 粗）：1m > 5m > 15m > 30m > 1h > 1d > 1w > 1mon。
+# 与实盘 `core.engine.live.timing.periods_on_boundary` 的派发顺序同序
+# （实盘同一 1m bar 到边界时按 5m→15m→30m→1h 依次派发），保证同时间戳
+# 多周期同时到边界时回测/实盘先手一致（现金/槽位竞争口径对齐）。
 # 每步只处理与当前周期相同的策略，价格索引按 (datetime, period) 键，杜绝跨周期
 # 前视（日线 00:00 bar 驱动分钟策略）与同时间戳 OHLC 互相覆盖。
+# "60m" 为历史别名（旧参数快照/旧数据可能仍带该串），与 "1h" 同权重。
 _PERIOD_ORDER: Dict[str, int] = {
-    "1mon": 0, "1w": 1, "1d": 2, "60m": 3, "30m": 4, "15m": 5, "5m": 6, "1m": 7,
+    "1m": 0, "5m": 1, "15m": 2, "30m": 3, "1h": 4, "60m": 4,
+    "1d": 5, "1w": 6, "1mon": 7,
 }
 
 
@@ -91,6 +101,44 @@ class BacktestEngine:
         # W4.5 regime：喂入"前一交易日"基准收盘（消除当日未来数据），逐日推进。
         last_regime_date: Optional[date] = None
         last_enter_date: Optional[date] = None
+
+        # 日终估值步：每个交易日的**最后时间戳**组里最细周期的那一步。
+        # 细→粗排序下即该组第一步；反之（粗→细）为最后一步。用它定义「当日最后一
+        # 根 bar」，使日终快照/日末 peak 保护与排序方向解耦：既避免 1w/1mon 的周期末
+        # close（对当日是未来价）污染估值，也不会在日内日末退化为粗周期估值。
+        day_end_steps = set()
+        _cur_date: Optional[date] = None
+        _cur_t: Optional[datetime] = None
+        _group_first: Optional[int] = None
+        for _idx, (_t, _p) in enumerate(times):
+            if _t.date() != _cur_date:
+                if _group_first is not None:
+                    day_end_steps.add(_group_first)
+                _cur_date, _cur_t, _group_first = _t.date(), _t, _idx
+            elif _t != _cur_t:
+                _cur_t, _group_first = _t, _idx
+        if _group_first is not None:
+            day_end_steps.add(_group_first)
+
+        # 新股窗口判据（修复 8）：A 股新股上市前 5 个交易日无涨跌幅限制，按板块幅度
+        # 一律校验会把一字板/大涨误拦成 price_limit 延后。回测**只能用自身数据**判定：
+        # 取每 code 首根 bar 日期，从该日起算交易日序（不引入外部上市日期）。
+        # run_first_date = 全区间首个交易日：某 code 首根 bar 恰落在该日 → 数据起点
+        # 与区间起点重合，无法区分「真新股」与「取数窗口截断」，**不**按新股宽松处理，
+        # 只记一次 WARNING（首个 bar 本无前收，涨跌停校验天然跳过，即保守放行一次）。
+        first_bar_date: Dict[str, date] = {}
+        for _code, _periods in klines.items():
+            _dates = [
+                _dt.date()
+                for _df in (_periods or {}).values() if _df is not None
+                for _dt in _df["datetime"].to_list() if _dt is not None
+            ]
+            if _dates:
+                first_bar_date[_code] = min(_dates)
+        run_first_date = min(first_bar_date.values()) if first_bar_date else None
+        _truncation_warned: set = set()
+        # 新股 fail-open 已记录过的订单（每订单只记 1 条 allow 事件）
+        new_listing_recorded: set = set()
 
         for i, (t, period) in enumerate(times):
             # B5 市场状态闸：在新交易日首根 bar 用"前一交易日"基准收盘推进因果状态机
@@ -177,37 +225,86 @@ class BacktestEngine:
                         prev_close = prev_close_map.get((order.stock_code, order.period))
                         if prev_close is not None and prev_close >= Decimal("1"):
                             open_px = bar_open_prices[order.stock_code]
-                            # 与实盘同源：resolve_limit_rule（ST 5% / 创业板 20% /
-                            # 北交所 30%）；无可靠档位（ETF/转债/未知）回落板块常规幅度。
-                            rule = limit_rule_for(
-                                order.stock_code,
-                                name=(stock_names or {}).get(order.stock_code),
+                            _name = (stock_names or {}).get(order.stock_code)
+                            _first_d = first_bar_date.get(order.stock_code)
+                            # 数据起点=区间起点 → 无法判断是否真新股：不套新股宽松，
+                            # 按板块幅度校验（首根 bar 无前收，天然放行一次），留 WARNING。
+                            _truncated = (
+                                _first_d is not None
+                                and run_first_date is not None
+                                and _first_d <= run_first_date
                             )
-                            ratio = rule.ratio
-                            limit_up = (prev_close * (1 + ratio)).quantize(
-                                Decimal("0.01"), rounding=ROUND_HALF_UP)
-                            limit_down = (prev_close * (1 - ratio)).quantize(
-                                Decimal("0.01"), rounding=ROUND_HALF_UP)
-                            is_buy = order.trade_type == TradeType.BUY
-                            if (is_buy and open_px >= limit_up) or (
-                                    not is_buy and open_px <= limit_down):
-                                if id(order) not in price_limit_recorded:
-                                    price_limit_recorded.add(id(order))
+                            if _truncated:
+                                if order.stock_code not in _truncation_warned:
+                                    _truncation_warned.add(order.stock_code)
+                                    logger.warning(
+                                        "涨跌停校验按板块幅度执行：%s 的数据起点 %s 与回测区间起点"
+                                        "重合，无法判断是否新股（不套前 5 日无限制的宽松判定）；"
+                                        "首个 bar 无前收，涨跌停校验天然跳过（保守放行一次）",
+                                        order.stock_code, _first_d)
+                                rule = limit_rule_for(order.stock_code, name=_name)
+                            else:
+                                # 从该 code 自身首根 bar 起算已过交易日（首发日=0），
+                                # 交由 resolve_limit_rule 判「前 5 个交易日无涨跌幅」。
+                                _listed = (
+                                    trading_days_between(_first_d, t.date())
+                                    if _first_d is not None else None
+                                )
+                                rule = resolve_limit_rule(
+                                    order.stock_code, name=_name,
+                                    listed_bars=_listed,
+                                    earliest_bar_date=_first_d, today=t.date(),
+                                )
+                            if rule.ratio is None and rule.source.startswith("new_listing"):
+                                # 新股窗口：fail-open 放行（与桥缺数据同取向），事件标
+                                # limit_rule=new_listing（每订单一次）。
+                                if id(order) not in new_listing_recorded:
+                                    new_listing_recorded.add(id(order))
                                     recorder.record(
-                                        gate="price_limit", layer="execution", action="defer",
+                                        gate="price_limit", layer="execution", action="allow",
                                         portfolio_id=order.portfolio_id or 0,
                                         strategy_id=order.strategy_id,
                                         stock_code=order.stock_code,
                                         bar_time=t,
-                                        message="涨跌停约束：%s 开盘价 %s %s（前收 %s ×%s，%s），订单延后至下一 bar 重试"
-                                                % ("涨停买不进" if is_buy else "跌停卖不出",
-                                                   open_px,
-                                                   ("≥ 涨停价 %s" % limit_up) if is_buy
-                                                   else ("≤ 跌停价 %s" % limit_down),
-                                                   prev_close, ratio, rule.source),
+                                        message="新股上市初期无涨跌幅限制（%s），跳过本地"
+                                                "涨跌停校验（fail-open，交柜台）；"
+                                                "limit_rule=new_listing" % rule.source,
                                     )
-                                deferred.append(order)
-                                continue
+                            elif rule.ratio is None:
+                                # ETF/转债/未知代码：无可靠档位 → 回落板块常规幅度（旧口径）。
+                                rule = limit_rule_for(order.stock_code, name=_name)
+                            ratio = rule.ratio
+                            if ratio is not None:
+                                limit_up = (prev_close * (1 + ratio)).quantize(
+                                    Decimal("0.01"), rounding=ROUND_HALF_UP)
+                                limit_down = (prev_close * (1 - ratio)).quantize(
+                                    Decimal("0.01"), rounding=ROUND_HALF_UP)
+                                is_buy = order.trade_type == TradeType.BUY
+                                if (is_buy and open_px >= limit_up) or (
+                                        not is_buy and open_px <= limit_down):
+                                    if id(order) not in price_limit_recorded:
+                                        price_limit_recorded.add(id(order))
+                                        # 名称缺失 → 幅度是「按板块默认推断」的（修复 7），
+                                        # 事件里明确标注，避免误以为已识别 ST。
+                                        _suffix = (
+                                            "（证券名称缺失，幅度按默认 %s 推断）" % ratio
+                                            if "name_unknown" in rule.source else ""
+                                        )
+                                        recorder.record(
+                                            gate="price_limit", layer="execution", action="defer",
+                                            portfolio_id=order.portfolio_id or 0,
+                                            strategy_id=order.strategy_id,
+                                            stock_code=order.stock_code,
+                                            bar_time=t,
+                                            message="涨跌停约束：%s 开盘价 %s %s（前收 %s ×%s，%s）%s，订单延后至下一 bar 重试"
+                                                    % ("涨停买不进" if is_buy else "跌停卖不出",
+                                                       open_px,
+                                                       ("≥ 涨停价 %s" % limit_up) if is_buy
+                                                       else ("≤ 跌停价 %s" % limit_down),
+                                                       prev_close, ratio, rule.source, _suffix),
+                                        )
+                                    deferred.append(order)
+                                    continue
                     # #2 成交量/流动性约束（可选，默认关）：单 bar 成交量 × ratio 为
                     # 成交股数上限（TDX Volume 单位=手，×100 转股数，向下取整手）。
                     # 订单量 ≤ 上限 → 照常；> 上限且上限 ≥ 一手 → 缩量成交（每次记）；
@@ -293,6 +390,9 @@ class BacktestEngine:
                     )
                     if trade is not None:
                         trades.append(trade)
+                        # 风控冷静期起算（与实盘共用 Portfolio.note_trade）：止损/止盈/
+                        # 移动止损成交后登记 (策略, 代码) → 当日/后续 N 交易日禁开新仓。
+                        portfolio.note_trade(trade)
 
             # 2. 构造 BarEvent（从预建索引 O(1) 查表；含当前周期标注）
             bar = self._build_bar(price_index, t, period)
@@ -312,24 +412,26 @@ class BacktestEngine:
             else:
                 pending_orders = deferred
 
-            # 4. 日终快照（W4.4：每交易日至多一行，取当日最后一根 bar 的末值）
+            # 4. 日终快照（W4.4：每交易日至多一行，取「日终估值步」的末值）
             total_value = portfolio.total_value(bar)
-            snap = portfolio.snapshot(t.date(), total_value, bar)
-            # 填基准值：benchmark_data 是 {date: Decimal}，按当前 bar 日期取值；
-            # 缺失（基准停牌/非交易日/区间外）直接为 None（不做 carry-forward），
-            # Evaluator 喂基准序列时会过滤 None 值，全无则 benchmark_return 退化为 0。
-            snap["benchmark_value"] = benchmark_data.get(t.date()) if benchmark_data else None
+            is_day_end = i in day_end_steps
+            if is_day_end:
+                snap = portfolio.snapshot(t.date(), total_value, bar)
+                # 填基准值：benchmark_data 是 {date: Decimal}，按当前 bar 日期取值；
+                # 缺失（基准停牌/非交易日/区间外）直接为 None（不做 carry-forward），
+                # Evaluator 喂基准序列时会过滤 None 值，全无则 benchmark_return 退化为 0。
+                snap["benchmark_value"] = benchmark_data.get(t.date()) if benchmark_data else None
+
+                # 4b. 策略层快照：共享现金按 capital_ratio 归一化分摊，保证可加性
+                #     Σ(策略总净值) == 组合总净值。供策略层独立净值曲线与评估。
+                #     注入与组合同日的 benchmark_value，使策略层相对指标（FR-1）可算。
+                day_strategy_snaps = self._strategy_snapshots(portfolio, bar, t.date())
+                for s_snap in day_strategy_snaps:
+                    s_snap["benchmark_value"] = snap["benchmark_value"]
 
             # 4a. W2 现金管理增强（预留触发点，默认关）：命中阈值仅记决策事件，不产生订单。
             #     每交易日内部去重（_cash_enhance_last_date），混合周期多 bar/日只记一次。
             portfolio.maybe_cash_enhancement(bar, total_value)
-
-            # 4b. 策略层快照：共享现金按 capital_ratio 归一化分摊，保证可加性
-            #     Σ(策略总净值) == 组合总净值。供策略层独立净值曲线与评估。
-            #     注入与组合同日的 benchmark_value，使策略层相对指标（FR-1）可算。
-            day_strategy_snaps = self._strategy_snapshots(portfolio, bar, t.date())
-            for s_snap in day_strategy_snaps:
-                s_snap["benchmark_value"] = snap["benchmark_value"]
 
             # 4c. W4.4 每日一行：日期变化时 flush 上一日的末值快照（组合 + 策略），
             #     当前 bar 落入 pending，循环结束后补最后一日的 pending。
@@ -338,19 +440,17 @@ class BacktestEngine:
                 for s_snap in pending_strategy_snaps:
                     strategy_snapshots[s_snap["target_id"]].append(s_snap)
             last_snap_date = t.date()
-            pending_snap = snap
-            pending_strategy_snaps = day_strategy_snaps
+            if is_day_end:
+                pending_snap = snap
+                pending_strategy_snaps = day_strategy_snaps
 
             # 5. 熔断检测：更新峰值/检测 max_drawdown，推进熔断次日恢复时序
             #    （daily_loss 已在本 bar 起始 enter_day 补算，此处只做峰值/回撤）
             #    可选日末保护：混合周期下粗 bar 的 close 是周期末价（对当前时点是未来），
-            #    只在当日最后一根 bar 更新 peak，避免其污染组合峰值/误触熔断。
+            #    只在日终估值步更新 peak，避免其污染组合峰值/误触熔断。
             allow_peak_update = True
             if daily_close_peak_enabled:
-                allow_peak_update = (
-                    i + 1 >= len(times)
-                    or times[i + 1][0].date() != t.date()
-                )
+                allow_peak_update = is_day_end
             portfolio.risk_manager.update_peak(
                 total_value, t.date(), allow_peak_update=allow_peak_update,
             )
@@ -429,8 +529,11 @@ class BacktestEngine:
         """合并所有股票所有周期的时间轴，返回排序去重的 (datetime, period) 列表。
 
         W4 周期路由：同一 datetime 下不同周期分别成步（不再合并为一个 bar）。
-        同 t 内按固定周期顺序（粗→细：1mon > 1w > 1d > 60m > 30m > 15m > 5m > 1m），
-        纯排序确定性，避免同 00:00 的 1d/1w/1mon 步序随集合遍历次序抖动。
+        同 t 内按固定周期顺序（细→粗：1m > 5m > 15m > 30m > 1h > 1d > 1w > 1mon，
+        与实盘 periods_on_boundary 同序，见 `_PERIOD_ORDER` 注释），纯排序确定性，
+        避免同 00:00 的 1d/1w/1mon 步序随集合遍历次序抖动。00:00 那一步只含
+        日线及以上周期（1d→1w→1mon），分钟级 bar 不会落在 00:00，故细→粗改动
+        不改变日线 `signal_bar_date` 闸与周期路由。
         """
         pairs = set()
         for _stock_code, periods in klines.items():

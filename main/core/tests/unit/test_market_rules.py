@@ -98,3 +98,39 @@ def test_tick_size_stock_is_one_cent():
 def test_tick_size_plain_code_without_suffix():
     assert tick_size("510300") == Decimal("0.001")
     assert tick_size("600000") == Decimal("0.01")
+
+
+# ---------------- 修复 5：交易日天数差（冷静期按交易日推进） ----------------
+
+def test_trading_days_between_skips_weekends_and_holidays():
+    from datetime import date
+    from core.engine.market_rules import trading_days_between
+    # 周五 → 下周一 = 1 个交易日（自然日 3 天）
+    assert trading_days_between(date(2026, 11, 13), date(2026, 11, 16)) == 1
+    # 同日 = 0（当日卖出当日，冷静期 N=1 时拦当日）
+    assert trading_days_between(date(2026, 11, 13), date(2026, 11, 13)) == 0
+    # 反向/缺失 = 0
+    assert trading_days_between(date(2026, 11, 16), date(2026, 11, 13)) == 0
+    assert trading_days_between(None, date(2026, 11, 13)) == 0
+    # 中秋（2026-09-25 休市）：9/24 → 9/28 = 1（周五 9/25 休市 + 周末）
+    assert trading_days_between(date(2026, 9, 24), date(2026, 9, 28)) == 1
+    # 国庆（10/1-10/7 休市）：9/30 → 10/8 = 1
+    assert trading_days_between(date(2026, 9, 30), date(2026, 10, 8)) == 1
+
+
+# ---------------- 修复 7：名称缺失 → 幅度按默认推断的可观测性 ----------------
+
+def test_limit_rule_for_name_missing_warns_once_per_code(caplog):
+    import logging
+    import core.engine.market_rules as mr
+    code = "600519.SH"
+    mr._name_unknown_warned.discard(code)      # 去重集合是进程级，测试内重置
+    with caplog.at_level(logging.WARNING, logger="core.engine.market_rules"):
+        r1 = limit_rule_for(code)              # 名称缺失但判定不变
+        r2 = limit_rule_for(code)
+    warns = [rec for rec in caplog.records if "证券名称缺失" in rec.getMessage()]
+    assert len(warns) == 1, [r.getMessage() for r in warns]
+    assert "600519.SH" in warns[0].getMessage()
+    # 判定结果不变（幅度仍按板块默认，只补可观测性）
+    assert r1.ratio == Decimal("0.10") and r2.ratio == r1.ratio
+

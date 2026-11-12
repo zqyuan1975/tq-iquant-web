@@ -449,6 +449,9 @@ PARAMS_SNAPSHOT_FIELDS = (
     "cash_enhance_equity_threshold",
     "cash_enhance_position_ratio_threshold",
     "equity_cap",
+    # 风控冷静期（默认 1）：影响开仓时点 → 必须冻结，否则续跑 checkpoint 不因该列
+    # 变化作废（params_fingerprint 的 params 分项直接来自本列表）。
+    "risk_cooldown_days",
 )
 
 # 复权模式：K线/指数传 dividend_type 字符串（"front"/"back"，通达信 SDK 原样透传）；
@@ -1359,6 +1362,7 @@ def ensure_pool_clone(
         "adaptive_slippage_enabled", "slippage_impact_coef", "position_sizing",
         "daily_loss_basis", "equity_cap", "cash_enhance_enabled",
         "cash_enhance_equity_threshold", "cash_enhance_position_ratio_threshold",
+        "risk_cooldown_days",
     ):
         _v = getattr(src, _f, None)
         if _v is not None:

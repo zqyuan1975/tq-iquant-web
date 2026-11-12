@@ -28,6 +28,10 @@ class PortfolioStrategy(Base):
     # 回测买卖两侧都计入（买入摊入成本、卖出从盈亏扣），与实盘柜台成本同口径。
     transfer_fee_rate = Column(Numeric(8, 6), default=0.000010, server_default="0.000010", nullable=False)
     slippage = Column(Numeric(8, 6), default=0, server_default="0", nullable=False)
+    # 风控冷静期（2026-11-12）：止损/止盈/移动止损**成交后**，同一 (策略, 代码)
+    # 在接下来 N 个交易日内禁止新开仓（当日算第 1 天，N=1=当日不再买回、次日恢复）；
+    # 0=关闭（等价改动前行为）。公式 CLOSE/REDUCE 不触发。回测/实盘共用引擎实现。
+    risk_cooldown_days = Column(Integer, default=1, server_default="1", nullable=False)
     trading_session = Column(String(10), default="full", server_default="full", nullable=False)
     # #1 涨跌停约束（回测成交步）：True=涨停买不进/跌停卖不出（延后重试）。
     # 默认开（含 ORM/server 默认）——无约束回测会系统性高估可成交性；旧组合由迁移置 1。

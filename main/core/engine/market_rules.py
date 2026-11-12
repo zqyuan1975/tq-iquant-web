@@ -6,9 +6,11 @@ TdxTqDispatcher 的下单前置校验共用同一函数，避免两处口径漂�
 组合交易时段（trading_session）闸同属两端口径：回测按 bar 时间、实盘按
 墙钟判定，允许窗口在此统一定义（market_rules 与涨跌停幅度同级的共享规则）。
 """
-from datetime import date, time as dtime
+from datetime import date, time as dtime, timedelta
 from decimal import Decimal
 from typing import Optional
+import logging
+import threading
 
 from .price_limit import (
     BOARD_LIMIT_RATIOS,
@@ -16,10 +18,31 @@ from .price_limit import (
     resolve_limit_rule,
 )
 
+logger = logging.getLogger(__name__)
+
 #: resolve_limit_rule 给出「无可靠幅度」（ETF/转债/未知/新股窗口）时的回测兜底幅度。
 #: 回测没有柜台兜底，必须有一个有限幅度才能判定涨跌停；保持旧口径 10%（宁宽勿错），
 #: 不引入「跳过校验」的行为反转。
 _FALLBACK_LIMIT_RATIO = Decimal("0.10")
+
+# 证券名称缺失（无法识别 ST）时按板块默认幅度推断的告警去重集合：同一 code
+# 每进程只告警一次，避免回测逐 bar / 实盘逐单刷屏。判定结果不变（fail-open
+# 方向：主板 ST 推成 10% 偏宽，仍由柜台 5% 兜底），只补可观测性。
+_name_unknown_warned: set = set()
+_name_unknown_lock = threading.Lock()
+
+
+def _warn_name_unknown(stock_code: str) -> None:
+    if stock_code in _name_unknown_warned:
+        return
+    with _name_unknown_lock:
+        if stock_code in _name_unknown_warned:
+            return
+        _name_unknown_warned.add(stock_code)
+    logger.warning(
+        "涨跌停幅度按板块默认推断：%s 证券名称缺失，无法识别 ST（主板 ST 实为 5%%），"
+        "该幅度为 fail-open 估计，超限委托仍由柜台拒绝", stock_code,
+    )
 
 
 def limit_rule_for(
@@ -45,6 +68,10 @@ def limit_rule_for(
         stock_code, name=name, listed_bars=listed_bars,
         earliest_bar_date=earliest_bar_date, today=today,
     )
+    # 名称缺失 → 无法识别 ST，resolve 走 board_default_name_unknown（偏宽）。
+    # 判定结果不变，只补一条每 code 每进程一次的可观测性告警（修复 7）。
+    if name is None and "name_unknown" in rule.source:
+        _warn_name_unknown(stock_code)
     if rule.ratio is not None:
         return rule
     ratio = BOARD_LIMIT_RATIOS.get(rule.board, _FALLBACK_LIMIT_RATIO)
@@ -145,3 +172,28 @@ def lot_size_for_board(stock_code: str) -> int:
         if code.startswith(prefix) and code.endswith(suffix):
             return lot
     return 100
+
+
+def trading_days_between(start: Optional[date], end: Optional[date]) -> int:
+    """交易日天数差（区间 ``(start, end]``），用内置休市表而非自然日。
+
+    风控冷静期（``portfolio_strategies.risk_cooldown_days``）按交易日推进，
+    跨周末/节假日必须正确：周末硬规则 + ``BUILTIN_CLOSURES``（上交所官方休市
+    表，与 ``TradingCalendar`` 同一份数据；此处只复用数据表，不引入 live 运行时依赖）。
+    表未收录的年份按「仅周末」计（与 TradingCalendar 的 fail-open 同口径）。
+
+    ``start``/``end`` 任一缺失或 ``end <= start`` → 0（当日卖出当日 = 0 个已过
+    交易日，冷静期 N=1 时正好拦当日、次日放行）。
+    """
+    if start is None or end is None or end <= start:
+        return 0
+    # 惰性导入：BUILTIN_CLOSURES 是纯数据表，不触发 live 模块的运行时依赖。
+    from .live.calendar import BUILTIN_CLOSURES
+    n = 0
+    day = start + timedelta(days=1)
+    while day <= end:
+        if day.weekday() < 5 and day not in BUILTIN_CLOSURES.get(day.year, frozenset()):
+            n += 1
+        day += timedelta(days=1)
+    return n
+

@@ -88,6 +88,7 @@ export interface PortfolioItem {
   stamp_duty_rate: number | null
   transfer_fee_rate: number | null  // 过户费率（买卖双向，默认 0.00001=0.001%）
   slippage: number | null
+  risk_cooldown_days: number | null  // 风控冷静期（交易日，默认 1；0=关闭）
   trading_session: string  // full|am|pm
   price_limit_check_enabled: boolean  // #1 涨跌停校验（回测成交 + 实盘下单前置，默认开）
   volume_limit_enabled: boolean       // #2 成交量/流动性约束（回测，默认关）

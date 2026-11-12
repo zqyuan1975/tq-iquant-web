@@ -2138,6 +2138,9 @@ class OrderStateMachine:
                 )
                 trade = trade.scaled_to(applied)
             portfolio.account.apply_trade(trade)
+            # 风控冷静期起算（与回测共用 Portfolio.note_trade）：止损/止盈/移动止损
+            # 成交后登记 (策略, 代码) → 后续 N 个交易日禁开新仓（当日算第 1 天）。
+            portfolio.note_trade(trade)
             # B5：持仓变化推送（filled 后真实持仓/成本；pnl 无市价标记暂为 0）
             self._emit("position", {
                 "portfolio_id": live_order.portfolio_strategy_id,

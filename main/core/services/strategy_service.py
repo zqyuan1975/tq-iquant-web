@@ -86,6 +86,7 @@ def serialize_portfolio(db: Session, p: PortfolioStrategy) -> dict:
         "sell_commission_rate": float(p.sell_commission_rate) if p.sell_commission_rate is not None else None,
         "stamp_duty_rate": float(p.stamp_duty_rate) if p.stamp_duty_rate is not None else None,
         "transfer_fee_rate": float(p.transfer_fee_rate) if p.transfer_fee_rate is not None else 0.00001,
+        "risk_cooldown_days": int(p.risk_cooldown_days) if p.risk_cooldown_days is not None else 1,
         "slippage": float(p.slippage) if p.slippage is not None else None,
         "trading_session": p.trading_session,
         "price_limit_check_enabled": bool(p.price_limit_check_enabled) if p.price_limit_check_enabled is not None else True,
@@ -130,6 +131,10 @@ def _apply_portfolio_fields(p: PortfolioStrategy, req) -> None:
         else req.transfer_fee_rate
     )
     p.slippage = req.slippage
+    # 风控冷静期（默认 1）：None=请求未携带 → 不动已有值（新建由 ORM/server 默认兜底）；
+    # 0=显式关闭（等价改动前行为），按值落库不偷改。
+    if getattr(req, "risk_cooldown_days", None) is not None:
+        p.risk_cooldown_days = max(0, int(req.risk_cooldown_days))
     p.trading_session = req.trading_session
     p.status = req.status
     # #1 涨跌停约束：None（请求未携带）不动已有值——编辑旧组合不偷改开关；

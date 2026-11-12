@@ -185,3 +185,42 @@ def test_daily_close_peak_guard_default_off_preserves_existing_behavior():
     result = BacktestEngine().run(port, klines=klines)
 
     assert [e for e in result["decisions"] if e["gate"] == "max_drawdown"]
+
+
+def test_period_order_covers_1h_and_legacy_60m_alias():
+    """周期键名：全系统周期串为 "1h"，"60m" 仅作历史别名，二者同权重且落在 30m 与 1d 之间。"""
+    from core.engine.backtest_engine import _PERIOD_ORDER
+
+    assert _PERIOD_ORDER["1h"] == _PERIOD_ORDER["60m"]
+    assert _PERIOD_ORDER["30m"] < _PERIOD_ORDER["1h"] < _PERIOD_ORDER["1d"]
+    assert _PERIOD_ORDER.get("1h", 99) != 99
+
+
+def test_timeline_orders_same_timestamp_fine_to_coarse():
+    """同时间戳多周期处理顺序为细→粗（与实盘 periods_on_boundary 同序）。
+
+    10:30 同时有 1m/5m/15m/30m/1h 五档；00:00 同时有 1d/1w/1mon 三档。
+    """
+    stock = "000001.SZ"
+    day = datetime(2026, 7, 30)
+    def _df(t):
+        return pl.DataFrame({
+            "datetime": [t],
+            "Open": [Decimal("10")], "High": [Decimal("10")],
+            "Low": [Decimal("10")], "Close": [Decimal("10")], "Volume": [1000],
+        })
+    klines = {stock: {
+        "1mon": _df(day), "1w": _df(day), "1d": _df(day),
+        "1h": _df(datetime(2026, 7, 30, 10, 30)),
+        "30m": _df(datetime(2026, 7, 30, 10, 30)),
+        "15m": _df(datetime(2026, 7, 30, 10, 30)),
+        "5m": _df(datetime(2026, 7, 30, 10, 30)),
+        "1m": _df(datetime(2026, 7, 30, 10, 30)),
+    }}
+
+    timeline = BacktestEngine()._build_timeline(klines)
+
+    assert [p for t, p in timeline if t == datetime(2026, 7, 30, 10, 30)] == [
+        "1m", "5m", "15m", "30m", "1h",
+    ]
+    assert [p for t, p in timeline if t == day] == ["1d", "1w", "1mon"]

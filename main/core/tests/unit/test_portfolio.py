@@ -1579,11 +1579,21 @@ def test_intraday_bar_triggers_stop_loss_for_daily_strategy():
     # 盘中价 8.8：相对成本 10 亏 12% > 止损 10%
     bar = _bar("000001.SZ", "8.8", datetime(2026, 7, 30, 10, 31))
     bar.period = "1m"
-    orders = port.on_bar(bar, signal_cache={}, period="1m")
+    orders = port.on_bar(bar, signal_cache={}, period="1m", mismatched_risk=True)
     assert len(orders) == 1
     assert orders[0].trade_type == TradeType.SELL
     assert orders[0].quantity == 1000
     assert orders[0].signal_type == SignalType.STOP_LOSS
+
+
+def test_on_bar_default_mismatched_risk_false_skips_other_period_risk():
+    """默认 mismatched_risk=False（与实盘默认一致）：错周期 bar 不跑风控，只更新价格快照。"""
+    port, ctx, _pos = _portfolio_1d_with_holdings(stop_loss=Decimal("0.1"))
+    bar = _bar("000001.SZ", "8.8", datetime(2026, 7, 30, 10, 31))  # 亏损 12% > 止损 10%
+    bar.period = "1m"
+
+    # 不显式传参即取默认值 False，止损不得在这根 1m bar 上被评估
+    assert port.on_bar(bar, signal_cache={}, period="1m") == []
 
 
 def test_check_risks_uses_close_only_not_high_low():
@@ -1606,7 +1616,7 @@ def test_check_risks_uses_close_only_not_high_low():
 def test_mismatched_risk_false_skips_weekly_strategy_on_advance_daily_bar():
     """14:51 提前收盘价轮次（mismatched_risk=False）：1w/1mon 策略不被 1d bar 触发风控。
 
-    对照：默认 True 时周期不匹配仍按 bar 价跑风控（既有行为不变）。
+    对照：显式 True 时周期不匹配仍按 bar 价跑风控（可选的盘中风控口径）。
     """
     port, ctx, _pos = _portfolio_1d_with_holdings(stop_loss=Decimal("0.1"))
     ctx.period = "1w"  # 周线策略
@@ -1616,7 +1626,7 @@ def test_mismatched_risk_false_skips_weekly_strategy_on_advance_daily_bar():
     assert port.on_bar(bar, signal_cache={}, period="1d",
                        mismatched_risk=False) == []
 
-    orders = port.on_bar(bar, signal_cache={}, period="1d")
+    orders = port.on_bar(bar, signal_cache={}, period="1d", mismatched_risk=True)
     assert len(orders) == 1
     assert orders[0].signal_type == SignalType.STOP_LOSS
 
@@ -1679,12 +1689,13 @@ def test_intraday_trailing_stop_uses_realtime_high():
     for px in ("10.5", "11.0"):
         bar = _bar("000001.SZ", px, datetime(2026, 7, 30, 10, 31))
         bar.period = "1m"
-        assert port.on_bar(bar, signal_cache={}, period="1m") == []
+        assert port.on_bar(bar, signal_cache={}, period="1m",
+                           mismatched_risk=True) == []
     assert pos.highest_price == Decimal("11.0")
     # 回撤 bar：10.4 / 11.0 = 5.45% > 5% → 触发
     bar = _bar("000001.SZ", "10.4", datetime(2026, 7, 30, 10, 35))
     bar.period = "1m"
-    orders = port.on_bar(bar, signal_cache={}, period="1m")
+    orders = port.on_bar(bar, signal_cache={}, period="1m", mismatched_risk=True)
     assert len(orders) == 1
     assert orders[0].signal_type == SignalType.TRAILING_STOP
 
@@ -1733,3 +1744,81 @@ def test_valuation_prefers_last_known_price_over_cost_across_days():
         _bar("000001.SZ", "9", datetime(2026, 7, 31, 10, 0)))
     assert port._prev_close_snapshot["600000.SH"] == Decimal("12")
     assert port._holdings_value() == Decimal("12000")
+
+
+# ------------ 修复 5：风控卖出后冷静期（risk_cooldown_days，回测/实盘共用） ------------
+def _risk_sell_trade(trade_time, signal_type=SignalType.STOP_LOSS, strategy_id=1,
+                     stock_code="000001.SZ"):
+    from core.engine.event import TradeEvent
+    return TradeEvent(
+        strategy_id=strategy_id, portfolio_id=1, stock_code=stock_code,
+        trade_type=TradeType.SELL, price=Decimal("9"), quantity=1000,
+        amount=Decimal("9000"), commission=Decimal("0"), stamp_duty=Decimal("0"),
+        trade_time=trade_time, signal_type=signal_type,
+    )
+
+
+def _open_orders(port, bar_time, strategy_id=1, code="000001.SZ"):
+    """喂一根带 OPEN 信号的 bar，返回该策略产出的订单。"""
+    bar = _bar(code, "10.5", bar_time)
+    cache = {(strategy_id, code, bar_time): [{"name": "open_sig", "value": 1}]}
+    return port.on_bar(bar, signal_cache=cache)
+
+
+def test_risk_cooldown_blocks_same_day_reopen_and_allows_next_trading_day():
+    """风控卖出（周五）后：当日再 OPEN 被拦（gate=risk_cooldown），周一放行。
+
+    交易日推进而非自然日：周五→周一 natural=3 天，但只隔 1 个交易日，
+    N=2 时周一仍应被拦、周二才放行。
+    """
+    port, ctx = _portfolio_with_strategy(
+        "000001.SZ",
+        [{"signal_name": "open_sig", "signal_type": SignalType.OPEN, "trigger_value": 1}],
+    )
+    rec = DecisionRecorder()
+    port.set_recorder(rec)
+    assert port.risk_cooldown_days == 1
+
+    sell_time = datetime(2026, 11, 13, 14, 0)      # 周五
+    port.note_trade(_risk_sell_trade(sell_time))
+
+    # 当日（周五收盘前）再开仓 → 拦截并留痕
+    assert _open_orders(port, datetime(2026, 11, 13, 15, 0)) == []
+    evs = [e for e in rec.drain() if e.gate == "risk_cooldown"]
+    assert len(evs) == 1
+    assert evs[0].action == "block"
+    assert evs[0].stock_code == "000001.SZ"
+    assert evs[0].param_name == "risk_cooldown_days"
+    assert evs[0].param_value == 1.0
+    assert evs[0].actual_value == 0.0          # 已过 0 个交易日（当日算第 1 天）
+    assert "2026-11-13" in evs[0].message
+
+    # 次一交易日（周一）→ 放行
+    orders = _open_orders(port, datetime(2026, 11, 16, 15, 0))
+    assert [o.trade_type for o in orders] == [TradeType.BUY]
+
+    # N=2：周五卖 → 周一（隔 1 个交易日）仍拦，周二放行
+    port.risk_cooldown_days = 2
+    assert _open_orders(port, datetime(2026, 11, 16, 15, 0)) == []
+    assert len(_open_orders(port, datetime(2026, 11, 17, 15, 0))) == 1
+
+
+def test_risk_cooldown_zero_disables_and_formula_close_not_registered():
+    """0=关闭（等价改动前行为）；公式 CLOSE/REDUCE 不触发冷静期。"""
+    port, _ctx = _portfolio_with_strategy(
+        "000001.SZ",
+        [{"signal_name": "open_sig", "signal_type": SignalType.OPEN, "trigger_value": 1}],
+    )
+    sell_time = datetime(2026, 11, 13, 14, 0)
+
+    # 公式 CLOSE 成交 → 不登记冷静期
+    port.note_trade(_risk_sell_trade(sell_time, signal_type=SignalType.CLOSE))
+    assert port._risk_cooldown == {}
+    assert len(_open_orders(port, datetime(2026, 11, 13, 15, 0))) == 1
+
+    # 风控卖出登记后，置 0 关闭 → 当日仍可开仓（旧行为）
+    port.note_trade(_risk_sell_trade(sell_time))
+    assert port._risk_cooldown[(1, "000001.SZ")] == sell_time.date()
+    port.risk_cooldown_days = 0
+    assert len(_open_orders(port, datetime(2026, 11, 13, 15, 0))) == 1
+

@@ -3555,13 +3555,37 @@ def _respond_quote_bars(stock, bars, fail_orders=False):
 
 # ---- 周期边界判定 ----
 def test_periods_on_boundary():
-    """C6：1m bar 结束时刻 → 命中边界周期（可累积，只读 stime 不引本机时钟）。"""
+    """C6：1m bar 结束时刻 → 命中边界周期（可累积，只读 stime 不引本机时钟）。
+
+    1h 边界 = 原生 60m bar / 聚合桶的终点 10:30、11:30、14:00、15:00。
+    """
     assert periods_on_boundary(datetime(2026, 8, 5, 10, 5)) == ["5m"]
     assert periods_on_boundary(datetime(2026, 8, 5, 10, 15)) == ["5m", "15m"]
-    assert periods_on_boundary(datetime(2026, 8, 5, 10, 30)) == ["5m", "15m", "30m"]
-    assert periods_on_boundary(datetime(2026, 8, 5, 11, 0)) == ["5m", "15m", "30m", "1h"]
+    assert periods_on_boundary(datetime(2026, 8, 5, 10, 30)) == ["5m", "15m", "30m", "1h"]
+    assert periods_on_boundary(datetime(2026, 8, 5, 11, 0)) == ["5m", "15m", "30m"]
+    assert periods_on_boundary(datetime(2026, 8, 5, 11, 30)) == ["5m", "15m", "30m", "1h"]
+    assert periods_on_boundary(datetime(2026, 8, 5, 14, 0)) == ["5m", "15m", "30m", "1h"]
+    assert periods_on_boundary(datetime(2026, 8, 5, 15, 0)) == ["5m", "15m", "30m", "1h"]
     assert periods_on_boundary(datetime(2026, 8, 5, 10, 3)) == []
     assert periods_on_boundary(None) == []
+
+
+def test_1h_boundary_matches_aggregation_bucket_ends():
+    """1h 派发边界集合 == snapshot_bars 1h 聚合桶终点集合，且同一分钟不重复派发。"""
+    from core.engine.live.snapshot_bars import _bucket_end
+
+    labels = [datetime(2026, 8, 5, 9, 31) + timedelta(minutes=i) for i in range(120)]
+    labels += [datetime(2026, 8, 5, 13, 1) + timedelta(minutes=i) for i in range(120)]
+
+    bucket_ends = {e for e in (_bucket_end(t, 60) for t in labels) if e is not None}
+    assert bucket_ends == {
+        datetime(2026, 8, 5, 10, 30), datetime(2026, 8, 5, 11, 30),
+        datetime(2026, 8, 5, 14, 0), datetime(2026, 8, 5, 15, 0),
+    }
+
+    one_h_labels = {t for t in labels if "1h" in periods_on_boundary(t)}
+    assert one_h_labels == bucket_ends
+    assert all(periods_on_boundary(t).count("1h") <= 1 for t in labels)
 
 
 # ---- 周期过滤（核心节拍正确性）----

@@ -8076,6 +8076,9 @@ class LiveEngine:
                 trade = trade.scaled_to(applied)
             if applied > 0:
                 port.account.apply_trade(trade)
+                # 风控冷静期恢复（与回测/回填共用 Portfolio.note_trade）：重启重放
+                # 时从 live_trades 重建冷静期起点，避免重启即「冷却失效」。
+                port.note_trade(trade)
             # 同步「已记账量」到委托状态机（重放后迟到成交/重复回填只补增量）
             if tr.live_order_id is not None:
                 oq, oa, oc = applied_by_order.get(

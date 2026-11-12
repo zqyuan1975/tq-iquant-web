@@ -450,6 +450,26 @@ def test_invalidation_reasons_locate_changed_section(db_session):
     assert any("无分项指纹" in r for r in reasons3)
 
 
+def test_engine_schema_v2_invalidates_with_readable_reason():
+    """修复 6：引擎口径升 v2；旧 checkpoint 作废时必须点名「引擎版本 v1 → v2」。"""
+    assert ib._ENGINE_SCHEMA == "backtest_engine_v2"
+    want_parts = ib.schema_parts("dual")
+    old_parts = dict(want_parts, engine="backtest_engine_v1")
+    reasons = ib._invalidation_reasons(
+        {"schema_fp": "old-fp", "schema_parts": old_parts, "params_fp_parts": {}},
+        "old-fp", ib.SCHEMA_VERSION, ib.schema_fingerprint("dual"), {},
+        want_parts)
+    assert any("引擎版本" in r and "backtest_engine_v1" in r
+               and "backtest_engine_v2" in r for r in reasons)
+
+
+def test_schema_parts_include_engine_version():
+    """checkpoint 落盘的口径分项必须含引擎版本（供下次作废定位）。"""
+    parts = ib.schema_parts("dual")
+    assert parts["engine"] == ib._ENGINE_SCHEMA
+    assert parts["dividend_mode"] == "dual"
+
+
 # ---------------------------------------------------------------- 9. 快路径闸
 def test_fast_path_only_when_gap_is_exactly_today():
     """连续多日未跑 + 当天有交接日线 → 禁止快路径（否则中间交易日被静默跳过）。"""
@@ -559,21 +579,69 @@ def test_evaluate_alignment_direction_uses_own_dirs_and_none_when_missing():
     tol = {"max_net_dev_pct": 0.5, "mean_net_dev_pct": 0.2,
            "trade_count_match_ratio": 0.9, "direction_match_ratio": 0.9,
            "max_drawdown_dev_pct": 1.0}
-    d = date(2026, 1, 5)
+    # 5 个交易日 × 两侧各 1 笔 = 10 笔 ≥ 小样本阈值，笔数/方向两项参与判定
+    days = [date(2026, 1, 5 + i) for i in range(5)]
     inc = {d: {"trade_date": d, "inc_total_value": Decimal("100000"),
-               "inc_trades_count": 1, "dirs": ["000001.SZ:BUY"]}}
+               "inc_trades_count": 1, "dirs": ["000001.SZ:BUY"]} for d in days}
     full_bad = {d: {"trade_date": d, "total_value": Decimal("100000"),
-                    "trades_count": 1, "dirs": ["000001.SZ:SELL"]}}
+                    "trades_count": 1, "dirs": ["000001.SZ:BUY"]} for d in days}
+    # 最后一天方向相反 → 方向一致率 4/5=0.8 < 0.9 → fail，首个背离日 = 该日
+    full_bad[days[-1]] = {**full_bad[days[-1]], "dirs": ["000001.SZ:SELL"]}
     res = ib.evaluate_alignment(inc, full_bad, tol)
-    assert res["direction_match_ratio"] == 0.0
+    assert res["direction_match_ratio"] == 0.8
     assert res["status"] == "fail"
-    assert res["first_divergence_date"] == d
+    assert res["first_divergence_date"] == days[-1]
 
-    # 任一侧无方向明细 → 该判据不参与（返回 None），而不是恒真通过
-    inc_no = {d: {**inc[d], "dirs": None}}
-    res2 = ib.evaluate_alignment(inc_no, full_bad, tol)
-    assert res2["direction_match_ratio"] is None
+    # 任一侧无方向明细 → 该日不参与判定（None），而不是恒真通过
+    inc_no = {d: ({**inc[d], "dirs": None} if d == days[0] else inc[d]) for d in days}
+    full_ok = {d: {**full_bad[d], "dirs": ["000001.SZ:BUY"]} for d in days}
+    res2 = ib.evaluate_alignment(inc_no, full_ok, tol)
+    assert res2["direction_match_ratio"] == 1.0
     assert res2["status"] == "pass"
+
+    # 全部日期都无方向明细 → 返回 None（不参与），而不是 0.0
+    inc_all_none = {d: {**inc[d], "dirs": None} for d in days}
+    res3 = ib.evaluate_alignment(inc_all_none, full_ok, tol)
+    assert res3["direction_match_ratio"] is None
+    assert res3["status"] == "pass"
+
+
+def test_evaluate_alignment_small_sample_exempts_count_and_direction():
+    """修复 9：成交笔数（两侧之和）< SMALL_SAMPLE_MIN_TRADES 时，笔数/方向一致率
+    判 None 不参与总体结论；净值/回撤偏差仍照常全量校验。"""
+    assert ib.SMALL_SAMPLE_MIN_TRADES == 5
+    tol = {"max_net_dev_pct": 0.5, "mean_net_dev_pct": 0.2,
+           "trade_count_match_ratio": 0.9, "direction_match_ratio": 0.9,
+           "max_drawdown_dev_pct": 1.0}
+    d = date(2026, 1, 5)
+    # 2 + 1 = 3 笔 < 5：笔数/方向都不同（旧口径必 fail）→ 小样本豁免后 pass
+    inc = {d: {"trade_date": d, "inc_total_value": Decimal("100000"),
+               "inc_trades_count": 2, "dirs": ["000001.SZ:BUY", "600000.SH:BUY"]}}
+    full = {d: {"trade_date": d, "total_value": Decimal("100000"),
+                "trades_count": 1, "dirs": ["000001.SZ:SELL"]}}
+    res = ib.evaluate_alignment(inc, full, tol)
+    assert res["small_sample"] is True
+    assert res["trades_seen"] == 3
+    assert res["trade_count_match_ratio"] is None
+    assert res["direction_match_ratio"] is None
+    assert res["first_divergence_date"] is None
+    assert res["status"] == "pass"
+
+    # 小样本不放过净值口径：净值偏差超容差仍判 fail
+    inc_bad = {d: {**inc[d], "inc_total_value": Decimal("90000")}}
+    res2 = ib.evaluate_alignment(inc_bad, full, tol)
+    assert res2["status"] == "fail"
+    assert res2["first_divergence_date"] == d
+
+    # 达到阈值（5 笔）后恢复原判定：笔数不一致 → 一致率下降并 fail
+    full5 = {d: {"trade_date": d, "total_value": Decimal("100000"),
+                 "trades_count": 4, "dirs": ["000001.SZ:SELL"] * 4}}
+    inc1 = {d: {"trade_date": d, "inc_total_value": Decimal("100000"),
+                "inc_trades_count": 1, "dirs": ["000001.SZ:BUY"]}}
+    res3 = ib.evaluate_alignment(inc1, full5, tol)
+    assert res3["small_sample"] is False
+    assert res3["trade_count_match_ratio"] == 0.0
+    assert res3["status"] == "fail"
 
 
 # ---------------------------------------------------------------- 12. 校验标记可清除

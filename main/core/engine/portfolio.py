@@ -11,6 +11,7 @@ from .risk_manager import PortfolioRiskManager
 from .event import BarEvent, SignalEvent, OrderEvent
 from .decision import NULL_RECORDER
 from .format import fmt_money, fmt_pct, fmt_price
+from .market_rules import trading_days_between
 from tq_iquant_shared.constants import SignalType, TradeType
 
 logger = logging.getLogger(__name__)
@@ -161,6 +162,13 @@ class Portfolio:
         # 决策事件）。类默认 True，与组合表 ORM/server 默认一致；builder 仍
         # 从组合表字段装配，用户显式关闭时按库值 False 跳过。
         self.price_limit_check_enabled: bool = True
+        # 风控冷静期（2026-11-12）：止损/止盈/移动止损**成交后**，同一 (策略, 代码)
+        # 在接下来 N 个交易日内禁止新开仓（当日算第 1 天，N=1=当日不再买回、次日
+        # 恢复）；0=关闭（等价改动前行为）。类默认 1，与组合表 ORM/server 默认一致；
+        # builder 从组合表装配。回测/实盘共用本层开仓闸，两端自动一致。
+        self.risk_cooldown_days: int = 1
+        # {(strategy_id, code): 最近一次风控卖出成交日}，由 note_trade 登记
+        self._risk_cooldown: Dict[tuple, date] = {}
         # #2 成交量/流动性约束（可选，默认关）：单 bar 成交量 × volume_limit_ratio
         # 为成交股数上限（TDX Volume 单位=手，×100 转股数）。超限缩量成交，
         # 不足一手延后重试。同样仅回测成交步生效。
@@ -199,6 +207,56 @@ class Portfolio:
         self.recorder = recorder or NULL_RECORDER
         self.risk_manager.recorder = self.recorder
         self.risk_manager.portfolio_id = self.portfolio_id
+
+    def note_trade(self, trade) -> None:
+        """成交回填钩子：风控类卖出成交后登记冷静期起算日（回测/实盘共用）。
+
+        只登记止损/止盈/移动止损（``_RISK_PRIORITY`` 三类）；公式 CLOSE/REDUCE
+        不触发冷静期（属策略主动调仓，不是风控出场）。登记粒度 = (策略, 代码)，
+        与开仓闸 ``_risk_cooldown_block`` 同键。
+
+        调用点（三处，均为「成交已记账」之后）：
+        - ``BacktestEngine.run`` 成交步 ``engine.execute`` 返回成交后；
+        - 实盘 ``OrderMachine._apply_fill`` 回填后；
+        - ``LiveEngine.recover`` 从 ``live_trades`` 重放时（重启后冷静期不丢）。
+        """
+        if trade is None:
+            return
+        if getattr(trade, "trade_type", None) != TradeType.SELL:
+            return
+        if getattr(trade, "signal_type", None) not in _RISK_PRIORITY:
+            return
+        t = getattr(trade, "trade_time", None)
+        if t is None:
+            return
+        self._risk_cooldown[(getattr(trade, "strategy_id", None),
+                             getattr(trade, "stock_code", None))] = t.date()
+
+    def _risk_cooldown_block(
+        self, ctx: StrategyContext, sig: SignalEvent, bar: BarEvent,
+    ) -> bool:
+        """风控冷静期闸（开新仓路径）：命中返回 True（已记决策事件）。
+
+        按**交易日**推进（``trading_days_between``，周末/节假日正确）。当日卖出
+        当日 elapsed=0 → N=1 时拦当日、次日 elapsed=1 放行（「当日算第 1 天」）。
+        """
+        days = int(self.risk_cooldown_days or 0)
+        if days <= 0:
+            return False
+        last = self._risk_cooldown.get((ctx.strategy_id, sig.stock_code))
+        if last is None:
+            return False
+        elapsed = trading_days_between(last, bar.bar_time.date())
+        if elapsed >= days:
+            return False
+        self._rec("risk_cooldown", "signal_gate", "block", ctx, sig, bar,
+                  param_name="risk_cooldown_days",
+                  param_value=float(days),
+                  actual_value=float(elapsed),
+                  message="风控冷静期：%s 于 %s 风控卖出，已过 %d 个交易日 / 剩余 %d 天"
+                          "（需 ≥%d 个交易日），不开新仓"
+                          % (sig.stock_code, last, elapsed, days - elapsed, days))
+        return True
 
     def _book_guard(self):
         """账本锁上下文（P0-2）：实盘返回注入的 RLock，回测返回 nullcontext。
@@ -298,7 +356,7 @@ class Portfolio:
         signal_cache: Optional[Dict] = None,
         period: Optional[str] = None,
         inflight_opens: Optional[Dict[int, set]] = None,
-        mismatched_risk: bool = True,
+        mismatched_risk: bool = False,
     ) -> List[OrderEvent]:
         """处理一根 bar：取信号 + 风控检查 + 优先级排序 → 返回待执行订单列表。
 
@@ -313,10 +371,10 @@ class Portfolio:
         排队的 OPEN 由内部累计跟踪。
         mismatched_risk：错周期 bar 是否跑风控。False 时周期不匹配的策略只更新
         价格快照，不评估止损/止盈/移动止损（周线/月线同样只在自身周期边界评估）。
-        来源：14:51 提前收盘价轮次显式传 False；实盘其余轮次由会话三态
+        默认 False：回测与实盘同口径（实盘由会话三态
         `live_sessions.intraday_mismatched_risk_enabled`（NULL 跟随全局
         `tq_trade.intraday_mismatched_risk_enabled`，默认 False）解析后传入；
-        默认 True 保持回测/旧调用原行为。
+        14:51 提前收盘价轮次同样显式传 False）。
         """
         # 工作副本：本 bar 处理过程中每排一个 OPEN 就地登记，同 bar 后续信号可见
         inflight: Dict[int, set] = {
@@ -336,11 +394,11 @@ class Portfolio:
         orders: List[OrderEvent] = []
         for ctx in self.strategies:
             if period is not None and ctx.period != period:
-                # 周期不匹配：仅跑风控（止损/止盈/移动止损按当前 bar 价盘中核算
-                # 与执行），公式信号仍锁策略周期（W4 防混合周期前视语义不变）。
-                # 实盘快照合成 1m bar → 日线策略持仓获得盘中风控；回测日线数据
-                # 无 1m bar → 行为与历史一致；混合周期回测 → 双端盘中风控统一。
-                # mismatched_risk=False（14:51 提前收盘价轮次）：周线/月线不参与。
+                # 周期不匹配：默认只更新价格快照，公式信号仍锁策略周期（W4 防
+                # 混合周期前视语义不变）。mismatched_risk=True 时才按当前 bar 价
+                # 盘中核算风控（实盘会话可显式打开）：实盘快照合成 1m bar → 日线
+                # 策略持仓获得盘中风控；回测日线数据无 1m bar → 行为与历史一致。
+                # 默认 False 两端同口径（AGENTS「错周期风控默认关闭」）。
                 if mismatched_risk:
                     orders.extend(self._process_strategy(
                         ctx, bar, signal_cache, inflight, include_signals=False))
@@ -711,6 +769,11 @@ class Portfolio:
                 self._rec("open_already_holding", "signal_gate", "block", ctx, sig, bar,
                           message="OPEN 信号时本票已持仓 %d 股（加仓走 ADD），忽略开仓"
                                   % pos.quantity)
+                return []
+            # 风控冷静期（回测/实盘共用，2026-11-12）：止损/止盈/移动止损成交后 N 个
+            # 交易日内禁止新开仓（当日算第 1 天）。放在 max_holdings/槽位闸之前，
+            # 轮动换入（_try_rotation）同受此闸约束——两者都是「开新仓」。
+            if self._risk_cooldown_block(ctx, sig, bar):
                 return []
             # 组合级 max_holdings 闸（回测/实盘共用 on_bar，一处接线两端生效）：
             # 组合当前去重股票数（跨策略按 stock_code 去重，主从同票合并计数）

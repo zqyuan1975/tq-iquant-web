@@ -106,7 +106,7 @@ const NULLABLE_NUMERIC_FIELDS = new Set([
   'max_order_amount',
   'cash_enhance_equity_threshold', 'cash_enhance_position_ratio_threshold',
   'trend_trailing_stop_ratio', 'trend_max_positions',
-  'signal_weekday',
+  'signal_weekday', 'risk_cooldown_days',
 ])
 
 // 表单字段元数据：key/名称/一行几个（≤2 保证不溢出）。分组用于弹窗分区。
@@ -131,6 +131,7 @@ const PORTFOLIO_GROUPS: { title: string; fields: FieldMeta[] }[] = [
     { key: 'max_drawdown', label: '最大回撤', span: 1, type: 'percent', placeholder: '20' },
     { key: 'daily_loss_limit', label: '日亏损限', span: 1, type: 'percent', placeholder: '5' },
     { key: 'max_holdings', label: '最大持仓数', span: 2, type: 'number', placeholder: '10' },
+    { key: 'risk_cooldown_days', label: '风控冷静期（交易日）', span: 2, type: 'number', placeholder: '1', hint: '止损/止盈/移动止损卖出成交后，同一策略同一股票在该天数内禁止新开仓（当日算第 1 天）；0=关闭' },
   ]},
   { title: '交易成本', fields: [
     { key: 'min_commission', label: '最低佣金（元）', span: 1, type: 'number', placeholder: '5' },
@@ -238,6 +239,7 @@ function emptyPortfolioForm(): Record<string, any> {
     max_holdings: 10,
     min_commission: 5, buy_commission_rate: 0.00025, sell_commission_rate: 0.00025,
     stamp_duty_rate: 0.0005, transfer_fee_rate: 0.00001, slippage: 0,
+    risk_cooldown_days: 1,
     trading_session: 'full', status: 'active',
     price_limit_check_enabled: true, volume_limit_enabled: false, volume_limit_ratio: 0.1,
     adaptive_slippage_enabled: false, slippage_impact_coef: 0.1,
@@ -481,6 +483,7 @@ async function openEditPortfolio(p: PortfolioItem) {
     stamp_duty_rate: detail.stamp_duty_rate ?? 0.0005,
     transfer_fee_rate: detail.transfer_fee_rate ?? 0.00001,
     slippage: detail.slippage ?? 0,
+    risk_cooldown_days: detail.risk_cooldown_days ?? 1,
     trading_session: detail.trading_session, status: detail.status,
     price_limit_check_enabled: detail.price_limit_check_enabled,
     volume_limit_enabled: detail.volume_limit_enabled,
