@@ -13,7 +13,11 @@
   从接缝日重跑。
 - 参数指纹闸：组合级列 + 策略数值参数/公式/角色/周期 + 策略增删 + 股票池
   成分代码列表任一变化 → 作废 checkpoint 并从接缝日重建（日志注明变化分项）。
-- 续跑只要日线周期；缺口规划只允许「恰好今天一天」走当日交接日线的快路径。
+- 接缝粒度 = **交易日 + 日内时间游标**：checkpoint 同时记 ``as_of_date``（最后
+  已处理交易日）与 ``as_of_bar_time``（最后已处理 bar 时间戳）。跨日不重放整天
+  分钟 bar（引擎视野从次一交易日 00:00 起）；同一交易日内续跑只喂游标之后的 bar。
+- 分钟级与日线共用同一条续跑路径（引擎按周期路由，订单/持仓状态序列化方式一致）。
+  缺口规划只允许「恰好今天一天」走当日交接日线的快路径（交接物只有日线）。
 - 双跑校验：从接缝日全量重算并与续跑结果按特征级容差对账。
 """
 import hashlib
@@ -83,9 +87,16 @@ _ENGINE_SCHEMA = "backtest_engine_v2"
 # 不参与总体结论，净值与回撤偏差照常全量校验。常量独立便于以后调阈值。
 SMALL_SAMPLE_MIN_TRADES = 5
 
-# 仅这些周期可续跑；分钟级续跑语义未定（跨日分段时在途分钟 bar 与
-# 成交时点边界未规范化），明确不支持而不是勉强实现。
+# 日线及以上周期（不含分钟 bar 的周期）。仅用于判断「该组合是否需要日内游标」：
+# 全为日线及以上时，同一交易日的重复触达一律按「当日已续跑」跳过（日线 bar 只有
+# 一根，15:00 之后取到即当日收盘，与历史行为逐字一致）；含任一周期即启用日内游标。
 _DAILY_PERIODS = {"1d", "1w", "1mon"}
+
+# 日内游标收敛判据：当日最后一根分钟 bar 的时间戳下界（15:00 收盘，留 5 分钟
+# 数据落盘余量）。本段最后一根 bar 的时间戳达到该下界才把 checkpoint 标成
+# ``day_complete``——否则 11:00 手工触发的一次续跑会把「只跑到 11:00」的日子
+# 误标成已完成，15:10 的调度 / 当日再触发就再也不会补齐余下 bar（静默丢半天）。
+_DAY_LAST_BAR_TIME = time(14, 55)
 
 # 同一组合策略的续跑/校验串行化（独立于 backtest 的 _BACKTEST_LOCK，
 # 续跑不排队等全量回测）。
@@ -207,8 +218,18 @@ def _order_from_dict(d: dict) -> OrderEvent:
 
 
 def state_payload(portfolio: Portfolio, as_of_date: date,
-                  pending_orders: Optional[List[OrderEvent]] = None) -> dict:
-    """把 Portfolio 完整内存态序列化为 JSON 安全 dict（漏项=静默错账）。"""
+                  pending_orders: Optional[List[OrderEvent]] = None,
+                  as_of_bar_time: Optional[datetime] = None,
+                  day_complete: bool = False) -> dict:
+    """把 Portfolio 完整内存态序列化为 JSON 安全 dict（漏项=静默错账）。
+
+    as_of_bar_time：**日内时间游标**——本段最后处理的一根 bar 的时间戳。跨日接缝
+    用它之外的交易日做边界（次一交易日 00:00 起），同一交易日内续跑只喂
+    ``datetime > as_of_bar_time`` 的 bar，已处理 bar 绝不重放（否则信号/风控/成交
+    会被同一根 bar 驱动两次）。None = 旧 checkpoint（无游标，按整日边界处理）。
+    day_complete：该交易日是否已收到收盘 bar（见 ``_DAY_LAST_BAR_TIME``）。False
+    时同一天再次触达要接着往后跑，而不是直接判「当日已续跑」。
+    """
     positions: Dict[str, dict] = {}
     for ctx in portfolio.strategies:
         bucket: Dict[str, dict] = {}
@@ -259,6 +280,9 @@ def state_payload(portfolio: Portfolio, as_of_date: date,
             k: _dt(v) for k, v in portfolio._price_hist_last_t.items()},
         "pending_orders": [_order_to_dict(o) for o in (pending_orders or [])],
         "processed_bar_date": as_of_date.isoformat(),
+        # 接缝粒度 = 交易日 + 日内时间游标（见函数 docstring）
+        "as_of_bar_time": _dt(as_of_bar_time),
+        "day_complete": bool(day_complete),
     }
 
 
@@ -578,6 +602,62 @@ def fast_path_allowed(as_of: Optional[date], today: date, periods,
     return (not plan["rebuild_from_seam"]) and plan["dates"] == [today]
 
 
+def _slice_klines_after(klines: dict, cursor: datetime) -> dict:
+    """引擎视野切片：只保留 ``datetime > cursor`` 的 bar（同一交易日内的续跑）。
+
+    cursor = checkpoint 里记录的日内时间游标（最后已处理 bar 的时间戳）。同日
+    再触发时游标之前的 bar 已经驱动过信号/风控/成交，重放会把同一根 bar 算两次
+    （接缝重复计入）。跨日续跑不走此函数（整段都是新 bar）。
+    """
+    result: dict = {}
+    for code, periods in klines.items():
+        per: dict = {}
+        for period, df in periods.items():
+            if "datetime" not in df.columns:
+                continue
+            sliced = df.filter(pl.col("datetime") > cursor)
+            if sliced.height > 0:
+                per[period] = sliced
+        if per:
+            result[code] = per
+    return result
+
+
+def _max_bar_time(klines: dict) -> Optional[datetime]:
+    """klines 里最晚的 bar 时间戳（= 本段最后处理的那一根）。"""
+    latest: Optional[datetime] = None
+    for periods in klines.values():
+        for df in periods.values():
+            if "datetime" not in df.columns:
+                continue
+            for t in df["datetime"].to_list():
+                if t is not None and (latest is None or t > latest):
+                    latest = t
+    return latest
+
+
+def _checkpoint_done(ckpt, today: date) -> bool:
+    """checkpoint 是否已推进到 ``today`` 且当日已收满（调度器跳过判据）。
+
+    - 早于今天 → 未完成；
+    - 晚于今天 → 已完成（异常态，按完成处理避免空转）；
+    - 同一天 → 看 ``day_complete``：分钟级策略盘中续跑过（游标只到 11:00 之类）
+      时当日尚未收满，15:10 还必须再跑一次补齐余下 bar。旧/损坏 checkpoint 无该
+      字段 → 按已完成处理（等同于改动前行为），由 run_incremental 自行作废重建。
+    """
+    if ckpt is None:
+        return False
+    if ckpt.as_of_date > today:
+        return True
+    if ckpt.as_of_date < today:
+        return False
+    try:
+        state = json.loads(ckpt.state_json or "{}")
+    except (TypeError, ValueError):
+        return True
+    return bool((state or {}).get("day_complete", True))
+
+
 # ---------------------------------------------------------------- 接缝锚定
 def capture_seam(db: Session, session_id: int, engine, today: Optional[date] = None) -> None:
     """实盘启动（recover 之后）写入接缝日与起账状态；已写定则不覆盖。"""
@@ -869,16 +949,39 @@ def evaluate_alignment(inc_rows: dict, full_rows: dict, tolerances: dict) -> dic
 
 # ---------------------------------------------------------------- 实盘侧重放
 def _close_map(klines: dict) -> Dict[str, Dict[date, Decimal]]:
+    """每 code 的「逐日收盘价」：优先 ``1d``，缺失时回落到分钟周期当日最后一根。
+
+    分钟级策略的 klines 通常不含 ``1d``（只拉策略自身周期）。实盘侧逐日估值若仍
+    只读 ``1d``，会退化成「最近成交价/成本」估值，与续跑侧（日终估值步 = 当日
+    最后一根 bar 的 close）产生成倍虚假净值偏差。回落口径与回测日终估值步同源：
+    取当日时间戳最晚的一根 bar 的 Close（同时间戳并列时取更细周期）。
+    """
     out: Dict[str, Dict[date, Decimal]] = {}
     for code, periods in klines.items():
         df = periods.get("1d")
-        if df is None or "datetime" not in df.columns:
+        if df is not None and "datetime" in df.columns:
+            m: Dict[date, Decimal] = {}
+            for t, c in zip(df["datetime"].to_list(), df["Close"].to_list()):
+                if c is not None and c > 0:
+                    m[t.date()] = Decimal(str(c))
+            out[code] = m
             continue
-        m: Dict[date, Decimal] = {}
-        for t, c in zip(df["datetime"].to_list(), df["Close"].to_list()):
-            if c is not None and c > 0:
-                m[t.date()] = Decimal(str(c))
-        out[code] = m
+        # 无日线：按「当日最晚时间戳」求收盘（细→粗遍历，并列时细周期先占位）
+        last_dt: Dict[date, datetime] = {}
+        m = {}
+        for period in ("1m", "5m", "15m", "30m", "1h", "60m", "1w", "1mon"):
+            pdf = periods.get(period)
+            if pdf is None or "datetime" not in pdf.columns:
+                continue
+            for t, c in zip(pdf["datetime"].to_list(), pdf["Close"].to_list()):
+                if t is None or c is None or c <= 0:
+                    continue
+                d = t.date()
+                if d not in last_dt or t > last_dt[d]:
+                    last_dt[d] = t
+                    m[d] = Decimal(str(c))
+        if m:
+            out[code] = m
     return out
 
 
@@ -1000,7 +1103,8 @@ def run_incremental(db: Session, session_id: int, portfolio_strategy_id: int,
                     today: Optional[date] = None,
                     now: Optional[datetime] = None) -> dict:
     """续跑一个组合策略到 ``today``（默认上海今天）。"""
-    today = today or datetime.now(_TZ).date()
+    now = now or datetime.now(_TZ)
+    today = today or now.date()
     cfg = _cfg()
     with _INCR_LOCK:
         return _run_incremental_locked(db, session_id, portfolio_strategy_id,
@@ -1023,13 +1127,10 @@ def _run_incremental_locked(db: Session, session_id: int,
         return {"status": "error", "reason": "组合策略不存在"}
 
     periods = _strategy_periods(ps, db)
-    unsupported = [p for p in periods if p not in _DAILY_PERIODS]
-    if unsupported:
-        return {
-            "status": "unsupported",
-            "reason": "分钟级策略（%s）续跑语义未定，本期不支持"
-                      % "/".join(unsupported),
-        }
+    # 分钟级策略走同一条续跑路径（引擎按周期路由 + 状态序列化与日线一致）。
+    # intraday=True 时才启用「同一交易日内按游标续跑」；纯日线组合保持旧语义
+    # （同一交易日重复触达一律「当日已续跑」，逐字不变）。
+    intraday = any(p not in _DAILY_PERIODS for p in periods)
     strategies = (
         db.query(Strategy).filter_by(portfolio_id=ps.id).order_by(Strategy.id).all()
     )
@@ -1077,10 +1178,19 @@ def _run_incremental_locked(db: Session, session_id: int,
             state = None
 
     as_of = date.fromisoformat(state["as_of_date"]) if state else None
-    # 幂等：当日已续跑过就跳过
+    as_of_bar = _pdt((state or {}).get("as_of_bar_time"))
+    # 幂等：当日（或更晚）已续跑过就跳过。分钟级例外：``day_complete=False`` 表示
+    # 上一轮只跑到盘中某根 bar（如 11:00 手工触发），必须接着补余下 bar，不能跳过。
+    done_today = bool((state or {}).get("day_complete", True))
     if as_of is not None and as_of >= today:
-        return {"status": "ok", "as_of_date": as_of.isoformat(),
-                "days": 0, "note": "当日已续跑"}
+        if (as_of > today or not intraday or done_today):
+            return {"status": "ok", "as_of_date": as_of.isoformat(),
+                    "days": 0, "note": "当日已续跑"}
+    # 同一交易日内的游标续跑（只喂 datetime > as_of_bar 的 bar，不重放已处理 bar）。
+    # 跨日续跑走整日边界（次一交易日 00:00 起），无需重放当天分钟 bar。
+    continue_intraday = (
+        state is not None and as_of is not None and as_of_bar is not None
+        and as_of >= today and not done_today)
 
     handoff = take_daily_bars(session_id, today)
     fast_path = fast_path_allowed(
@@ -1096,7 +1206,13 @@ def _run_incremental_locked(db: Session, session_id: int,
         klines_all = _klines_from_handoff(handoff)
         run_from = today
     else:
-        range_start = link.seam_date if state is None else as_of + timedelta(days=1)
+        if state is None:
+            range_start = link.seam_date
+        elif continue_intraday:
+            # 同一交易日续跑：从游标所在交易日重新取数，稍后按游标切掉已处理 bar
+            range_start = as_of
+        else:
+            range_start = as_of + timedelta(days=1)
         klines_all = build_klines(ps, range_start, today, db,
                                   dividend_mode=accounting_mode)
         run_from = range_start
@@ -1125,9 +1241,15 @@ def _run_incremental_locked(db: Session, session_id: int,
             run_from = link.seam_date
 
     if not klines_all:
-        return {"status": "skipped", "reason": "无可用日线数据（今日 bar 未落盘？）"}
+        return {"status": "skipped", "reason": "无可用 K 线数据（今日 bar 未落盘？）"}
 
     klines = _slice_klines_from(klines_all, run_from)
+    if continue_intraday and as_of_bar is not None:
+        # 同一交易日续跑：游标之前的 bar 已经驱动过信号/风控/成交，绝不重放
+        klines = _slice_klines_after(klines, as_of_bar)
+        if not klines:
+            return {"status": "ok", "as_of_date": as_of_bar.date().isoformat(),
+                    "days": 0, "note": "游标之后无新增 bar"}
     if not klines:
         return {"status": "skipped", "reason": "续跑区间无 K 线"}
 
@@ -1155,8 +1277,18 @@ def _run_incremental_locked(db: Session, session_id: int,
 
     new_dates = sorted({s["snap_date"] for s in snaps})
     as_of_new = new_dates[-1]
+    # 接缝粒度 = 交易日 + 日内游标：游标取本段最后处理的那根 bar 时间戳。
+    # day_complete 判定「该交易日是否已收到收盘 bar」：分钟级盘中续跑（如 11:00）
+    # 只到 11:00 → False，同一天再触发会从游标接着往后跑；纯日线组合恒 True
+    # （日线只有一根 bar，与改动前「当日已续跑」语义逐字一致）。
+    last_bar = _max_bar_time(klines)
+    day_complete = (not intraday) or bool(
+        last_bar is not None and last_bar.date() >= today
+        and last_bar.time() >= _DAY_LAST_BAR_TIME)
     payload = state_payload(portfolio, as_of_new,
-                            pending_orders=result.get("pending_orders"))
+                            pending_orders=result.get("pending_orders"),
+                            as_of_bar_time=last_bar,
+                            day_complete=day_complete)
     payload["schema_fp"] = want_schema_fp
     # 口径分项随 checkpoint 落盘：下次作废时据此定位「引擎版本/复权模式/成本口径」
     # 具体哪一项变了（旧 checkpoint 无该字段 → 日志退化为笼统原因）。
@@ -1179,6 +1311,15 @@ def _run_incremental_locked(db: Session, session_id: int,
     live = _live_rows(db, link, new_dates, closes)
     inc_dirs = _inc_trades_by_day(result.get("trades") or [], new_dates)
     tol = _tolerances(cfg)
+    # 同日游标续跑：当日已有「游标之前」的成交方向记录，本段只含游标之后的成交，
+    # 直接覆盖会让当日笔数偏少（与实盘侧对不上）。这里与既有行合并成整日口径。
+    prev_days: Dict[date, IncrementalBacktestDay] = {}
+    if continue_intraday:
+        for row in db.query(IncrementalBacktestDay).filter(
+                IncrementalBacktestDay.session_id == session_id,
+                IncrementalBacktestDay.portfolio_strategy_id == ps_id,
+                IncrementalBacktestDay.trade_date.in_(new_dates)).all():
+            prev_days[row.trade_date] = row
 
     for snap in snaps:
         d = snap["snap_date"]
@@ -1190,11 +1331,19 @@ def _run_incremental_locked(db: Session, session_id: int,
         denom = max(abs(live_total), Decimal("1"))
         dev = float(abs(inc_total - live_total) / denom) * 100.0
         inc_d = inc_dirs.get(d, [])
+        if d in prev_days:
+            try:
+                inc_d = list(json.loads(prev_days[d].inc_dirs_json or "[]")) + inc_d
+            except (TypeError, ValueError):
+                pass
         live_d = lv.get("dirs", [])
         direction_match = inc_d == live_d
         tags: List[str] = []
         if d in gap_dates:
             tags.append("gap")
+        if not day_complete and d >= today:
+            # 当日收盘 bar 未到：这一行是盘中口径（当日后续续跑会覆盖）
+            tags.append("intraday")
         if dev > tol["max_net_dev_pct"]:
             tags.append("net_dev")
         if len(inc_d) != len(live_d):
@@ -1277,14 +1426,6 @@ def run_validation(db: Session, session_id: int, ps_id: int,
         ps = db.query(PortfolioStrategy).filter_by(id=ps_id).first()
         if ps is None:
             return {"status": "error", "reason": "组合策略不存在"}
-        unsupported = [p for p in _strategy_periods(ps, db)
-                       if p not in _DAILY_PERIODS]
-        if unsupported:
-            return {
-                "status": "error",
-                "reason": "分钟级策略（%s）续跑语义未定，本期不支持双跑校验"
-                          % "/".join(unsupported),
-            }
         from_date = from_date or link.seam_date
         strategies = (
             db.query(Strategy).filter_by(portfolio_id=ps.id)
@@ -1400,16 +1541,29 @@ def run_validation(db: Session, session_id: int, ps_id: int,
 
 
 # ---------------------------------------------------------------- 查询汇总
+def _checkpoint_summary(ckpt) -> dict:
+    """checkpoint 的可读摘要（含接缝粒度：交易日 + 日内游标）。"""
+    try:
+        state = json.loads(ckpt.state_json or "{}") or {}
+    except (TypeError, ValueError):
+        state = {}
+    return {
+        "seam_date": ckpt.seam_date.isoformat(),
+        "as_of_date": ckpt.as_of_date.isoformat(),
+        # 分钟级盘中续跑后能看出跑到哪一根 bar（None = 旧 checkpoint 无游标）
+        "as_of_bar_time": state.get("as_of_bar_time"),
+        "day_complete": bool(state.get("day_complete", True)),
+        "params_hash": ckpt.params_hash,
+        "schema_version": ckpt.schema_version,
+        "updated_at": _dt(ckpt.updated_at),
+    }
+
+
 def summary(db: Session, session_id: int, ps_id: int) -> dict:
     ps = db.query(PortfolioStrategy).filter_by(id=ps_id).first()
-    periods = _strategy_periods(ps, db) if ps is not None else []
-    unsupported = [p for p in periods if p not in _DAILY_PERIODS]
-    supported = ps is not None and not unsupported
-    reason = ""
-    if ps is None:
-        reason = "组合策略不存在"
-    elif unsupported:
-        reason = "分钟级策略（%s）续跑语义未定，本期不支持" % "/".join(unsupported)
+    # 分钟级与日线同一条续跑路径（接缝粒度 = 交易日 + 日内游标），故只看组合是否存在。
+    supported = ps is not None
+    reason = "" if ps is not None else "组合策略不存在"
 
     link = (
         db.query(LiveSessionPortfolio)
@@ -1440,13 +1594,7 @@ def summary(db: Session, session_id: int, ps_id: int) -> dict:
         "reason": reason,
         "seam_date": link.seam_date.isoformat() if link and link.seam_date else None,
         "seam_cash": str(link.seam_cash) if link and link.seam_cash is not None else None,
-        "checkpoint": None if ckpt is None else {
-            "seam_date": ckpt.seam_date.isoformat(),
-            "as_of_date": ckpt.as_of_date.isoformat(),
-            "params_hash": ckpt.params_hash,
-            "schema_version": ckpt.schema_version,
-            "updated_at": _dt(ckpt.updated_at),
-        },
+        "checkpoint": None if ckpt is None else _checkpoint_summary(ckpt),
         "days": [{
             "trade_date": r.trade_date.isoformat(),
             "inc_total_value": str(r.inc_total_value) if r.inc_total_value is not None else None,
@@ -1568,7 +1716,7 @@ class IncrementalBacktestScheduler:
                         portfolio_strategy_id=link.portfolio_strategy_id)
                     .first()
                 )
-                if ckpt is not None and ckpt.as_of_date >= today:
+                if _checkpoint_done(ckpt, today):
                     continue
                 try:
                     run_incremental(

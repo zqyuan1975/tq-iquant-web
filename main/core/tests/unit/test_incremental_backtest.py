@@ -350,16 +350,297 @@ def test_evaluate_alignment_pass_and_fail():
     assert fail_res["first_divergence_date"] == date(2026, 1, 6)
 
 
-# ---------------------------------------------------------------- 7. 不支持场景
-def test_minute_strategy_is_unsupported(db_session):
-    sess, ps, link = _seed_live_link(db_session)
-    # 把策略周期改成 5m
-    db_session.query(Strategy).filter_by(portfolio_id=ps.id).update(
-        {"period": "5m"})
+# ---------------------------------------------------------------- 7. 分钟级续跑
+# 日内 bar 序列（bar 时间戳 = bar 终点，与 TDX/快照合成口径一致）：
+# 含跨午休（11:30 → 13:05）与收盘前最后一根（15:00）。
+_MINUTE_TIMES = ((9, 35), (10, 30), (11, 30), (13, 5), (14, 0), (15, 0))
+
+
+def _minute_klines(days, price=Decimal("10"), period="5m"):
+    rows = []
+    for d in days:
+        for h, m in _MINUTE_TIMES:
+            rows.append({
+                "datetime": datetime(d.year, d.month, d.day, h, m),
+                "Open": price, "High": price, "Low": price, "Close": price,
+                "Volume": 100000,
+            })
+    return {"000001.SZ": {period: pl.DataFrame(rows)}}
+
+
+def _minute_sig_cache(strategy_id, times, code="000001.SZ", name="open_sig"):
+    return {(strategy_id, code, t): [{"name": name, "value": 1}]
+            for t in times}
+
+
+def _seed_minute_link(db, period="5m"):
+    """组合 + 策略周期 = 分钟级 + 一条 OPEN 公式信号（供 signal_cache 命中）。"""
+    sess, ps, link = _seed_live_link(db)
+    strat = db.query(Strategy).filter_by(portfolio_id=ps.id).first()
+    strat.period = period
+    db.add(FormulaSignal(formula_id=1, signal_name="open_sig",
+                         signal_type="OPEN", trigger_value=1))
+    link.seam_date = date(2026, 1, 5)
+    link.seam_cash = Decimal("100000")
+    link.seam_positions_json = "[]"
+    link.seam_trade_cursor = 0
+    db.commit()
+    return sess, ps, link, strat
+
+
+def _seed_minute_checkpoint(db, sess, ps, as_of, as_of_bar=None,
+                            day_complete=False):
+    """落一个「已跑到 as_of 某根 bar」的 checkpoint（省略则整日已跑完）。"""
+    dm = ib._cfg().get("dividend_mode", "dual")
+    fp = ib.params_fingerprint(ps, dm, db)
+    port = _make_portfolio(cash="100000", period="5m")
+    state = ib.state_payload(port, as_of, pending_orders=[],
+                             as_of_bar_time=as_of_bar,
+                             day_complete=day_complete)
+    state["schema_fp"] = ib.schema_fingerprint(dm)
+    state["params_fp_parts"] = fp["parts"]
+    db.add(IncrementalBacktestCheckpoint(
+        session_id=sess.id, portfolio_strategy_id=ps.id, seam_date=as_of,
+        as_of_date=as_of, state_json=json.dumps(state),
+        params_hash=fp["hash"], schema_version=ib.SCHEMA_VERSION))
+    db.commit()
+    return port
+
+
+def _ckpt_state(db, sess, ps):
+    ckpt = (
+        db.query(IncrementalBacktestCheckpoint)
+        .filter_by(session_id=sess.id, portfolio_strategy_id=ps.id)
+        .first()
+    )
+    return json.loads(ckpt.state_json)
+
+
+def test_minute_strategy_incremental_supported_with_intraday_cursor(
+        db_session, monkeypatch):
+    """分钟级策略不再判 unsupported；checkpoint 落「交易日 + 日内游标」。"""
+    sess, ps, link, strat = _seed_minute_link(db_session)
+    t = datetime(2026, 1, 5, 10, 30)
+    monkeypatch.setattr(ib, "build_klines",
+                        lambda *a, **k: _minute_klines([date(2026, 1, 5)]))
+    monkeypatch.setattr(ib, "build_signal_cache",
+                        lambda *a, **k: _minute_sig_cache(strat.id, [t]))
+
+    result = ib.run_incremental(
+        db_session, sess.id, ps.id, today=date(2026, 1, 5))
+    assert result["status"] == "ok"
+    assert result["days"] == 1
+    state = _ckpt_state(db_session, sess, ps)
+    assert state["as_of_date"] == "2026-01-05"
+    assert state["as_of_bar_time"] == "2026-01-05T15:00:00"
+    assert state["day_complete"] is True
+    # summary 也把 supported 放开（前端不再显示「本期不支持」）
+    assert ib.summary(db_session, sess.id, ps.id)["supported"] is True
+
+
+def test_minute_resume_matches_full_run_and_no_double_count():
+    """分段续跑 = 全量重跑：净值逐字相等，接缝日成交不重复计入。"""
+    days = [date(2026, 1, 5), date(2026, 1, 6), date(2026, 1, 7)]
+    code = "000001.SZ"
+    kl = _minute_klines(days)
+    t1 = datetime(2026, 1, 5, 10, 30)   # 第 1 日开仓
+    t3 = datetime(2026, 1, 7, 10, 30)   # 第 3 日清仓（成交落在下一根 bar）
+    sig = {}
+    sig.update(_minute_sig_cache(1, [t1], name="open_sig"))
+    sig.update(_minute_sig_cache(1, [t3], name="close_sig"))
+
+    def _port():
+        p = _make_portfolio(period="5m")
+        p.strategies[0].formula_signals.append({
+            "signal_name": "close_sig", "signal_type": SignalType.CLOSE,
+            "trigger_value": 1,
+        })
+        return p
+
+    full = _port()
+    full_result = BacktestEngine().run(
+        full, klines={code: {"5m": kl[code]["5m"]}}, signal_cache=dict(sig))
+    full_day3 = [s for s in full_result["snapshots"]
+                 if s["snap_date"] == days[2]][0]["total_value"]
+    full_day3_trades = [x for x in full_result["trades"]
+                        if x.trade_time.date() == days[2]]
+    assert len(full_day3_trades) == 1
+
+    part = _port()
+    first = BacktestEngine().run(
+        part,
+        klines={code: {"5m": kl[code]["5m"].filter(
+            pl.col("datetime") < datetime(2026, 1, 7))}},
+        signal_cache=dict(sig))
+    payload = ib.state_payload(
+        part, days[1], pending_orders=first["pending_orders"],
+        as_of_bar_time=datetime(2026, 1, 6, 15, 0), day_complete=True)
+
+    resumed = _port()
+    pending = ib.restore_portfolio(resumed, payload)
+    tail = BacktestEngine().run(
+        resumed,
+        klines={code: {"5m": kl[code]["5m"].filter(
+            pl.col("datetime") >= datetime(2026, 1, 7))}},
+        signal_cache={(1, code, t3): [{"name": "close_sig", "value": 1}]},
+        initial_pending_orders=pending)
+    day3 = [s for s in tail["snapshots"] if s["snap_date"] == days[2]][0]
+    day3_trades = [x for x in tail["trades"]
+                   if x.trade_time.date() == days[2]]
+
+    assert Decimal(str(day3["total_value"])) == Decimal(str(full_day3)), (
+        "full=%s tail=%s | full_trades=%s tail_trades=%s"
+        % (full_day3, day3["total_value"],
+           [(t.trade_type.value, t.quantity, t.price, t.trade_time)
+            for t in full_result["trades"]],
+           [(t.trade_type.value, t.quantity, t.price, t.trade_time)
+            for t in tail["trades"]]))
+    # 接缝日只成交 1 笔（不是 2 笔）：没有把上一段的成交/信号重放一次
+    assert len(day3_trades) == 1
+    assert len(day3_trades) == len(full_day3_trades)
+    assert day3_trades[0].price == full_day3_trades[0].price
+
+
+def test_minute_intraday_cursor_does_not_replay_processed_bars(
+        db_session, monkeypatch):
+    """同一交易日按游标续跑：游标之前的 bar 不重放，当日成交明细合并成整日口径。"""
+    sess, ps, link, strat = _seed_minute_link(db_session)
+    d = date(2026, 1, 5)
+    # 上午那轮只跑到 11:30（day_complete=False）
+    _seed_minute_checkpoint(db_session, sess, ps, as_of=d,
+                            as_of_bar=datetime(2026, 1, 5, 11, 30),
+                            day_complete=False)
+    # 当日已有上午的成交记录（BUY），续跑后应与下午的成交合并
+    db_session.add(IncrementalBacktestDay(
+        session_id=sess.id, portfolio_strategy_id=ps.id, trade_date=d,
+        inc_total_value=Decimal("100000"), inc_cash=Decimal("98995"),
+        inc_market_value=Decimal("1000"), live_total_value=Decimal("100000"),
+        inc_trades_count=1, live_trades_count=1,
+        inc_dirs_json=json.dumps(["BUY"]), direction_match=True, status="ok"))
     db_session.commit()
-    result = ib.run_incremental(db_session, sess.id, ps.id)
-    assert result["status"] == "unsupported"
-    assert "分钟级" in result["reason"]
+
+    before = datetime(2026, 1, 5, 10, 30)   # 游标之前（重放才会产生成交）
+    after = datetime(2026, 1, 5, 13, 5)     # 游标之后
+    monkeypatch.setattr(ib, "build_klines",
+                        lambda *a, **k: _minute_klines([d]))
+    monkeypatch.setattr(
+        ib, "build_signal_cache",
+        lambda *a, **k: _minute_sig_cache(strat.id, [before, after]))
+
+    result = ib.run_incremental(db_session, sess.id, ps.id, today=d)
+    assert result["status"] == "ok"
+    state = _ckpt_state(db_session, sess, ps)
+    # 游标推进到当日收盘，并标记当日已收满（否则 15:10 调度会跳过）
+    assert state["as_of_bar_time"] == "2026-01-05T15:00:00"
+    assert state["day_complete"] is True
+
+    row = (
+        db_session.query(IncrementalBacktestDay)
+        .filter_by(session_id=sess.id, portfolio_strategy_id=ps.id,
+                   trade_date=d).first()
+    )
+    # 只有游标之后那一根触发成交（上午那根没被重放），且与既有行合并
+    assert json.loads(row.inc_dirs_json) == ["BUY", "000001.SZ:BUY"]
+    assert row.inc_trades_count == 2
+
+
+def test_minute_incremental_detects_gap_and_rebuilds_from_seam(
+        db_session, monkeypatch):
+    """分钟级断档：中间交易日不得静默跳过（超补跑上限 → 从接缝日重建）。"""
+    sess, ps, link, strat = _seed_minute_link(db_session)
+    as_of = date(2026, 1, 5)
+    _seed_minute_checkpoint(db_session, sess, ps, as_of=as_of,
+                            as_of_bar=datetime(2026, 1, 5, 15, 0),
+                            day_complete=True)
+    days = [date(2026, 1, 5), date(2026, 1, 6), date(2026, 1, 7),
+            date(2026, 1, 8), date(2026, 1, 9), date(2026, 1, 12),
+            date(2026, 1, 13)]
+    monkeypatch.setattr(ib, "build_klines", lambda *a, **k: _minute_klines(days))
+    monkeypatch.setattr(ib, "build_signal_cache",
+                        lambda *a, **k: _minute_sig_cache(strat.id, []))
+
+    result = ib.run_incremental(
+        db_session, sess.id, ps.id, today=date(2026, 1, 13))
+    assert result["status"] == "ok"
+    assert result["gap_days"] > 0
+    rows = (
+        db_session.query(IncrementalBacktestDay)
+        .filter_by(session_id=sess.id, portfolio_strategy_id=ps.id)
+        .all()
+    )
+    # 中间交易日一个都不能少（gap 只是标记，不是跳过）
+    assert sorted(r.trade_date for r in rows) == days
+
+
+def test_minute_checkpoint_invalidated_by_params_change(db_session, monkeypatch):
+    """分钟级 checkpoint 同样受参数指纹闸约束（参数变更 → 作废重建）。"""
+    sess, ps, link, strat = _seed_minute_link(db_session)
+    _seed_minute_checkpoint(db_session, sess, ps, as_of=date(2026, 1, 5),
+                            as_of_bar=datetime(2026, 1, 5, 15, 0),
+                            day_complete=True)
+    strat.stop_loss_ratio = Decimal("0.09")
+    db_session.commit()
+    monkeypatch.setattr(
+        ib, "build_klines",
+        lambda *a, **k: _minute_klines([date(2026, 1, 5), date(2026, 1, 6)]))
+    monkeypatch.setattr(ib, "build_signal_cache",
+                        lambda *a, **k: _minute_sig_cache(strat.id, []))
+
+    result = ib.run_incremental(
+        db_session, sess.id, ps.id, today=date(2026, 1, 6))
+    assert result["status"] == "ok"
+    assert result["checkpoint_invalidated"]
+    assert result["checkpoint_invalidated"]["from_as_of"] == "2026-01-05"
+    rows = (
+        db_session.query(IncrementalBacktestDay)
+        .filter_by(session_id=sess.id, portfolio_strategy_id=ps.id)
+        .all()
+    )
+    # 作废后从接缝日（1/5）重建，两日都在
+    assert sorted(r.trade_date for r in rows) == [date(2026, 1, 5),
+                                                  date(2026, 1, 6)]
+
+
+def test_checkpoint_done_requires_day_complete_for_intraday():
+    """调度跳过判据：盘中续跑过的当日 checkpoint 不算完成（15:10 还要补跑）。"""
+    from types import SimpleNamespace
+
+    today = date(2026, 1, 5)
+
+    def _ckpt(as_of, state):
+        return SimpleNamespace(as_of_date=as_of, state_json=json.dumps(state))
+
+    assert ib._checkpoint_done(
+        _ckpt(today, {"day_complete": False}), today) is False
+    assert ib._checkpoint_done(
+        _ckpt(today, {"day_complete": True}), today) is True
+    # 旧 checkpoint 无该字段 → 按已完成处理（与改动前行为一致）
+    assert ib._checkpoint_done(_ckpt(today, {}), today) is True
+    assert ib._checkpoint_done(
+        _ckpt(date(2026, 1, 4), {}), today) is False
+    assert ib._checkpoint_done(None, today) is False
+
+
+def test_minute_validation_supported_and_small_sample_exempt(
+        db_session, monkeypatch):
+    """分钟级双跑校验不再判 unsupported；小样本笔数/方向一致率判 None。"""
+    sess, ps, link, strat = _seed_minute_link(db_session)
+    days = [date(2026, 1, 5), date(2026, 1, 6)]
+    t = datetime(2026, 1, 5, 10, 30)
+    monkeypatch.setattr(ib, "build_klines", lambda *a, **k: _minute_klines(days))
+    monkeypatch.setattr(ib, "build_signal_cache",
+                        lambda *a, **k: _minute_sig_cache(strat.id, [t]))
+
+    inc = ib.run_incremental(
+        db_session, sess.id, ps.id, today=date(2026, 1, 6))
+    assert inc["status"] == "ok"
+    res = ib.run_validation(db_session, sess.id, ps.id,
+                            from_date=date(2026, 1, 5),
+                            to_date=date(2026, 1, 6))
+    assert res["status"] == "pass"
+    assert res["trade_count_match_ratio"] is None
+    assert res["direction_match_ratio"] is None
+    assert res["small_sample"] is True
 
 
 # ---------------------------------------------------------------- 8. 参数指纹
