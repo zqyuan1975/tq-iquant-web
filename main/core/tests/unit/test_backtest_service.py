@@ -974,6 +974,10 @@ def test_build_params_snapshot_includes_dividend_mode():
     snap = json.loads(svc.build_params_snapshot(ps, dividend_mode="back"))
     assert snap["dividend_mode"] == "back"
     assert snap["benchmark_index"] == "000300.SH"
+    # 取数窗口起点随快照冻结：跨记录比价前先确认复权基准同源
+    snap2 = json.loads(svc.build_params_snapshot(
+        ps, dividend_mode="back", data_start="2015-01-05"))
+    assert snap2["data_start_date"] == "2015-01-05"
 
 
 def test_build_index_close_series_batches_codes_and_skips_missing(monkeypatch):
@@ -1853,6 +1857,10 @@ _SNAPSHOT_KEYS = {
     "bond_t0_enabled", "bond_lot_enabled",
     "daily_close_peak_enabled",
     "daily_loss_basis",
+    # 风控卖出后冷静期（修复 5，PortfolioStrategy 列自动进快照）
+    "risk_cooldown_days",
+    # 取数窗口起点（复权基准同源确认用）
+    "data_start_date",
 }
 
 _NO_TRADES_RESULT = {

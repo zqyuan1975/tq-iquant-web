@@ -20,7 +20,7 @@ from .market_rules import (  # noqa: F401
     session_allows_bar,
     trading_days_between,
 )
-from tq_iquant_shared.constants import TradeType
+from tq_iquant_shared.constants import SignalType, TradeType
 
 logger = logging.getLogger(__name__)
 
@@ -42,6 +42,12 @@ _PERIOD_ORDER: Dict[str, int] = {
 # 峰值会造成前视（max_drawdown 提前/错误触发）。故这类 bar 只在「日终估值步」
 # 才允许抬峰（纯日线/周线/月线回测里该步就是日终步，行为不变）。
 _COARSE_PERIODS = ("1d", "1w", "1mon")
+# 风控卖出信号类型（回测侧在途卖单去重键与实盘 inflight_sell 同口径）：
+# 同一 (策略, 代码, SELL) 存在未结清的风控卖单（含缩量未成交残量）时，
+# 不重复产生 trigger 事件与订单，残量由原单继续分批成交。
+_RISK_SELL_TYPES = frozenset({
+    SignalType.STOP_LOSS, SignalType.TAKE_PROFIT, SignalType.TRAILING_STOP,
+})
 
 
 class BacktestEngine:
@@ -199,6 +205,9 @@ class BacktestEngine:
                 # t.date() > signal_bar_date 的下一交易日成交，防止当日 00:00
                 # 日线 bar 的信号在当日 09:30 分钟 bar 成交。未满足的订单延后。
                 for order in pending_orders:
+                    # 风控卖单缩量前的原始委托量：成交不足时残量回队续卖
+                    # （对齐实盘 inflight_sell：一次触发 + 缩量分批成交）。
+                    risk_sell_original = None
                     # W4 周期路由：订单只在其所属周期的 bar 上成交（1d 单等下一根 1d bar，
                     # 5m 单等下一根 5m bar），非本周期延后——杜绝跨周期前视成交。
                     if order.period is not None and order.period != period:
@@ -351,6 +360,9 @@ class BacktestEngine:
                                                 % (order.quantity, cap_shares, bar_volume,
                                                    portfolio.volume_limit_ratio, final_qty),
                                     )
+                                    if (not is_buy
+                                            and order.signal_type in _RISK_SELL_TYPES):
+                                        risk_sell_original = order.quantity
                                     order.quantity = final_qty
                                 else:
                                     if id(order) not in volume_defer_recorded:
@@ -400,6 +412,27 @@ class BacktestEngine:
                         # 风控冷静期起算（与实盘共用 Portfolio.note_trade）：止损/止盈/
                         # 移动止损成交后登记 (策略, 代码) → 当日/后续 N 交易日禁开新仓。
                         portfolio.note_trade(trade)
+                    # 风控卖单缩量后残量不丢弃：挂回原单（quantity=剩余量）继续在
+                    # 后续 bar 分批成交。这样一笔风控触发只产生 1 次 trigger 事件，
+                    # 不会被下一根 bar 的风控检查重复触发（对齐实盘 inflight_sell）。
+                    if risk_sell_original is not None and trade is not None:
+                        remaining = (int(risk_sell_original)
+                                     - int(getattr(trade, "quantity", 0) or 0))
+                        if remaining > 0:
+                            order.quantity = remaining
+                            deferred.append(order)
+                            recorder.record(
+                                gate="risk_sell_residual", layer="execution",
+                                action="carry",
+                                portfolio_id=order.portfolio_id or 0,
+                                strategy_id=order.strategy_id,
+                                stock_code=order.stock_code,
+                                bar_time=t,
+                                requested_qty=remaining,
+                                message="风控卖单缩量成交 %d 股，续卖残量 %d 股挂在原单上"
+                                        "于后续 bar 分批成交（不重复触发风控）"
+                                        % (int(risk_sell_original) - remaining, remaining),
+                            )
 
             # 2. 构造 BarEvent（从预建索引 O(1) 查表；含当前周期标注）
             bar = self._build_bar(price_index, t, period)
@@ -414,7 +447,19 @@ class BacktestEngine:
             #    （bar_time=00:00）不受时段过滤——否则 am/pm 组合的日线回测会
             #    被整程跳过（session_allows_bar 的周期判定）。
             if session_allows_bar(portfolio.trading_session, t.time(), period):
-                new_orders = portfolio.on_bar(bar, signal_cache=signal_cache, period=period)
+                # 在途风控卖单去重（与实盘 inflight_sell 同口径）：deferred 里仍有
+                # 未结清的同 (策略, 代码, SELL) 风控单（含刚回队的缩量残量）时，
+                # 本 bar 不再重复评估风控/不重复发单，只让残量继续成交。
+                inflight_risk_sells: Dict[int, set] = {}
+                for _order in deferred:
+                    if (_order.trade_type == TradeType.SELL
+                            and _order.signal_type in _RISK_SELL_TYPES):
+                        inflight_risk_sells.setdefault(
+                            _order.strategy_id, set()).add(_order.stock_code)
+                new_orders = portfolio.on_bar(
+                    bar, signal_cache=signal_cache, period=period,
+                    inflight_risk_sells=inflight_risk_sells,
+                )
                 pending_orders = deferred + new_orders
             else:
                 pending_orders = deferred
@@ -514,6 +559,17 @@ class BacktestEngine:
             }
             for o in pending_orders
         ]
+        decision_dicts = [ev.to_dict() for ev in recorder.drain()]
+        # 修复 10 统计口径：triggered = 真实风控触发次数；fill_attempts = 风控卖单
+        # 实际成交笔数（缩量分批时 > triggered）。正常情况下 1 次触发可对应多笔
+        # 成交，但绝不会因「残量未卖完」重复触发。
+        risk_trigger_count = sum(
+            1 for d in decision_dicts
+            if d.get("layer") == "strategy_risk" and d.get("action") == "trigger"
+        )
+        risk_fill_attempts = sum(
+            1 for t in trades if getattr(t, "signal_type", None) in _RISK_SELL_TYPES
+        )
         return {
             "trades": trades,
             "snapshots": snapshots,
@@ -521,12 +577,15 @@ class BacktestEngine:
             "strategy_snapshots": strategy_snapshots,
             "strategy_evaluations": strategy_evaluations,
             # 决策闸门事件（止损/止盈/熔断/资金不足/超仓…逐触发一条），供落库与调参统计
-            "decisions": [ev.to_dict() for ev in recorder.drain()],
+            "decisions": decision_dicts,
             # 段末仍未成交的在途单（增量续跑写入 checkpoint，下一段继续尝试）
             "pending_orders": pending_orders,
             # D9 收尾统计：未成交信号数 + 摘要（服务层据此写 warnings）
             "pending_order_count": len(pending_orders),
             "pending_order_summary": pending_summary,
+            # 修复 10 汇总：风控触发次数 vs 风控卖单成交笔数（缩量分批可见）
+            "risk_sell_trigger_count": risk_trigger_count,
+            "risk_sell_fill_attempts": risk_fill_attempts,
         }
 
     def _exposure_kwargs(self, portfolio: Portfolio, ctx) -> dict:

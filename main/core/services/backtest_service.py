@@ -524,12 +524,18 @@ def build_params_snapshot(ps, dividend_mode: str = "front",
                           volume_limit_ratio=None,
                           equity_cap=None,
                           daily_close_peak_enabled: bool = False,
-                          daily_loss_basis: str = "equity") -> str:
+                          daily_loss_basis: str = "equity",
+                          data_start: str | None = None) -> str:
     payload = {
         field: _snapshot_value(getattr(ps, field, None))
         for field in PARAMS_SNAPSHOT_FIELDS
     }
     payload["dividend_mode"] = dividend_mode
+    # 复权基准随取数窗口变化（同一票同日，2015 起取数 vs 2023 起取数的后复权价
+    # 比值可达 0.3154，最大 25.7 倍）——不是缺陷，但跨记录比价必须确认同源。
+    # 落「本次取数起始日期 + 复权模式」，日后比对先看这两项是否一致。
+    if data_start:
+        payload["data_start_date"] = str(data_start)
     # run 级可选开关/覆盖冻结入快照，保证结果可复现：
     # 费用预留/可转债 T+0/转债 10 张（均默认关）；自适应滑点/成交量/容量 run 级覆盖（None=用组合默认）
     payload["fee_reserve_enabled"] = bool(fee_reserve_enabled)
@@ -3418,6 +3424,7 @@ def run_backtest(db: Session, ps: PortfolioStrategy, req,
             equity_cap=equity_cap,
             daily_close_peak_enabled=daily_close_peak_enabled,
             daily_loss_basis=daily_loss_basis,
+            data_start=req.start_date,
         ),
         evaluation_profile=evaluation_profile,
         is_oos_gate_enabled=is_oos_gate_enabled,

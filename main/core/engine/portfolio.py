@@ -362,6 +362,7 @@ class Portfolio:
         period: Optional[str] = None,
         inflight_opens: Optional[Dict[int, set]] = None,
         mismatched_risk: bool = False,
+        inflight_risk_sells: Optional[Dict[int, set]] = None,
     ) -> List[OrderEvent]:
         """处理一根 bar：取信号 + 风控检查 + 优先级排序 → 返回待执行订单列表。
 
@@ -380,6 +381,10 @@ class Portfolio:
         `live_sessions.intraday_mismatched_risk_enabled`（NULL 跟随全局
         `tq_trade.intraday_mismatched_risk_enabled`，默认 False）解析后传入；
         14:51 提前收盘价轮次同样显式传 False）。
+        inflight_risk_sells：strategy_id → 在途未结清的风控卖单股票集合（回测
+        BacktestEngine 从 deferred 队列注入，含缩量未成交残量）。命中时该票本 bar
+        只刷新峰值、不再评估风控、不重复产生 trigger 事件与订单——残量由原单在
+        后续 bar 继续分批成交（对齐实盘 `inflight_sell` 去重语义）。默认 None=旧行为。
         """
         # 工作副本：本 bar 处理过程中每排一个 OPEN 就地登记，同 bar 后续信号可见
         inflight: Dict[int, set] = {
@@ -398,6 +403,7 @@ class Portfolio:
             self._feed_price_history(bar, rot_cap + 2)
         orders: List[OrderEvent] = []
         for ctx in self.strategies:
+            skip_risk = (inflight_risk_sells or {}).get(ctx.strategy_id) or set()
             if period is not None and ctx.period != period:
                 # 周期不匹配：默认只更新价格快照，公式信号仍锁策略周期（W4 防
                 # 混合周期前视语义不变）。mismatched_risk=True 时才按当前 bar 价
@@ -406,9 +412,11 @@ class Portfolio:
                 # 默认 False 两端同口径（AGENTS「错周期风控默认关闭」）。
                 if mismatched_risk:
                     orders.extend(self._process_strategy(
-                        ctx, bar, signal_cache, inflight, include_signals=False))
+                        ctx, bar, signal_cache, inflight, include_signals=False,
+                        skip_risk_codes=skip_risk))
                 continue
-            strat_orders = self._process_strategy(ctx, bar, signal_cache, inflight)
+            strat_orders = self._process_strategy(
+                ctx, bar, signal_cache, inflight, skip_risk_codes=skip_risk)
             orders.extend(strat_orders)
             # follow_master 状态镜像：slave 处理完自身信号后，对"master 已不再持有"的
             # 持仓股全平（本 bar 已自行卖出的股票去重）。以 master 的已成交持仓为准，
@@ -493,19 +501,22 @@ class Portfolio:
     def _process_strategy(
         self, ctx: StrategyContext, bar: BarEvent, signal_cache,
         inflight: Dict[int, set], include_signals: bool = True,
+        skip_risk_codes: Optional[set] = None,
     ) -> List[OrderEvent]:
         """单策略 bar 处理：公式信号 + 风控检查 → 合并排序 → 转订单。
 
         include_signals=False（周期解耦盘中风控）：跳过公式信号评估，仅产出
         风控单——非本策略周期的 bar 到来时按当前 bar 价核算止损/止盈/移动止损
         （实盘快照合成 1m bar 盘中风控；信号周期锁不受影响）。
+        skip_risk_codes：在途风控卖单未结清的股票（含缩量残量）→ 跳过风控评估，
+        避免同一持仓重复触发；峰值仍由 _check_risks_locked 内部刷新。
         """
         signals = (
             ctx.get_signal(bar, signal_cache=signal_cache)
             if include_signals else []
         )
         # 风控检查：对每只持仓股票检查止损/止盈/移动止损
-        risk_signals = self._check_risks(ctx, bar)
+        risk_signals = self._check_risks(ctx, bar, skip_codes=skip_risk_codes)
 
         # 合并并按优先级排序：风控优先，公式按 CLOSE>REDUCE>ADD>OPEN
         all_signals = risk_signals + signals
@@ -528,7 +539,8 @@ class Portfolio:
                     cleared.add(o.stock_code)
         return orders
 
-    def _check_risks(self, ctx: StrategyContext, bar: BarEvent) -> List[SignalEvent]:
+    def _check_risks(self, ctx: StrategyContext, bar: BarEvent,
+                     skip_codes: Optional[set] = None) -> List[SignalEvent]:
         """风控检查入口：整段持组合账本锁（P0-2）。
 
         风控判定读 ``quantity/avg_cost/highest_price`` 并写 ``update_high``，必须
@@ -537,9 +549,10 @@ class Portfolio:
         持锁时间微秒级，不会阻塞回填。
         """
         with self._book_guard():
-            return self._check_risks_locked(ctx, bar)
+            return self._check_risks_locked(ctx, bar, skip_codes=skip_codes)
 
-    def _check_risks_locked(self, ctx: StrategyContext, bar: BarEvent) -> List[SignalEvent]:
+    def _check_risks_locked(self, ctx: StrategyContext, bar: BarEvent,
+                            skip_codes: Optional[set] = None) -> List[SignalEvent]:
         """对策略持仓检查止损/止盈/移动止损，返回风控 SignalEvent。
 
         口径固化（2026-11-11）：峰值 ``highest_price`` 更新与三类风控判定
@@ -599,6 +612,12 @@ class Portfolio:
                     )
             # B5：移动止损阈值按市场状态解析（未开闸/非趋势态回落策略风控原值，行为不变）
             eff_trailing = ctx.effective_trailing_stop(self.current_regime)
+            if skip_codes and stock_code in skip_codes:
+                # 在途风控卖单（含缩量未成交残量）未结清：本 bar 不重复评估/不重复
+                # 发 trigger，残量由原单在后续 bar 继续分批成交（对齐实盘
+                # `inflight_sell` 去重：一次触发 + 缩量分批，而非逐日重复触发）。
+                # 峰值刷新在其上方完成，移动止损基准不丢。
+                continue
             if risk_manager.check_stop_loss(pos, close):
                 loss = (pos.avg_cost - close) / pos.avg_cost if pos.avg_cost else Decimal("0")
                 risks.append(SignalEvent(

@@ -29,7 +29,8 @@ def _klines(stock_code, rows):
     return {stock_code: {"1d": df}}
 
 
-def _portfolio_with_strategy(stop_loss=Decimal("0.05")):
+def _portfolio_with_strategy(stop_loss=Decimal("0.05"),
+                             trailing=Decimal("0")):
     pm = PortfolioRiskManager(max_drawdown=Decimal("0.2"), daily_loss_limit=Decimal("0.05"))
     port = Portfolio(portfolio_id=1, initial_capital=Decimal("100000"), risk_manager=pm)
     ctx = StrategyContext(
@@ -42,7 +43,7 @@ def _portfolio_with_strategy(stop_loss=Decimal("0.05")):
     ctx.strategy_risk = StrategyRiskManager(
         stop_loss_ratio=stop_loss,
         take_profit_ratio=Decimal("0.2"),
-        trailing_stop_ratio=Decimal("0"),
+        trailing_stop_ratio=trailing,
     )
     port.strategies.append(ctx)
     return port, ctx
@@ -2022,3 +2023,113 @@ def test_bond_t0_same_day_sell_intraday_when_enabled():
     assert len([t for t in result2["trades"] if t.trade_type == TradeType.SELL]) == 0
     assert ctx2.positions[bond].quantity == 300
     assert any(ev["gate"] == "t1_insufficient" for ev in result2["decisions"])
+
+
+# ---------------------------------------------------------------------------
+# 修复 10：风控卖出缩量后的残量不得重复触发风控
+# ---------------------------------------------------------------------------
+
+def _seed_trailing_position(ctx, stock, quantity, cost="10", high="40"):
+    """预置一笔「成本 10 / 持仓期最高 40」的持仓，供移动止损触发。"""
+    pos = ctx.positions.setdefault(stock, Position(stock))
+    pos.apply_trade(_buy_trade(cost, quantity, datetime(2026, 7, 28, 9, 30)))
+    pos.highest_price = Decimal(high)
+    return pos
+
+
+def test_risk_sell_shrink_carries_residual_without_retrigger():
+    """成交量上限缩量跨 3 日成交：风控只触发 1 次，成交 3 笔，最终清仓。
+
+    对齐实盘 inflight_sell：同一 (策略, 代码, SELL) 未结清（含缩量残量）时，
+    不再重复产生 trigger 事件与新订单，残量挂在原单上于后续 bar 继续成交。
+    """
+    stock = "000001.SZ"
+    klines = _klines(stock, [
+        (datetime(2026, 7, 29), Decimal("10"), Decimal("10"), Decimal("10"), Decimal("10"), 100000),
+        (datetime(2026, 7, 30), Decimal("10"), Decimal("10"), Decimal("10"), Decimal("10"), 31140),
+        (datetime(2026, 7, 31), Decimal("10"), Decimal("10"), Decimal("10"), Decimal("10"), 44520),
+        (datetime(2026, 8, 1), Decimal("10"), Decimal("10"), Decimal("10"), Decimal("10"), 2340),
+    ])
+    port, ctx = _portfolio_with_strategy(stop_loss=Decimal("0.9"),
+                                         trailing=Decimal("0.05"))
+    port.volume_limit_enabled = True
+    port.volume_limit_ratio = Decimal("0.10")
+    _seed_trailing_position(ctx, stock, 7800)
+    port.account.cash = Decimal("22000")  # 市值 78000 + 现金 22000 = 100000
+
+    result = BacktestEngine().run(port, klines=klines, signal_cache={})
+
+    sells = [t for t in result["trades"] if t.trade_type == TradeType.SELL]
+    assert [int(t.quantity) for t in sells] == [3114, 4452, 234]
+    assert ctx.positions[stock].quantity == 0
+
+    triggers = [d for d in result["decisions"]
+                if d.get("gate") == "trailing_stop" and d.get("action") == "trigger"]
+    assert len(triggers) == 1
+    carries = [d for d in result["decisions"] if d.get("gate") == "risk_sell_residual"]
+    assert [int(d["requested_qty"]) for d in carries] == [4686, 234]
+    assert sells[0].signal_type == SignalType.TRAILING_STOP
+    assert all(t.signal_type == SignalType.TRAILING_STOP for t in sells)
+    # 统计口径：triggered（真实触发次数）与 fill_attempts（缩量分批成交次数）
+    assert result["risk_sell_trigger_count"] == 1
+    assert result["risk_sell_fill_attempts"] == 3
+    # D9 收尾统计一致：残量跨日卖完后无挂单
+    assert result["pending_order_count"] == 0
+
+
+def test_risk_sell_retrigger_works_after_position_cleared():
+    """先缩量清仓、再经公式 OPEN 重开：第二次风控仍能正常触发（释放状态不残留）。"""
+    stock = "000001.SZ"
+    klines = _klines(stock, [
+        (datetime(2026, 7, 29), Decimal("10"), Decimal("10"), Decimal("10"), Decimal("10"), 100000),
+        (datetime(2026, 7, 30), Decimal("10"), Decimal("10"), Decimal("10"), Decimal("10"), 31140),
+        (datetime(2026, 7, 31), Decimal("10"), Decimal("10"), Decimal("10"), Decimal("10"), 44520),
+        (datetime(2026, 8, 1), Decimal("10"), Decimal("10"), Decimal("10"), Decimal("10"), 2340),
+        # 清仓后重开：8/4 触发 OPEN（8/5 开盘买入），8/5 收盘跌破买价 5% 再次触发移动止损
+        (datetime(2026, 8, 4), Decimal("10"), Decimal("10"), Decimal("10"), Decimal("10"), 100000),
+        (datetime(2026, 8, 5), Decimal("10"), Decimal("10"), Decimal("9"), Decimal("9"), 100000),
+        (datetime(2026, 8, 6), Decimal("9"), Decimal("9"), Decimal("9"), Decimal("9"), 100000),
+    ])
+    port, ctx = _portfolio_with_strategy(stop_loss=Decimal("0.9"),
+                                         trailing=Decimal("0.05"))
+    port.volume_limit_enabled = True
+    port.volume_limit_ratio = Decimal("0.10")
+    _seed_trailing_position(ctx, stock, 7800)
+    port.account.cash = Decimal("22000")
+    cache = {
+        (1, stock, datetime(2026, 8, 4)): [{"name": "open_sig", "value": 1}],
+    }
+
+    result = BacktestEngine().run(port, klines=klines, signal_cache=cache)
+
+    triggers = [d for d in result["decisions"]
+                if d.get("gate") == "trailing_stop" and d.get("action") == "trigger"]
+    assert len(triggers) == 2  # 第一次缩量清仓 + 重开后的第二次
+    buys = [t for t in result["trades"] if t.trade_type == TradeType.BUY]
+    assert len(buys) == 1
+    assert ctx.positions[stock].quantity == 0
+    assert result["pending_order_count"] == 0
+
+
+def test_risk_sell_full_fill_unchanged_without_residual_event():
+    """未触发缩量的整仓风控卖出与改动前一致：1 次触发 + 1 笔成交 + 无残量事件。"""
+    stock = "000001.SZ"
+    klines = _klines(stock, [
+        (datetime(2026, 7, 29), Decimal("10"), Decimal("10"), Decimal("10"), Decimal("10"), 100000),
+        (datetime(2026, 7, 30), Decimal("10"), Decimal("10"), Decimal("10"), Decimal("10"), 100000),
+    ])
+    port, ctx = _portfolio_with_strategy(stop_loss=Decimal("0.9"),
+                                         trailing=Decimal("0.05"))
+    port.volume_limit_enabled = True
+    port.volume_limit_ratio = Decimal("0.10")
+    _seed_trailing_position(ctx, stock, 1000)
+    port.account.cash = Decimal("90000")
+
+    result = BacktestEngine().run(port, klines=klines, signal_cache={})
+
+    sells = [t for t in result["trades"] if t.trade_type == TradeType.SELL]
+    assert [int(t.quantity) for t in sells] == [1000]
+    assert ctx.positions[stock].quantity == 0
+    assert not [d for d in result["decisions"] if d.get("gate") == "risk_sell_residual"]
+    assert result["risk_sell_trigger_count"] == 1
+    assert result["risk_sell_fill_attempts"] == 1
