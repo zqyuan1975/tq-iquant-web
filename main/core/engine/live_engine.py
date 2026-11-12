@@ -205,12 +205,17 @@ def _expected_minute_labels(start: Optional[datetime],
     bar 标签是分钟**终点**（09:31 表示 09:30–09:31 这根）：只统计
     09:30 < t ≤ 11:30 与 13:00 < t ≤ 15:00。跨日返回空（跨日缺口不做逐分钟
     期望，调用方按「跨日」语义记录起止即可）。上限 300 根防异常输入死循环。
+
+    P1-2（2026-11-12）：`end` 所在那一分钟是**正在形成**的 bar（其完成时刻 =
+    下一分钟整点），不能计入「应有分钟」——否则每轮审计必缺 1 根、`action`
+    恒为 `partial`，告警失真。故先回退 1 秒再取分钟下限（`end=10:06:00` →
+    `stop=10:05`；`end=10:05:30` → `stop=10:05`）。
     """
     if start is None or end is None or start.date() != end.date():
         return []
     labels: List[datetime] = []
     t = start.replace(second=0, microsecond=0) + timedelta(minutes=1)
-    stop = end.replace(second=0, microsecond=0)
+    stop = (end - timedelta(seconds=1)).replace(second=0, microsecond=0)
     while t <= stop and len(labels) <= 300:
         hm = (t.hour, t.minute)
         if (9, 30) < hm <= (11, 30) or (13, 0) < hm <= (15, 0):
@@ -573,6 +578,11 @@ class LiveEngine:
         # 撤单已收敛）或到达重试截止（10:00）后才置位；缺价/取数失败不置位，
         # 保留后续 1m bar 的重试机会（旧实现先置位后比对，首根 bar 迟到即漏撤）。
         self._pre_open_open_check_day: Optional[date] = None
+        # P1-1（2026-11-12）：`_check_pre_open_orders_at_open` 由 `_handle_bar` 按
+        # **组合**调用（一个组合一份 bar），同一根 1m bar 会被调 P 次 → 未收敛单
+        # 每根 bar 被撤 P 次、`action=cancel` 事件重复 P 条。记录已处理过的 bar
+        # 时间，同一根 bar 只跑一次（跨组合共享）。
+        self._pre_open_open_check_bar: Optional[datetime] = None
         self._pre_open_day: Optional[date] = None
         self._pre_open_attempted: Set[tuple] = set()
         # 盘前能力闸拦截（QMT 桥不能确认指定价）：按日只记一条
@@ -896,6 +906,10 @@ class LiveEngine:
         # 恢复首轮的补派计划（count/gap_start）与待消费的放大 count（P2-6）
         self._gap_recovery_plan: Optional[dict] = None
         self._pending_backfill_count: int = 0
+        # P1-3（2026-11-12）：补派 poll 抛非 BridgeUnavailableError 异常时计数已被
+        # 消费（旧实现静默清零 = 永久放弃补派）。保留计数重试，并按缺口计划只落
+        # 一条 `gate=bar_gap/action=retry` 事件（成功审计或新缺口计划时复位）。
+        self._backfill_retry_reported: bool = False
         # P2-8：上一轮各段耗时（ms）与最近一次饱和告警时间（工作台/日志可观测）
         self._last_tick_profile: Dict[str, int] = {}
         self._tick_profile_total_ms: int = 0
@@ -1638,7 +1652,11 @@ class LiveEngine:
         gap_start = self._bar_poller.last_completed_stime or self._offline_since
         if gap_start is None:
             return None
-        plan = {"gap_start": gap_start, "gap_end": now}
+        # P1-2：gap_end 取「最近一根已闭合分钟」（now 所在分钟正在形成，不能算进去，
+        # 否则审计每轮必缺 1 根 → action 恒 partial）。
+        plan = {"gap_start": gap_start,
+                "gap_end": (now - timedelta(seconds=1)).replace(
+                    second=0, microsecond=0)}
         if not getattr(self._bar_poller, "supports_backfill", False):
             plan.update(action="unrecoverable", reason="snapshot_source")
             return plan
@@ -1659,6 +1677,8 @@ class LiveEngine:
         if plan is not None and plan.get("count"):
             self._pending_backfill_count = int(plan["count"])
             self._gap_recovery_plan = plan
+            # P1-3：新缺口计划 = 新的补派周期，失败告警可再落一条
+            self._backfill_retry_reported = False
             logger.info(
                 "[bar-gap] bridge back online: backfill %d bars (%s → %s) (session %s)",
                 plan["count"], plan["gap_start"], now, self.session_id,
@@ -1688,6 +1708,8 @@ class LiveEngine:
         """补派后记录实际覆盖情况：完整 / 部分（桥 count 上限截断）（P2-6）。"""
         plan = self._gap_recovery_plan
         self._gap_recovery_plan = None
+        # P1-3：本轮补派已落地（审计已写），失败告警标志复位
+        self._backfill_retry_reported = False
         if not plan:
             return
         expected = _expected_minute_labels(plan["gap_start"], plan["gap_end"])
@@ -1836,9 +1858,42 @@ class LiveEngine:
                     # bar 级幂等键），不绕过任何检查。
                     count = self._pending_backfill_count
                     self._pending_backfill_count = 0
-                    triggered = _seg(
-                        "poll_backfill",
-                        lambda: self._bar_poller.poll(backfill_count=count))
+                    try:
+                        triggered = _seg(
+                            "poll_backfill",
+                            lambda: self._bar_poller.poll(backfill_count=count))
+                    except BridgeUnavailableError:
+                        # 桥又断了：交给外层 _mark_bridge_offline（行为不变）
+                        raise
+                    except Exception:  # noqa: BLE001
+                        # P1-3（2026-11-12）：旧实现先清零再 poll，非 Bridge* 异常
+                        # 抛出后计数已丢 = 本次补派永久放弃、静默丢缺口。现在保留
+                        # 计数（下一轮重试），并按缺口计划只落一条 retry 事件。
+                        self._pending_backfill_count = count
+                        if not self._backfill_retry_reported:
+                            self._backfill_retry_reported = True
+                            plan = self._gap_recovery_plan or {}
+                            self._emit("risk", {
+                                "session_id": self.session_id,
+                                "engine": self._engine_key,
+                                "gate": "bar_gap",
+                                "action": "retry",
+                                "rule": "backfill_failed",
+                                "gap_start": (
+                                    plan["gap_start"].isoformat()
+                                    if plan.get("gap_start") else None),
+                                "gap_end": (
+                                    plan["gap_end"].isoformat()
+                                    if plan.get("gap_end") else None),
+                                "count": count,
+                                "message": ("缺口补派失败（非桥离线异常），保留 %d 根"
+                                            "计数下一轮重试；缺口审计将延后出具"
+                                            % count),
+                            })
+                        logger.exception(
+                            "gap backfill failed, will retry (session %s)",
+                            self.session_id)
+                        raise
                     self._audit_gap_recovery(now, triggered)
                 else:
                     _seg("poll", self._bar_poller.poll)
@@ -2272,6 +2327,12 @@ class LiveEngine:
         today = bt.date()
         if self._pre_open_open_check_day == today:
             return
+        # P1-1（2026-11-12）：本方法由 `_handle_bar` 按组合调用，同一根 1m bar 会
+        # 被调 P 次（P=组合数）。未收敛单若每份 bar 都撤一次，会重复发撤单请求、
+        # 重复落 action=cancel 事件。同一根 bar 只跑一次（引擎级，跨组合共享）。
+        if self._pre_open_open_check_bar == bt:
+            return
+        self._pre_open_open_check_bar = bt
         entries = [e for e in self._pre_open_open_checks
                    if e.get("day") == today]
         if not entries:
@@ -2338,7 +2399,7 @@ class LiveEngine:
         返回 **该登记单是否已解决**（P2-4，供调用方决定「当天校验是否完成」）：
         - True：已比对完成——通道不支持撤单 / 无在途行 / 撤单确认 canceled
           （含撤单后成功回 deferred）；
-        - False：撤单未收敛（pending/failed/异常），旧单可能仍在柜台撮合，
+        - False：撤单未收敛（accepted/pending/failed/异常），旧单可能仍在柜台撮合，
           需保留登记由下一根 1m bar 重试；绝不在此状态重排（防双份委托）。
         """
         cancel = getattr(self._dispatcher, "cancel_order", None)
@@ -2402,20 +2463,46 @@ class LiveEngine:
                     db, entry, row, open_price)
             if requeued:
                 return True
-            self._emit("risk", {
-                "session_id": self.session_id,
-                "engine": self._engine_key,
-                "gate": "pre_open_auction",
-                "action": "cancel",
-                "rule": "open_crossed_limit",
-                "code": entry["code"],
-                "side": entry["side"].value,
-                "limit_price": float(entry["limit"]),
-                "open_price": float(open_price),
-                "order_ref": row.order_ref,
-                "message": ("开盘价已越过盘前限价，判定必然未成交，主动撤单；"
-                            "撤单未确认或重排次数用尽 → 不重报"),
-            })
+            # P1-5（2026-11-12）：桥返回 accepted = 撤单已受理但终态未观测到，
+            # **不是已解决**。旧实现因 dispatcher 对 accepted 返回 True 而被
+            # `return bool(cancel_ok)` 当成已解决 → 登记单被摘除、再无撤单机会。
+            # 现在保留登记交给下一根 1m bar 再撤，并留痕（每单只落一条）。
+            if outcome == "accepted":
+                if not entry.get("cancel_accepted_reported"):
+                    entry["cancel_accepted_reported"] = True
+                    self._emit("risk", {
+                        "session_id": self.session_id,
+                        "engine": self._engine_key,
+                        "gate": "pre_open_auction",
+                        "action": "cancel",
+                        "rule": "open_crossed_limit",
+                        "status": "accepted",
+                        "code": entry["code"],
+                        "side": entry["side"].value,
+                        "limit_price": float(entry["limit"]),
+                        "open_price": float(open_price),
+                        "order_ref": row.order_ref,
+                        "message": ("开盘价已越过盘前限价，撤单已被受理但未观测到"
+                                    "终态 → 保留登记，下一根 1m bar 再撤"),
+                    })
+                return False
+            # 同一登记单的撤单结论事件只落一次（未收敛时会跨 bar 重试，避免刷屏）
+            if not entry.get("cancel_reported"):
+                entry["cancel_reported"] = True
+                self._emit("risk", {
+                    "session_id": self.session_id,
+                    "engine": self._engine_key,
+                    "gate": "pre_open_auction",
+                    "action": "cancel",
+                    "rule": "open_crossed_limit",
+                    "code": entry["code"],
+                    "side": entry["side"].value,
+                    "limit_price": float(entry["limit"]),
+                    "open_price": float(open_price),
+                    "order_ref": row.order_ref,
+                    "message": ("开盘价已越过盘前限价，判定必然未成交，主动撤单；"
+                                "撤单未确认或重排次数用尽 → 不重报"),
+                })
             # 撤单已确认但未重排（次数用尽/无订单对象）→ 旧单已撤，登记解决；
             # 撤单未确认（pending/failed/传输失败）→ 保留登记下一根 bar 再试。
             # not_found/rejected 视为已解决：柜台已无此单或明确拒撤，再试也无意义。
@@ -4629,6 +4716,11 @@ class LiveEngine:
             return
         if getattr(order, "_release_priced", False):
             return
+        # P1-6（2026-11-12）：重排（deferred_retry）复用同一个 OrderEvent 再次进入
+        # 本方法，旧实现会再让 1 跳 → 首报 + 2 次重排最多偏 3 跳。让过价就打标，
+        # 同一笔单只让一次。
+        if getattr(order, "_price_biased", False):
+            return
         if getattr(order, "_pre_open_bar_time", None) is not None:
             return
         period = self._order_period(portfolio, order)
@@ -4647,6 +4739,7 @@ class LiveEngine:
         if clamped is None or clamped == price:
             return
         order.price = clamped
+        order._price_biased = True
         logger.info(
             "[submit-price] 分钟单%s 1 跳：signal=%s → submit=%s %s %s "
             "(requote_enabled, session %s)",
@@ -5875,6 +5968,58 @@ class LiveEngine:
         result = db.execute(stmt)
         return bool(result.rowcount)
 
+    def _clear_bar_mark(self, db: Session, key) -> None:
+        """删除本次提交写入的「该 bar 已处理」标记（P0-1 异常回滚专用）。
+
+        `_mark_bar_processed` 与订单行同事务落库；异常回滚后若不清掉标记，
+        同一 bar 同向重试会在 `_mark_bar_processed` 撞唯一索引被静默回滚
+        （= 当天该信号永久丢失）。key 为 None（bar_time 缺失 / 追价重下不写
+        标记）时直接返回。清标记失败只告警，不阻断回滚主流程。
+        """
+        if key is None:
+            return
+        try:
+            db.query(LiveBarOrderMark).filter(
+                LiveBarOrderMark.live_session_id == key[0],
+                LiveBarOrderMark.portfolio_strategy_id == key[1],
+                LiveBarOrderMark.strategy_id == key[2],
+                LiveBarOrderMark.stock_code == key[3],
+                LiveBarOrderMark.bar_time == key[4],
+                LiveBarOrderMark.direction == key[5],
+                LiveBarOrderMark.seq == key[6],
+            ).delete(synchronize_session=False)
+            db.commit()
+        except Exception:  # noqa: BLE001 — 清标记失败不改变已回滚的订单状态
+            logger.warning(
+                "clear bar mark failed: %s (session %s)", key, self.session_id)
+            db.rollback()
+
+    def _dispatcher_may_have_sent(
+        self,
+        prev_enqueued_oid: Optional[str],
+        prev_unconfirmed_oid: Optional[str],
+        prev_broker_oid: Optional[str],
+    ) -> bool:
+        """execute 抛非 Bridge* 异常时判定「委托是否可能已发出」（P0-1）。
+
+        各 dispatcher 的 `place_order` 起始处都会重置 `last_enqueued_order_id` /
+        `last_unconfirmed_order_id` / `last_broker_order_id` 三个哨兵，只有真正走到
+        发单路径（入队 / 柜台受理未认领 / 拿到柜台委托号）才会写新值。因此
+        「本次 execute 后任一哨兵为非 None 且与进入前不同」= 请求已发出。
+
+        已发出时柜台可能已受理，**绝不能**把 DB 行回滚成 rejected——那会让一笔
+        真实在途单脱离跟踪（无 ref、成交不回填、无法撤）。
+        """
+        for attr, prev in (
+            ("last_enqueued_order_id", prev_enqueued_oid),
+            ("last_unconfirmed_order_id", prev_unconfirmed_oid),
+            ("last_broker_order_id", prev_broker_oid),
+        ):
+            cur = getattr(self._dispatcher, attr, None)
+            if cur is not None and cur != prev:
+                return True
+        return False
+
     def _submit_one_order(
         self,
         db: Session,
@@ -6294,6 +6439,10 @@ class LiveEngine:
             # （deferred 或 submitted 必居其一）。行 id 随单挂在 _deferred_row_id，
             # 重启 recover 重建的单同样带此标记（2026-11-09 起）。
             _dr = getattr(order, "_deferred_row_id", None)
+            # P0-1：放行单标记（异常回滚时决定「回 deferred 重排」还是「落 rejected」）
+            had_deferred_row = bool(_dr)
+            # P0-1：本次写入的 bar 幂等标记键（回滚时必须清掉，否则同 bar 重试被判重）
+            bar_mark_key = None
             if _dr:
                 db.query(LiveOrder).filter(LiveOrder.id == _dr).delete()
                 order._deferred_row_id = None
@@ -6302,6 +6451,7 @@ class LiveEngine:
             # 在多线程下会漏）。冲突 = 同一根 bar 已被处理 → 回滚本单，绝不发桥。
             # 追价重下不写标记（同一张单的加价重报，原单标记已在）。
             if not getattr(order, "_requote", False):
+                bar_mark_key = self._bar_mark_key(order)
                 bar_mark_ok = self._mark_bar_processed(db, order)
                 if not bar_mark_ok:
                     lo_id = live_order.id
@@ -6344,6 +6494,9 @@ class LiveEngine:
         # 新写入的标记才有效，避免残留值把 approval failed 误判成已受理。
         prev_unconfirmed_oid = getattr(
             self._dispatcher, "last_unconfirmed_order_id", None)
+        # P0-1：柜台委托号哨兵（桥受理应答带 cl_ord_id）——与上面两个哨兵同理，
+        # 用于判定「请求是否已真正发出」，决定异常时能否安全回滚。
+        prev_broker_oid = getattr(self._dispatcher, "last_broker_order_id", None)
         try:
             # 涨跌停前置校验（price_limit_check_enabled 配置门控，通道无关，
             # 口径与回测同源）：approve（cap_quantity）之后、place_order 之前。
@@ -6430,6 +6583,61 @@ class LiveEngine:
                 })
                 db.commit()
             return
+        except Exception as e:  # noqa: BLE001 — P0-1：兜住 TDXLockTimeout 等非 Bridge* 异常
+            # P0-1（2026-11-12）：旧实现只捕 BridgeUnavailableError / BridgeOrderRejected，
+            # TDXLockTimeout（TQ 锁超时）等其它异常直接外抛 → DB 留 submitted 幻影行、
+            # `_pending_orders` 留幻影在途（`_dedupe_inflight_sells` 把同码同向重试判死）、
+            # 本 bar 幂等标记已占键（重试被唯一索引静默拦下）→ 当天该信号永久丢失。
+            # 语义：**只有「dispatcher 明确还没返回 order_id」才允许回滚**。
+            detail = "%s: %s" % (type(e).__name__, e)
+            if self._dispatcher_may_have_sent(
+                    prev_enqueued_oid, prev_unconfirmed_oid, prev_broker_oid):
+                # 请求已发出（柜台可能已受理）：保留 submitted，绝不回滚成 rejected
+                # ——否则真实在途单脱离跟踪（无 ref、成交不回填、无法撤）。
+                live_order.error_message = (
+                    "submit_error_after_send: %s（请求已发出，柜台状态待核对，"
+                    "保留 submitted 等回填/超时收口）" % detail)[:500]
+                self._rec_live(
+                    "submit_error", "keep", portfolio, order,
+                    message=("发单后异常（%s）：请求已发出，保留 submitted 待核对，"
+                             "不回滚、不重报" % detail),
+                )
+                with self._book_lock:
+                    db.commit()
+                detach_loaded(db, live_order)
+                raise
+            # 明确未发出：同事务回滚幻影（订单行 / 在途集合 / bar 幂等标记）
+            self._rec_live(
+                "submit_error", "rollback", portfolio, order,
+                message=("发单异常（%s）且请求未发出：回滚本单（不留在途、不占 bar 标记）"
+                         % detail),
+            )
+            if had_deferred_row and self._requeue_rejected_order(
+                    db, portfolio, order, live_order,
+                    "submit_error: %s" % detail):
+                # 放行单：回 deferred 可重排（受既有次数上限约束），并清掉本次写入的
+                # bar 标记，避免重试被 `_mark_bar_processed` 唯一索引静默拦下。
+                self._clear_bar_mark(db, bar_mark_key)
+                return
+            live_order.status = "rejected"
+            live_order.error_message = ("submit_error: %s" % detail)[:500]
+            with self._book_lock:
+                # 摘掉幻影在途；`_reserved_buy_cash` 按在途单实时汇总，pop 即释放预留
+                self._pending_orders.pop(live_order.id, None)
+                self._emit("order", {
+                    "portfolio_id": portfolio.portfolio_id,
+                    "order_id": live_order.id,
+                    "status": "rejected",
+                    "stock_code": live_order.stock_code,
+                    "trade_type": (live_order.trade_type or "").upper(),
+                    "quantity": live_order.quantity,
+                    "bar_time": live_order.bar_time.isoformat() if live_order.bar_time else None,
+                    "error_message": live_order.error_message,
+                })
+                db.commit()
+            detach_loaded(db, live_order)
+            self._clear_bar_mark(db, bar_mark_key)
+            raise
         if trade is None:
             # TDX：柜台已受理（ErrorId=0）但委托表暂未见该单——**保持 submitted**，
             # 绝不能判 rejected（真实在途单会脱离跟踪：无 ref、成交不回填、无法撤，
