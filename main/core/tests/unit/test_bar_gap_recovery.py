@@ -99,7 +99,7 @@ def test_plan_gap_recovery_replay_same_day(monkeypatch):
         supports_backfill=True,
     )
     stub = SimpleNamespace(_bar_poller=poller, _offline_since=None,
-                           _quote_poll_active=lambda now: True)
+                           _quote_window_open=lambda now: True)
     plan = LiveEngine._plan_gap_recovery(stub, datetime(2026, 8, 25, 10, 25))
     assert plan["action"] == "replay"
     assert plan["gap_start"] == datetime(2026, 8, 25, 9, 55)
@@ -112,7 +112,7 @@ def test_plan_gap_recovery_cross_day_skips():
         supports_backfill=True,
     )
     stub = SimpleNamespace(_bar_poller=poller, _offline_since=None,
-                           _quote_poll_active=lambda now: True)
+                           _quote_window_open=lambda now: True)
     plan = LiveEngine._plan_gap_recovery(stub, datetime(2026, 8, 25, 9, 40))
     assert plan["action"] == "skip"
     assert plan["reason"] == "cross_day"
@@ -124,7 +124,7 @@ def test_plan_gap_recovery_snapshot_source_unrecoverable():
         supports_backfill=False,
     )
     stub = SimpleNamespace(_bar_poller=poller, _offline_since=None,
-                           _quote_poll_active=lambda now: True)
+                           _quote_window_open=lambda now: True)
     plan = LiveEngine._plan_gap_recovery(stub, datetime(2026, 8, 25, 10, 3))
     assert plan["action"] == "unrecoverable"
     assert plan["reason"] == "snapshot_source"

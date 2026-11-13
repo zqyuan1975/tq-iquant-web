@@ -11833,6 +11833,106 @@ def test_quote_polling_active_in_session(monkeypatch):
     assert "count=10" in str(quotes[0].url)
 
 
+def test_quote_polling_skipped_during_lunch_break(monkeypatch, caplog):
+    """午休 12:00：交易所无新 bar → 整段不轮询（每分钟 40 只 ETF 空转被堵掉）。"""
+    import logging
+
+    fixed = datetime(2026, 8, 5, 12, 0)  # 周三交易日，午休中
+    engine, poller, rec = _window_engine(monkeypatch, fixed, [date(2026, 8, 5)])
+    # 隔离变量：日终/清扫/对账标记置为该日已完成，只剩"行情轮询"一个差异
+    engine._last_daily_date = fixed.date()
+    engine._last_daily_bar_date = fixed.date()
+    engine._last_close_sweep_date = fixed.date()
+    engine._last_reconcile_date = fixed.date()
+
+    with caplog.at_level(logging.INFO, logger="core.engine.live_engine"):
+        engine._tick_main()
+        engine._tick_main()  # 第二轮：状态未跳变，不重复打日志
+
+    assert _count_quote(rec) == []
+    assert poller.last_completed_stime is None  # poll 从未执行
+    paused_logs = [r for r in caplog.records if "行情轮询已暂停" in r.getMessage()]
+    assert len(paused_logs) == 1  # 只在进入暂停时打一条，不按 tick 刷屏
+    assert "午休" in paused_logs[0].getMessage()
+
+
+def test_quote_polling_keeps_1130_bar_and_resumes_at_1300(monkeypatch, caplog):
+    """11:30 收线那根不丢：午休不轮询，13:00 恢复首轮一次取回并派发。"""
+    import asyncio
+    import logging
+
+    stock = "600000.SH"
+    cur = {"now": datetime(2026, 8, 5, 11, 29, 30)}
+    rows = {"bars": [datetime(2026, 8, 5, 11, 28), datetime(2026, 8, 5, 11, 29)]}
+
+    def respond(request):
+        path = request.url.path
+        if path == "/ping":
+            return httpx.Response(200, json={"ok": True})
+        if path == "/quote":
+            code = request.url.params.get("code")
+            return httpx.Response(200, json={"ok": True,
+                                             "data": {code: _quote_bars(code, rows["bars"])}})
+        return httpx.Response(404, json={"ok": False})
+
+    engine, poller, rec = _window_engine(
+        monkeypatch, cur["now"], [date(2026, 8, 5)],
+        quote_polling={"enabled": True, "resume_time": "09:15", "pause_time": "15:05"},
+        respond=respond,
+    )
+    # 时钟可推进（同一引擎跑三段时间）
+    monkeypatch.setattr("core.engine.live_engine.now_shanghai", lambda: cur["now"])
+    # 恢复预热单独打桩：本用例只验证 BarPoller 的 1m 轮询节拍
+    monkeypatch.setattr(engine.market_data, "preheat", lambda only_missing=False: None)
+    engine._last_daily_date = datetime(2026, 8, 5).date()
+    engine._last_daily_bar_date = datetime(2026, 8, 5).date()
+    engine._last_close_sweep_date = datetime(2026, 8, 5).date()
+    engine._last_reconcile_date = datetime(2026, 8, 5).date()
+
+    triggered = []
+    orig_on_bar = poller.on_bar
+    poller.on_bar = lambda bar: (triggered.append(bar.bar_time), orig_on_bar(bar))
+    q = asyncio.Queue()
+    engine._stream_subscribers.append(q)
+
+    with caplog.at_level(logging.INFO, logger="core.engine.live_engine"):
+        # 11:29:30 —— 上午最后一轮：首轮只建基线（水位 11:28），11:29 仍在形成
+        engine._tick_main()
+        assert triggered == []
+        quotes_after_am = len(_count_quote(rec))
+        assert quotes_after_am == 1
+        assert engine._quote_poll_paused is False
+
+        # 11:31 —— 进入午休：不拉行情（11:30 那根不会丢，13:00 首轮取回）
+        cur["now"] = datetime(2026, 8, 5, 11, 31)
+        engine._tick_main()
+        assert len(_count_quote(rec)) == quotes_after_am
+        assert engine._quote_poll_paused is True
+        assert "午休" in (engine._quote_poll_pause_reason or "")
+        assert poller.last_completed_stime == datetime(2026, 8, 5, 11, 28)
+
+        # 12:30 —— 仍在午休：继续停拉
+        cur["now"] = datetime(2026, 8, 5, 12, 30)
+        engine._tick_main()
+        assert len(_count_quote(rec)) == quotes_after_am
+        assert poller.last_completed_stime == datetime(2026, 8, 5, 11, 28)
+
+        # 13:00:30 —— 恢复轮询：11:30 收线那根随首轮窗口取回并派发
+        rows["bars"] = [datetime(2026, 8, 5, 11, 29), datetime(2026, 8, 5, 11, 30),
+                        datetime(2026, 8, 5, 13, 0)]
+        cur["now"] = datetime(2026, 8, 5, 13, 0, 30)
+        engine._tick_main()
+
+    assert len(_count_quote(rec)) > quotes_after_am
+    assert engine._quote_poll_paused is False
+    assert datetime(2026, 8, 5, 11, 30) in triggered
+    assert poller.last_completed_stime == datetime(2026, 8, 5, 11, 30)
+    assert any("行情轮询已恢复" in r.getMessage() for r in caplog.records)
+    resumed = [e for e in _drain_events(q) if e.get("rule") == "quote_polling_resumed"]
+    assert len(resumed) == 1
+    assert "午休结束" in resumed[0]["message"]
+
+
 def test_quote_polling_skipped_on_non_trading_day(monkeypatch, caplog):
     """非交易日（周六）：即使时刻落在 09:15–15:05 窗口内也不轮询。"""
     import logging

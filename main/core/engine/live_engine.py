@@ -609,6 +609,8 @@ class LiveEngine:
         self._fill_dev_checked: Set[Tuple[int, int]] = set()
         # 暂停状态标记：只在进入/退出暂停时各打一条 INFO，避免每 tick 刷屏
         self._quote_poll_paused = False
+        # 本次暂停原因（非交易日 / 午休 / 收盘后）：恢复事件文案据此区分
+        self._quote_poll_pause_reason: Optional[str] = None
         # 提交前价格刷新「1m 行情非当日」告警去重（键 (code, bar 时间)）：同一根
         # 陈旧 bar 只 WARN 一次，避免 deferred 批量放行时刷屏
         self._stale_quote_warned: Optional[Set[Tuple[str, str]]] = None
@@ -1559,23 +1561,47 @@ class LiveEngine:
             await asyncio.sleep(delay)
 
     # ---------------- 行情轮询窗口（收盘后停拉行情）----------------
-    def _quote_poll_active(self, now: datetime) -> bool:
-        """now 时刻是否允许行情轮询：交易日 + 轮询窗口内。
+    def _quote_window_open(self, now: datetime) -> bool:
+        """now 是否落在轮询窗口内（交易日 + resume/pause 之间）。
 
-        enabled=False（显式关窗）→ 永远允许（等价旧行为：全天轮询，非交易日也轮）。
+        enabled=False（显式关窗）→ 永远 True（等价旧行为：全天轮询，非交易日也轮）。
+        只判窗口，不含午休闸：断线补派（_plan_gap_recovery）沿用此口径，午休内
+        也允许一次性补回上午缺口，避免把 11:30 那根误当「窗口外」重建基线。
         """
         window = self._quote_polling
         if not window.enabled:
             return True
         return self._calendar.is_trading_day(now.date()) and window.is_open(now)
 
+    def _quote_poll_active(self, now: datetime) -> bool:
+        """now 时刻是否允许行情轮询：窗口内 且 非午休。
+
+        午休 11:30–13:00 交易所无新 bar（每轮 40 只 ETF 纯空转，2026-11-13 观测
+        每分钟一轮），整段不拉。不丢 bar：BarPoller 把窗口内最新一根当「仍在形成」，
+        11:30 那根本来就要等 13:00 出现新 bar 才判完成——13:00 恢复首轮 count=10
+        的窗口一次取回，按完成 bar 派发（与暂停前的行为逐字一致）。
+        09:31 首根、日线轮次、周期边界新鲜度闸均不受影响（都不在午休时段）。
+        """
+        if not self._quote_polling.enabled:
+            return True
+        if not self._quote_window_open(now):
+            return False
+        return not self._calendar.is_lunch_break(now)
+
     def _enter_quote_poll_pause(self, now: datetime) -> None:
         """进入轮询暂停：只在状态跳变时调用一次（不按 tick 刷屏）。"""
         if not self._calendar.is_trading_day(now.date()):
             reason = "非交易日"
+            next_at = self._quote_polling.next_resume_at(
+                now, self._calendar.is_trading_day)
+        elif self._calendar.is_lunch_break(now):
+            reason = "午休 11:30–13:00（交易所无新 bar）"
+            next_at = self._calendar.lunch_end_at(now)
         else:
             reason = "已过收盘轮询截止 %s" % self._quote_polling.pause_time.strftime("%H:%M")
-        next_at = self._quote_polling.next_resume_at(now, self._calendar.is_trading_day)
+            next_at = self._quote_polling.next_resume_at(
+                now, self._calendar.is_trading_day)
+        self._quote_poll_pause_reason = reason
         next_text = next_at.strftime("%Y-%m-%d %H:%M") if next_at else "下一交易日"
         logger.info(
             "行情轮询已暂停（会话 %s）：%s，下次恢复 %s；账户快照/成交回填/收盘清扫照常",
@@ -1609,6 +1635,11 @@ class LiveEngine:
             "行情轮询已恢复（会话 %s，%s）：预热 %.1fs（仅补缺失缓存，不重拉历史）",
             self.session_id, now.strftime("%H:%M:%S"), elapsed,
         )
+        is_lunch_resume = "午休" in (self._quote_poll_pause_reason or "")
+        message = ("行情轮询已恢复：午休结束，已补取缺失行情"
+                   if is_lunch_resume else
+                   "行情轮询已恢复：进入 %s 窗口，已预热缺失行情"
+                   % self._quote_polling.resume_time.strftime("%H:%M"))
         # 状态跳变同步发 risk 事件（SSE 可见）；调用方以 _quote_poll_paused 保证只发一次。
         self._emit("risk", {
             "rule": "quote_polling_resumed",
@@ -1616,8 +1647,7 @@ class LiveEngine:
             "engine": self._engine_key,
             "resumed_at": now.strftime("%Y-%m-%d %H:%M:%S"),
             "preheat_seconds": round(elapsed, 1),
-            "message": "行情轮询已恢复：进入 %s 窗口，已预热缺失行情"
-                       % self._quote_polling.resume_time.strftime("%H:%M"),
+            "message": message,
         })
 
     def _run_daily_schedule(self) -> None:
@@ -1782,7 +1812,7 @@ class LiveEngine:
         if gap_start.date() != now.date():
             plan.update(action="skip", reason="cross_day")
             return plan
-        if not self._quote_poll_active(now):
+        if not self._quote_window_open(now):
             plan.update(action="skip", reason="quote_window_closed")
             return plan
         span_min = max(1, int((now - gap_start).total_seconds() // 60))

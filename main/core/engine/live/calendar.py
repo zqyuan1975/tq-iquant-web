@@ -477,6 +477,20 @@ class TradingCalendar:
             return False
         return not (_LUNCH_START <= t < _LUNCH_END)
 
+    def is_lunch_break(self, now: datetime) -> bool:
+        """是否处于午休 11:30–13:00（左闭右开）。
+
+        与下单总闸 ``is_trading_allowed`` 共用同一组午休常量（_LUNCH_START /
+        _LUNCH_END），不另造时间常量。午休交易所无新 bar，行情轮询可整段暂停；
+        11:30 收线那根由 13:00 首轮一次取回并派发（见 LiveEngine._quote_poll_active）。
+        """
+        return _LUNCH_START <= now.time() < _LUNCH_END
+
+    def lunch_end_at(self, now: datetime) -> datetime:
+        """``now`` 当日的午休结束时刻（13:00:00），供暂停状态回报「下次恢复」。"""
+        return now.replace(hour=_LUNCH_END.hour, minute=_LUNCH_END.minute,
+                           second=0, microsecond=0)
+
     # ---------------- 可观测性 ----------------
 
     def status(self) -> dict:

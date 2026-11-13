@@ -142,6 +142,27 @@ def test_trading_blocked_during_lunch_break():
     assert cal.is_trading_allowed(datetime(2026, 8, 24, 14, 0)) is True
 
 
+def test_is_lunch_break_left_closed_right_open():
+    """午休判定左闭右开（11:30 起、13:00 止），与 is_trading_allowed 同一组常量。"""
+    cal = TradingCalendar(_provider([date(2026, 8, 24)]))
+    assert cal.is_lunch_break(datetime(2026, 8, 24, 11, 29, 59)) is False
+    assert cal.is_lunch_break(datetime(2026, 8, 24, 11, 30)) is True
+    assert cal.is_lunch_break(datetime(2026, 8, 24, 12, 0)) is True
+    assert cal.is_lunch_break(datetime(2026, 8, 24, 12, 59, 59)) is True
+    assert cal.is_lunch_break(datetime(2026, 8, 24, 13, 0)) is False
+    # 与下单总闸口径互为镜像：午休内禁报，11:29 与 13:00 允许
+    assert cal.is_trading_allowed(datetime(2026, 8, 24, 11, 29, 59)) is True
+    assert cal.is_trading_allowed(datetime(2026, 8, 24, 11, 30)) is False
+    assert cal.is_trading_allowed(datetime(2026, 8, 24, 13, 0)) is True
+
+
+def test_lunch_end_at_is_same_day_1300():
+    """暂停状态回报的「下次恢复」= 当日 13:00:00。"""
+    cal = TradingCalendar(_provider([date(2026, 8, 24)]))
+    assert cal.lunch_end_at(datetime(2026, 8, 24, 11, 45, 12, 500000)) == \
+        datetime(2026, 8, 24, 13, 0)
+
+
 def test_trading_blocked_on_weekend_even_at_session_time():
     # 周六 10:00 —— 时段对但非交易日，禁止
     cal = TradingCalendar(_provider([]))
