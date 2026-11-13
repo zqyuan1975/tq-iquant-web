@@ -486,7 +486,8 @@ class PreOpenAuctionConfig:
 
 # _DAILY_CLOSE_TIME(14:30) / _DAILY_BARS_TIME(15:05) / _MARKET_CLOSE_SWEEP_TIME(15:05)
 # 与日终/收盘编排一并迁入 core.engine.live.daily_closer.DailyCloser（0010 步骤 5）；
-# 收盘新落单拦截仍留本模块（_MARKET_CLOSE_TIME，_handle_bar 内按 bar_time 判定）。
+# 收盘新落单拦截仍留本模块（_MARKET_CLOSE_TIME，_submit_one_order 内按 bar_time 判定）：
+# 2026-11-13 起改为「转 deferred」而非丢弃（次一交易日首根分钟 bar 放行）。
 
 # 委托状态机/成交回填相关常量（_ORDER_REF_MATCH_TIMEOUT 等）与 OrderStateMachine 一并
 # 迁入 core.engine.live.order_machine（0010 步骤 3），此处由顶部 import re-export，保持
@@ -5849,6 +5850,16 @@ class LiveEngine:
         risk_timing=immediate（当日确认立即执行）跳过本闸门。post_close（15:05
         收盘落定轮次）无条件 defer——收盘后报单报不进交易所。
         """
+        # 收盘后（bar_time/墙钟 ≥ 15:00）的分钟级信号：提交链已置
+        # `_after_close_defer` 并写入 signal_bar_date，这里无条件 defer——否则
+        # risk_timing=immediate 的策略会绕过闸门在 15:00 直接报单（必成待废单）。
+        # 放行时 `bar_time` 已改写为次一交易日首根分钟 bar（> signal_bar_date），
+        # 条件自然失效，不会把放行单再 defer 回去。
+        if (getattr(order, "_after_close_defer", False)
+                and order.signal_bar_date is not None
+                and order.bar_time is not None
+                and order.bar_time.date() <= order.signal_bar_date):
+            return True
         # P1（2026-11-09）：post_close 判据前置——收盘落定轮次恒 defer，不受
         # signal_bar_date 是否为空（外部信号注入 / 风控单也可能走到这里）影响。
         if post_close:
@@ -6279,7 +6290,8 @@ class LiveEngine:
         """提交单笔订单走完整闸门链（_handle_bar 与撤单追价重下共用，批次1 3a）。
 
         闸门序（与原 _handle_bar 内联段逐字等价，continue→return）：
-        1w/1mon signal SSE → 收盘后守卫 → 交易日历总闸 → B-1 未来函数 deferred
+        1w/1mon signal SSE → 收盘后守卫（bar_time/墙钟 ≥15:00 转 deferred）→
+        交易日历总闸（收盘 deferred 单豁免）→ B-1 未来函数 deferred
         （risk_timing=immediate 跳过）→ 资金/T+1 审批 → 跨重启去重（D6）→
         在途单门（F7）→ 落 submitted → 发桥（桥离线/拒单收口）。
         闸门拦截时静默返回（决策事件已记录）；异常向上抛由调用方回滚。
@@ -6322,29 +6334,29 @@ class LiveEngine:
                     "signal_type": order.signal_type.value if order.signal_type else None,
                     "bar_time": order.bar_time.isoformat() if order.bar_time else None,
                 })
-        # 收盘后不下单守卫：bar 结束时间（bar_time）≥ 15:00（深交所收盘）则信号
-        # 已推但跳过落单。根因：真机 2026-08-14 id40-41 的 bar_time=15:02:42（已过
-        # 15:00），报不进交易所成待报单冻结持仓永不成交。用 bar_time（非墙钟：
-        # 不依赖本机时钟/时区，测试与真实部署一致；主循环 60s 延迟不影响——延迟
-        # 处理的是 15:00 前的合法 bar，其 bar_time<15:00 不被拦，正常下单）。
-        # 不写 DB、不进 pending。
+        # 收盘后信号改 deferred（方案 A，2026-11-13）：bar 结束时间（bar_time）≥ 15:00
+        # 或墙钟已过 15:00 时，报单报不进交易所（真机 2026-08-14 id40-41 实证成待报单
+        # 冻结持仓），但**不再丢弃信号**——置 `_after_close_defer` 并写入 signal_bar_date，
+        # 落进下方既有 deferred 分支：次一交易日 09:31 首根 1m bar 按当日开盘价限价放行。
+        # 与回测同口径（15:00 bar 的信号本就在次日首根 bar 开盘成交），也避免收盘止损
+        # 静默不执行、留仓过夜。分钟级单不进 09:15–09:20 集合竞价（见
+        # `_pre_open_release` 的 `_DAILY_PERIODS` 过滤）。
         bt = order.bar_time
+        deferred_by_close = False
         if bt is not None and (bt.hour, bt.minute) >= _MARKET_CLOSE_TIME:
+            deferred_by_close = True
+            order.signal_bar_date = bt.date()
             logger.info(
-                "skip after-close order %s %s %s bar=%s (bar_time >= 15:00)",
+                "defer after-close order %s %s %s bar=%s (bar_time >= 15:00)",
                 order.trade_type.value, order.stock_code, order.signal_name,
                 bt,
             )
-            self._rec_live(
-                "after_close_block", "block", portfolio, order,
-                message="bar_time %s >= 15:00 收盘后不下单" % bt,
-            )
-            return
-        # P2（2026-11-09）：墙钟硬闸——分钟级单在 15:00 之后才被处理（主循环 60s
-        # 延迟 / 队列积压 / 桥慢）一律拒绝。bar_time 守卫只能拦「bar 本身晚于 15:00」，
-        # 拦不住 14:59 的 bar 拖到 15:01 才走到提交（此时报价/撮合已不可用，报单必成
-        # 待报废单并冻结持仓）。日线级单不适用（post_close 恒 defer，由闸门另行处理）。
-        if period not in self._DAILY_PERIODS and order.bar_time is not None:
+        # P2（2026-11-09）：墙钟闸——分钟级单在 15:00 之后才被处理（主循环 60s 延迟 /
+        # 队列积压 / 桥慢）同样转 deferred：bar_time 守卫只能拦「bar 本身晚于 15:00」，
+        # 拦不住 14:59 的 bar 拖到 15:01 才走到提交（此时报价/撮合已不可用）。
+        # 日线级单不适用（post_close 恒 defer，由闸门另行处理）。
+        if (not deferred_by_close and period not in self._DAILY_PERIODS
+                and order.bar_time is not None):
             # 用注入时钟（ctx.clock，默认上海时区）。只在「墙钟与 bar 同一自然日」时
             # 生效：这才是「14:59 的 bar 拖到 15:01 才提交」的场景；跨日（历史 bar
             # 回放/单测固定日期）不适用，避免误挡。
@@ -6352,17 +6364,15 @@ class LiveEngine:
             if wall.date() != order.bar_time.date():
                 wall = None
             if wall is not None and (wall.hour, wall.minute) >= _MARKET_CLOSE_TIME:
+                deferred_by_close = True
+                order.signal_bar_date = order.bar_time.date()
                 logger.info(
-                    "skip after-close order %s %s %s wall=%s period=%s (wall >= 15:00)",
+                    "defer after-close order %s %s %s wall=%s period=%s (wall >= 15:00)",
                     order.trade_type.value, order.stock_code, order.signal_name,
                     wall.strftime("%H:%M:%S"), period,
                 )
-                self._rec_live(
-                    "after_close_block", "block", portfolio, order,
-                    message="墙钟 %s >= 15:00，分钟级信号已过期不下单"
-                            % wall.strftime("%H:%M:%S"),
-                )
-                return
+        if deferred_by_close:
+            order._after_close_defer = True
         # 交易日历总闸：非交易日不下新单。用 bar_time（非墙钟，见上方收盘守卫同理）。
         # 桥日历时 fail-open（工作日放行），只在权威日历明确判定"非交易"时才拦——
         # 周末/节假日绝不误下，真实交易日不误挡。风控 update_peak 与 signal 事件仍
@@ -6370,7 +6380,11 @@ class LiveEngine:
         # 日内周期(1m/5m...)额外卡交易时段 09:30–15:00；1d/1w/1mon 的 bar_time 按
         # 约定是当日 00:00（由 15:05「收盘落定」轮次 / B 的 14:52 提前轮次驱动），
         # 不套时段门，只判交易日，否则会把合法的日线单误杀。
-        if bt is not None and not self._trading_allowed_for(bt, period):
+        # 收盘后转 deferred 的单（15:00 已不在交易时段内）不套本闸——否则会被
+        # non_trading_block 提前 return，走不到下方 deferred 分支；交易日/时段
+        # 由放行时（次日首根分钟 bar）重新判定。
+        if (bt is not None and not deferred_by_close
+                and not self._trading_allowed_for(bt, period)):
             logger.info(
                 "skip non-trading order %s %s %s bar=%s period=%s (calendar/closed)",
                 order.trade_type.value, order.stock_code, order.signal_name,
@@ -6427,11 +6441,18 @@ class LiveEngine:
                 db.rollback()
                 logger.exception(
                     "deferred order persist failed (session %s)", self.session_id)
-            self._rec_live(
-                "signal_bar_date", "defer", portfolio, order,
-                message="日线级信号次日执行：signal_bar_date=%s，本 bar %s 不下单，"
-                        "延至次一交易日首 bar 提交" % (order.signal_bar_date, order.bar_time),
-            )
+            if getattr(order, "_after_close_defer", False):
+                self._rec_live(
+                    "after_close_defer", "defer", portfolio, order,
+                    message="收盘后信号次日执行：bar %s 已过 15:00，延至次一交易日"
+                            "首根 1m bar 按当日开盘价限价提交" % (order.bar_time,),
+                )
+            else:
+                self._rec_live(
+                    "signal_bar_date", "defer", portfolio, order,
+                    message="日线级信号次日执行：signal_bar_date=%s，本 bar %s 不下单，"
+                            "延至次一交易日首 bar 提交" % (order.signal_bar_date, order.bar_time),
+                )
             return
         # BUY 首次建仓：确保 Position 存在（同回测 BacktestEngine；submitted 不 apply）
         pos = ctx.positions.get(order.stock_code)

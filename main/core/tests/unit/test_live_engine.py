@@ -7050,33 +7050,40 @@ def test_loop_offline_to_online_still_resets_baseline_after_thread_offload():
     assert len(reset_calls) == 1
 
 
-# ---------------- 收盘后不下单守卫（修复2）----------------
-def test_handle_bar_after_close_skips_order_but_emits_signal():
-    """修复2：bar_time >= 15:00（深交所收盘）→ 信号仍 emit，但不落 LiveOrder。
+# ---------------- 收盘后信号转 deferred（方案 A，2026-11-13）----------------
+def test_handle_bar_after_close_defers_order_instead_of_dropping():
+    """方案 A：bar_time >= 15:00（收盘）→ 信号仍 emit，订单不丢弃而是落 deferred。
 
-    根因：真机 2026-08-14 id40-41 的 bar_time=15:02:42，报不进交易所成待报单冻结持仓
-    永不成交。守卫用 bar.bar_time 判定（非墙钟：不依赖本机时钟/时区），bar_time>=15:00
-    则信号推送后 continue 跳过落单。不写 DB、不进 pending。
+    旧行为直接丢弃，会让收盘 bar 的止损/止盈/CLOSE 静默不执行、留仓过夜；回测里
+    同一信号本就在次日首根 bar 开盘成交。现改为进既有 deferred 链路（次日 09:31
+    首根 1m bar 按当日开盘价限价放行），与回测同口径。
     """
     factory, _ = _db_factory()
-    port, _ = _portfolio_single()
+    port, _ = _portfolio_single(period="5m")
     stock = "600000.SH"
     bar_time = datetime(2026, 8, 5, 15, 1)  # 收盘后
     engine, q = _ss_engine(factory, port)
     engine.signal_cache = {(1, stock, bar_time): [{"name": "open_sig", "value": 1}]}
+    bar = _bar(stock, "9.0", bar_time)
+    bar.period = "5m"
 
-    engine._handle_bar(port, _bar(stock, "9.0", bar_time))
+    engine._handle_bar(port, bar)
 
     # 信号已推送（用户能看到收盘后的信号意图）
     events = []
     while not q.empty():
         events.append(q.get_nowait())
     assert any(e["type"] == "signal" and e["stock_code"] == stock for e in events)
-    # 无 order 事件、无 LiveOrder 落库
+    # 不即时落 submitted、不发 order 事件；改为 deferred 行 + 内存队列
     assert not any(e["type"] == "order" for e in events)
     db = factory()
-    assert db.query(LiveOrder).count() == 0
+    orders = db.query(LiveOrder).all()
+    assert len(orders) == 1 and orders[0].status == "deferred"
     db.close()
+    assert len(engine._signal_bar_deferred) == 1
+    deferred = engine._signal_bar_deferred[0]
+    assert deferred.signal_bar_date == date(2026, 8, 5)
+    assert deferred.bar_time == bar_time  # 信号 bar 时间保持（放行时才改写）
 
 
 def test_handle_bar_before_close_places_order_normally():
@@ -7097,6 +7104,184 @@ def test_handle_bar_before_close_places_order_normally():
     orders = db.query(LiveOrder).all()
     assert len(orders) == 1
     assert orders[0].status == "submitted"
+    db.close()
+
+
+def test_after_close_defer_released_next_day_at_first_1m_open(monkeypatch):
+    """方案 A：收盘 deferred 单在次日首根 1m bar 放行，限价=当日首根 1m 开盘价。"""
+    from core.engine.live.snapshot_bars import SnapshotBarSynthesizer
+
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single(period="5m")
+    stock = "600000.SH"
+    day1 = datetime(2026, 8, 5, 15, 1)
+    day2 = datetime(2026, 8, 6, 9, 31)
+    rec = _Recorder()
+    disp, _ = _make_dispatcher(rec)
+    engine = _calendar_engine(
+        factory, port, disp, [date(2026, 8, 5), date(2026, 8, 6)], stock)
+    engine.signal_cache = {(1, stock, day1): [{"name": "open_sig", "value": 1}]}
+    bar1 = _bar(stock, "9.20", day1)
+    bar1.period = "5m"
+    engine._handle_bar(port, bar1)
+    assert len(engine._signal_bar_deferred) == 1
+
+    # 次日：首根 1m bar（09:30）open=9.50，次根 9.60
+    monkeypatch.setattr("core.engine.live_engine.now_shanghai",
+                        lambda: datetime(2026, 8, 6, 9, 31, 2))
+    snaps = {stock: {"Now": "9.50", "Volume": "1000"}}
+    synth = SnapshotBarSynthesizer(
+        [stock],
+        fetch_snapshot=lambda codes: {c: dict(snaps[c]) for c in codes if c in snaps},
+        in_session=lambda dt: True,
+    )
+    synth.sample(datetime(2026, 8, 6, 9, 30, 5))
+    engine._snapshot_synth = synth
+
+    engine.signal_cache = {}
+    bar2 = _bar(stock, "9.60", day2)
+    bar2.period = "1m"
+    engine._handle_bar(port, bar2)
+
+    db = factory()
+    orders = db.query(LiveOrder).all()
+    assert len(orders) == 1 and orders[0].status == "submitted"
+    assert orders[0].bar_time == day2          # 决策时间戳 = 放行 bar
+    assert Decimal(str(orders[0].price)) == Decimal("9.50")  # 首根 1m open
+    db.close()
+    assert engine._signal_bar_deferred == []
+    assert any(r.url.path == "/order" for r in rec.requests)
+
+
+def test_after_close_defer_survives_restart_recover_and_releases(monkeypatch):
+    """方案 A：收盘 deferred 行可跨重启由 recover 重建队列，次日仍能放行。"""
+    from core.engine.bar_poller import BarPoller
+
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single(period="5m")
+    stock = "600000.SH"
+    day1 = datetime(2026, 8, 5, 15, 1)
+    day2 = datetime(2026, 8, 6, 9, 31)
+    rec = _Recorder()
+    disp, _ = _make_dispatcher(rec)
+    engine = _calendar_engine(
+        factory, port, disp, [date(2026, 8, 5), date(2026, 8, 6)], stock)
+    engine.signal_cache = {(1, stock, day1): [{"name": "open_sig", "value": 1}]}
+    bar1 = _bar(stock, "9.20", day1)
+    bar1.period = "5m"
+    engine._handle_bar(port, bar1)
+
+    # 模拟重启：新引擎从 DB 足迹重建内存队列（时钟固定到次日，避免新鲜度清扫）
+    monkeypatch.setattr("core.engine.live_engine.now_shanghai",
+                        lambda: datetime(2026, 8, 6, 9, 31, 2))
+    port2, _ = _portfolio_single(period="5m")
+    engine2 = _calendar_engine(
+        factory, port2, disp, [date(2026, 8, 5), date(2026, 8, 6)], stock)
+    db = factory()
+    engine2.recover(db)
+    db.close()
+    assert len(engine2._signal_bar_deferred) == 1
+
+    engine2.signal_cache = {}
+    bar2 = _bar(stock, "9.40", day2)
+    bar2.period = "1m"
+    engine2._handle_bar(port2, bar2)
+
+    db = factory()
+    orders = db.query(LiveOrder).all()
+    assert len(orders) == 1 and orders[0].status == "submitted"
+    db.close()
+
+
+def test_after_close_defer_dedupes_same_bar_replay():
+    """方案 A：同一 15:00 bar 重放不产生第二行 deferred（六元组去重）。"""
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single(period="5m")
+    stock = "600000.SH"
+    bar_time = datetime(2026, 8, 5, 15, 1)
+    engine, _ = _ss_engine(factory, port)
+    engine.signal_cache = {(1, stock, bar_time): [{"name": "open_sig", "value": 1}]}
+    bar = _bar(stock, "9.0", bar_time)
+    bar.period = "5m"
+
+    engine._handle_bar(port, bar)
+    engine._handle_bar(port, bar)
+
+    db = factory()
+    rows = db.query(LiveOrder).filter(LiveOrder.status == "deferred").all()
+    assert len(rows) == 1
+    db.close()
+    assert len(engine._signal_bar_deferred) == 1
+
+
+def test_after_close_defers_even_when_risk_timing_immediate():
+    """方案 A：risk_timing=immediate 也不能绕过收盘闸在 15:00 直接报单。"""
+    factory, _ = _db_factory()
+    port, ctx = _portfolio_single(period="5m")
+    ctx.risk_timing = "immediate"
+    stock = "600000.SH"
+    bar_time = datetime(2026, 8, 5, 15, 1)
+    rec = _Recorder()
+    disp, _ = _make_dispatcher(rec)
+    engine = _calendar_engine(factory, port, disp, [date(2026, 8, 5)], stock)
+    engine.signal_cache = {(1, stock, bar_time): [{"name": "open_sig", "value": 1}]}
+    bar = _bar(stock, "9.0", bar_time)
+    bar.period = "5m"
+
+    engine._handle_bar(port, bar)
+
+    db = factory()
+    rows = db.query(LiveOrder).filter(LiveOrder.status == "deferred").all()
+    assert len(rows) == 1
+    db.close()
+    assert not any(r.url.path == "/order" for r in rec.requests)  # 不发桥
+
+
+def test_after_close_deferred_minute_order_skips_pre_open_auction():
+    """方案 A：15:00 分钟单不进 09:15–09:20 集合竞价，留给 09:31 首根 1m 路径。"""
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single(period="5m")
+    stock = "600000.SH"
+    day1 = datetime(2026, 8, 5, 15, 1)
+    rec = _Recorder()
+    disp, _ = _make_dispatcher(rec)
+    engine = _calendar_engine(
+        factory, port, disp, [date(2026, 8, 5), date(2026, 8, 6)], stock)
+    engine.signal_cache = {(1, stock, day1): [{"name": "open_sig", "value": 1}]}
+    bar1 = _bar(stock, "9.20", day1)
+    bar1.period = "5m"
+    engine._handle_bar(port, bar1)
+
+    # 次日 09:16 盘前窗口：分钟单必须被过滤掉
+    engine._pre_open_release(port, datetime(2026, 8, 6, 9, 16))
+
+    assert len(engine._signal_bar_deferred) == 1  # 仍在队列，未被摘走
+    assert not any(r.url.path == "/order" for r in rec.requests)  # 未报出
+    db = factory()
+    assert db.query(LiveDecisionEvent).filter_by(
+        gate="pre_open_auction").count() == 0
+    db.close()
+
+
+def test_after_close_defer_records_gate_action():
+    """方案 A：收盘 defer 的决策事件 gate=after_close_defer / action=defer。"""
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single(period="5m")
+    stock = "600000.SH"
+    bar_time = datetime(2026, 8, 5, 15, 1)
+    engine, _ = _ss_engine(factory, port)
+    engine.signal_cache = {(1, stock, bar_time): [{"name": "open_sig", "value": 1}]}
+    bar = _bar(stock, "9.0", bar_time)
+    bar.period = "5m"
+
+    engine._handle_bar(port, bar)
+
+    db = factory()
+    evs = db.query(LiveDecisionEvent).filter_by(gate="after_close_defer").all()
+    assert len(evs) == 1
+    assert evs[0].action == "defer"
+    assert evs[0].layer == "live_gate"
+    assert evs[0].stock_code == stock
     db.close()
 
 
@@ -8451,22 +8636,24 @@ def _drain_queue(q):
 
 
 def test_handle_bar_after_close_records_decision_event():
-    """收盘后拦单 → after_close_block(live_gate/block) 落 LiveDecisionEvent + SSE decision。"""
+    """收盘后信号转 deferred → after_close_defer(live_gate/defer) 落决策事件 + SSE。"""
     factory, _ = _db_factory()
-    port, _ = _portfolio_single()
+    port, _ = _portfolio_single(period="5m")
     stock = "600000.SH"
     bar_time = datetime(2026, 8, 5, 15, 1)  # 收盘后
     engine, q = _ss_engine(factory, port)
     engine.signal_cache = {(1, stock, bar_time): [{"name": "open_sig", "value": 1}]}
+    bar = _bar(stock, "9.0", bar_time)
+    bar.period = "5m"
 
-    engine._handle_bar(port, _bar(stock, "9.0", bar_time))
+    engine._handle_bar(port, bar)
 
     rows = _decision_rows(factory)
     assert len(rows) == 1
     ev = rows[0]
-    assert ev.gate == "after_close_block"
+    assert ev.gate == "after_close_defer"
     assert ev.layer == "live_gate"
-    assert ev.action == "block"
+    assert ev.action == "defer"
     assert ev.portfolio_id == 1
     assert ev.strategy_id == 1
     assert ev.stock_code == stock
@@ -8475,12 +8662,13 @@ def test_handle_bar_after_close_records_decision_event():
     queued = _drain_queue(q)
     dec = [e for e in queued if e.get("type") == "decision"]
     assert len(dec) == 1
-    assert dec[0]["gate"] == "after_close_block"
+    assert dec[0]["gate"] == "after_close_defer"
     assert dec[0]["layer"] == "live_gate"
     assert not any(e.get("type") == "order" for e in queued)
-    # 无 LiveOrder 落库（拦单不下单）
+    # 落 deferred 行（不即时下单）
     db = factory()
-    assert db.query(LiveOrder).count() == 0
+    orders = db.query(LiveOrder).all()
+    assert len(orders) == 1 and orders[0].status == "deferred"
     db.close()
 
 
