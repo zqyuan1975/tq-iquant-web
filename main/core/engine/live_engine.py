@@ -207,16 +207,18 @@ def _expected_minute_labels(start: Optional[datetime],
     09:30 < t ≤ 11:30 与 13:00 < t ≤ 15:00。跨日返回空（跨日缺口不做逐分钟
     期望，调用方按「跨日」语义记录起止即可）。上限 300 根防异常输入死循环。
 
-    P1-2（2026-11-12）：`end` 所在那一分钟是**正在形成**的 bar（其完成时刻 =
-    下一分钟整点），不能计入「应有分钟」——否则每轮审计必缺 1 根、`action`
-    恒为 `partial`，告警失真。故先回退 1 秒再取分钟下限（`end=10:06:00` →
-    `stop=10:05`；`end=10:05:30` → `stop=10:05`）。
+    P1-2（2026-11-12）：正在形成的分钟（其完成时刻 = 下一分钟整点）不能计入
+    「应有分钟」，否则每轮审计必缺 1 根、`action` 恒为 `partial`。该保护由调用方
+    ``_plan_gap_recovery`` 完成——它把 ``gap_end`` 取成 ``(now − 1s)`` 截到分钟，
+    **已是最后一根已闭合 bar 的标签**；本函数按闭区间 ``(start, end]`` 计入 `end`
+    本身（`end=10:05` → 含 10:05）。2026-11-13 修：旧实现这里**又**减 1 秒，
+    双端各减一次 → `gap_bars` 每轮恒少 1 根（审计口径失真）。
     """
     if start is None or end is None or start.date() != end.date():
         return []
     labels: List[datetime] = []
     t = start.replace(second=0, microsecond=0) + timedelta(minutes=1)
-    stop = (end - timedelta(seconds=1)).replace(second=0, microsecond=0)
+    stop = end.replace(second=0, microsecond=0)
     while t <= stop and len(labels) <= 300:
         hm = (t.hour, t.minute)
         if (9, 30) < hm <= (11, 30) or (13, 0) < hm <= (15, 0):
