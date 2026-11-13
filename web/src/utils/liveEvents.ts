@@ -104,6 +104,9 @@ export const GATE_LABEL: Record<string, string> = {
   cash_flow: '外部现金流',
   fill_price_deviation: '成交价偏离',
   claim_price_mismatch: '委托价认领不符',
+  // 通道在线态（watchdog / 引擎心跳转场，2026-11-13）
+  channel_offline: '通道离线',
+  channel_recovered: '通道恢复',
   // 下单闸门里此前未登记的中文标签（工作台不再露英文 key）
   signal: '信号闸',
   trading_session: '非交易时段',
@@ -163,6 +166,13 @@ export function gateLabel(gate: string): string {
 export const TRADE_TYPE_LABEL: Record<string, string> = {
   BUY: '买入',
   SELL: '卖出',
+}
+
+/** 通道在线态 → 中文：true=在线 / false=离线 / null|undefined=未知。 */
+export function channelStateLabel(v: boolean | null | undefined): string {
+  if (v === true) return '在线'
+  if (v === false) return '离线'
+  return '未知'
 }
 
 /** trade_type → 中文标签（大小写不敏感；未知值回退原值）。 */

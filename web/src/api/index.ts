@@ -1698,6 +1698,8 @@ export interface LiveSessionItem {
   execution_mode?: LiveExecutionMode  // 执行模式（旧数据缺省视作 auto）
   status: string  // stopped|running
   engine_running?: boolean  // 该会话引擎是否真的在注册表中运行（status=running 但 false=重启后未启动）
+  // 通道在线态（会话详情接口返回；列表接口通常不返回 → undefined=未知）
+  bridge_online?: boolean | null
   live_capital?: number | null  // 会话级实盘资金基准（账户总资产，元）；null=各组合用自身 initial_capital
   started_at: string | null
   stopped_at: string | null

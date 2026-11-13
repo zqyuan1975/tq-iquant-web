@@ -38,10 +38,11 @@ from sqlalchemy import func
 
 from core.config import load_config
 from core.db import SessionLocal
-from core.models import LiveAccountSnapshot
+from core.models import LiveAccountSnapshot, LiveDecisionEvent
 
 from .snapshot_bars import default_in_session
 from .timing import now_shanghai
+from .win_dialog_scope import client_window_present
 
 logger = logging.getLogger(__name__)
 
@@ -67,7 +68,15 @@ _RECOVERY_EVENT = {
     "execution_stalled": "execution_recovered",
     "bridge_unreachable": "bridge_recovered",
     "market_data_stalled": "market_data_recovered",
+    "client_offline": "client_recovered",
 }
+
+#: 通道类规则（首次判定落 ``live_decision_events``）；``engine_stale`` 属引擎层，
+#: 不是通道在线态，不冒充 ``channel_offline``（2026-11-13）。
+_CHANNEL_RULES = frozenset({
+    "market_data_stalled", "bridge_unreachable", "execution_stalled",
+    "client_offline",
+})
 
 #: 日线及以上周期（bar_time 为 00:00:00，不具备分钟级行情新鲜度语义）
 _LONG_PERIODS = frozenset({"1d", "1w", "1mon", "day", "week", "month"})
@@ -76,6 +85,49 @@ _LONG_PERIODS = frozenset({"1d", "1w", "1mon", "day", "week", "month"})
 _AM_OPEN = _dtime(9, 30)
 _LUNCH_START = _dtime(11, 30)
 _LUNCH_END = _dtime(13, 0)
+#: 盘前判定窗口（含集合竞价）：此时段无行情，只能看客户端是否还在
+_PRE_OPEN_START = _dtime(8, 55)
+
+
+def in_pre_open_window(now: datetime) -> bool:
+    """盘前窗口 08:55–09:30（工作日）：只判客户端在线，不判行情。
+
+    2026-11-13 早盘事故落在 08:54–09:30，旧实现 ``_probe_tdx`` 在该时段直接
+    ``return None``，退出完全无声。盘后（15:00 之后）仍不判，避免噪音。
+    """
+    if now.weekday() >= 5:
+        return False
+    return _PRE_OPEN_START <= now.time() < _AM_OPEN
+
+
+def record_channel_decision(session_id: int, channel: str, gate: str,
+                            action: str, seconds: float, basis: str,
+                            message: str) -> None:
+    """通道在线态决策事件落库（best-effort，复用 ``live_decision_events``）。
+
+    字段：``gate=channel_offline|channel_recovered``、``layer=live_gate``、
+    ``action=trigger|recover``、``param_name=channel:<通道>``、``actual_value``=
+    已持续秒数、``message`` 含会话/规则/依据。失败只记日志，**绝不抛回扫描线程**。
+    """
+    try:
+        db = SessionLocal()
+        try:
+            db.add(LiveDecisionEvent(
+                live_session_id=int(session_id),
+                gate=gate,
+                layer="live_gate",
+                action=action,
+                param_name=("channel:%s" % channel)[:40],
+                actual_value=float(seconds),
+                message=(message or "")[:200],
+            ))
+            db.commit()
+        finally:
+            db.close()
+    except Exception:  # noqa: BLE001 — 观测链路失败不影响监控/交易
+        logger.exception(
+            "record channel decision failed (session %s, gate %s)",
+            session_id, gate)
 
 
 def _tradable_seconds(start: datetime, end: datetime) -> float:
@@ -152,6 +204,8 @@ class EngineWatchdog:
         mono_fn: Callable[[], float] = time.monotonic,
         snapshot_fn: Callable[[int], Optional[datetime]] = latest_snapshot_at,
         in_session_fn: Callable[[datetime], bool] = default_in_session,
+        client_online_fn: Callable[[str], bool] = client_window_present,
+        persist_fn: Optional[Callable[..., None]] = None,
     ):
         self._sessions_provider = sessions_provider
         self._timeout = (heartbeat_timeout_seconds() if timeout_seconds is None
@@ -172,6 +226,10 @@ class EngineWatchdog:
         self._mono = mono_fn
         self._snapshot = snapshot_fn
         self._in_session = in_session_fn
+        # 客户端窗口/进程探针（tdx/ths）：毫秒级 ctypes，不初始化 TQ
+        self._client_online = client_online_fn
+        # 通道事件落库（None=不落库：单测默认不写真实 dev.db；生产由 main.py 注入）
+        self._persist = persist_fn
         # (session_id, rule) -> {"alerted": bool, "last_alert_mono": float}
         self._states: Dict[tuple, dict] = {}
         # 探针用的持续态：cursor 未推进起点 / 桥离线起点 / 回执积压起点
@@ -365,17 +423,55 @@ class EngineWatchdog:
                 return floor
         return started
 
+    def _probe_tdx_client(self, now: datetime, session_id: int,
+                          engine: object) -> Optional[StallSignal]:
+        """通达信客户端窗口/进程是否还在（毫秒级 ctypes，不初始化 TQ）。
+
+        这是**不依赖心跳侧证**的在线判据：客户端退出 = 行情与下单同时不可用，
+        盘前同样成立。探测本身异常按「在线」处理（不误判离线）。
+        持续离线起点用单调时钟记在 ``_probe_state``，恢复即清。
+        """
+        try:
+            online = bool(self._client_online("tdx"))
+        except Exception:  # noqa: BLE001 — 探针异常不等于客户端掉了
+            logger.warning(
+                "engine watchdog: tdx 客户端探测失败 (session %s)", session_id,
+                exc_info=True)
+            online = True
+        key = (session_id, "client_offline")
+        if online:
+            self._probe_state.pop(key, None)
+            return None
+        since = self._probe_state.setdefault(key, self._mono())
+        seconds = max(self._mono() - since, 0.0)
+        return StallSignal(
+            rule="client_offline", seconds=seconds,
+            message=("通达信客户端不在线：会话 %s 未检测到通达信窗口/进程"
+                     "（客户端可能已退出；已持续约 %.0f 秒）"
+                     % (session_id, seconds)),
+            detail={"basis": "client_window", "engine": "tdx_tq"})
+
     def _probe_tdx(self, now: datetime, session_id: int,
                    engine: object) -> Optional[StallSignal]:
-        """行情新鲜度停滞；或行情链路已标离线。
+        """客户端在线 + 行情新鲜度 / 行情链路离线。
+
+        时段口径（2026-11-13）：连续竞价判行情；盘前 08:55–09:30 只判客户端
+        （盘前没有行情，不能用「合成停摆」推断）；盘后/午休/非交易日不判。
 
         新鲜度基准优先取快照合成器「最近一根已闭合 1m bar」（tdx/ths/alert/掘金
         的盘中数据源）。**策略周期 bar（1d/1w/1mon）的 00:00:00 不参与判定**——
         直接与墙钟相减会在每天开盘后必报假警（2026-11-05 14:31 实证：
         last bar=00:00:00、静默 52278 秒，实际 5s 账户采样与 1m bar 一直在跑）。
         """
-        if not self._in_session(now):
-            return None  # 盘外无 bar 正常
+        in_session = self._in_session(now)
+        if not in_session and not in_pre_open_window(now):
+            return None  # 盘后/午休/非交易日不判，避免噪音
+        # 客户端是否还在（不依赖心跳侧证；盘前同样有效）
+        client = self._probe_tdx_client(now, session_id, engine)
+        if client is not None:
+            return client
+        if not in_session:
+            return None  # 盘前客户端在：无行情可判，不臆造停滞
         if not getattr(engine, "_bridge_online", True):
             started = getattr(engine, "_started_at", None)
             last = getattr(engine, "_last_tick_at", None) or started
@@ -515,6 +611,7 @@ class EngineWatchdog:
         mono = self._mono()
         if state["alerted"] and mono - state["last_alert_mono"] < self._repeat:
             return
+        first = not state["alerted"]
         state["alerted"] = True
         state["last_alert_mono"] = mono
         self._scan_stats["alarms"] += 1
@@ -529,6 +626,35 @@ class EngineWatchdog:
         payload.update(signal.detail)
         logger.error("%s", signal.message)
         self._safe_emit(engine, "risk", payload)
+        # 单次判定即留痕（不等 300s 重复周期），几分钟闪断也能在库里查到
+        if first and signal.rule in _CHANNEL_RULES:
+            self._persist_channel_event(
+                session_id, channel, signal.rule, online=False,
+                seconds=signal.seconds,
+                message=("通道离线：%s（会话 %s，判据=%s，已持续 %d 秒）%s"
+                         % (channel, session_id, signal.rule,
+                            int(signal.seconds), signal.message)))
+
+    def _persist_channel_event(self, session_id: int, channel: str, rule: str,
+                               *, online: bool, seconds: float = 0.0,
+                               message: str = "") -> None:
+        """落一条 ``channel_offline``/``channel_recovered``（失败只记日志）。"""
+        if self._persist is None:
+            return
+        try:
+            self._persist(
+                session_id=session_id,
+                channel=channel,
+                gate="channel_recovered" if online else "channel_offline",
+                action="recover" if online else "trigger",
+                seconds=seconds,
+                basis=rule,
+                message=message,
+            )
+        except Exception:  # noqa: BLE001 — 观测链路失败不影响监控/交易
+            logger.exception(
+                "engine watchdog persist channel event failed (session %s, %s)",
+                session_id, rule)
 
     def _recover_rule(self, engine: object, session_id: int, channel: str,
                       rule: str) -> None:
@@ -545,12 +671,17 @@ class EngineWatchdog:
             "rule": _RECOVERY_EVENT.get(rule, rule + "_recovered"),
             "message": message,
         })
+        if rule in _CHANNEL_RULES:
+            self._persist_channel_event(
+                session_id, channel, rule, online=True,
+                message=("通道恢复：%s（会话 %s，判据=%s）"
+                         % (channel, session_id, rule)))
 
     def _recover_if_alerted(self, engine: object, session_id: int, channel: str,
                             channel_probe: bool) -> None:
         """通道探针未命中：清该会话所有通道类规则的告警态并各发一次恢复。"""
         for rule in ("execution_stalled", "bridge_unreachable",
-                     "market_data_stalled"):
+                     "market_data_stalled", "client_offline"):
             self._recover_rule(engine, session_id, channel, rule)
 
     def _clear_session(self, session_id: int) -> None:

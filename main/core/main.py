@@ -21,7 +21,9 @@ from core.services.backtest_service import (
 from core.services.live_service import (
     ENGINES, recover_stale_running_live_sessions,
 )
-from core.engine.live.engine_watchdog import EngineWatchdog
+from core.engine.live.engine_watchdog import (
+    EngineWatchdog, record_channel_decision,
+)
 from core.services.backup_service import BackupScheduler
 from core.services.incremental_backtest import IncrementalBacktestScheduler
 from core.services.auto_shutdown import arm as arm_auto_shutdown
@@ -62,7 +64,10 @@ async def lifespan(app: FastAPI):
     # 需外部 watchdog（scripts/ops/watch_live_backend.ps1）兜底。
     watchdog = None
     try:
-        watchdog = EngineWatchdog(lambda: ENGINES)
+        # 通道类故障单次判定即落 live_decision_events（gate=channel_offline/
+        # channel_recovered），几分钟闪断也能在库里查到（2026-11-13）。
+        watchdog = EngineWatchdog(
+            lambda: ENGINES, persist_fn=record_channel_decision)
         watchdog.start()
         logger.info("实盘引擎存活监控已启动（进程内，30s 扫描）")
     except Exception:  # noqa: BLE001 — 监控启动失败不得阻断主服务

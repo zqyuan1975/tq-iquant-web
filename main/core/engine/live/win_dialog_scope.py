@@ -70,6 +70,44 @@ def window_image_name(pid: int) -> str:
     return name
 
 
+def client_window_present(channel: str) -> bool:
+    """该通道客户端是否有可见顶层窗口（进程映像名关键词匹配）。
+
+    纯 ctypes、毫秒级：**不 import tqcenter、不初始化 TQ、不碰 UI 自动化**，
+    供 watchdog 在盘前/盘中做「不依赖心跳侧证」的在线判定（2026-11-13）。
+    与 live_service._window_present 同一口径；未知通道/非 Windows/任何异常 → False。
+    """
+    keywords = _CHANNEL_PROC_KEYWORDS.get(channel)
+    if not keywords:
+        return False
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        found = []
+        user32 = ctypes.windll.user32
+        enum_proc = ctypes.WINFUNCTYPE(
+            wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+
+        def _cb(hwnd, _lparam):
+            try:
+                if user32.IsWindowVisible(hwnd):
+                    pid = wintypes.DWORD()
+                    user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+                    name = window_image_name(pid.value)
+                    if any(k in name for k in keywords):
+                        found.append(True)
+                        return False
+            except Exception:  # noqa: BLE001 - 单个窗口读失败不影响整体
+                pass
+            return True
+
+        user32.EnumWindows(enum_proc(_cb), 0)
+        return bool(found)
+    except Exception:  # noqa: BLE001 - 非 Windows/ctypes 异常 → 判不在
+        return False
+
+
 def dialog_matches_channel(dialog, channel: str) -> bool:
     """弹窗是否属于指定通道的客户端进程（映像名关键词匹配）。
 

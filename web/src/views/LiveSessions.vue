@@ -1,6 +1,6 @@
 ﻿<script setup lang="ts">
 import { ref, computed, onMounted, onUnmounted } from 'vue'
-import { formatEvent, nextEventId, EVENT_TYPE_COLOR, tradeTypeLabel, ORDER_STATUS_LABEL, gateLabel, LAYER_LABEL, ACTION_LABEL, type LiveEvent } from '../utils/liveEvents'
+import { formatEvent, nextEventId, EVENT_TYPE_COLOR, tradeTypeLabel, ORDER_STATUS_LABEL, gateLabel, LAYER_LABEL, ACTION_LABEL, channelStateLabel, type LiveEvent } from '../utils/liveEvents'
 import {
   orderHistoryToRows, upsertOrderRow,
   tradeEventToRow, tradeHistoryToRows,
@@ -183,6 +183,10 @@ const accountSnapshots = ref<Record<number, any>>({})
 const calendarStatus = ref<Record<number, any>>({})
 // 真实账户总资产 vs 虚拟净值（详情接口 equity_check；>20% 后端已告警一次）
 const equityChecks = ref<Record<number, any>>({})
+// 通道在线态（会话详情 bridge_online）：null=未知（未运行/未取到）。15s 轮询，
+// 让「客户端退出/通道掉线」在工作台可见，而不是只留在后端日志里（2026-11-13）。
+const bridgeOnline = ref<boolean | null>(null)
+let bridgeTimer: ReturnType<typeof setInterval> | null = null
 
 /** 单年日历摘要：正常=来源/交易日数/覆盖区间；退化=来源+标记。 */
 function calendarYearText(year: string, y: any): string {
@@ -414,6 +418,7 @@ async function loadHistory(id: number) {
         accountSnapshots.value = { ...accountSnapshots.value, [id]: d?.account_snapshot ?? null }
         calendarStatus.value = { ...calendarStatus.value, [id]: d?.trading_calendar ?? null }
         equityChecks.value = { ...equityChecks.value, [id]: d?.equity_check ?? null }
+        bridgeOnline.value = typeof d?.bridge_online === 'boolean' ? d.bridge_online : null
       }).catch(() => {})
     } catch { /* api 缺失等 → 辅助卡静默 */ }
     // 竞态补拉（audit C1）：五请求在途期间 SSE 已推过 position/order/trade 时，
@@ -516,6 +521,7 @@ const watchedSessionId = ref<number | null>(null)
 function watchSession(id: number) {
   watchedSessionId.value = id
   activeSessionId = id
+  bridgeOnline.value = null  // 切换会话先置未知，避免显示上一个会话的在线态
   const target = sessions.value.find((s) => s.id === id)
   if (target) {
     runningEngine.value = (target.engine as LiveEngineKey) || null
@@ -555,6 +561,7 @@ async function load() {
     // 无运行会话 → 断开事件流、工作台聚焦清空
     closeEventStreams()
     activeSessionId = null
+    bridgeOnline.value = null
   }
   // 通道条跟随监控中 session 的引擎；无运行会话时跟随默认引擎
   loadChannel(target?.engine)
@@ -621,6 +628,25 @@ async function loadChannel(engine?: LiveEngineKey) {
   }
 }
 
+/** 定时刷新聚焦会话的通道在线态（只在 running 会话上取；未知=null）。 */
+async function refreshBridgeOnline() {
+  const id = activeSessionId
+  if (id === null) {
+    bridgeOnline.value = null
+    return
+  }
+  const target = sessions.value.find((s) => s.id === id)
+  if (!target || target.status !== 'running') {
+    bridgeOnline.value = null
+    return
+  }
+  try {
+    const d = await getLiveSession(id)
+    if (activeSessionId !== id) return  // 在途期间已切走 → 丢弃
+    bridgeOnline.value = typeof d?.bridge_online === 'boolean' ? d.bridge_online : null
+  } catch { /* 保持现状 */ }
+}
+
 async function testChannel() {
   if (!channel.value) return
   channelTesting.value = true
@@ -638,8 +664,18 @@ async function testChannel() {
   }
 }
 
-onMounted(() => { load() })
-onUnmounted(closeEventStreams)
+onMounted(() => {
+  load()
+  // 通道在线态 15s 轮询（与决策流 SSE 互补：SSE 掉线时仍能看到状态）
+  bridgeTimer = setInterval(refreshBridgeOnline, 15000)
+})
+onUnmounted(() => {
+  closeEventStreams()
+  if (bridgeTimer !== null) {
+    clearInterval(bridgeTimer)
+    bridgeTimer = null
+  }
+})
 </script>
 
 <template>
@@ -668,6 +704,13 @@ onUnmounted(closeEventStreams)
       v-else-if="channel?.online !== null && channel?.online !== undefined"
       class="badge" :class="channel.online ? 'badge-green' : 'badge-red'"
     >{{ channel.online ? '在线' : '离线' }}</span>
+    <!-- 聚焦会话的通道心跳态（会话详情 bridge_online，15s 轮询）：客户端退出时由绿转红 -->
+    <span
+      v-if="watchedSessionId !== null"
+      class="badge"
+      :class="bridgeOnline === true ? 'badge-green' : bridgeOnline === false ? 'badge-red' : 'badge-gray'"
+      title="当前聚焦会话的通道心跳状态（会话详情 bridge_online，15 秒刷新）；未知=会话未运行或尚未取到心跳态"
+    >通道：{{ channelStateLabel(bridgeOnline) }}</span>
     <button class="btn btn-sm" :disabled="channelTesting" @click="testChannel">
       {{ channelTesting ? '测试中…' : '测试连接' }}
     </button>

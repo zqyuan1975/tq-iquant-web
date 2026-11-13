@@ -43,6 +43,8 @@ def _watchdog(engines, **kw):
     kw.setdefault("mono_fn", lambda: 0.0)
     kw.setdefault("snapshot_fn", lambda sid: None)
     kw.setdefault("in_session_fn", lambda dt: True)
+    # 客户端窗口探针注入固定「在线」：单测不依赖本机是否真的开着通达信
+    kw.setdefault("client_online_fn", lambda ch: True)
     # 默认关掉引擎层阈值，避免干扰通道探针断言
     kw.setdefault("timeout_seconds", 10 ** 9)
     kw.setdefault("execution_stall_seconds", 180)

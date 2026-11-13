@@ -1644,10 +1644,68 @@ class LiveEngine:
 
     # ---------------- P2-6 桥离线缺口恢复 ----------------
     def _mark_bridge_offline(self, now: datetime) -> None:
-        """置离线状态并只记录**首次**离线时点（缺口审计/补派起点）。"""
+        """置离线状态并只记录**首次**离线时点（缺口审计/补派起点）。
+
+        2026-11-13：在线态 True→False 翻转时落一条 ``channel_offline`` 决策事件
+        ——「退出后 1 分钟内重启」只要有一次心跳失败就留痕，不等 watchdog 阈值。
+        """
+        was_online = self._bridge_online
         self._bridge_online = False
         if self._offline_since is None:
             self._offline_since = now
+        if was_online:
+            self._record_channel_state(
+                online=False, reason="heartbeat_failed", now=now)
+
+    def _mark_bridge_online(self, now: datetime) -> None:
+        """置在线状态；仅 False→True 翻转时落一条 ``channel_recovered``。
+
+        重复调用（已在线）不写库，避免每轮心跳都产生事件。
+        """
+        if self._bridge_online:
+            return
+        self._bridge_online = True
+        self._record_channel_state(
+            online=True, reason="heartbeat_ok", now=now)
+
+    def _record_channel_state(self, *, online: bool, reason: str,
+                              now: datetime) -> None:
+        """通道在线态转场留痕（best-effort，复用 live_decision_events）。
+
+        与 watchdog 的 ``channel_offline/channel_recovered`` 同 gate 口径，区别
+        只在判据：这里是心跳转场（``heartbeat_failed``/``heartbeat_ok``），
+        watchdog 是行情停摆/客户端消失/桥超时。失败只记日志，不影响下单记账。
+        """
+        factory = self._db_session_factory
+        if factory is None:
+            return
+        dispatcher = getattr(self, "_dispatcher", None)
+        channel = str(getattr(dispatcher, "channel", "")
+                      or getattr(self, "_engine_key", "") or "unknown")
+        text = ("通道恢复：%s（会话 %s，判据=%s，%s）" if online
+                else "通道离线：%s（会话 %s，判据=%s，%s）")
+        message = text % (channel, self.session_id, reason,
+                          now.strftime("%Y-%m-%d %H:%M:%S"))
+        logger.warning("%s", message)
+        try:
+            db = factory()
+            try:
+                db.add(LiveDecisionEvent(
+                    live_session_id=self.session_id,
+                    gate=("channel_recovered" if online else "channel_offline"),
+                    layer="live_gate",
+                    action=("recover" if online else "trigger"),
+                    param_name=("channel:%s" % channel)[:40],
+                    actual_value=0.0,
+                    message=message[:200],
+                ))
+                db.commit()
+            finally:
+                db.close()
+        except Exception:  # noqa: BLE001 — 观测链路失败不得影响交易
+            logger.exception(
+                "record channel state failed (session %s, online=%s)",
+                self.session_id, online)
 
     def _plan_gap_recovery(self, now: datetime) -> Optional[dict]:
         """离线恢复时决定「补派 / 放弃 + 审计」的处置计划（P2-6）。
@@ -1840,7 +1898,7 @@ class LiveEngine:
                 # 否则当天 1d/1w/1mon 信号与 daily_loss/熔断推进被静默吞掉一整天。
                 self._run_daily_schedule()
                 return
-            self._bridge_online = True
+            self._mark_bridge_online(now)
             if not was_online:
                 # E8：离线恢复。P2-6：行情源可回补历史 bar 时**不**重建基线，改为
                 # 按缺口长度放大 count 幂等补派（见 _plan_gap_recovery）；快照合成源
@@ -5276,9 +5334,9 @@ class LiveEngine:
         """alert 单轮：TQ 心跳 → 拉行情 → 调度信号；不碰委托/成交/持仓。"""
         was_online = self._bridge_online
         if not self._dispatcher.heartbeat():
-            self._bridge_online = False
+            self._mark_bridge_offline(now_shanghai())
             return
-        self._bridge_online = True
+        self._mark_bridge_online(now_shanghai())
         if not was_online:
             # 离线恢复：丢弃离线期间积压的 bar/预热缓存，避免恢复首轮补发陈旧预警。
             if hasattr(self._bar_poller, "reset_baseline"):

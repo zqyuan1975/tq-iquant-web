@@ -423,46 +423,14 @@ def _engine_state_freshness(engine) -> Tuple[Optional[str], bool]:
     return last_tick.strftime("%Y-%m-%d %H:%M:%S"), stale
 
 
-#: 本机客户端窗口探针（tdx/ths）：EnumWindows + 映像名关键词匹配，纯用户态、
-#: 毫秒级。**刻意不碰 TQ / 同花顺 UI**——AGENTS.md 明确 TQ 调用会冻结通达信客户端，
-#: 状态卡刷新不得触发；同花顺 connect 会做登录页 OCR（秒级），也不适合页面请求。
-#: 判据与既有弹窗归属识别（win_dialog_scope）同一套映像名：tdx / xiadan|hexin。
-_WINDOW_KEYWORDS = {"tdx": ("tdx",), "ths": ("xiadan", "hexin")}
-
-
 def _window_present(engine_key: str) -> bool:
-    """该通道客户端是否有可见顶层窗口（进程映像名匹配）。失败一律判不在。"""
-    keywords = _WINDOW_KEYWORDS.get(engine_key)
-    if not keywords:
-        return False
-    try:
-        import ctypes
-        from ctypes import wintypes
+    """该通道客户端是否有可见顶层窗口（进程映像名匹配）。失败一律判不在。
 
-        from core.engine.live.win_dialog_scope import window_image_name
-
-        found = []
-        user32 = ctypes.windll.user32
-        enum_proc = ctypes.WINFUNCTYPE(
-            wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
-
-        def _cb(hwnd, _lparam):
-            try:
-                if user32.IsWindowVisible(hwnd):
-                    pid = wintypes.DWORD()
-                    user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
-                    name = window_image_name(pid.value)
-                    if any(k in name for k in keywords):
-                        found.append(True)
-                        return False
-            except Exception:  # noqa: BLE001 - 单个窗口读失败不影响整体
-                pass
-            return True
-
-        user32.EnumWindows(enum_proc(_cb), 0)
-        return bool(found)
-    except Exception:  # noqa: BLE001 - 非 Windows/ctypes 异常 → 判不在
-        return False
+    实现已下沉到 ``win_dialog_scope.client_window_present``（watchdog 盘前判据
+    共用同一套 ctypes 探测），行为不变：**刻意不碰 TQ / 同花顺 UI**。
+    """
+    from core.engine.live.win_dialog_scope import client_window_present
+    return client_window_present(engine_key)
 
 
 class _WindowProbe:

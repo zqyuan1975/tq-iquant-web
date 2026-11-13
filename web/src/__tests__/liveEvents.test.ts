@@ -1,5 +1,19 @@
 import { describe, it, expect } from 'vitest'
-import { formatEvent, gateLabel, GATE_LABEL, LAYER_LABEL, ACTION_LABEL, EVENT_TYPE_LABEL, EVENT_TYPE_COLOR } from '../utils/liveEvents'
+import { formatEvent, gateLabel, GATE_LABEL, LAYER_LABEL, ACTION_LABEL, EVENT_TYPE_LABEL, EVENT_TYPE_COLOR, channelStateLabel } from '../utils/liveEvents'
+
+describe('channelStateLabel', () => {
+  it('maps online state to Chinese label', () => {
+    expect(channelStateLabel(true)).toBe('在线')
+    expect(channelStateLabel(false)).toBe('离线')
+    expect(channelStateLabel(null)).toBe('未知')
+    expect(channelStateLabel(undefined)).toBe('未知')
+  })
+
+  it('labels channel offline/recovered gates', () => {
+    expect(gateLabel('channel_offline')).toBe('通道离线')
+    expect(gateLabel('channel_recovered')).toBe('通道恢复')
+  })
+})
 
 describe('formatEvent', () => {
   it('formats signal', () => {

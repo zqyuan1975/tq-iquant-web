@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, onMounted } from 'vue'
+import { ref, onMounted, onUnmounted } from 'vue'
 import {
   getStockPools, getFormulas, getPortfolios, getBacktestRecords,
   getLiveSessions, getSystemConfigs, getSystemStatus, getLiveChannel,
@@ -57,12 +57,15 @@ function mismatchTitle(s: LiveSessionItem): string {
 }
 
 /** 通道卡片单独加载：互不阻塞，超时先占位、迟到结果仍会刷新 */
-function loadChannels() {
+function loadChannels(silent = false) {
   const seq = ++channelSeq
-  channels.value = CHANNEL_DEFS.map((c) => ({
-    key: c.key, label: c.label, online: null, state: 'loading' as ChannelState,
-    detail: '', checkedAt: null,
-  }))
+  // 静默刷新（30s 轮询）不重置卡片，避免每次轮询闪一下「加载中」
+  if (!silent || channels.value.length !== CHANNEL_DEFS.length) {
+    channels.value = CHANNEL_DEFS.map((c) => ({
+      key: c.key, label: c.label, online: null, state: 'loading' as ChannelState,
+      detail: '', checkedAt: null,
+    }))
+  }
   CHANNEL_DEFS.forEach((c, i) => {
     let settled = false
     const timer = setTimeout(() => {
@@ -159,7 +162,20 @@ function fmtDate(d: string | null): string {
   return d ? d.slice(0, 10) : '-'
 }
 
-onMounted(load)
+// 通道卡定时复探（30s）：页面常开时客户端退出/桥断开也能及时从绿转红，
+// 不再只在首屏探一次（2026-11-13）
+let channelTimer: ReturnType<typeof setInterval> | null = null
+
+onMounted(() => {
+  load()
+  channelTimer = setInterval(() => loadChannels(true), 30000)
+})
+onUnmounted(() => {
+  if (channelTimer !== null) {
+    clearInterval(channelTimer)
+    channelTimer = null
+  }
+})
 </script>
 
 <template>
