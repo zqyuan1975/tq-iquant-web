@@ -5,6 +5,7 @@ import logging
 import os
 
 from core.db import init_db, SessionLocal
+from core.version import APP_VERSION
 from core.api.stock_pools import router as stock_pools_router
 from core.api.formulas import router as formulas_router
 from core.api.strategies import router as strategies_router
@@ -108,7 +109,7 @@ async def lifespan(app: FastAPI):
         watchdog.stop()
 
 
-app = FastAPI(title="创懿私募基金量化投资平台", version="1.0.0", lifespan=lifespan)
+app = FastAPI(title="创懿私募基金量化投资平台", version=APP_VERSION, lifespan=lifespan)
 
 app.include_router(stock_pools_router)
 app.include_router(formulas_router)
