@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { formatEvent, gateLabel, GATE_LABEL, LAYER_LABEL, ACTION_LABEL, EVENT_TYPE_LABEL, EVENT_TYPE_COLOR, channelStateLabel } from '../utils/liveEvents'
+import { formatEvent, gateLabel, GATE_LABEL, LAYER_LABEL, ACTION_LABEL, EVENT_TYPE_LABEL, EVENT_TYPE_COLOR, channelStateLabel, channelBadgeState } from '../utils/liveEvents'
 
 describe('channelStateLabel', () => {
   it('maps online state to Chinese label', () => {
@@ -12,6 +12,27 @@ describe('channelStateLabel', () => {
   it('labels channel offline/recovered gates', () => {
     expect(gateLabel('channel_offline')).toBe('通道离线')
     expect(gateLabel('channel_recovered')).toBe('通道恢复')
+  })
+})
+
+describe('channelBadgeState', () => {
+  it('channel alarm wins over lagging heartbeat', () => {
+    // 心跳仍 true（最长 60–90s 才翻），但 watchdog 已判客户端离线 → 立即红
+    expect(channelBadgeState(true, [{ session_id: 5, rule: 'client_offline' }], 5)).toBe(false)
+    expect(channelBadgeState(true, [{ session_id: 5, rule: 'market_data_stalled' }], 5)).toBe(false)
+    expect(channelBadgeState(null, [{ session_id: 5, rule: 'bridge_unreachable' }], 5)).toBe(false)
+  })
+
+  it('ignores engine_stale and other sessions', () => {
+    expect(channelBadgeState(true, [{ session_id: 5, rule: 'engine_stale' }], 5)).toBe(true)
+    expect(channelBadgeState(null, [{ session_id: 9, rule: 'client_offline' }], 5)).toBe(null)
+  })
+
+  it('falls back to heartbeat and unknown', () => {
+    expect(channelBadgeState(false, [], 5)).toBe(false)
+    expect(channelBadgeState(true, [], 5)).toBe(true)
+    expect(channelBadgeState(null, [], 5)).toBe(null)
+    expect(channelBadgeState(null, [], null)).toBe(null)
   })
 })
 

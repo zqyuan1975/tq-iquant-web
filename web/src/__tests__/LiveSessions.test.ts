@@ -2,7 +2,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { mount, flushPromises } from '@vue/test-utils'
 
 // 会话 CRUD/启停 + 工作台历史查询 + 组合选单全走 ../api 客户端（import 的即 mock 的 vi.fn）
-const { mockGetLiveSessions, mockCreateLiveSession, mockStartLiveSession, mockStopLiveSession, mockGetLiveChannel, mockTestLiveChannel, mockGetLiveSession } = vi.hoisted(() => ({
+const { mockGetLiveSessions, mockCreateLiveSession, mockStartLiveSession, mockStopLiveSession, mockGetLiveChannel, mockTestLiveChannel, mockGetLiveSession, mockGetWatchdogStatus } = vi.hoisted(() => ({
   mockGetLiveSessions: vi.fn(),
   mockCreateLiveSession: vi.fn(),
   mockStartLiveSession: vi.fn(),
@@ -10,6 +10,7 @@ const { mockGetLiveSessions, mockCreateLiveSession, mockStartLiveSession, mockSt
   mockGetLiveChannel: vi.fn(),
   mockTestLiveChannel: vi.fn(),
   mockGetLiveSession: vi.fn(),
+  mockGetWatchdogStatus: vi.fn(),
 }))
 vi.mock('../api', () => ({
   getLiveSessions: mockGetLiveSessions,
@@ -18,6 +19,7 @@ vi.mock('../api', () => ({
   stopLiveSession: mockStopLiveSession,
   getLiveChannel: mockGetLiveChannel,
   testLiveChannel: mockTestLiveChannel,
+  getWatchdogStatus: mockGetWatchdogStatus,
   getLivePositions: vi.fn(),
   getLiveOrders: vi.fn(),
   getLiveTrades: vi.fn(),
@@ -54,7 +56,7 @@ class FakeEventSource {
 }
 
 import LiveSessions from '../views/LiveSessions.vue'
-import { getLiveSessions, createLiveSession, startLiveSession, stopLiveSession, getLivePositions, getLiveOrders, getLiveTrades, getLiveDecisions, getLiveSignals, getPortfolios, getLiveChannel, testLiveChannel, sendUserBlock, getFormulas, getLiveSession } from '../api'
+import { getLiveSessions, createLiveSession, startLiveSession, stopLiveSession, getLivePositions, getLiveOrders, getLiveTrades, getLiveDecisions, getLiveSignals, getPortfolios, getLiveChannel, testLiveChannel, sendUserBlock, getFormulas, getLiveSession, getWatchdogStatus } from '../api'
 import { deriveBlockCode } from '../utils/blockCode'
 
 const runningSession = { id: 7, name: '模拟盘A', mode: 'simulation', status: 'running', started_at: null, stopped_at: null, portfolio_ids: [] }
@@ -75,6 +77,7 @@ beforeEach(() => {
   ;(getLiveDecisions as any).mockResolvedValue({ summary: [], events: [] })
   ;(getLiveSignals as any).mockResolvedValue({ items: [], total: 0 })
   ;(getLiveSession as any).mockResolvedValue({ account_snapshot: null, trading_calendar: null })
+  ;(getWatchdogStatus as any).mockResolvedValue({ running: true, active_alarms: [] })
   ;(getPortfolios as any).mockResolvedValue([])
   ;(getFormulas as any).mockResolvedValue([])
   ;(getLiveChannel as any).mockResolvedValue({
@@ -1644,6 +1647,7 @@ describe('LiveSessions.vue 交易日历可见性', () => {
   it('trading_calendar=null → 不渲染任何日历信息', async () => {
     ;(getLiveSessions as any).mockResolvedValue([runningSession])
     ;(getLiveSession as any).mockResolvedValue({ account_snapshot: null, trading_calendar: null })
+  ;(getWatchdogStatus as any).mockResolvedValue({ running: true, active_alarms: [] })
     const w = mount(LiveSessions)
     await flushPromises()
 

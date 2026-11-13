@@ -1786,6 +1786,15 @@ def stop_session(
     session.status = "stopped"
     session.stopped_at = datetime.now()
     db.commit()
+    # 会话离开 ENGINES 后 watchdog 再也扫不到它：显式清监控态，否则停止前的
+    # 告警（如 client_offline）会在 active_alarms 里永久挂红灯（2026-11-13 实证）。
+    try:
+        from core.engine.live.engine_watchdog import current_watchdog
+        watchdog = current_watchdog()
+        if watchdog is not None:
+            watchdog.clear_session(session_id)
+    except Exception:  # noqa: BLE001 — 观测清理失败不得影响停会话
+        logger.exception("clear watchdog state failed (session %s)", session_id)
     return engine
 
 

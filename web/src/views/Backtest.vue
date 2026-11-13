@@ -26,6 +26,7 @@ import { useTable } from '../composables/useTable'
 import TableToolbar from '../components/TableToolbar.vue'
 import TablePager from '../components/TablePager.vue'
 import { useTheme } from '../composables/useTheme'
+import { onNavReselect } from '../utils/navReselect'
 
 function cssVar(name: string): string {
   if (typeof document === 'undefined') return '#000000'
@@ -2934,12 +2935,20 @@ function handleResize() {
   rbHistChart?.resize()
 }
 
+let disposeNavReselect: (() => void) | null = null
+
 onMounted(() => {
   load()
   window.addEventListener('resize', handleResize)
+  // 左侧导航在当前路由重复点击「回测管理」→ 从详情回列表（顶部「返回」行为不变）
+  disposeNavReselect = onNavReselect((to) => {
+    if (to === '/backtest' && currentRecord.value) backToList()
+  })
 })
 onUnmounted(() => {
   window.removeEventListener('resize', handleResize)
+  disposeNavReselect?.()
+  disposeNavReselect = null
   disposeAllCharts()
 })
 

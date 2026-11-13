@@ -1,6 +1,6 @@
 ﻿<script setup lang="ts">
 import { ref, computed, onMounted, onUnmounted } from 'vue'
-import { formatEvent, nextEventId, EVENT_TYPE_COLOR, tradeTypeLabel, ORDER_STATUS_LABEL, gateLabel, LAYER_LABEL, ACTION_LABEL, channelStateLabel, type LiveEvent } from '../utils/liveEvents'
+import { formatEvent, nextEventId, EVENT_TYPE_COLOR, tradeTypeLabel, ORDER_STATUS_LABEL, gateLabel, LAYER_LABEL, ACTION_LABEL, channelStateLabel, channelBadgeState, type LiveEvent } from '../utils/liveEvents'
 import {
   orderHistoryToRows, upsertOrderRow,
   tradeEventToRow, tradeHistoryToRows,
@@ -14,10 +14,10 @@ import {
 import {
   getLiveOrders, getLiveTrades, getLivePositions, getLiveDecisions, getLiveSignals, getPortfolios,
   getLiveSessions, getLiveSession, createLiveSession, startLiveSession, stopLiveSession, deleteLiveSession,
-  recoverLiveBreaker, getLiveChannel, testLiveChannel, sendUserBlock, getFormulas,
+  recoverLiveBreaker, getLiveChannel, testLiveChannel, sendUserBlock, getFormulas, getWatchdogStatus,
   type PortfolioItem, type LiveSessionItem,
   type LiveChannelInfo, type LiveEngineKey, type LiveExecutionMode, type LiveSignalItem,
-  type FormulaItem,
+  type FormulaItem, type WatchdogAlarm,
 } from '../api'
 import PageHeader from '../components/PageHeader.vue'
 import { deriveBlockCode } from '../utils/blockCode'
@@ -186,6 +186,12 @@ const equityChecks = ref<Record<number, any>>({})
 // 通道在线态（会话详情 bridge_online）：null=未知（未运行/未取到）。15s 轮询，
 // 让「客户端退出/通道掉线」在工作台可见，而不是只留在后端日志里（2026-11-13）。
 const bridgeOnline = ref<boolean | null>(null)
+// watchdog 活跃告警（通道级）：比心跳更早反映掉线（watchdog 30s 一轮 vs 心跳 60–90s）
+const watchdogAlarms = ref<WatchdogAlarm[]>([])
+// 徽章最终态：通道级告警优先，无告警回退心跳值
+const channelBadge = computed(
+  () => channelBadgeState(bridgeOnline.value, watchdogAlarms.value, watchedSessionId.value),
+)
 let bridgeTimer: ReturnType<typeof setInterval> | null = null
 
 /** 单年日历摘要：正常=来源/交易日数/覆盖区间；退化=来源+标记。 */
@@ -628,22 +634,33 @@ async function loadChannel(engine?: LiveEngineKey) {
   }
 }
 
-/** 定时刷新聚焦会话的通道在线态（只在 running 会话上取；未知=null）。 */
+/** 定时刷新聚焦会话的通道在线态（只在 running 会话上取；未知=null）。
+ *
+ * 同时取 watchdog 活跃告警：``channel_offline`` 是即时的（30s 扫描），而
+ * ``bridge_online`` 要等心跳失败（60–90s）才翻转，徽章优先用前者（2026-11-13）。
+ */
 async function refreshBridgeOnline() {
   const id = activeSessionId
   if (id === null) {
     bridgeOnline.value = null
+    watchdogAlarms.value = []
     return
   }
   const target = sessions.value.find((s) => s.id === id)
   if (!target || target.status !== 'running') {
     bridgeOnline.value = null
+    watchdogAlarms.value = []
     return
   }
   try {
     const d = await getLiveSession(id)
     if (activeSessionId !== id) return  // 在途期间已切走 → 丢弃
     bridgeOnline.value = typeof d?.bridge_online === 'boolean' ? d.bridge_online : null
+  } catch { /* 保持现状 */ }
+  try {
+    const w = await getWatchdogStatus()
+    if (activeSessionId !== id) return
+    watchdogAlarms.value = Array.isArray(w?.active_alarms) ? w.active_alarms : []
   } catch { /* 保持现状 */ }
 }
 
@@ -704,13 +721,13 @@ onUnmounted(() => {
       v-else-if="channel?.online !== null && channel?.online !== undefined"
       class="badge" :class="channel.online ? 'badge-green' : 'badge-red'"
     >{{ channel.online ? '在线' : '离线' }}</span>
-    <!-- 聚焦会话的通道心跳态（会话详情 bridge_online，15s 轮询）：客户端退出时由绿转红 -->
+    <!-- 聚焦会话的通道态：watchdog 告警（30s）优先，回退会话详情心跳（60–90s） -->
     <span
       v-if="watchedSessionId !== null"
       class="badge"
-      :class="bridgeOnline === true ? 'badge-green' : bridgeOnline === false ? 'badge-red' : 'badge-gray'"
-      title="当前聚焦会话的通道心跳状态（会话详情 bridge_online，15 秒刷新）；未知=会话未运行或尚未取到心跳态"
-    >通道：{{ channelStateLabel(bridgeOnline) }}</span>
+      :class="channelBadge === true ? 'badge-green' : channelBadge === false ? 'badge-red' : 'badge-gray'"
+      title="当前聚焦会话的通道状态：watchdog 通道告警优先（30 秒扫描，客户端退出即翻红），无告警回退心跳态；未知=会话未运行或尚未取到"
+    >通道：{{ channelStateLabel(channelBadge) }}</span>
     <button class="btn btn-sm" :disabled="channelTesting" @click="testChannel">
       {{ channelTesting ? '测试中…' : '测试连接' }}
     </button>

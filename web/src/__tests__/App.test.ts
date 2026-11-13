@@ -1,8 +1,9 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest'
+import { describe, it, expect, vi, beforeEach, afterEach, type Mock } from 'vitest'
 import { mount, flushPromises } from '@vue/test-utils'
 import { reactive } from 'vue'
 import { ICONS } from '../icons'
 import { resetTheme } from '../composables/useTheme'
+import { NAV_RESELECT_EVENT } from '../utils/navReselect'
 
 // 路由 mock：App.vue 调 useRoute() 且模板用 <router-link>，
 // 不装 router 插件时 useRoute() 返回 undefined 会直接抛错。
@@ -103,6 +104,58 @@ describe('App.vue — 外壳结构', () => {
     const banner = w.find('.topbar .app-banner')
     expect(banner.exists()).toBe(true)
     expect(banner.text()).toContain('创懿私募基金量化投资平台')
+  })
+})
+
+describe('App.vue — 左侧导航重复点击回入口页', () => {
+  let spy: Mock<(e: Event) => void>
+  // addEventListener 需要 (e: Event) => void 的具名函数，vi.fn 的 Mock 类型
+  // 不满足 EventListener 重载（TS2769），用包一层的 handler 保持类型正确。
+  let handler: (e: Event) => void
+
+  beforeEach(() => {
+    resetTheme()
+    localStorage.clear()
+    routeState.path = '/dashboard'
+    routeState.name = 'dashboard'
+    spy = vi.fn()
+    handler = (e: Event) => spy(e)
+    window.addEventListener(NAV_RESELECT_EVENT, handler)
+  })
+
+  afterEach(() => {
+    window.removeEventListener(NAV_RESELECT_EVENT, handler)
+  })
+
+  async function clickNav(label: string) {
+    const w = mount(App)
+    await flushPromises()
+    const item = w.findAll('.sidebar-nav .nav-item').find((i) => i.text().includes(label))!
+    expect(item.exists()).toBe(true)
+    await item.trigger('click')
+    w.unmount()
+  }
+
+  it('已在回测管理路由时点击「回测管理」→ 派发重选事件（供详情页回列表）', async () => {
+    routeState.path = '/backtest'
+    routeState.name = 'backtest'
+    await clickNav('回测管理')
+    expect(spy).toHaveBeenCalledTimes(1)
+    expect((spy.mock.calls[0][0] as CustomEvent).detail).toEqual({ to: '/backtest' })
+  })
+
+  it('在其它路由点击「回测管理」→ 不派发事件（保持正常跳转）', async () => {
+    routeState.path = '/dashboard'
+    routeState.name = 'dashboard'
+    await clickNav('回测管理')
+    expect(spy).not.toHaveBeenCalled()
+  })
+
+  it('已在其它菜单路由时重复点击该菜单项 → 不派发事件（不影响其它菜单项）', async () => {
+    routeState.path = '/live'
+    routeState.name = 'live'
+    await clickNav('实盘交易')
+    expect(spy).not.toHaveBeenCalled()
   })
 })
 

@@ -273,7 +273,7 @@ class EngineWatchdog:
         ``last_scan_at`` 停止前进 = 扫描线程自身卡死/退出，这是外部可判据。
         """
         active = [
-            {"session_id": sid, "rule": rule}
+            {"session_id": sid, "rule": rule, "channel": state.get("channel")}
             for (sid, rule), state in list(self._states.items())
             if state.get("alerted")
         ]
@@ -614,6 +614,10 @@ class EngineWatchdog:
         first = not state["alerted"]
         state["alerted"] = True
         state["last_alert_mono"] = mono
+        state["channel"] = channel
+        if first:
+            # 离线起点（首次判定时刻），恢复行据此算出「断了多久」
+            state["first_mono"] = mono
         self._scan_stats["alarms"] += 1
         payload = {
             "session_id": session_id,
@@ -662,6 +666,8 @@ class EngineWatchdog:
         state = self._states.pop(key, None)
         if not state or not state.get("alerted"):
             return
+        since = state.get("first_mono")
+        seconds = max(self._mono() - since, 0.0) if since is not None else 0.0
         name = "%s（%s）" % (session_id, channel)
         message = "实盘监控恢复：会话 %s 的 %s 已恢复正常" % (name, rule)
         logger.info("%s", message)
@@ -673,9 +679,9 @@ class EngineWatchdog:
         })
         if rule in _CHANNEL_RULES:
             self._persist_channel_event(
-                session_id, channel, rule, online=True,
-                message=("通道恢复：%s（会话 %s，判据=%s）"
-                         % (channel, session_id, rule)))
+                session_id, channel, rule, online=True, seconds=seconds,
+                message=("通道恢复：%s（会话 %s，判据=%s，已持续 %d 秒）"
+                         % (channel, session_id, rule, int(seconds))))
 
     def _recover_if_alerted(self, engine: object, session_id: int, channel: str,
                             channel_probe: bool) -> None:
@@ -683,6 +689,15 @@ class EngineWatchdog:
         for rule in ("execution_stalled", "bridge_unreachable",
                      "market_data_stalled", "client_offline"):
             self._recover_rule(engine, session_id, channel, rule)
+
+    def clear_session(self, session_id: int) -> None:
+        """会话停止（从 ENGINES 移除）后清该会话监控态。
+
+        否则 ``status().active_alarms`` 会把停止前的告警永久挂着（2026-11-13
+        实证：会话 5 停止后 ``client_offline`` 红灯不灭，直到重新启动会话）。
+        只清内存态，不写库、不发 SSE（停止不是「恢复」，不应伪造 recovered）。
+        """
+        self._clear_session(session_id)
 
     def _clear_session(self, session_id: int) -> None:
         for key in [k for k in self._states if k[0] == session_id]:

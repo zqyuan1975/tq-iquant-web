@@ -175,6 +175,32 @@ export function channelStateLabel(v: boolean | null | undefined): string {
   return '未知'
 }
 
+/**
+ * watchdog 里属于「通道级掉线」的规则；engine_stale 只是引擎主循环停摆，
+ * 通道本身可能仍在线，不进通道徽章。
+ */
+export const CHANNEL_ALARM_RULES: readonly string[] = [
+  'client_offline', 'market_data_stalled', 'bridge_unreachable', 'execution_stalled',
+]
+
+/**
+ * 通道徽章状态：优先看 watchdog 的通道级告警（watchdog 30s 一轮，比心跳
+ * 60–90s 的 ``bridge_online`` 翻转更早），无告警再回退心跳值。
+ * 返回 true=在线 / false=离线 / null=未知（无运行会话或尚未取到）。
+ */
+export function channelBadgeState(
+  bridgeOnline: boolean | null | undefined,
+  alarms: readonly { session_id: number; rule: string }[] | null | undefined,
+  sessionId: number | null | undefined,
+): boolean | null {
+  if (sessionId === null || sessionId === undefined) return null
+  const hit = (alarms || []).some(
+    (a) => a.session_id === sessionId && CHANNEL_ALARM_RULES.includes(a.rule))
+  if (hit) return false
+  if (bridgeOnline === true || bridgeOnline === false) return bridgeOnline
+  return null
+}
+
 /** trade_type → 中文标签（大小写不敏感；未知值回退原值）。 */
 export function tradeTypeLabel(v: unknown): string {
   const raw = fmt(v)

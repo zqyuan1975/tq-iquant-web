@@ -1660,21 +1660,71 @@ class LiveEngine:
     def _mark_bridge_online(self, now: datetime) -> None:
         """置在线状态；仅 False→True 翻转时落一条 ``channel_recovered``。
 
-        重复调用（已在线）不写库，避免每轮心跳都产生事件。
+        重复调用（已在线）不写库，避免每轮心跳都产生事件；但**新实例首个心跳**
+        会反查库中残留的未闭环 ``channel_offline`` 补记恢复（2026-11-13：会话
+        重启后 ``_bridge_online`` 初值即 True，id=1038 那条离线永远不闭环）。
         """
         if self._bridge_online:
+            self._maybe_close_stale_offline(now)
             return
+        seconds = 0.0
+        if self._offline_since is not None:
+            seconds = max((now - self._offline_since).total_seconds(), 0.0)
         self._bridge_online = True
         self._record_channel_state(
-            online=True, reason="heartbeat_ok", now=now)
+            online=True, reason="heartbeat_ok", now=now, seconds=seconds)
+
+    def _maybe_close_stale_offline(self, now: datetime) -> None:
+        """新实例在线确认时补齐上一条离线的恢复行（每实例只查一次）。
+
+        判据 = 该会话该通道最新一条通道事件仍是 ``channel_offline``；写成功后最
+        新一条即 ``channel_recovered``，重复心跳与后续重启都不会再补第二条。
+        时长按离线行的 ``created_at``（SQLite UTC）到当前 UTC 计算。
+        """
+        if getattr(self, "_channel_recovery_checked", False):
+            return
+        factory = self._db_session_factory
+        if factory is None:
+            return
+        self._channel_recovery_checked = True
+        dispatcher = getattr(self, "_dispatcher", None)
+        channel = str(getattr(dispatcher, "channel", "")
+                      or getattr(self, "_engine_key", "") or "unknown")
+        try:
+            db = factory()
+            try:
+                last = (db.query(LiveDecisionEvent)
+                        .filter(
+                            LiveDecisionEvent.live_session_id == self.session_id,
+                            LiveDecisionEvent.param_name
+                            == ("channel:%s" % channel)[:40],
+                            LiveDecisionEvent.gate.in_(
+                                ("channel_offline", "channel_recovered")))
+                        .order_by(LiveDecisionEvent.id.desc()).first())
+                if last is None or last.gate != "channel_offline":
+                    return
+                seconds = 0.0
+                if last.created_at is not None:
+                    seconds = max(
+                        (datetime.utcnow() - last.created_at).total_seconds(), 0.0)
+            finally:
+                db.close()
+        except Exception:  # noqa: BLE001 — 观测链路失败不得影响交易
+            logger.exception(
+                "query stale channel_offline failed (session %s)", self.session_id)
+            return
+        self._record_channel_state(
+            online=True, reason="heartbeat_ok_after_restart", now=now,
+            seconds=seconds)
 
     def _record_channel_state(self, *, online: bool, reason: str,
-                              now: datetime) -> None:
+                              now: datetime, seconds: float = 0.0) -> None:
         """通道在线态转场留痕（best-effort，复用 live_decision_events）。
 
         与 watchdog 的 ``channel_offline/channel_recovered`` 同 gate 口径，区别
         只在判据：这里是心跳转场（``heartbeat_failed``/``heartbeat_ok``），
         watchdog 是行情停摆/客户端消失/桥超时。失败只记日志，不影响下单记账。
+        ``seconds`` 写进 ``actual_value`` 并在 message 标注，让「断了多久」可直接读。
         """
         factory = self._db_session_factory
         if factory is None:
@@ -1682,10 +1732,11 @@ class LiveEngine:
         dispatcher = getattr(self, "_dispatcher", None)
         channel = str(getattr(dispatcher, "channel", "")
                       or getattr(self, "_engine_key", "") or "unknown")
-        text = ("通道恢复：%s（会话 %s，判据=%s，%s）" if online
-                else "通道离线：%s（会话 %s，判据=%s，%s）")
+        span = "，已持续 %d 秒" % int(seconds) if seconds > 0 else ""
+        text = ("通道恢复：%s（会话 %s，判据=%s，%s%s）" if online
+                else "通道离线：%s（会话 %s，判据=%s，%s%s）")
         message = text % (channel, self.session_id, reason,
-                          now.strftime("%Y-%m-%d %H:%M:%S"))
+                          now.strftime("%Y-%m-%d %H:%M:%S"), span)
         logger.warning("%s", message)
         try:
             db = factory()
@@ -1696,7 +1747,7 @@ class LiveEngine:
                     layer="live_gate",
                     action=("recover" if online else "trigger"),
                     param_name=("channel:%s" % channel)[:40],
-                    actual_value=0.0,
+                    actual_value=float(seconds),
                     message=message[:200],
                 ))
                 db.commit()

@@ -4,6 +4,7 @@ import { useRoute } from 'vue-router'
 import { useTheme } from './composables/useTheme'
 import { getSystemStatus, type SystemStatus } from './api'
 import { ICONS } from './icons'
+import { emitNavReselect } from './utils/navReselect'
 
 const route = useRoute()
 const { theme, toggle: toggleTheme } = useTheme()
@@ -51,6 +52,15 @@ const statusFailed = ref(false)
 const drawerOpen = ref(false)
 let statusTimer: number | null = null
 let heartbeatTimer: number | null = null
+
+/**
+ * 已停留在菜单对应路由时再次点击：同址 router-link 跳转会被 vue-router 忽略，
+ * 这里派发重选事件让视图自行回到入口页（目前仅回测管理有「详情」二级视图）。
+ * 其它菜单项保持原行为不变。
+ */
+function onNavItemClick(to: string) {
+  if (to === '/backtest' && route.path === to) emitNavReselect(to)
+}
 
 function beacon(url: string) {
   try { navigator.sendBeacon?.(url) } catch { /* noop */ }
@@ -143,6 +153,7 @@ onUnmounted(() => {
             class="nav-item"
             active-class="active"
             :title="item.label"
+            @click="onNavItemClick(item.to)"
           >
             <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor"
                  stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">

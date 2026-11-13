@@ -1898,6 +1898,26 @@ export async function getLiveChannel(engine?: LiveEngineKey) {
   return res.data.data
 }
 
+/** watchdog 活跃告警（通道级在线态；engine_stale 属引擎层，不算通道离线）。 */
+export interface WatchdogAlarm {
+  session_id: number
+  rule: string
+  channel?: string | null
+}
+
+export interface WatchdogStatus {
+  running: boolean
+  last_scan_at: string | null
+  scan_count: number
+  last_scan_duration_ms: number | null
+  active_alarms: WatchdogAlarm[]
+}
+
+export async function getWatchdogStatus() {
+  const res = await api.get<ApiResponse<WatchdogStatus>>('/live/watchdog-status')
+  return res.data.data
+}
+
 export async function testLiveChannel(
   channel: 'ths_ui' | 'iquant_bridge' | 'tdx_tq', mode = 'simulation',
 ) {

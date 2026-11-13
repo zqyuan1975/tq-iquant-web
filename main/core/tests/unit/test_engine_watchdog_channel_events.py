@@ -267,6 +267,123 @@ def test_bridge_state_transitions_persist_once_each():
         assert [r.gate for r in rows] == [
             "channel_offline", "channel_recovered"]
         assert rows[1].action == "recover"
+        # 恢复行带上「断了多久」：离线 60s 起算，120s 恢复 → ≥60s
+        assert rows[1].actual_value >= 60
+        assert "已持续" in (rows[1].message or "")
     finally:
         db.close()
     assert eng._bridge_online is True
+
+
+def test_new_engine_instance_closes_previous_offline_row():
+    """会话重启后新实例 ``_bridge_online`` 初值即 True：仍要补一条 recovered。
+
+    2026-11-13 实证：id=1038（heartbeat_failed）重启后至今没有对应 recovered，
+    因为 ``_mark_bridge_online`` 命中「已在线」直接返回。改为首个心跳时反查该
+    会话/通道最新一条通道事件，若仍是 offline 则补恢复（每实例只查一次）。
+    """
+    factory, _ = _db_factory()
+    db = factory()
+    try:
+        db.add(LiveDecisionEvent(
+            live_session_id=1, gate="channel_offline", layer="live_gate",
+            action="trigger", param_name="channel:tdx_tq", actual_value=0.0,
+            message="旧进程留下的离线",
+            created_at=datetime.utcnow() - timedelta(seconds=330),
+        ))
+        db.commit()
+    finally:
+        db.close()
+
+    eng = _bare_engine(factory)
+    eng._bridge_online = True          # 新实例初值即在线
+    eng._mark_bridge_online(NOW)
+    eng._mark_bridge_online(NOW)       # 重复心跳不重复补记
+    db = factory()
+    try:
+        rows = db.query(LiveDecisionEvent).order_by(LiveDecisionEvent.id).all()
+        assert [r.gate for r in rows] == [
+            "channel_offline", "channel_recovered"]
+        assert rows[1].actual_value >= 300
+        assert "已持续" in (rows[1].message or "")
+    finally:
+        db.close()
+
+
+def test_no_stale_recovery_when_last_event_already_recovered():
+    """最新一条已是 recovered → 重启不补第二条（防重复恢复行）。"""
+    factory, _ = _db_factory()
+    db = factory()
+    try:
+        db.add(LiveDecisionEvent(
+            live_session_id=1, gate="channel_recovered", layer="live_gate",
+            action="recover", param_name="channel:tdx_tq", actual_value=10.0,
+            message="已闭环"))
+        db.commit()
+    finally:
+        db.close()
+    eng = _bare_engine(factory)
+    eng._bridge_online = True
+    eng._mark_bridge_online(NOW)
+    db = factory()
+    try:
+        rows = db.query(LiveDecisionEvent).all()
+        assert [r.gate for r in rows] == ["channel_recovered"]
+    finally:
+        db.close()
+
+
+# ---------------------------------------------------------------- 5. 状态可见/清理
+
+def test_recovered_event_carries_offline_seconds():
+    """watchdog 恢复行带离线持续秒数（首次判定 → 恢复的差值），不再恒 0。"""
+    mono = [0.0]
+    eng = _Engine(channel="goldminer_bridge",
+                  started=NOW - timedelta(seconds=900), tick=NOW)
+    eng._bridge_online = False
+    rec = _Recorder()
+    wd = _watchdog({1: eng}, bridge_timeout_seconds=90,
+                   mono_fn=lambda: mono[0], persist_fn=rec)
+    wd.scan()
+    mono[0] = 100.0
+    wd.scan()                          # 首次判定（t=100）
+    mono[0] = 400.0
+    eng._bridge_online = True
+    wd.scan()                          # 恢复（t=400）
+    row = rec.rows[1]
+    assert row["gate"] == "channel_recovered"
+    assert row["seconds"] >= 300
+    assert "已持续" in row["message"]
+
+
+def test_status_alarm_exposes_channel_and_clear_session():
+    eng = _Engine(channel="tdx_tq", started=NOW - timedelta(seconds=900), tick=NOW)
+    wd = _watchdog({1: eng}, client_online_fn=lambda ch: False,
+                   persist_fn=_Recorder())
+    wd.scan()
+    alarms = wd.status()["active_alarms"]
+    assert alarms and alarms[0]["channel"] == "tdx_tq"
+    wd.clear_session(1)
+    assert wd.status()["active_alarms"] == []
+
+
+def test_stop_session_clears_watchdog_alarm(db_session, monkeypatch):
+    """会话 stop（从 ENGINES 弹出）时必须清监控态，否则 active_alarms 永久挂红灯。"""
+    from core.engine.live import engine_watchdog as wd_mod
+    from core.models import LiveSession
+    from core.services import live_service as svc
+
+    session = LiveSession(name="s", mode="simulation", engine="tdx",
+                          status="running")
+    db_session.add(session)
+    db_session.commit()
+    eng = _Engine(channel="tdx_tq", started=NOW - timedelta(seconds=900), tick=NOW)
+    eng.session_id = session.id
+    wd = _watchdog({session.id: eng}, client_online_fn=lambda ch: False,
+                   persist_fn=_Recorder())
+    wd.scan()
+    assert wd.status()["active_alarms"]
+    monkeypatch.setattr(wd_mod, "_ACTIVE_WATCHDOG", wd)
+
+    svc.stop_session(db_session, session.id, {session.id: eng})
+    assert wd.status()["active_alarms"] == []

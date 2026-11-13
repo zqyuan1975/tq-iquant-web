@@ -3,6 +3,7 @@ import { mount, flushPromises } from '@vue/test-utils'
 import { readFileSync } from 'node:fs'
 import { useTheme } from '../composables/useTheme'
 import { deriveBlockCode } from '../utils/blockCode'
+import { emitNavReselect } from '../utils/navReselect'
 
 const { CSS_VARS, SCORE_TIER_OF, stubGetComputedStyle } = vi.hoisted(() => {
   const CSS_VARS: Record<string, string> = {
@@ -730,6 +731,50 @@ describe('Backtest.vue — 详情视图', () => {
 
     expect(w.text()).toContain('回测A')  // 回到列表
     expect(w.text()).not.toContain('总收益')
+  })
+
+  it('详情页收到导航「回测管理」重选事件 → 回列表（等同顶部返回）', async () => {
+    const w = mount(Backtest)
+    await flushPromises()
+    await w.findAll('button').find(b => b.text().includes('查看'))!.trigger('click')
+    await flushPromises()
+    expect(w.text()).toContain('总收益')
+
+    emitNavReselect('/backtest')
+    await flushPromises()
+
+    expect(w.text()).toContain('回测A')
+    expect(w.text()).not.toContain('总收益')
+  })
+
+  it('列表页收到重选事件 → 保持在列表（无副作用、不重复请求详情）', async () => {
+    const w = mount(Backtest)
+    await flushPromises()
+    emitNavReselect('/backtest')
+    await flushPromises()
+
+    expect(w.text()).toContain('回测A')
+    expect(getBacktestDetail).not.toHaveBeenCalled()
+  })
+
+  it('其它路由的重选事件不影响回测详情', async () => {
+    const w = mount(Backtest)
+    await flushPromises()
+    await w.findAll('button').find(b => b.text().includes('查看'))!.trigger('click')
+    await flushPromises()
+    expect(w.text()).toContain('总收益')
+
+    emitNavReselect('/live')
+    await flushPromises()
+
+    expect(w.text()).toContain('总收益')
+  })
+
+  it('卸载后重选事件不再作用于已销毁的视图', async () => {
+    const w = mount(Backtest)
+    await flushPromises()
+    w.unmount()
+    expect(() => emitNavReselect('/backtest')).not.toThrow()
   })
 
   it('评估指标百分比显示（total_return 0.05 → 5%）', async () => {
