@@ -3270,6 +3270,39 @@ class LiveEngine:
                     self.session_id, exc_info=True)
         return asset, positions
 
+    def _account_read_trustworthy(self, asset: dict, positions: list) -> bool:
+        """本轮账户读取是否可信（只用于「柜台清仓」这类不可逆判定）。
+
+        「查询不可用」的典型形态是：持仓返回空表 + 资产字段缺失（2026-11-13 实测：
+        TDX 交易引擎未就绪时 ``query_stock_positions`` 返回 0 行且不置 last_error，
+        同时 ``query_stock_asset`` 报「与通达信客户端建立连接失败」→ 空表被当成
+        「人工清仓」，虚拟仓按成本回补现金，随后 09:15 卖单被 T+1 全拦）。
+        真实清仓时现金/总资产仍然可读、账户市值归零。
+
+        判据：持仓非空 → 可信；持仓为空时必须有 ``total_asset``，且要么账户级
+        ``market_value`` 可读且 ≈0，要么 ``total_asset ≈ available``（全部是现金）。
+        任一不满足 → 不可信，不得进人工清仓分支。
+        """
+        if positions:
+            return True
+        total = _finite_or_none(asset.get("total_asset"))
+        if total is None:
+            return False
+        mv = _finite_or_none(asset.get("market_value"))
+        if mv is None:
+            cash = _finite_or_none(asset.get("available"))
+            if cash is None:
+                return False
+            try:
+                total_f, cash_f = float(total), float(cash)
+            except (TypeError, ValueError):
+                return False
+            return abs(total_f - cash_f) <= max(1.0, abs(total_f) * 0.001)
+        try:
+            return float(mv) <= 0.01
+        except (TypeError, ValueError):
+            return False
+
     def _note_cash_diff(self, real_cash: Decimal) -> None:
         """③ 柜台可用现金 vs 虚拟现金偏差告警（只告警，不改账）。
 
@@ -3443,6 +3476,25 @@ class LiveEngine:
         if read is None:
             return
         asset, positions = read
+        account_ok = self._account_read_trustworthy(asset, positions)
+        if not positions and not account_ok:
+            # 持仓空表 + 资产不可信 = 读取失败（引擎未就绪/查询异常），不是真空仓。
+            # 跳过本轮：不写空快照（会污染峰值/对账源）、不累计清仓确认；只对账内
+            # 仍有虚拟仓的代码发一条 notice（每日去重），绝不进 apply 清仓分支。
+            logger.warning(
+                "account snapshot skipped: positions empty but account asset "
+                "unavailable/inconsistent (session %s; total_asset=%r "
+                "market_value=%r available=%r)",
+                self.session_id, asset.get("total_asset"),
+                asset.get("market_value"), asset.get("available"))
+            try:
+                self._detect_counter_cleared_holdings(
+                    db, positions, read_at, account_ok=False)
+            except Exception:  # noqa: BLE001 — 告警失败不阻断采集主链路
+                logger.exception(
+                    "detect counter cleared holdings failed (session %s)",
+                    self.session_id)
+            return
         # 复用本轮真实持仓回读结果作为 live_service.engine_external_positions 的
         # 60s TTL 缓存：快照线程已每 60s 读一次真实持仓，/positions 请求不应再
         # 独立等一次 GUI 读表（THS 单次 6-10s，冷读会顶到前端 20s 超时）。
@@ -3611,7 +3663,8 @@ class LiveEngine:
         # 人工干预（2026-11-11）：柜台整行消失 = 人工/外部清仓。连续确认后清理
         # 虚拟账本（否则幽灵持仓继续参与风控并产生必被拒的卖单），留审计行。
         try:
-            self._detect_counter_cleared_holdings(db, positions, now)
+            self._detect_counter_cleared_holdings(db, positions, now,
+                                                 account_ok=account_ok)
         except Exception:  # noqa: BLE001 — 观测/修正失败不阻断采集主链路
             logger.exception(
                 "detect counter cleared holdings failed (session %s)",
@@ -3770,6 +3823,8 @@ class LiveEngine:
             "counter_gt_ledger": "柜台多于虚拟台账（人工买入/外部转入）",
             "counter_lt_ledger": "柜台少于虚拟台账（人工卖出/转出）",
             "counter_position_gone": "柜台已无此持仓（人工清仓）",
+            "counter_position_gone_unverified": (
+                "柜台持仓查询不可信（疑似引擎未就绪/读取失败），仅告警未清仓"),
             "close_reconcile_counter_zero": "收盘对账柜台已无此持仓，按柜台口径修正",
         }.get(reason, reason)
         direction_text = {"increase": "增加", "decrease": "减少"}.get(
@@ -3960,7 +4015,7 @@ class LiveEngine:
         return changed
 
     def _detect_counter_cleared_holdings(
-        self, db: Session, positions: list, now
+        self, db: Session, positions: list, now, account_ok: bool = True
     ) -> int:
         """柜台持仓行消失 → 连续确认后按「人工/外部清仓」清理虚拟账本并留审计。
 
@@ -3969,10 +4024,13 @@ class LiveEngine:
         账本永久保留幽灵持仓：风控仍按它算止损/止盈并产生卖单（柜台拒单刷屏），
         收盘对账只告警不修正 → 幽灵仓跨日不消失。
 
-        保守判据（缺一不可）：①本轮持仓读取成功（调用方已过滤读取失败）；②该代码
-        不在本轮真实持仓；③无在途平台单；④**连续** ``_COUNTER_ABSENT_CONFIRM``
-        次采集都缺（单次返回不完整不得清仓）。满足才清零虚拟持仓 + 按账面成本退回
-        虚拟现金 + 落 ``manual_intervention`` 审计（action=apply）。
+        保守判据（缺一不可）：⓪``account_ok``=本轮账户读取可信（持仓空表且资产
+        口径不可信时由调用方传 False：引擎未就绪/查询异常返回空表 ≠ 清仓，
+        2026-11-13 实证误清三仓）；①本轮持仓读取成功（调用方已过滤读取失败）；
+        ②该代码不在本轮真实持仓；③无在途平台单；④**连续**
+        ``_COUNTER_ABSENT_CONFIRM`` 次采集都缺（单次返回不完整不得清仓）。满足才
+        清零虚拟持仓 + 按账面成本退回虚拟现金 + 落 ``manual_intervention`` 审计
+        （action=apply）。``account_ok=False`` 时**只发 notice、不累计确认、绝不清仓**。
 
         幂等：清仓后 quantity=0，下一轮自然跳过；``_counter_absent_streak`` 同步清空。
         """
@@ -4007,6 +4065,19 @@ class LiveEngine:
                         self._counter_absent_streak.pop(code, None)
                         continue
                     if code in inflight:
+                        continue
+                    if not account_ok:
+                        # 账户读取不可信（引擎未就绪/资产口径异常）：空表 ≠ 人工清仓。
+                        # 只打标告警（notice，按 code/虚拟量/实量每日去重），不累计
+                        # 确认次数、绝不进 apply 清仓分支。
+                        self._note_manual_intervention(
+                            db, code, pos.quantity, 0, direction="decrease",
+                            reason="counter_position_gone_unverified",
+                            action="notice", source="counter_gone")
+                        logger.warning(
+                            "counter position row missing but account read "
+                            "untrusted → notice only: %s (virtual=%d, session %s)",
+                            code, pos.quantity, self.session_id)
                         continue
                     streak = self._counter_absent_streak.get(code, 0) + 1
                     self._counter_absent_streak[code] = streak
