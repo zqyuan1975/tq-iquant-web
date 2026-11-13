@@ -29,6 +29,7 @@ from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Dict, List, Optional, Tuple
 
+from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
 from core.config import load_config
@@ -2247,18 +2248,35 @@ def serialize_decision(d: LiveDecisionEvent) -> dict:
     }
 
 
+# 决策事件读取侧年份下限：低于此值的 bar_time 视为历史脏行（epoch 秒误解析），
+# 保留在库里以备追溯，但不进列表与统计。bar_time 为 NULL 的事件（peak_seed 审计等）
+# 是正常事件，不在此过滤范围内。
+_MIN_DECISION_BAR_TIME = datetime(2000, 1, 1)
+
+
 def session_decisions(db: Session, session_id: int) -> Optional[dict]:
     """决策闸门事件：聚合统计 + 原始事件。session 不存在返回 None。
 
     summary 复用 summarize_decisions（与回测详情同口径），按 (gate, param_name)
     分组计数；events 按 bar_time 正序返回（下钻看逐次触发）。
+
+    读取侧年份下限：历史脏行 ``bar_time = 1970-08-23 20:05:06``（旧
+    ``parse_bar_time`` 把 ``20261106`` 当 epoch 秒，2026-11-06 一次性写入会话 4
+    共 66 条）按约定保留在库里以备追溯，但不参与展示与统计。``bar_time`` 为
+    NULL 的行（如 peak_seed 审计）是正常事件，照常返回。
     """
     session = db.query(LiveSession).filter(LiveSession.id == session_id).first()
     if not session:
         return None
     rows = (
         db.query(LiveDecisionEvent)
-        .filter(LiveDecisionEvent.live_session_id == session_id)
+        .filter(
+            LiveDecisionEvent.live_session_id == session_id,
+            or_(
+                LiveDecisionEvent.bar_time.is_(None),
+                LiveDecisionEvent.bar_time >= _MIN_DECISION_BAR_TIME,
+            ),
+        )
         .order_by(LiveDecisionEvent.bar_time, LiveDecisionEvent.id)
         .all()
     )
