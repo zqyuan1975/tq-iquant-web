@@ -72,6 +72,10 @@ class _AcctDispatcher:
     def poll_deals(self):
         return []
 
+    def query_deals(self, *args, **kwargs):
+        """成交轮询别名（引擎 _poll_deals 走 query_deals，缺该方法会抛异常）。"""
+        return []
+
 
 def _real_positions():
     return [
@@ -1139,7 +1143,10 @@ def test_intraday_reconcile_emits_risk_event_on_diff():
     factory, _ = _db_factory()
     port, _ = _portfolio_single()
     # 桥已无该代码的行，虚拟账本仍挂 500 → 对账报告差异 500
-    disp = _AcctDispatcher(positions=[])
+    # 账户本身可读（现金/总资产非 0），否则会被「资产不可信 → 跳过本轮」拦掉
+    disp = _AcctDispatcher(positions=[],
+                           asset={"total_asset": 100000.0, "available": 50000.0,
+                                  "market_value": 0.0})
     engine = _mk_engine(disp, factory, port, engine_key="tdx",
                         account_snapshot_interval=5.0)
     engine._last_intraday_reconcile = 0.0
@@ -1343,7 +1350,9 @@ def test_capture_refresh_records_mismatch_with_computed_at():
     """重算确有差异时写回新差异，并带 computed_at（前端显示「算于何时」）。"""
     factory, _ = _db_factory()
     port, _ = _portfolio_single()
-    disp = _AcctDispatcher(positions=[])
+    disp = _AcctDispatcher(positions=[],
+                           asset={"total_asset": 100000.0, "available": 50000.0,
+                                  "market_value": 0.0})
     engine = _mk_engine(disp, factory, port, engine_key="tdx",
                         account_snapshot_interval=5.0)
     # 虚拟有仓、真实无仓（柜台已卖出但账本未回填）→ 真差异
@@ -1848,6 +1857,10 @@ def test_equity_deviation_warns_once_and_only_when_over_threshold():
     assert hits[0]["action"] == "notice"
     assert hits[0]["virtual_total"] == "100000"
     assert hits[0]["real_total"] == "130000"
+    # 文案自证口径：虚拟净值按配置资金起账，与柜台总资产不直接可比
+    assert "按组合配置资金起账" in hits[0]["message"]
+    assert "不直接可比" in hits[0]["message"]
+    assert "不要用现金流台账抹平" in hits[0]["message"]
     # 只告警不改账
     assert port.account.cash == Decimal("100000")
 

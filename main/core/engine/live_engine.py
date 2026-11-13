@@ -3534,8 +3534,10 @@ class LiveEngine:
             "virtual_total": str(virtual),
             "out_of_pool_value": str(out_value),
             "deviation_pct": str(pct),
-            "message": ("真实账户总资产 %s（剔除池外 %s）与虚拟净值 %s 偏差 %+.2f%%，"
-                        "请核对继承仓/成交回填/外部流水" % (
+            "message": ("真实账户总资产 %s（剔除池外 %s）与虚拟净值 %s 偏差 %+.2f%%。"
+                        "虚拟净值按组合配置资金起账，与柜台真实总资产不直接可比"
+                        "（长期偏差属口径差）；如需对齐请调整组合资金配置，"
+                        "不要用现金流台账抹平。" % (
                             fmt_money(real_total), fmt_money(out_value),
                             fmt_money(virtual), pct * 100)),
         })
@@ -8446,8 +8448,11 @@ class LiveEngine:
                     "重算并取最大者（session %s, 组合 %s, 策略 %s）",
                     code, table_val[0], snap_peak, self.session_id, pid,
                     ctx.strategy_id)
-                recompute_meta.append(
-                    (pid, ctx.strategy_id, code, table_val[0], snap_peak))
+                recompute_meta.append({
+                    "pid": pid, "strategy_id": ctx.strategy_id, "code": code,
+                    "table_val": table_val[0], "snap_peak": snap_peak,
+                    "final": None,
+                })
             strat_period = (getattr(ctx, "period", None) or "1m").lower()
             pkey = (code, anchor, strat_period)
             if pkey not in period_cache:
@@ -8482,6 +8487,10 @@ class LiveEngine:
                 source = "cost"
             if final > cur:
                 pos.update_high(final)
+            if (recompute_meta and recompute_meta[-1]["code"] == code
+                    and recompute_meta[-1]["final"] is None):
+                # 审计行补齐「重算值」（表值/快照MAX 之外的一项）
+                recompute_meta[-1]["final"] = final
             # 落库（只升不降；下一轮重启即可直接读表、不再取数）
             self._note_peak_raised(pid, code, final, None)
             logger.info(
@@ -8496,7 +8505,10 @@ class LiveEngine:
         # 补种结果统一落库（不提交，recover 末尾由服务层提交）。
         # 补种期持仓集合不完整（继承仓/外部仓尚未导入）→ 只 UPSERT，禁止清仓删行。
         self._flush_position_peaks(db)
-        for pid, strategy_id, code, table_pk, snap_pk in recompute_meta:
+        for meta in recompute_meta:
+            pid, strategy_id = meta["pid"], meta["strategy_id"]
+            code, table_pk, snap_pk = meta["code"], meta["table_val"], meta["snap_peak"]
+            final = meta["final"]
             self._recorder.record(
                 gate="peak_seed",
                 layer="live_gate",
@@ -8507,8 +8519,8 @@ class LiveEngine:
                 bar_time=None,
                 param_value=float(table_pk) if table_pk is not None else None,
                 actual_value=float(snap_pk) if snap_pk is not None else None,
-                message=("峰值表值可疑：表值 %s < 快照MAX %s，已重算并取最大者"
-                         % (table_pk, snap_pk)),
+                message=("峰值表值可疑：表值 %s < 快照MAX %s，已重算为 %s（取最大者）"
+                         % (table_pk, snap_pk, final)),
             )
         if fallback_meta:
             for pid, strategy_id, code, anchor, cur in fallback_meta:

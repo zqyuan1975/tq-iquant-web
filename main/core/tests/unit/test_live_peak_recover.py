@@ -722,6 +722,42 @@ def test_peak_table_below_snapshot_max_triggers_recompute():
     assert "10.46" in events[0].message and "10.83" in events[0].message
 
 
+def test_peak_recompute_event_carries_recomputed_value():
+    """recompute 审计行必须含「代码 / 表值 / 重算值 / 快照 MAX」四项。
+
+    表值 10.46 < 快照 MAX 10.83 < 周期重算 10.95：final=10.95，审计行要在
+    message 里给出重算值，param/actual 分别落表值与快照 MAX，库内可直接核对。
+    """
+    factory, _ = _db_factory()
+    port = _portfolio()
+    disp = _StubDispatcher(bars=[_bar("2026-11-12", "10.95")])
+    engine = _engine(factory, disp, port)
+    db = factory()
+    _buy_trade(db, datetime(2026, 11, 10, 9, 31, 54), price="10.46", qty=5300)
+    _snapshot(db, datetime(2026, 11, 11, 9, 32), "10.83", qty=5300)
+    db.add(LivePositionPeak(
+        live_session_id=1,
+        portfolio_strategy_id=_SID,
+        stock_code=_STOCK,
+        highest_price=Decimal("10.46"),
+        peak_bar_time=datetime(2026, 11, 12, 15, 0),
+    ))
+    db.commit()
+
+    engine.recover(db)
+    events = _events(db)
+    db.close()
+
+    assert port.strategies[0].positions[_STOCK].highest_price == Decimal("10.95")
+    assert len(events) == 1
+    ev = events[0]
+    assert ev.action == "recompute"
+    assert ev.stock_code == _STOCK
+    assert ev.param_value == 10.46            # 表值
+    assert ev.actual_value == 10.83           # 快照 MAX
+    assert "10.95" in ev.message              # 重算值
+
+
 # ---------------- 缺口三：继承仓表值退化自愈（002745 场景） ----------------
 def test_imported_position_heals_stale_table_peak():
     """导入仓（buy_time=今日）+ 表值 10.46（已退化）+ 11-10 快照 10.83：
