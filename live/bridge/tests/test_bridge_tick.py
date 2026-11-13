@@ -185,6 +185,8 @@ def test_ping_returns_200_and_status_fields(bridge):
     assert status == 200
     assert data["ok"] is True
     assert data["service"].startswith("iquant-bridge")
+    # 版本自证：/ping 的 build 必须与文件常量一致（排查"跑的是哪一版"用）
+    assert data["build"] == mod.BRIDGE_BUILD
     assert data["port"] == mod.PORT
     assert data["account"] == mod.ACCOUNT
     assert data["account_type"] == mod.ACCOUNT_TYPE
@@ -325,7 +327,7 @@ def _quote_frame(labels, closes):
 
 
 def test_quote_uses_contextinfo_when_globals_lacks_it(bridge, monkeypatch, capsys):
-    """ContextInfo 取数：显式字段 + subscribe=True + dividend_type=follow。"""
+    """ContextInfo 取数：显式字段 + subscribe=True + dividend_type=none（不复权）。"""
     mod, _ctx = bridge
     seen = []
 
@@ -346,7 +348,7 @@ def test_quote_uses_contextinfo_when_globals_lacks_it(bridge, monkeypatch, capsy
     assert bar["close"] == 1.5 and bar["amount"] == 150.0
     assert seen[0][0] == mod.CTX_FIELDS
     assert seen[0][1]["subscribe"] is True
-    assert seen[0][1]["dividend_type"] == "follow"
+    assert seen[0][1]["dividend_type"] == "none"
     out = capsys.readouterr().out
     assert "quote via ContextInfo ok" in out
     assert "rows_before=1 rows_after=1" in out     # 取数 → 序列化 行数自证

@@ -6,6 +6,7 @@ direction=48）。真正区分股票买卖的是 ``m_nOffsetFlag``：48=买，49
 """
 import importlib.util
 import pathlib
+import time
 
 import pytest
 
@@ -105,46 +106,154 @@ def _quote_mod(name, rows_by_mode):
 
 
 @pytest.mark.parametrize("name", _BOTH)
-def test_quote_without_dividend_param_keeps_historical_follow(name):
-    mod, calls = _quote_mod(name, {"follow": [_BAR]})
+def test_quote_without_dividend_param_is_unadjusted(name):
+    """未传 divide_type：显式 none（不复权），不再是含混的 follow/default。"""
+    mod, calls = _quote_mod(name, {"none": [_BAR]})
     out = mod.get_quote({"code": "000001.SZ", "period": "1m", "count": "5"})
     assert out["ok"] is True and out["data"]["000001.SZ"]
-    assert calls[0]["dividend_type"] == "follow", "缺省必须仍是历史 follow 口径"
-    assert out["dividend_type"] == "default"
+    assert calls[0]["dividend_type"] == "none", "缺省必须显式不复权（none）"
+    assert out["dividend_type"] == "none"
+    assert out["meta"]["dividend_type"] == "none"
+    assert "dividend_type_requested" not in out
 
 
 @pytest.mark.parametrize("name", _BOTH)
 def test_quote_forwards_explicit_dividend_type(name):
-    mod, calls = _quote_mod(name, {"front": [_BAR], "follow": [_BAR]})
+    mod, calls = _quote_mod(name, {"front": [_BAR], "none": [_BAR]})
     out = mod.get_quote({"code": "000001.SZ", "period": "1m",
                          "dividend_type": "front"})
     assert calls[0]["dividend_type"] == "front"
     assert out["dividend_type"] == "front"
+    assert out["meta"]["dividend_type"] == "front"
     # 复权模式进缓存键：再取缺省口径必须重新取数，不能复用前复权结果
     mod.get_quote({"code": "000001.SZ", "period": "1m"})
-    assert len(calls) == 2 and calls[1]["dividend_type"] == "follow"
+    assert len(calls) == 2 and calls[1]["dividend_type"] == "none"
 
 
 @pytest.mark.parametrize("name", _BOTH)
 def test_quote_empty_adjusted_table_falls_back_and_marks(name):
-    mod, calls = _quote_mod(name, {"follow": [_BAR]})   # back -> 空表
+    mod, calls = _quote_mod(name, {"none": [_BAR]})     # back -> 空表
     out = mod.get_quote({"code": "000001.SZ", "period": "1m",
                          "dividend_type": "back"})
     assert out["ok"] is True and out["data"]["000001.SZ"]
     assert out["dividend_fallback"] is True
-    assert out["dividend_type"] == "default"
+    assert out["dividend_type"] == "none"
+    assert out["meta"]["dividend_type"] == "none"
     assert out["dividend_type_requested"] == "back"
     assert len(calls) == 2, "显式模式空表后只降级一次"
 
 
 @pytest.mark.parametrize("name", _BOTH)
 def test_quote_unknown_dividend_type_ignored_but_reported(name):
-    mod, calls = _quote_mod(name, {"follow": [_BAR]})
+    mod, calls = _quote_mod(name, {"none": [_BAR]})
     out = mod.get_quote({"code": "000001.SZ", "period": "1m",
                          "dividend_type": "week"})
-    assert calls[0]["dividend_type"] == "follow"
-    assert out["dividend_type"] == "default"
-    assert "dividend_note" in out
+    assert calls[0]["dividend_type"] == "none", "非法值必须按 none 处理"
+    assert out["dividend_type"] == "none"
+    assert out["meta"]["dividend_type"] == "none"
+    assert "unknown dividend_type" in out["dividend_note"]
+    assert "none" in out["dividend_note"]
+    assert out["meta"]["dividend_note"] == out["dividend_note"]
+
+
+# ---------------- 绑定等待（2026-11-13c，bind-first） ----------------
+# 2026-11-13b 的「每秒 probe 一次」本身是病根：旧监听接了不读不关，每秒攒一个
+# CLOSE_WAIT，反把端口堵死。现改为 bind 优先、失败后才 kick（≤4 次）+ 退避，
+# 且「无监听但 bind 一直失败」= 半死 socket，快失败。
+class _FakeTime:
+    """替身：只记录 sleep 秒数，其余属性（strftime 等）透传真实 time。"""
+
+    def __init__(self):
+        self.sleeps = []
+
+    def sleep(self, seconds):
+        self.sleeps.append(seconds)
+
+    def __getattr__(self, name):
+        return getattr(time, name)
+
+
+@pytest.mark.parametrize("name", _BOTH)
+def test_acquire_port_first_bind_success_never_probes(name):
+    """正常 stop+start：一次 bind 成功，绝不建连（不产生 CLOSE_WAIT）。"""
+    mod = _load(name)
+    calls = {"probe": 0, "kick": 0}
+    sock = object()
+
+    def probe():
+        calls["probe"] += 1
+        return True
+
+    def kick():
+        calls["kick"] += 1
+        return True
+
+    mod._port_in_use = probe
+    mod._request_shutdown = kick
+    mod._bind_listener = lambda: sock
+    mod.time = _FakeTime()
+
+    got, waited = mod._acquire_listen_socket()
+    assert got is sock and waited == 0
+    assert calls == {"probe": 0, "kick": 0}, "一次 bind 成功就返回，不探活、不 kick"
+    assert mod.time.sleeps == []
+
+
+@pytest.mark.parametrize("name", _BOTH)
+def test_acquire_port_half_dead_sockets_fail_fast(name, capsys):
+    """无监听 + bind 一直 WSAEADDRINUSE = CLOSE_WAIT 残留：不烧 60 秒，快失败。"""
+    mod = _load(name)
+    err = OSError(10048, "address already in use")
+
+    def boom():
+        raise err
+
+    mod._port_in_use = lambda: False
+    mod._request_shutdown = lambda: True
+    mod._bind_listener = boom
+    mod.time = _FakeTime()
+    mod.BIND_WAIT_SECONDS = 60
+
+    with pytest.raises(mod._BindTimeout) as ei:
+        mod._acquire_listen_socket()
+    assert ei.value.dead_sockets is True
+    assert ei.value.last_error is err
+    assert len(mod.time.sleeps) == 1, "只给一次重试机会就判定半死，不等到 60s"
+    out = capsys.readouterr().out
+    assert "CLOSE_WAIT/TIME_WAIT" in out, "日志必须点明半死连接"
+
+
+@pytest.mark.parametrize("name", _BOTH)
+def test_acquire_port_live_listener_kick_then_bind(name):
+    """有旧监听：kick 释放 -> 退避 -> bind 成功，且 kick 次数受上限约束。"""
+    mod = _load(name)
+    busy = {"n": 2}                      # 前两次探测仍是活着的老监听
+    kicks = []
+    sock = object()
+    binds = {"n": 0}
+
+    def fake_kick():
+        kicks.append(1)
+        busy["n"] -= 1
+        return True
+
+    def fake_bind():
+        binds["n"] += 1
+        if busy["n"] > 0 or binds["n"] == 1:
+            raise OSError(10048, "address already in use")
+        return sock
+
+    mod._port_in_use = lambda: busy["n"] > 0
+    mod._request_shutdown = fake_kick
+    mod._bind_listener = fake_bind
+    mod.time = _FakeTime()
+
+    got, waited = mod._acquire_listen_socket()
+    assert got is sock
+    assert len(kicks) <= mod.BIND_SHUTDOWN_MAX
+    assert len(kicks) == 2
+    assert mod.time.sleeps == [1, 2], "退避 1s / 2s，不是每秒猛敲"
+    assert waited == 3
 
 
 # ---------------- /price_limit 除权日前收（2026-11-12） ----------------

@@ -169,6 +169,8 @@ def test_quote_without_dividend_param_keeps_adjust_zero(bridge, monkeypatch):
     assert out["ok"] is True and out["data"]["600000.SH"]
     assert calls[0]["adjust"] == 0, "缺省必须仍是历史 adjust=0（不复权）"
     assert out["dividend_type"] == "none"
+    assert out["meta"]["dividend_type"] == "none", "meta 与 QMT 桥同形态"
+    assert "dividend_type_requested" not in out
 
 
 def test_quote_forwards_explicit_dividend_type(bridge, monkeypatch):
@@ -178,11 +180,13 @@ def test_quote_forwards_explicit_dividend_type(bridge, monkeypatch):
                          "dividend_type": "front"})
     assert calls[0]["adjust"] == 1
     assert out["dividend_type"] == "front"
+    assert out["meta"]["dividend_type"] == "front"
     out2, calls2 = _quote(bridge, monkeypatch, {2: [_bar_row()]},
                           {"code": "600000.SH", "period": "1m",
                            "dividend_type": "back"})
     assert calls2[0]["adjust"] == 2
     assert out2["dividend_type"] == "back"
+    assert out2["meta"]["dividend_type"] == "back"
 
 
 def test_quote_empty_adjusted_table_falls_back_and_marks(bridge, monkeypatch):
@@ -193,6 +197,7 @@ def test_quote_empty_adjusted_table_falls_back_and_marks(bridge, monkeypatch):
     assert [c["adjust"] for c in calls] == [1, 0]
     assert out["dividend_fallback"] is True
     assert out["dividend_type"] == "none"
+    assert out["meta"]["dividend_type"] == "none"
     assert out["dividend_type_requested"] == "front"
 
 
@@ -200,9 +205,11 @@ def test_quote_unknown_dividend_type_ignored_but_reported(bridge, monkeypatch):
     out, calls = _quote(bridge, monkeypatch, {0: [_bar_row()]},
                         {"code": "600000.SH", "period": "1m",
                          "dividend_type": "week"})
-    assert calls[0]["adjust"] == 0
+    assert calls[0]["adjust"] == 0, "非法值必须按 none（adjust=0）处理"
     assert out["dividend_type"] == "none"
-    assert "dividend_note" in out
+    assert out["meta"]["dividend_type"] == "none"
+    assert "unknown dividend_type" in out["dividend_note"]
+    assert "using 'none'" in out["dividend_note"]
 
 
 # ---------------- /price_limit 除权日前收（2026-11-12） ----------------

@@ -43,8 +43,10 @@
 #       DRY_RUN     (dev print switch, keep False for real trading)
 # 4. Start the strategy and watch the client console. Expected, in order:
 #       [BRIDGE-LIVE] 2026-11-06 09:30:00 bind ok 127.0.0.1:8791 account=... type=CREDIT dry_run=False
-#       [BRIDGE-LIVE] 2026-11-06 09:30:00 init done: tick scheduled every 1.0s (tag=...)
+#       [BRIDGE-LIVE] 2026-11-06 09:30:00 init done: build=2026-11-13c
+#                 dividend=none bindwait=60s; tick scheduled every 1.0s (tag=...)
 #       [BRIDGE-LIVE] 2026-11-06 09:30:01 tick#1 alive listen=127.0.0.1:8791 served_total=0 conns=0
+#    /ping also echoes "build", so you never have to guess which code is live.
 #    The tick#N line (with timestamp) must keep advancing -- it is printed on the
 #    FIRST tick and then at most once per HEARTBEAT_INTERVAL (60s) while idle.
 #    If tick#N never appears, the scheduled timer is not firing (see RUN MODEL)
@@ -54,9 +56,15 @@
 #    the running strategy keeps the old code until restarted.
 #    PORT EXCLUSIVITY: on Windows the bridge binds with SO_EXCLUSIVEADDRUSE, so
 #    a second instance on the same port FAILS LOUDLY (FATAL line) instead of
-#    "binding ok" and silently swallowing requests. If you see that FATAL line:
-#    stop the strategy first, then start it; if it persists, restart the client
-#    (a stopped instance can leave a socket handle behind inside the process).
+#    "binding ok" and silently swallowing requests. A new instance tries bind
+#    FIRST (a normal stop+start binds on the first try and opens no connection);
+#    only if bind fails does it ask a live old instance to /shutdown, at most 4
+#    times with 1/2/4/8s backoff, up to 60s total. If nothing is listening yet
+#    bind still fails, the port is held by half-dead CLOSE_WAIT/TIME_WAIT
+#    sockets: it prints FATAL immediately instead of waiting (waiting never
+#    clears those). Then: stop the strategy, then RESTART the QMT client.
+#    A stopped instance can leave a socket handle behind inside the process --
+#    that is the half-dead case above, and only a client restart clears it.
 #
 # THIS LEG = CREDIT ACCOUNT: this bridge is bound to the margin/credit account
 # 410009993017 (QMT account type "CREDIT", ACCOUNT_TYPE below). In the client's
@@ -177,11 +185,20 @@ QUOTE_COUNT = 10                  # default bar count for /quote
 # ---- /quote dividend (adjust) mode ----------------------------------------
 # Optional query params: ?dividend_type=front|back|none -- the same vocabulary
 # the platform TQ layer uses (main/core/tq/data.py: front / back / none).
-# ABSENT keeps the historical behaviour byte-for-byte: ContextInfo is called
-# with dividend_type="follow" (which the client resolves to its own default,
-# i.e. unadjusted) and the xtdata fallback passes no dividend_type at all.
+# ABSENT (and an unknown value) means UNADJUSTED bars, which is passed to
+# ContextInfo explicitly as "none" -- the SDK's documented unadjusted value.
+# The old value was "follow", which obeys whatever adjust mode the CLIENT is
+# configured with: if the client defaults to front adjustment, QMT would answer
+# adjusted bars while the goldminer bridge answers unadjusted ones (gm adjust=0)
+# -- a silent cross-channel price mismatch on the same request. "none" pins both
+# bridges to the same baseline (2026-11-13).
 DIVIDEND_TYPES = ("front", "back", "none")
-DEFAULT_DIVIDEND_TYPE = "follow"   # historical ContextInfo value; never change implicitly
+DEFAULT_DIVIDEND_TYPE = "none"     # explicit unadjusted; never "follow" (see above)
+# Build stamp: printed in the init log and echoed by /ping, so "which code is
+# actually running" is self-evident instead of being guessed from behaviour.
+# Bump it on every behavioural change to this file.
+#   2026-11-13c = bind-first + fast-fail on half-dead sockets (no probe storm)
+BRIDGE_BUILD = "2026-11-13c"
 HISTORY_DAYS = 30                 # history depth floor (calendar days) for downloads
 CTX_DAILY_DAYS = 90               # interval window for 1d reads (count is unreliable)
 # Fields requested from ContextInfo.get_market_data_ex. MUST be explicit: with
@@ -1463,7 +1480,7 @@ def _ctx_read(fn, code, period, count, dividend_type=None):
     are populated).
 
     dividend_type: None = the caller did not ask for an adjust mode -> the
-    historical "follow" value is passed unchanged (unadjusted in practice).
+    DEFAULT_DIVIDEND_TYPE value ("none", i.e. explicitly unadjusted) is passed.
     front/back/none are forwarded verbatim to the client.
     """
     kwargs = {"start_time": "", "count": count,
@@ -1798,8 +1815,8 @@ def _parse_dividend_type(params):
         return None, None
     if raw in DIVIDEND_TYPES:
         return raw, None
-    return None, ("unknown dividend_type %r ignored (expect %s)"
-                  % (raw, "/".join(DIVIDEND_TYPES)))
+    return None, ("unknown dividend_type %r ignored (expect %s), using %r"
+                  % (raw, "/".join(DIVIDEND_TYPES), DEFAULT_DIVIDEND_TYPE))
 
 
 def get_quote(params):
@@ -1821,11 +1838,12 @@ def get_quote(params):
     if cached is not None and now - cached[0] <= QUOTE_CACHE_TTL:
         body = {"ok": True, "data": {code: cached[1]}, "cached": True}
         body.update(cached[2])
+        body["meta"] = dict(cached[2])
         return body
 
     df = _fetch_quote(code, period, count, dividend)
     fallback = False
-    applied = dividend or "default"
+    applied = dividend or DEFAULT_DIVIDEND_TYPE
     if df is None and dividend is not None:
         # The SDK frequently returns an empty table for an adjust mode it cannot
         # serve (thin local store / unsupported mode). Degrade to the historical
@@ -1833,18 +1851,21 @@ def get_quote(params):
         df = _fetch_quote(code, period, count, None)
         if df is not None:
             fallback = True
-            applied = "default"
+            applied = DEFAULT_DIVIDEND_TYPE
             _throttled_log(("div-fallback", code, period, dividend),
                            "[BRIDGE-LIVE] %s quote dividend_type=%s empty for %s %s,"
-                           " fell back to default (unadjusted)"
-                           % (_ts(), dividend, code, period))
+                           " fell back to %s (unadjusted)"
+                           % (_ts(), dividend, code, period,
+                              DEFAULT_DIVIDEND_TYPE))
     if df is None:
-        body = {"ok": False, "error": "no data for %s %s" % (code, period),
-                "dividend_type": applied}
+        div_meta = {"dividend_type": applied}
         if dividend is not None:
-            body["dividend_type_requested"] = dividend
+            div_meta["dividend_type_requested"] = dividend
         if div_note:
-            body["dividend_note"] = div_note
+            div_meta["dividend_note"] = div_note
+        body = {"ok": False, "error": "no data for %s %s" % (code, period)}
+        body.update(div_meta)           # top-level: legacy callers
+        body["meta"] = dict(div_meta)   # nested: same shape as goldminer bridge
         return body
     bars = _df_to_bars(df)
     # Self-evidencing line for "fetched N rows but HTTP returned []": throttled,
@@ -1852,8 +1873,9 @@ def get_quote(params):
     _throttled_log(("bars", code, period),
                    "[BRIDGE-LIVE] %s quote rows code=%s period=%s rows_before=%d rows_after=%d"
                    % (_ts(), code, period, len(df), len(bars)))
-    meta = {"dividend_type": dividend if (dividend is not None and not fallback)
-            else "default"}
+    # dividend_type is the mode ACTUALLY APPLIED (front/back/none) -- never a
+    # vague "default": Core compares this string against the goldminer bridge.
+    meta = {"dividend_type": applied}
     if fallback:
         meta["dividend_type_requested"] = dividend
         meta["dividend_fallback"] = True
@@ -1862,6 +1884,7 @@ def get_quote(params):
     _quote_cache[cache_key] = (now, bars, meta)
     body = {"ok": True, "data": {code: bars}, "cached": False}
     body.update(meta)
+    body["meta"] = dict(meta)
     return body
 
 
@@ -1923,6 +1946,7 @@ def _handle(method, path, headers, body):
 
     if method == "GET" and path == "/ping":
         return _json({"ok": True, "service": "iquant-bridge-live",
+                      "build": BRIDGE_BUILD,
                       "port": PORT, "account": ACCOUNT,
                       "account_type": ACCOUNT_TYPE, "dry_run": DRY_RUN,
                       "ctx_ok": bool(_CTX is not None and callable(
@@ -2001,8 +2025,18 @@ def _port_in_use():
 # socket when a strategy is stopped -- the handle survives inside the same QMT
 # process, so the next instance can never bind. Instead of forcing a full client
 # restart, the new instance asks the old one to release the port via /shutdown.
-KICK_ATTEMPTS = 3                 # how many polite shutdown requests before FATAL
-KICK_INTERVAL = 0.7               # seconds between attempts
+# 2026-11-13b: wait up to 60s instead of giving up after ~2s.
+# 2026-11-13c: BIND FIRST, probe only after a failure. Probing every second built
+# one throw-away connection per second; an old listener that accepted but never
+# served left each one in CLOSE_WAIT, and those sockets keep the port bound, so
+# waiting could never succeed (self-inflicted). Now: one bind attempt first (the
+# normal stop+start case never opens a connection), at most BIND_SHUTDOWN_MAX
+# /shutdown kicks per init, exponential backoff between retries, and an
+# immediate FATAL when NOTHING is listening yet bind keeps failing -- that is
+# the CLOSE_WAIT/TIME_WAIT case, which never clears by itself.
+BIND_WAIT_SECONDS = 60            # total patience before FATAL
+BIND_BACKOFF = (1, 2, 4, 8)       # seconds slept before each retry (last repeats)
+BIND_SHUTDOWN_MAX = 4             # max /shutdown kicks per init (each = 1 connection)
 KICK_TIMEOUT = 0.5                # connect/read timeout of one shutdown request
 
 
@@ -2021,6 +2055,95 @@ def _request_shutdown():
     finally:
         if conn is not None:
             _close_quietly(conn)
+
+
+class _BindTimeout(Exception):
+    """Raised when HOST:PORT cannot be acquired.
+
+    last_error  = the last bind() exception (None if bind never failed).
+    dead_sockets = True when bind kept failing while NOTHING was listening,
+    i.e. CLOSE_WAIT/TIME_WAIT leftovers; waiting can never clear those.
+    """
+
+    def __init__(self, last_error=None, dead_sockets=False):
+        Exception.__init__(self, "port acquisition timed out")
+        self.last_error = last_error
+        self.dead_sockets = dead_sockets
+
+
+def _bind_listener():
+    """Create+bind+listen the bridge socket. Raises on failure (retried by caller)."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        if os.name == "nt" and hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+            # Windows: SO_REUSEADDR lets a SECOND bind succeed on a port that is
+            # already bound, and the old (possibly leaked) socket keeps receiving
+            # the connections -- the 2026-11 "bind ok but /ping times out" bug.
+            # EXCLUSIVEADDRUSE makes the second bind FAIL instead of silently
+            # stealing half the traffic. Verified available on Python 3.6.
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        else:
+            # POSIX: SO_REUSEADDR only skips TIME_WAIT, it does not allow two
+            # live listeners -- safe as-is.
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        s.bind((HOST, PORT))
+        s.listen(32)
+        s.settimeout(0)               # non-blocking accept; tick() polls via select
+        return s
+    except Exception:
+        _close_quietly(s)
+        raise
+
+
+def _acquire_listen_socket():
+    """Return (listening_socket, seconds_waited); raise _BindTimeout on give-up.
+
+    Bind FIRST. Probing before bind cost us: every probe is a connection, and an
+    old listener that accepts but never serves leaves each probe in CLOSE_WAIT,
+    which keeps the port bound and turns the wait into a self-inflicted deadlock.
+    So we only look at the port after a bind failure, and we kick at most
+    BIND_SHUTDOWN_MAX times. When nothing is listening but bind still fails, the
+    port is held by half-dead sockets -> fail fast instead of waiting 60s.
+    """
+    waited = 0
+    kicks = 0
+    dead_rounds = 0
+    step = 0
+    last_err = None
+    while True:
+        try:
+            return _bind_listener(), waited
+        except Exception as e:            # noqa: BLE001 -- inspected below
+            last_err = e
+        if _port_in_use():
+            dead_rounds = 0
+            if kicks < BIND_SHUTDOWN_MAX:
+                kicks += 1
+                print("[BRIDGE-LIVE] %s port busy: live listener holds %s:%d, asking it to"
+                      " shutdown [kick %d/%d] (%ds/%ds)"
+                      % (_ts(), HOST, PORT, kicks, BIND_SHUTDOWN_MAX,
+                         waited, BIND_WAIT_SECONDS))
+                _request_shutdown()
+            else:
+                print("[BRIDGE-LIVE] %s port busy: live listener still holds %s:%d,"
+                      " no more shutdown kicks (%ds/%ds)"
+                      % (_ts(), HOST, PORT, waited, BIND_WAIT_SECONDS))
+        else:
+            dead_rounds += 1
+            if dead_rounds >= 2:
+                raise _BindTimeout(last_err, dead_sockets=True)
+            print("[BRIDGE-LIVE] %s bind failed but NOTHING is listening on %s:%d"
+                  " (%s: %s) -- likely CLOSE_WAIT/TIME_WAIT sockets (%ds/%ds)"
+                  % (_ts(), HOST, PORT, type(last_err).__name__, last_err,
+                     waited, BIND_WAIT_SECONDS))
+        if waited >= BIND_WAIT_SECONDS:
+            raise _BindTimeout(last_err)
+        delay = BIND_BACKOFF[min(step, len(BIND_BACKOFF) - 1)]
+        step += 1
+        print("[BRIDGE-LIVE] %s waiting %ds for port release (%ds/%ds)"
+              % (_ts(), delay, waited, BIND_WAIT_SECONDS))
+        time.sleep(delay)
+        waited += delay
 
 
 def _release_port(message):
@@ -2237,54 +2360,42 @@ def init(ContextInfo):
         _close_quietly(_listen_sock)
         _listen_sock = None
 
-    # Pre-bind probe: a leftover listener (previous strategy instance whose
-    # socket handle leaked inside the QMT process) keeps completing TCP
-    # handshakes and stealing every connection, so our bind can still "succeed"
-    # while every request is swallowed. Ask it to release the port first; only
-    # if that fails do we give up loudly.
-    if _port_in_use():
-        for attempt in range(1, KICK_ATTEMPTS + 1):
-            print("[BRIDGE-LIVE] %s port busy, asking old instance to shutdown (attempt %d)"
-                  % (_ts(), attempt))
-            _request_shutdown()
-            time.sleep(KICK_INTERVAL)
-            if not _port_in_use():
-                print("[BRIDGE-LIVE] %s old instance released the port" % _ts())
-                break
-
-    if _port_in_use():
-        print("[BRIDGE-LIVE] %s FATAL: %s:%d already in use -- an old bridge/listener is "
-              "still there and would swallow every request (bind-ok-but-no-response). "
-              "Stop this strategy in QMT, then start it again; if it still fails, "
-              "restart the QMT client. tick NOT scheduled, nothing will answer."
-              % (_ts(), HOST, PORT))
-        return
-
+    # Bind first, ask questions later (2026-11-13c): the normal stop+start case
+    # binds on the first try and never opens a probe connection. Only a failed
+    # bind triggers /shutdown kicks, and half-dead sockets (nothing listening yet
+    # bind fails) abort immediately instead of burning the full wait.
     try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        if os.name == "nt" and hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
-            # Windows: SO_REUSEADDR lets a SECOND bind succeed on a port that is
-            # already bound, and the old (possibly leaked) socket keeps receiving
-            # the connections -- the 2026-11 "bind ok but /ping times out" bug.
-            # EXCLUSIVEADDRUSE makes the second bind FAIL instead of silently
-            # stealing half the traffic. Verified available on Python 3.6.
-            s.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        _listen_sock, _waited = _acquire_listen_socket()
+    except _BindTimeout as e:
+        if e.dead_sockets:
+            _log_exception("bind", e.last_error)
+            print("[BRIDGE-LIVE] %s FATAL: %s:%d is held by HALF-DEAD sockets "
+                  "(CLOSE_WAIT/TIME_WAIT) -- NOTHING is listening, so waiting cannot "
+                  "help (%s: %s). STOP this strategy in QMT, then RESTART the QMT "
+                  "client. Find the owner with: netstat -ano | findstr :%d "
+                  "then: tasklist /FI \"PID eq <pid>\". "
+                  "tick NOT scheduled, nothing will answer."
+                  % (_ts(), HOST, PORT, type(e.last_error).__name__, e.last_error, PORT))
+        elif e.last_error is not None:
+            _log_exception("bind", e.last_error)
+            print("[BRIDGE-LIVE] %s FATAL: bind/listen failed on %s:%d (%s: %s) while the "
+                  "port is still LISTENING by another process. Stop this strategy in "
+                  "QMT, then start it again; if it still fails, restart the QMT client. "
+                  "Find the owner with: netstat -ano | findstr :%d "
+                  "then: tasklist /FI \"PID eq <pid>\". "
+                  "tick NOT scheduled, nothing will answer."
+                  % (_ts(), HOST, PORT, type(e.last_error).__name__, e.last_error, PORT))
         else:
-            # POSIX: SO_REUSEADDR only skips TIME_WAIT, it does not allow two
-            # live listeners -- safe as-is.
-            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        s.bind((HOST, PORT))
-        s.listen(32)
-        s.settimeout(0)               # non-blocking accept; tick() polls via select
-        _listen_sock = s
-    except Exception as e:
-        _log_exception("bind", e)
-        print("[BRIDGE-LIVE] %s FATAL: bind/listen failed on %s:%d (%s: %s). "
-              "Old instance not exited? Stop this strategy in QMT and start it "
-              "again; if it still fails, restart the QMT client. "
-              "tick NOT scheduled, nothing will answer."
-              % (_ts(), HOST, PORT, type(e).__name__, e))
+            print("[BRIDGE-LIVE] %s FATAL: %s:%d already in use -- a live listener is "
+                  "still there and would swallow every request (bind-ok-but-no-response). "
+                  "Stop this strategy in QMT, then start it again; if it still fails, "
+                  "restart the QMT client. Find the owner with: "
+                  "netstat -ano | findstr :%d then: tasklist /FI \"PID eq <pid>\". "
+                  "tick NOT scheduled, nothing will answer."
+                  % (_ts(), HOST, PORT, PORT))
         return
+    if _waited:
+        print("[BRIDGE-LIVE] %s port acquired after %ds, binding done" % (_ts(), _waited))
 
     _last_heartbeat = 0.0             # let the very first tick print the heartbeat
     print("[BRIDGE-LIVE] %s bind ok %s:%d account=%s type=%s dry_run=%s"
@@ -2306,8 +2417,10 @@ def init(ContextInfo):
               "Check the signature/interval support (minute fallback: TICK_INTERVAL="
               "timedelta(minutes=1), TICK_BUDGET_SECONDS=55)." % _ts())
         return
-    print("[BRIDGE-LIVE] %s init done: tick scheduled every %.1fs (tag=%s); init returns now"
-          % (_ts(), TICK_INTERVAL.total_seconds(), TICK_TAG))
+    print("[BRIDGE-LIVE] %s init done: build=%s dividend=%s bindwait=%ds; "
+          "tick scheduled every %.1fs (tag=%s); init returns now"
+          % (_ts(), BRIDGE_BUILD, DEFAULT_DIVIDEND_TYPE, BIND_WAIT_SECONDS,
+             TICK_INTERVAL.total_seconds(), TICK_TAG))
 
 
 def handlebar(ContextInfo):

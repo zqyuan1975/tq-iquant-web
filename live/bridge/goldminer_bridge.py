@@ -939,7 +939,8 @@ def _parse_dividend_type(p):
         return None, None
     if raw in _ADJUST_BY_MODE:
         return raw, None
-    return None, ("unknown dividend_type %r ignored (expect front/back/none)" % raw)
+    return None, ("unknown dividend_type %r ignored (expect front/back/none),"
+                  " using 'none'" % raw)
 
 
 def _quote_bars(code, freq, count, adjust):
@@ -988,6 +989,7 @@ def get_quote(p):
         if now - hit[0] < ttl:
             body = {"ok": True, "cached": True, "data": {code: hit[1]}}
             body.update(hit[2])
+            body["meta"] = dict(hit[2])
             return body
     try:
         rows = _quote_bars(code, freq, count, _ADJUST_BY_MODE.get(mode, 0))
@@ -1001,13 +1003,16 @@ def get_quote(p):
             meta["dividend_type_requested"] = mode
             meta["dividend_fallback"] = True
         else:
+            # dividend_type 是**实际生效**的复权模式（front/back/none），
+            # 与 QMT 桥同一口径；缺省/非法值都落 none（adjust=0）。
             meta["dividend_type"] = mode or "none"
         if div_note:
             meta["dividend_note"] = div_note
         # 空结果同样缓存（10s），结构与非空一致：data[code] 为空列表，不伪造行
         _QUOTE_CACHE[ck] = (now, rows, meta)
         body = {"ok": True, "cached": False, "data": {code: rows}}
-        body.update(meta)
+        body.update(meta)            # 顶层：老调用方兼容
+        body["meta"] = dict(meta)    # 嵌套：与 QMT 桥同形态
         return body
     except Exception as e:
         return {"ok": False, "error": "quote: %s" % e}
