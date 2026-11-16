@@ -129,7 +129,9 @@ end;
 { 是否有本程序进程在跑（tasklist 过滤镜像名；无匹配时输出不含镜像名） }
 function AppProcessesRunning(): Boolean;
 var
-  ProbeFile, Content: String;
+  ProbeFile: String;
+  // Inno Setup 6 的 LoadStringFromFile 第二参数签名是 AnsiString，传 String 会 Type mismatch
+  Content: AnsiString;
   ResultCode: Integer;
 begin
   Result := False;
