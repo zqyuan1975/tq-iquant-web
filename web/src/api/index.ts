@@ -1775,6 +1775,73 @@ export async function getLiveSessions() {
   return res.data.data
 }
 
+/** H2 参数漂移（绑定回测记录时）：当前组合参数 vs params_snapshot 的差异。 */
+export interface ParamsDriftField {
+  field: string
+  snapshot: string | null
+  current: string | null
+}
+
+export interface ParamsDrift {
+  backtest_record_id: number | null
+  portfolio_strategy_id?: number
+  checked: boolean
+  drifted: boolean
+  fields: ParamsDriftField[]
+  block_enabled: boolean
+  reason?: string | null
+}
+
+export async function getLiveParamsDrift(sessionId: number) {
+  const res = await api.get<ApiResponse<ParamsDrift>>(`/live/sessions/${sessionId}/params-drift`)
+  return res.data.data
+}
+
+// ---- 外部现金流台账（入金/出金/分红/其他）----
+export type LiveCashFlowType = 'deposit' | 'withdraw' | 'dividend' | 'other'
+
+export interface LiveCashFlowItem {
+  id: number
+  portfolio_id: number
+  flow_type: LiveCashFlowType
+  amount: string          // 有符号：>0 流入，<0 流出
+  flow_date: string | null
+  note: string | null
+  created_at: string | null
+}
+
+export interface LiveCashFlowList {
+  flows: LiveCashFlowItem[]
+  net_inflow: { portfolio_id: number; net_inflow: string }[]
+  total_net_inflow: string
+}
+
+export async function getLiveCashFlows(sessionId: number, portfolioId?: number) {
+  const res = await api.get<ApiResponse<LiveCashFlowList>>(
+    `/live/sessions/${sessionId}/cash-flows`,
+    { params: portfolioId !== undefined ? { portfolio_id: portfolioId } : {} })
+  return res.data.data
+}
+
+/** 登记一笔外部现金流。deposit/withdraw/dividend 传正数（符号由类型决定）；other 按符号判方向。 */
+export async function createLiveCashFlow(
+  sessionId: number,
+  req: {
+    portfolio_id: number
+    flow_type: LiveCashFlowType
+    amount: number
+    flow_date?: string | null
+    note?: string | null
+  },
+) {
+  const res = await api.post<ApiResponse<{
+    id: number; session_id: number; portfolio_id: number; flow_type: string
+    amount: string; flow_date: string | null; note: string | null
+    net_inflow: string; engine_applied: boolean
+  }>>(`/live/sessions/${sessionId}/cash-flows`, req)
+  return res.data.data
+}
+
 export async function getLiveAccountPreview(engine?: LiveEngineKey) {
   const res = await api.get<ApiResponse<LiveAccountPreview>>('/live/account-preview', {
     params: engine ? { engine } : {},
@@ -1783,7 +1850,11 @@ export async function getLiveAccountPreview(engine?: LiveEngineKey) {
 }
 
 export async function createLiveSession(req: LiveSessionCreate) {
-  const res = await api.post<ApiResponse<{ id: number; status: string }>>('/live/sessions', req)
+  const res = await api.post<ApiResponse<{
+    id: number
+    status: string
+    warnings?: string[]   // A1 软校验：目标引擎已被其它 running/stopping 会话占用（不阻断）
+  }>>('/live/sessions', req)
   return res.data.data
 }
 
@@ -1794,6 +1865,7 @@ export async function startLiveSession(id: number, opts?: { ack_keyboard_risk?: 
     status: string
     account_key?: string | null
     account_key_source?: string | null
+    warnings?: string[]   // 通道建议类告警（如推荐通道与所选引擎不一致）
   }>>(`/live/sessions/${id}/start`, opts?.ack_keyboard_risk ? { ack_keyboard_risk: true } : undefined)
   return res.data.data
 }
@@ -1904,9 +1976,14 @@ export interface BackupStatus {
   auto_done_today: boolean
 }
 
+// 下单通道类型：ths_ui / iquant_bridge / tdx_tq 为老三类；goldminer_bridge 为掘金桥，
+// alert 为预警模式（只推送不下单）。后端会返回全部取值，类型不得窄化。
+export type LiveChannelKind =
+  | 'ths_ui' | 'iquant_bridge' | 'tdx_tq' | 'goldminer_bridge' | 'alert'
+
 export interface LiveChannelEngine {
   key: LiveEngineKey
-  channel: 'ths_ui' | 'iquant_bridge' | 'tdx_tq'
+  channel: LiveChannelKind
   label: string
   configured: boolean
   detail: string
@@ -1914,7 +1991,7 @@ export interface LiveChannelEngine {
 
 export interface LiveChannelInfo {
   engine: LiveEngineKey
-  active: 'ths_ui' | 'iquant_bridge' | 'tdx_tq'
+  active: LiveChannelKind
   label: string
   online: boolean | null
   engine_running?: boolean  // 无运行引擎时为 false（此时 online=null，不做在线判定）
@@ -1931,7 +2008,7 @@ export interface LiveChannelInfo {
 
 export interface ChannelTestResult {
   ok: boolean
-  channel: 'ths_ui' | 'iquant_bridge' | 'tdx_tq'
+  channel: LiveChannelKind
   error?: string | null
   window_title?: string
   positions?: number
@@ -1964,7 +2041,7 @@ export async function getWatchdogStatus() {
 }
 
 export async function testLiveChannel(
-  channel: 'ths_ui' | 'iquant_bridge' | 'tdx_tq', mode = 'simulation',
+  channel: LiveChannelKind, mode = 'simulation',
 ) {
   const res = await api.post<ApiResponse<ChannelTestResult>>('/live/channel/test', { channel, mode })
   return res.data.data

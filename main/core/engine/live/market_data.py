@@ -245,14 +245,19 @@ class MarketDataService:
         完整桶的 code 继续按 ``period_bar_freshness`` 告警。
 
         返回："dispatched"（至少一只 code 派发成功）/ "stale"（全部被新鲜度闸拦下，可补偿）/
-        "empty"（实例无该周期策略 / 无 bar / 无完成 bar，无事可做）。
+        "empty"（有该周期策略但一只 code 都取不到可用 bar，可补偿）/ "no_strategy"
+        （实例无该周期策略，无事可做，不进补偿）。
 
         周期 guard：periods_on_boundary 是纯算术（minute%15==0 等），不查实例有无该周期策略，
         会带出实例无人用的周期（如 14:30 的 15m）。此处按 _strategy_periods 过滤——实例无该
         周期策略直接 return，避免白拉（拉完 period 过滤全跳过，不出单纯浪费）。
+
+        P1#6（2026-11-16）：旧实现把「无该周期策略」与「全部 code 取不到 bar」都返回
+        "empty"，引擎只对 "stale" 挂待补偿 → TQ 偶发返回空时该 5m/15m/30m/1h 边界当日
+        永久丢失。现在无策略返回 "no_strategy"，"empty" 只表示可补偿的「暂无数据」。
         """
         if period not in self._strategy_periods:
-            return "empty"
+            return "no_strategy"
         gate_freshness = period in _FRESHNESS_GATED_PERIODS
         today = boundary_time.date()
         bars_by_code: Dict[str, list] = {}

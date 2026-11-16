@@ -1209,3 +1209,69 @@ def test_buy_fee_guard_counts_transfer_fee_no_negative_cash():
     assert trade.quantity == 900
     assert acc.cash >= Decimal("0")
     assert trade.transfer_fee > 0
+
+
+# ---------------------------------------------------------------------------
+# 2026-11-16 核查修复（P1）：印花税按成交日分段 + 含滑点成交价夹涨跌停
+# ---------------------------------------------------------------------------
+def test_stamp_duty_rate_segments_by_trade_date():
+    """2023-08-28 起卖出印花税 0.05%，之前 0.1%（配置为默认值时按成交日分段）。"""
+    from core.engine.execution_engine import (
+        STAMP_DUTY_SEGMENTS_VERSION, stamp_duty_rate_on,
+    )
+    assert STAMP_DUTY_SEGMENTS_VERSION == "cn_a_share_sell_2008_20230828_v2"
+    assert stamp_duty_rate_on(datetime(2023, 8, 25, 15, 0)) == Decimal("0.001")
+    assert stamp_duty_rate_on(datetime(2023, 8, 28, 9, 30)) == Decimal("0.0005")
+    assert stamp_duty_rate_on(datetime(2026, 7, 30, 15, 0)) == Decimal("0.0005")
+    # 用户显式把组合费率配成非 0.0005 → 全区间照用（可配置语义不破）
+    assert stamp_duty_rate_on(
+        datetime(2015, 1, 5, 15, 0), Decimal("0.0003")) == Decimal("0.0003")
+
+
+def test_dispatcher_charges_double_stamp_duty_before_20230828():
+    """2023-08-28 前卖出 10000 元 → 印花税 10 元（旧实现恒按 0.05% 只收 5 元）。"""
+    dispatcher = SimulatedDispatcher(
+        open_prices={"000001.SZ": Decimal("10")},
+        min_commission=Decimal("0"),
+        buy_commission_rate=Decimal("0"),
+        sell_commission_rate=Decimal("0"),
+        stamp_duty_rate=Decimal("0.0005"),
+        transfer_fee_rate=Decimal("0"),
+        slippage=Decimal("0"),
+    )
+    trade = dispatcher.place_order(_order_open(
+        "000001.SZ", TradeType.SELL, 1000, "10",
+        bar_time=datetime(2023, 8, 25, 15, 0)))
+    assert trade.stamp_duty == Decimal("10.00")
+
+
+def test_dispatcher_slippage_fill_price_clamped_to_limit_bounds():
+    """开盘贴涨停：open 10.95 合法，含 1% 滑点后 11.0595 越板 → 夹到涨停价 11。"""
+    dispatcher = SimulatedDispatcher(
+        open_prices={"000001.SZ": Decimal("10.95")},
+        min_commission=Decimal("0"),
+        buy_commission_rate=Decimal("0"),
+        sell_commission_rate=Decimal("0"),
+        transfer_fee_rate=Decimal("0"),
+        slippage=Decimal("0.01"),
+        price_limits={"000001.SZ": (Decimal("9"), Decimal("11"))},
+    )
+    trade = dispatcher.place_order(
+        _order_open("000001.SZ", TradeType.BUY, 100, "10.95"))
+    assert trade.price == Decimal("11")
+
+
+def test_dispatcher_sell_slippage_fill_price_clamped_to_limit_down():
+    """开盘贴跌停：sell 9.05 含 1% 滑点后 8.9595 越板 → 夹到跌停价 9。"""
+    dispatcher = SimulatedDispatcher(
+        open_prices={"000001.SZ": Decimal("9.05")},
+        min_commission=Decimal("0"),
+        buy_commission_rate=Decimal("0"),
+        sell_commission_rate=Decimal("0"),
+        transfer_fee_rate=Decimal("0"),
+        slippage=Decimal("0.01"),
+        price_limits={"000001.SZ": (Decimal("9"), Decimal("11"))},
+    )
+    trade = dispatcher.place_order(
+        _order_open("000001.SZ", TradeType.SELL, 100, "9.05"))
+    assert trade.price == Decimal("9")

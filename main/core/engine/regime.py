@@ -234,20 +234,45 @@ class CausalRegimeTracker:
         return self._label
 
 
-def segment_regime(prices) -> dict:
+def segment_regime(prices, trim_start: Optional[date] = None,
+                   trim_end: Optional[date] = None) -> dict:
     """对基准收盘价序列做周频四态分段。
 
     :param prices: 基准收盘价。dict[date, number] / pandas Series /
         [(date, number), ...]，日频或周频均可（内部按 ISO 周聚合）。
-    :returns: ``{"weeks": [...], "segments": [...], "counts": {...}}``
+    :param trim_start: 可选。标签照常在全序列上因果计算，输出仅保留 ≥ 该日的周。
+    :param trim_end: 可选。输出仅保留 ≤ 该日的周。
+    :returns: ``{"weeks": [...], "segments": [...], "counts": {...},
+        "warmup_weeks": n}``
         - weeks: 每周 ``{"date"(周五), "close", "label"}``
         - segments: 连续同标签段 ``{"label", "start_date", "end_date",
           "start_close", "end_close", "change_pct", "weeks"}``，按时间排序
         - counts: 四态周数统计
+        - warmup_weeks: 因早于 trim_start 而被裁掉的周数（预热周）
+
+    预热口径（2026-11-16 P1）：``MA_SLOW_WEEKS=30``，前 30 周恒 ``range``。
+    调用方须从回测起点**之前多取约 40 周**收盘价仅用于预热，标签产出后按
+    ``[trim_start, trim_end]`` 裁剪；否则回测前 30 周的市场状态恒为 range，
+    B5 趋势闸/状态归因会在半年内失效。裁剪不影响因果性（标签只依赖 ≤当周）。
     """
-    weekly = _to_weekly(_normalize_prices(prices))
+    weekly_all = _to_weekly(_normalize_prices(prices))
     # 标签规则与 CausalRegimeTracker 共用 _WeekLabeler（单一实现）。
-    labels: List[str] = _label_weeks(weekly)
+    labels_all: List[str] = _label_weeks(weekly_all)
+
+    warmup_weeks = 0
+    if trim_start is not None or trim_end is not None:
+        keep_idx: List[int] = []
+        for i, (d, _v) in enumerate(weekly_all):
+            if trim_start is not None and d < trim_start:
+                warmup_weeks += 1
+                continue
+            if trim_end is not None and d > trim_end:
+                continue
+            keep_idx.append(i)
+        weekly = [weekly_all[i] for i in keep_idx]
+        labels = [labels_all[i] for i in keep_idx]
+    else:
+        weekly, labels = weekly_all, labels_all
 
     weeks = [{
         "date": d,
@@ -281,4 +306,5 @@ def segment_regime(prices) -> dict:
     for label in labels:
         counts[label] += 1
 
-    return {"weeks": weeks, "segments": segments, "counts": counts}
+    return {"weeks": weeks, "segments": segments, "counts": counts,
+            "warmup_weeks": warmup_weeks}

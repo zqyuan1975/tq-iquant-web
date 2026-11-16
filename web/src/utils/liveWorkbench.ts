@@ -596,7 +596,8 @@ export function parseStartConflict(err: unknown): StartConflict {
   const data = body && typeof body === 'object' ? (body.data ?? {}) : {}
   const rule = typeof data?.rule === 'string' ? data.rule : ''
   const backendMsg = body && typeof body.message === 'string' ? body.message.trim() : ''
-  if (backendMsg) return { rule, message: backendMsg }
+  // 参数漂移需按字段中文名重排（后端 message 只列英文 key），故跳过直取
+  if (backendMsg && rule !== 'params_drift') return { rule, message: backendMsg }
   const occ = data?.occupied_by ?? null
   const who = occ ? `会话 ${occ.session_id}「${occ.name}」` : '另一会话'
   const engineText = ENGINE_TEXT[occ?.engine] || occ?.engine || '该'
@@ -618,6 +619,19 @@ export function parseStartConflict(err: unknown): StartConflict {
         rule,
         message: `键鼠冲突：${who}与当前会话同为键鼠 UI 通道，不建议同时启动`,
       }
+    case 'params_drift': {
+      // tq_trade.params_drift_block=true：组合参数与回测快照不一致 → 409 阻断启动
+      const recId = data?.backtest_record_id ?? '—'
+      const fields = Array.isArray(data?.fields)
+        ? data.fields.map((f: any) => paramFieldLabel(String(f?.field ?? ''))).filter(Boolean)
+        : []
+      return {
+        rule,
+        message: `参数漂移阻断：当前组合参数与回测快照 #${recId} 不一致`
+          + (fields.length > 0 ? `（${fields.join('、')}）` : '')
+          + '，请先对齐参数后重试（tq_trade.params_drift_block=true）',
+      }
+    }
     default:
       return { rule, message: e?.message?.trim() || '启动失败' }
   }
@@ -654,3 +668,74 @@ export function formatMoney2(v: number | null | undefined): string {
   if (v === null || v === undefined || !Number.isFinite(Number(v))) return '—'
   return Number(v).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })
 }
+
+// ===== 参数漂移（H2 / A7）=====
+// 后端 compute_params_drift 比对的是 PARAMS_SNAPSHOT_FIELDS（回测快照冻结的组合参数），
+// 下面标签与之 1:1 对齐；出现未知字段时回退英文 key（不静默丢弃）。
+export const PARAM_FIELD_LABEL: Record<string, string> = {
+  benchmark_index: '基准指数',
+  initial_capital: '初始资金',
+  max_drawdown: '最大回撤',
+  daily_loss_limit: '日亏损限',
+  max_holdings: '最大持仓数',
+  min_commission: '最低佣金',
+  buy_commission_rate: '买佣金率',
+  sell_commission_rate: '卖佣金率',
+  stamp_duty_rate: '印花税率',
+  transfer_fee_rate: '过户费率',
+  slippage: '滑点',
+  trading_session: '交易时段',
+  stock_pool_id: '股票池',
+  position_sizing: '仓位模型',
+  price_limit_check_enabled: '涨跌停校验',
+  volume_limit_enabled: '成交量约束',
+  volume_limit_ratio: '成交量占比上限',
+  adaptive_slippage_enabled: '自适应滑点',
+  slippage_impact_coef: '滑点冲击系数',
+  cash_enhance_enabled: '现金管理增强',
+  cash_enhance_equity_threshold: '净资产阈值',
+  cash_enhance_position_ratio_threshold: '仓位占比阈值',
+  equity_cap: '容量上限',
+  risk_cooldown_days: '风控冷静期',
+}
+
+const PARAM_RATIO_FIELDS = new Set([
+  'max_drawdown', 'daily_loss_limit',
+  'buy_commission_rate', 'sell_commission_rate', 'stamp_duty_rate',
+  'transfer_fee_rate', 'slippage', 'volume_limit_ratio', 'slippage_impact_coef',
+  'cash_enhance_position_ratio_threshold',
+])
+
+export function paramFieldLabel(field: string): string {
+  return PARAM_FIELD_LABEL[field] || field
+}
+
+/** 快照值/当前值展示：比例字段转百分比，其余原样（空值显示「空」）。 */
+export function formatParamValue(field: string, raw: unknown): string {
+  if (raw === null || raw === undefined || raw === '') return '空'
+  const n = Number(raw)
+  if (PARAM_RATIO_FIELDS.has(field) && Number.isFinite(n)) {
+    return `${Number((n * 100).toFixed(4))}%`
+  }
+  return String(raw)
+}
+
+export interface ParamsDriftLike {
+  drifted: boolean
+  checked: boolean
+  block_enabled?: boolean
+  fields?: { field: string; snapshot: string | null; current: string | null }[]
+  reason?: string | null
+}
+
+/**
+ * 漂移差异行：「最大回撤：20% → 25%」。drifted=false 或未检查时返回空数组。
+ */
+export function paramsDriftLines(d: ParamsDriftLike | null | undefined): string[] {
+  if (!d || !d.drifted || !Array.isArray(d.fields)) return []
+  return d.fields.map((f) => {
+    const label = paramFieldLabel(f.field)
+    return `${label}：${formatParamValue(f.field, f.snapshot)} → ${formatParamValue(f.field, f.current)}`
+  })
+}
+

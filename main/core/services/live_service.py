@@ -38,7 +38,7 @@ from core.models import (
     LiveSession, LiveSessionPortfolio, PortfolioStrategy, Strategy,
     StockPoolStock, Formula, FormulaSignal, LiveOrder, LiveTrade, LiveDecisionEvent,
     LiveSignal, LiveAccountSnapshot, LiveCashFlow, LiveBaselineReset,
-    IncrementalBacktestCheckpoint,
+    IncrementalBacktestCheckpoint, BacktestRecord,
 )
 from core.engine.portfolio_builder import assemble_portfolio
 try:
@@ -1389,6 +1389,14 @@ def create_session(db: Session, data: dict, mode: str) -> dict:
         baseline_mode = "total_asset"
     if baseline_mode not in ("total_asset", "manual"):
         baseline_mode = "manual" if baseline_value is not None else "total_asset"
+    # H2 参数绑定（A7）：绑定某条回测记录后，启动时比对 params_snapshot 与实际参数。
+    # 软引用（不设 FK）：回测记录被删不影响会话；非法值静默忽略（API 层已校验存在性）。
+    backtest_record_id = data.get("backtest_record_id")
+    if backtest_record_id is not None:
+        try:
+            backtest_record_id = int(backtest_record_id)
+        except (TypeError, ValueError):
+            backtest_record_id = None
     session = LiveSession(
         name=data["name"], mode=mode, status="stopped",
         engine=data.get("engine") or default_engine(),
@@ -1407,6 +1415,7 @@ def create_session(db: Session, data: dict, mode: str) -> dict:
         # 错周期 bar 风控（三态）：NULL=跟随全局默认，0/1=会话覆盖
         intraday_mismatched_risk_enabled=normalize_mismatched_risk(
             data.get("intraday_mismatched_risk_enabled")),
+        backtest_record_id=backtest_record_id,
     )
     db.add(session)
     db.flush()
@@ -1414,9 +1423,13 @@ def create_session(db: Session, data: dict, mode: str) -> dict:
         link = LiveSessionPortfolio(session_id=session.id, portfolio_strategy_id=pid)
         db.add(link)
     db.commit()
+    # A1 软校验（不阻断）：目标引擎已被其它 running/stopping 会话占用时提示
+    # 「启动前需先停止」，避免用户建完才发现启动 409。
     return {"id": session.id, "status": session.status,
             "engine": session_engine(session),
-            "execution_mode": session.execution_mode}
+            "execution_mode": session.execution_mode,
+            "backtest_record_id": backtest_record_id,
+            "warnings": _engine_occupancy_warnings(db, session)}
 
 
 def get_session(db: Session, session_id: int, engine: Optional[LiveEngine] = None) -> Optional[dict]:
@@ -1446,6 +1459,9 @@ def get_session(db: Session, session_id: int, engine: Optional[LiveEngine] = Non
         "baseline_set_at": getattr(session, "baseline_set_at", None),
         "adopt_inherited_positions": bool(
             getattr(session, "adopt_inherited_positions", True)),
+        # H2 参数绑定（A7）：绑定的回测记录 + 当前参数与快照差异（None=未绑定）
+        "backtest_record_id": getattr(session, "backtest_record_id", None),
+        "params_drift": compute_params_drift(db, session),
         # 外部信号注入（0011）：None=不启用
         "signal_file_path": session.signal_file_path,
         # 14:50 提前收盘价（仅 1d）
@@ -1783,6 +1799,10 @@ KEYBOARD_ENGINES = ("tdx", "ths")
 #: stop() 收敛后才置 stopped；超过该时长仍未收敛视为僵尸，允许抢占。
 STOPPING_STALE_SECONDS = 120
 
+#: 平台同时运行中的实盘会话硬上限（显式常量，不再用「四引擎各一」的隐式推论）。
+#: 超过即 409 rule=session_limit；停止一个即可再启。
+MAX_ACTIVE_LIVE_SESSIONS = 4
+
 
 def _occupied_since(session) -> Optional[datetime]:
     return getattr(session, "started_at", None) or getattr(session, "updated_at", None)
@@ -1851,6 +1871,56 @@ def _occupied_payload(session) -> dict:
         "status": getattr(session, "status", None),
         "since": since.isoformat() if since is not None else None,
     }
+
+
+def _record_decision_event(
+    db: Session,
+    session_id: int,
+    *,
+    gate: str,
+    layer: str,
+    action: str,
+    param_name: Optional[str] = None,
+    actual_value: Optional[float] = None,
+    message: Optional[str] = None,
+) -> None:
+    """轻量决策事件落库（A2 键鼠 ack / A7 参数漂移）：失败只告警，绝不影响主流程。
+
+    不单独 commit——随调用方（路由）的 commit 一并持久化；调用方回滚则该事件
+    也不落库，符合「启动失败时无需留痕」的口径。
+    """
+    try:
+        db.add(LiveDecisionEvent(
+            live_session_id=session_id,
+            gate=gate,
+            layer=layer,
+            action=action,
+            param_name=param_name,
+            actual_value=actual_value,
+            message=(message or "")[:200] or None,
+        ))
+    except Exception:  # noqa: BLE001 — 观测失败不得阻断启动
+        logger.warning("写入决策事件失败（gate=%s）", gate, exc_info=True)
+
+
+def _engine_occupancy_warnings(db: Session, session) -> list:
+    """A1 建会话软校验（不阻断）：目标引擎已被其它 running/stopping 会话占用。
+
+    仅在创建响应里提示「启动前需先停止该会话」，真正的硬拦仍在 start_session
+    （C1 引擎独占）。任何异常都降级为空列表——创建会话不得因提示失败而失败。
+    """
+    try:
+        eng = session_engine(session)
+        for other in _occupied_sessions(db, ENGINES, session.id).values():
+            if session_engine(other) == eng:
+                return [
+                    "该引擎（%s）当前被会话 %d「%s」占用，启动前需先停止该会话"
+                    % (eng, other.id, other.name)
+                ]
+    except Exception:  # noqa: BLE001
+        logger.warning("会话占用软校验失败（session %s）", getattr(session, "id", None),
+                       exc_info=True)
+    return []
 
 
 def _check_channel_conflict(
@@ -1961,12 +2031,14 @@ def _check_keyboard_conflict(
     engines: Dict[int, LiveEngine],
     ack_keyboard_risk: bool,
 ) -> Optional[Tuple[int, str, dict]]:
-    """C3 键鼠类互斥（tdx / ths）：默认软拦（告警+二次确认），可配置升级硬拦。
+    """C3 键鼠类互斥（tdx / ths）：默认软拦（409 要求显式 ack），可配置升级硬拦。
 
     两者都是键鼠 UI 自动化，同时启动有误点风险，但底层已有
     ``win_dialog_scope`` 的 UI 自动化互斥锁防「同时操作」；真正残留的是
-    「人看错窗口点错」。默认不阻断，仅要求前端二次确认（ack_keyboard_risk）；
-    ``tq_trade.keyboard_conflict_hard_block=true`` 时升级为 409 硬拦。
+    「人看错窗口点错」。软拦语义（2026-11-16 起 ack 真正改变结果）：
+    未带 ``ack_keyboard_risk`` → 409 要求确认；带 ack → 放行并留 WARNING +
+    决策事件。``tq_trade.keyboard_conflict_hard_block=true`` 时升级为无条件 409
+    （ack 也不放行）。
     """
     eng = session_engine(session)
     if eng not in KEYBOARD_ENGINES:
@@ -1988,6 +2060,7 @@ def _check_keyboard_conflict(
         "peer_engine": session_engine(peer),
         "occupied_by": _occupied_payload(peer),
         "hard_block": hard_block,
+        "requires_ack": not hard_block,
     }
     message = (
         "键鼠类通道互斥提醒：会话 %d「%s」（%s）正在运行，同时启动 %s 有误点风险，"
@@ -1997,10 +2070,18 @@ def _check_keyboard_conflict(
     if hard_block:
         return 409, message, payload
     if ack_keyboard_risk:
-        logger.warning("键鼠互斥已确认放行：%s", message)
+        logger.warning("键鼠互斥已确认放行（ack_keyboard_risk）：%s", message)
+        _record_decision_event(
+            db, session.id,
+            gate="keyboard_exclusive", layer="live_gate", action="ack",
+            param_name="peer_session", actual_value=float(peer.id), message=message,
+        )
         return None
-    logger.warning("%s（未确认，软拦放行）", message)
-    return None
+    return (
+        409,
+        message + "。如确认风险，请携带 ack_keyboard_risk=true 重试",
+        payload,
+    )
 
 
 def recommended_channel_warnings(
@@ -2022,6 +2103,104 @@ def recommended_channel_warnings(
         "避免在同一个终端窗口误操作到其它账户。"
         % (len(accounts), "、".join(sorted(accounts)))
     ]
+
+
+def params_drift_block_enabled() -> bool:
+    """A7 参数漂移阻断开关（默认 false）：仅显式配置才把告警升级为 409。"""
+    tq = load_config().get("tq_trade") or {}
+    return bool(tq.get("params_drift_block", False)) if isinstance(tq, dict) else False
+
+
+#: 回测 run 级覆盖字段（只影响那一次回测的成交/费用模拟，不落组合表）：
+#: 与组合配置天然不相等，比对它们会制造假漂移，必须跳过。
+_RUN_LEVEL_SNAPSHOT_FIELDS = frozenset({
+    "fee_reserve_enabled", "bond_t0_enabled", "bond_lot_enabled",
+    "daily_close_peak_enabled", "daily_loss_basis", "dividend_mode",
+    "data_start_date", "adaptive_slippage_enabled", "slippage_impact_coef",
+    "volume_limit_enabled", "volume_limit_ratio", "equity_cap",
+})
+
+
+def _norm_param(value) -> Optional[str]:
+    """参数归一：数值统一 Decimal 归一后比较（'5' 与 '5.0' 等价），其余按 str。
+
+    回测快照里数值以 str(repr/Decimal) 形式落库，当前值是 Decimal/float/int；
+    直接字符串比较会出现 '5.0' != '5' 的假漂移，故先做数值归一。
+    """
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    try:
+        return str(Decimal(text).normalize())
+    except (ArithmeticError, TypeError, ValueError):
+        return text
+
+
+def compute_params_drift(db: Session, session) -> Optional[dict]:
+    """A7 参数绑定：比对绑定回测记录的 params_snapshot 与当前组合参数。
+
+    返回 None = 会话未绑定回测记录；否则返回
+    ``{backtest_record_id, portfolio_strategy_id?, checked, drifted, fields,
+    block_enabled, reason}``。
+
+    只比对快照中**存在**的 portfolio 级字段（``PARAMS_SNAPSHOT_FIELDS``），
+    数值归一后比较；资金基准重置只改运行时现金/基准，不改组合配置，因此不会
+    造成假漂移。**run 级覆盖字段**（回测时临时覆盖、不落组合表，如
+    ``adaptive_slippage_enabled`` / ``volume_limit_ratio`` / ``equity_cap`` /
+    ``dividend_mode``）一律跳过——它们与组合配置天然不等，比了就是假漂移。
+    任何读取异常一律降级为 checked=False（绝不阻断启动）。
+    """
+    rec_id = getattr(session, "backtest_record_id", None)
+    if not rec_id:
+        return None
+    block_enabled = params_drift_block_enabled()
+    base = {"backtest_record_id": int(rec_id), "block_enabled": block_enabled}
+    try:
+        rec = db.query(BacktestRecord).filter(BacktestRecord.id == rec_id).first()
+        if rec is None:
+            return dict(base, checked=False, drifted=False, fields=[],
+                        reason="绑定的回测记录不存在")
+        snapshot_raw = getattr(rec, "params_snapshot", None)
+        if not snapshot_raw:
+            return dict(base, checked=False, drifted=False, fields=[],
+                        reason="回测记录缺少参数快照")
+        snapshot = (json.loads(snapshot_raw) if isinstance(snapshot_raw, str)
+                    else snapshot_raw)
+        if not isinstance(snapshot, dict):
+            return dict(base, checked=False, drifted=False, fields=[],
+                        reason="参数快照格式异常")
+        ps = db.query(PortfolioStrategy).filter_by(
+            id=rec.portfolio_strategy_id).first()
+        if ps is None:
+            return dict(base, checked=False, drifted=False, fields=[],
+                        reason="回测记录关联的组合策略不存在")
+        try:
+            from core.services.backtest_service import PARAMS_SNAPSHOT_FIELDS
+        except Exception:  # noqa: BLE001 — 常量缺失时退化为「无可比对字段」
+            PARAMS_SNAPSHOT_FIELDS = ()
+        fields = []
+        for name in PARAMS_SNAPSHOT_FIELDS:
+            if name not in snapshot or name in _RUN_LEVEL_SNAPSHOT_FIELDS:
+                continue
+            if not hasattr(ps, name):
+                continue
+            old_raw = snapshot.get(name)
+            new_raw = getattr(ps, name, None)
+            if _norm_param(old_raw) != _norm_param(new_raw):
+                fields.append({
+                    "field": name,
+                    "snapshot": None if old_raw is None else str(old_raw),
+                    "current": None if new_raw is None else str(new_raw),
+                })
+        return dict(base, portfolio_strategy_id=rec.portfolio_strategy_id,
+                    checked=True, drifted=bool(fields), fields=fields, reason="")
+    except Exception:  # noqa: BLE001 — 比对失败只降级为未检查
+        logger.warning("参数漂移比对失败（session %s）",
+                       getattr(session, "id", None), exc_info=True)
+        return dict(base, checked=False, drifted=False, fields=[],
+                    reason="参数漂移比对失败")
 
 
 def start_session(
@@ -2053,6 +2232,43 @@ def start_session(
     if session_id in engines:
         # 幂等：已在跑，直接返回（无 engine 新建，路由据此返回 ok running）
         return None, session, None
+    # A1 运行中会话总量硬上限（显式常量，不用「四引擎各一」隐式推论）：
+    # 本会话之外已有 MAX_ACTIVE_LIVE_SESSIONS 个占用 → 409。
+    occupied = _occupied_sessions(db, engines, session_id)
+    if len(occupied) >= MAX_ACTIVE_LIVE_SESSIONS:
+        return None, session, (
+            409,
+            "同时运行的实盘会话已达上限 %d 个：请先停止不再需要的会话"
+            % MAX_ACTIVE_LIVE_SESSIONS,
+            {
+                "rule": "session_limit",
+                "limit": MAX_ACTIVE_LIVE_SESSIONS,
+                "occupied_by": [_occupied_payload(o) for o in occupied.values()],
+            },
+        )
+    # A7 参数绑定：与回测参数快照比对。默认只告警（WARNING + 决策事件），
+    # 绝不阻断启动；tq_trade.params_drift_block=true 才升级为 409。
+    drift = compute_params_drift(db, session)
+    if drift and drift.get("drifted"):
+        drift_msg = "参数漂移：当前组合参数与回测快照 #%d 不一致（%s）" % (
+            drift["backtest_record_id"],
+            "、".join(f["field"] for f in drift["fields"]) or "-",
+        )
+        logger.warning("会话 %s %s（%s）", session_id, drift_msg,
+                       "阻断" if drift.get("block_enabled") else "仅告警")
+        _record_decision_event(
+            db, session_id, gate="params_drift", layer="live_gate",
+            action="block" if drift.get("block_enabled") else "notify",
+            message=drift_msg,
+        )
+        if drift.get("block_enabled"):
+            return None, session, (
+                409,
+                drift_msg + "；参数漂移阻断已开启（tq_trade.params_drift_block=true），"
+                "请先对齐参数后重试",
+                {"rule": "params_drift", "fields": drift["fields"],
+                 "backtest_record_id": drift["backtest_record_id"]},
+            )
     # B6 资源互斥（M1 多会话并行）：THS 通道键鼠独占，其余通道（tdx/iquant）
     # 可并行；组合重叠允许（复制交易语义，各会话独立虚拟账本）。
     conflict = _check_channel_conflict(db, session, engines)
@@ -2153,8 +2369,8 @@ def start_session(
     account_conflict = _check_account_conflict(db, session, engines, own_key)
     if account_conflict is not None:
         return None, session, account_conflict
-    # C3 键鼠类互斥（tdx/ths）：默认软拦（未确认也放行，仅告警）；ack_keyboard_risk
-    # 表示前端已二次确认；config 可升级为硬拦（409）。
+    # C3 键鼠类互斥（tdx/ths）：默认软拦——未带 ack 返回 409 要求确认，带
+    # ack_keyboard_risk 放行并留痕；config 可升级为硬拦（409，ack 也拒）。
     keyboard_conflict = _check_keyboard_conflict(
         db, session, engines, ack_keyboard_risk)
     if keyboard_conflict is not None:
@@ -2235,17 +2451,47 @@ def finalize_stopped(session_id: int, db_session_factory=SessionLocal) -> None:
         db.close()
 
 
-def _baseline_reset_window_allowed(now: datetime) -> bool:
-    """资金基准重置时段闸：盘中（含集合竞价与午盘）禁用，收盘后/盘前允许。
+_BASELINE_RESET_CALENDAR = None
 
-    09:15–11:30、13:00–15:00 为不可重置窗口（含集合竞价 09:15–09:25 与连续竞价），
-    其余时段（含收盘后）允许。非交易日按时间窗判定即可，无副作用。
+
+def _baseline_reset_calendar():
+    """重置窗口用的交易日历（懒加载单例）：主源掘金桥 /calendar，失败回退内置休市表。
+
+    只在手工重置基准时调用（低频），不参与主循环；`is_trading_day` 内部按年缓存，
+    桥离线时退化到 `BUILTIN_CLOSURES`，未知年份工作日 fail-open。
     """
+    global _BASELINE_RESET_CALENDAR
+    if _BASELINE_RESET_CALENDAR is None:
+        from core.engine.live.calendar import (
+            TradingCalendar, goldminer_calendar_provider,
+        )
+        _BASELINE_RESET_CALENDAR = TradingCalendar(goldminer_calendar_provider)
+    return _BASELINE_RESET_CALENDAR
+
+
+def _baseline_reset_window_allowed(
+    now: datetime, calendar=None,
+) -> Tuple[bool, str]:
+    """资金基准重置时段闸：先判交易日，再判盘中；返回 (是否允许, 拒绝原因)。
+
+    2026-11-16 起加交易日判据：非交易日直接拒绝（此前只说「盘中禁止」，周末/节假日
+    会给出误导文案）。交易日仍禁用 09:15–11:30、13:00–15:00（含集合竞价与午盘），
+    收盘后/盘前允许。日历不可用（桥离线且年份未收录）时告警并退化为只看时间窗——
+    绝不因日历问题把真实交易日误挡。
+    """
+    cal = calendar if calendar is not None else _baseline_reset_calendar()
+    try:
+        if not cal.is_trading_day(now.date()):
+            return False, "今天不是交易日：资金基准重置仅在交易日收盘后执行"
+    except Exception:  # noqa: BLE001 — 日历不可用：告警后按时间窗判定
+        logger.warning("重置窗口交易日判定失败（按时间窗继续）", exc_info=True)
     minutes = now.hour * 60 + now.minute
-    return not (
+    if (
         (9 * 60 + 15 <= minutes < 11 * 60 + 30)
         or (13 * 60 <= minutes < 15 * 60)
-    )
+    ):
+        return False, "盘中禁止重置资金基准：请收盘后（15:00 之后）再操作"
+    return True, ""
 
 
 def reset_baseline(
@@ -2274,8 +2520,9 @@ def reset_baseline(
     if session is None:
         return False, (404, "资源不存在")
     now = now_shanghai()
-    if not _baseline_reset_window_allowed(now):
-        return False, (403, "盘中禁止重置资金基准：请收盘后（15:00 之后）再操作")
+    allowed, reason = _baseline_reset_window_allowed(now)
+    if not allowed:
+        return False, (403, reason)
     link = (
         db.query(LiveSessionPortfolio)
         .filter(
@@ -2435,18 +2682,34 @@ def reset_baseline(
 def account_preview_by_engine(
     db: Session,
     engine_key: str,
+    mode: Optional[str] = None,
 ) -> Tuple[Optional[dict], Optional[Tuple]]:
-    """A7 资金基准预览（GET /api/live/account-preview?engine=）。
+    """A7 资金基准预览（GET /api/live/account-preview?engine=&mode=）。
 
     优先实时探测所选通道的账户资产（桥 /account、通达信 query_stock_asset、
     同花顺资金标签）；探测失败回退该引擎最近一次账户快照。返回
-    ``{engine,total_asset,available,captured_at,source}``，只读、不下单、不改账。
+    ``{engine,mode,total_asset,available,captured_at,source}``，只读、不下单、不改账。
+
+    2026-11-16 修（A6）：mode 不再固定 ``simulation``。显式传入优先；未传时取该
+    引擎最近一条会话的实际 mode（兼容 NULL/历史会话的 `session_engine` 解析）——
+    live/simulation 指向不同桥地址时，预览才不会取到错账户。
     """
     if engine_key not in ENGINES_META:
         return None, (400, "engine 非法，仅支持 %s" % " / ".join(ENGINES_META))
+    effective_mode = mode if mode in ("simulation", "live") else None
+    sessions = (
+        db.query(LiveSession).order_by(LiveSession.id.desc()).all()
+    )
+    if effective_mode is None:
+        for s in sessions:
+            if session_engine(s) == engine_key:
+                effective_mode = getattr(s, "mode", None) or "simulation"
+                break
+        else:
+            effective_mode = "simulation"
     probe_error = ""
     try:
-        dispatcher = make_dispatcher(engine_key, "simulation", 0)
+        dispatcher = make_dispatcher(engine_key, effective_mode, 0)
         if engine_key == "ths":
             rows = dispatcher.get_account()
             row = rows[0] if isinstance(rows, list) and rows else {}
@@ -2457,6 +2720,7 @@ def account_preview_by_engine(
             available = row.get("available")
             return {
                 "engine": engine_key,
+                "mode": effective_mode,
                 "total_asset": float(total),
                 "available": float(available) if available is not None else None,
                 "captured_at": now_shanghai().isoformat(),
@@ -2467,13 +2731,9 @@ def account_preview_by_engine(
         probe_error = str(exc) or exc.__class__.__name__
 
     # 回退：该引擎最近一次会话的账户快照（事后查看/盘后预览）。
-    sessions = (
-        db.query(LiveSession)
-        .filter(LiveSession.engine == engine_key)
-        .order_by(LiveSession.id.desc())
-        .all()
-    )
     for session in sessions:
+        if session_engine(session) != engine_key:
+            continue
         snap = (
             db.query(LiveAccountSnapshot)
             .filter(LiveAccountSnapshot.live_session_id == session.id)
@@ -2484,6 +2744,7 @@ def account_preview_by_engine(
             continue
         return {
             "engine": engine_key,
+            "mode": effective_mode,
             "total_asset": (
                 float(snap.total_asset) if snap.total_asset is not None else None),
             "available": (

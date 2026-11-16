@@ -2133,3 +2133,112 @@ def test_risk_sell_full_fill_unchanged_without_residual_event():
     assert not [d for d in result["decisions"] if d.get("gate") == "risk_sell_residual"]
     assert result["risk_sell_trigger_count"] == 1
     assert result["risk_sell_fill_attempts"] == 1
+
+
+# ===========================================================================
+# 2026-11-16 核查修复（P1）：涨跌停前收按「(代码, 交易日)」、在途单最大存活期
+# ===========================================================================
+def test_build_prev_close_by_day_is_previous_trading_day_last_close():
+    """前收 = 上一交易日**最后一根 bar（任意周期）**收盘，同一天内恒定。
+
+    修复前键为 (code, period) 且每根 bar 覆写：5m 策略当日第二根起前收变成上一根
+    5m 收盘，涨停价≈1.1×5 分钟前收盘（封板买/跌停卖都能成交）。
+    """
+    from core.engine.backtest_engine import build_prev_close_by_day
+    code = "000001.SZ"
+    d1, d2 = date(2026, 7, 29), date(2026, 7, 30)
+    five_min = pl.DataFrame({
+        "datetime": [
+            datetime(2026, 7, 29, 14, 55), datetime(2026, 7, 29, 15, 0),
+            datetime(2026, 7, 30, 9, 35), datetime(2026, 7, 30, 10, 0),
+        ],
+        "Open": [Decimal("10"), Decimal("10.2"), Decimal("10.5"), Decimal("10.6")],
+        "High": [Decimal("10.3"), Decimal("10.6"), Decimal("10.8"), Decimal("10.9")],
+        "Low": [Decimal("9.9"), Decimal("10.1"), Decimal("10.4"), Decimal("10.5")],
+        "Close": [Decimal("10.2"), Decimal("10.5"), Decimal("10.6"), Decimal("10.7")],
+        "Volume": [100, 200, 300, 400],
+    })
+    table = build_prev_close_by_day({code: {"5m": five_min}})
+    # 7/29 是首日 → 无前收；7/30 的前收取 7/29 收盘（15:00 = 10.5），不是 10.2/10.6
+    assert (code, d1) not in table
+    assert table[(code, d2)] == Decimal("10.5")
+
+
+def test_build_prev_close_by_day_mixed_period_prefers_latest_timestamp():
+    """同日有日线与分钟线时，取最晚时间戳的收盘（分钟线 15:00 覆盖日线 00:00）。"""
+    from core.engine.backtest_engine import build_prev_close_by_day
+    code = "600000.SH"
+    klines = {code: {
+        "1d": pl.DataFrame({
+            "datetime": [datetime(2026, 7, 29), datetime(2026, 7, 30)],
+            "Close": [Decimal("10.1"), Decimal("10.3")],
+        }),
+        "5m": pl.DataFrame({
+            "datetime": [datetime(2026, 7, 29, 15, 0),
+                         datetime(2026, 7, 30, 9, 35)],
+            "Close": [Decimal("10.9"), Decimal("11.0")],
+        }),
+    }}
+    table = build_prev_close_by_day(klines)
+    # 7/30 的前收取 7/29 最晚时间戳（5m 15:00 的 10.9），不是日线的 10.1
+    assert table[(code, date(2026, 7, 30))] == Decimal("10.9")
+
+
+def _weekday_dates(start: date, n: int):
+    out = []
+    cur = start
+    while len(out) < n:
+        if cur.weekday() < 5:
+            out.append(cur)
+        cur += timedelta(days=1)
+    return out
+
+
+def test_pending_order_expires_after_max_trading_days():
+    """停牌导致在途买单一再顺延 → 超过 20 个交易日后作废，不再按复牌价成交。
+
+    修复前 deferred 单无限期留在队列，几个月后复牌仍按当日 open 成交（等于凭空
+    补做一笔早已过期的决策）。B 全程无行情，A 提供 25 个交易日 bar 推进时间。
+    """
+    days = _weekday_dates(date(2026, 7, 1), 25)
+    rows_a = [
+        (datetime(d.year, d.month, d.day), Decimal("10"), Decimal("10.2"),
+         Decimal("9.8"), Decimal("10"), 1000)
+        for d in days
+    ]
+    rows_b = [(datetime(2026, 7, 1), Decimal("5"), Decimal("5.1"),
+               Decimal("4.9"), Decimal("5"), 1000)]
+    klines = _two_stock_klines(rows_a, rows_b)
+    port, ctx = _portfolio_with_strategy()
+    port.price_limit_check_enabled = False
+    cache = {(1, "600001.SH", datetime(2026, 7, 1)): [{"name": "open_sig", "value": 1}]}
+
+    result = BacktestEngine().run(port, klines=klines, signal_cache=cache)
+
+    assert not result["trades"], "停牌全程不应有成交"
+    expired = [d for d in result["decisions"] if d["gate"] == "pending_order_expired"]
+    assert len(expired) == 1
+    assert expired[0]["action"] == "cancel"
+    # 第 21 个交易日（下标 20）触发作废
+    assert expired[0]["bar_time"].date() == days[20]
+
+
+def test_pending_order_max_days_zero_disables_expiry():
+    """pending_order_max_days<=0 = 保留旧行为（无限顺延），供回归对比。"""
+    days = _weekday_dates(date(2026, 7, 1), 25)
+    rows_a = [
+        (datetime(d.year, d.month, d.day), Decimal("10"), Decimal("10.2"),
+         Decimal("9.8"), Decimal("10"), 1000)
+        for d in days
+    ]
+    rows_b = [(datetime(2026, 7, 1), Decimal("5"), Decimal("5.1"),
+               Decimal("4.9"), Decimal("5"), 1000)]
+    klines = _two_stock_klines(rows_a, rows_b)
+    port, ctx = _portfolio_with_strategy()
+    port.price_limit_check_enabled = False
+    cache = {(1, "600001.SH", datetime(2026, 7, 1)): [{"name": "open_sig", "value": 1}]}
+
+    result = BacktestEngine().run(
+        port, klines=klines, signal_cache=cache, pending_order_max_days=0)
+
+    assert not [d for d in result["decisions"] if d["gate"] == "pending_order_expired"]

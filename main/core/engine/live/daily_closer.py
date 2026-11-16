@@ -35,12 +35,12 @@ from __future__ import annotations
 
 import logging
 from datetime import date, datetime, time, timedelta
-from typing import Callable, Dict, Optional
+from typing import Callable, Dict, Optional, Set
 
 from ..bar_poller import parse_bar_time, to_ohlcv
 from ..event import BarEvent
 from ..http_bridge_dispatcher import BridgeUnavailableError
-from ...models import LiveOrder, LiveSession, LiveTrade
+from ...models import LiveDecisionEvent, LiveOrder, LiveSession, LiveTrade
 from .context import EngineContext
 
 logger = logging.getLogger("core.engine.live.daily_closer")
@@ -123,6 +123,11 @@ class DailyCloser:
         # daily_bars_done_date 跨重启幂等）
         self.last_daily_bar_date = None
         self._daily_bars_done_loaded = False
+        # 本轮已成功驱动的 (交易日, 周期, 组合) 集合（P1，2026-11-16）：整轮未完成
+        # （有组合因桥离线跳过）时不标 done、下轮 60s tick 重试，这里用来跳过已
+        # 驱动成功的组合，避免重试时对同一根 bar 重复驱动（幂等门虽兜底，但会产生
+        # 成串 bar_processed 噪音事件）。
+        self._daily_driven_keys: Set[tuple] = set()
         # P2-11：日线取数非当日 / 取数为空 的 risk 事件节流（每交易日一条）
         self._daily_freshness_noted_date = None
         # 15:05 收盘清扫已执行的日期标记（每日一次，确定性兜底未成交单）
@@ -242,6 +247,29 @@ class DailyCloser:
         except Exception:  # noqa: BLE001 — 事件推送失败不影响轮次重试
             logger.warning("daily_bar_freshness 事件推送失败 (session %s)",
                            self._ctx.session_id, exc_info=True)
+        # P1#3（2026-11-16）：该事件原只推 SSE，刷新页面即消失（注释却写「工作台
+        # 可见」）。补落 live_decision_events；节流沿用上面每交易日一条，不会刷表。
+        db = None
+        try:
+            db = self._ctx.db_session_factory()
+            db.add(LiveDecisionEvent(
+                live_session_id=self._ctx.session_id,
+                gate="daily_bar_freshness",
+                layer="risk",
+                action="skip",
+                bar_time=datetime.combine(today, datetime.min.time()),
+                param_name="daily_bar_not_today",
+                message=message[:200],
+            ))
+            db.commit()
+        except Exception:  # noqa: BLE001
+            if db is not None:
+                db.rollback()
+            logger.warning("daily_bar_freshness 落库失败 (session %s)",
+                           self._ctx.session_id, exc_info=True)
+        finally:
+            if db is not None:
+                db.close()
 
     def maybe_daily_bars(self, now: Optional[datetime] = None) -> None:
         """15:05 日线级别轮次：等周期收盘价落定后，用**完整 bar**驱动 1d/1w/1mon。
@@ -275,6 +303,10 @@ class DailyCloser:
             return
         if self._daily_bars_done(today):
             return
+        # 跨日残留的驱动记录不参与判定（幂等键含交易日，这里只做清理）
+        if self._daily_driven_keys:
+            self._daily_driven_keys = {
+                k for k in self._daily_driven_keys if k[0] == today}
         cal = self._calendar
         periods: list = []
         # 1d：默认每交易日收盘落定后跑；B 开启且当日 14:52 提前轮次**已成功执行**时
@@ -334,7 +366,13 @@ class DailyCloser:
         daily_time = parse_bar_time(next(iter(bars_by_code.values()))[-1])
         if daily_time is None:
             daily_time = datetime.combine(today, datetime.min.time())
-        self._mark_daily_bars_done(today)
+        # P1（2026-11-16）：幂等标记**延后到整轮驱动成功之后**（原实现在驱动前就写
+        # daily_bars_done_date 并 commit）。旧实现下多组合会话一次短暂掉线（驱动循环
+        # 遇 BridgeUnavailableError 直接 return）或进程在第一个组合驱动后崩溃，都会
+        # 留下「已标记完成但剩余组合/周期从未驱动」的状态，当天永久不再重试——剩余
+        # 组合的 1d/1w/1mon 信号与日线风控整体缺失。现在：离线组合跳过继续驱动其余
+        # 组合，只要本轮有组合因桥离线未驱动就不标完成，由既有 60s tick 重试（已驱动
+        # 成功的 (周期, 组合) 记在 _daily_driven_keys 里，重试不重复驱动）。
         # 日切检测：新 daily_time 的 1w/1mon cache miss → 通达信补注入
         # （外部信号文件模式：不补注入，信号只来自预警文件；bar 驱动/风控不变）
         reinjected = False
@@ -347,28 +385,46 @@ class DailyCloser:
         # C4(#28)：跨周期共享去重缓存（key 含 period，1d/1w/1mon 互不干扰）
         df_cache: Dict = {}
         raw_cache: Dict = {}
+        undriven = 0
         for period in periods:
             # post_close=True：收盘后报不进交易所，immediate 策略也必须 defer 到次日。
             bar_event = BarEvent(stocks=stocks, bar_time=daily_time, period=period,
                                  post_close=True)
             for portfolio in self._ctx.portfolios:
+                done_key = (today, period, portfolio.portfolio_id)
+                if done_key in self._daily_driven_keys:
+                    continue
                 try:
                     self._on_bar(
                         portfolio, bar_event, bars_by_code=bars_by_code,
                         df_cache=df_cache, raw_cache=raw_cache,
                     )
                 except BridgeUnavailableError as e:
+                    # 掉线只跳过本组合（不中断整轮）：其余组合/周期照常驱动，
+                    # 本轮的 done 标记在循环后统一决定（有 undriven 就不标，靠
+                    # 60s tick 重试）。绝不留「已标记完成但未驱动」的状态。
                     self._set_bridge_offline()
+                    undriven += 1
                     logger.warning(
-                        "bridge unavailable on daily %s bar %s: %s",
-                        period, daily_time, e,
+                        "bridge unavailable on daily %s bar %s (portfolio %s): %s",
+                        period, daily_time, portfolio.portfolio_id, e,
                     )
-                    return
+                    continue
                 except Exception:  # noqa: BLE001
                     logger.exception(
                         "daily %s bar error (portfolio %s, time %s)",
                         period, portfolio.portfolio_id, daily_time,
                     )
+                    continue
+                self._daily_driven_keys.add(done_key)
+        if undriven:
+            logger.warning(
+                "daily bar drive incomplete (session %s, %s): %d portfolio(s) "
+                "skipped by bridge offline, 不标记完成，下一轮 60s tick 重试",
+                self._ctx.session_id, daily_time, undriven,
+            )
+            return
+        self._mark_daily_bars_done(today)
         logger.info(
             "daily bar driven (session %s, %s): %s completed bar over %d code(s), "
             "1w/1mon reinject=%s",

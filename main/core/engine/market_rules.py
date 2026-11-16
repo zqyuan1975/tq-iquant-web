@@ -13,6 +13,7 @@ import logging
 import threading
 
 from .price_limit import (
+    BOARD_BOND,
     BOARD_LIMIT_RATIOS,
     LimitRule,
     resolve_limit_rule,
@@ -74,6 +75,18 @@ def limit_rule_for(
         _warn_name_unknown(stock_code)
     if rule.ratio is not None:
         return rule
+    # 可转债（2026-11-16 B2）：沪深可转债自 2022-08-01 起统一 ±20%（旧口径回落
+    # 10% → 涨停买入/跌停卖出被误判为「未越板」而成交，等于在板上追价成交）。
+    # 代码前缀判档（price_limit.board_for 的 _BOND_PREFIXES）是确定信息，不依赖
+    # 历史数据。已知限制（不硬做，报告中标注）：
+    #   1) 转债**上市首日**的 -43.3%/+57.3% 特例未建模（按 20% 推偏窄，首日大幅
+    #      单会被延后而非误成交，fail-safe 方向）；2) 名称含 ST 的历史时点无法回溯
+    #      ——回测用「当前名称」判 ST，历史某段若为 ST 而当前不是，会按板块默认
+    #      幅度（主板 10%）推宽，属已知偏差。
+    if rule.board == BOARD_BOND:
+        return LimitRule(
+            ratio=Decimal("0.20"), unlimited=False, board=rule.board,
+            source="%s_bond_default_20pct" % rule.source, confidence="low")
     ratio = BOARD_LIMIT_RATIOS.get(rule.board, _FALLBACK_LIMIT_RATIO)
     return LimitRule(
         ratio=ratio,

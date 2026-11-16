@@ -28,6 +28,7 @@ from core.engine.live.engine_watchdog import (
 from core.services.backup_service import BackupScheduler
 from core.services.incremental_backtest import IncrementalBacktestScheduler
 from core.services.auto_shutdown import arm as arm_auto_shutdown
+from core import runtime
 
 
 logger = logging.getLogger(__name__)
@@ -36,9 +37,13 @@ logger = logging.getLogger(__name__)
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     setup_logging()
+    # 记录本次进程的实际监听端口 / pid / 版本到 data/runtime/server.json：
+    # 打包版端口动态（8888~8898），自愈父进程与第二次双击都靠它找到本实例。
+    runtime.mark_serving(runtime.resolve_bound_port())
     init_db()
-    # 打包版启用自动退出：浏览器标签页全部关闭后自动退出进程，避免残留占用端口
-    if _is_frozen():
+    # 打包版启用自动退出：浏览器标签页全部关闭后自动退出进程，避免残留占用端口。
+    # 自愈子进程（--serve）必须常驻，不做「关标签页即退出」，否则父进程会反复重启。
+    if _is_frozen() and not runtime.auto_shutdown_suppressed():
         arm_auto_shutdown()
         logger.info("打包模式：已启用自动退出（全部标签页关闭后自动退出）")
     # #5: 清理上次进程崩溃/重启残留的僵尸 running 回测记录（同步内联执行，
@@ -60,9 +65,25 @@ async def lifespan(app: FastAPI):
         n3 = recover_stale_running_live_sessions(db)
         if n3:
             logger.warning("启动恢复：%d 个僵尸 running 实盘会话已置 stopped", n3)
-    # 进程内引擎存活监控（daemon 线程，30s 扫描）：只发现 + 告警（logger/SSE），
-    # 不干预交易。冷启动注册表为空时安全空转；进程本身崩溃时该线程随之消失，
-    # 需外部 watchdog（scripts/ops/watch_live_backend.ps1）兜底。
+        # L1 旧交接目录清理（2026-11-16）：把 ths_ui.work_dir 下非活跃会话的数字
+        # 目录移入 {work_dir}/_archive/<日期>/（空目录删除）。当前 running/stopping
+        # 会话目录与引擎注册表键一律保留（cursor 仍在被消费的目录绝不动）；
+        # 失败只告警，不得阻断启动。
+        try:
+            from core.engine.live.file_handoff import archive_stale_session_dirs
+            from core.services.live_service import ths_ui_config
+            from core.models import LiveSession as _LiveSession
+            active_ids = {
+                row.id for row in db.query(_LiveSession)
+                .filter(_LiveSession.status.in_(("running", "stopping"))).all()
+            } | set(ENGINES.keys())
+            archive_stale_session_dirs(ths_ui_config()["work_dir"], active_ids)
+        except Exception:  # noqa: BLE001 — 清理失败只告警
+            logger.warning("旧交接目录清理失败（忽略，不影响启动）", exc_info=True)
+    # 进程内引擎存活监控（daemon 线程，30s 扫描）：只做「通道停摆 / 轮次卡住」
+    # 的检测与告警（logger / SSE / live_decision_events），**不重启进程**——它随
+    # 进程一起消失，没法救自己。进程级崩溃/无响应的自愈由 `--supervise` 父进程
+    # （core/supervisor.py）负责，两者职责不重叠。
     watchdog = None
     try:
         # 通道类故障单次判定即落 live_decision_events（gate=channel_offline/
@@ -107,6 +128,8 @@ async def lifespan(app: FastAPI):
         backup_scheduler.stop()
     if watchdog is not None:
         watchdog.stop()
+    # 正常退出清理 server.json（只删属于本进程的那份）；被强杀时由父进程/下次启动覆盖
+    runtime.mark_stopped()
 
 
 app = FastAPI(title="创懿私募基金量化投资平台", version=APP_VERSION, lifespan=lifespan)
@@ -139,7 +162,12 @@ async def uncaught_exception_handler(request: Request, exc: Exception):
 
 @app.get("/health")
 async def health():
-    return {"ok": True}
+    """轻量探活（无鉴权）：版本 / 运行时长 / 实际端口 / pid。
+
+    自愈父进程（``--supervise``）与桌面壳都靠它判断后端是否真的在服务；
+    端口动态，以 ``data/runtime/server.json`` 记录的端口为准。
+    """
+    return runtime.health_payload()
 
 
 @app.get("/debug-path")

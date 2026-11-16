@@ -23,6 +23,7 @@
 import json
 import logging
 import os
+import shutil
 import threading
 
 from .timing import now_shanghai
@@ -218,3 +219,64 @@ class FileHandoff:
             json.dump(self._cursor, f, ensure_ascii=False)
             f.flush()
         os.replace(tmp, self.cursor_path)
+
+
+def archive_stale_session_dirs(work_dir: str, keep_ids) -> dict:
+    """L1 旧交接目录清理：把非活跃会话的数字目录移入 ``{work_dir}/_archive/<日期>/``。
+
+    规则（2026-11-16）：
+    - 只处理纯数字命名的目录（会话交接目录约定），`_archive` 等其它目录不动；
+    - ``keep_ids``（当前 running/stopping 会话 id ∪ 进程内引擎注册表键）一律不动，
+      因此「cursor.json 仍在被消费」的目录绝不会被移走；
+    - 空目录直接删除；非空目录整体移动（保留 cursor.json / orders.jsonl 等数据，
+      不删除、不截断），同名重复时追加时间后缀避免覆盖；
+    - 任何失败只 WARNING 并计入 failed，绝不抛出（清理不得阻断服务启动）。
+
+    返回 ``{"archived": n, "removed_empty": n, "failed": n}``。
+    """
+    stats = {"archived": 0, "removed_empty": 0, "failed": 0}
+    root = os.path.abspath(str(work_dir or "data/ths"))
+    if not os.path.isdir(root):
+        return stats
+    keep = set()
+    for item in (keep_ids or []):
+        try:
+            keep.add(int(item))
+        except (TypeError, ValueError):
+            continue
+    try:
+        entries = list(os.scandir(root))
+    except OSError as exc:
+        stats["failed"] += 1
+        logger.warning("扫描交接目录失败（%s）：%s", root, exc)
+        return stats
+    now = now_shanghai()
+    archive_dir = os.path.join(root, "_archive", now.date().isoformat())
+    for entry in entries:
+        try:
+            if not entry.is_dir(follow_symlinks=False) or not entry.name.isdigit():
+                continue
+            if int(entry.name) in keep:
+                continue
+            with os.scandir(entry.path) as child:
+                has_files = any(True for _ in child)
+            if not has_files:
+                os.rmdir(entry.path)
+                stats["removed_empty"] += 1
+                continue
+            os.makedirs(archive_dir, exist_ok=True)
+            target = os.path.join(archive_dir, entry.name)
+            if os.path.exists(target):
+                target = "%s-%s" % (target, now.strftime("%H%M%S"))
+            shutil.move(entry.path, target)
+            stats["archived"] += 1
+            logger.info("旧交接目录已归档：%s → %s", entry.path, target)
+        except Exception as exc:  # noqa: BLE001 — 单个目录失败不影响其它目录
+            stats["failed"] += 1
+            logger.warning("旧交接目录处理失败（%s）：%s", entry.path, exc)
+    if any(stats.values()):
+        logger.warning(
+            "交接目录清理：归档 %d / 删除空目录 %d / 失败 %d（work_dir=%s）",
+            stats["archived"], stats["removed_empty"], stats["failed"], root)
+    return stats
+

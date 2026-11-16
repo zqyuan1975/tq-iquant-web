@@ -1,7 +1,8 @@
 ﻿; 创懿基金量化投资平台 —— 前端补丁安装包（Inno Setup 6）
 ; 用途：只改前端（Vue 文案/样式/交互）时，不跑 Nuitka、不重打 200MB 全量包，
 ;       只需几 MB 的补丁包覆盖安装目录下的 _internal\web\dist。
-; 前置：web\ 下 npm run build；main\.venv\Scripts\python.exe main\build_package.py --web-only
+; 前置：web\ 下 npm run build（本脚本直接取 web\dist，不再从 dist\tq-iquant 下拷旧副本）。
+;       跑 --web-only 仍建议用于刷新本地 dist 副本并更新 build-info.json。
 ; 编译："C:\Users\<用户名>\AppData\Local\Programs\Inno Setup 6\ISCC.exe" packaging\installer_web.iss
 ;
 ; 与 installer.iss 共用同一个 AppId，因此覆盖安装同一「程序和功能」条目；
@@ -13,7 +14,12 @@
 #define BuildStamp GetDateTimeString('yyyymmdd-hhnnss', '', '')
 #define AppPublisher "创懿私募基金"
 #define AppExe "tq-iquant.exe"
-#define DistDir "..\dist\tq-iquant"
+
+; 前端产物必须来自本次构建：dist\tq-iquant\_internal\web\dist 是历史拷贝（可能是旧前端），
+; 一律直接从 web\dist 取；缺失说明没跑 npm run build，编译期直接报错。
+#if !FileExists(AddBackslash(SourcePath) + "..\web\dist\index.html")
+  #error "缺少 web\dist\index.html：请先在 web\ 下执行 npm run build 再编译前端补丁包"
+#endif
 
 [Setup]
 AppId={{3B0F4A52-9C61-4C7A-8E1D-2F5B7A9C0D31}
@@ -48,8 +54,8 @@ Name: "chinesesimplified"; MessagesFile: "lang\ChineseSimplified.isl"
 Type: filesandordirs; Name: "{app}\_internal\web\dist"
 
 [Files]
-; 仅前端静态产物；其余文件由全量安装包负责
-Source: "{#DistDir}\_internal\web\dist\*"; DestDir: "{app}\_internal\web\dist"; Flags: ignoreversion recursesubdirs createallsubdirs
+; 仅前端静态产物；直接取 web\dist（唯一事实来源），其余文件由全量安装包负责
+Source: "..\web\dist\*"; DestDir: "{app}\_internal\web\dist"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 [Code]
 { 补丁包必须装在已安装的程序目录上：未检测到主程序时直接拦下，避免凭空建目录 }

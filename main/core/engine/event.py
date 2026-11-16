@@ -69,6 +69,10 @@ class OrderEvent:
     #   防止当日 00:00 日线 bar 的信号在当日 09:30 分钟 bar 成交（未来函数）。
     signal_bar_date: Optional[date] = None
     period: Optional[str] = None
+    # 在途单寿命起点（2026-11-16）：订单首次未能成交的交易日。回测引擎用它按
+    # 交易日累计「已顺延天数」，超过 pending_order_max_days 作废（防停牌/连板
+    # 无限顺延后凭空补做）。随增量 checkpoint 序列化，跨段续跑仍受同一上限约束。
+    pending_since: Optional[date] = None
 
 
 @dataclass

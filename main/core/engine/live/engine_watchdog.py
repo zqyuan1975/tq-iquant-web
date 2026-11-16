@@ -12,8 +12,10 @@
     results 回执未消费（**不受交易时段限制**）；
   - ``goldminer_bridge``：``engine._bridge_online=False`` 持续超过阈值。
 
-**不覆盖进程级崩溃**——进程消失后本线程一并消失，需外部 watchdog 兜底
-（``scripts/ops/watch_live_backend.ps1`` + Windows 计划任务）。
+**不覆盖进程级崩溃**——本线程是进程内 daemon，进程消失后一并消失，**不会也
+不可能重启自己**。进程级崩溃/无响应的自愈由随包分发的 ``--supervise`` 父进程
+（``core/supervisor.py``：探活 ``/health`` + 退避重启）负责；本类只做上面的通道
+与轮次停摆检测并告警，两者职责不重叠。
 
 阈值（config.yaml ``live.*``，非法/非正回退默认）：
 ``heartbeat_timeout_seconds``=90、``execution_stall_seconds``=180、

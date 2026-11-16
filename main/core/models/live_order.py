@@ -16,10 +16,14 @@ class LiveOrder(Base):
     order_type = Column(String(10), nullable=False)
     price = Column(Numeric(10, 3), nullable=True)
     quantity = Column(Integer, nullable=False)
-    # 资金基准对齐（2026-11-16）：信号原始目标量。下单链按目标金额动态缩量时，
-    # quantity 可能被比例缩减，orig_quantity 保留信号原意，供审计/复盘对照。
+    # 资金基准对齐（2026-11-16）：**仅基准重置时**给顺延单（status='deferred'）
+    # 打快照——orig_quantity 首次重置时保存当时的 quantity（信号原始目标量），
+    # 供审计/复盘对照。引擎**不读取**该列（放行时按真实可用动态缩量）。
     orig_quantity = Column(Integer, nullable=True)
-    # 生成该单时的资金基准版本；基准重置后据此识别「旧基准下的顺延单」
+    # 基准重置时写入的 live_sessions.baseline_version，仅作审计留痕。引擎当前
+    # **不读取**该列——旧注释称「据此识别旧基准下的顺延单」与代码事实不符；
+    # 实际识别靠 deferred 行本身 + bar_time/signal_bar_date 口径（见 live_engine
+    # recover 的隐式契约注释）。
     baseline_version = Column(Integer, nullable=True)
     filled_quantity = Column(Integer, default=0, server_default="0", nullable=False)
     filled_price = Column(Numeric(10, 3), nullable=True)

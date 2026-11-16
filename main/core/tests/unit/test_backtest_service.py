@@ -980,6 +980,68 @@ def test_build_params_snapshot_includes_dividend_mode():
     assert snap2["data_start_date"] == "2015-01-05"
 
 
+def test_build_params_snapshot_freezes_strategy_params_and_pool_composition():
+    """2026-11-16 P1：策略级参数/池成分/口径版本全部冻进 params_snapshot（纯 JSON）。"""
+    ps = SimpleNamespace(
+        benchmark_index="000300.SH", initial_capital=Decimal("1000000"),
+        max_drawdown=Decimal("0.2"), daily_loss_limit=Decimal("0.05"),
+        max_holdings=10, min_commission=Decimal("5"),
+        buy_commission_rate=Decimal("0.00025"), sell_commission_rate=Decimal("0.00025"),
+        stamp_duty_rate=Decimal("0.0005"), slippage=Decimal("0"),
+        trading_session="full", stock_pool_id=2,
+    )
+    strat = SimpleNamespace(
+        id=7, name="s7", formula_id=3, period="5m", role="master",
+        master_strategy_id=None, capital_ratio=Decimal("0.5"),
+        max_positions=3, single_open_ratio=Decimal("0.3"),
+        stop_loss_ratio=Decimal("0.08"), take_profit_ratio=Decimal("0.25"),
+        trailing_stop_ratio=Decimal("0.05"),
+        add_position_threshold=Decimal("0.03"), max_add_count=2,
+        add_position_ratio=Decimal("0.1"), rotation_enabled=False,
+        regime_filter_enabled=True,
+    )
+    snap = json.loads(svc.build_params_snapshot(
+        ps, dividend_mode="dual", strategies=[strat],
+        stock_pool_codes={"2": ["600000.SH", "000001.SZ"]}))
+
+    # 口径版本（改口径后旧记录不可混比）
+    assert snap["no_trade_bar_policy"] == svc.NO_TRADE_BAR_POLICY
+    assert snap["stamp_duty_segments"] == "cn_a_share_sell_2008_20230828_v2"
+    assert snap["fee_threshold_basis"] == "adjusted_price_space_v1"
+
+    row = snap["strategies"][0]
+    assert row["id"] == 7 and row["formula_id"] == 3 and row["period"] == "5m"
+    assert row["stop_loss_ratio"] == "0.08"
+    assert row["take_profit_ratio"] == "0.25"
+    assert row["trailing_stop_ratio"] == "0.05"
+    assert row["single_open_ratio"] == "0.3"
+    assert row["add_position_threshold"] == "0.03"
+    assert row["max_add_count"] == 2
+    assert row["max_positions"] == 3
+    assert row["role"] == "master"
+    assert row["regime_filter_enabled"] is True
+    assert snap["stock_pool_codes"] == {"2": ["000001.SZ", "600000.SH"]}
+    # 前复权/原始价空间标记不同
+    snap_front = json.loads(svc.build_params_snapshot(ps, dividend_mode="front"))
+    assert snap_front["fee_threshold_basis"] == "raw_price_space_v1"
+
+
+def test_pool_stocks_and_composition_are_stable_sorted(db_session):
+    """候选股票顺序稳定（ORDER BY pool_id, stock_code）：与增量侧 _pool_fp 同口径。"""
+    ps, _ = _seed(db_session)
+    pool_id = ps.stock_pool_id
+    db_session.add_all([
+        StockPoolStock(pool_id=pool_id, stock_code="600000.SH", stock_name="浦发银行"),
+        StockPoolStock(pool_id=pool_id, stock_code="000002.SZ", stock_name="万科A"),
+    ])
+    db_session.commit()
+
+    assert svc._pool_stocks(ps, db_session) == [
+        "000001.SZ", "000002.SZ", "600000.SH"]
+    assert svc.pool_composition(ps, db_session) == {
+        str(pool_id): ["000001.SZ", "000002.SZ", "600000.SH"]}
+
+
 def test_build_index_close_series_batches_codes_and_skips_missing(monkeypatch):
     days = [date(2026, 1, 5), date(2026, 1, 6)]
     fake = _FakeIndexTQ({
@@ -1315,6 +1377,8 @@ def _mr_seed_snapshots(db, rec, ps, limit=None):
 
 def test_recompute_market_regime_upserts_and_detail_embeds(db_session, monkeypatch):
     """TR-8.1: 重算→落库→详情返回；重复重算 upsert 不新增行。"""
+    # 样本量闸已提到 210 天（2026-11-16），本用例只验证 upsert/嵌入，放宽下限
+    monkeypatch.setattr(svc, "_MARKET_REGIME_MIN_DAYS", 10)
     rec, ps = _seed_record(db_session)
     _mr_seed_snapshots(db_session, rec, ps)
     bm_pts = _ca_daily_points([0.0] + _CA_WEEKS_B)
@@ -1367,6 +1431,8 @@ def test_backfilled_positions_unblock_industry_attribution(db_session, monkeypat
     """
     from core.services.positions_backfill import backfill_record
 
+    # 样本量闸已提到 210 天（2026-11-16），本用例只验证双门禁，放宽下限
+    monkeypatch.setattr(svc, "_MARKET_REGIME_MIN_DAYS", 10)
     rec, ps = _seed_record(db_session)
     strat = db_session.query(Strategy).filter_by(portfolio_id=ps.id).one()
     bm_pts = _ca_daily_points([0.0] + _CA_WEEKS_B)
@@ -1445,11 +1511,14 @@ def test_recompute_market_regime_without_benchmark_marks_failed(db_session, monk
 
 def test_recompute_market_regime_insufficient_common_days(db_session, monkeypatch):
     rec, ps = _seed_record(db_session)
-    _mr_seed_snapshots(db_session, rec, ps, limit=10)  # 10 个共同日 < 30
+    _mr_seed_snapshots(db_session, rec, ps, limit=10)  # 10 个共同日 < 210
     bm_pts = _ca_daily_points([0.0] + _CA_WEEKS_B)
     monkeypatch.setattr(
         svc, "TQData",
         lambda: _FakeIndexTQ({"000300.SH": _ca_decimal_frames(bm_pts)}))
+    # 2026-11-16 P1：MA30W 预热要求样本 ≥210 天；40 周预热只用于打标
+    assert svc._MARKET_REGIME_MIN_DAYS == 210
+    assert svc._MARKET_REGIME_WARMUP_DAYS == 280
     out = svc.recompute_market_regime(db_session, rec.id)
     assert out["status"] == "insufficient"
     assert "不足" in out["error"]
@@ -1472,6 +1541,7 @@ class _FakeIndustryTQ(_FakeIndexTQ):
 
 def test_tr16_industry_attribution_ok_with_positions(db_session, monkeypatch):
     """TR-16.1 service 链路：positions_json → 行业归因 ok 块并入 payload。"""
+    monkeypatch.setattr(svc, "_MARKET_REGIME_MIN_DAYS", 10)
     rec, ps = _seed_record(db_session)
     nav_pts = _ca_daily_points([0.0] + _CA_WEEKS_S)
     bm_pts = _ca_daily_points([0.0] + _CA_WEEKS_B)
@@ -1531,6 +1601,7 @@ def test_tr16_industry_attribution_ok_with_positions(db_session, monkeypatch):
 
 def test_tr16_industry_attribution_failure_isolated(db_session, monkeypatch):
     """行业归因 TQ 异常不影响市场态主链路，落 failed 块。"""
+    monkeypatch.setattr(svc, "_MARKET_REGIME_MIN_DAYS", 10)
     rec, ps = _seed_record(db_session)
     nav_pts = _ca_daily_points([0.0] + _CA_WEEKS_S)
     bm_pts = _ca_daily_points([0.0] + _CA_WEEKS_B)
@@ -1565,6 +1636,7 @@ def test_tr16_industry_attribution_failure_isolated(db_session, monkeypatch):
 def test_tr18_robustness_never_calls_backtest_engine(db_session, monkeypatch):
     """AC-8/TR-18.1：稳健性只读快照/基准，BacktestEngine.run 零调用。"""
     from core.engine import backtest_engine
+    monkeypatch.setattr(svc, "_MARKET_REGIME_MIN_DAYS", 10)
     rec, ps = _seed_record(db_session)
     _mr_seed_snapshots(db_session, rec, ps)
     bm_pts = _ca_daily_points([0.0] + _CA_WEEKS_B)
@@ -1861,6 +1933,9 @@ _SNAPSHOT_KEYS = {
     "risk_cooldown_days",
     # 取数窗口起点（复权基准同源确认用）
     "data_start_date",
+    # 2026-11-16 P1：口径版本 + 策略级参数 + 池成分冻结（纯 JSON，不加表列）
+    "no_trade_bar_policy", "stamp_duty_segments", "fee_threshold_basis",
+    "strategies", "stock_pool_codes",
 }
 
 _NO_TRADES_RESULT = {

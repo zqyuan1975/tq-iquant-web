@@ -10,7 +10,7 @@ from sqlalchemy.orm import Session
 
 from core.api.response import err, ok
 from core.db import SessionLocal, get_db
-from core.models import LiveSession, PortfolioStrategy
+from core.models import BacktestRecord, LiveSession, PortfolioStrategy
 from core.config import load_config
 from core.engine.http_bridge_dispatcher import HttpBridgeDispatcher
 from core.engine.live_engine import LiveEngine
@@ -134,6 +134,19 @@ def create_session(data: dict, db: Session = Depends(get_db)):
         if not live_capital > 0:
             return err(400, "实盘资金基准须大于 0")
     data["live_capital"] = live_capital
+    # H2 参数绑定（A7）：可选绑定回测记录（软引用不设 FK），须真实存在。
+    backtest_record_id = data.get("backtest_record_id")
+    if backtest_record_id not in (None, ""):
+        try:
+            backtest_record_id = int(backtest_record_id)
+        except (TypeError, ValueError):
+            return err(400, "backtest_record_id 须为整数")
+        if not db.query(BacktestRecord.id).filter(
+                BacktestRecord.id == backtest_record_id).first():
+            return err(400, "回测记录不存在：%s" % backtest_record_id)
+        data["backtest_record_id"] = backtest_record_id
+    else:
+        data["backtest_record_id"] = None
     # 外部信号注入（0011）：通达信「条件预警」输出文件路径；空串/缺省 → None（不启用，
     # 走 TQ 公式计算）。填写后该会话信号来源改为文件，停用 TQ 公式链路（二者互斥）。
     signal_file_path = data.get("signal_file_path")
@@ -324,14 +337,39 @@ def recover_breaker(session_id: int, portfolio_id: int, db: Session = Depends(ge
 
 
 @router.get("/account-preview")
-def account_preview(engine: Optional[str] = None, db: Session = Depends(get_db)):
+def account_preview(engine: Optional[str] = None, mode: Optional[str] = None,
+                    db: Session = Depends(get_db)):
     """资金基准预览（A7）：按引擎探测真实账户资产（只读，不下单、不改账）。
 
-    返回 {total_asset, available, captured_at}；实时探测失败回退最近账户快照。
+    返回 {engine, mode, total_asset, available, captured_at}；实时探测失败回退
+    最近账户快照。``mode`` 缺省时按该引擎最近会话的实际 mode（A6），避免
+    live/simulation 指向不同桥地址时预览到错账户。
     """
-    data, error = svc.account_preview_by_engine(db, engine or svc.default_engine())
+    if mode is not None and mode not in ("simulation", "live"):
+        return err(400, "mode 非法，仅支持 simulation(仿真) / live(实盘)")
+    data, error = svc.account_preview_by_engine(
+        db, engine or svc.default_engine(), mode=mode)
     if error is not None:
         return err(error[0], error[1])
+    return ok(data)
+
+
+@router.get("/sessions/{session_id}/params-drift")
+def session_params_drift(session_id: int, db: Session = Depends(get_db)):
+    """H2 参数漂移（A7）：绑定回测记录时返回当前参数与 params_snapshot 的差异。
+
+    未绑定返回 ``{backtest_record_id: null, checked: false, drifted: false}``；
+    比对失败（记录/快照缺失）返回 checked=false + reason，不报错。
+    """
+    session = db.query(LiveSession).filter(LiveSession.id == session_id).first()
+    if session is None:
+        return err(404, "资源不存在")
+    data = svc.compute_params_drift(db, session)
+    if data is None:
+        return ok({
+            "backtest_record_id": None, "checked": False, "drifted": False,
+            "fields": [], "block_enabled": svc.params_drift_block_enabled(),
+        })
     return ok(data)
 
 

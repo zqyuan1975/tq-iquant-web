@@ -23,6 +23,7 @@ import pandas as pd
 import polars as pl
 from sqlalchemy.orm import Session
 
+from core.config import load_config
 from core.models import (
     StockPool, StockPoolStock, Strategy, Formula, FormulaSignal, PortfolioStrategy,
     BacktestRecord, BacktestTrade, BacktestDailySnapshot, BacktestEvaluation,
@@ -31,6 +32,7 @@ from core.models import (
     ParamPerturbRun,
 )
 from core.engine.backtest_engine import BacktestEngine
+from core.engine.execution_engine import STAMP_DUTY_SEGMENTS_VERSION
 from core.engine.evaluator import Evaluator
 from core.engine.crisis_alpha import (
     CRISIS_BENCHMARKS, DEFAULT_BENCHMARK_CODE, build_crisis_alpha_payload,
@@ -52,7 +54,7 @@ from core.services.oos_gate import evaluate_oos_gate
 from core.engine.portfolio_builder import (
     assemble_portfolio as _assemble_portfolio,
 )
-from core.tq.data import TQData
+from core.tq.data import TQData, no_trade_bar_mask
 from core.tq.formula import TQFormula
 from core.engine.tdx_formula import (
     FormulaEvalError,
@@ -137,6 +139,15 @@ def _build_polars_kline(raw: dict, code: str, timestamps: list):
         o > 0 and c > 0 and c >= _MIN_TRADE_PRICE
         for o, c in zip(converted["Open"], converted["Close"])
     ]
+    # 无成交 bar 过滤（2026-11-16 P0）：fill_data=True 用上一根收盘补出的停牌/上市前
+    # 假 bar（OHLC 全等于前收、Volume=0、价格>0）不会被上面的伪影规则拦下，若进入
+    # 价格索引会让停牌日照成交/照估值/照推进日快照。判据与依据见
+    # core.tq.data.no_trade_bar_mask；真实一字板/低成交日 Volume>0 不受影响。
+    no_trade = no_trade_bar_mask(
+        converted["Open"], converted["High"], converted["Low"],
+        converted["Close"], converted["Volume"],
+    )
+    keep = [k and not nt for k, nt in zip(keep, no_trade)]
     if not any(keep):
         return None
     col_data: dict = {"datetime": [ts for ts, k in zip(timestamps, keep) if k]}
@@ -157,6 +168,11 @@ def _is_nan(val) -> bool:
 # 最低可交易价：A股无低于 1 分钱的真实成交价，前复权"加性压缩"产物可能逼近 0/转负，
 # 用于在取数层过滤伪影行（防近零价 → 巨量股数 / 负价成交现金倒增）。
 _MIN_TRADE_PRICE = Decimal("0.01")
+
+# 无成交假 bar 剔除口径版本（2026-11-16 P0）：Volume==0 且 OHLC 全等于相邻有效
+# 收盘的「停牌/上市前」补行整行剔除，不参与成交/估值/日快照。写入 params_snapshot，
+# 旧结果（含假 bar）不与新结果混比。
+NO_TRADE_BAR_POLICY = "drop_volume0_carryforward_v1"
 
 
 def _to_decimal(val) -> Decimal:
@@ -514,6 +530,36 @@ def _json_safe(obj):
     return obj
 
 
+# 策略级可复现字段（2026-11-16 P1）：params_snapshot 与增量 checkpoint 指纹共用
+# 同一取值口径（incremental_backtest._FP_STRATEGY_FIELDS 直接复用本元组），
+# 避免两处对「哪些字段影响结果」态度不一致。
+STRATEGY_SNAPSHOT_FIELDS = (
+    "id", "name", "formula_id", "period",
+    "signal_frequency", "signal_at", "signal_weekday", "signal_data_end",
+    "role", "master_strategy_id", "stock_pool_id", "slave_exit_mode",
+    "capital_ratio", "max_positions", "single_open_ratio",
+    "stop_loss_ratio", "take_profit_ratio", "trailing_stop_ratio",
+    "add_position_threshold", "max_add_count", "add_position_ratio",
+    "reduce_position_ratio",
+    "rotation_enabled", "rotation_momentum_bars", "rotation_hysteresis",
+    "regime_filter_enabled", "trend_trailing_stop_ratio", "trend_max_positions",
+    "exposure_cap_enabled", "risk_timing",
+    "max_order_amount", "requote_enabled", "requote_max_attempts",
+    "split_order_enabled", "split_order_threshold",
+)
+
+
+def _strategy_snapshot_rows(strategies) -> List[dict]:
+    """策略对象 → 纯 JSON 行（Decimal/日期经 _snapshot_value 归一，按 id 排序）。"""
+    rows = [
+        {field: _snapshot_value(getattr(s, field, None))
+         for field in STRATEGY_SNAPSHOT_FIELDS}
+        for s in (strategies or [])
+    ]
+    rows.sort(key=lambda r: (r.get("id") is None, r.get("id") or 0))
+    return rows
+
+
 def build_params_snapshot(ps, dividend_mode: str = "front",
                           fee_reserve_enabled: bool = False,
                           bond_t0_enabled: bool = False,
@@ -525,12 +571,30 @@ def build_params_snapshot(ps, dividend_mode: str = "front",
                           equity_cap=None,
                           daily_close_peak_enabled: bool = False,
                           daily_loss_basis: str = "equity",
-                          data_start: str | None = None) -> str:
+                          data_start: str | None = None,
+                          strategies: Optional[list] = None,
+                          stock_pool_codes: Optional[dict] = None) -> str:
     payload = {
         field: _snapshot_value(getattr(ps, field, None))
         for field in PARAMS_SNAPSHOT_FIELDS
     }
     payload["dividend_mode"] = dividend_mode
+    # 口径版本标记（2026-11-16 P1 核查）：
+    #   - no_trade_bar_policy：无成交假 bar（Volume=0 且 OHLC=前收）整行剔除；
+    #   - stamp_duty_segments：卖出印花税分段表（2023-08-28 前 0.1%）；
+    # 两者都会改变历史回测的成本/成交结果，旧快照缺这两项即不可与新结果混比。
+    payload["no_trade_bar_policy"] = NO_TRADE_BAR_POLICY
+    payload["stamp_duty_segments"] = STAMP_DUTY_SEGMENTS_VERSION
+    # 费用阈值币种口径（2026-11-16 B3，已知限制）：min_commission（最低 5 元）/
+    # max_order_amount / equity_cap 都以「元」为单位，而成交额 = 价格×数量；back/
+    # dual 模式下记账价是**后复权价**，长区间可把价格放大数倍 → 按缩放后的金额
+    # 判「最低佣金」和「单笔上限」：5 元最低佣金实际几乎不触发，单笔上限等效收紧。
+    # 两种修法（按复权因子还原到未复权空间 / 直接改用未复权价判定）都需新增
+    # 复权因子或原始价数据源，改动面大（取数层 + 引擎 + 校验），本轮不硬改，
+    # 只冻结口径标记，跨记录比较/解释费用时先看这一项。
+    payload["fee_threshold_basis"] = (
+        "adjusted_price_space_v1"
+        if dividend_mode in ("back", "dual") else "raw_price_space_v1")
     # 复权基准随取数窗口变化（同一票同日，2015 起取数 vs 2023 起取数的后复权价
     # 比值可达 0.3154，最大 25.7 倍）——不是缺陷，但跨记录比价必须确认同源。
     # 落「本次取数起始日期 + 复权模式」，日后比对先看这两项是否一致。
@@ -552,6 +616,15 @@ def build_params_snapshot(ps, dividend_mode: str = "front",
     ):
         if val is not None:
             payload[name] = _snapshot_value(val)
+    # 策略级参数与股票池成分（2026-11-16 P1）：此前只冻结组合级字段 + stock_pool_id，
+    # 策略公式/周期/风控阈值/轮动/主从关系与池内成分全部缺失，bool/数值改动后旧记录
+    # 无法解释也无法复现。纯 JSON 字段落库，不新增表列。
+    if strategies:
+        payload["strategies"] = _strategy_snapshot_rows(strategies)
+    if stock_pool_codes:
+        payload["stock_pool_codes"] = {
+            str(k): sorted(v) for k, v in stock_pool_codes.items()
+        }
     return json.dumps(payload, ensure_ascii=False, sort_keys=True)
 
 
@@ -812,8 +885,12 @@ def _upsert_market_regime(
     return row
 
 
-# 与危机一致的共同交易日下限（不足标 insufficient，不落 payload）
-_MARKET_REGIME_MIN_DAYS = 30
+# 与危机一致的共同交易日下限（不足标 insufficient，不落 payload）。
+# 2026-11-16：由 30 提到 210 —— 市场状态用 MA30W 慢均线（约 150 个交易日）+
+# 26 周突破窗口，30 天样本连一周标签都凑不齐，产出的四态统计无意义。
+_MARKET_REGIME_MIN_DAYS = 210
+# 预热窗口：MA_SLOW_WEEKS=30 周 + 余量，向前多取 40 周仅用于打标预热（标签裁剪到区间）
+_MARKET_REGIME_WARMUP_DAYS = 40 * 7
 _INDUSTRY_FETCH_BATCH = 40
 
 
@@ -876,7 +953,11 @@ def compute_and_store_market_regime(
     codes = ([benchmark_code]
              + [spec["code"] for spec in CRISIS_BENCHMARKS]
              + [spec["code"] for spec in QUADRANT_STYLE_INDICES])
-    closes = build_index_close_series(codes, start, end)
+    # 预热（2026-11-16 P1）：MA30W 慢均线前 30 周恒 range，若只取 [start, end]，
+    # 回测前 30 周市场状态全部失真。向前多取 40 周只用于打标，标签再裁回区间；
+    # 净值/成交仍只用 [start, end]（nav 索引），不影响指标口径。
+    warm_start = start - timedelta(days=_MARKET_REGIME_WARMUP_DAYS)
+    closes = build_index_close_series(codes, warm_start, end)
     main_closes = closes.get(benchmark_code) or {}
     if not main_closes:
         return _upsert_market_regime(
@@ -904,7 +985,7 @@ def compute_and_store_market_regime(
             error=(f"策略与基准共同交易日不足{_MARKET_REGIME_MIN_DAYS}天"
                    f"（{len(common)}），无法分析"),
         )
-    regime = segment_regime(benchmark)
+    regime = segment_regime(benchmark, trim_start=start, trim_end=end)
     analyzer = RegimeAlphaAnalyzer(
         nav, benchmark,
         trades=trades, regime_weeks=regime,
@@ -1237,7 +1318,10 @@ def _upsert_persistence(
     row.error = error
     row.skipped_benchmarks_json = json.dumps(skipped or [], ensure_ascii=False) if skipped else None
     if payload is not None:
-        row.payload_json = json.dumps(payload, ensure_ascii=False)
+        # NaN/Inf 会写出非标准 JSON（Python json 默认 allow_nan=True），前端/复核侧
+        # JSON.parse 直接失败。与其它落库点同口径：先 _json_safe 再 allow_nan=False。
+        row.payload_json = json.dumps(
+            _json_safe(payload), ensure_ascii=False, allow_nan=False)
     elif status == "completed":
         # 成功但 payload 为空：显式清空（异常路径）
         row.payload_json = None
@@ -2195,14 +2279,42 @@ def _pool_stocks(ps, db: Session) -> list:
             pool_ids.add(s.stock_pool_id)
     if not pool_ids:
         return []
+    # ORDER BY：候选股票顺序稳定可复现（与增量侧 _pool_fp 的 code 排序口径一致；
+    # 否则 SQLite 物理顺序抖动会让统一买入排序/资金分配顺序漂移）。
     rows = db.query(StockPoolStock).filter(
         StockPoolStock.pool_id.in_(pool_ids)
-    ).all()
+    ).order_by(StockPoolStock.pool_id, StockPoolStock.stock_code).all()
     seen: list = []
     for r in rows:
         if r.stock_code not in seen:
             seen.append(r.stock_code)
     return seen
+
+
+def pool_composition(ps, db: Session) -> Dict[str, List[str]]:
+    """股票池成分快照：{pool_id(str): [stock_code 已排序]}。
+
+    覆盖组合级池 ∪ 各策略级独立池；用于 params_snapshot 冻结「当时池里有哪些票」
+    （仅存 stock_pool_id 无法复现，池成分后续可被编辑）。db 为 None 返回空。
+    """
+    if db is None:
+        return {}
+    pool_ids = {ps.stock_pool_id}
+    for s in _portfolio_strategies(ps, db):
+        if s.stock_pool_id is not None:
+            pool_ids.add(s.stock_pool_id)
+    pool_ids.discard(None)
+    if not pool_ids:
+        return {}
+    rows = db.query(StockPoolStock.pool_id, StockPoolStock.stock_code).filter(
+        StockPoolStock.pool_id.in_(pool_ids)
+    ).order_by(StockPoolStock.pool_id, StockPoolStock.stock_code).all()
+    out: Dict[str, List[str]] = {}
+    for pool_id, code in rows:
+        bucket = out.setdefault(str(pool_id), [])
+        if code not in bucket:
+            bucket.append(code)
+    return out
 
 
 def _pool_stock_names(ps, db: Session) -> dict:
@@ -2221,7 +2333,7 @@ def _pool_stock_names(ps, db: Session) -> dict:
         return {}
     rows = db.query(StockPoolStock).filter(
         StockPoolStock.pool_id.in_(pool_ids)
-    ).all()
+    ).order_by(StockPoolStock.pool_id, StockPoolStock.stock_code).all()
     names: dict = {}
     for r in rows:
         if r.stock_name and r.stock_code not in names:
@@ -2399,6 +2511,21 @@ def _persist_result(
             final_qty=d.get("final_qty"),
             message=msg if len(msg) <= 200 else msg[:199] + "…",
         ))
+
+    # params_snapshot 落策略级参数（2026-11-16 P1）：此前本函数收了 strategies 却未落库，
+    # 记录只有组合级字段 → 策略公式/周期/风控阈值/主从/轮动改动后无法解释与复现。
+    # 以本轮回测实际装配（含 param_overrides 微扰）的策略对象为准补齐，纯 JSON 字段
+    # （不加表列），并保持 sort_keys 与创建时同口径。
+    rec = db.get(BacktestRecord, record_id)
+    if rec is not None and strategies:
+        try:
+            payload = json.loads(rec.params_snapshot or "{}")
+        except (TypeError, ValueError):
+            payload = {}
+        if not isinstance(payload, dict):
+            payload = {}
+        payload["strategies"] = _strategy_snapshot_rows(strategies)
+        rec.params_snapshot = json.dumps(payload, ensure_ascii=False, sort_keys=True)
 
 
 # ---------------------------------------------------------------------------
@@ -3425,6 +3552,10 @@ def run_backtest(db: Session, ps: PortfolioStrategy, req,
             daily_close_peak_enabled=daily_close_peak_enabled,
             daily_loss_basis=daily_loss_basis,
             data_start=req.start_date,
+            # 策略级参数（含 param_overrides 微扰后的实际生效值）与池成分一并冻结：
+            # 仅凭组合级字段无法复现/解释本记录。
+            strategies=strategies,
+            stock_pool_codes=pool_composition(ps, db),
         ),
         evaluation_profile=evaluation_profile,
         is_oos_gate_enabled=is_oos_gate_enabled,
@@ -3550,6 +3681,10 @@ def run_backtest(db: Session, ps: PortfolioStrategy, req,
                 {d: c for d, c in regime_closes.items() if d < req.start_date}
             )
         engine = BacktestEngine()
+        # 在途单最大存活期（交易日，2026-11-16 B1）：config.backtest
+        # .pending_order_max_days，缺键=20（引擎常量同值），<=0 不限。停牌/连板时
+        # 防止 deferred 单无限顺延、几个月后按恢复日开盘价补做早已过期的决策。
+        _bt_cfg = (load_config() or {}).get("backtest") or {}
         result = engine.run(
             portfolio,
             klines=klines,
@@ -3558,6 +3693,8 @@ def run_backtest(db: Session, ps: PortfolioStrategy, req,
             regime_tracker=regime_tracker,
             daily_close_peak_enabled=daily_close_peak_enabled,
             stock_names=_pool_stock_names(ps, db),
+            pending_order_max_days=int(
+                _bt_cfg.get("pending_order_max_days", 20)),
         )
         t7 = datetime.now()
         _log_timing(f"[回测#{record_id}] 引擎逐bar回测: {(t7-t6).total_seconds():.1f}s")

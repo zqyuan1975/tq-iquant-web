@@ -35,18 +35,21 @@ from sqlalchemy.orm import Session
 
 from core.config import load_config
 from core.db import SessionLocal
-from core.engine.backtest_engine import BacktestEngine
+from core.engine.backtest_engine import BacktestEngine, build_prev_close_by_day
 from core.engine.bar_poller import parse_bar_time, to_ohlcv
 from core.engine.event import OrderEvent
 from core.engine.portfolio import Portfolio
 from core.engine.portfolio_builder import assemble_portfolio
 from core.engine.position import Position
 from core.models import (
+    Formula,
+    FormulaSignal,
     IncrementalBacktestCheckpoint,
     IncrementalBacktestDay,
     IncrementalBacktestValidation,
     LiveAccountSnapshot,
     LiveAccountPositionSnapshot,
+    LiveCashFlow,
     LiveSession,
     LiveSessionPortfolio,
     LiveTrade,
@@ -55,6 +58,7 @@ from core.models import (
     Strategy,
 )
 from core.services.backtest_service import (
+    STRATEGY_SNAPSHOT_FIELDS,
     _pool_stock_names,
     _slice_klines_from,
     _strategy_periods,
@@ -62,13 +66,14 @@ from core.services.backtest_service import (
     build_params_snapshot,
     build_signal_cache,
 )
+from core.tq.data import no_trade_bar_mask
 from tq_iquant_shared.constants import SignalType, TradeType
 
 logger = logging.getLogger(__name__)
 
 _TZ = ZoneInfo("Asia/Shanghai")
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 # 口径版本（任一语义变化 → 提升 SCHEMA_VERSION 并在注释里写明原因）
 _COST_SCHEMA = "fee_inclusive_v2"    # 成本含佣金/印花税/过户费
 _EXEC_SCHEMA = "next_bar_open_v1"    # 成交价 = 下一根 bar 开盘价
@@ -78,6 +83,15 @@ _T1_SCHEMA = "t1_forced_v1"          # 回测强制 T+1
 # 基准重置会重设 seam_date/seam_cash 并删除旧 checkpoint。旧 checkpoint 的
 # initial_capital/seam 属于旧基准，恢复会把新基准覆盖回去，故整体作废重建。
 _ENGINE_SCHEMA = "backtest_engine_v3"
+
+# SCHEMA_VERSION 3（2026-11-16，P1 核查）：
+#   1) checkpoint state 新增 risk_cooldown（风控冷静期不再续跑后清零）；
+#   2) 参数指纹新增 sections["formula"]（公式正文哈希/engine/no_leak_cross/信号线）
+#      与接缝日游标 seam_bar_time；
+#   3) 成本/成交口径变化：无成交假 bar 剔除 + 卖出印花税按成交日分段（2023-08-28
+#      前 0.1%）。旧 checkpoint 的 state 缺冷静期、结果按旧成本口径算出 → 一律判废。
+#   **不自动迁移/修补旧 checkpoint**：判废后由调用方（用户/调度器）决定何时从接缝日
+#   重建（下一轮 run_incremental 会按常规路径重建）。
 
 # 小样本豁免阈值（修复 9）：成交笔数与方向一致率在个位数样本上没有统计意义。
 # 取 5 的依据：n=4 时任意 1 笔不一致 → 一致率 ≤ 0.75，直接击穿 0.9 容差，
@@ -152,6 +166,15 @@ def _klines_from_handoff(bars_by_code: Dict[str, list]) -> dict:
                 "Volume": int(o["volume"]),
             })
         if data:
+            # 无成交假 bar 剔除（2026-11-16 P0）：DailyCloser 交接日线同样可能带
+            # fill 补出的停牌行（OHLC 全等于前收、Volume=0），与 build_klines 的
+            # 取数层同口径剔除，否则快路径会照停牌价成交/估值。
+            mask = no_trade_bar_mask(
+                [r["Open"] for r in data], [r["High"] for r in data],
+                [r["Low"] for r in data], [r["Close"] for r in data],
+                [r["Volume"] for r in data])
+            data = [r for r, nt in zip(data, mask) if not nt]
+        if data:
             out[code] = {"1d": pl.DataFrame(data)}
     return out
 
@@ -198,6 +221,8 @@ def _order_to_dict(o: OrderEvent) -> dict:
         "signal_name": o.signal_name,
         "signal_bar_date": _dt(o.signal_bar_date),
         "period": o.period,
+        # 在途单寿命起点（B1）：随 checkpoint 跨段传递，续跑后仍受同一交易日上限约束。
+        "pending_since": _dt(getattr(o, "pending_since", None)),
     }
 
 
@@ -214,6 +239,7 @@ def _order_from_dict(d: dict) -> OrderEvent:
         signal_name=d.get("signal_name") or "",
         signal_bar_date=_pdate(d.get("signal_bar_date")),
         period=d.get("period"),
+        pending_since=_pdate(d.get("pending_since")),
     )
 
 
@@ -278,6 +304,12 @@ def state_payload(portfolio: Portfolio, as_of_date: date,
             k: [_s(x) for x in v] for k, v in portfolio._price_history.items()},
         "price_hist_last_t": {
             k: _dt(v) for k, v in portfolio._price_hist_last_t.items()},
+        # 风控冷静期（P1，2026-11-16）：{(strategy_id, code): 风控卖出日}。漏存 →
+        # 续跑后冷静期清零，全量会拦的回买在续跑段直接成交（两端口径不一致）。
+        "risk_cooldown": {
+            "%s|%s" % (sid, code): d.isoformat()
+            for (sid, code), d in (portfolio._risk_cooldown or {}).items()
+        },
         "pending_orders": [_order_to_dict(o) for o in (pending_orders or [])],
         "processed_bar_date": as_of_date.isoformat(),
         # 接缝粒度 = 交易日 + 日内时间游标（见函数 docstring）
@@ -351,6 +383,18 @@ def restore_portfolio(portfolio: Portfolio, payload: dict) -> List[OrderEvent]:
         k: _pdt(v) for k, v in (payload.get("price_hist_last_t") or {}).items()
         if v}
 
+    # 风控冷静期恢复（P1）：键 (strategy_id, code) → 风控卖出日。
+    portfolio._risk_cooldown = {}
+    for key, val in (payload.get("risk_cooldown") or {}).items():
+        sid_str, _, code = str(key).partition("|")
+        d = _pdate(val)
+        if not code or d is None:
+            continue
+        try:
+            portfolio._risk_cooldown[(int(sid_str), code)] = d
+        except (TypeError, ValueError):
+            continue
+
     return [_order_from_dict(d) for d in (payload.get("pending_orders") or [])]
 
 
@@ -411,22 +455,21 @@ def params_hash(ps, dividend_mode: str, db: Optional[Session] = None,
 #    周期、策略增删（按 id 升序，重命名不参与）；
 # 3) 股票池成分代码列表（组合级 ∪ 各策略独立池）。
 # 实盘执行配置（max_order_amount/requote/split_order 等）不影响回测，不参与。
-_FP_STRATEGY_FIELDS = (
-    "id", "formula_id", "period", "signal_frequency", "signal_at",
-    "signal_weekday", "signal_data_end", "role", "master_strategy_id",
-    "stock_pool_id", "slave_exit_mode",
-    "capital_ratio", "max_positions", "single_open_ratio",
-    "stop_loss_ratio", "take_profit_ratio", "trailing_stop_ratio",
-    "add_position_threshold", "max_add_count", "add_position_ratio",
-    "reduce_position_ratio",
-    "rotation_enabled", "rotation_momentum_bars", "rotation_hysteresis",
-    "regime_filter_enabled", "trend_trailing_stop_ratio", "trend_max_positions",
-    "exposure_cap_enabled", "risk_timing",
-)
+# 复用 params_snapshot 的同一字段口径（2026-11-16）：指纹与快照对「哪些策略
+# 字段影响结果」必须一致，避免一处改了、另一处漏判。
+# 不参与指纹的字段：name 只影响展示（重命名不该作废 checkpoint）；实盘执行配置
+# （max_order_amount/requote/split_order）不影响回测结果（旧口径）。
+_FP_EXCLUDED_FIELDS = frozenset({
+    "name", "max_order_amount", "requote_enabled", "requote_max_attempts",
+    "split_order_enabled", "split_order_threshold",
+})
+_FP_STRATEGY_FIELDS = tuple(
+    f for f in STRATEGY_SNAPSHOT_FIELDS if f not in _FP_EXCLUDED_FIELDS)
 
 _FP_PART_LABELS = {
     "params": "组合级参数（资金/费率/滑点/复权模式等）",
     "strategies": "策略参数/公式/角色/周期或策略增删",
+    "formula": "公式正文/引擎/跨周期口径/信号线",
     "pool": "股票池成分代码",
     "baseline": "资金基准（baseline_version / baseline_value）",
 }
@@ -462,6 +505,49 @@ def _strategy_fp_rows(ps, db: Optional[Session]) -> list:
         {f: _fp_value(getattr(s, f, None)) for f in _FP_STRATEGY_FIELDS}
         for s in rows
     ]
+
+
+def _formula_fp(ps, db: Optional[Session]) -> dict:
+    """公式实体指纹：正文哈希 + engine + no_leak_cross + 绑定信号线（2026-11-16 P1）。
+
+    依据：旧指纹只有 ``formula_id``。改公式正文/计算引擎/跨周期口径，或增删改
+    绑定的信号线（signal_name / trigger_value）后继续续跑，checkpoint 不判废
+    → 旧持仓 + 新信号混算（结果既不是旧公式也不是新公式的完整产物）。
+    正文用 sha256（正文可能很长，且历史记录只需判「变没变」）。
+    """
+    if db is None:
+        return {}
+    formula_ids = {
+        s.formula_id for s in (
+            db.query(Strategy).filter_by(portfolio_id=ps.id).all())
+        if s.formula_id is not None
+    }
+    out: Dict[str, object] = {}
+    for fid in sorted(formula_ids):
+        formula = db.get(Formula, fid)
+        if formula is None:
+            out[str(fid)] = None
+            continue
+        signals = (
+            db.query(FormulaSignal)
+            .filter_by(formula_id=fid)
+            .order_by(FormulaSignal.id)
+            .all()
+        )
+        out[str(fid)] = {
+            "content_sha256": hashlib.sha256(
+                (formula.content or "").encode("utf-8")).hexdigest(),
+            "engine": formula.engine,
+            "no_leak_cross": bool(formula.no_leak_cross),
+            "formula_count": formula.formula_count,
+            "signals": [
+                {"id": sig.id, "signal_name": sig.signal_name,
+                 "signal_type": sig.signal_type,
+                 "trigger_value": sig.trigger_value}
+                for sig in signals
+            ],
+        }
+    return out
 
 
 def _pool_fp(ps, db: Optional[Session]) -> dict:
@@ -525,6 +611,10 @@ def params_fingerprint(ps, dividend_mode: str,
         "params": build_params_snapshot(ps, dividend_mode=dividend_mode),
         "strategies": json.dumps(
             _strategy_fp_rows(ps, db), sort_keys=True, ensure_ascii=False),
+        # 公式实体（正文/引擎/跨周期口径/信号线）：只改公式不换 formula_id 时
+        # 旧指纹完全无感 → 旧持仓 + 新信号混算，故单列分项。
+        "formula": json.dumps(
+            _formula_fp(ps, db), sort_keys=True, ensure_ascii=False),
         "pool": json.dumps(_pool_fp(ps, db), sort_keys=True, ensure_ascii=False),
         "baseline": json.dumps(baseline or {}, sort_keys=True, ensure_ascii=False),
     }
@@ -794,7 +884,25 @@ def capture_seam(db: Session, session_id: int, engine, today: Optional[date] = N
                 })
         link.seam_date = today
         link.seam_cash = port.account.cash
-        link.seam_positions_json = json.dumps(positions, ensure_ascii=False)
+        # 已计入 seam_cash 的现金流水位（2026-11-16 P1）：实盘侧净值重放要并入
+        # live_cash_flows，但接缝日的流水可能已包含在 seam_cash 里。按 id 水位
+        # 右开最精确（flow_date 只有日期、created_at 是 UTC，都不可靠）。
+        flow_cursor = (
+            db.query(func.max(LiveCashFlow.id))
+            .filter(
+                LiveCashFlow.live_session_id == session_id,
+                LiveCashFlow.portfolio_strategy_id == link.portfolio_strategy_id,
+            )
+            .scalar()
+        )
+        link.seam_positions_json = json.dumps({
+            "positions": positions,
+            # 接缝游标（P0，2026-11-16）：引擎恢复完成、首轮 tick 之前的时刻。
+            # 首段重放会按它切掉接缝日的分钟 bar —— 接缝现金/持仓取自 recover
+            # 之后，已含这些 bar 驱动的成交；再全量重放当日就会重复开仓/扣现金。
+            "seam_bar_time": datetime.now(_TZ).replace(tzinfo=None).isoformat(),
+            "flow_cursor": int(flow_cursor) if flow_cursor is not None else 0,
+        }, ensure_ascii=False)
         # 起账状态来自 recover 之后的引擎（已含当日成交）；记下已计入的成交
         # 水位，重放只补该水位之后的成交，防同一笔成交被算两次。
         cursor = (
@@ -816,6 +924,77 @@ def resolve_anchor(link: LiveSessionPortfolio, cfg: Optional[dict] = None) -> bo
     if link.seam_anchor_enabled is not None:
         return bool(link.seam_anchor_enabled)
     return bool((cfg or _cfg()).get("anchor_on_live_start", True))
+
+
+def _seam_payload(raw) -> tuple:
+    """解析接缝持仓 JSON → ``(positions, seam_bar_time)``。
+
+    兼容两种存储：旧格式为纯 list（无游标 → 返回 None，行为与旧版一致）；
+    新格式 ``{"positions": [...], "seam_bar_time": "ISO 本地时间"}``。
+    """
+    if not raw:
+        return [], None
+    try:
+        data = json.loads(raw)
+    except (TypeError, ValueError):
+        return [], None
+    if isinstance(data, dict):
+        return list(data.get("positions") or []), _pdt(data.get("seam_bar_time"))
+    if isinstance(data, list):
+        return data, None
+    return [], None
+
+
+def _seam_flow_cursor(raw) -> Optional[int]:
+    """解析接缝 JSON 内的现金流水位 ``flow_cursor``（``live_cash_flows.id`` 右开）。
+
+    为什么不用 ``flow_date``/``created_at``（2026-11-16 P1）：``flow_date`` 只有日期，
+    同日流水无法区分先后；``created_at`` 是 SQLite ``func.now()`` 的 UTC 值，而接缝
+    游标是本地（Asia/Shanghai）naive 时间，直接比较有 8 小时偏差——接缝日 09:00
+    的流水会被判成「已计入」。按自增主键右开两处歧义都不存在。
+    旧接缝（无该字段）返回 None，由调用方回退到 ``flow_date > seam_date`` 并告警。
+    """
+    if not raw:
+        return None
+    try:
+        data = json.loads(raw)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    cursor = data.get("flow_cursor")
+    if cursor is None:
+        return None
+    try:
+        return int(cursor)
+    except (TypeError, ValueError):
+        return None
+
+
+def _trim_seam_day_intraday(klines: dict, seam_bar_time) -> dict:
+    """首段重放：切掉接缝日 ``datetime <= seam_bar_time`` 的**分钟级** bar。
+
+    依据（2026-11-16 P0）：``capture_seam`` 在 ``engine.recover(db)`` 之后取状态，
+    接缝现金/持仓已包含当日盘中（如 09:31–10:30）成交；若首段仍从接缝日 00:00
+    重放整日 bar，这些成交会进两次（重复开仓、重复扣现金）。日线及以上周期的
+    bar 时间戳是**周期起点**（00:00），捕获时 LiveEngine 尚未处理当日日线信号，
+    必须保留（否则首段丢掉当日 1d/1w/1mon 信号）；分钟级按游标右开切片。
+    """
+    if seam_bar_time is None:
+        return klines
+    out: dict = {}
+    for code, periods in (klines or {}).items():
+        out[code] = {}
+        for period, df in (periods or {}).items():
+            if df is None or period in _DAILY_PERIODS or "datetime" not in df.columns:
+                out[code][period] = df
+                continue
+            try:
+                sliced = df.filter(pl.col("datetime") > seam_bar_time)
+            except Exception:  # noqa: BLE001 - 数据异常时保留原样（宁可重放也不静默丢）
+                sliced = df
+            out[code][period] = sliced
+    return out
 
 
 def apply_seam_anchor(portfolio: Portfolio, seam_cash, seam_positions: List[dict]) -> None:
@@ -1022,10 +1201,37 @@ def _close_map(klines: dict) -> Dict[str, Dict[date, Decimal]]:
     return out
 
 
+def _seam_trim_cursor(link: 'LiveSessionPortfolio', db: Session,
+                      seam_bar_time: Optional[datetime]) -> Optional[datetime]:
+    """首次构建时切分「已入账 bar」的游标（2026-11-16 P0）。
+
+    优先用 v3 接缝落盘的 ``seam_bar_time``（捕获时刻）。旧接缝（纯 list 格式）没有
+    该字段，退化为「成交游标那笔成交的时间」：recover 后的基线已含游标之前的全部
+    成交，切掉此前的分钟 bar 即可避免同一笔成交进两次。两者都缺 → None（不裁剪，
+    保持旧行为，由调用方日志留痕）。
+    """
+    if seam_bar_time is not None:
+        return seam_bar_time
+    cursor = getattr(link, "seam_trade_cursor", None)
+    if cursor is None:
+        return None
+    trade = db.get(LiveTrade, cursor)
+    if trade is None or trade.trade_time is None:
+        return None
+    return trade.trade_time
+
+
 def _live_rows(db: Session, link: LiveSessionPortfolio, dates: List[date],
                closes: Dict[str, Dict[date, Decimal]]) -> Dict[date, dict]:
-    """实盘侧逐日净值：接缝基线 + live_trades 重放，按该日收盘价估值。"""
-    base = json.loads(link.seam_positions_json or "[]")
+    """实盘侧逐日净值：接缝基线 + live_trades + live_cash_flows 重放，按该日收盘价估值。
+
+    现金流（2026-11-16，P1）：旧实现只重放 ``live_trades``，出入金/分红不进现金，
+    有流水时 live 侧净值系统性偏低（进而把正常的 inc_total 判成 ``net_dev``）。
+    现金台账与成交一样按「接缝捕获之后」过滤，避免把已计入 ``seam_cash`` 的流水
+    再算一次：新接缝按 ``flow_cursor``（``live_cash_flows.id`` 右开）精确过滤；
+    旧接缝无游标，只能按 ``flow_date > seam_date`` 保守过滤并留痕。
+    """
+    base, _seam_bar_time = _seam_payload(link.seam_positions_json)
     qty: Dict[str, Decimal] = {}
     last_price: Dict[str, Decimal] = {}
     for item in base:
@@ -1065,11 +1271,42 @@ def _live_rows(db: Session, link: LiveSessionPortfolio, dates: List[date],
                 "%s 已有成交：按接缝日 00:00 重放，当日成交可能重复计入基线",
                 link.session_id, link.portfolio_strategy_id, link.seam_date)
     trades = trades_q.order_by(LiveTrade.trade_time, LiveTrade.id).all()
+    # 外部现金流台账（入金/出金/分红）：amount 有符号（>0 流入，<0 流出）。
+    flows_q = db.query(LiveCashFlow).filter(
+        LiveCashFlow.live_session_id == link.session_id,
+        LiveCashFlow.portfolio_strategy_id == link.portfolio_strategy_id,
+    )
+    flow_cursor = _seam_flow_cursor(link.seam_positions_json)
+    if flow_cursor is not None:
+        # 接缝基线的现金已含捕获时刻之前的全部流水 → 只重放之后新增的（id 右开）。
+        flows_q = flows_q.filter(LiveCashFlow.id > flow_cursor)
+    else:
+        flows_q = flows_q.filter(LiveCashFlow.flow_date > link.seam_date)
+        same_day_flow = (
+            db.query(LiveCashFlow.id)
+            .filter(
+                LiveCashFlow.live_session_id == link.session_id,
+                LiveCashFlow.portfolio_strategy_id == link.portfolio_strategy_id,
+                LiveCashFlow.flow_date == link.seam_date,
+            )
+            .first()
+        )
+        if same_day_flow is not None:
+            logger.warning(
+                "[seam] 会话 %s 组合 %s 的接缝无流水游标（旧版本）且接缝日 %s "
+                "有现金流：按 flow_date > 接缝日重放，当日流水可能漏计",
+                link.session_id, link.portfolio_strategy_id, link.seam_date)
+    flows = flows_q.order_by(LiveCashFlow.flow_date, LiveCashFlow.id).all()
     ptr = 0
+    flow_ptr = 0
     out: Dict[date, dict] = {}
     for d in dates:
         day_trades = 0
         dirs: List[str] = []
+        while flow_ptr < len(flows) and flows[flow_ptr].flow_date <= d:
+            # 现金流只改虚拟现金，不产生成交（不计入笔数/方向对账）。
+            cash += Decimal(str(flows[flow_ptr].amount or 0))
+            flow_ptr += 1
         while ptr < len(trades) and trades[ptr].trade_time.date() <= d:
             t = trades[ptr]
             amount = Decimal(str(t.amount or 0))
@@ -1179,6 +1416,7 @@ def _run_incremental_locked(db: Session, session_id: int,
     if link.seam_date is None:
         return {"status": "skipped",
                 "reason": "尚未建立接缝日（该组合未在实盘启动过）"}
+    seam_positions, seam_bar_time = _seam_payload(link.seam_positions_json)
 
     dividend_mode = cfg.get("dividend_mode", "dual")
     accounting_mode, signal_mode = _resolve_modes(dividend_mode)
@@ -1212,8 +1450,14 @@ def _run_incremental_locked(db: Session, session_id: int,
                 "[incremental] 参数/口径指纹变化 → checkpoint 作废并从接缝日重建 "
                 "(session %s, ps %s, 旧 as_of=%s)：%s",
                 session_id, ps_id, ckpt.as_of_date, "；".join(reasons))
+            # 作废 checkpoint 与随后的重建放在**同一事务**（flush 不 commit）：
+            # 旧实现先 delete+commit，若本轮重建在取数/引擎处失败（提前 return），
+            # 库里只剩空 checkpoint——旧 as_of/days/validations 不清、摘要继续按
+            # 旧口径展示。flush 立刻执行 DELETE（SQLAlchemy 同 flush 内 INSERT
+            # 先于 DELETE，不 flush 会撞 (session, ps) 唯一键），提交由本函数末尾
+            # 的事务统一完成；中途失败则回滚，旧 checkpoint 原样保留。
             db.delete(ckpt)
-            db.commit()
+            db.flush()
             ckpt = None
             state = None
 
@@ -1275,15 +1519,25 @@ def _run_incremental_locked(db: Session, session_id: int,
             )
         gap_dates = plan["gap_dates"]
         if plan["rebuild_from_seam"]:
-            # 超过补跑上限 → 标断档，并从接缝日全量重建，保证 checkpoint 之后可用
+            # 超过补跑上限 → 标断档，并从接缝日全量重建，保证 checkpoint 之后可用。
+            # 全量重建必须**丢弃旧 checkpoint 状态**（现金/持仓/在途单），只按接缝
+            # 锚点重放；否则旧 as_of 状态叠加从接缝日重放的整段 bar = 每次成交算两遍。
             klines_all = build_klines(ps, link.seam_date, today, db,
                                       dividend_mode=accounting_mode)
             run_from = link.seam_date
+            state = None
 
     if not klines_all:
         return {"status": "skipped", "reason": "无可用 K 线数据（今日 bar 未落盘？）"}
 
     klines = _slice_klines_from(klines_all, run_from)
+    if state is None:
+        # 首次构建（或断档全量重建）：接缝现金/持仓取自 engine.recover 之后，已含
+        # 接缝日盘中成交；切掉游标之前的分钟 bar，防同一笔成交进两次（见
+        # _trim_seam_day_intraday / _seam_trim_cursor）。日线及以上周期不受影响
+        # （保留当日信号）。
+        klines = _trim_seam_day_intraday(
+            klines, _seam_trim_cursor(link, db, seam_bar_time))
     if continue_intraday and as_of_bar is not None:
         # 同一交易日续跑：游标之前的 bar 已经驱动过信号/风控/成交，绝不重放
         klines = _slice_klines_after(klines, as_of_bar)
@@ -1299,9 +1553,7 @@ def _run_incremental_locked(db: Session, session_id: int,
     portfolio = assemble_portfolio(ps, strategies, db)
     if state is None:
         if resolve_anchor(link, cfg):
-            apply_seam_anchor(
-                portfolio, link.seam_cash,
-                json.loads(link.seam_positions_json or "[]"))
+            apply_seam_anchor(portfolio, link.seam_cash, seam_positions)
         pending: List[OrderEvent] = []
     else:
         pending = restore_portfolio(portfolio, state)
@@ -1309,7 +1561,14 @@ def _run_incremental_locked(db: Session, session_id: int,
     result = BacktestEngine().run(
         portfolio, klines=klines, signal_cache=signal_cache,
         initial_pending_orders=pending,
-        stock_names=_pool_stock_names(ps, db))
+        stock_names=_pool_stock_names(ps, db),
+        # 涨跌停基准按「(代码, 交易日) 前收」显式传入：续跑首段从接缝日/游标起，
+        # 引擎内部按本次 klines 现推会缺前收（首根 fail-open），用全量 klines_all
+        # 推出的前收表保证与全量回测同一口径。
+        prev_close_by_day=build_prev_close_by_day(klines_all),
+        # 在途单最大存活期（交易日；缺键=20，<=0 不限）：与全量回测同一配置项，
+        # 防止停牌/连板单跨段无限顺延。
+        pending_order_max_days=int(cfg.get("pending_order_max_days", 20)))
 
     snaps = result.get("snapshots") or []
     if not snaps:
@@ -1474,20 +1733,29 @@ def run_validation(db: Session, session_id: int, ps_id: int,
         dividend_mode = cfg.get("dividend_mode", "dual")
         accounting_mode, signal_mode = _resolve_modes(dividend_mode)
         try:
+            seam_positions, seam_bar_time = _seam_payload(link.seam_positions_json)
             klines_all = build_klines(ps, from_date, to_date, db,
                                       dividend_mode=accounting_mode)
             klines = _slice_klines_from(klines_all, from_date)
+            # 与续跑首段同口径：从接缝日全量重算时，接缝日游标之前的分钟 bar 已计入
+            # 接缝基线（seam_cash/seam_positions），必须一并切掉，否则对账两侧基线
+            # 不同源（一侧含盘中成交、一侧重复成交），永远对不上。
+            klines = _trim_seam_day_intraday(
+                klines, _seam_trim_cursor(link, db, seam_bar_time))
+            if not klines:
+                return {"status": "skipped",
+                        "reason": "接缝游标已覆盖区间内全部 K 线，无需校验"}
             signal_cache = build_signal_cache(
                 ps, klines_all, db, start=from_date,
                 dividend_mode=signal_mode)
             portfolio = assemble_portfolio(ps, strategies, db)
             if resolve_anchor(link, cfg):
-                apply_seam_anchor(
-                    portfolio, link.seam_cash,
-                    json.loads(link.seam_positions_json or "[]"))
+                apply_seam_anchor(portfolio, link.seam_cash, seam_positions)
             result = BacktestEngine().run(
                 portfolio, klines=klines, signal_cache=signal_cache,
-                stock_names=_pool_stock_names(ps, db))
+                stock_names=_pool_stock_names(ps, db),
+                prev_close_by_day=build_prev_close_by_day(klines_all),
+                pending_order_max_days=int(cfg.get("pending_order_max_days", 20)))
         except Exception as exc:  # noqa: BLE001 — 校验失败要留痕，不吞
             logger.exception("incremental validation failed")
             row = IncrementalBacktestValidation(

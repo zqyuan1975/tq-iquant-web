@@ -15,10 +15,10 @@ from core.engine.position import Position
 from core.engine.risk_manager import PortfolioRiskManager
 from core.engine.strategy_context import StrategyContext
 from core.models import (
-    Base, FormulaSignal, IncrementalBacktestCheckpoint, IncrementalBacktestDay,
-    LiveAccountPositionSnapshot, LiveAccountSnapshot,
-    LiveSession, LiveSessionPortfolio, LiveTrade, PortfolioStrategy, StockPool,
-    StockPoolStock, Strategy,
+    Base, Formula, FormulaSignal, IncrementalBacktestCheckpoint,
+    IncrementalBacktestDay, LiveAccountPositionSnapshot, LiveAccountSnapshot,
+    LiveCashFlow, LiveSession, LiveSessionPortfolio, LiveTrade,
+    PortfolioStrategy, StockPool, StockPoolStock, Strategy,
 )
 from tq_iquant_shared.constants import SignalType, TradeType
 
@@ -149,7 +149,7 @@ def test_capture_seam_writes_baseline_once(db_session):
     db_session.refresh(link)
     assert link.seam_date == date.today()
     assert Decimal(str(link.seam_cash)) == Decimal("80000")
-    seeded = json.loads(link.seam_positions_json)
+    seeded, seam_bar_time = ib._seam_payload(link.seam_positions_json)
     assert seeded[0]["stock_code"] == "000001.SZ"
     assert seeded[0]["highest_price"] == "10"
 
@@ -183,7 +183,7 @@ def test_capture_seam_seeds_peak_from_prior_snapshot(db_session):
 
     ib.capture_seam(db_session, sess.id, _FakeEngine([port]))
     db_session.refresh(link)
-    seeded = json.loads(link.seam_positions_json)
+    seeded, seam_bar_time = ib._seam_payload(link.seam_positions_json)
     assert Decimal(seeded[0]["highest_price"]) == Decimal("10.83")
 
 
@@ -199,7 +199,7 @@ def test_capture_seam_ignores_stale_snapshot_peak(db_session):
 
     ib.capture_seam(db_session, sess.id, _FakeEngine([port]))
     db_session.refresh(link)
-    seeded = json.loads(link.seam_positions_json)
+    seeded, seam_bar_time = ib._seam_payload(link.seam_positions_json)
     assert Decimal(seeded[0]["highest_price"]) == Decimal("10")
 
 
@@ -232,7 +232,7 @@ def test_capture_seam_skips_empty_snapshot_for_prior_peak(db_session):
 
     ib.capture_seam(db_session, sess.id, _FakeEngine([port]))
     db_session.refresh(link)
-    seeded = json.loads(link.seam_positions_json)
+    seeded, seam_bar_time = ib._seam_payload(link.seam_positions_json)
     assert Decimal(seeded[0]["highest_price"]) == Decimal("10.83")
 
 
@@ -248,7 +248,7 @@ def test_capture_seam_falls_back_to_cost_with_warning(db_session, caplog):
     with caplog.at_level(logging.WARNING):
         ib.capture_seam(db_session, sess.id, _FakeEngine([port]))
     db_session.refresh(link)
-    seeded = json.loads(link.seam_positions_json)
+    seeded, seam_bar_time = ib._seam_payload(link.seam_positions_json)
     assert Decimal(seeded[0]["highest_price"]) == Decimal("10")
     assert any("无任何含有效持仓的账户快照" in r.getMessage()
                for r in caplog.records)
@@ -958,3 +958,277 @@ def test_apply_validation_marks_clears_stale_validation_fail(db_session):
     assert "validation_fail" in json.loads(rows[1].tags_json)
     assert "validation_fail" in json.loads(rows[2].tags_json)
     assert rows[2].status == "gap"
+
+
+# ===========================================================================
+# 2026-11-16 核查修复（P0/P1）：接缝日内游标、冷静期、公式指纹、现金流重放、
+# checkpoint 作废事务
+# ===========================================================================
+def test_capture_seam_records_bar_time_cursor(db_session):
+    """接缝基线必须记下捕获时刻（seam_bar_time），供首次构建切掉已入账 bar。"""
+    sess, ps, link = _seed_live_link(db_session)
+    port = _make_portfolio(cash="80000", strategy_id=1)
+
+    ib.capture_seam(db_session, sess.id, _FakeEngine([port]), today=date(2026, 1, 8))
+    db_session.refresh(link)
+    positions, seam_bar_time = ib._seam_payload(link.seam_positions_json)
+    assert positions == []
+    assert seam_bar_time is not None
+    raw = json.loads(link.seam_positions_json)
+    assert isinstance(raw, dict) and "seam_bar_time" in raw
+    # 现金流游标（P1）：无流水时为 0；供 _live_rows 按 id 右开重放
+    assert raw["flow_cursor"] == 0
+    assert ib._seam_flow_cursor(link.seam_positions_json) == 0
+
+
+def test_seam_flow_cursor_parses_and_tolerates_legacy():
+    """旧接缝/坏数据无 flow_cursor → None（调用方回退 flow_date 过滤并告警）。"""
+    assert ib._seam_flow_cursor(None) is None
+    assert ib._seam_flow_cursor("not-json") is None
+    assert ib._seam_flow_cursor(json.dumps([{"stock_code": "x"}])) is None
+    assert ib._seam_flow_cursor(json.dumps({"positions": []})) is None
+    assert ib._seam_flow_cursor(json.dumps({"flow_cursor": 12})) == 12
+
+
+def test_seam_payload_parses_legacy_list_format():
+    """旧接缝（纯 list）仍可解析：positions 正常、游标 None（调用方按成交游标兜底）。"""
+    old = [{"stock_code": "000001.SZ", "quantity": 1000, "avg_cost": "10"}]
+    positions, bar_time = ib._seam_payload(json.dumps(old))
+    assert positions == old
+    assert bar_time is None
+    # 空/坏数据不抛异常
+    assert ib._seam_payload(None) == ([], None)
+    assert ib._seam_payload("not-json") == ([], None)
+
+
+def test_trim_seam_day_intraday_cuts_bars_at_or_before_cursor():
+    """接缝日游标之前的分钟 bar 被切掉；日线及以上完整保留（当日信号照跑）。"""
+    day = date(2026, 1, 5)
+    kl = {
+        "000001.SZ": {
+            "5m": pl.DataFrame([
+                {"datetime": datetime(2026, 1, 5, 9, 35), "Close": Decimal("10")},
+                {"datetime": datetime(2026, 1, 5, 10, 30), "Close": Decimal("10")},
+                {"datetime": datetime(2026, 1, 5, 11, 30), "Close": Decimal("10")},
+                {"datetime": datetime(2026, 1, 6, 9, 35), "Close": Decimal("10")},
+            ]),
+            "1d": pl.DataFrame([
+                {"datetime": datetime(2026, 1, 5), "Close": Decimal("10")},
+            ]),
+        }
+    }
+    out = ib._trim_seam_day_intraday(kl, datetime(2026, 1, 5, 10, 30))
+    times = out["000001.SZ"]["5m"]["datetime"].to_list()
+    assert times == [datetime(2026, 1, 5, 11, 30), datetime(2026, 1, 6, 9, 35)]
+    # 日线保留（周期起点 00:00 早于游标，但捕获时 LiveEngine 尚未处理当日日线）
+    assert out["000001.SZ"]["1d"]["datetime"].to_list() == [datetime(2026, 1, 5)]
+
+
+def test_state_roundtrip_preserves_risk_cooldown():
+    """风控冷静期（(策略, 代码) → 卖出日）必须随 checkpoint 续跑，否则全量会拦的
+    回买在续跑段直接成交。"""
+    port = _make_portfolio()
+    port._risk_cooldown[(1, "000001.SZ")] = date(2026, 1, 6)
+
+    payload = ib.state_payload(port, date(2026, 1, 6))
+    json.dumps(payload, ensure_ascii=False)
+    assert payload["risk_cooldown"] == {"1|000001.SZ": "2026-01-06"}
+
+    fresh = _make_portfolio()
+    ib.restore_portfolio(fresh, payload)
+    assert fresh._risk_cooldown[(1, "000001.SZ")] == date(2026, 1, 6)
+
+
+def test_schema_version_bumped_to_3_for_formula_and_cooldown(db_session):
+    """SCHEMA_VERSION=3：旧 checkpoint 一律判废（不自动迁移/修补）。"""
+    assert ib.SCHEMA_VERSION == 3
+    sess, ps, link = _seed_live_link(db_session)
+    assert not ib.checkpoint_valid(
+        "whatever", "", 2, "whatever", ib.schema_fingerprint("dual"))
+
+
+def test_formula_content_change_invalidates_params_hash(db_session):
+    """公式正文/引擎/跨周期口径/信号线变化必须改变参数指纹（旧指纹只看 id）。"""
+    sess, ps, link = _seed_live_link(db_session)
+    formula = Formula(id=1, name="f", content="C>MA(C,20)", formula_count=200,
+                      engine="builtin", no_leak_cross=False)
+    db_session.add(formula)
+    db_session.add(FormulaSignal(formula_id=1, signal_name="open_sig",
+                                 signal_type="OPEN", trigger_value=1))
+    db_session.commit()
+    base = ib.params_hash(ps, "dual", db_session)
+
+    formula.content = "C>MA(C,60)"
+    db_session.commit()
+    assert ib.params_hash(ps, "dual", db_session) != base
+    formula.content = "C>MA(C,20)"
+    db_session.commit()
+    assert ib.params_hash(ps, "dual", db_session) == base
+
+    formula.engine = "tq"
+    db_session.commit()
+    assert ib.params_hash(ps, "dual", db_session) != base
+    formula.engine = "builtin"
+    db_session.commit()
+
+    formula.no_leak_cross = True
+    db_session.commit()
+    assert ib.params_hash(ps, "dual", db_session) != base
+    formula.no_leak_cross = False
+    db_session.commit()
+    assert ib.params_hash(ps, "dual", db_session) == base
+
+    sig = db_session.query(FormulaSignal).filter_by(formula_id=1).first()
+    sig.trigger_value = 2
+    db_session.commit()
+    assert ib.params_hash(ps, "dual", db_session) != base
+
+
+def test_live_rows_replays_cash_flows_after_seam(db_session):
+    """实盘侧重放并出入金/分红：seam 之后的现金流按日累加进虚拟现金。
+
+    修复前只看 live_trades，入金 5000 / 出金 3000 都不进现金 → live 净值系统性
+    偏低（100000 vs 102000），正常的 inc 侧被误判成 net_dev。
+    """
+    sess, ps, link = _seed_live_link(db_session)
+    link.seam_date = date(2026, 1, 5)
+    link.seam_cash = Decimal("100000")
+    link.seam_positions_json = "[]"
+    db_session.add_all([
+        LiveCashFlow(live_session_id=sess.id, portfolio_strategy_id=ps.id,
+                     flow_type="deposit", amount=Decimal("5000"),
+                     flow_date=date(2026, 1, 6)),
+        LiveCashFlow(live_session_id=sess.id, portfolio_strategy_id=ps.id,
+                     flow_type="withdraw", amount=Decimal("-3000"),
+                     flow_date=date(2026, 1, 7)),
+        LiveCashFlow(live_session_id=sess.id, portfolio_strategy_id=ps.id,
+                     flow_type="dividend", amount=Decimal("500"),
+                     flow_date=date(2026, 1, 8)),
+    ])
+    db_session.commit()
+
+    days = [date(2026, 1, 5), date(2026, 1, 6), date(2026, 1, 7), date(2026, 1, 8)]
+    rows = ib._live_rows(db_session, link, days, {})
+    assert Decimal(str(rows[date(2026, 1, 5)]["total_value"])) == Decimal("100000")
+    assert Decimal(str(rows[date(2026, 1, 6)]["total_value"])) == Decimal("105000")
+    assert Decimal(str(rows[date(2026, 1, 7)]["total_value"])) == Decimal("102000")
+    assert Decimal(str(rows[date(2026, 1, 8)]["total_value"])) == Decimal("102500")
+
+
+def test_live_rows_skips_flows_at_or_below_flow_cursor(db_session):
+    """flow_cursor 右开：接缝前已计入 seam_cash 的流水不再重放（同日也不重复）。
+
+    依据：``flow_date`` 只有日期、``created_at`` 是 SQLite 的 UTC 值（与本地
+    seam_bar_time 差 8 小时），都不能判定「接缝当日的流水是否已入账」；按自增
+    id 右开唯一无歧义。这里让接缝游标落在第 2 笔之后，第 1/2 笔即使 flow_date
+    等于/晚于接缝日也必须跳过。
+    """
+    sess, ps, link = _seed_live_link(db_session)
+    link.seam_date = date(2026, 1, 5)
+    link.seam_cash = Decimal("100000")  # 已含前两笔流水
+    db_session.add_all([
+        LiveCashFlow(live_session_id=sess.id, portfolio_strategy_id=ps.id,
+                     flow_type="deposit", amount=Decimal("5000"),
+                     flow_date=date(2026, 1, 5)),
+        LiveCashFlow(live_session_id=sess.id, portfolio_strategy_id=ps.id,
+                     flow_type="dividend", amount=Decimal("500"),
+                     flow_date=date(2026, 1, 6)),
+    ])
+    db_session.commit()
+    flow_cursor = (
+        db_session.query(LiveCashFlow).order_by(LiveCashFlow.id.desc()).first().id
+    )
+    link.seam_positions_json = json.dumps({
+        "positions": [],
+        "seam_bar_time": "2026-01-06T10:30:00",
+        "flow_cursor": int(flow_cursor),
+    })
+    # 接缝之后新增的流水：与接缝前第二笔同一天（1/6）也必须计入。
+    db_session.add_all([
+        LiveCashFlow(live_session_id=sess.id, portfolio_strategy_id=ps.id,
+                     flow_type="deposit", amount=Decimal("1000"),
+                     flow_date=date(2026, 1, 6)),
+        LiveCashFlow(live_session_id=sess.id, portfolio_strategy_id=ps.id,
+                     flow_type="withdraw", amount=Decimal("-200"),
+                     flow_date=date(2026, 1, 7)),
+    ])
+    db_session.commit()
+
+    days = [date(2026, 1, 5), date(2026, 1, 6), date(2026, 1, 7)]
+    rows = ib._live_rows(db_session, link, days, {})
+    assert Decimal(str(rows[date(2026, 1, 5)]["total_value"])) == Decimal("100000")
+    assert Decimal(str(rows[date(2026, 1, 6)]["total_value"])) == Decimal("101000")
+    assert Decimal(str(rows[date(2026, 1, 7)]["total_value"])) == Decimal("100800")
+
+
+def test_invalidated_checkpoint_not_deleted_when_rebuild_fails(db_session, monkeypatch):
+    """作废 checkpoint 与重建必须同一事务：重建失败时旧 checkpoint 原样保留。"""
+    sess, ps, link = _seed_live_link(db_session)
+    link.seam_date = date(2026, 1, 5)
+    db_session.add(IncrementalBacktestCheckpoint(
+        session_id=sess.id, portfolio_strategy_id=ps.id,
+        seam_date=date(2026, 1, 5), as_of_date=date(2026, 1, 6),
+        state_json=json.dumps({"schema": 2, "as_of_date": "2026-01-06"}),
+        params_hash="old-hash", schema_version=2))
+    db_session.commit()
+
+    def _boom(*a, **k):
+        raise RuntimeError("TQ down")
+
+    monkeypatch.setattr(ib, "build_klines", _boom)
+    with pytest.raises(RuntimeError):
+        ib.run_incremental(db_session, sess.id, ps.id, today=date(2026, 1, 8))
+    db_session.rollback()
+
+    ckpt = (
+        db_session.query(IncrementalBacktestCheckpoint)
+        .filter_by(session_id=sess.id, portfolio_strategy_id=ps.id)
+        .first()
+    )
+    assert ckpt is not None
+    assert ckpt.schema_version == 2
+    assert ckpt.as_of_date == date(2026, 1, 6)
+
+
+def test_hour_period_last_bar_1500_marks_day_complete(db_session, monkeypatch):
+    """A7 验证：1h 周期末根 bar 时间戳为 15:00（TDX 60m 标注为桶终点），
+    ≥ _DAY_LAST_BAR_TIME(14:55) → day_complete=True，不会每 60s 空跑整夜。"""
+    sess, ps, link, strat = _seed_minute_link(db_session, period="1h")
+    day = date(2026, 1, 5)
+    rows = [
+        {"datetime": datetime(2026, 1, 5, h, m),
+         "Open": Decimal("10"), "High": Decimal("10"),
+         "Low": Decimal("10"), "Close": Decimal("10"), "Volume": 100000}
+        for h, m in ((10, 30), (11, 30), (14, 0), (15, 0))
+    ]
+    monkeypatch.setattr(
+        ib, "build_klines", lambda *a, **k: {"000001.SZ": {"1h": pl.DataFrame(rows)}})
+    monkeypatch.setattr(
+        ib, "build_signal_cache",
+        lambda *a, **k: _minute_sig_cache(strat.id, [datetime(2026, 1, 5, 10, 30)]))
+
+    result = ib.run_incremental(db_session, sess.id, ps.id, today=day)
+    assert result["status"] == "ok"
+    state = _ckpt_state(db_session, sess, ps)
+    assert state["day_complete"] is True
+    assert state["as_of_bar_time"] == "2026-01-05T15:00:00"
+
+
+def test_klines_from_handoff_drops_halted_flat_volume0_bars():
+    """DailyCloser 交接日线同样剔除停牌补行（OHLC=前收、Volume=0），与取数层同源。"""
+    rows = [
+        {"stime": "20260105000000", "open": "10.2", "high": "10.2",
+         "low": "10.2", "close": "10.2", "volume": "800"},
+        {"stime": "20260106000000", "open": "10.2", "high": "10.2",
+         "low": "10.2", "close": "10.2", "volume": "0"},   # 停牌补行
+        {"stime": "20260107000000", "open": "10.5", "high": "10.9",
+         "low": "10.3", "close": "10.8", "volume": "1200"},
+        {"stime": "20260108000000", "open": "10.8", "high": "10.8",
+         "low": "10.8", "close": "10.8", "volume": "0"},   # 停牌补行
+    ]
+    out = ib._klines_from_handoff({"000001.SZ": rows})
+    df = out["000001.SZ"]["1d"]
+    assert df["datetime"].to_list() == [
+        datetime(2026, 1, 5), datetime(2026, 1, 7)]
+    assert df["Volume"].to_list() == [800, 1200]
+

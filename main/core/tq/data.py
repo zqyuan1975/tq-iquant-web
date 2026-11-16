@@ -48,6 +48,57 @@ def strip_lunch_phantom(raw: Optional[dict], period: str) -> Optional[dict]:
     return out if changed else raw
 
 
+def no_trade_bar_mask(
+    opens: List, highs: List, lows: List, closes: List, volumes: List,
+) -> List[bool]:
+    """识别 ``fill_data=True`` 用上一根收盘补出的「无成交 bar」（停牌/上市前）。
+
+    背景（2026-11-16 P0 核查）：``get_market_data(fill_data=True)`` 遇到停牌/未上市
+    区间会用「上一根 bar 收盘」补行——OHLC 四价全等于前收、Volume=0，价格 >0，
+    因此不会被「Open/Close<=0」的伪影过滤拦下。这类假 bar 一旦进入回测价格索引，
+    停牌日照样成交、照估值、照推进日快照（假收益/假回撤/假换手）。
+
+    判据（与审计口径一致，纯函数便于单测）：
+      - ``Volume == 0`` 且四价完全相同（contains no trade）；
+      - 且该价格等于**上一根有效 bar 收盘**（carry-forward，停牌中段），
+        或无前收时等于**下一根有效 bar 收盘**（上市前回填）。
+    真实一字板/低成交日的 Volume > 0，不会命中；指数行情（Volume 常为 0）
+    不调用本函数（只在个股 klines 转换时使用）。
+
+    返回与输入等长的布尔列表，True = 无成交 bar，应整行剔除。
+    """
+    n = len(closes)
+    mask = [False] * n
+    flat_vol0: List[bool] = []
+    for i in range(n):
+        o, h, l, c, v = opens[i], highs[i], lows[i], closes[i], volumes[i]
+        try:
+            is_flat = (
+                o is not None and c is not None and o > 0
+                and o == h and o == l and o == c
+                and v is not None and v == 0
+            )
+        except TypeError:
+            is_flat = False
+        flat_vol0.append(bool(is_flat))
+
+    prev_close = None
+    for i in range(n):
+        if flat_vol0[i] and prev_close is not None and closes[i] == prev_close:
+            mask[i] = True
+        if not flat_vol0[i] and closes[i] is not None and closes[i] > 0:
+            prev_close = closes[i]
+
+    next_close = None
+    for i in range(n - 1, -1, -1):
+        if flat_vol0[i] and not mask[i] and next_close is not None \
+                and closes[i] == next_close:
+            mask[i] = True
+        if not flat_vol0[i] and not mask[i] and closes[i] is not None and closes[i] > 0:
+            next_close = closes[i]
+    return mask
+
+
 class TQData:
     def __init__(self):
         # 最近一次 get_history_raw 因行情数据异常被跳过的股票代码。
@@ -290,7 +341,21 @@ class TQData:
                             if col in df and code in df[col].columns:
                                 series[col] = df[col][code]
                         if series:
-                            result[code][period] = pl.DataFrame(series)
+                            # 无成交 bar（fill_data 补出的停牌/上市前假行）整行剔除：
+                            # 见 no_trade_bar_mask 的判据与依据。
+                            frame = pl.DataFrame(series)
+                            if "Volume" in series:
+                                mask = no_trade_bar_mask(
+                                    series["Open"].to_list(),
+                                    series["High"].to_list(),
+                                    series["Low"].to_list(),
+                                    series["Close"].to_list(),
+                                    series["Volume"].to_list(),
+                                )
+                                if any(mask):
+                                    frame = frame.filter(
+                                        pl.Series([not m for m in mask]))
+                            result[code][period] = frame
                     except Exception as e:
                         # 静默丢弃会让回测/试算少一只股票且不可复现——异常必须可见。
                         logger.warning(

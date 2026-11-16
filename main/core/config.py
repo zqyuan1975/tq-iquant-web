@@ -266,6 +266,14 @@ def _defaults() -> dict:
             # → 限价 = 当日首根 1m bar 开盘价（夹涨跌停、quantize 到分）；True →
             # 不按首根 open 定价，改用通道默认对手价，优先成交而非价格可复现。
             "deferred_release_ensure_fill": False,
+            # 键鼠类通道（tdx/ths）互斥：False（默认）＝软拦，未带
+            # ack_keyboard_risk 的启动请求返回 409 要求确认，带 ack 放行并留痕；
+            # True ＝ 硬拦，检测到冲突一律 409（ack 也不放行）。
+            "keyboard_conflict_hard_block": False,
+            # H2 参数绑定漂移：False（默认）＝绑定了回测记录的会话启动时若组合参数
+            # 与 params_snapshot 不一致，只 WARNING + 决策事件（gate=params_drift）；
+            # True ＝ 升级为 409 阻断启动（需先对齐参数）。
+            "params_drift_block": False,
         },
         # 接缝续跑式增量回测：组合策略从接缝日（进入实盘那天）接着往后延，
         # 每天只跑新交易日，与实盘逐日对照；结果按特征级容差与全量重跑对齐。

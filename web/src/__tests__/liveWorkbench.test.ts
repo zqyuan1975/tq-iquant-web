@@ -8,6 +8,7 @@ import {
   isSessionActive, resolvedSessionEngine, engineOccupants, engineOccupiedText,
   multiAccountBannerText, keyboardConflictOpponents, parseStartConflict,
   baselineResetAllowed, shortAccountKey, formatMoney2, BASELINE_RESET_BLOCKED_REASON,
+  paramsDriftLines, paramFieldLabel, formatParamValue,
   type SessionOccupancy,
 } from '../utils/liveWorkbench'
 
@@ -474,6 +475,52 @@ describe('liveWorkbench', () => {
       expect(formatMoney2(300000)).toBe('300,000.00')
       expect(formatMoney2(null)).toBe('—')
       expect(formatMoney2(Number.NaN)).toBe('—')
+    })
+  })
+
+  describe('参数漂移（params_drift）', () => {
+    it('字段名翻译：已知字段中文，未知字段回退英文 key', () => {
+      expect(paramFieldLabel('max_drawdown')).toBe('最大回撤')
+      expect(paramFieldLabel('unknown_field')).toBe('unknown_field')
+    })
+
+    it('比例字段按百分比展示，其余原样，空值显示「空」', () => {
+      expect(formatParamValue('max_drawdown', '0.2')).toBe('20%')
+      expect(formatParamValue('max_holdings', '10')).toBe('10')
+      expect(formatParamValue('equity_cap', null)).toBe('空')
+    })
+
+    it('diff 行：快照值 → 当前值；未漂移/无字段返回空数组', () => {
+      expect(paramsDriftLines({
+        drifted: true, checked: true,
+        fields: [
+          { field: 'max_drawdown', snapshot: '0.2', current: '0.25' },
+          { field: 'max_holdings', snapshot: '10', current: '8' },
+        ],
+      })).toEqual(['最大回撤：20% → 25%', '最大持仓数：10 → 8'])
+      expect(paramsDriftLines({ drifted: false, checked: true, fields: [] })).toEqual([])
+      expect(paramsDriftLines(null)).toEqual([])
+    })
+
+    it('start 409 rule=params_drift：中文重排并附带阻断说明', () => {
+      const err = new Error('blocked') as Error & { response: unknown }
+      err.response = {
+        data: {
+          message: '组合参数与回测记录 #7 不一致：max_drawdown',
+          data: {
+            rule: 'params_drift', backtest_record_id: 7,
+            fields: [{ field: 'max_drawdown', snapshot: '0.2', current: '0.25' }],
+          },
+        },
+      }
+      const info = parseStartConflict(err)
+      expect(info.rule).toBe('params_drift')
+      expect(info.message).toContain('参数漂移阻断')
+      expect(info.message).toContain('回测快照 #7')
+      expect(info.message).toContain('最大回撤')
+      expect(info.message).toContain('params_drift_block=true')
+      // 不再露英文 key
+      expect(info.message).not.toContain('max_drawdown')
     })
   })
 })

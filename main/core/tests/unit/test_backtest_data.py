@@ -1613,3 +1613,47 @@ def test_build_signal_cache_builtin_macd_momentum_crossweek(db_session, monkeypa
     assert cache
     values = [v["value"] for lst in cache.values() for v in lst]
     assert any(v != 0 for v in values), "周 DIF 回升段应至少出现一次金叉信号"
+
+
+# ---------------------------------------------------------------------------
+# P0（2026-11-16）：fill_data 补出的无成交假 bar（OHLC=前收、Volume=0）不进 klines
+# ---------------------------------------------------------------------------
+def _fake_bar_raw():
+    import pandas as pd
+    ts = [datetime(2026, 7, 29), datetime(2026, 7, 30),
+          datetime(2026, 7, 31), datetime(2026, 8, 3)]
+    # 7/30、7/31 停牌：四价全等于 7/29 收盘 10.2、Volume=0（fill_data 补行）
+    cols = {
+        "Open": [10.0, 10.2, 10.2, 11.0],
+        "High": [10.4, 10.2, 10.2, 11.5],
+        "Low": [9.9, 10.2, 10.2, 10.8],
+        "Close": [10.2, 10.2, 10.2, 11.2],
+        "Volume": [1000, 0, 0, 1500],
+        "Amount": [10000.0, 0.0, 0.0, 16500.0],
+    }
+    return ts, {k: pd.DataFrame({"000001.SZ": v}, index=ts) for k, v in cols.items()}
+
+
+def test_convert_market_data_drops_halted_flat_volume0_bars():
+    """停牌补行整行剔除：不参与成交/估值/日快照（修复前停牌日照样成交）。"""
+    ts, raw = _fake_bar_raw()
+    out = svc._convert_market_data(raw, ["000001.SZ"], ["1d"])
+    df = out["000001.SZ"]["1d"]
+    assert df["datetime"].to_list() == [ts[0], ts[3]]
+    assert df["Volume"].to_list() == [1000, 1500]
+
+
+def test_convert_market_data_keeps_real_one_word_limit_board():
+    """真实一字板 Volume>0 且价格变动 → 保留（不误伤）。"""
+    import pandas as pd
+    ts = [datetime(2026, 7, 29), datetime(2026, 7, 30)]
+    raw = {
+        "Open": pd.DataFrame({"000001.SZ": [10.0, 11.0]}, index=ts),
+        "High": pd.DataFrame({"000001.SZ": [10.5, 11.0]}, index=ts),
+        "Low": pd.DataFrame({"000001.SZ": [9.8, 11.0]}, index=ts),
+        "Close": pd.DataFrame({"000001.SZ": [10.0, 11.0]}, index=ts),
+        "Volume": pd.DataFrame({"000001.SZ": [1000, 300]}, index=ts),
+        "Amount": pd.DataFrame({"000001.SZ": [10000.0, 3300.0]}, index=ts),
+    }
+    out = svc._convert_market_data(raw, ["000001.SZ"], ["1d"])
+    assert out["000001.SZ"]["1d"]["datetime"].to_list() == ts

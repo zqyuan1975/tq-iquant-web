@@ -49,6 +49,54 @@ _RISK_SELL_TYPES = frozenset({
     SignalType.STOP_LOSS, SignalType.TAKE_PROFIT, SignalType.TRAILING_STOP,
 })
 
+# 在途单最大存活期（交易日，2026-11-16 核查修复）：停牌/连板时 deferred 单会被
+# 无上限地顺延，几个月后恢复交易仍按当日 open 成交——等于凭空补做一笔早已过期的
+# 决策，且与实盘不一致（实盘由超时撤单/次日重排兜底，不会挂几个月）。
+# 默认 20 个交易日：约一个月，覆盖停牌复牌、连续涨跌停的常见持续期，又不至于把
+# 长期停牌票的过期信号永久留在队列。<=0 = 不限制（恢复旧行为）。
+PENDING_ORDER_MAX_DAYS = 20
+
+
+def build_prev_close_by_day(klines: dict) -> Dict[tuple, Decimal]:
+    """按 ``(code, 交易日)`` 预计算「上一交易日最后一根 bar 的收盘」（任意周期）。
+
+    依据（2026-11-16 P1 核查修复）：涨跌停价 = 前收 ×(1±幅度)，前收必须是**上一
+    交易日收盘**且日内恒定。旧实现键为 ``(code, period)`` 并在每根 bar 收盘后覆写：
+    5m/15m/30m/1h 策略当日第二根起「前收」变成上一根同周期收盘 → 涨停价≈1.1×
+    5 分钟前收盘，封板买、跌停卖都能成交。
+
+    口径：
+      - 每个交易日取「该日最晚时间戳的收盘」（细→粗遍历，同时间戳取先遇到者）——
+        日线 00:00 的周期末价与分钟 bar 同日时以分钟 bar 为准；纯周/月线没有分钟
+        bar，取该周期末价即真实收盘。
+      - 停牌日无 bar → 自然回落到更早的「上一有效交易日」收盘（与本条修复
+        「停牌不成交」口径一致）。
+    """
+    day_closes: Dict[str, Dict[date, tuple]] = {}
+    for _code, _periods in klines.items():
+        per_day: Dict[date, tuple] = {}
+        for _period in sorted((_periods or {}).keys(),
+                              key=lambda p: _PERIOD_ORDER.get(p, 99)):
+            _df = _periods.get(_period)
+            if _df is None or "datetime" not in _df.columns:
+                continue
+            for _dt, _close in zip(_df["datetime"].to_list(), _df["Close"].to_list()):
+                if _dt is None or _close is None or _close <= 0:
+                    continue
+                _d = _dt.date()
+                _prev = per_day.get(_d)
+                if _prev is None or _dt > _prev[0]:
+                    per_day[_d] = (_dt, _close)
+        if per_day:
+            day_closes[_code] = per_day
+
+    result: Dict[tuple, Decimal] = {}
+    for _code, per_day in day_closes.items():
+        _days = sorted(per_day.keys())
+        for _i in range(1, len(_days)):
+            result[(_code, _days[_i])] = per_day[_days[_i - 1]][1]
+    return result
+
 
 class BacktestEngine:
     def run(
@@ -61,6 +109,8 @@ class BacktestEngine:
         daily_close_peak_enabled: bool = False,
         initial_pending_orders: Optional[List[OrderEvent]] = None,
         stock_names: Optional[dict] = None,
+        prev_close_by_day: Optional[Dict[tuple, Decimal]] = None,
+        pending_order_max_days: int = PENDING_ORDER_MAX_DAYS,
     ) -> dict:
         """逐 bar 回测主链路。
 
@@ -79,6 +129,13 @@ class BacktestEngine:
         stock_names：{stock_code: 证券名称}（默认 None=无名称）。涨跌停幅度与实盘
         同源（``price_limit.resolve_limit_rule``）：名称含 ST/*ST 的股票按 5%（主板）
         判定，缺名称时按板块常规幅度（偏宽）。回测无可靠上市日期，新股窗口不生效。
+        prev_close_by_day：可选外部注入的 {(code, 交易日): 上一交易日最后一根收盘}。
+        为 None 时由本段 klines 预计算；增量续跑传入「未切片」的全区间 klines
+        结果，避免续跑首日缺前收（否则该日涨跌停校验整体 fail-open）。
+        pending_order_max_days：在途单最大存活期（交易日，默认
+        ``PENDING_ORDER_MAX_DAYS``=20，<=0 不限）。超期单在本 bar 记
+        ``gate=pending_order_expired`` 决策事件后作废（不再回队），防停牌/连板
+        无限顺延后在几个月后按恢复日开盘价「补做」早已过期的决策。依据见常量注释。
         """
         klines = klines or {}
         signal_cache = signal_cache if signal_cache is not None else {}
@@ -92,14 +149,24 @@ class BacktestEngine:
         times = self._build_timeline(klines)
         price_index = self._build_price_index(klines)
         pending_orders: List[OrderEvent] = list(initial_pending_orders or [])
+        # 续跑带入的在途单：checkpoint 序列化了 pending_since 时沿用（跨段累计
+        # 交易日，寿命上限不被分段重置）；旧 checkpoint 无该字段 → 以本段首根
+        # bar 的交易日为起点（保守：最多多给一个上限周期）。
+        if pending_orders and times:
+            _segment_first_date = times[0][0].date()
+            for _o in pending_orders:
+                if _o.pending_since is None:
+                    _o.pending_since = _segment_first_date
         trades: List[TradeEvent] = []
         snapshots: List[dict] = []
         # #2：已记过 no_market_data 决策事件的订单 id（仅首次延后记 1 条，长停牌不刷屏）
         no_price_recorded: set = set()
-        # #1 涨跌停约束：{(code, period) → 该周期上一根 bar 有效收盘(>0)}，逐 bar 末尾刷新；
-        # 键含 period：混合周期下 1d 00:00 bar 的当日收盘不得污染 5m/1m 的"前收"判定
-        # （否则分钟单会把当日收盘当昨日前收 → 涨跌停判定失真/前视）。单周期行为不变。
-        prev_close_map: Dict[tuple, Decimal] = {}
+        # #1 涨跌停约束：{(code, 交易日) → 上一交易日最后一根 bar 收盘(>0)}，日内恒定；
+        # 由全部周期 klines 预计算（见 build_prev_close_by_day 的依据说明）。
+        # 旧实现键含 period 且每根 bar 覆写，5m/15m/30m/1h 当日第二根起前收变成上
+        # 一根同周期收盘 → 涨停价虚高、跌停价虚低，封板买/跌停卖都能成交。
+        if prev_close_by_day is None:
+            prev_close_by_day = build_prev_close_by_day(klines)
         price_limit_recorded: set = set()
         # #2 成交量约束：已记过 volume_cap_defer 事件的订单 id（每订单只记 1 条）
         volume_defer_recorded: set = set()
@@ -152,6 +219,9 @@ class BacktestEngine:
         _truncation_warned: set = set()
         # 新股 fail-open 已记录过的订单（每订单只记 1 条 allow 事件）
         new_listing_recorded: set = set()
+        # 涨跌停档位缓存：{(code, 交易日) → LimitRule}。同一天同一票的档位只解析一次
+        # （滑点夹取与闸门判定共用同一结果，避免重复告警/重复推导）。
+        _rule_cache: Dict[tuple, object] = {}
 
         for i, (t, period) in enumerate(times):
             # B5 市场状态闸：在新交易日首根 bar 用"前一交易日"基准收盘推进因果状态机
@@ -178,6 +248,36 @@ class BacktestEngine:
             deferred: List[OrderEvent] = []
             if pending_orders:
                 bar_open_prices = self._bar_open_prices(price_index, t, period)
+                # 滑点越板防护（2026-11-16）：成交价 = open ± 滑点，而闸门只比 open 与
+                # 涨跌停价 → 开盘贴板时「含滑点成交价」可越板（买入高于涨停/卖出低于
+                # 跌停 = 凭空多付/少收）。这里把本 bar 待成交票的涨跌停区间交给
+                # dispatcher 夹取；仅开启涨跌停校验时提供（关闭时不做任何夹取，保持
+                # 「关闭=完全不约束」的原语义）。
+                bar_price_limits: Dict[str, tuple] = {}
+                if portfolio.price_limit_check_enabled:
+                    for _pending in pending_orders:
+                        _code = _pending.stock_code
+                        if _code in bar_price_limits or _code not in bar_open_prices:
+                            continue
+                        _pc = prev_close_by_day.get((_code, t.date()))
+                        if _pc is None or _pc < Decimal("1"):
+                            continue
+                        _rule = _rule_cache.get((_code, t.date()))
+                        if _rule is None:
+                            _rule = self._limit_rule_for(
+                                _code, t, stock_names, first_bar_date,
+                                run_first_date, _truncation_warned,
+                            )
+                            _rule_cache[(_code, t.date())] = _rule
+                        # 新股窗口档位为 None：无涨跌幅限制，不夹取（交由闸门 fail-open）
+                        if _rule.ratio is None:
+                            continue
+                        bar_price_limits[_code] = (
+                            (_pc * (1 - _rule.ratio)).quantize(
+                                Decimal("0.01"), rounding=ROUND_HALF_UP),
+                            (_pc * (1 + _rule.ratio)).quantize(
+                                Decimal("0.01"), rounding=ROUND_HALF_UP),
+                        )
                 # #4 自适应滑点（可选，默认关）：开启时透传本 bar 各票成交量
                 # （手）与冲击系数，dispatcher 按订单量占比动态加滑点；
                 # 关闭时不传（dispatcher 走固定滑点，原行为）。
@@ -192,6 +292,7 @@ class BacktestEngine:
                         portfolio.slippage_impact_coef
                         if portfolio.adaptive_slippage_enabled else None
                     ),
+                    price_limits=bar_price_limits or None,
                     **portfolio.cost_params,
                 )
                 engine = ExecutionEngine(
@@ -205,6 +306,26 @@ class BacktestEngine:
                 # t.date() > signal_bar_date 的下一交易日成交，防止当日 00:00
                 # 日线 bar 的信号在当日 09:30 分钟 bar 成交。未满足的订单延后。
                 for order in pending_orders:
+                    # 在途单最大存活期（B1，2026-11-16）：从「首次未能成交的交易日」
+                    # 起算交易日数，超期直接作废（不回队）。停牌/连板可让 deferred
+                    # 单无限顺延，几个月后按恢复日开盘价成交 = 用过期决策补做一笔
+                    # 交易；实盘有超时撤单 + 次日重排兜底，不会挂这么久。
+                    if (pending_order_max_days and pending_order_max_days > 0
+                            and order.pending_since is not None
+                            and trading_days_between(order.pending_since, t.date())
+                            >= pending_order_max_days):
+                        recorder.record(
+                            gate="pending_order_expired", layer="execution",
+                            action="cancel",
+                            portfolio_id=order.portfolio_id or 0,
+                            strategy_id=order.strategy_id,
+                            stock_code=order.stock_code,
+                            bar_time=t,
+                            message=(
+                                "在途单超过最大存活期（%d 个交易日）：作废，不再顺延"
+                                % pending_order_max_days),
+                        )
+                        continue
                     # 风控卖单缩量前的原始委托量：成交不足时残量回队续卖
                     # （对齐实盘 inflight_sell：一次触发 + 缩量分批成交）。
                     risk_sell_original = None
@@ -238,59 +359,37 @@ class BacktestEngine:
                     # 无前收或前收 < 1 元跳过检查：前复权"加性压缩"使早期前收逼近 0/
                     # 失真，比率不可信，宁宽勿错（dual 后复权记账口径比率真实）。
                     if portfolio.price_limit_check_enabled:
-                        prev_close = prev_close_map.get((order.stock_code, order.period))
+                        # 前收 = 上一交易日最后一根 bar 收盘（日内恒定，任意周期），
+                        # 见 build_prev_close_by_day 的依据说明。
+                        prev_close = prev_close_by_day.get((order.stock_code, t.date()))
                         if prev_close is not None and prev_close >= Decimal("1"):
                             open_px = bar_open_prices[order.stock_code]
-                            _name = (stock_names or {}).get(order.stock_code)
-                            _first_d = first_bar_date.get(order.stock_code)
-                            # 数据起点=区间起点 → 无法判断是否真新股：不套新股宽松，
-                            # 按板块幅度校验（首根 bar 无前收，天然放行一次），留 WARNING。
-                            _truncated = (
-                                _first_d is not None
-                                and run_first_date is not None
-                                and _first_d <= run_first_date
-                            )
-                            if _truncated:
-                                if order.stock_code not in _truncation_warned:
-                                    _truncation_warned.add(order.stock_code)
-                                    logger.warning(
-                                        "涨跌停校验按板块幅度执行：%s 的数据起点 %s 与回测区间起点"
-                                        "重合，无法判断是否新股（不套前 5 日无限制的宽松判定）；"
-                                        "首个 bar 无前收，涨跌停校验天然跳过（保守放行一次）",
-                                        order.stock_code, _first_d)
-                                rule = limit_rule_for(order.stock_code, name=_name)
-                            else:
-                                # 从该 code 自身首根 bar 起算已过交易日（首发日=0），
-                                # 交由 resolve_limit_rule 判「前 5 个交易日无涨跌幅」。
-                                _listed = (
-                                    trading_days_between(_first_d, t.date())
-                                    if _first_d is not None else None
+                            _rule_key = (order.stock_code, t.date())
+                            rule = _rule_cache.get(_rule_key)
+                            if rule is None:
+                                rule = self._limit_rule_for(
+                                    order.stock_code, t, stock_names, first_bar_date,
+                                    run_first_date, _truncation_warned,
                                 )
-                                rule = resolve_limit_rule(
-                                    order.stock_code, name=_name,
-                                    listed_bars=_listed,
-                                    earliest_bar_date=_first_d, today=t.date(),
-                                )
-                            if rule.ratio is None and rule.source.startswith("new_listing"):
-                                # 新股窗口：fail-open 放行（与桥缺数据同取向），事件标
-                                # limit_rule=new_listing（每订单一次）。
-                                if id(order) not in new_listing_recorded:
-                                    new_listing_recorded.add(id(order))
-                                    recorder.record(
-                                        gate="price_limit", layer="execution", action="allow",
-                                        portfolio_id=order.portfolio_id or 0,
-                                        strategy_id=order.strategy_id,
-                                        stock_code=order.stock_code,
-                                        bar_time=t,
-                                        message="新股上市初期无涨跌幅限制（%s），跳过本地"
-                                                "涨跌停校验（fail-open，交柜台）；"
-                                                "limit_rule=new_listing" % rule.source,
-                                    )
-                            elif rule.ratio is None:
-                                # ETF/转债/未知代码：无可靠档位 → 回落板块常规幅度（旧口径）。
-                                rule = limit_rule_for(order.stock_code, name=_name)
+                                _rule_cache[_rule_key] = rule
                             ratio = rule.ratio
-                            if ratio is not None:
+                            if ratio is None:
+                                if rule.source.startswith("new_listing"):
+                                    # 新股窗口：fail-open 放行（与桥缺数据同取向），事件标
+                                    # limit_rule=new_listing（每订单一次）。
+                                    if id(order) not in new_listing_recorded:
+                                        new_listing_recorded.add(id(order))
+                                        recorder.record(
+                                            gate="price_limit", layer="execution", action="allow",
+                                            portfolio_id=order.portfolio_id or 0,
+                                            strategy_id=order.strategy_id,
+                                            stock_code=order.stock_code,
+                                            bar_time=t,
+                                            message="新股上市初期无涨跌幅限制（%s），跳过本地"
+                                                    "涨跌停校验（fail-open，交柜台）；"
+                                                    "limit_rule=new_listing" % rule.source,
+                                        )
+                            else:
                                 limit_up = (prev_close * (1 + ratio)).quantize(
                                     Decimal("0.01"), rounding=ROUND_HALF_UP)
                                 limit_down = (prev_close * (1 - ratio)).quantize(
@@ -460,6 +559,11 @@ class BacktestEngine:
                     bar, signal_cache=signal_cache, period=period,
                     inflight_risk_sells=inflight_risk_sells,
                 )
+                # 在途单寿命起点：新单在其信号 bar 当日登记（后续若首根就成交，
+                # 该字段不参与任何计算；只有真正被延后的单才会累计交易日）。
+                for _o in new_orders:
+                    if _o.pending_since is None:
+                        _o.pending_since = t.date()
                 pending_orders = deferred + new_orders
             else:
                 pending_orders = deferred
@@ -512,12 +616,8 @@ class BacktestEngine:
                 total_value, t.date(), allow_peak_update=allow_peak_update,
             )
 
-            # 6. #1 涨跌停约束：用本 bar 有效收盘(>0) 刷新该周期前收表（下一 bar 判定用）。
-            #    开关关闭时零判定开销（仅一次 dict 写入/票）。
-            for code, ohlcv in price_index.get((t, period), {}).items():
-                close = ohlcv.get("close")
-                if close is not None and close > 0:
-                    prev_close_map[(code, period)] = close
+            # 6. 前收表（涨跌停基准）已在 run 开头按 (code, 交易日) 预计算好，日内恒定，
+            #    无需逐 bar 刷新（旧实现此处覆写导致分钟策略前收取错，见上方依据注释）。
 
         # 6. flush 最后一日的 pending 快照（无后续跨日触发）
         if pending_snap is not None:
@@ -668,6 +768,45 @@ class BacktestEngine:
         """O(1) 查表取 (t, period) 下所有股票的 open 价。"""
         row = price_index.get((t, period), {})
         return {code: data["open"] for code, data in row.items()}
+
+    def _limit_rule_for(self, code: str, t: datetime, stock_names, first_bar_date,
+                        run_first_date, truncation_warned):
+        """解析 (code, 交易日) 的涨跌停档位（带新股窗口判定），供闸门与滑点夹取共用。"""
+        _name = (stock_names or {}).get(code)
+        _first_d = first_bar_date.get(code)
+        # 数据起点=区间起点 → 无法判断是否真新股：不套新股宽松，
+        # 按板块幅度校验（首根 bar 无前收，天然放行一次），留 WARNING。
+        _truncated = (
+            _first_d is not None
+            and run_first_date is not None
+            and _first_d <= run_first_date
+        )
+        if _truncated:
+            if code not in truncation_warned:
+                truncation_warned.add(code)
+                logger.warning(
+                    "涨跌停校验按板块幅度执行：%s 的数据起点 %s 与回测区间起点"
+                    "重合，无法判断是否新股（不套前 5 日无限制的宽松判定）；"
+                    "首个 bar 无前收，涨跌停校验天然跳过（保守放行一次）",
+                    code, _first_d)
+            return limit_rule_for(code, name=_name)
+        # 从该 code 自身首根 bar 起算已过交易日（首发日=0），
+        # 交由 resolve_limit_rule 判「前 5 个交易日无涨跌幅」。
+        _listed = (
+            trading_days_between(_first_d, t.date())
+            if _first_d is not None else None
+        )
+        rule = resolve_limit_rule(
+            code, name=_name,
+            listed_bars=_listed,
+            earliest_bar_date=_first_d, today=t.date(),
+        )
+        if rule.ratio is None and rule.source.startswith("new_listing"):
+            return rule
+        if rule.ratio is None:
+            # ETF/转债/未知代码：无可靠档位 → 回落板块常规幅度（旧口径）。
+            rule = limit_rule_for(code, name=_name)
+        return rule
 
     def _build_bar(self, price_index: dict, t: datetime, period: str) -> BarEvent:
         """O(1) 查表取 (t, period) 的 OHLCV 构造 BarEvent（含周期标注）。"""

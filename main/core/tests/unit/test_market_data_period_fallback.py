@@ -176,3 +176,29 @@ def test_incomplete_aggregated_bucket_stays_stale():
 
     assert svc.dispatch_period_bar("5m", TODAY) == "stale"
     assert any(r.get("gate") == "period_bar_freshness" for r in risks)
+
+
+def test_empty_status_means_no_data_and_is_distinct_from_no_strategy():
+    """P1#6（2026-11-16）：empty 只表示「有该周期策略但取不到 bar」（可补偿重试）。
+
+    旧的 empty 同时表示「实例无该周期策略」——引擎据此无法区分，只对 stale 挂
+    待补偿，TQ 偶发空返回时该 5m/15m/30m/1h 边界当日永久丢失。现在无策略返回
+    no_strategy（不补偿），取不到数据返回 empty（与 stale 同等补偿）。
+    """
+    # 有 5m 策略，但任何 code 都拿不到 bar → empty（可补偿）
+    svc = _service(_StaleDispatcher({}), _StaleDispatcher({}))
+    assert svc.dispatch_period_bar("5m", TODAY) == "empty"
+
+    # 实例只有 1m 策略 → 5m 边界直接 no_strategy（无事可做，不补偿）
+    ctx = SimpleNamespace(
+        portfolios=[SimpleNamespace(strategies=[_Strategy(period="1m")])],
+        dispatcher=_StaleDispatcher({}),
+        code_period_count={},
+    )
+    svc_m1 = MarketDataService(
+        ctx, _Poller([STOCK], _StaleDispatcher({})),
+        on_bar=lambda *a, **k: None,
+        set_available_map=lambda m: None,
+    )
+    assert svc_m1.dispatch_period_bar("5m", TODAY) == "no_strategy"
+

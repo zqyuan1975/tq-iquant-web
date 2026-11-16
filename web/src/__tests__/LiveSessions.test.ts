@@ -2,7 +2,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { mount, flushPromises } from '@vue/test-utils'
 
 // 会话 CRUD/启停 + 工作台历史查询 + 组合选单全走 ../api 客户端（import 的即 mock 的 vi.fn）
-const { mockGetLiveSessions, mockCreateLiveSession, mockStartLiveSession, mockStopLiveSession, mockGetLiveChannel, mockTestLiveChannel, mockGetLiveSession, mockGetWatchdogStatus, mockGetLiveAccountPreview, mockResetLiveBaseline } = vi.hoisted(() => ({
+const { mockGetLiveSessions, mockCreateLiveSession, mockStartLiveSession, mockStopLiveSession, mockGetLiveChannel, mockTestLiveChannel, mockGetLiveSession, mockGetWatchdogStatus, mockGetLiveAccountPreview, mockResetLiveBaseline, mockGetLiveParamsDrift, mockGetLiveCashFlows, mockCreateLiveCashFlow } = vi.hoisted(() => ({
   mockGetLiveSessions: vi.fn(),
   mockCreateLiveSession: vi.fn(),
   mockStartLiveSession: vi.fn(),
@@ -13,6 +13,9 @@ const { mockGetLiveSessions, mockCreateLiveSession, mockStartLiveSession, mockSt
   mockGetWatchdogStatus: vi.fn(),
   mockGetLiveAccountPreview: vi.fn(),
   mockResetLiveBaseline: vi.fn(),
+  mockGetLiveParamsDrift: vi.fn(),
+  mockGetLiveCashFlows: vi.fn(),
+  mockCreateLiveCashFlow: vi.fn(),
 }))
 vi.mock('../api', () => ({
   getLiveSessions: mockGetLiveSessions,
@@ -24,6 +27,9 @@ vi.mock('../api', () => ({
   getWatchdogStatus: mockGetWatchdogStatus,
   getLiveAccountPreview: mockGetLiveAccountPreview,
   resetLiveBaseline: mockResetLiveBaseline,
+  getLiveParamsDrift: mockGetLiveParamsDrift,
+  getLiveCashFlows: mockGetLiveCashFlows,
+  createLiveCashFlow: mockCreateLiveCashFlow,
   getLivePositions: vi.fn(),
   getLiveOrders: vi.fn(),
   getLiveTrades: vi.fn(),
@@ -60,7 +66,7 @@ class FakeEventSource {
 }
 
 import LiveSessions from '../views/LiveSessions.vue'
-import { getLiveSessions, createLiveSession, startLiveSession, stopLiveSession, getLivePositions, getLiveOrders, getLiveTrades, getLiveDecisions, getLiveSignals, getPortfolios, getLiveChannel, testLiveChannel, sendUserBlock, getFormulas, getLiveSession, getWatchdogStatus, getLiveAccountPreview, resetLiveBaseline } from '../api'
+import { getLiveSessions, createLiveSession, startLiveSession, stopLiveSession, getLivePositions, getLiveOrders, getLiveTrades, getLiveDecisions, getLiveSignals, getPortfolios, getLiveChannel, testLiveChannel, sendUserBlock, getFormulas, getLiveSession, getWatchdogStatus, getLiveAccountPreview, resetLiveBaseline, getLiveParamsDrift, getLiveCashFlows, createLiveCashFlow } from '../api'
 import { deriveBlockCode } from '../utils/blockCode'
 
 const runningSession = { id: 7, name: '模拟盘A', mode: 'simulation', status: 'running', started_at: null, stopped_at: null, portfolio_ids: [] }
@@ -87,6 +93,11 @@ beforeEach(() => {
   // 真实总资产预览默认取不到（null → 不做超上限拦截，按「通道未就绪」展示）
   ;(getLiveAccountPreview as any).mockResolvedValue({ total_asset: null, available: null, captured_at: null })
   ;(resetLiveBaseline as any).mockResolvedValue({ portfolio_id: 1, baseline: null })
+  ;(getLiveParamsDrift as any).mockResolvedValue({
+    backtest_record_id: null, checked: false, drifted: false, fields: [], block_enabled: false,
+  })
+  ;(getLiveCashFlows as any).mockResolvedValue({ flows: [], net_inflow: [], total_net_inflow: '0' })
+  ;(createLiveCashFlow as any).mockResolvedValue({ id: 1, net_inflow: '10000' })
   ;(getLiveChannel as any).mockResolvedValue({
     engine: 'iquant',
     active: 'iquant_bridge',
@@ -1938,6 +1949,171 @@ describe('LiveSessions.vue 交易日历可见性', () => {
 
     expect(w.find('[data-test="calendar-degraded"]').exists()).toBe(false)
     expect(w.find('[data-test="calendar-info"]').exists()).toBe(false)
+    w.unmount()
+  })
+})
+
+describe('LiveSessions — 参数漂移横幅（A7）', () => {
+  it('drifted=true → 列出差异字段与阻断提示', async () => {
+    ;(getLiveSessions as any).mockResolvedValue([runningSession])
+    ;(getLiveParamsDrift as any).mockResolvedValue({
+      backtest_record_id: 12, checked: true, drifted: true, block_enabled: true,
+      fields: [
+        { field: 'max_drawdown', snapshot: '0.2', current: '0.25' },
+        { field: 'max_holdings', snapshot: '10', current: '8' },
+      ],
+    })
+    const w = mount(LiveSessions)
+    await flushPromises()
+
+    const banner = w.find('[data-test="params-drift-banner"]')
+    expect(banner.exists()).toBe(true)
+    expect(banner.text()).toContain('参数漂移')
+    expect(banner.text()).toContain('启动将被阻断')
+    expect(banner.text()).toContain('最大回撤：20% → 25%')
+    expect(banner.text()).toContain('最大持仓数：10 → 8')
+    w.unmount()
+  })
+
+  it('未漂移 / 未绑定回测 → 不出横幅', async () => {
+    ;(getLiveSessions as any).mockResolvedValue([runningSession])
+    ;(getLiveParamsDrift as any).mockResolvedValue({
+      backtest_record_id: null, checked: false, drifted: false, fields: [], block_enabled: false,
+    })
+    const w = mount(LiveSessions)
+    await flushPromises()
+    expect(w.find('[data-test="params-drift-banner"]').exists()).toBe(false)
+    w.unmount()
+  })
+})
+
+describe('LiveSessions — 外部现金流台账（P1）', () => {
+  it('点击入口打开弹窗：展示风险说明与台账列表/净流入', async () => {
+    ;(getLiveSessions as any).mockResolvedValue([{ ...runningSession, portfolio_ids: [3] }])
+    ;(getPortfolios as any).mockResolvedValue([{ id: 3, name: '稳健组合', strategies: [] }])
+    ;(getLiveCashFlows as any).mockResolvedValue({
+      flows: [
+        { id: 1, portfolio_id: 3, flow_type: 'deposit', amount: '50000.00', flow_date: '2026-11-10', note: '追加', created_at: null },
+        { id: 2, portfolio_id: 3, flow_type: 'withdraw', amount: '-20000.00', flow_date: '2026-11-12', note: null, created_at: null },
+      ],
+      net_inflow: [{ portfolio_id: 3, net_inflow: '30000.00' }],
+      total_net_inflow: '30000.00',
+    })
+    const w = mount(LiveSessions)
+    await flushPromises()
+
+    await w.find('[data-test="cash-flow-open"]').trigger('click')
+    await flushPromises()
+
+    expect(w.find('[data-test="cash-flow-risk"]').text()).toContain('漏记会让这些指标被外部资金扭曲')
+    const text = w.text()
+    expect(text).toContain('入金')
+    expect(text).toContain('50,000.00')
+    expect(text).toContain('流出')
+    expect(text).toContain('累计净流入：30,000.00')
+    w.unmount()
+  })
+
+  it('登记一笔 → POST 带 portfolio_id/类型/正数金额，成功后重拉台账', async () => {
+    ;(getLiveSessions as any).mockResolvedValue([{ ...runningSession, portfolio_ids: [3] }])
+    ;(getPortfolios as any).mockResolvedValue([{ id: 3, name: '稳健组合', strategies: [] }])
+    const w = mount(LiveSessions)
+    await flushPromises()
+
+    await w.find('[data-test="cash-flow-open"]').trigger('click')
+    await flushPromises()
+    ;(getLiveCashFlows as any).mockClear()
+
+    ;(w.find('input[data-field="cash-flow-amount"]') as any).setValue('10000')
+    ;(w.find('input[data-field="cash-flow-note"]') as any).setValue('追加资金')
+    await w.find('.cash-flow-form button.btn-primary').trigger('click')
+    await flushPromises()
+
+    expect(createLiveCashFlow).toHaveBeenCalledTimes(1)
+    const [sid, req] = (createLiveCashFlow as any).mock.calls[0]
+    expect(sid).toBe(7)
+    expect(req.portfolio_id).toBe(3)
+    expect(req.flow_type).toBe('deposit')
+    expect(req.amount).toBe(10000)
+    expect(req.note).toBe('追加资金')
+    // 提交成功后重拉台账（金额/备注清空）
+    expect(getLiveCashFlows).toHaveBeenCalledWith(7)
+    expect((w.find('input[data-field="cash-flow-amount"]').element as HTMLInputElement).value).toBe('')
+    w.unmount()
+  })
+
+  it('金额为空 → 行内错误，不发请求', async () => {
+    ;(getLiveSessions as any).mockResolvedValue([{ ...runningSession, portfolio_ids: [3] }])
+    ;(getPortfolios as any).mockResolvedValue([{ id: 3, name: '稳健组合', strategies: [] }])
+    const w = mount(LiveSessions)
+    await flushPromises()
+
+    await w.find('[data-test="cash-flow-open"]').trigger('click')
+    await flushPromises()
+    ;(createLiveCashFlow as any).mockClear()
+
+    await w.find('.cash-flow-form button.btn-primary').trigger('click')
+    await flushPromises()
+
+    expect(w.find('[data-test="cash-flow-error"]').text()).toContain('金额需为非 0 数字')
+    expect(createLiveCashFlow).not.toHaveBeenCalled()
+    w.unmount()
+  })
+})
+
+describe('LiveSessions — warnings 与恢复事件（P2/P3）', () => {
+  it('create 返回 warnings → 顶部软告警横幅可见且可关闭', async () => {
+    ;(getLiveSessions as any).mockResolvedValue([])
+    ;(getPortfolios as any).mockResolvedValue([{ id: 1, name: '稳健组合', strategies: [] }])
+    ;(createLiveSession as any).mockResolvedValue({
+      id: 99, status: 'stopped', warnings: ['引擎 tdx 已被 会话 3「TDX 主策略」占用，建议先停止该会话'],
+    })
+    const w = mount(LiveSessions)
+    await flushPromises()
+
+    await w.findAll('button').find((b) => b.text().includes('新建实盘'))!.trigger('click')
+    await flushPromises()
+    await w.findAll('input[data-portfolio-check]')[0].setValue(true)
+    await w.findAll('button').find((b) => b.text() === '确认')!.trigger('click')
+    await flushPromises()
+
+    const banner = w.find('[data-test="create-warnings"]')
+    expect(banner.exists()).toBe(true)
+    expect(banner.text()).toContain('已被 会话 3')
+
+    await banner.find('button').trigger('click')
+    expect(w.find('[data-test="create-warnings"]').exists()).toBe(false)
+    w.unmount()
+  })
+
+  it('start 返回 warnings → 行内提示（不阻断）', async () => {
+    ;(getLiveSessions as any).mockResolvedValue([stoppedSession])
+    ;(startLiveSession as any).mockResolvedValue({
+      id: 8, status: 'running', warnings: ['当前引擎非推荐通道，请确认下单账户'],
+    })
+    const w = mount(LiveSessions)
+    await flushPromises()
+
+    const startBtn = w.findAll('button').find((b) => b.text() === '启动')!
+    await startBtn.trigger('click')
+    await flushPromises()
+
+    expect(w.find('[data-test="start-warning"]').text()).toContain('当前引擎非推荐通道')
+    w.unmount()
+  })
+
+  it('watchdog 恢复事件进「恢复」日志（独立于 risk 流）', async () => {
+    ;(getLiveSessions as any).mockResolvedValue([runningSession])
+    const w = mount(LiveSessions)
+    await flushPromises()
+
+    const es = FakeEventSource.instances.find((i) => i.url.includes('/sessions/7/stream'))!
+    es.emit('bridge_recovered', { type: 'bridge_recovered', rule: 'bridge_recovered', message: '交易桥已恢复' })
+    await flushPromises()
+
+    const logText = w.find('.event-log').text()
+    expect(logText).toContain('恢复')
+    expect(logText).toContain('交易桥恢复: 交易桥已恢复')
     w.unmount()
   })
 })

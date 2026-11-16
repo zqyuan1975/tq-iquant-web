@@ -35,6 +35,7 @@ ENTRY = ROOT / "desktop.py"
 ICON = REPO / "packaging" / "icon" / "app.ico"
 CONFIG_TEMPLATE = REPO / "packaging" / "config.template.yaml"
 VERSION_FILE = REPO / "packaging" / "app-version.iss"
+CORE_VERSION_FILE = ROOT / "core" / "version.py"
 
 
 def read_version() -> str:
@@ -240,14 +241,79 @@ def _git_info():
         return "", False
 
 
+def read_core_version() -> str:
+    """读取 main/core/version.py 的 APP_VERSION（文本解析，不 import core 依赖）。"""
+    if not CORE_VERSION_FILE.exists():
+        sys.exit(f"缺少版本号文件：{CORE_VERSION_FILE}")
+    text = CORE_VERSION_FILE.read_text(encoding="utf-8")
+    match = re.search(r'APP_VERSION\s*=\s*"([^"]+)"', text)
+    if not match:
+        sys.exit(f"无法从 {CORE_VERSION_FILE} 解析 APP_VERSION")
+    return match.group(1)
+
+
+def preflight_release_check(require_dist_info: bool):
+    """出包前强校验：版本单一来源一致 + 工作区干净（+ 复用已有产物时校验 build-info）。
+
+    防「新版本号 + 旧代码」：
+    - 全量构建会重建 dist，只校验源码侧（app-version.iss == core.version.APP_VERSION、git 干净）；
+    - --web-only 复用已有二进制，额外要求 dist/tq-iquant/build-info.json 的
+      app_version 等于当前代码版本、且 git_dirty=false，不符直接中止。
+    """
+    core_version = read_core_version()
+    if core_version != VERSION:
+        sys.exit(
+            "出包中止：版本号两处不一致——packaging/app-version.iss=%s，"
+            "main/core/version.py APP_VERSION=%s。请同步两处后再出包。"
+            % (VERSION, core_version)
+        )
+    commit, dirty = _git_info()
+    if dirty:
+        sys.exit(
+            "出包中止：工作区有未提交改动（git_dirty=true，HEAD=%s）。"
+            "只允许从干净工作区出包，请先提交或还原。" % (commit or "no-git")
+        )
+    if not require_dist_info:
+        print(f"出包前校验通过：版本 {core_version}，工作区干净")
+        return
+    info_path = DIST_OUT / "build-info.json"
+    if not info_path.exists():
+        sys.exit(
+            "出包中止：缺少 %s。请先跑一次完整构建（python main\\build_package.py）。" % info_path
+        )
+    try:
+        info = json.loads(info_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        sys.exit("出包中止：无法解析 %s：%s" % (info_path, exc))
+    dist_version = str(info.get("app_version") or "")
+    if dist_version != core_version:
+        sys.exit(
+            "出包中止：dist/tq-iquant 的 build-info.json 记录 app_version=%s，"
+            "当前代码版本=%s——典型「新版本号 + 旧代码」。请先完整构建再出补丁包。"
+            % (dist_version or "<缺失>", core_version)
+        )
+    if info.get("git_dirty") is not False:
+        sys.exit(
+            "出包中止：build-info.json 记录 git_dirty=%s，现有产物来自脏工作区，"
+            "请重新完整构建。" % info.get("git_dirty")
+        )
+    print(f"出包前校验通过：版本 {core_version}，工作区干净，dist build-info 匹配")
+
+
 def write_build_info(dist_dir: Path, mode: str):
-    """分发目录内留一份构建档案：装到目标机后可直接看版本/来源，便于核对与回滚。"""
+    """分发目录内留一份构建档案：装到目标机后可直接看版本/来源，便于核对与回滚。
+
+    --web-only 复用已有二进制：app_version / build_time / git 来源必须保留原值
+    （否则 1.0.4 的 exe 会配上一份写着 1.0.5 的档案），只追加 frontend_patch_time，
+    并刷新 frontend_dist_mtime 指向本次前端产物。
+    """
     index = WEB_DIST / "index.html"
     commit, dirty = _git_info()
+    now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     info = {
         "app_version": VERSION,
         "build_mode": mode,
-        "build_time": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "build_time": now,
         "git_commit": commit,
         "git_dirty": dirty,
         "frontend_dist_mtime": (
@@ -255,6 +321,18 @@ def write_build_info(dist_dir: Path, mode: str):
             if index.exists() else ""
         ),
     }
+    if mode == "web-only":
+        info_path = dist_dir / "build-info.json"
+        prev = {}
+        if info_path.exists():
+            try:
+                prev = json.loads(info_path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                prev = {}
+        for key in ("app_version", "build_time", "git_commit", "git_dirty"):
+            if prev.get(key) is not None:
+                info[key] = prev[key]
+        info["frontend_patch_time"] = now
     (dist_dir / "build-info.json").write_text(
         json.dumps(info, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
     )
@@ -263,6 +341,7 @@ def write_build_info(dist_dir: Path, mode: str):
 
 def web_only():
     """只刷新前端产物：不跑 Nuitka，几秒完成；随后用 installer_web.iss 出几 MB 补丁包。"""
+    preflight_release_check(require_dist_info=True)
     if not (DIST_OUT / "tq-iquant.exe").exists():
         sys.exit(f"未找到已有分发目录：{DIST_OUT}（先跑一次完整构建：python main\\build_package.py）")
     print("=== 仅刷新前端（--web-only） ===")
@@ -286,6 +365,8 @@ def main():
     if args.web_only:
         web_only()
         return
+
+    preflight_release_check(require_dist_info=False)
 
     if not ENTRY.exists():
         sys.exit(f"缺少桌面入口：{ENTRY}")

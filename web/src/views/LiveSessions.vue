@@ -1,6 +1,6 @@
 ﻿<script setup lang="ts">
 import { ref, computed, onMounted, onUnmounted } from 'vue'
-import { formatEvent, nextEventId, EVENT_TYPE_COLOR, tradeTypeLabel, ORDER_STATUS_LABEL, gateLabel, LAYER_LABEL, ACTION_LABEL, channelStateLabel, channelBadgeState, type LiveEvent } from '../utils/liveEvents'
+import { formatEvent, nextEventId, EVENT_TYPE_COLOR, tradeTypeLabel, ORDER_STATUS_LABEL, gateLabel, LAYER_LABEL, ACTION_LABEL, channelStateLabel, channelBadgeState, RECOVERY_EVENT_TYPES, type LiveEvent } from '../utils/liveEvents'
 import {
   orderHistoryToRows, upsertOrderRow,
   tradeEventToRow, tradeHistoryToRows,
@@ -11,7 +11,7 @@ import {
   positionRowKey,
   isSessionActive, resolvedSessionEngine, engineOccupants, engineOccupiedText,
   multiAccountBannerText, keyboardConflictOpponents, parseStartConflict,
-  baselineResetAllowed, formatMoney2, shortAccountKey,
+  baselineResetAllowed, formatMoney2, shortAccountKey, paramsDriftLines,
   type OrderRow, type TradeRow, type PositionRow, type DecisionRow, type TimeRange,
   type SessionOccupancy,
 } from '../utils/liveWorkbench'
@@ -20,9 +20,10 @@ import {
   getLiveSessions, getLiveSession, createLiveSession, startLiveSession, stopLiveSession, deleteLiveSession,
   recoverLiveBreaker, getLiveChannel, testLiveChannel, sendUserBlock, getFormulas, getWatchdogStatus,
   getLiveAccountPreview, resetLiveBaseline,
+  getLiveParamsDrift, getLiveCashFlows, createLiveCashFlow,
   type PortfolioItem, type LiveSessionItem,
   type LiveChannelInfo, type LiveChannelEngine, type LiveEngineKey, type LiveExecutionMode, type LiveSignalItem,
-  type FormulaItem, type WatchdogAlarm,
+  type FormulaItem, type WatchdogAlarm, type ParamsDrift, type LiveCashFlowList, type LiveCashFlowType,
 } from '../api'
 import PageHeader from '../components/PageHeader.vue'
 import { deriveBlockCode } from '../utils/blockCode'
@@ -100,6 +101,56 @@ const baselineError = ref('')
 const bannerDismissed = ref(false)
 // 重置窗口判定的时钟（随 15s 轮询刷新，跨过 15:00 后按钮自动解禁）
 const nowTick = ref(Date.now())
+
+// ---- H2/A7 参数漂移（绑定回测记录时：当前组合参数 vs params_snapshot）----
+// 后端 `GET /sessions/{id}/params-drift`；drifted=true 才出横幅，block_enabled 时标注会拦启动
+const paramsDrifts = ref<Record<number, ParamsDrift>>({})
+const driftBanners = computed(() =>
+  Object.entries(paramsDrifts.value)
+    .map(([sid, d]) => ({
+      sessionId: Number(sid),
+      name: sessions.value.find((s) => s.id === Number(sid))?.name ?? `#${sid}`,
+      blockEnabled: !!d.block_enabled,
+      lines: paramsDriftLines(d),
+    }))
+    // 只有真漂移才出横幅（未绑定回测/未完成比对不打扰）
+    .filter((b) => b.lines.length > 0),
+)
+// start 返回的通道建议告警（按会话展示，非阻断）
+const startWarnings = ref<Record<number, string[]>>({})
+// 新建会话返回的占用类软告警（A1，非阻断）
+const createWarnings = ref<string[]>([])
+
+// ---- 外部现金流台账（入金/出金/分红/其他）----
+// 不记账 → 净值/收益率/回撤/日亏被外部资金扭曲（后端按「总市值 − 累计净流入」计风险指标）
+const cashFlowModal = ref<{ session: LiveSessionItem } | null>(null)
+const cashFlows = ref<LiveCashFlowList | null>(null)
+const cashFlowError = ref('')
+const cashFlowSaving = ref(false)
+const CASH_FLOW_TYPES: { value: LiveCashFlowType; label: string }[] = [
+  { value: 'deposit', label: '入金' },
+  { value: 'withdraw', label: '出金' },
+  { value: 'dividend', label: '分红' },
+  { value: 'other', label: '其他' },
+]
+const cashFlowForm = ref({
+  portfolio_id: null as number | null,
+  flow_type: 'deposit' as LiveCashFlowType,
+  amount: '' as number | string,
+  flow_date: '' as string,
+  note: '' as string,
+})
+const CASH_FLOW_TYPE_LABEL: Record<string, string> = {
+  deposit: '入金', withdraw: '出金', dividend: '分红', other: '其他',
+}
+/** 台账表格「方向」列：deposit/dividend/正数 other = 流入，withdraw/负数 other = 流出。 */
+function cashFlowDirection(f: { flow_type: string; amount: string | number }): string {
+  const n = Number(f.amount)
+  if (f.flow_type === 'withdraw') return '流出'
+  if (n < 0) return '流出'
+  if (n === 0) return '—'
+  return '流入'
+}
 
 // C1：当前被占用的引擎（running/stopping）→ 建会话下拉置灰 + 显示占用方
 const occupants = computed(() => engineOccupants(sessions.value))
@@ -268,6 +319,12 @@ const watchdogAlarms = ref<WatchdogAlarm[]>([])
 const channelBadge = computed(
   () => channelBadgeState(bridgeOnline.value, watchdogAlarms.value, watchedSessionId.value),
 )
+// 告警项自带 channel（watchdog 回传的通道名）此前未被读取 → 在徽章 title 里点名告警通道
+const sessionChannelBadgeTitle = computed(() => {
+  const base = '当前聚焦会话的通道状态：watchdog 通道告警优先（30 秒扫描，客户端退出即翻红），无告警回退心跳态；未知=会话未运行或尚未取到'
+  const channels = [...new Set(watchdogAlarms.value.map((a) => a.channel).filter(Boolean))]
+  return channels.length > 0 ? `${base}。活跃告警通道：${channels.join(' / ')}` : base
+})
 let bridgeTimer: ReturnType<typeof setInterval> | null = null
 
 /** 单年日历摘要：正常=来源/交易日数/覆盖区间；退化=来源+标记。 */
@@ -530,63 +587,45 @@ function startEventStreams() {
     connState.value = 'closed'
     return
   }
-  for (const s of running) {
-    const id = s.id
-    const label = `#${s.id} ${s.name}`
-    const source = new EventSource(`/api/live/sessions/${id}/stream`)
-    // D-5（audit 前端 I4）：心跳流升级——收到 reconnect 关当前流重接（按流隔离，
-    // 旧流迟到的 reconnect 不影响其它会话）。
-    source.addEventListener('reconnect', () => {
-      const cur = esMap.get(id)
-      if (cur === source) {
-        cur.close()
-        esMap.delete(id)
-        openOneStream(s)
-        // 心跳流→真流切换间隙可能漏事件：聚焦会话重拉工作台历史兜底
-        if (activeSessionId === id) loadHistory(id)
-      }
-    })
-    EVENT_TYPES.forEach((t) => {
-      source.addEventListener(t, (e: MessageEvent) => {
-        const data = JSON.parse(e.data)
-        const time = nowTime()
-        pushLog(t, data, time, label, id)
-        // 工作台（持仓/委托/成交…）只跟随聚焦会话
-        if (id === activeSessionId) applyToWorkbench(t, data, time)
-      })
-    })
-    source.onopen = () => { connState.value = 'open' }
-    source.onerror = () => {
-      // EventSource 规范：readyState=2(CLOSED) 才是终态不再重连（如后端 404），
-      // 0/1 都仍在自动重连中（显示「连接中」而非 closed/未连接）
-      connState.value = source.readyState === 2 ? 'error' : 'connecting'
-    }
-    esMap.set(id, source)
-  }
+  for (const s of running) openOneStream(s)
 }
 
+/** 单会话 SSE（唯一实现：首连与心跳 reconnect 重连共用）。 */
 function openOneStream(s: { id: number; name: string; status: string }) {
   const id = s.id
   const label = `#${s.id} ${s.name}`
   const source = new EventSource(`/api/live/sessions/${id}/stream`)
+  // D-5（audit 前端 I4）：心跳流升级——收到 reconnect 关当前流重接（按流隔离，
+  // 旧流迟到的 reconnect 不影响其它会话）；切换间隙可能漏事件，聚焦会话重拉兜底。
   source.addEventListener('reconnect', () => {
     const cur = esMap.get(id)
-    if (cur === source) {
-      cur.close()
-      esMap.delete(id)
-      openOneStream(s)
-    }
+    if (cur !== source) return
+    cur.close()
+    esMap.delete(id)
+    openOneStream(s)
+    if (activeSessionId === id) loadHistory(id)
   })
   EVENT_TYPES.forEach((t) => {
     source.addEventListener(t, (e: MessageEvent) => {
       const data = JSON.parse(e.data)
       const time = nowTime()
       pushLog(t, data, time, label, id)
+      // 工作台（持仓/委托/成交…）只跟随聚焦会话
       if (id === activeSessionId) applyToWorkbench(t, data, time)
+    })
+  })
+  // watchdog 恢复事件（engine_recovered / bridge_recovered …）：统一落「恢复」日志条。
+  // 不并入 risk 流：恢复是正向事件，混进红色风控会误导，也会污染风控统计口径。
+  RECOVERY_EVENT_TYPES.forEach((t) => {
+    source.addEventListener(t, (e: MessageEvent) => {
+      const data = e.data ? JSON.parse(e.data) : {}
+      pushLog('recovered', { ...data, rule: t }, nowTime(), label, id)
     })
   })
   source.onopen = () => { connState.value = 'open' }
   source.onerror = () => {
+    // EventSource 规范：readyState=2(CLOSED) 才是终态不再重连（如后端 404），
+    // 0/1 都仍在自动重连中（显示「连接中」而非 closed/未连接）
     connState.value = source.readyState === 2 ? 'error' : 'connecting'
   }
   esMap.set(id, source)
@@ -649,6 +688,8 @@ async function load() {
   }
   // 通道条跟随监控中 session 的引擎；无运行会话时跟随默认引擎
   loadChannel(target?.engine)
+  // 参数漂移（绑定回测记录时）：随列表刷新，drifted 才出横幅
+  void loadParamsDrift()
 }
 
 function openCreate() {
@@ -683,12 +724,14 @@ async function create() {
   }
   createError.value = ''
   try {
-    await createLiveSession({
+    const res = await createLiveSession({
       ...form.value,
       live_capital: cap,
       baseline_mode: cap === null ? 'total_asset' : 'manual',
       baseline_value: cap,
     })
+    // A1 软校验：目标引擎已被其它会话占用等提示（不阻断创建，但必须让用户看见）
+    createWarnings.value = Array.isArray(res?.warnings) ? res.warnings : []
     showCreate.value = false
     form.value = { name: '', mode: 'simulation', engine: defaultEngineKey(), execution_mode: 'alert', portfolio_ids: [], live_capital: null, signal_file_path: '', advance_close_enabled: false, advance_close_time: '14:51', intraday_mismatched_risk_enabled: null }
     load()
@@ -716,11 +759,16 @@ function startSession(id: number, ack = false) {
 async function doStart(id: number, ack: boolean) {
   clearStartError(id)
   try {
-    if (ack) await startLiveSession(id, { ack_keyboard_risk: true })
-    else await startLiveSession(id)
+    const r = ack
+      ? await startLiveSession(id, { ack_keyboard_risk: true })
+      : await startLiveSession(id)
+    // 通道建议类告警（非阻断）：如所选引擎与推荐通道不一致，展示在行内
+    if (Array.isArray(r?.warnings) && r.warnings.length > 0) {
+      startWarnings.value = { ...startWarnings.value, [id]: r.warnings }
+    }
     load() // load 内自动连接新运行 session 的流
   } catch (e: any) {
-    // 结构化 409：按 data.rule（引擎占用/账户占用/键鼠硬拦）给指名话术，不笼统报「启动失败」
+    // 结构化 409：按 data.rule（引擎占用/账户占用/键鼠硬拦/参数漂移阻断）给指名话术
     const info = parseStartConflict(e)
     startErrors.value = { ...startErrors.value, [id]: info.message }
     alert(info.message)
@@ -770,6 +818,96 @@ async function confirmBaseline() {
   } catch (e: any) {
     baselineError.value = e?.response?.data?.message || e?.message || '重置失败'
   }
+}
+
+// ---- 参数漂移（随会话列表刷新；只查 running/stopping）----
+async function loadParamsDrift() {
+  const active = sessions.value.filter(isSessionActive)
+  if (active.length === 0) {
+    paramsDrifts.value = {}
+    return
+  }
+  const pairs = await Promise.all(active.map(async (s) => {
+    try {
+      return [s.id, await getLiveParamsDrift(s.id)] as const
+    } catch {
+      return [s.id, null] as const
+    }
+  }))
+  const next: Record<number, ParamsDrift> = {}
+  for (const [id, d] of pairs) if (d) next[id] = d
+  paramsDrifts.value = next
+}
+
+// ---- 外部现金流台账（入金/出金/分红/其他）----
+function openCashFlows(s: LiveSessionItem) {
+  cashFlowModal.value = { session: s }
+  cashFlowError.value = ''
+  cashFlows.value = null
+  const pids = sessionPortfolioIds(s)
+  cashFlowForm.value = {
+    portfolio_id: pids[0] ?? null,
+    flow_type: 'deposit',
+    amount: '',
+    flow_date: beijingDayKey(Date.now()),
+    note: '',
+  }
+  void loadCashFlows(s.id)
+}
+
+async function loadCashFlows(sessionId: number) {
+  try {
+    const d = await getLiveCashFlows(sessionId)
+    if (cashFlowModal.value?.session.id !== sessionId) return
+    cashFlows.value = d
+  } catch (e: any) {
+    cashFlowError.value = e?.response?.data?.message || e?.message || '台账加载失败'
+  }
+}
+
+async function submitCashFlow() {
+  if (!cashFlowModal.value) return
+  const sid = cashFlowModal.value.session.id
+  const pid = cashFlowForm.value.portfolio_id
+  const amount = Number(cashFlowForm.value.amount)
+  if (pid === null) {
+    cashFlowError.value = '请选择组合策略'
+    return
+  }
+  if (!Number.isFinite(amount) || amount === 0) {
+    cashFlowError.value = '金额需为非 0 数字（入金/出金/分红传正数，其他可按正负判方向）'
+    return
+  }
+  cashFlowSaving.value = true
+  cashFlowError.value = ''
+  try {
+    await createLiveCashFlow(sid, {
+      portfolio_id: pid,
+      flow_type: cashFlowForm.value.flow_type,
+      amount,
+      flow_date: cashFlowForm.value.flow_date || null,
+      note: cashFlowForm.value.note.trim() || null,
+    })
+    cashFlowForm.value.amount = ''
+    cashFlowForm.value.note = ''
+    await loadCashFlows(sid)
+  } catch (e: any) {
+    cashFlowError.value = e?.response?.data?.message || e?.message || '登记失败'
+  } finally {
+    cashFlowSaving.value = false
+  }
+}
+
+function closeCashFlows() {
+  cashFlowModal.value = null
+  cashFlows.value = null
+  cashFlowError.value = ''
+}
+
+/** 台账净流入（按组合；弹窗底部汇总）。 */
+function netInflowOf(pid: number): string {
+  const row = cashFlows.value?.net_inflow?.find((x) => x.portfolio_id === pid)
+  return row ? formatMoney2(Number(row.net_inflow)) : '—'
 }
 
 async function stopSession(id: number) {
@@ -872,10 +1010,37 @@ onUnmounted(() => {
     <button @click="openCreate" class="btn btn-primary">+ 新建实盘</button>
   </PageHeader>
 
+  <!-- A1 新建会话软告警（如目标引擎已被其它会话占用）：不阻断，但必须可见 -->
+  <div v-if="createWarnings.length" class="card create-warning-banner" data-test="create-warnings">
+    <div v-for="w in createWarnings" :key="w">{{ w }}</div>
+    <button class="btn btn-sm" @click="createWarnings = []">关闭</button>
+  </div>
+
   <!-- C4 多账户并行提示：不阻断任何操作，可关闭 -->
   <div v-if="multiAccountBanner && !bannerDismissed" class="card multi-account-banner" data-test="multi-account-banner">
     <span>{{ multiAccountBanner }}</span>
     <button class="btn btn-sm" @click="bannerDismissed = true">关闭</button>
+  </div>
+
+  <!-- A7 参数漂移：绑定回测记录的会话，当前组合参数与快照不一致（drifted）时提示差异字段 -->
+  <div
+    v-for="b in driftBanners" :key="`drift-${b.sessionId}`"
+    class="card drift-banner" data-test="params-drift-banner"
+  >
+    <div class="drift-head">
+      <strong>参数漂移</strong>
+      <span class="badge" :class="b.blockEnabled ? 'badge-red' : 'badge-gray'">
+        会话 {{ b.sessionId }}「{{ b.name }}」{{ b.blockEnabled ? '启动将被阻断' : '仅告警' }}
+      </span>
+    </div>
+    <div v-if="b.lines.length" class="drift-fields">
+      <ul>
+        <li v-for="line in b.lines" :key="line">{{ line }}</li>
+      </ul>
+    </div>
+    <div class="drift-hint">
+      当前组合参数与回测参数快照不一致，实盘行为可能已偏离该回测结果；请先对齐参数（或重新回测）后再启动。
+    </div>
   </div>
 
   <div class="card channel-bar">
@@ -903,7 +1068,7 @@ onUnmounted(() => {
       v-if="watchedSessionId !== null"
       class="badge"
       :class="channelBadge === true ? 'badge-green' : channelBadge === false ? 'badge-red' : 'badge-gray'"
-      title="当前聚焦会话的通道状态：watchdog 通道告警优先（30 秒扫描，客户端退出即翻红），无告警回退心跳态；未知=会话未运行或尚未取到"
+      :title="sessionChannelBadgeTitle"
     >通道：{{ channelStateLabel(channelBadge) }}</span>
     <button class="btn btn-sm" :disabled="channelTesting" @click="testChannel">
       {{ channelTesting ? '测试中…' : '测试连接' }}
@@ -982,9 +1147,19 @@ onUnmounted(() => {
             <button v-if="s.status === 'stopping'" class="btn btn-sm" disabled
               title="引擎正在退出中，停止完成后才会释放引擎/账户占用">停止中…</button>
             <button v-if="s.status === 'running' && s.id !== watchedSessionId" @click="watchSession(s.id)" class="btn btn-sm">监控</button>
+            <button
+              v-if="s.status !== 'stopping'"
+              @click="openCashFlows(s)"
+              class="btn btn-sm" data-test="cash-flow-open"
+              title="登记入金/出金/分红等外部现金流（不记台账会扭曲净值、收益率、回撤、日亏）"
+            >存取款/分红</button>
             <button v-if="s.status === 'stopped'" @click="deleteSession(s)" class="btn btn-sm">删除</button>
-            <!-- 结构化 409：按 data.rule 指名占用者（C1 引擎占用 / C2 账户占用 / C3 键鼠硬拦） -->
+            <!-- 结构化 409：按 data.rule 指名占用者（C1 引擎占用 / C2 账户占用 / C3 键鼠硬拦 / 参数漂移阻断） -->
             <div v-if="startErrors[s.id]" class="start-error" data-test="start-error">{{ startErrors[s.id] }}</div>
+            <!-- start 返回的通道建议类告警（非阻断）：如所选引擎与推荐通道不一致 -->
+            <div v-if="startWarnings[s.id]?.length" class="start-warning" data-test="start-warning">
+              <div v-for="w in startWarnings[s.id]" :key="w">{{ w }}</div>
+            </div>
           </td>
         </tr>
       </tbody>
@@ -1470,6 +1645,70 @@ onUnmounted(() => {
     </div>
   </div>
 
+  <!-- ============ 外部现金流台账（入金/出金/分红/其他）============ -->
+  <div v-if="cashFlowModal" class="modal-overlay modal-lg" @click.self="closeCashFlows">
+    <div class="modal-content">
+      <h3>存取款 / 分红台账</h3>
+      <div class="modal-body">
+        <p>会话 #{{ cashFlowModal.session.id }}「{{ cashFlowModal.session.name }}」</p>
+        <p class="cash-flow-risk" data-test="cash-flow-risk">
+          重要：外部资金进出必须记台账。后端按「总市值 − 累计净流入」计算净值、收益率、回撤与日亏，
+          漏记会让这些指标被外部资金扭曲（可能误触熔断，或掩盖真实亏损）。
+        </p>
+        <div class="form-group">
+          <label>登记一笔</label>
+          <div class="cash-flow-form">
+            <select v-model="cashFlowForm.portfolio_id" data-field="cash-flow-portfolio">
+              <option :value="null" disabled>选择组合</option>
+              <option v-for="pid in sessionPortfolioIds(cashFlowModal.session)" :key="pid" :value="pid">
+                {{ portfolioName(pid) }}
+              </option>
+            </select>
+            <select v-model="cashFlowForm.flow_type" data-field="cash-flow-type">
+              <option v-for="t in CASH_FLOW_TYPES" :key="t.value" :value="t.value">{{ t.label }}</option>
+            </select>
+            <input v-model="cashFlowForm.amount" type="number" step="0.01"
+              placeholder="金额（元）" data-field="cash-flow-amount" />
+            <input v-model="cashFlowForm.flow_date" type="date" data-field="cash-flow-date" />
+            <input v-model="cashFlowForm.note" type="text"
+              placeholder="备注（可选）" data-field="cash-flow-note" />
+            <button class="btn btn-primary" :disabled="cashFlowSaving" @click="submitCashFlow">
+              {{ cashFlowSaving ? '提交中…' : '登记' }}
+            </button>
+          </div>
+          <p class="field-hint" style="font-size:12px;color:var(--ink-faint)">
+            入金 / 出金 / 分红填正数（方向由类型决定）；「其他」按正负判方向（正 = 流入）。
+          </p>
+          <p v-if="cashFlowError" class="form-error" data-test="cash-flow-error">{{ cashFlowError }}</p>
+        </div>
+        <table v-if="cashFlows?.flows?.length" class="table">
+          <thead>
+            <tr><th>日期</th><th>组合</th><th>类型</th><th>方向</th><th>金额（元）</th><th>备注</th></tr>
+          </thead>
+          <tbody>
+            <tr v-for="f in cashFlows.flows" :key="f.id">
+              <td>{{ f.flow_date || '—' }}</td>
+              <td>{{ portfolioName(f.portfolio_id) }}</td>
+              <td>{{ CASH_FLOW_TYPE_LABEL[f.flow_type] || f.flow_type }}</td>
+              <td>{{ cashFlowDirection(f) }}</td>
+              <td>{{ formatMoney2(Number(f.amount)) }}</td>
+              <td>{{ f.note || '—' }}</td>
+            </tr>
+          </tbody>
+        </table>
+        <div v-else class="empty-state"><p>暂无台账记录</p></div>
+        <div v-if="cashFlows" class="cash-flow-summary" data-test="cash-flow-summary">
+          <span v-for="pid in sessionPortfolioIds(cashFlowModal.session)" :key="pid">
+            {{ portfolioName(pid) }} 累计净流入：{{ netInflowOf(pid) }} 元
+          </span>
+        </div>
+      </div>
+      <div class="modal-actions">
+        <button class="btn" @click="closeCashFlows">关闭</button>
+      </div>
+    </div>
+  </div>
+
   <!-- ============ 实盘配置指南 Modal（M2）============ -->
   <div v-if="showGuide" class="modal-overlay modal-lg" @click.self="showGuide = false">
     <div class="modal-content">
@@ -1701,6 +1940,60 @@ onUnmounted(() => {
   line-height: 1.5;
   color: var(--red);
   white-space: normal;
+}
+/* start 返回的通道建议类告警（非阻断） */
+.start-warning {
+  margin-top: 6px;
+  max-width: 320px;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--orange, #e67e22);
+  white-space: normal;
+}
+/* A1 新建会话软告警横幅 */
+.create-warning-banner {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 14px;
+  margin-bottom: 12px;
+  font-size: 13px;
+  line-height: 1.6;
+  border-left: 4px solid var(--orange, #e67e22);
+  background: rgba(230, 126, 34, 0.08);
+}
+/* A7 参数漂移横幅：差异字段逐条列出 */
+.drift-banner {
+  padding: 10px 14px;
+  margin-bottom: 12px;
+  border-left: 4px solid var(--red);
+  background: rgba(231, 76, 60, 0.06);
+  font-size: 13px;
+}
+.drift-head { display: flex; align-items: center; gap: 10px; margin-bottom: 6px; }
+.drift-fields { margin: 4px 0 6px; }
+.drift-fields ul { margin: 0; padding-left: 20px; line-height: 1.7; }
+.drift-hint { font-size: 12px; color: var(--ink-faint); }
+/* 外部现金流台账弹窗 */
+.cash-flow-risk {
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--orange, #e67e22);
+  background: rgba(230, 126, 34, 0.08);
+  padding: 8px 10px;
+  border-radius: 4px;
+  margin: 4px 0 12px;
+}
+.cash-flow-form { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+.cash-flow-form input, .cash-flow-form select { width: auto; min-width: 110px; }
+.cash-flow-summary {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 16px;
+  margin-top: 8px;
+  font-size: 12px;
+  color: var(--ink-soft);
 }
 .formula-tag { font-size: 11px; color: var(--accent); background: var(--accent-light); padding: 1px 6px; border-radius: 3px; margin-left: 4px; }
 .event-log {

@@ -67,7 +67,50 @@ def test_single_trading_day_does_not_divide_by_zero():
     ])
     assert result
     assert result["volatility"] == Decimal("0")
-    assert result["sharpe_ratio"] == Decimal("0")
+    # W5-L1（2026-11-16）：无有效波动样本时 sharpe/sortino 与 calmar 统一 None
+    # （「无样本/无波动」≠「极差」，避免筛选把两者混成同一个 0）。
+    assert result["sharpe_ratio"] is None
+    assert result["sortino_ratio"] is None
+    assert result["calmar_ratio"] is None
+
+
+def test_total_return_guards_zero_start_value():
+    """首日净值为 0 时分母保护生效：total_return=0 而非 Decimal DivisionByZero。"""
+    result = Evaluator().evaluate([
+        _snap(0, date(2024, 1, 2)),
+        _snap(100000, date(2024, 1, 3)),
+    ])
+    assert result["total_return"] == Decimal("0")
+    assert result["max_drawdown"] == Decimal("0")
+
+
+def test_infer_periods_per_year_by_snapshot_frequency():
+    """评估层按快照实际频率推断年化因子：日 252 / 周 52 / 月 12 / 样本<3 默认 252。"""
+    from datetime import timedelta
+    from core.engine.evaluator import infer_periods_per_year
+
+    base = date(2024, 1, 2)
+    assert infer_periods_per_year([base + timedelta(days=i) for i in range(10)]) == 252.0
+    assert infer_periods_per_year([base + timedelta(days=7 * i) for i in range(10)]) == 52.0
+    assert infer_periods_per_year([base + timedelta(days=30 * i) for i in range(10)]) == 12.0
+    assert infer_periods_per_year([base]) == 252.0
+    assert infer_periods_per_year([]) == 252.0
+
+
+def test_weekly_snapshot_volatility_annualized_with_52_factor():
+    """纯周粒度快照：volatility 用 √52 年化（修复前按 √252 放大 √5 倍）。"""
+    import math
+    from datetime import timedelta
+    base = date(2024, 1, 2)
+    values = [100000, 102000, 99000, 103000, 98000, 104000]
+    snaps = [_snap(v, base + timedelta(days=7 * i)) for i, v in enumerate(values)]
+    result = Evaluator().evaluate(snaps)
+
+    returns = [values[i + 1] / values[i] - 1 for i in range(len(values) - 1)]
+    mean = sum(returns) / len(returns)
+    var = sum((r - mean) ** 2 for r in returns) / len(returns)
+    expected = math.sqrt(var * 52)
+    assert abs(float(result["volatility"]) - expected) < 1e-4
 
 
 def test_max_drawdown():

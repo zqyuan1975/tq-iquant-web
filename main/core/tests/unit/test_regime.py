@@ -187,6 +187,30 @@ def test_chinese_label_map_covers_four_states():
         REGIME_BULL, REGIME_BEAR, REGIME_RANGE, REGIME_REBOUND}
 
 
+# ---------------------------------------------------------------------------
+# 2026-11-16 P1：预热窗口（MA_SLOW_WEEKS=30）只用于算标签，输出裁剪到回测区间
+# ---------------------------------------------------------------------------
+def test_trim_start_uses_warmup_then_clips_output():
+    """向前多取的预热周只参与计算：裁剪后首周已承接正确标签（不是恒 range）。"""
+    vals = [100.0] * 30 + [100.0 * (1.02 ** i) for i in range(1, 31)]
+    fridays = _fridays(60)
+    res = segment_regime(
+        _series(vals), trim_start=fridays[40], trim_end=fridays[49])
+
+    assert res["warmup_weeks"] == 40
+    assert len(res["weeks"]) == 10
+    assert [w["date"] for w in res["weeks"]] == fridays[40:50]
+    # 无预热时首 30 周恒 range；这里第 41 周直接给出 bull，证明预热生效
+    assert res["weeks"][0]["label"] == REGIME_BULL
+
+
+def test_trim_without_bounds_keeps_all_weeks_and_zero_warmup():
+    vals = [100.0] * 40
+    res = segment_regime(_series(vals))
+    assert res["warmup_weeks"] == 0
+    assert len(res["weeks"]) == 40
+
+
 # ===========================================================================
 # B5：CausalRegimeTracker —— 逐日因果跟踪（引擎运行时注入 portfolio.current_regime）
 # ===========================================================================

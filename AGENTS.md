@@ -2,7 +2,7 @@
 
 ## 项目状态
 
-**已实现（脚手架 + 主链路已通）** — 24 个模型文件、48 个引擎源码文件、9 个 API 路由模块、10 个前端视图、41 个 Alembic 迁移均已落地；回测/实盘主链路已接线。完整实现状态见 [CLAUDE.md](CLAUDE.md)「实现状态」小节。本文档记录业务规则与设计依据，实现细节以代码与 CLAUDE.md 为准。
+**已实现（脚手架 + 主链路已通）** — 31 个模型文件、52 个引擎源码文件、11 个 API 路由模块、11 个前端视图、57 个 Alembic 迁移均已落地；回测/实盘主链路已接线。完整实现状态见 [CLAUDE.md](CLAUDE.md)「实现状态」小节。本文档记录业务规则与设计依据，实现细节以代码与 CLAUDE.md 为准。
 
 **单用户系统**：无用户鉴权，所有接口无需登录。
 
@@ -45,6 +45,15 @@ Web 前端 (Vue 3 + Vite + Pinia) ←HTTP/SSE→ Core (FastAPI)
 
 开发期前端通过 Vite proxy 代理 API 到 FastAPI；生产期由 FastAPI 直接托管 `web/dist/` 静态文件。
 
+## 进程自愈与部署（2026-11-16）
+
+- **进程内看门狗只告警**：`core/engine/live/engine_watchdog.py`（30s daemon）只检测通道停摆/轮次卡住并告警，**不重启进程**（进程消失它也消失）；文档/注释里禁止再写"靠它兜底进程"。
+- **进程级自愈 = 程序自带父进程**：`core/supervisor.py`，入口 `tq-iquant.exe --supervise`（源码 `python -m core.supervisor` 或 `desktop.py --supervise`）。父进程拉起 `--serve` 子进程，每 10s 探活 `/health`；子进程退出或连续 3 次无响应 → 退避重启（3s 起翻倍、上限 60s）；连续 5 次失败 → 停止重试并写明确日志，不无限刷屏。日志：`logs/supervisor.log`（父）/`logs/supervisor-child.log`（子进程输出）。
+- **端口禁止硬编码**：打包版端口 8888~8898 动态，实际端口/pid/版本写 `data/runtime/server.json`（正常退出清理）；父进程、桌面壳、二次双击都读它探活。`/health` 无鉴权，返回版本/运行时长/端口/pid/app 标记。
+- **单实例**：`data/runtime/supervisor.lock`（只允许一个父进程）+ `server.lock`（只允许一个后端，防两后端同连一个 SQLite），均为 OS 级文件锁，进程强杀自动释放；已有健康实例时二次启动只复用界面，不起第二个后端。
+- **默认双击行为不变**：不加参数仍是单进程（后端 + 界面；`--no-supervise` 等价）；自愈模式只由安装器注册的登录计划任务或显式 `--supervise` 触发。子进程内父进程看门狗保证父进程被杀后 5s 内自行退出，不留孤儿端口。
+- **禁止用 Windows 服务托管**：服务在会话 0、无交互桌面，通达信/同花顺键鼠自动化会失效。安装器只用「登录时计划任务」（任务名 `TQ-IQuant-Supervisor`，`/SC ONLOGON /RL LIMITED`，卸载删除）。
+
 ## 开发范式
 
 **TDD**：先写测试，再写实现。pytest（后端）+ vitest（前端）。
@@ -58,7 +67,7 @@ Web 前端 (Vue 3 + Vite + Pinia) ←HTTP/SSE→ Core (FastAPI)
 - 基础路径：`/api`
 - 无鉴权，API 直接可访问
 - 统一返回格式：`{ "code": 0, "message": "ok", "data": { ... } }`（code=0 成功，非 0 错误）
-- 44 个 HTTP 接口 + 1 个 WebSocket，9 组（详见设计文档 5.6 节）
+- 80 条 HTTP 路由（11 个路由模块；**全仓无 WebSocket 实现**），详见设计文档 5.6 节
 - 实盘实时推送通过 SSE（`GET /api/live/sessions/{id}/stream`），非轮询
 
 ## 数据库（SQLite）
@@ -68,7 +77,7 @@ Web 前端 (Vue 3 + Vite + Pinia) ←HTTP/SSE→ Core (FastAPI)
 - `config.yaml`（项目根目录）存储系统路径配置，无数据库密码（SQLite 本地文件）
 - 每日快照 `backtest_daily_snapshots` 是评估指标的原始数据来源
 - `backtest_evaluations` 18 个指标由 Evaluator 从快照序列计算
-- `backtest_records.params_snapshot` 冻结回测时的策略参数，确保结果可复现
+- `backtest_records.params_snapshot` 冻结回测时的组合/策略级参数、股票池成分与口径版本标记，确保结果可复现、可比
 - 实盘交易记录：`live_orders`（订单状态跟踪）+ `live_trades`（成交记录）
 - 多组合策略实盘：`live_session_portfolios` 关联表，一个 session 可含多个组合策略，共享同一资金账户（实际账户由所选引擎通道决定），各组合策略独立维护虚拟持仓和虚拟现金
 
@@ -106,6 +115,31 @@ Web 前端 (Vue 3 + Vite + Pinia) ←HTTP/SSE→ Core (FastAPI)
 - **桥拒单可重排（2026-11-11）**：`BridgeOrderRejected` 分两类——「价格闸/涨跌停」类（未命中 `_REJECT_TERMINAL_HINTS`）视为**可重排**，订单不落终态而是回 `deferred`（`live_orders.status="deferred"`），`error_message` 写 `deferred_retry:n=<k>; <柜台原因>`，计数上限 `_DEFERRED_RETRY_MAX=2`（首报 + 2 次重排 = 最多 3 次尝试），`recover` 从该标记读回计数（跨重启仍受上限约束）；命中终态提示（资金不足/可用数量/数量价格非法/非交易时间/停牌/重复委托/通道不支持 `not supported`）或 `BridgeOrderIdError`（认领键冲突）→ 仍 `rejected` 终态。**与 at-most-once 不冲突**：重排只发生在「次日 due 窗口」或「同一交易日 09:31 首根 bar」各一次，当日绝不重复报；`LiveBarOrderMark` 仍按 `(session, 组合, 策略, 代码, bar_time, 方向, seq)` 独立成键、不看终态。终态分支同时把该单从 `_signal_bar_deferred` 内存队列摘除，避免终态单被放行路径二次提交。
 - **分钟单提交价让 1 跳（2026-11-11）**：`requote_enabled=true` 时，分钟级策略（非 `1d`/`1w`/`1mon`）提交价在信号 bar 收盘价上 BUY `+1 tick` / SELL `−1 tick`（`tick_size(code)`，经 `_clamp_release_price` 夹当日涨跌停并 quantize 到分），记 `gate=submit_price/action=bias` 决策事件。豁免：日线及以上周期、deferred 放行价（`_release_priced`，由 `_refresh_release_price` 取首根 open 后不再让价）、盘前集合竞价单（`_pre_open_bar_time`，按 bias% 定价）、追价重下（`_requote`，已自带 ±1 跳）。默认 `requote_enabled=false` → 与旧版逐字一致；未成交仍由既有 180s 超时撤单 + 追价路径兜底（`requote_max_attempts`）。
 
+## 回测口径（2026-11-16 核查收口）
+
+- **无成交假 bar 剔除**：`NO_TRADE_BAR_POLICY = "drop_volume0_carryforward_v1"`（`backtest_service.py`）。取数层把「`Volume==0` 且 `OHLC` 全等于相邻有效收盘」的补行（停牌/上市前占位行）整行剔除，不参与信号、成交、估值与日快照；口径版本写 `params_snapshot["no_trade_bar_policy"]`，**旧结果（含假 bar）不与新结果混比**。
+- **卖出印花税按成交日分段**：`STAMP_DUTY_SEGMENTS_VERSION = "cn_a_share_sell_2008_20230828_v2"`（`execution_engine.py`）；2023-08-28 起 0.05%，之前 0.1%（2008-09-19 后单边 0.1% 兜底）。组合 `stamp_duty_rate` 显式配成非默认值（≠0.0005）时**全区间照用**（保住自定义费率语义）。版本写 `params_snapshot["stamp_duty_segments"]`。
+- **涨跌停前收按 `(code, 交易日)`**：`build_prev_close_by_day`（`backtest_engine.py`）= 上一交易日**最晚一根** bar 收盘（任意周期），**日内恒定**。旧实现键含 period 且逐 bar 覆写，5m/15m/30m/1h 当日第二根起「前收」变成上一根同周期收盘 → 涨停虚高/跌停虚低，封板买、跌停卖都能成交。增量续跑传「未切片全区间」结果，避免续跑首日缺前收导致整体 fail-open。
+- **在途单最大存活期**：`backtest.pending_order_max_days`（`config.yaml`；缺键 = `PENDING_ORDER_MAX_DAYS = 20` 个交易日，`<=0` 不限）。超期单记 `gate=pending_order_expired / action=cancel` 后作废不回队——防停牌/连板把 deferred 单无限顺延、几个月后按恢复日开盘价「补做」早已过期的决策（实盘有超时撤单 + 次日重排，不会挂这么久）。
+- **`params_snapshot` 冻结范围**：组合级参数 + run 级覆盖（费用预留/债券 T+0/整手/自适应滑点/成交量与权益上限/复权/日终抬峰/日亏基准）之外，本轮新增**策略级参数**（`strategies[]`：止损止盈移动止损/开仓比例/加仓阈值与次数/槽位/主从角色/周期/公式）与**股票池成分**（`pool`：pool_id → 代码列表），另含三个口径标记 `no_trade_bar_policy` / `stamp_duty_segments` / `fee_threshold_basis`。
+- **back/dual 下费用阈值在复权价空间判定**：`fee_threshold_basis = "adjusted_price_space_v1"`——最低佣金 5 元等金额阈值判据用后复权记账价而非原始价，后复权价更高时「未达 5 元」判定偏保守（成本略高估）。**已知限制**，不与原始价空间逐笔对齐。
+- **评估口径**：年化因子按快照日期间隔中位数推断（`infer_periods_per_year`：≥20 天 → 12、≥5 天 → 52、否则 252；分钟快照先聚合到日），Sharpe/Sortino/年化超额/跟踪误差不再被 √5~√21 放大；**无有效样本时 sharpe/sortino/calmar 返回 `None`**（界面「—」）；`total_return` / 最大回撤 / ulcer 有分母保护（首末净值或回撤基准为 0 时给 None/0，不出 inf/NaN）。
+- **市场状态预热**：`_MARKET_REGIME_WARMUP_DAYS = 280`（约 40 周）仅用于打标预热，须从回测起点之前提前取基准收盘；样本量闸 `_MARKET_REGIME_MIN_DAYS = 210`（≈ MA30 周 + 2 周确认），不足返回 `status=insufficient`（「样本不足」），**不退回 range 冒充结论**。
+- **可转债涨跌停与已知限制**：`market_rules.backtest_limit_rule` 对转债（`BOARD_BOND`）兜底 **±20%**（自 2022-08-01 统一口径；旧口径回落 10% → 板上追价成交）。已知限制：①转债**上市首日** -43.3%/+57.3% 特例未建模（按 20% 推偏窄，方向 fail-safe＝延后而非误成交）；②**历史 ST 名单不可回溯**——回测用当前名称判 ST，历史某段为 ST 而当前不是时按板块默认幅度推宽（主板 10%）。
+- **增量 checkpoint v3 判定依据**：`SCHEMA_VERSION = 3` / `_ENGINE_SCHEMA = "backtest_engine_v3"`。指纹分项 = `params` / `strategies` / `formula`（正文哈希/engine/no_leak_cross/信号线）/ `pool` / `baseline`（baseline_version + baseline_value），叠加成本口径 `fee_inclusive_v2`、成交 `next_bar_open_v1`、T+1 `t1_forced_v1`；state 新增 `risk_cooldown`（冷静期）与接缝游标 `seam_bar_time`。任一分项变化 → checkpoint **判废**；**判废不自动重建**，由用户/调度器决定（下一轮 `run_incremental` 按常规路径从接缝日重建）。
+- **实盘侧重放并入 `live_cash_flows`**：接缝 JSON 记 `flow_cursor`（`live_cash_flows.id` **右开**，表示该水位已计入 `seam_cash`）——重放只取 `id > flow_cursor` 的流水。不用 `flow_date`（只有日期，同日无法排序）或 `created_at`（SQLite UTC，与本地接缝时刻差 8 小时），两者都会把接缝日流水误判为「已计入」；旧接缝无该字段时回退 `flow_date > seam_date` 并告警。
+
+## 实盘链 P1 收口（2026-11-16）
+
+- **日线轮次幂等**：`live_sessions.daily_bars_done_date` **只在整轮驱动成功后写**（旧实现驱动前就写，一次短暂掉线/崩溃就永久丢剩余组合的 1d/1w/1mon）。桥离线（`BridgeUnavailableError`）只跳过该组合、继续驱动其余组合并计「未完成」，其它异常同样跳过该组合；本轮有未完成则不标完成，由 60s tick 重试，已成功的 `(交易日, 周期, 组合)` 记在 `_daily_driven_keys` 不再重复驱动。
+- **拆单队列可观测**：`stop` 时未提交子单随队列丢弃（预期行为），逐队列落 `gate=split_children_lost / action=drop` 决策事件（含剩余笔数与股数，供人工判断是否补单）；`recover` 按 `live_bar_order_marks(seq>0)` + 在途子单反查剩余量并记 `action=notice` 告警，**不自动补单、不落库重放、不新增列**。
+- **risk 事件落库清单**：`valuation_missing_price` / `deferred_release fallback` / `deferred_dropped_stale` / `cash_diff` / `equity_deviation` / `daily_bar_freshness` 经 `_emit_risk_safe(persist=True)` **同落 `live_decision_events`（layer=risk）**，刷新页面仍可查；节流口径不变（每 code 每日一次 / 10 分钟 / 每会话一次 / 每交易日一条）。
+- **周期边界补偿**：`dispatch_period_bar` 返回 `dispatched | stale | empty | no_strategy`；`stale`（全部被新鲜度闸拦下）与 `empty`（有该周期策略但一只 code 都取不到可用 bar）**同等挂待补偿**（15 分钟或跨日放弃），`no_strategy`（实例无该周期策略）不进补偿。
+- **`bought_today` 口径**：BUY-only、区间 `[当日 0 点, 次日 0 点)`（旧实现只有下界，一条未来时间脏行会让该策略该股被永久判定「当日已买过」）；**同一笔单的续做豁免**——`_requote` / `_requeued_for_retry` / `_deferred_retry_count>0` 带的是原单未成交剩余量，追价与 deferred 重排**不再被信号级排重吞掉**（partial 成交后剩量不丢）；槽位/在途/bar 幂等闸照旧，新信号仍严格（同日同策略同代码只买一次）。
+- **记账锁（BUY 临界区）**：BUY 的「资金上限计算（读在途预留）+ 审批 + 拆单 + 落库 + 在途注册」在**同一个 `_book_lock` 临界区**内完成（旧实现 cap 在锁外算、注册在锁内，deals 池追价与新单并发时双份占用同一笔现金＝超买）；锁序恒为 `_book_lock → get_tdx_lock`。
+- **判重键**：桥可用持仓刷新按 **`bar_time`** 判重（`_available_bar_time`，不用 bar 对象身份——1m 节拍与周期边界可能是同一时刻的两个 `BarEvent`）；**缺价告警去重键 = `(portfolio_id, code)`**（旧键只用 code，多组合持同一缺价票时只有第一个组合报一次）；`trade_type` 读取统一走 `_is_buy()` 大小写归一（大写行漏计在途 BUY → 超开仓）。
+- **隐式契约**：`live_orders` **无 `signal_bar_date` 列**，deferred 的信号日靠 `bar_time.date()` 重建；`orig_quantity` / `baseline_version` **只写不读**（放行时按真实可用动态缩量；基准识别靠 deferred 行 + `bar_time` 口径，不靠这两列）。
+
 ## 模块复用
 
 引擎层核心逻辑（风控、信号优先级排序、资金审批、持仓更新）回测/实盘共用，集中在 `portfolio.py`/`risk_manager.py`/`strategy_context.py`。实盘独有逻辑（对账告警、熔断次日恢复、SSE 事件流、周期边界 1m/1d 14:30/1w·1mon 处理）在 `live_engine.py`。差异通过策略模式隔离下单与 T+1 检查：
@@ -136,6 +170,9 @@ Web 前端 (Vue 3 + Vite + Pinia) ←HTTP/SSE→ Core (FastAPI)
 | `main/core/engine/live/file_handoff.py` | 执行契约文件交接层（通道无关；signals/risk/orders/results JSONL + cursor.json 游标） |
 | `main/core/engine/live/win_dialog_scope.py` | 双引擎弹窗归属识别 + UI 自动化互斥锁（tdx/ths 并行防串扰） |
 | `main/core/engine/live/snapshot_bars.py` | 快照合成 1m bar（TQ 盘中分钟线不可得的盘中数据源） |
+| `main/core/runtime.py` | 运行期实例信息 `data/runtime/server.json` + 单实例锁 + 动态端口发现（`/health` 载荷） |
+| `main/core/supervisor.py` | 自带自愈父进程（`--supervise` 父进程 / `--serve` 子进程；探活 + 退避重启 + 孤儿防护） |
+| `main/desktop.py` | 打包版/桌面壳入口（默认单进程；`--supervise` 自愈；`--serve` 纯后端） |
 | `live/bridge/` | HTTP 桥策略：`iquant_bridge.py`（QMT 通道生产桥，`127.0.0.1:8790`，账号 410038214257 / `STOCK`，**在用**；账户为 **QMT 仿真账户/仿真资金**，切真实资金须改 `ACCOUNT` / `ACCOUNT_TYPE` 并重跑实盘验证）/ `iquant_bridge_live.py`（`8791` + 信用账户 `CREDIT` 410009993017，**非生产、未启用**，仓库保留以维持镜像护栏）/ `goldminer_bridge.py`（掘金量化，掘金终端内运行，`127.0.0.1:7801`）。QMT 与掘金、同花顺、通达信并列为四条生产通道；Core 的 `simulation` / `live` 两个模式位均指向 8790 |
 | `web/` | Vue 3 + Vite 前端 |
 | `config.yaml` | 系统配置（TDX 路径、`ths_ui` / `tq_trade` / `goldminer` / `iquant_bridge` 交易通道） |
@@ -170,3 +207,4 @@ Web 前端 (Vue 3 + Vite + Pinia) ←HTTP/SSE→ Core (FastAPI)
 - **禁止由 AI 执行重启/部署**：杀后端进程、启动 `uvicorn`、重开实盘会话一律由用户择时手动执行（启动预热与 TQ 调用会冻结通达信客户端，AI 不掌握用户盘中节奏）。
 - **AI 汇报格式**：改动文件清单 + 冒烟测试结果 + 「需要重启生效」标注；用户重启后如有验证需求，只做只读 API/日志检查。
 - **全量测试**（`uv run pytest core/tests/unit/`，~80s，部分用例触真实 TQ）同样会卡通达信——仅在用户明确要求或停会话窗口执行。
+- **文档与代码同一轮收口**：修复任务凡涉及配置项、参数、接口或库结构变更，必须同步更新 [docs/用户使用说明.md](docs/用户使用说明.md)（配置指南：键名、默认值、取值范围、实盘/回测生效范围、界面入口）与本文件对应规则，不得只改代码；迁移 revision 与新增库列要写进该文档「九、系统配置」。

@@ -18,6 +18,16 @@ _pending_close = False
 _CLOSE_GRACE = 8.0  # 关闭信号后的宽限期（秒），覆盖刷新/新标签页接入的间隙
 
 
+def _exit_process() -> None:
+    """清理本进程的运行期实例信息后硬退出（不走 uvicorn 优雅关闭）。"""
+    try:
+        from core import runtime
+        runtime.clear_server_info(os.getpid())
+    except Exception:  # noqa: BLE001 — 退出路径绝不能被清理失败阻断
+        pass
+    os._exit(0)
+
+
 def arm() -> None:
     """打包 exe 启动时调用：启用自动退出。开发模式不调用 → 全部接口 no-op。"""
     global _armed
@@ -48,7 +58,7 @@ def request_close() -> None:
         time.sleep(_CLOSE_GRACE)
         with _lock:
             if _armed and _pending_close and time.monotonic() - last >= _CLOSE_GRACE:
-                os._exit(0)
+                _exit_process()
 
     threading.Thread(target=_check, daemon=True).start()
 
@@ -60,6 +70,6 @@ def shutdown_now() -> None:
 
     def _exit() -> None:
         time.sleep(0.5)
-        os._exit(0)
+        _exit_process()
 
     threading.Thread(target=_exit, daemon=True).start()

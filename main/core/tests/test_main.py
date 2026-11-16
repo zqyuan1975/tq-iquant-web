@@ -14,7 +14,13 @@ async def test_health():
     async with AsyncClient(transport=transport, base_url="http://test") as client:
         resp = await client.get("/health")
         assert resp.status_code == 200
-        assert resp.json() == {"ok": True}
+        body = resp.json()
+        # 自愈父进程靠这些字段确认「真的是我们的后端」（端口动态，见 server.json）
+        assert body["ok"] is True
+        assert body["app"] == "tq-iquant"
+        assert body["version"]
+        assert body["pid"] > 0
+        assert body["uptime_seconds"] >= 0
 
 
 @pytest.mark.anyio

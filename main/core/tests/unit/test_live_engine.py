@@ -4933,6 +4933,28 @@ def test_on_bar_stale_boundary_pending_then_compensated():
     assert boundary not in engine._pending_boundaries
 
 
+def test_on_bar_empty_boundary_pending_compensation():
+    """P1#6（2026-11-16）：TQ 返回空（全部 code 无 bar）与陈旧同等挂待补偿。
+
+    旧实现只对 "stale" 挂 `_pending_boundaries`，"empty" 直接丢弃（既不登记也不
+    补偿），TQ 偶发空返回会让该 5m/15m/30m/1h 边界当日永久丢失。
+    """
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single(period="5m")
+    stock = "600000.SH"
+    boundary = datetime(2026, 8, 12, 10, 5)
+    rec = _Recorder()  # /quote 默认返回空 data → dispatch_period_bar 返回 empty
+    disp, _ = _make_dispatcher(rec)
+    engine = _make_engine_formula_portfolio(disp, factory, port, {1: "MA_CROSS"})
+
+    bar = _bar(stock, "9.3", boundary)
+    bar.period = "1m"
+    engine._on_bar(bar)
+
+    assert boundary not in engine._dispatched_boundaries
+    assert engine._pending_boundaries.get(boundary) == {"5m"}
+
+
 def test_retry_pending_boundary_expires_after_ttl():
     """待补偿边界超 TTL（15 分钟）→ 放弃且不再拉取（旧 bar 不触发）。"""
     factory, _ = _db_factory()
@@ -11812,6 +11834,167 @@ def test_external_signal_inherits_gates_duplicate_trade():
     rows = _decision_rows(factory)
     assert any(r.gate == "duplicate_signal" for r in rows)
     db.close()
+
+
+def test_buy_same_order_continuation_bypasses_bought_today():
+    """P1#12（2026-11-16）：同一张逻辑单的续做（追价/ deferred 重试）绕开 bought_today。
+
+    部分成交（300/800）后追价重下剩余量、或拒单/越价撤单后回 deferred 重试，带的
+    都是原单剩余量，不是新信号——若仍走信号级排重，剩余量会静默丢失。新信号仍
+    保持严格（同日同策略同代码只买一次）。
+
+    每个续做标记独立夹具（真实链路里续做发生在原单已收敛之后，同库残留的
+    在途单会被 inflight 闸拦下，那是另一条正确的闸，与本用例无关）。
+    """
+    def _run(mark):
+        factory, _ = _db_factory()
+        port, _ctx = _portfolio_single()
+        db = factory()
+        _seed_buy_trade(db, "600000.SH", _BT, qty=300)  # 当日已部分成交 300 股
+        engine, rec = _gate_engine(factory, port)
+
+        # ① 新信号：仍被 duplicate_signal 拦下（不落新单）
+        engine._submit_one_order(db, port, _order("600000.SH", TradeType.BUY), "1m")
+        engine._drain_decisions(db, port)
+        assert db.query(LiveOrder).count() == 1
+        rows = _decision_rows(factory)
+        assert any(r.gate == "duplicate_signal" for r in rows)
+
+        # ② 续做（剩余量）：绕过 bought_today → 落库 + 发桥
+        cont = _order("600000.SH", TradeType.BUY,
+                      bar_time=datetime(2026, 8, 5, 9, 31))
+        mark(cont)
+        engine._submit_one_order(db, port, cont, "1m")
+        assert db.query(LiveOrder).count() == 2
+        assert len([r for r in rec.requests if r.url.path == "/order"]) == 1
+        db.close()
+
+    _run(lambda o: setattr(o, "_requote", True))
+    _run(lambda o: setattr(o, "_requeued_for_retry", True))
+    _run(lambda o: setattr(o, "_deferred_retry_count", 1))
+
+
+def test_bought_today_ignores_future_dated_trade_rows():
+    """P1#10（2026-11-16）：排重查询补上界——异常的未来时间成交行不再永久阻断 BUY。"""
+    factory, _ = _db_factory()
+    port, ctx = _portfolio_single()
+    db = factory()
+    # 脏数据：成交时间在未来（次日 10:00）
+    _seed_buy_trade(db, "600000.SH", datetime(2026, 8, 7, 10, 0))
+    engine, rec = _gate_engine(factory, port)
+
+    engine._submit_one_order(db, port, _order("600000.SH", TradeType.BUY), "1m")
+
+    # 未来行不在 [当日 0 点, 次日 0 点) 内 → 正常提交
+    assert db.query(LiveOrder).count() == 2
+    assert any(r.url.path == "/order" for r in rec.requests)
+    db.close()
+
+
+def test_risk_event_persist_flag_writes_decision_row():
+    """P1#3（2026-11-16）：risk 事件 persist=True 时同部落 live_decision_events。
+
+    cash_diff/equity_deviation/valuation_missing_price 等原只推 SSE，刷新页面即
+    消失；落库后工作台可查。persist=False 保持原行为（只推 SSE）。
+    """
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single()
+    engine, rec = _gate_engine(factory, port)
+
+    engine._emit_risk_safe(
+        {"gate": "cash_diff", "rule": "cash_diff", "action": "notice",
+         "message": "柜台与虚拟现金不一致"})
+    assert _decision_rows(factory) == []
+
+    engine._emit_risk_safe(
+        {"gate": "cash_diff", "rule": "cash_diff", "action": "notice",
+         "message": "柜台与虚拟现金不一致"}, persist=True)
+    rows = _decision_rows(factory)
+    assert [(r.gate, r.layer, r.action) for r in rows] == [("cash_diff", "risk", "notice")]
+    assert rows[0].live_session_id == 1
+
+
+def test_available_map_refresh_dedupes_by_bar_time_not_object_identity():
+    """P1#4（2026-11-16）：可用持仓刷新按 bar_time 判重，不按 bar 对象身份。
+
+    1m 节拍 bar 与周期边界 bar 可能同 bar_time 但对象不同；按身份判重会各刷一次，
+    把前一批 consume_available 的递减冲掉（同码多策略跨周期时可重复卖超可用量）。
+    """
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single()
+    engine, _ = _gate_engine(factory, port)
+    calls = []
+    engine._refresh_available_map = lambda: calls.append(1)
+    engine.signal_cache = {}
+
+    engine._handle_bar(port, _bar("600000.SH", "9.0", _BT))
+    engine._handle_bar(port, _bar("600000.SH", "9.0", _BT))  # 同 bar_time 新对象
+    assert len(calls) == 1
+
+    engine._handle_bar(port, _bar("600000.SH", "9.0",
+                                  _BT + timedelta(minutes=1)))
+    assert len(calls) == 2
+
+
+def test_buy_cash_cap_computed_inside_book_lock():
+    """P1#5（2026-11-16）：BUY 资金上限计算与 pending 注册同处 _book_lock 临界区。
+
+    旧实现 cap 在锁外算、注册在锁内做，deals 池 requote 与主池新单可并发读到同一
+    笔未预留现金 → 双份占用。这里断言 _buy_available_cash 被调用时已持有记账锁。
+    """
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single()
+    engine, rec = _gate_engine(factory, port)
+    owned = []
+    orig = engine._buy_available_cash
+
+    def _spy(portfolio):
+        owned.append(engine._book_lock._is_owned())
+        return orig(portfolio)
+
+    engine._buy_available_cash = _spy
+    db = factory()
+    engine._submit_one_order(db, port, _order("600000.SH", TradeType.BUY), "1m")
+
+    assert owned == [True]
+    assert len(engine._pending_orders) == 1
+    db.close()
+
+
+def test_valuation_gap_dedupe_keyed_by_portfolio(monkeypatch):
+    """P1#7（2026-11-16）：缺价事件去重键带 portfolio_id，多组合同码都可见。"""
+    from types import SimpleNamespace as _NS
+
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single()
+    engine, _ = _gate_engine(factory, port)
+    seen = []
+    monkeypatch.setattr(
+        engine, "_emit_risk_safe",
+        lambda payload, persist=False: seen.append(payload))
+
+    def _port(pid):
+        return _NS(portfolio_id=pid, unpriced_codes=lambda: {"600000.SH"})
+
+    bar = _NS(bar_time=_BT)
+    engine._note_valuation_gaps(_port(1), bar)
+    engine._note_valuation_gaps(_port(2), bar)
+    engine._note_valuation_gaps(_port(1), bar)  # 组合 1 同 code 当日只报一次
+
+    assert [(p["portfolio_id"], p["stock_code"]) for p in seen] == [
+        (1, "600000.SH"), (2, "600000.SH")]
+
+
+def test_is_buy_trade_type_normalizes_case_and_enum():
+    """P1#8（2026-11-16）：trade_type 判定统一归一化（大小写/枚举都认）。"""
+    from core.engine.live_engine import _is_buy_trade_type
+
+    assert _is_buy_trade_type("buy")
+    assert _is_buy_trade_type("BUY")
+    assert _is_buy_trade_type(" Buy ")
+    assert _is_buy_trade_type(TradeType.BUY)
+    assert not _is_buy_trade_type("sell")
+    assert not _is_buy_trade_type(None)
 
 
 # ===========================================================================

@@ -12,6 +12,34 @@ from .format import fmt_money, fmt_price
 from tq_iquant_shared.constants import TradeType, SignalType
 
 
+# 卖出印花税分段表（2026-11-16 P1 核查修复）：此前恒按 0.0005，2023-08-28 前实为
+# 0.001（2008-09-19 起单边 0.1%，更早双边 0.3% 不在回测覆盖范围，按 0.1% 兜底）。
+# 版本号写入 backtest_records.params_snapshot（stamp_duty_segments），新旧结果不可混比。
+STAMP_DUTY_SEGMENTS_VERSION = "cn_a_share_sell_2008_20230828_v2"
+STAMP_DUTY_SEGMENTS = (
+    (date(2023, 8, 28), Decimal("0.0005")),
+    (date.min, Decimal("0.001")),
+)
+_CURRENT_STAMP_DUTY_RATE = Decimal("0.0005")
+
+
+def stamp_duty_rate_on(day, configured_rate: Decimal = _CURRENT_STAMP_DUTY_RATE) -> Decimal:
+    """按成交日返回卖出印花税率。
+
+    组合配置的 ``stamp_duty_rate`` 是用户显式口径：不等于现行默认 0.0005 时全区间
+    照用（保住「可配置费率」语义，如测试/自定义模型）；等于默认值时按交易所历史
+    分段（2023-08-28 前 0.1%）。日线及以上/分钟级的 ``order.bar_time`` 均为成交
+    当日时间戳，直接取 date 比较。
+    """
+    if configured_rate != _CURRENT_STAMP_DUTY_RATE or day is None:
+        return configured_rate
+    d = day.date() if hasattr(day, "date") else day
+    for start, rate in STAMP_DUTY_SEGMENTS:
+        if d >= start:
+            return rate
+    return configured_rate
+
+
 class OrderDispatcher(ABC):
     @abstractmethod
     def place_order(self, order: OrderEvent,
@@ -47,6 +75,7 @@ class SimulatedDispatcher(OrderDispatcher):
         slippage: Decimal = Decimal("0"),
         bar_volumes: dict = None,
         slippage_impact_coef: Optional[Decimal] = None,
+        price_limits: dict = None,
     ):
         """成本参数来自组合表，默认值 = 历史硬编码值，老调用不破。
 
@@ -54,6 +83,9 @@ class SimulatedDispatcher(OrderDispatcher):
         时有效滑点 = slippage + coef×订单股数/(bar成交量×100)，封顶 0.10；
         任一缺失或该票无量时回退固定 slippage（原行为）。bar_volumes 值为
         TDX Volume（单位=手，×100 转股数）。
+        price_limits：{(code): (跌停价, 涨停价)}，可选。提供时把**含滑点的成交价**
+        夹进该区间（2026-11-16 修复滑点越板：闸门只比 open 与涨跌停，开盘贴板时
+        含滑点成交价可越板）；未提供（涨跌停校验关闭/无前收/新股窗口）不夹取。
         """
         self.open_prices = open_prices or {}
         self.min_commission = min_commission
@@ -66,6 +98,7 @@ class SimulatedDispatcher(OrderDispatcher):
         self.slippage = slippage
         self.bar_volumes = bar_volumes
         self.slippage_impact_coef = slippage_impact_coef
+        self.price_limits = price_limits or {}
 
     def _effective_slippage(self, order: OrderEvent) -> Decimal:
         """#4 自适应滑点：市场冲击随订单量占 bar 成交量比例线性上浮，封顶 0.10。
@@ -93,11 +126,28 @@ class SimulatedDispatcher(OrderDispatcher):
             fill_price = price * (Decimal("1") + slippage)
         else:
             fill_price = price * (Decimal("1") - slippage)
+        # 滑点越板夹取（2026-11-16）：开盘贴板时 open 合法但含滑点成交价会越板
+        # （买入 > 涨停 / 卖出 < 跌停 = 凭空多付或少收）。只夹「滑点推出去的那一侧」：
+        # 买价只受涨停上限约束、卖价只受跌停下限约束——若原始 open 本身就在区间外
+        # （数据缺口/复牌跳空），保持不变，避免把「已成交价」反向拉回制造假收益。
+        bounds = self.price_limits.get(order.stock_code)
+        if bounds:
+            _low, _high = bounds
+            if order.trade_type.value == "BUY":
+                if _high is not None and fill_price > _high:
+                    fill_price = _high
+            else:
+                if _low is not None and fill_price < _low:
+                    fill_price = _low
         amount = fill_price * order.quantity
         is_sell = order.trade_type.value == "SELL"
         rate = self.sell_commission_rate if is_sell else self.buy_commission_rate
         commission = max(self.min_commission, amount * rate)
-        stamp_duty = amount * self.stamp_duty_rate if is_sell else Decimal("0")
+        # 印花税按成交日分段（2023-08-28 前 0.1%，之后 0.05%），见 stamp_duty_rate_on
+        stamp_duty = (
+            amount * stamp_duty_rate_on(order.bar_time, self.stamp_duty_rate)
+            if is_sell else Decimal("0")
+        )
         # 过户费：买卖双向按成交额计（组合 transfer_fee_rate，默认 0.001%）
         transfer_fee = amount * self.transfer_fee_rate
         return TradeEvent(

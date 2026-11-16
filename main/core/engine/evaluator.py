@@ -20,15 +20,40 @@ REL_METRIC_KEYS = (
 EVAL_REL_KEYS = REL_METRIC_KEYS + ("excess_calmar_ratio",)
 
 
+def infer_periods_per_year(dates) -> float:
+    """按快照日期间隔中位数推断年化因子（2026-11-16 P1）。
+
+    依据：``_strategy_periods`` 只取策略自身周期，纯 1w/1mon 组合的「日快照」
+    实际是周/月粒度。若仍按日频 √252 年化，Sharpe/Sortino/年化超额/跟踪误差
+    会被放大 √5~√21（周 √52/√252≈0.45，月 √12/√252≈0.22）。以相邻快照日期
+    间隔中位数判定：≥20 天 → 12（月）；≥5 天 → 52（周）；否则 252（日）。
+    分钟级快照先经 ``_daily_rows`` 聚合到日，恒 252。CAGR/最大回撤/Calmar 用
+    日历天数计算，不受该因子影响（本函数只影响波动率类年化）。
+    """
+    ds = sorted(d for d in (dates or []) if d is not None)
+    if len(ds) < 3:
+        return 252.0
+    gaps = sorted((ds[i + 1] - ds[i]).days for i in range(len(ds) - 1))
+    median_gap = gaps[len(gaps) // 2]
+    if median_gap >= 20:
+        return 12.0
+    if median_gap >= 5:
+        return 52.0
+    return 252.0
+
+
 def compute_relative_metrics_core(
     rs: List[float], rb: List[float],
     s_first: float, s_last: float, b_first: float, b_last: float,
     days: int,
+    periods_per_year: float = 252.0,
 ) -> dict:
     """FR-1 八项基准相对指标唯一实现（Minor-5：evaluator/robustness 共用核心）。
 
     输入：对齐日收益序列 rs/rb（等长）、策略与基准首末净值、跨度天数。
     输出：raw float dict（None 安全）；样本 < MIN_REL_SAMPLE_DAYS → 全 None。
+    periods_per_year：年化因子，默认 252（日频）。纯周/月粒度快照由调用方传
+    52/12（见 Evaluator._infer_periods_per_year 的依据说明）。
 
     口径（固化，勿随手感改）：
     - beta：日频总体协方差 / 基准总体方差（分子分母同 ddof=0，比值精确）
@@ -58,8 +83,8 @@ def compute_relative_metrics_core(
 
     active = [s - b for s, b in zip(rs, rb)]
     mean_a = sum(active) / n
-    excess_annual = mean_a * 252
-    te = math.sqrt(sum((a - mean_a) ** 2 for a in active) / n * 252)
+    excess_annual = mean_a * periods_per_year
+    te = math.sqrt(sum((a - mean_a) ** 2 for a in active) / n * periods_per_year)
     ir = excess_annual / te if te > 0 else None
 
     up_s = [s for s, b in zip(rs, rb) if b > 0]
@@ -124,7 +149,11 @@ class Evaluator:
         # annual_return 及其派生 sharpe/sortino/calmar 随之对齐。
         start_val = daily_values[0]
         end_val = daily_values[-1]
-        total_return = (end_val - start_val) / start_val
+        # 分母保护（2026-11-16）：首日净值为 0（极端参数/外部改动）时不得抛
+        # Decimal DivisionByZero 中断整条评估，与逐日收益处 prev<=0 跳过同口径。
+        total_return = (
+            (end_val - start_val) / start_val if start_val > 0 else Decimal("0")
+        )
 
         days = (snapshots[-1]["snap_date"] - snapshots[0]["snap_date"]).days
         years = max(days / 365.25, 1 / 365.25)
@@ -135,27 +164,34 @@ class Evaluator:
         for v in daily_values:
             if v > peak:
                 peak = v
-            dd = (peak - v) / peak
+            # 分母保护：峰值 <=0 时回撤无定义，跳过该点（同 total_return 口径）。
+            dd = (peak - v) / peak if peak > 0 else Decimal("0")
             if dd > max_dd:
                 max_dd = dd
 
         # 单日回测（区间内只有 1 个交易日，快照≥2 但按日聚合只有 1 行）时
         # daily_returns 为空，直接 sum/len 会除零；此时波动率按 0 处理，
         # sharpe 上层已对 volatility==0 退化，var/cvar 因样本<20 保持 None。
+        # 年化因子按快照实际频率推断（2026-11-16 P1）：纯 1w/1mon 组合的「日快照」
+        # 实际是周/月粒度，仍按 √252 年化会把 Sharpe/Sortino/年化超额/跟踪误差
+        # 放大 √5~√21。CAGR/最大回撤/Calmar 走日历天数，不受该因子影响。
+        periods_per_year = infer_periods_per_year([r["date"] for r in daily_rows])
         if daily_returns:
             mean_dr = sum(daily_returns) / len(daily_returns)
             variance = sum((r - mean_dr) ** 2 for r in daily_returns) / len(daily_returns)
-            volatility = math.sqrt(variance * 252)
+            volatility = math.sqrt(variance * periods_per_year)
         else:
             volatility = 0.0
 
         rf = RISK_FREE_RATE
-        sharpe = (annual_return - rf) / volatility if volatility > 0 else 0
+        # W5-L1 统一口径（2026-11-16）：无有效波动样本时 sharpe/sortino 与 calmar
+        # 一样返回 None（「无样本/无波动」≠「极差」，避免筛选把两者混为一谈）。
+        sharpe = (annual_return - rf) / volatility if volatility > 0 else None
 
         neg_returns = [r for r in daily_returns if r < 0]
         downside_var = sum(r ** 2 for r in neg_returns) / len(neg_returns) if neg_returns else 0
-        downside_dev = math.sqrt(downside_var * 252)
-        sortino = (annual_return - rf) / downside_dev if downside_dev > 0 else 0
+        downside_dev = math.sqrt(downside_var * periods_per_year)
+        sortino = (annual_return - rf) / downside_dev if downside_dev > 0 else None
 
         # W5-L1：max_dd==0（区间无回撤）→ calmar_ratio=None（无意义，不填 0，
         # 避免被误读为"极差"）；acceptance 对 None 视为未知，不误拒。
@@ -177,7 +213,9 @@ class Evaluator:
         for v in daily_values:
             if v > peak_u:
                 peak_u = v
-            drawdown = (peak_u - v) / peak_u
+            # 分母保护（同 total_return/max_drawdown）：峰值 <=0 时回撤无定义，
+            # 该点按 0 计入（替代旧实现的 DivisionUndefined 中断整条评估）。
+            drawdown = (peak_u - v) / peak_u if peak_u > 0 else Decimal("0")
             dd_sq_sum += drawdown ** 2
         ulcer = math.sqrt(float(dd_sq_sum) / daily_n) if daily_n > 0 else 0
 
@@ -221,9 +259,15 @@ class Evaluator:
             "annual_return": Decimal(str(annual_return)).quantize(Decimal("0.0001")),
             "max_drawdown": max_dd,
             "volatility": Decimal(str(volatility)).quantize(Decimal("0.0001")),
-            "sharpe_ratio": Decimal(str(sharpe)).quantize(Decimal("0.0001")),
-            "sortino_ratio": Decimal(str(sortino)).quantize(Decimal("0.0001")),
-            # 年化下行波动率：与索提诺分母同口径（负收益日均方根 × √252）
+            "sharpe_ratio": (
+                Decimal(str(sharpe)).quantize(Decimal("0.0001"))
+                if sharpe is not None else None
+            ),
+            "sortino_ratio": (
+                Decimal(str(sortino)).quantize(Decimal("0.0001"))
+                if sortino is not None else None
+            ),
+            # 年化下行波动率：与索提诺分母同口径（负收益日均方根 × √年化因子）
             "downside_volatility": Decimal(str(downside_dev)).quantize(Decimal("0.0001")),
             "calmar_ratio": Decimal(str(calmar)).quantize(Decimal("0.0001")) if calmar is not None else None,
             "win_rate": trade_metrics["win_rate"],
@@ -449,7 +493,8 @@ class Evaluator:
             return {k: None for k in EVAL_REL_KEYS}
         days = (pairs[-1][0] - pairs[0][0]).days
         core = compute_relative_metrics_core(
-            rs, rb, pairs[0][1], pairs[-1][1], pairs[0][2], pairs[-1][2], days)
+            rs, rb, pairs[0][1], pairs[-1][1], pairs[0][2], pairs[-1][2], days,
+            periods_per_year=infer_periods_per_year([p[0] for p in pairs]))
         # 超额卡玛 = 年化超额收益 / |超额最大回撤|；超额回撤为 0 → None（无意义）
         ex_annual = core.get("excess_annual_return")
         ex_dd = core.get("excess_max_drawdown")

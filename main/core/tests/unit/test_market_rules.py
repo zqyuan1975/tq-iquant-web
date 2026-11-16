@@ -70,12 +70,26 @@ def test_limit_rule_for_matches_live_resolver():
 
 
 def test_limit_rule_for_unresolved_ratio_falls_back_to_board_ratio():
-    """ETF/转债/未知：resolve 给不出可靠幅度时回落板块常规幅度（保持回测旧口径）。"""
-    for code in ("510300.SH", "113537.SH", "abcdef"):
+    """ETF/未知：resolve 给不出可靠幅度时回落板块常规幅度（保持回测旧口径）。"""
+    for code in ("510300.SH", "abcdef"):
         rule = limit_rule_for(code)
         assert rule.ratio == Decimal("0.10"), code
         assert rule.source.endswith("_board_fallback"), code
         assert rule.unlimited is False
+
+
+def test_limit_rule_for_convertible_bond_is_twenty_percent():
+    """可转债（2026-11-16 B2）：11/12 开头按 ±20%，不再回落 10%。
+
+    依据：沪深转债自 2022-08 起统一 ±20%；旧口径 10% 会让「涨停买入/跌停卖出」
+    被判未越板而成交。用途覆盖回测引擎与桥接 fallback（桥无 price_limit 时）。
+    已知限制：转债上市首日 +57.3%/-43.3% 特例未建模（按 20% 偏窄，fail-safe）。
+    """
+    for code in ("113537.SH", "110059.SH", "123456.SZ", "127789.SZ"):
+        rule = limit_rule_for(code)
+        assert rule.ratio == Decimal("0.20"), code
+        assert rule.unlimited is False
+        assert rule.source.endswith("_bond_default_20pct"), code
 
 
 def test_tick_size_etf_is_one_milli():

@@ -53,8 +53,10 @@ main\.venv\Scripts\python.exe main\build_package.py --clean
 > 与既有安装包的兼容性，属于发行形态变更，需单独评审。
 >
 > **分层原理**：前端 `web/dist` 是明文静态文件（`_internal\web\dist`），与 exe 无关，
-> 因此改前端只需替换这个目录。`--web-only` 只做「清旧 dist + 复制新 dist + 更新 build-info.json」，
-> 不触发 Nuitka；`installer_web.iss` 只打包这几 MB 前端文件，且**不删除** `_internal` 其它内容。
+> 因此改前端只需替换这个目录。`--web-only` 做「清旧 dist + 复制新 dist + 更新 build-info.json」，
+> 不触发 Nuitka；**不改写 `app_version` / `build_time` / git 来源**（沿用原全量包），只追加
+> `frontend_patch_time`。`installer_web.iss` **直接取 `web\dist`**（不再从 `dist\tq-iquant` 拷旧副本；
+> 缺失 `index.html` 时编译期 `#error`），只打包这几 MB 前端文件，且**不删除** `_internal` 其它内容。
 >
 > **同一台机器手工更新**：也可以不装补丁包，直接
 > `robocopy web\dist "<安装目录>\_internal\web\dist" /MIR`（先关程序），效果相同。
@@ -70,6 +72,12 @@ main\.venv\Scripts\python.exe main\build_package.py --clean
 
 - **版本号**：只改 `packaging\app-version.iss` 一处，`build_package.py` 编译出的 exe 属性、
   两个安装包文件名/卸载项都随之变化。
+- **出包前强校验**（`build_package.py`）：
+  - 全量构建：`app-version.iss` 必须等于 `main/core/version.py` 的 `APP_VERSION`，且工作区必须干净
+    （`git_dirty=false`），否则直接中止并给中文提示；
+  - `--web-only`：额外要求 `dist\tq-iquant\build-info.json` 的 `app_version` 等于当前代码版本、
+    且 `git_dirty=false`，防止产出「新版本号 + 旧代码」的补丁包。
+  - 两处版本号一致性另有单元测试兜底：`main/core/tests/unit/test_version_single_source.py`。
 - **构建档案**：每次出包在 `dist\tq-iquant\build-info.json`（随安装包落到安装目录根）写入
   `app_version` / `build_mode`（full-clean / full-incremental / web-only）/ `build_time` /
   `git_commit` / `git_dirty` / `frontend_dist_mtime`。装到目标机后可直接核对「这版到底是什么」。
@@ -92,6 +100,16 @@ main\.venv\Scripts\python.exe main\build_package.py --clean
 | `dist/build/` | Nuitka 中间产物与模块缓存（不入库；`nuitka-build` 为增量缓存，勿随手删） |
 
 - 安装位置默认 `D:\创懿基金量化投资平台`，安装需管理员权限；**程序日常运行不提权**。
+- **登录自启（内建自愈）**：安装向导「附加任务」默认勾选「登录后自动启动并保持运行」，
+  安装器用计划任务 `TQ-IQuant-Supervisor`（`/SC ONLOGON /RL LIMITED`）在登录时执行
+  `"<安装目录>\tq-iquant.exe" --supervise`；卸载时删除该任务，升级/卸载前先
+  `schtasks /End` 停掉它并等子进程随父退出。**不用 Windows 服务**（会话 0 无交互桌面，
+  通达信/同花顺键鼠自动化失效）。
+- 双击桌面快捷方式仍走默认单进程（后端 + 界面）；若自愈后端已在跑，则只开界面复用，
+  不会起第二个后端（`data/runtime/server.lock` 单实例保护）。
+- 自愈日志：`logs/supervisor.log`（父进程：探活/重启/放弃重试）、
+  `logs/supervisor-child.log`（子进程输出）、`logs/core.log`（应用）。
+  实际监听端口写在 `data/runtime/server.json`（8888~8898 动态，正常退出清理）。
 - 数据根目录：优先 `<安装目录>`（需可写），不可写时自动回落
   `%LOCALAPPDATA%\创懿基金量化投资平台`。`data/`（SQLite、同花顺交接文件）、
   `logs/`、`config.yaml` 都在该根目录下；首次启动从 `config.template.yaml` 生成

@@ -2,11 +2,13 @@
  * 实盘 SSE 事件格式化 —— 纯函数模块,便于单元测试。
  *
  * 与 backend `core/api/live.py` 的 `/sessions/{id}/stream` 事件 payload 对齐。
- * 事件类型:signal / order / trade / position / risk / decision / ping。
+ * 事件类型:signal / order / trade / position / risk / decision / ping，
+ * 以及 watchdog 的 5 类「恢复」事件（recovered，见 RECOVERY_EVENT_TYPES）。
  */
 
 export type LiveEventType =
   | 'signal' | 'order' | 'trade' | 'position' | 'risk' | 'decision' | 'ping'
+  | 'recovered'
 
 export interface LiveEvent {
   id: number
@@ -24,6 +26,7 @@ export const EVENT_TYPE_LABEL: Record<string, string> = {
   position: '持仓',
   risk: '风控',
   decision: '拦截',
+  recovered: '恢复',
 }
 
 export const EVENT_TYPE_COLOR: Record<string, string> = {
@@ -33,6 +36,28 @@ export const EVENT_TYPE_COLOR: Record<string, string> = {
   position: 'teal',
   risk: 'red',
   decision: 'purple',
+  recovered: 'green',
+}
+
+/**
+ * watchdog 恢复事件（engine_watchdog 转场时发出）：这些 type 直接走 SSE，
+ * 不并入 risk 流——恢复是正向事件，混进红色风控条会误导；独立类型也便于
+ * 一眼看出「刚才掉线，现在回来了」。
+ */
+export const RECOVERY_EVENT_TYPES: readonly string[] = [
+  'engine_recovered',
+  'execution_recovered',
+  'bridge_recovered',
+  'market_data_recovered',
+  'client_recovered',
+]
+
+export const RECOVERY_LABEL: Record<string, string> = {
+  engine_recovered: '引擎恢复',
+  execution_recovered: '执行恢复',
+  bridge_recovered: '交易桥恢复',
+  market_data_recovered: '行情恢复',
+  client_recovered: '客户端恢复',
 }
 
 // 决策闸门代码 → 中文（调参可观测性，对齐 backend decision.py gate 词汇表）
@@ -114,6 +139,24 @@ export const GATE_LABEL: Record<string, string> = {
   no_market_data: '无行情数据',
   volume_cap_shrink: '量能上限缩量',
   volume_cap_defer: '量能上限顺延',
+  // 资金基准对齐 / 仓位约束（2026-11-16 契约审计补齐）
+  params_drift: '参数漂移',
+  exposure_cap: '敞口上限',
+  max_single_position: '单票上限',
+  min_cash_reserve: '现金下限',
+  order_amount_cap: '单笔金额上限',
+  risk_sell_residual: '风控卖出余额',
+  requote: '追价重下',
+  insufficient_cash: '可用资金不足',
+  after_close_defer: '收盘后顺延',
+  keyboard_exclusive: '键鼠通道独占',
+  peak_seed: '峰值种入',
+  // _rec 口径补齐（同轮审计扫出）
+  risk_cooldown: '风控冷静期',
+  add_cost_unknown: '加仓成本未知',
+  max_holdings: '持仓数达上限',
+  // 拆单队列（stop 时子单未清）
+  split_children_lost: '拆单队列丢失',
 }
 
 // 闸门层 → 中文
@@ -156,6 +199,15 @@ export const ACTION_LABEL: Record<string, string> = {
   forced: '强制',
   requeue: '重新排队',
   scale: '缩量',
+  // 契约审计补齐（2026-11-16）
+  ack: '已确认',
+  allow: '放行',
+  carry: '沿用',
+  recompute: '重算',
+  approve: '审批通过',
+  retry: '重试',
+  // 拆单队列（stop 时子单未清）
+  drop: '丢弃',
 }
 
 /** 闸门代码 → 中文标签（未知 gate 回退原代码）。 */
@@ -215,7 +267,7 @@ export const ORDER_STATUS_LABEL: Record<string, string> = {
   canceled: '已撤单',
 }
 
-const RISK_RULE_LABEL: Record<string, string> = {
+export const RISK_RULE_LABEL: Record<string, string> = {
   max_drawdown: '最大回撤熔断',
   daily_loss: '日内亏损熔断',
   reconcile_mismatch: '持仓对账差异',
@@ -241,6 +293,13 @@ const RISK_RULE_LABEL: Record<string, string> = {
   // 盘前 / 资金
   pre_open_price_capability: '盘前定价能力不足',
   real_account_insufficient: '真实可用资金不足',
+  // watchdog 运行健康（engine_watchdog 每 30s 扫描）
+  engine_stale: '引擎主循环停摆',
+  client_offline: '交易客户端离线',
+  market_data_stalled: '行情停滞',
+  bridge_unreachable: '交易桥不可达',
+  execution_stalled: '执行通道停滞',
+  stop_inflight_orders: '停止时撤在途单',
 }
 
 const fmt = (v: unknown): string => (v === null || v === undefined ? '' : String(v))
@@ -357,6 +416,13 @@ export function formatEvent(type: string, data: Record<string, unknown>): string
     }
     case 'decision':
       return formatDecision(data)
+    case 'recovered': {
+      // watchdog 恢复：rule 即事件名（engine_recovered / bridge_recovered …）
+      const rule = fmt(data.rule)
+      const label = RECOVERY_LABEL[rule] || '恢复'
+      const msg = fmt(data.message)
+      return msg ? `${label}: ${msg}` : label
+    }
     case 'ping':
       return ''
     default:

@@ -23,7 +23,7 @@ from core.engine.position import Position
 from core.engine.risk_manager import PortfolioRiskManager, StrategyRiskManager
 from core.engine.strategy_context import StrategyContext
 from core.engine.live.timing import now_shanghai
-from core.models import Base, LiveDecisionEvent, LiveOrder
+from core.models import Base, LiveBarOrderMark, LiveDecisionEvent, LiveOrder
 from tq_iquant_shared.constants import SignalType, TradeType
 
 from sqlalchemy import create_engine
@@ -462,7 +462,12 @@ def test_split_children_do_not_cross_bind_same_volume_refs():
 
 
 def test_stop_clears_split_children():
-    """stop() 清空拆单队列（未提交子单随队列丢弃，在途单由撤单兜底）。"""
+    """stop() 清空拆单队列（未提交子单随队列丢弃，在途单由撤单兜底）。
+
+    P1#2（2026-11-16）：丢弃必须留决策事件（gate=split_children_lost/action=drop），
+    否则工作台完全看不出「剩余子单当天不再提交」。stop 后无下一轮 _drain_decisions，
+    事件必须由 stop 直接写库。
+    """
     factory, _ = _db_factory()
     port, _ = _portfolio_split()
     disp = _FakeTdxDispatcher()
@@ -475,3 +480,66 @@ def test_stop_clears_split_children():
     asyncio.run(engine.stop())
 
     assert engine._split_children == {}
+    db = factory()
+    try:
+        rows = (
+            db.query(LiveDecisionEvent)
+            .filter(LiveDecisionEvent.gate == "split_children_lost")
+            .all()
+        )
+        assert len(rows) == 1
+        assert rows[0].action == "drop"
+        assert rows[0].requested_qty == 500
+        assert rows[0].strategy_id == 1
+        assert rows[0].stock_code == STOCK
+    finally:
+        db.close()
+
+
+def test_recover_warns_when_split_queue_lost():
+    """P1#2（2026-11-16）：重启后拆单队列必为空——用持久足迹反查未完成子单并告警。
+
+    子单 1 已提交在途（submitted、未成交），子单 2 只存在内存队列（重启即丢），
+    「目标量 − 已成交量」仍有剩余 → 落 gate=split_children_lost/action=notice，
+    只提示人工确认、不自动补单。
+    """
+    factory, _ = _db_factory()
+    port, _ = _portfolio_split()
+    disp = _FakeTdxDispatcher()
+    engine = _make_engine(disp, factory, port)
+    bt = now_shanghai().replace(second=0, microsecond=0)
+
+    db = factory()
+    try:
+        db.add(LiveOrder(
+            live_session_id=1, portfolio_strategy_id=1, strategy_id=1,
+            stock_code=STOCK, trade_type="buy", order_type="limit",
+            price=Decimal("10"), quantity=501, filled_quantity=0,
+            status="submitted", signal_name="open_sig", signal_type="OPEN",
+            bar_time=bt,
+        ))
+        # 子单标记（seq=1）：证明这是拆单子单且当日已决策过
+        db.add(LiveBarOrderMark(
+            live_session_id=1, portfolio_strategy_id=1, strategy_id=1,
+            stock_code=STOCK, bar_time=bt, direction="buy", seq=1,
+        ))
+        db.commit()
+
+        engine.recover(db)
+    finally:
+        db.close()
+
+    db = factory()
+    try:
+        rows = (
+            db.query(LiveDecisionEvent)
+            .filter(LiveDecisionEvent.gate == "split_children_lost")
+            .all()
+        )
+        assert len(rows) == 1
+        assert rows[0].action == "notice"
+        assert rows[0].param_name == "split_queue_lost_on_restart"
+        assert rows[0].requested_qty == 501
+        assert rows[0].final_qty == 0
+    finally:
+        db.close()
