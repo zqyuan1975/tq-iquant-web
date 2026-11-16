@@ -103,6 +103,8 @@ def test_plan_gap_recovery_replay_same_day(monkeypatch):
     plan = LiveEngine._plan_gap_recovery(stub, datetime(2026, 8, 25, 10, 25))
     assert plan["action"] == "replay"
     assert plan["gap_start"] == datetime(2026, 8, 25, 9, 55)
+    # 排除正在形成的 10:25：gap_end = (now − 1s) 截到分钟 = 最近一根已闭合 bar
+    assert plan["gap_end"] == datetime(2026, 8, 25, 10, 24)
     assert plan["count"] == 35            # 30 分钟缺口 +5 余量
 
 

@@ -15,12 +15,28 @@ class LiveSession(Base):
     # 保持升级前行为不变；新建会话一律显式写入。
     # 历史 qmt 会话（通道已移除）由 session_engine 白名单回退到默认引擎。
     engine = Column(String(10), nullable=True)
-    # 实盘资金基准（真实账户总资产口径，元）：仅作「真实账户总闸/校验」用途——
-    # live_service 把它下发给引擎的 account_total_capital（桥快照缺失时的真实侧
-    # 资金上限），并用于真实-虚拟净值比对。**不参与各组合起账**：每个组合策略
-    # 一律按自身 initial_capital 独立起账、独立记账（与回测单组合资金口径一致）。
-    # None=不启用该总闸校验。
+    # 实盘资金基准（真实账户总资产口径，元）：语义见 baseline_mode/baseline_value。
+    # 兼容旧列：等价于 baseline_value（未写 baseline_value 时回退本列）。
+    # **只缩不放**：超过真实总资产的填写值一律拒绝写入，起账时再按 min 截断。
     live_capital = Column(Numeric(18, 2), nullable=True)
+    # ---- 资金基准对齐（2026-11-16）----
+    # baseline_mode：total_asset=起账即用真实总资产（默认）/ manual=显式填写。
+    baseline_mode = Column(String(16), nullable=True, server_default="total_asset")
+    # 资金基准（真实账户总资产口径，元）；各组合按 initial_capital 占比切分。
+    baseline_value = Column(Numeric(18, 2), nullable=True)
+    baseline_set_at = Column(DateTime, nullable=True)
+    # 基准版本：每次「收盘后重置」+1，参与增量回测指纹与 deferred 单基线标记，
+    # 确保旧 checkpoint / 旧 deferred 行不能把新基准覆盖回去。
+    baseline_version = Column(Integer, nullable=False, server_default="0", default=0)
+    # 起账时是否把柜台继承仓按当前市值扣减虚拟现金（默认 1；0 仅调试旧口径）
+    adopt_inherited_positions = Column(
+        Boolean, nullable=False, server_default="1", default=True)
+    # ---- C2 账户键独占（2026-11-16）----
+    # 账户身份键：iquant/goldminer 取桥 /ping 的 account；tdx/ths 取配置账号；
+    # 都取不到时降级为 "engine:<key>"（宁可多拦）。启动成功时落库，供后续会话
+    # 做账户级互斥判定；account_key_source 记录来源便于排障。
+    account_key = Column(String(128), nullable=True)
+    account_key_source = Column(String(16), nullable=True)
     # 执行模式：alert（半自动，只预警不下单）/ auto（现有自动交易）。
     # 迁移前历史会话写 auto；新建会话由 live_service 显式写 alert。
     execution_mode = Column(String(10), nullable=False, server_default="auto")

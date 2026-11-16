@@ -94,7 +94,13 @@ def test_counter_row_gone_clears_after_confirmation():
     factory, _ = _db_factory()
     port, ctx = _portfolio_single_port()
     _seed_holding(port, qty=1000, cost=Decimal("10"))
-    disp = _AcctDispatcher(positions=[])
+    # 空表必须伴随「可信账户」才会进确认计数（live_engine._account_read_trustworthy：
+    # 空表 + 资产不可读 = 查询失败，只 notice、不累计确认，绝不误清仓）
+    disp = _AcctDispatcher(
+        positions=[],
+        asset={"total_asset": 110000.0, "market_value": 0.0,
+               "available": 110000.0},
+    )
     engine = _mk_engine(disp, factory, port, engine_key="tdx",
                         account_snapshot_interval=5.0)
 

@@ -793,10 +793,10 @@ def test_post_close_restart_keeps_prev_day_deferred_until_next_day():
 
 
 def test_released_deferred_orders_join_batch_allocation():
-    """P3：放行后的 deferred 单（bar_time 已刷新为放行 bar）参与批量比例分配。"""
+    """P3：放行后的 deferred 单（bar_time 已刷新为放行 bar）参与同批资金分配。"""
     factory, _ = _db_factory()
     port, _ = _portfolio_single(period="1d")
-    port.account.cash = Decimal("10000")  # 两笔各目标 10000，只能分到 1000 股总量
+    port.account.cash = Decimal("20000")  # 两笔各目标 10000，现金足够满额
     disp, _ = _make_dispatcher(_Recorder())
     engine = _make_engine(disp, factory, port)
     d1 = date(2026, 8, 24)
@@ -809,8 +809,7 @@ def test_released_deferred_orders_join_batch_allocation():
     kept = engine._allocate_batch_buys(port, [o1, o2])
 
     assert len(kept) == 2  # 两笔都参与（未被当作 deferred 排除）
-    assert sum(o.quantity for o in kept) == 1000  # 现金 10000 / 10 = 1000 股
-    assert all(o.quantity == 500 for o in kept)  # 等额比例分配，非 FIFO 吃满
+    assert all(o.quantity == 1000 for o in kept)  # 资金足够 → 按目标量满额
 
 
 def test_settle_unsubmitted_released_marks_row_canceled():
@@ -1121,10 +1120,11 @@ def test_buy_available_cash_conservative_without_snapshot_time(caplog):
     assert sum("保守口径" in r.getMessage() for r in caplog.records) == 1
 
 
-def test_allocate_batch_buys_proportional_then_greedy_fill():
-    """4 笔等额买单超可用现金 → 按目标比例分配 + 整手取整 + 贪心补手，合计吃满。"""
+def test_allocate_batch_buys_full_target_then_skip_when_cash_short():
+    """4 笔各 1 万、目标份额 1.2 万：可用 3 万满额开 3 只，第 4 只整笔跳过（不缩量）。"""
     factory, _ = _db_factory()
-    port, _ = _portfolio_single()
+    port, ctx = _portfolio_single()
+    ctx.single_open_ratio = Decimal("0.2")  # 目标份额 = 0.2 × 0.6 × 100000 = 12000
     port.account.cash = Decimal("30000")  # 4 笔各 10000 目标合计 40000 > 30000
     disp, _ = _make_dispatcher(_Recorder())
     engine = _make_engine(disp, factory, port)
@@ -1138,42 +1138,41 @@ def test_allocate_batch_buys_proportional_then_greedy_fill():
 
     kept = engine._allocate_batch_buys(port, list(orders))
 
-    assert len(kept) == 4
-    qtys = [o.quantity for o in orders]
-    assert qtys == [800, 800, 700, 700]  # 700 起步 + 余量 2000 补两笔整手
-    assert sum(Decimal(o.quantity) * o.price for o in orders) == Decimal("30000")
+    assert len(kept) == 3
+    assert [o.quantity for o in orders[:3]] == [1000, 1000, 1000]  # 满额，不缩量
+    assert orders[3].quantity == 1000  # 被跳过，原量不变（不下单）
     evs = engine._recorder.drain()
-    assert len(evs) == 4 and all(e.gate == "batch_cash_alloc" for e in evs)
-    assert all(e.action == "shrink" for e in evs)
+    assert len(evs) == 1
+    assert evs[0].gate == "insufficient_cash" and evs[0].action == "skip"
+    assert evs[0].stock_code == "600003.SH"
+    assert evs[0].final_qty == 0
 
 
-def test_allocate_batch_buys_skips_below_one_lot_with_event():
-    """分配额不足 1 手的单剔除（不静默）：返回列表不含该单 + 记 block 决策事件。"""
+def test_allocate_batch_buys_skips_below_min_fill_ratio():
+    """实际可买金额 < 目标份额 80% → 整笔跳过并记 insufficient_cash/skip。"""
     factory, _ = _db_factory()
-    port, _ = _portfolio_single()
-    port.account.cash = Decimal("50000")
+    port, _ = _portfolio_single()  # 目标份额 = 0.1 × 0.6 × 100000 = 6000（80% = 4800）
+    port.account.cash = Decimal("4000")
     disp, _ = _make_dispatcher(_Recorder())
     engine = _make_engine(disp, factory, port)
     bt = datetime(2026, 8, 5, 10, 0)
-    small = _buy_order("600000.SH", "10", 1000, bt)       # 目标 1 万
-    big = _buy_order("600001.SH", "10", 900000, bt)       # 目标 900 万
-    orders = [small, big]
+    order = _buy_order("600000.SH", "10", 1000, bt)  # 目标 1 万
 
-    kept = engine._allocate_batch_buys(port, orders)
+    kept = engine._allocate_batch_buys(port, [order])
 
-    assert kept == [big]                       # 小额被剔除
-    assert small.quantity == 1000              # 原量不变（不下单）
-    assert big.quantity == 5000                # 4900 + 余量 1000 补 1 手
+    assert kept == []
+    assert order.quantity == 1000  # 原量不变（不下单）
     evs = engine._recorder.drain()
-    blocked = [e for e in evs if e.action == "block"]
-    assert len(blocked) == 1 and blocked[0].stock_code == "600000.SH"
-    assert all(e.gate == "batch_cash_alloc" for e in evs)
+    assert len(evs) == 1
+    assert evs[0].gate == "insufficient_cash" and evs[0].action == "skip"
+    assert evs[0].actual_value == 4000.0
+    assert evs[0].param_value == 6000.0
 
 
 def test_allocate_batch_buys_excludes_deferred_orders():
     """deferred 单不参与本 bar 资金分配（其额度以放行 bar 为准），数量保持目标值。"""
     factory, _ = _db_factory()
-    port, _ = _portfolio_single()
+    port, _ = _portfolio_single()  # 目标份额 6000（80% = 4800）
     port.account.cash = Decimal("15000")
     disp, _ = _make_dispatcher(_Recorder())
     engine = _make_engine(disp, factory, port)
@@ -1188,13 +1187,123 @@ def test_allocate_batch_buys_excludes_deferred_orders():
 
     assert len(kept) == 3
     assert deferred.quantity == 1000           # 不参与分配
-    assert (a.quantity, b.quantity) == (800, 700)
+    # a 满额 1000（1 万），剩余 5000 给 b（≥4800 门槛）→ 500 股
+    assert (a.quantity, b.quantity) == (1000, 500)
     assert Decimal(a.quantity) * a.price + Decimal(b.quantity) * b.price \
         == Decimal("15000")
 
 
+# ---- 组合级护栏：单票集中度上限 / 现金留存下限（2026-11-16 仅实盘接线）----
+def _equity_caps_port(cash="100000", cap=None, reserve=None):
+    """构造单组合单策略 port + 两个护栏阈值（None=不设限）。"""
+    port, ctx = _portfolio_single()
+    ctx.single_open_ratio = Decimal("0.2")   # 目标份额 12000（80% = 9600）
+    port.account.cash = Decimal(cash)
+    port.max_single_position_pct = (
+        Decimal(str(cap)) if cap is not None else None)
+    port.min_cash_reserve_pct = (
+        Decimal(str(reserve)) if reserve is not None else None)
+    return port, ctx
+
+
+def test_allocation_caps_default_unconstrained_keeps_tomorrow_plan():
+    """默认不约束（NULL / 0）：明日两只（700@67.40、1300@39.50）数量逐字不变。"""
+    factory, _ = _db_factory()
+    bt = datetime(2026, 11, 17, 9, 31)
+    for cap, reserve in ((None, None), (Decimal("0"), Decimal("0"))):
+        port, _ = _equity_caps_port(cash="108513.51", cap=cap, reserve=reserve)
+        disp, _ = _make_dispatcher(_Recorder())
+        engine = _make_engine(disp, factory, port)
+        a = _buy_order("301600.SZ", "67.40", 700, bt)
+        b = _buy_order("600211.SH", "39.50", 1300, bt)
+
+        kept = engine._allocate_batch_buys(port, [a, b])
+
+        assert len(kept) == 2
+        assert (a.quantity, b.quantity) == (700, 1300)
+        assert engine._recorder.drain() == []    # 未命中任何约束，无事件
+
+
+def test_allocation_caps_max_single_position_truncates():
+    """单票上限 5%（组合总资产 10 万 → 5,000 元）：1000 股 @10 截断到 500 股。"""
+    factory, _ = _db_factory()
+    port, _ = _equity_caps_port(cash="100000", cap="0.05")
+    disp, _ = _make_dispatcher(_Recorder())
+    engine = _make_engine(disp, factory, port)
+    order = _buy_order("600000.SH", "10", 1000, datetime(2026, 8, 5, 10, 0))
+
+    kept = engine._allocate_batch_buys(port, [order])
+
+    assert kept == [order]
+    assert order.quantity == 500            # 5,000 / 10 = 500 股（整手）
+    evs = engine._recorder.drain()
+    assert len(evs) == 1
+    ev = evs[0]
+    assert ev.gate == "max_single_position" and ev.action == "shrink"
+    assert ev.param_value == 0.05
+    assert ev.actual_value == 0.1           # 未截断时买入后占比 10,000/100,000
+    assert (ev.requested_qty, ev.final_qty) == (1000, 500)
+
+
+def test_allocation_caps_min_cash_reserve_truncates():
+    """现金下限 95%（10 万 → 最多花 5,000）：1000 股 @10 截断到 500 股。"""
+    factory, _ = _db_factory()
+    port, _ = _equity_caps_port(cash="100000", reserve="0.95")
+    disp, _ = _make_dispatcher(_Recorder())
+    engine = _make_engine(disp, factory, port)
+    order = _buy_order("600000.SH", "10", 1000, datetime(2026, 8, 5, 10, 0))
+
+    kept = engine._allocate_batch_buys(port, [order])
+
+    assert kept == [order]
+    assert order.quantity == 500
+    evs = engine._recorder.drain()
+    assert len(evs) == 1
+    ev = evs[0]
+    assert ev.gate == "min_cash_reserve" and ev.action == "shrink"
+    assert ev.param_value == 0.95
+    assert ev.actual_value == 0.9           # 未截断时买完只剩 10% 现金（< 95%）
+    assert (ev.requested_qty, ev.final_qty) == (1000, 500)
+
+
+def test_allocation_caps_both_hit_take_smaller_and_record_both():
+    """两者同时命中：单票 3%（3,000 元 → 300 股）先截，现金 98%（→ 200 股）再截。"""
+    factory, _ = _db_factory()
+    port, _ = _equity_caps_port(cash="100000", cap="0.03", reserve="0.98")
+    disp, _ = _make_dispatcher(_Recorder())
+    engine = _make_engine(disp, factory, port)
+    order = _buy_order("600000.SH", "10", 1000, datetime(2026, 8, 5, 10, 0))
+
+    kept = engine._allocate_batch_buys(port, [order])
+
+    assert kept == [order]
+    assert order.quantity == 200            # 取两者更小：2,000 元可花 → 200 股
+    evs = engine._recorder.drain()
+    assert [e.gate for e in evs] == ["max_single_position", "min_cash_reserve"]
+    assert (evs[0].requested_qty, evs[0].final_qty) == (1000, 300)
+    assert (evs[1].requested_qty, evs[1].final_qty) == (300, 200)
+
+
+def test_allocation_caps_truncate_below_one_lot_skips():
+    """截断后不足 1 手（单票上限 0.1% → 100 元买不到 1 手）→ 整笔跳过并记 block。"""
+    factory, _ = _db_factory()
+    port, _ = _equity_caps_port(cash="100000", cap="0.001")
+    disp, _ = _make_dispatcher(_Recorder())
+    engine = _make_engine(disp, factory, port)
+    order = _buy_order("600000.SH", "10", 1000, datetime(2026, 8, 5, 10, 0))
+
+    kept = engine._allocate_batch_buys(port, [order])
+
+    assert kept == []
+    assert order.quantity == 1000           # 原量不变（不下单）
+    evs = engine._recorder.drain()
+    assert len(evs) == 1
+    assert evs[0].gate == "max_single_position" and evs[0].action == "block"
+    assert evs[0].final_qty == 0
+
+
 def test_handle_bar_allocates_batch_buy_cash(monkeypatch):
-    """_handle_bar 接线：同 bar 4 笔买单超可用现金时按比例缩量后逐笔提交。"""
+    """_handle_bar 接线：同 bar 4 笔买单在可用 3 万下满额开 3 只、第 4 只跳过。"""
     factory, _ = _db_factory()
     port, _ctx = _portfolio_single()
     port.account.cash = Decimal("30000")
@@ -1212,7 +1321,7 @@ def test_handle_bar_allocates_batch_buy_cash(monkeypatch):
 
     engine._handle_bar(port, _bar("600000.SH", "10", _BT))
 
-    assert [q for _, q in submitted] == [800, 800, 700, 700]
+    assert [q for _, q in submitted] == [1000, 1000, 1000]  # 第 4 只资金不足跳过
 
 
 def test_no_signal_no_trade():
@@ -1596,11 +1705,11 @@ def test_handle_bar_sell_capped_by_bridge_available():
     db.close()
 
 
-def test_handle_bar_buy_rejected_by_cap_logs_info(caplog):
+def test_submit_one_order_buy_rejected_by_cap_logs_info(caplog):
     """⑤ 实盘 cap_quantity 返回 None（资金不足不足1手）→ logger.info。
 
-    实盘专用路径（回测走 engine.execute 不经此），INFO 级别。账户 cash 清零
-    使 approve_order 不足1手拒绝 → cap_quantity None → 不下单 + 打日志。
+    资金不足的单在上游 ``_allocate_batch_buys`` 已整笔跳过（insufficient_cash），
+    故这里直接调 ``_submit_one_order``，锁定执行层 cap 拒绝仍打 INFO 日志的兜底。
     """
     import logging
     factory, _ = _db_factory()
@@ -1608,8 +1717,6 @@ def test_handle_bar_buy_rejected_by_cap_logs_info(caplog):
     stock = "600000.SH"
     bar_time = datetime(2026, 8, 5, 10, 0)
     port.account.cash = Decimal("0")  # 现金清零 → 不足1手拒绝
-    # 本例专测执行层资金不足路径：dynamic 会因净值=0 在信号层拦零股，故固定名义
-    # 口径保留信号层出单、走到 execution 的 cap 拒绝路径（INFO 日志）。
     port.position_sizing = "fixed"
 
     rec = _Recorder()
@@ -1621,19 +1728,17 @@ def test_handle_bar_buy_rejected_by_cap_logs_info(caplog):
         session_id=1, portfolios=[port], dispatcher=disp,
         bar_poller=poller, db_session_factory=factory,
     )
-    engine.signal_cache = {(1, stock, bar_time): [{"name": "open_sig", "value": 1}]}
-    bar = _bar(stock, "9.0", bar_time)
-
-    with caplog.at_level(logging.INFO, logger="core.engine.live_engine"):
-        engine._handle_bar(port, bar)
-
+    order = _buy_order(stock, "9.0", 100, bar_time)
     db = factory()
-    orders = db.query(LiveOrder).all()
-    assert orders == []  # 不下单
+    try:
+        with caplog.at_level(logging.INFO, logger="core.engine.live_engine"):
+            engine._submit_one_order(db, port, order, "1m")
+        assert db.query(LiveOrder).all() == []  # 不下单
+    finally:
+        db.close()
     assert any(
         r.levelno == logging.INFO for r in caplog.records
     ), "cap_quantity None 拦截应打 info 日志"
-    db.close()
 
 
 def test_handle_bar_refreshes_available_once_per_bar():
@@ -8741,9 +8846,10 @@ def test_handle_bar_bridge_unavailable_records_decision_event():
 
     engine._handle_bar(port, _bar(stock, "9.0", bar_time))
 
+    # 心跳/下单发觉断线先落一条 channel_offline（通道状态留痕），再落 bridge_unavailable
     gates = [r.gate for r in _decision_rows(factory)]
-    assert gates == ["bridge_unavailable"]
-    ev = _decision_rows(factory)[0]
+    assert gates == ["channel_offline", "bridge_unavailable"]
+    ev = _decision_rows(factory)[1]
     assert ev.layer == "live_gate" and ev.action == "reject"
     assert ev.stock_code == stock
     queued = _drain_queue(q)

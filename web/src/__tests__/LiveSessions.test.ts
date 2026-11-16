@@ -2,7 +2,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { mount, flushPromises } from '@vue/test-utils'
 
 // 会话 CRUD/启停 + 工作台历史查询 + 组合选单全走 ../api 客户端（import 的即 mock 的 vi.fn）
-const { mockGetLiveSessions, mockCreateLiveSession, mockStartLiveSession, mockStopLiveSession, mockGetLiveChannel, mockTestLiveChannel, mockGetLiveSession, mockGetWatchdogStatus } = vi.hoisted(() => ({
+const { mockGetLiveSessions, mockCreateLiveSession, mockStartLiveSession, mockStopLiveSession, mockGetLiveChannel, mockTestLiveChannel, mockGetLiveSession, mockGetWatchdogStatus, mockGetLiveAccountPreview, mockResetLiveBaseline } = vi.hoisted(() => ({
   mockGetLiveSessions: vi.fn(),
   mockCreateLiveSession: vi.fn(),
   mockStartLiveSession: vi.fn(),
@@ -11,6 +11,8 @@ const { mockGetLiveSessions, mockCreateLiveSession, mockStartLiveSession, mockSt
   mockTestLiveChannel: vi.fn(),
   mockGetLiveSession: vi.fn(),
   mockGetWatchdogStatus: vi.fn(),
+  mockGetLiveAccountPreview: vi.fn(),
+  mockResetLiveBaseline: vi.fn(),
 }))
 vi.mock('../api', () => ({
   getLiveSessions: mockGetLiveSessions,
@@ -20,6 +22,8 @@ vi.mock('../api', () => ({
   getLiveChannel: mockGetLiveChannel,
   testLiveChannel: mockTestLiveChannel,
   getWatchdogStatus: mockGetWatchdogStatus,
+  getLiveAccountPreview: mockGetLiveAccountPreview,
+  resetLiveBaseline: mockResetLiveBaseline,
   getLivePositions: vi.fn(),
   getLiveOrders: vi.fn(),
   getLiveTrades: vi.fn(),
@@ -56,7 +60,7 @@ class FakeEventSource {
 }
 
 import LiveSessions from '../views/LiveSessions.vue'
-import { getLiveSessions, createLiveSession, startLiveSession, stopLiveSession, getLivePositions, getLiveOrders, getLiveTrades, getLiveDecisions, getLiveSignals, getPortfolios, getLiveChannel, testLiveChannel, sendUserBlock, getFormulas, getLiveSession, getWatchdogStatus } from '../api'
+import { getLiveSessions, createLiveSession, startLiveSession, stopLiveSession, getLivePositions, getLiveOrders, getLiveTrades, getLiveDecisions, getLiveSignals, getPortfolios, getLiveChannel, testLiveChannel, sendUserBlock, getFormulas, getLiveSession, getWatchdogStatus, getLiveAccountPreview, resetLiveBaseline } from '../api'
 import { deriveBlockCode } from '../utils/blockCode'
 
 const runningSession = { id: 7, name: '模拟盘A', mode: 'simulation', status: 'running', started_at: null, stopped_at: null, portfolio_ids: [] }
@@ -80,6 +84,9 @@ beforeEach(() => {
   ;(getWatchdogStatus as any).mockResolvedValue({ running: true, active_alarms: [] })
   ;(getPortfolios as any).mockResolvedValue([])
   ;(getFormulas as any).mockResolvedValue([])
+  // 真实总资产预览默认取不到（null → 不做超上限拦截，按「通道未就绪」展示）
+  ;(getLiveAccountPreview as any).mockResolvedValue({ total_asset: null, available: null, captured_at: null })
+  ;(resetLiveBaseline as any).mockResolvedValue({ portfolio_id: 1, baseline: null })
   ;(getLiveChannel as any).mockResolvedValue({
     engine: 'iquant',
     active: 'iquant_bridge',
@@ -741,7 +748,7 @@ describe('LiveSessions.vue 新建实盘选组合', () => {
 })
 
 describe('LiveSessions.vue 实盘资金基准（live_capital）', () => {
-  it('新建弹窗渲染「实盘资金基准（元）」number 输入 + 占位符 + 说明', async () => {
+  it('新建弹窗渲染「实盘资金基准（元）」number 输入 + 只缩不放文案', async () => {
     ;(getLiveSessions as any).mockResolvedValue([stoppedSession])
     ;(getPortfolios as any).mockResolvedValue([{ id: 1, name: '稳健组合' }])
     const w = mount(LiveSessions)
@@ -752,18 +759,61 @@ describe('LiveSessions.vue 实盘资金基准（live_capital）', () => {
 
     const capInput = w.findAll('input').find((i) => (i.element as HTMLInputElement).type === 'number')
     expect(capInput).toBeTruthy()
-    expect((capInput!.element as HTMLInputElement).placeholder).toContain('留空 = 只用桥账户快照')
+    expect((capInput!.element as HTMLInputElement).placeholder).toContain('留空 = 以真实通道总资产为基准')
     expect(w.text()).toContain('实盘资金基准（元）')
-    // ①：live_capital 只作真实侧总闸，不再覆盖各组合虚拟起账
-    expect(w.text()).toContain('真实侧总闸')
-    expect(w.text()).toContain('每个组合虚拟现金起账 = 该组合配置的 initial_capital')
-    expect(w.text()).toContain('多组合各自独立记账')
-    // ②：池外持仓只展示/对账，不进虚拟现金与净值
-    expect(w.text()).toContain('池外持仓（代码不在任何组合股票池）只展示/对账，不进虚拟现金与净值')
+    // 默认取真实总资产、只缩不放
+    expect(w.text()).toContain('默认取真实通道总资产')
+    expect(w.text()).toContain('只能小于当前真实总资产')
+    // 起账口径：基准 × 占比 − 继承仓成本；池外持仓不上净值
+    expect(w.text()).toContain('起账现金 = 基准 × 组合资金占比 − 该组合继承仓成本')
+    expect(w.text()).toContain('池外持仓只展示/对账，不进虚拟现金与净值')
     w.unmount()
   })
 
-  it('填写 live_capital 提交 → 透传数值', async () => {
+  it('真实总资产预览可见（通道就绪）+ 超上限拒绝保存并给出指名文案', async () => {
+    ;(getLiveSessions as any).mockResolvedValue([stoppedSession])
+    ;(getPortfolios as any).mockResolvedValue([{ id: 1, name: '稳健组合' }])
+    ;(getLiveAccountPreview as any).mockResolvedValue({ total_asset: 263515.51, available: 10000, captured_at: '2026-11-16T15:00:00' })
+    const w = mount(LiveSessions)
+    await flushPromises()
+
+    await w.findAll('button').find((b) => b.text().includes('新建实盘'))!.trigger('click')
+    await flushPromises()
+    expect(w.find('[data-test="account-preview"]').text()).toContain('263,515.51')
+
+    const capInput = w.findAll('input').find((i) => (i.element as HTMLInputElement).type === 'number')!
+    await capInput.setValue('300000')
+    await w.findAll('input[data-portfolio-check]')[0].setValue(true)
+    await w.findAll('button').find((b) => b.text().includes('确认'))!.trigger('click')
+    await flushPromises()
+
+    expect(createLiveSession).not.toHaveBeenCalled()
+    expect(w.find('[data-test="baseline-error"]').text())
+      .toContain('填写值 300,000.00 超过当前真实总资产 263,515.51，请填写更小的值')
+    w.unmount()
+  })
+
+  it('通道未就绪 → 提示可先固定金额起账，不拦保存', async () => {
+    ;(getLiveSessions as any).mockResolvedValue([stoppedSession])
+    ;(getPortfolios as any).mockResolvedValue([{ id: 1, name: '稳健组合' }])
+    ;(getLiveAccountPreview as any).mockRejectedValue({
+      response: { data: { code: 503, message: '通达信通道未就绪', data: null } },
+    })
+    const w = mount(LiveSessions)
+    await flushPromises()
+
+    await w.findAll('button').find((b) => b.text().includes('新建实盘'))!.trigger('click')
+    await flushPromises()
+    expect(w.find('[data-test="account-preview-error"]').text()).toContain('通道未就绪')
+
+    await w.findAll('input[data-portfolio-check]')[0].setValue(true)
+    await w.findAll('button').find((b) => b.text().includes('确认'))!.trigger('click')
+    await flushPromises()
+    expect(createLiveSession).toHaveBeenCalled()
+    w.unmount()
+  })
+
+  it('填写 live_capital 提交 → 透传数值 + baseline_mode=manual', async () => {
     ;(getLiveSessions as any).mockResolvedValue([stoppedSession])
     ;(getPortfolios as any).mockResolvedValue([{ id: 1, name: '稳健组合' }])
     const w = mount(LiveSessions)
@@ -779,12 +829,13 @@ describe('LiveSessions.vue 实盘资金基准（live_capital）', () => {
     await flushPromises()
 
     expect(createLiveSession).toHaveBeenCalledWith(expect.objectContaining({
-      name: '', mode: 'simulation', portfolio_ids: [1], live_capital: 1000000,
+      name: '', mode: 'simulation', portfolio_ids: [1],
+      live_capital: 1000000, baseline_mode: 'manual', baseline_value: 1000000,
     }))
     w.unmount()
   })
 
-  it('留空 live_capital 提交 → null（用组合初始资金）', async () => {
+  it('留空 live_capital 提交 → null + baseline_mode=total_asset', async () => {
     ;(getLiveSessions as any).mockResolvedValue([stoppedSession])
     ;(getPortfolios as any).mockResolvedValue([{ id: 1, name: '稳健组合' }])
     const w = mount(LiveSessions)
@@ -798,8 +849,241 @@ describe('LiveSessions.vue 实盘资金基准（live_capital）', () => {
     await flushPromises()
 
     expect(createLiveSession).toHaveBeenCalledWith(expect.objectContaining({
-      portfolio_ids: [1], live_capital: null,
+      portfolio_ids: [1], live_capital: null, baseline_mode: 'total_asset', baseline_value: null,
     }))
+    w.unmount()
+  })
+})
+
+describe('LiveSessions.vue 资金基准重置（收盘后）', () => {
+  const sessionWithPortfolios = {
+    id: 9, name: '多组合盘', mode: 'live', status: 'stopped', engine: 'tdx',
+    started_at: null, stopped_at: null, portfolio_ids: [1, 2],
+    portfolios: [{ portfolio_id: 1, status: 'active' }, { portfolio_id: 2, status: 'active' }],
+  }
+
+  it('交易时段（周一 10:00）→ 重置按钮置灰并给出原因', async () => {
+    const spy = vi.spyOn(Date, 'now').mockReturnValue(Date.parse('2026-11-16T02:00:00Z')) // 北京 10:00
+    ;(getLiveSessions as any).mockResolvedValue([sessionWithPortfolios])
+    const w = mount(LiveSessions)
+    await flushPromises()
+
+    const btn = w.find('[data-test="baseline-reset"]')
+    expect((btn.element as HTMLButtonElement).disabled).toBe(true)
+    expect(btn.attributes('title')).toContain('交易时段禁止重置，请 15:00 后操作')
+    w.unmount()
+    spy.mockRestore()
+  })
+
+  it('收盘后（周一 16:00）→ 可重置，留空按组合逐个重置为当日收盘总资产', async () => {
+    const spy = vi.spyOn(Date, 'now').mockReturnValue(Date.parse('2026-11-16T08:00:00Z')) // 北京 16:00
+    ;(getLiveSessions as any).mockResolvedValue([sessionWithPortfolios])
+    const w = mount(LiveSessions)
+    await flushPromises()
+
+    const btn = w.find('[data-test="baseline-reset"]')
+    expect((btn.element as HTMLButtonElement).disabled).toBe(false)
+    await btn.trigger('click')
+    await flushPromises()
+    expect(w.text()).toContain('重置资金基准')
+
+    await w.findAll('button').find((b) => b.text().includes('确认重置'))!.trigger('click')
+    await flushPromises()
+
+    expect(resetLiveBaseline).toHaveBeenCalledTimes(2)
+    expect(resetLiveBaseline).toHaveBeenCalledWith(9, 1, { value: null })
+    expect(resetLiveBaseline).toHaveBeenCalledWith(9, 2, { value: null })
+    w.unmount()
+    spy.mockRestore()
+  })
+
+  it('重置弹窗可再次手动填写更小值；后端 403 文案原样展示', async () => {
+    const spy = vi.spyOn(Date, 'now').mockReturnValue(Date.parse('2026-11-19T08:00:00Z'))
+    ;(getLiveSessions as any).mockResolvedValue([sessionWithPortfolios])
+    ;(resetLiveBaseline as any).mockRejectedValue({
+      response: { data: { code: 403, message: '当前处于交易时段，禁止重置资金基准（请在收盘后操作）', data: null } },
+    })
+    const w = mount(LiveSessions)
+    await flushPromises()
+
+    await w.find('[data-test="baseline-reset"]').trigger('click')
+    await flushPromises()
+    await w.find('input[data-field="baseline-reset-value"]').setValue('200000')
+    await w.findAll('button').find((b) => b.text().includes('确认重置'))!.trigger('click')
+    await flushPromises()
+
+    expect(resetLiveBaseline).toHaveBeenCalledWith(9, 1, { value: 200000 })
+    expect(w.find('[data-test="baseline-reset-error"]').text()).toContain('禁止重置资金基准')
+    w.unmount()
+    spy.mockRestore()
+  })
+})
+
+describe('LiveSessions.vue 引擎占用（C1）与多账户横幅（C4）', () => {
+  it('被占用的引擎在新建下拉置灰，并显示占用方与「先停止该会话」引导', async () => {
+    ;(getLiveSessions as any).mockResolvedValue([
+      { id: 3, name: 'TDX 主策略', mode: 'live', status: 'running', engine: 'tdx', started_at: '2026-11-16T09:15:00', portfolio_ids: [] },
+    ])
+    ;(getPortfolios as any).mockResolvedValue([{ id: 1, name: '稳健组合' }])
+    const w = mount(LiveSessions)
+    await flushPromises()
+
+    await w.findAll('button').find((b) => b.text().includes('新建实盘'))!.trigger('click')
+    await flushPromises()
+
+    const tdxOption = w.findAll('option').find((o) => o.text().includes('tdx'))!
+    expect((tdxOption.element as HTMLOptionElement).disabled).toBe(true)
+    expect(tdxOption.text()).toContain('tdx（被 会话 3「TDX 主策略」占用，09:15 起）')
+    // 新会话默认引擎避开被占用项（回退到未占用的 iquant）
+    const select = w.find('select[data-field="create-engine"]').element as HTMLSelectElement
+    expect(select.value).toBe('iquant')
+
+    const hint = w.find('[data-test="engine-occupied-hint"]')
+    expect(hint.text()).toContain('先停止该会话')
+    w.unmount()
+  })
+
+  it('多账户并行（2 个 running 且账户键不同）→ 顶部横幅，可关闭且不拦操作', async () => {
+    ;(getLiveSessions as any).mockResolvedValue([
+      { id: 7, name: 'A', mode: 'live', status: 'running', engine: 'tdx', account_key: 'tdx:410038214257', portfolio_ids: [] },
+      { id: 8, name: 'B', mode: 'live', status: 'running', engine: 'goldminer', account_key: 'gm:0e5343aabb', portfolio_ids: [] },
+    ])
+    const w = mount(LiveSessions)
+    await flushPromises()
+
+    const banner = w.find('[data-test="multi-account-banner"]')
+    expect(banner.exists()).toBe(true)
+    expect(banner.text()).toContain('当前同时运行 2 个实盘会话')
+    expect(banner.text()).toContain('tdx:410038…')
+    expect(banner.text()).toContain('gm:0e5343…')
+    expect(banner.text()).toContain('多账户同时下单建议分设备操作')
+
+    await banner.findAll('button').find((b) => b.text().includes('关闭'))!.trigger('click')
+    await flushPromises()
+    expect(w.find('[data-test="multi-account-banner"]').exists()).toBe(false)
+    // 不阻断：启动/停止按钮仍可用
+    expect(w.text()).toContain('运行中')
+    w.unmount()
+  })
+
+  it('同账户双会话（account_key 相同）→ 不显示多账户横幅', async () => {
+    ;(getLiveSessions as any).mockResolvedValue([
+      { id: 7, name: 'A', mode: 'live', status: 'running', engine: 'tdx', account_key: 'tdx:410038214257', portfolio_ids: [] },
+      { id: 8, name: 'B', mode: 'live', status: 'running', engine: 'tdx', account_key: 'tdx:410038214257', portfolio_ids: [] },
+    ])
+    const w = mount(LiveSessions)
+    await flushPromises()
+    expect(w.find('[data-test="multi-account-banner"]').exists()).toBe(false)
+    w.unmount()
+  })
+
+  it('stopping 会话显示「停止中」并继续占用引擎（禁用占位按钮）', async () => {
+    ;(getLiveSessions as any).mockResolvedValue([
+      { id: 5, name: '停止中的盘', mode: 'live', status: 'stopping', engine: 'ths', portfolio_ids: [] },
+    ])
+    const w = mount(LiveSessions)
+    await flushPromises()
+
+    expect(w.text()).toContain('停止中')
+    const stoppingBtn = w.findAll('button').find((b) => b.text().includes('停止中…'))!
+    expect((stoppingBtn.element as HTMLButtonElement).disabled).toBe(true)
+    // stopping 会话仍在订阅事件流（等待终态事件）
+    expect(FakeEventSource.instances.length).toBe(1)
+    w.unmount()
+  })
+})
+
+describe('LiveSessions.vue 启动 409 与键鼠冲突确认（C2/C3）', () => {
+  it('引擎占用 409（engine_exclusive）→ 行内红字指名占用者，不笼统报启动失败', async () => {
+    ;(getLiveSessions as any).mockResolvedValue([stoppedSession])
+    ;(startLiveSession as any).mockRejectedValue({
+      response: { data: { code: 409, message: '引擎独占：会话 3「TDX 主策略」正在使用通达信通道（engine=tdx），请先停止后再启动', data: { rule: 'engine_exclusive' } } },
+    })
+    vi.stubGlobal('alert', vi.fn())
+    const w = mount(LiveSessions)
+    await flushPromises()
+
+    await w.findAll('button').find((b) => b.text().includes('启动'))!.trigger('click')
+    await flushPromises()
+
+    expect(alert).toHaveBeenCalledWith(expect.stringContaining('引擎独占'))
+    expect(w.find('[data-test="start-error"]').text()).toContain('会话 3「TDX 主策略」')
+    expect(w.text()).not.toContain('启动失败')
+    vi.unstubAllGlobals()
+    w.unmount()
+  })
+
+  it('账户占用 409（account_exclusive, stopping）→ 提示稍候再启动', async () => {
+    ;(getLiveSessions as any).mockResolvedValue([stoppedSession])
+    ;(startLiveSession as any).mockRejectedValue({
+      response: { data: { code: 409, message: '', data: {
+        rule: 'account_exclusive',
+        occupied_by: { session_id: 4, name: '旧盘', engine: 'tdx', account_key: 'tdx:410038214257', status: 'stopping' },
+      } } },
+    })
+    vi.stubGlobal('alert', vi.fn())
+    const w = mount(LiveSessions)
+    await flushPromises()
+
+    await w.findAll('button').find((b) => b.text().includes('启动'))!.trigger('click')
+    await flushPromises()
+
+    expect(w.find('[data-test="start-error"]').text()).toContain('账户独占')
+    expect(w.find('[data-test="start-error"]').text()).toContain('正在停止中')
+    vi.unstubAllGlobals()
+    w.unmount()
+  })
+
+  it('tdx 启动时已有 ths 会话 → 弹键鼠风险确认；未勾选不可提交，勾选后带 ack 启动', async () => {
+    ;(getLiveSessions as any).mockResolvedValue([
+      { id: 3, name: '同花顺盘', mode: 'live', status: 'running', engine: 'ths', portfolio_ids: [] },
+      { id: 8, name: '通达信盘', mode: 'live', status: 'stopped', engine: 'tdx', portfolio_ids: [] },
+    ])
+    const w = mount(LiveSessions)
+    await flushPromises()
+
+    await w.findAll('button').find((b) => b.text().includes('启动'))!.trigger('click')
+    await flushPromises()
+
+    // 未提交：先弹确认框
+    expect(startLiveSession).not.toHaveBeenCalled()
+    expect(w.find('[data-test="keyboard-risk-text"]').text()).toContain('键鼠 UI 自动化')
+    expect(w.find('[data-test="keyboard-risk-text"]').text()).toContain('会话 3「同花顺盘」')
+
+    const confirmBtn = w.find('[data-test="keyboard-risk-confirm"]')
+    expect((confirmBtn.element as HTMLButtonElement).disabled).toBe(true)
+
+    await w.find('[data-test="keyboard-risk-ack"]').setValue(true)
+    expect((confirmBtn.element as HTMLButtonElement).disabled).toBe(false)
+    await confirmBtn.trigger('click')
+    await flushPromises()
+
+    expect(startLiveSession).toHaveBeenCalledWith(8, { ack_keyboard_risk: true })
+    w.unmount()
+  })
+
+  it('后端硬拦键鼠冲突（一次性 409）→ 勾选 ack 后直接展示拒绝文案', async () => {
+    ;(getLiveSessions as any).mockResolvedValue([
+      { id: 3, name: '同花顺盘', mode: 'live', status: 'running', engine: 'ths', portfolio_ids: [] },
+      { id: 8, name: '通达信盘', mode: 'live', status: 'stopped', engine: 'tdx', portfolio_ids: [] },
+    ])
+    ;(startLiveSession as any).mockRejectedValue({
+      response: { data: { code: 409, message: '键鼠冲突：通达信与同花顺不能同时启动（当前配置为硬拦）', data: { rule: 'keyboard_exclusive' } } },
+    })
+    vi.stubGlobal('alert', vi.fn())
+    const w = mount(LiveSessions)
+    await flushPromises()
+
+    await w.findAll('button').find((b) => b.text().includes('启动'))!.trigger('click')
+    await flushPromises()
+    await w.find('[data-test="keyboard-risk-ack"]').setValue(true)
+    await w.find('[data-test="keyboard-risk-confirm"]').trigger('click')
+    await flushPromises()
+
+    expect(startLiveSession).toHaveBeenCalledWith(8, { ack_keyboard_risk: true })
+    expect(alert).toHaveBeenCalledWith(expect.stringContaining('键鼠冲突'))
+    expect(w.find('[data-test="start-error"]').text()).toContain('键鼠冲突')
+    vi.unstubAllGlobals()
     w.unmount()
   })
 })
@@ -1444,8 +1728,9 @@ describe('LiveSessions.vue 多会话并行监控（M1）', () => {
     await flushPromises()
 
     expect(w.text()).toContain('支持跨引擎多会话并行')
-    expect(w.text()).toContain('同一引擎同时仅一个会话')
-    expect(w.text()).toContain('复制交易')
+    expect(w.text()).toContain('同一引擎类型同时仅一个会话')
+    expect(w.text()).toContain('同一实盘账户跨引擎也仅一个会话')
+    expect(w.text()).toContain('键鼠通道')
     w.unmount()
   })
 })

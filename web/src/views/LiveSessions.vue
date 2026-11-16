@@ -7,16 +7,21 @@ import {
   upsertPositionRows, positionHistoryToRows, prependCapped,
   decisionEventToRow, decisionHistoryToRows,
   filterRowsByRange, summarizeDecisionRows, beijingNowHms, TIME_RANGE_OPTIONS,
-  beijingDayKey, rangeStartTs,
+  beijingDayKey, rangeStartTs, parseBeijingTime,
   positionRowKey,
+  isSessionActive, resolvedSessionEngine, engineOccupants, engineOccupiedText,
+  multiAccountBannerText, keyboardConflictOpponents, parseStartConflict,
+  baselineResetAllowed, formatMoney2, shortAccountKey,
   type OrderRow, type TradeRow, type PositionRow, type DecisionRow, type TimeRange,
+  type SessionOccupancy,
 } from '../utils/liveWorkbench'
 import {
   getLiveOrders, getLiveTrades, getLivePositions, getLiveDecisions, getLiveSignals, getPortfolios,
   getLiveSessions, getLiveSession, createLiveSession, startLiveSession, stopLiveSession, deleteLiveSession,
   recoverLiveBreaker, getLiveChannel, testLiveChannel, sendUserBlock, getFormulas, getWatchdogStatus,
+  getLiveAccountPreview, resetLiveBaseline,
   type PortfolioItem, type LiveSessionItem,
-  type LiveChannelInfo, type LiveEngineKey, type LiveExecutionMode, type LiveSignalItem,
+  type LiveChannelInfo, type LiveChannelEngine, type LiveEngineKey, type LiveExecutionMode, type LiveSignalItem,
   type FormulaItem, type WatchdogAlarm,
 } from '../api'
 import PageHeader from '../components/PageHeader.vue'
@@ -52,7 +57,7 @@ const form = ref({
   engine: 'tdx' as LiveEngineKey,
   execution_mode: 'alert' as LiveExecutionMode,
   portfolio_ids: [] as number[],
-  // 实盘资金基准（元）：null=用组合初始资金；number input v-model 空输入为 ''，提交前归一化
+  // 实盘资金基准（元）：null/空=以真实通道总资产为基准（只缩不放）；number=固定上限
   live_capital: null as number | string | null,
   // 外部信号注入：通达信条件预警输出的信号文件路径（空=走 TQ 公式计算）
   signal_file_path: '' as string,
@@ -69,11 +74,82 @@ const form = ref({
   intraday_mismatched_risk_enabled: null as boolean | null,
 })
 
-/** live_capital 归一化：空串/未填 → null（用组合初始资金），否则转数值透传。 */
+/** live_capital 归一化：空串/未填 → null（以真实总资产为基准），否则转数值透传。 */
 function normalizedLiveCapital(): number | null {
   const v = form.value.live_capital
   if (v === null || v === undefined || v === '') return null
   return Number(v)
+}
+
+// ---- 资金基准 / 并发约束（文档《实盘资金基准对齐-修复方案》§3.2 / §3.3 / §7）----
+// 新建弹窗的真实总资产预览（GET /live/account-preview；通道未就绪 → 仅提示不拦保存）
+const accountPreview = ref<{ total_asset: number | null; available: number | null; captured_at: string | null } | null>(null)
+const accountPreviewError = ref('')
+// 新建弹窗内联校验错误（如基准超上限），不静默 alert
+const createError = ref('')
+// start 409 的行内红字（按 data.rule 给指名占用者的不同话术）
+const startErrors = ref<Record<number, string>>({})
+// C3 键鼠冲突二次确认（tdx ↔ ths 同时启动）
+const keyboardRisk = ref<{ session: LiveSessionItem; opponents: SessionOccupancy[] } | null>(null)
+const ackKeyboardRisk = ref(false)
+// 资金基准重置弹窗（收盘后可用；留空 = 当日收盘总资产，也可再次手动填写更小值）
+const baselineModal = ref<{ session: LiveSessionItem } | null>(null)
+const baselineValue = ref<number | string>('')
+const baselineError = ref('')
+// C4 多账户并行横幅（可关闭，不阻断任何操作）
+const bannerDismissed = ref(false)
+// 重置窗口判定的时钟（随 15s 轮询刷新，跨过 15:00 后按钮自动解禁）
+const nowTick = ref(Date.now())
+
+// C1：当前被占用的引擎（running/stopping）→ 建会话下拉置灰 + 显示占用方
+const occupants = computed(() => engineOccupants(sessions.value))
+// C4：多账户并行横幅文案（<2 个 running 或同账户 → null）
+const multiAccountBanner = computed(() => multiAccountBannerText(sessions.value))
+// 重置窗口：交易日 15:00 前禁用（后端 403 兜底半日市/临时休市）
+const resetWindow = computed(() => baselineResetAllowed(nowTick.value))
+// 被占用的引擎清单（新建弹窗引导「先停止该会话」）
+const occupiedEngineList = computed(() =>
+  (channel.value?.engines || [])
+    .filter((e) => occupants.value[e.key])
+    .map((e) => ({ engine: e, occ: occupants.value[e.key] as SessionOccupancy })),
+)
+
+function engineOptionText(e: LiveChannelEngine): string {
+  const occ = occupants.value[e.key]
+  // 文档 §3.2.3.1 / §7 文案：`tdx（被 会话 3「TDX 主策略」占用，09:15 起）`
+  if (occ) return engineOccupiedText(e.key, occ)
+  return `${e.label}${e.configured ? '' : '（未配置）'}`
+}
+function engineOptionDisabled(e: LiveChannelEngine): boolean {
+  return !e.configured || !!occupants.value[e.key]
+}
+/** 键鼠冲突 modal 的对方会话信息：引擎 / 账户键 / 占用起始时间。 */
+function opponentAccountText(o: SessionOccupancy): string {
+  return o.account_key ? shortAccountKey(o.account_key) : `engine:${o.engine}`
+}
+function occupiedSinceText(o: SessionOccupancy): string {
+  const t = parseBeijingTime(o.since).text
+  return t ? `${t.slice(0, 5)} 起` : '时间未知'
+}
+
+/** 会话的组合策略 id 列表（portfolios 有状态时优先，缺省回退 portfolio_ids）。 */
+function sessionPortfolioIds(s: LiveSessionItem): number[] {
+  const ids = (s.portfolios || []).map((p) => p.portfolio_id)
+  return ids.length > 0 ? ids : (s.portfolio_ids || [])
+}
+
+async function loadAccountPreview(engine: LiveEngineKey) {
+  accountPreview.value = null
+  accountPreviewError.value = ''
+  try {
+    accountPreview.value = await getLiveAccountPreview(engine)
+  } catch (e: any) {
+    accountPreviewError.value = e?.response?.data?.message || e?.message || '通道未就绪'
+  }
+}
+function onEngineChange() {
+  createError.value = ''
+  loadAccountPreview(form.value.engine)
 }
 // 引擎中文名（列表与弹窗共用；后端 engines 清单里有 label 时优先）
 const ENGINE_LABEL: Record<string, string> = {
@@ -448,7 +524,8 @@ async function loadHistory(id: number) {
 
 function startEventStreams() {
   closeEventStreams()
-  const running = sessions.value.filter((s) => s.status === 'running')
+  // stopping 仍占用引擎/账户，且后端会在停止过程中推 canceled 终态事件 → 流保持到真正 stopped
+  const running = sessions.value.filter(isSessionActive)
   if (running.length === 0) {
     connState.value = 'closed'
     return
@@ -550,6 +627,7 @@ async function load() {
     sessions.value = []
   } finally {
     loading.value = false
+    nowTick.value = Date.now()
   }
   portfolios.value = await getPortfolios().catch(() => [])
   formulas.value = await getFormulas().catch(() => [])
@@ -574,8 +652,17 @@ async function load() {
 }
 
 function openCreate() {
-  form.value = { name: '', mode: 'simulation', engine: defaultEngineKey(), execution_mode: 'alert', portfolio_ids: [], live_capital: null, signal_file_path: '', advance_close_enabled: false, advance_close_time: '14:51', intraday_mismatched_risk_enabled: null }
+  // C1：默认引擎若已被占用，自动选第一个未占用且已配置的引擎（避免默认值即非法）
+  const occ = occupants.value
+  const engines = channel.value?.engines || []
+  const preferred = defaultEngineKey()
+  const engine = (!occ[preferred]
+    ? preferred
+    : (engines.find((e) => e.configured && !occ[e.key])?.key as LiveEngineKey | undefined)) || preferred
+  form.value = { name: '', mode: 'simulation', engine, execution_mode: 'alert', portfolio_ids: [], live_capital: null, signal_file_path: '', advance_close_enabled: false, advance_close_time: '14:51', intraday_mismatched_risk_enabled: null }
+  createError.value = ''
   showCreate.value = true
+  loadAccountPreview(engine)
 }
 
 async function create() {
@@ -583,25 +670,105 @@ async function create() {
     alert('请至少选择一个组合策略')
     return
   }
+  const cap = normalizedLiveCapital()
+  // 只缩不放：填写值超过真实总资产 → 提示超上限并拒绝保存（通道未就绪取不到时不拦）
+  const totalAsset = accountPreview.value?.total_asset
+  if (cap !== null && totalAsset !== null && totalAsset !== undefined && cap > Number(totalAsset)) {
+    createError.value = `填写值 ${formatMoney2(cap)} 超过当前真实总资产 ${formatMoney2(totalAsset)}，请填写更小的值`
+    return
+  }
+  if (cap !== null && (!Number.isFinite(cap) || cap <= 0)) {
+    createError.value = '实盘资金基准需大于 0，或留空以真实通道总资产为基准'
+    return
+  }
+  createError.value = ''
   try {
-    await createLiveSession({ ...form.value, live_capital: normalizedLiveCapital() })
+    await createLiveSession({
+      ...form.value,
+      live_capital: cap,
+      baseline_mode: cap === null ? 'total_asset' : 'manual',
+      baseline_value: cap,
+    })
     showCreate.value = false
     form.value = { name: '', mode: 'simulation', engine: defaultEngineKey(), execution_mode: 'alert', portfolio_ids: [], live_capital: null, signal_file_path: '', advance_close_enabled: false, advance_close_time: '14:51', intraday_mismatched_risk_enabled: null }
     load()
   } catch (e: any) {
     // 后端参数校验失败（名称空/资金≤0 等）返回 code!==0 → 拦截器 reject，
     // 必须提示并保留弹窗，否则点「确认」看起来完全无反应。
-    alert(e?.message || '创建失败')
+    createError.value = e?.message || '创建失败'
   }
 }
 
-async function startSession(id: number) {
+/** 启动会话：tdx ↔ ths 键鼠冲突时先弹二次确认（需勾选风险），确认后带 ack 提交。 */
+function startSession(id: number, ack = false) {
+  if (!ack) {
+    const target = sessions.value.find((s) => s.id === id)
+    const opponents = target ? keyboardConflictOpponents(sessions.value, resolvedSessionEngine(target)) : []
+    if (opponents.length > 0) {
+      keyboardRisk.value = { session: target as LiveSessionItem, opponents }
+      ackKeyboardRisk.value = false
+      return
+    }
+  }
+  void doStart(id, ack)
+}
+
+async function doStart(id: number, ack: boolean) {
+  clearStartError(id)
   try {
-    await startLiveSession(id)
+    if (ack) await startLiveSession(id, { ack_keyboard_risk: true })
+    else await startLiveSession(id)
     load() // load 内自动连接新运行 session 的流
   } catch (e: any) {
-    // 桥未启动等业务错误：后端返回 code!==0，拦截器 reject 带 message。
-    alert(e?.message || '启动失败')
+    // 结构化 409：按 data.rule（引擎占用/账户占用/键鼠硬拦）给指名话术，不笼统报「启动失败」
+    const info = parseStartConflict(e)
+    startErrors.value = { ...startErrors.value, [id]: info.message }
+    alert(info.message)
+  }
+}
+
+function clearStartError(id: number) {
+  if (startErrors.value[id] === undefined) return
+  const next = { ...startErrors.value }
+  delete next[id]
+  startErrors.value = next
+}
+
+function confirmKeyboardRisk() {
+  if (!ackKeyboardRisk.value || !keyboardRisk.value) return
+  const id = keyboardRisk.value.session.id
+  keyboardRisk.value = null
+  startSession(id, true)
+}
+
+/** 打开重置弹窗；交易时段置灰不可点（原因见 title）。 */
+function openBaseline(s: LiveSessionItem) {
+  if (!resetWindow.value.allowed) return
+  baselineModal.value = { session: s }
+  baselineValue.value = ''
+  baselineError.value = ''
+}
+
+async function confirmBaseline() {
+  if (!baselineModal.value) return
+  const s = baselineModal.value.session
+  const v = baselineValue.value === '' ? null : Number(baselineValue.value)
+  if (v !== null && (!Number.isFinite(v) || v <= 0)) {
+    baselineError.value = '请填写大于 0 的金额，或留空使用当日收盘总资产'
+    return
+  }
+  const pids = sessionPortfolioIds(s)
+  if (pids.length === 0) {
+    baselineError.value = '该会话没有可重置的组合策略'
+    return
+  }
+  try {
+    // 文档 §7 的重置端点是按组合，一个会话的多组合逐个重置
+    for (const pid of pids) await resetLiveBaseline(s.id, pid, { value: v })
+    baselineModal.value = null
+    load()
+  } catch (e: any) {
+    baselineError.value = e?.response?.data?.message || e?.message || '重置失败'
   }
 }
 
@@ -683,8 +850,12 @@ async function testChannel() {
 
 onMounted(() => {
   load()
-  // 通道在线态 15s 轮询（与决策流 SSE 互补：SSE 掉线时仍能看到状态）
-  bridgeTimer = setInterval(refreshBridgeOnline, 15000)
+  // 通道在线态 15s 轮询（与决策流 SSE 互补：SSE 掉线时仍能看到状态）；
+  // 同时刷新 nowTick，使「重置资金基准」在跨过 15:00 后自动解禁。
+  bridgeTimer = setInterval(() => {
+    nowTick.value = Date.now()
+    refreshBridgeOnline()
+  }, 15000)
 })
 onUnmounted(() => {
   closeEventStreams()
@@ -700,6 +871,12 @@ onUnmounted(() => {
     <button class="btn btn-sm" @click="showGuide = true" data-field="live-guide-toggle">📖 配置指南</button>
     <button @click="openCreate" class="btn btn-primary">+ 新建实盘</button>
   </PageHeader>
+
+  <!-- C4 多账户并行提示：不阻断任何操作，可关闭 -->
+  <div v-if="multiAccountBanner && !bannerDismissed" class="card multi-account-banner" data-test="multi-account-banner">
+    <span>{{ multiAccountBanner }}</span>
+    <button class="btn btn-sm" @click="bannerDismissed = true">关闭</button>
+  </div>
 
   <div class="card channel-bar">
     <span class="channel-label">{{ channelLabelPrefix }}</span>
@@ -736,14 +913,14 @@ onUnmounted(() => {
       :style="{ color: channelTestMsg.ok ? 'var(--green)' : 'var(--red)', fontSize: '13px' }"
     >{{ channelTestMsg.text }}</span>
     <span class="channel-hint">自动模式可在「新建实盘」时另选引擎；默认引擎在 系统配置 → 通达信 TQ 通道 修改</span>
-    <span class="channel-hint">支持跨引擎多会话并行（不同账户）；同一引擎同时仅一个会话；同组合多会话=复制交易（需不同引擎，各账户独立记账）</span>
+    <span class="channel-hint">支持跨引擎多会话并行（不同账户）；同一引擎类型同时仅一个会话；同一实盘账户跨引擎也仅一个会话；同时运行键鼠通道（通达信/同花顺）需二次确认风险</span>
     <router-link to="/system" style="margin-left:auto;font-size:13px">通道配置 →</router-link>
   </div>
 
   <div v-if="loading" class="card" style="padding:12px"><p>加载中…</p></div>
   <div v-else class="card table-wrap">
     <table>
-      <thead><tr><th>ID</th><th>名称</th><th>组合策略</th><th>执行模式</th><th>引擎</th><th>模式</th><th>状态</th><th>操作</th></tr></thead>
+      <thead><tr><th>ID</th><th>名称</th><th>组合策略</th><th>执行模式</th><th>引擎</th><th>模式</th><th>资金基准</th><th>状态</th><th>操作</th></tr></thead>
       <tbody>
         <tr v-for="s in sessions" :key="s.id">
           <td style="color:var(--ink-soft)">#{{ s.id }}</td>
@@ -766,7 +943,24 @@ onUnmounted(() => {
           </td>
           <td>{{ s.mode === 'simulation' ? '仿真' : '实盘' }}</td>
           <td>
-            <span class="badge" :class="s.status === 'running' ? 'badge-green' : 'badge-gray'">{{ s.status === 'running' ? '运行中' : '已停止' }}</span>
+            <span :title="s.live_capital != null ? '手动填写的实盘资金基准（只缩不放）' : '以真实通道总资产为基准（只缩不放）'">
+              {{ s.live_capital != null ? formatMoney2(s.live_capital) : '真实总资产' }}
+            </span>
+            <button
+              class="btn btn-sm" style="margin-left:6px" data-test="baseline-reset"
+              :disabled="!resetWindow.allowed"
+              :title="resetWindow.allowed ? '重置资金基准（留空=当日收盘总资产，只能小于真实总资产）' : resetWindow.reason"
+              @click="openBaseline(s)"
+            >重置</button>
+          </td>
+          <td>
+            <span class="badge"
+              :class="s.status === 'running' ? 'badge-green' : s.status === 'stopping' ? 'badge-orange' : 'badge-gray'"
+            >{{ s.status === 'running' ? '运行中' : s.status === 'stopping' ? '停止中' : '已停止' }}</span>
+            <!-- C4：真的在操作多个账户 → 徽标提示（不阻断） -->
+            <span v-if="s.status === 'running' && multiAccountBanner"
+              class="badge badge-orange" style="margin-left:4px"
+              title="当前有多个实盘账户并行运行，下单前请确认窗口对应的账户">多账户并行中</span>
             <!-- 状态陈旧保护：后端重启后引擎未恢复时，DB 可能仍留 running；以引擎
                  注册表（engine_running）为准提示，避免误以为在自动交易。 -->
             <span v-if="s.status === 'running' && s.engine_running === false"
@@ -785,8 +979,12 @@ onUnmounted(() => {
           <td>
             <button v-if="s.status === 'stopped'" @click="startSession(s.id)" class="btn btn-sm btn-primary">启动</button>
             <button v-if="s.status === 'running'" @click="stopSession(s.id)" class="btn btn-sm btn-danger">停止</button>
+            <button v-if="s.status === 'stopping'" class="btn btn-sm" disabled
+              title="引擎正在退出中，停止完成后才会释放引擎/账户占用">停止中…</button>
             <button v-if="s.status === 'running' && s.id !== watchedSessionId" @click="watchSession(s.id)" class="btn btn-sm">监控</button>
             <button v-if="s.status === 'stopped'" @click="deleteSession(s)" class="btn btn-sm">删除</button>
+            <!-- 结构化 409：按 data.rule 指名占用者（C1 引擎占用 / C2 账户占用 / C3 键鼠硬拦） -->
+            <div v-if="startErrors[s.id]" class="start-error" data-test="start-error">{{ startErrors[s.id] }}</div>
           </td>
         </tr>
       </tbody>
@@ -1133,11 +1331,15 @@ onUnmounted(() => {
         <option value="auto">自动（按交易引擎下单）</option>
       </select>
       <label>交易引擎（决定信号计算的数据源）</label>
-      <select v-model="form.engine">
-        <option v-for="e in channel?.engines || []" :key="e.key" :value="e.key" :disabled="!e.configured">
-          {{ e.label }}{{ e.configured ? '' : '（未配置）' }}
+      <select v-model="form.engine" data-field="create-engine" @change="onEngineChange">
+        <option v-for="e in channel?.engines || []" :key="e.key" :value="e.key" :disabled="engineOptionDisabled(e)">
+          {{ engineOptionText(e) }}
         </option>
       </select>
+      <div v-for="item in occupiedEngineList" :key="`occ-${item.engine.key}`" class="engine-occupied-hint" data-test="engine-occupied-hint">
+        <span>{{ item.engine.label }} 已被 会话 #{{ item.occ.session_id }}「{{ item.occ.name }}」占用（{{ opponentAccountText(item.occ) }}，{{ occupiedSinceText(item.occ) }}，{{ item.occ.status === 'stopping' ? '停止中' : '运行中' }}）。</span>
+        <button class="btn btn-sm" :disabled="item.occ.status === 'stopping'" @click="stopSession(item.occ.session_id)">先停止该会话</button>
+      </div>
       <p style="font-size:12px;color:var(--ink-faint);margin:2px 0 12px">
         模式只对 QMT 通道选桥：simulation / live 两个模式位当前都指向 8790（410038214257，STOCK；
         该账户是 QMT 仿真账户、账户内为仿真资金）。8791 信用账户桥位保留但未启用。其它引擎的账户由通道自身决定，模式不改变下单账户。
@@ -1149,10 +1351,21 @@ onUnmounted(() => {
         </span>
       </p>
       <label>实盘资金基准（元）</label>
-      <input v-model="form.live_capital" type="number" min="0" placeholder="留空 = 只用桥账户快照（不用此兜底）" />
+      <input v-model="form.live_capital" type="number" min="0" placeholder="留空 = 以真实通道总资产为基准" data-field="live-capital" />
       <p style="font-size:12px;color:var(--ink-faint);margin:2px 0 12px">
-        请填账户「总资产」（可用资金 + 持仓市值）：它只作<b>真实侧总闸</b>上限（合计下单+在途 ≤ 真实可用，不足时按各组合配置资金占比缩量），<b>不</b>覆盖各组合的虚拟起账；每个组合虚拟现金起账 = 该组合配置的 initial_capital（与回测单组合资金口径一致），多组合各自独立记账。启动后池内继承的存量持仓市值会从该组合起账现金中扣除，避免与基准重复计入；池外持仓（代码不在任何组合股票池）只展示/对账，不进虚拟现金与净值。
+        默认取真实通道总资产，<b>只缩不放</b>：填写值只能小于当前真实总资产（超过会被拒绝保存）；留空 = 直接以真实总资产为基准。
+        起账现金 = 基准 × 组合资金占比 − 该组合继承仓成本（起账按成本估值，首日浮亏即真实持仓浮亏）；
+        多组合共享同一真实账户、各自独立记账，池外持仓只展示/对账，不进虚拟现金与净值。
       </p>
+      <div v-if="accountPreview?.total_asset != null" class="baseline-preview" data-test="account-preview">
+        当前真实总资产：<b>{{ formatMoney2(accountPreview.total_asset) }}</b>
+        <span v-if="accountPreview.captured_at" style="color:var(--ink-faint)">（采集于 {{ accountPreview.captured_at }}）</span>
+        ，填写值不能超过该金额。
+      </div>
+      <div v-else-if="accountPreviewError" class="baseline-preview warn" data-test="account-preview-error">
+        通道未就绪，无法读取真实总资产；可先用固定金额起账，通道就绪后手动重置。
+      </div>
+      <p v-if="createError" class="form-error" data-test="baseline-error">{{ createError }}</p>
       <label>外部信号文件路径（通达信条件预警输出，可选）</label>
       <input v-model="form.signal_file_path" placeholder="留空 = 走 TQ 公式计算信号；填写完整文件路径" />
       <p style="font-size:12px;color:var(--ink-faint);margin:2px 0 12px">
@@ -1206,6 +1419,53 @@ onUnmounted(() => {
       <div class="modal-actions">
         <button @click="create" class="btn btn-primary">确认</button>
         <button @click="showCreate = false" class="btn">取消</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- C3 键鼠冲突二次确认：勾选风险后才可带 ack_keyboard_risk 提交 -->
+  <div v-if="keyboardRisk" class="modal-overlay" @click.self="keyboardRisk = null">
+    <div class="modal-content">
+      <h3>键鼠冲突风险确认</h3>
+      <div class="modal-body">
+        <p data-test="keyboard-risk-text">
+          通达信与同花顺都是键鼠 UI 自动化，同时运行可能因抢焦点/看错窗口导致误操作。
+          建议先停止会话 {{ keyboardRisk.opponents[0].session_id }}「{{ keyboardRisk.opponents[0].name }}」。仍要继续吗？
+        </p>
+        <p style="font-size:12px;color:var(--ink-faint)">
+          当前冲突会话：
+          <span v-for="o in keyboardRisk.opponents" :key="o.session_id">
+            #{{ o.session_id }} {{ o.name }}（{{ engineLabel(o.engine) }}，{{ opponentAccountText(o) }}，{{ occupiedSinceText(o) }}）
+          </span>
+        </p>
+        <label style="display:flex;align-items:center;gap:8px">
+          <input v-model="ackKeyboardRisk" type="checkbox" style="width:auto" data-test="keyboard-risk-ack" />
+          已知键盘鼠标冲突风险
+        </label>
+      </div>
+      <div class="modal-actions">
+        <button class="btn btn-primary" :disabled="!ackKeyboardRisk" data-test="keyboard-risk-confirm" @click="confirmKeyboardRisk">我已了解风险，仍要启动（不推荐）</button>
+        <button class="btn" @click="keyboardRisk = null">取消</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 资金基准重置（收盘后）：留空=当日收盘总资产，也可再次手动填写更小值 -->
+  <div v-if="baselineModal" class="modal-overlay" @click.self="baselineModal = null">
+    <div class="modal-content">
+      <h3>重置资金基准</h3>
+      <div class="modal-body">
+        <p>会话 #{{ baselineModal.session.id }}「{{ baselineModal.session.name }}」</p>
+        <label>实盘资金基准（元）</label>
+        <input v-model="baselineValue" type="number" min="0" placeholder="留空 = 当日收盘总资产" data-field="baseline-reset-value" />
+        <p style="font-size:12px;color:var(--ink-faint);margin:2px 0 12px">
+          默认取当日收盘总资产，只缩不放：填写值只能小于真实总资产；重置不解除熔断、不清零熔断次数。
+        </p>
+        <p v-if="baselineError" class="form-error" data-test="baseline-reset-error">{{ baselineError }}</p>
+      </div>
+      <div class="modal-actions">
+        <button class="btn btn-primary" @click="confirmBaseline">确认重置</button>
+        <button class="btn" @click="baselineModal = null">取消</button>
       </div>
     </div>
   </div>
@@ -1407,6 +1667,41 @@ onUnmounted(() => {
 }
 .channel-label { font-size: 13px; color: var(--ink-soft); }
 .channel-hint { font-size: 12px; color: var(--ink-faint); }
+/* C4 多账户并行横幅：提示不阻断，可关闭 */
+.multi-account-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 14px;
+  margin-bottom: 12px;
+  font-size: 13px;
+  border-left: 4px solid var(--orange, #e67e22);
+  background: rgba(230, 126, 34, 0.08);
+}
+/* 引擎下拉占用引导（C1） */
+.engine-occupied-hint {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin: 2px 0 10px;
+  font-size: 12px;
+  color: var(--ink-soft);
+}
+/* 新建弹窗真实总资产预览 / 内联校验错误 */
+.baseline-preview { font-size: 12px; color: var(--ink-soft); margin: -6px 0 12px; }
+.baseline-preview.warn { color: var(--orange, #e67e22); }
+.form-error { font-size: 12px; color: var(--red); margin: -6px 0 12px; }
+/* start 409 行内红字：指名占用者，不笼统报「启动失败」 */
+.start-error {
+  margin-top: 6px;
+  max-width: 320px;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--red);
+  white-space: normal;
+}
 .formula-tag { font-size: 11px; color: var(--accent); background: var(--accent-light); padding: 1px 6px; border-radius: 3px; margin-left: 4px; }
 .event-log {
   max-height: 420px;

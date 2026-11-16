@@ -311,18 +311,19 @@ def test_plan_resume_marks_gap_beyond_cap():
 
 # ---------------------------------------------------------------- 5. 口径版本闸
 def test_checkpoint_invalidated_by_params_hash_and_schema():
+    v = ib.SCHEMA_VERSION
     ok = ib.checkpoint_valid(
-        params_hash="h1", schema_fp="f1", schema_version=1,
+        params_hash="h1", schema_fp="f1", schema_version=v,
         expected_params_hash="h1", expected_schema_fp="f1")
     assert ok is True
     assert ib.checkpoint_valid(
-        params_hash="h2", schema_fp="f1", schema_version=1,
+        params_hash="h2", schema_fp="f1", schema_version=v,
         expected_params_hash="h1", expected_schema_fp="f1") is False
     assert ib.checkpoint_valid(
-        params_hash="h1", schema_fp="f2", schema_version=1,
+        params_hash="h1", schema_fp="f2", schema_version=v,
         expected_params_hash="h1", expected_schema_fp="f1") is False
     assert ib.checkpoint_valid(
-        params_hash="h1", schema_fp="f1", schema_version=0,
+        params_hash="h1", schema_fp="f1", schema_version=v - 1,
         expected_params_hash="h1", expected_schema_fp="f1") is False
 
 
@@ -392,7 +393,8 @@ def _seed_minute_checkpoint(db, sess, ps, as_of, as_of_bar=None,
                             day_complete=False):
     """落一个「已跑到 as_of 某根 bar」的 checkpoint（省略则整日已跑完）。"""
     dm = ib._cfg().get("dividend_mode", "dual")
-    fp = ib.params_fingerprint(ps, dm, db)
+    fp = ib.params_fingerprint(ps, dm, db,
+                               baseline=ib.baseline_fingerprint(sess))
     port = _make_portfolio(cash="100000", period="5m")
     state = ib.state_payload(port, as_of, pending_orders=[],
                              as_of_bar_time=as_of_bar,
@@ -731,17 +733,17 @@ def test_invalidation_reasons_locate_changed_section(db_session):
     assert any("无分项指纹" in r for r in reasons3)
 
 
-def test_engine_schema_v2_invalidates_with_readable_reason():
-    """修复 6：引擎口径升 v2；旧 checkpoint 作废时必须点名「引擎版本 v1 → v2」。"""
-    assert ib._ENGINE_SCHEMA == "backtest_engine_v2"
+def test_engine_schema_bump_invalidates_with_readable_reason():
+    """引擎口径升 v3（基准对齐）；旧 checkpoint 作废时必须点名「引擎版本 v2 → v3」。"""
+    assert ib._ENGINE_SCHEMA == "backtest_engine_v3"
     want_parts = ib.schema_parts("dual")
-    old_parts = dict(want_parts, engine="backtest_engine_v1")
+    old_parts = dict(want_parts, engine="backtest_engine_v2")
     reasons = ib._invalidation_reasons(
         {"schema_fp": "old-fp", "schema_parts": old_parts, "params_fp_parts": {}},
         "old-fp", ib.SCHEMA_VERSION, ib.schema_fingerprint("dual"), {},
         want_parts)
-    assert any("引擎版本" in r and "backtest_engine_v1" in r
-               and "backtest_engine_v2" in r for r in reasons)
+    assert any("引擎版本" in r and "backtest_engine_v2" in r
+               and "backtest_engine_v3" in r for r in reasons)
 
 
 def test_schema_parts_include_engine_version():

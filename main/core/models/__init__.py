@@ -17,6 +17,7 @@ from .walk_forward_run import WalkForwardRun
 from .param_perturb_run import ParamPerturbRun
 from .live_session import LiveSession
 from .live_session_portfolio import LiveSessionPortfolio
+from .live_baseline_reset import LiveBaselineReset
 from .live_order import LiveOrder
 from .live_bar_order_mark import LiveBarOrderMark
 from .live_position_peak import LivePositionPeak
@@ -52,6 +53,7 @@ __all__ = [
     "ParamPerturbRun",
     "LiveSession",
     "LiveSessionPortfolio",
+    "LiveBaselineReset",
     "LiveOrder",
     "LiveBarOrderMark",
     "LivePositionPeak",

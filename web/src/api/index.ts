@@ -101,6 +101,8 @@ export interface PortfolioItem {
   cash_enhance_equity_threshold: number | null
   cash_enhance_position_ratio_threshold: number | null
   equity_cap: number | null            // W3 容量上限（dynamic 仓位资金封顶，None=不设上限）
+  max_single_position_pct: number | null  // 单票上限（0~1 比例，null=不限制；仅实盘生效）
+  min_cash_reserve_pct: number | null     // 现金下限（0~1 比例，null=不限制；仅实盘生效）
   status: string  // active|archived
   created_at: string | null
   updated_at: string | null
@@ -871,6 +873,8 @@ export interface PortfolioRequest {
   cash_enhance_equity_threshold?: number | null
   cash_enhance_position_ratio_threshold?: number | null
   equity_cap?: number | null  // W3 容量上限（dynamic 仓位资金封顶，None=不设上限）
+  max_single_position_pct?: number | null  // 单票上限（0~1 比例，null=不限制；仅实盘生效）
+  min_cash_reserve_pct?: number | null     // 现金下限（0~1 比例，null=不限制；仅实盘生效）
   status: string  // active|archived
   strategies?: StrategyItem[]  // 创建时携带；更新组合时后端忽略（策略单独 CRUD）
 }
@@ -1696,11 +1700,18 @@ export interface LiveSessionItem {
   mode: string  // simulation|live
   engine?: LiveEngineKey  // 交易引擎（旧数据缺省视作 iquant）
   execution_mode?: LiveExecutionMode  // 执行模式（旧数据缺省视作 auto）
-  status: string  // stopped|running
+  status: string  // stopped|running|stopping（stopping=引擎真正退出中，仍占用引擎/账户）
   engine_running?: boolean  // 该会话引擎是否真的在注册表中运行（status=running 但 false=重启后未启动）
+  // 账户身份键（launch 成功后由后端解析写入）：qmt:<account>:<type> / gm:<id> /
+  // tdx:<account> / ths:<account> / engine:<engine>（取不到账号时降级）
+  account_key?: string | null
+  // 账户键来源：bridge_ping|config|engine_fallback；engine_fallback 表示仅同引擎互斥
+  account_key_source?: string | null
+  // 占用起始时间（直接取 started_at，供引擎下拉置灰/多账户横幅展示）
+  occupied_since?: string | null
   // 通道在线态（会话详情接口返回；列表接口通常不返回 → undefined=未知）
   bridge_online?: boolean | null
-  live_capital?: number | null  // 会话级实盘资金基准（账户总资产，元）；null=各组合用自身 initial_capital
+  live_capital?: number | null  // 实盘资金基准（元）；null=以真实通道总资产为基准（只缩不放）
   started_at: string | null
   stopped_at: string | null
   portfolio_ids: number[]
@@ -1735,13 +1746,23 @@ export interface LiveSessionCreate {
   engine?: LiveEngineKey
   execution_mode?: LiveExecutionMode
   portfolio_ids: number[]
-  live_capital?: number | null  // 实盘资金基准（账户总资产，元）；空=null=用组合初始资金
+  live_capital?: number | null  // 实盘资金基准（元）；空=null=以真实通道总资产为基准（只缩不放）
+  // 基准口径（文档 §7/§6）：total_asset=以真实总资产为基准 / manual=显式填写 / initial_capital=旧行为
+  baseline_mode?: 'total_asset' | 'manual' | 'initial_capital'
+  baseline_value?: number | null
   signal_file_path?: string | null  // 外部信号文件路径；空=null=走 TQ 公式计算
   advance_close_enabled?: boolean  // B 可选增强，仅 1d：14:50 定信号、14:52 bar 开盘价报单、当日尾盘成交；默认 false（1d/1w/1mon 均 15:05 收盘落定后算、次日执行）
   advance_close_time?: string      // 执行时点 HH:MM；默认 14:51，限定 14:51–14:59，实际轮次不早于 14:52
   // 错周期风控三态：null=跟随全局（tq_trade.intraday_mismatched_risk_enabled，默认 False=对齐回测）/
   // true=强制开启（任意 bar 都跑风控，旧行为）/ false=强制关闭
   intraday_mismatched_risk_enabled?: boolean | null
+}
+
+/** 真实总资产预览（GET /live/account-preview）：只读；通道未就绪时后端 503。 */
+export interface LiveAccountPreview {
+  total_asset: number | null
+  available: number | null
+  captured_at: string | null
 }
 
 export async function getLiveSession(sessionId: number) {
@@ -1754,18 +1775,42 @@ export async function getLiveSessions() {
   return res.data.data
 }
 
+export async function getLiveAccountPreview(engine?: LiveEngineKey) {
+  const res = await api.get<ApiResponse<LiveAccountPreview>>('/live/account-preview', {
+    params: engine ? { engine } : {},
+  })
+  return res.data.data
+}
+
 export async function createLiveSession(req: LiveSessionCreate) {
   const res = await api.post<ApiResponse<{ id: number; status: string }>>('/live/sessions', req)
   return res.data.data
 }
 
-export async function startLiveSession(id: number) {
-  const res = await api.post<ApiResponse<{ id: number; status: string }>>(`/live/sessions/${id}/start`)
+/** 启动实盘会话；键鼠冲突（C3）软拦时带 ack_keyboard_risk=true 二次确认。 */
+export async function startLiveSession(id: number, opts?: { ack_keyboard_risk?: boolean }) {
+  const res = await api.post<ApiResponse<{
+    id: number
+    status: string
+    account_key?: string | null
+    account_key_source?: string | null
+  }>>(`/live/sessions/${id}/start`, opts?.ack_keyboard_risk ? { ack_keyboard_risk: true } : undefined)
   return res.data.data
 }
 
 export async function stopLiveSession(id: number) {
   const res = await api.post<ApiResponse<{ id: number; status: string }>>(`/live/sessions/${id}/stop`)
+  return res.data.data
+}
+
+/** 重置资金基准（收盘后）：value=null → 当日收盘总资产；仅缩不放。 */
+export async function resetLiveBaseline(
+  sessionId: number,
+  portfolioId: number,
+  req: { value: number | null; note?: string },
+) {
+  const res = await api.post<ApiResponse<{ portfolio_id: number; baseline: number | null }>>(
+    `/live/sessions/${sessionId}/portfolios/${portfolioId}/reset-baseline`, req)
   return res.data.data
 }
 

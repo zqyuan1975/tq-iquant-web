@@ -90,6 +90,7 @@ const PORTFOLIO_RATIO_FIELDS = new Set([
   'buy_commission_rate', 'sell_commission_rate', 'stamp_duty_rate', 'transfer_fee_rate', 'slippage',
   'volume_limit_ratio', 'cash_enhance_position_ratio_threshold',
   'slippage_impact_coef',
+  'max_single_position_pct', 'min_cash_reserve_pct',
 ])
 const STRATEGY_RATIO_FIELDS = new Set([
   'capital_ratio', 'single_open_ratio',
@@ -103,6 +104,7 @@ const STRATEGY_RATIO_FIELDS = new Set([
 // （开关打开但阈值留空是最常见的自然操作，不能因此保存失败）
 const NULLABLE_NUMERIC_FIELDS = new Set([
   'equity_cap',
+  'max_single_position_pct', 'min_cash_reserve_pct',
   'max_order_amount',
   'cash_enhance_equity_threshold', 'cash_enhance_position_ratio_threshold',
   'trend_trailing_stop_ratio', 'trend_max_positions',
@@ -154,6 +156,8 @@ const PORTFOLIO_GROUPS: { title: string; fields: FieldMeta[] }[] = [
   { title: '仓位与现金管理', fields: [
     { key: 'position_sizing', label: '仓位模型', span: 2, type: 'select', options: 'positionSizings', hint: '动态=按组合当前总净值分配资金；固定=按初始资金（旧行为）' },
     { key: 'equity_cap', label: '容量上限（元）', span: 2, type: 'number', placeholder: '不设上限', showIf: { key: 'position_sizing', equals: 'dynamic' }, hint: '动态仓位的资金封顶：净值超上限后仓位不再放大（模拟超容量撤回/封盘），None=不设上限' },
+    { key: 'max_single_position_pct', label: '单票上限', span: 1, type: 'percent', placeholder: '留空=不限制', hint: '按「买入后该票市值 ÷ 组合总资产」判定，留空或 0 表示不限制。仅实盘生效，回测不读。' },
+    { key: 'min_cash_reserve_pct', label: '现金下限', span: 1, type: 'percent', placeholder: '留空=不限制', hint: '按「买入后剩余现金 ÷ 组合总资产」判定，留空或 0 表示不限制。仅实盘生效，回测不读。' },
     { key: 'daily_loss_basis', label: '日内亏损熔断口径', span: 2, type: 'select', options: 'dailyLossBases', hint: '分母：净值=上一交易日收盘净值（默认，5% 阈值随净值滚动）；初始资金=按 initial_capital 固定阈值（旧口径，净值增长后相对变严）' },
     { key: 'cash_enhance_enabled', label: '现金管理增强（预留）', span: 2, type: 'switch', hint: '命中阈值仅记录决策事件，暂不自动下单' },
     { key: 'cash_enhance_equity_threshold', label: '净资产阈值（元）', span: 1, type: 'number', showIf: { key: 'cash_enhance_enabled', equals: true } },
@@ -246,6 +250,9 @@ function emptyPortfolioForm(): Record<string, any> {
     position_sizing: 'dynamic', daily_loss_basis: 'equity', cash_enhance_enabled: false,
     cash_enhance_equity_threshold: null, cash_enhance_position_ratio_threshold: null,
     equity_cap: null,
+    // 单票上限 / 现金下限：默认不限制（null → 输入框留空，提交 null，后端 NULL=不设限）。
+    // 绝不能预填非 0 值——会立刻改变次日实际报单结果。
+    max_single_position_pct: null, min_cash_reserve_pct: null,
     strategies: [],
   }
 }
@@ -335,6 +342,10 @@ function buildPortfolioPayload(): PortfolioRequest {
   out.status = f.status
   // equity_cap 容量上限：0 归一为 null（不设上限），后端校验须 >0
   if (out.equity_cap === 0) out.equity_cap = null
+  // 单票上限 / 现金下限：留空或 0 一律归一 null（后端 NULL=不限制）
+  for (const k of ['max_single_position_pct', 'min_cash_reserve_pct'] as const) {
+    if (out[k] === 0 || out[k] === '' || out[k] === undefined) out[k] = null
+  }
   return out as unknown as PortfolioRequest
 }
 
@@ -362,6 +373,34 @@ function num(v: unknown): number | null {
   if (v === '' || v === null || v === undefined) return null
   const n = Number(v)
   return Number.isFinite(n) ? n : null
+}
+
+// 单票上限 / 现金下限：0–100 百分比（留空或 0 = 不限制）。非法值行内提示。
+const portfolioFieldErrors = ref<Record<string, string>>({})
+const OPTIONAL_PCT_LIMITS = [
+  { key: 'max_single_position_pct', label: '单票上限' },
+  { key: 'min_cash_reserve_pct', label: '现金下限' },
+] as const
+
+function validateOptionalPctLimits(): boolean {
+  const errs: Record<string, string> = {}
+  for (const { key, label } of OPTIONAL_PCT_LIMITS) {
+    const raw = portfolioForm.value[key]
+    if (raw === '' || raw === null || raw === undefined) continue
+    const n = Number(raw)
+    if (!Number.isFinite(n) || n < 0 || n > 100) {
+      errs[key] = `${label}需在 0–100 之间（留空或 0 表示不限制）`
+    }
+  }
+  portfolioFieldErrors.value = errs
+  return Object.keys(errs).length === 0
+}
+
+function clearPortfolioFieldError(key: string) {
+  if (!portfolioFieldErrors.value[key]) return
+  const next = { ...portfolioFieldErrors.value }
+  delete next[key]
+  portfolioFieldErrors.value = next
 }
 
 // 可见且必填的数值字段留空 → 明确提示，而不是把 '' 交给后端换回框架级 422
@@ -456,6 +495,7 @@ function validateStrategyPayload(p: Record<string, unknown>): string | null {
 function openCreatePortfolio() {
   editingPortfolioId.value = null
   portfolioForm.value = emptyPortfolioForm()
+  portfolioFieldErrors.value = {}
   // 把比例默认值转成百分比显示
   for (const k of PORTFOLIO_RATIO_FIELDS) {
     portfolioForm.value[k] = toPercent(portfolioForm.value[k], true)
@@ -465,6 +505,7 @@ function openCreatePortfolio() {
 
 async function openEditPortfolio(p: PortfolioItem) {
   editingPortfolioId.value = p.id
+  portfolioFieldErrors.value = {}
   let detail: PortfolioItem
   try {
     detail = await getPortfolioDetail(p.id)
@@ -496,6 +537,8 @@ async function openEditPortfolio(p: PortfolioItem) {
     cash_enhance_equity_threshold: detail.cash_enhance_equity_threshold,
     cash_enhance_position_ratio_threshold: detail.cash_enhance_position_ratio_threshold,
     equity_cap: detail.equity_cap ?? null,
+    max_single_position_pct: detail.max_single_position_pct ?? null,
+    min_cash_reserve_pct: detail.min_cash_reserve_pct ?? null,
     strategies: [],
   }
   // 比例字段转百分比显示
@@ -516,8 +559,11 @@ function errMsg(e: any): string {
 
 async function submitPortfolio() {
   const payload = buildPortfolioPayload()
+  // 单票上限/现金下限非法值走行内提示；其它门控仍走 alert。任一不通过都不发请求
+  const pctOk = validateOptionalPctLimits()
   const gateMsg = validatePortfolioPayload(payload as unknown as Record<string, unknown>)
   if (gateMsg) { alert(gateMsg); return }
+  if (!pctOk) return
   try {
     if (editingPortfolioId.value === null) {
       await createPortfolio(payload)
@@ -761,7 +807,8 @@ onMounted(loadPortfolios)
               <div
                 v-for="fld in g.fields" :key="fld.key"
                 v-show="fieldVisible(fld, portfolioForm)"
-                class="field-row" :class="fld.span === 2 ? 'field-span-2' : ''"
+                class="field-row"
+                :class="[fld.span === 2 ? 'field-span-2' : '', ((fld.type === 'percent' && fld.hint) || portfolioFieldErrors[fld.key]) ? 'field-row--hinted' : '']"
               >
                 <span class="field-label">{{ fld.label }}</span>
                 <label v-if="fld.type === 'switch'" class="switch-row">
@@ -774,11 +821,14 @@ onMounted(loadPortfolios)
                   :data-field="fld.key"
                   v-model="portfolioForm[fld.key]"
                   :placeholder="fld.placeholder"
+                  @input="clearPortfolioFieldError(fld.key)"
                 />
                 <select v-else :data-field="fld.key" v-model="portfolioForm[fld.key]">
                   <option v-for="o in optionsOf(fld.options)" :key="o.value ?? 'null'" :value="o.value">{{ o.label }}</option>
                 </select>
                 <span v-if="fld.type === 'percent'" class="field-suffix">%</span>
+                <span v-if="fld.type === 'percent' && fld.hint" class="field-hint field-hint--below">{{ fld.hint }}</span>
+                <span v-if="portfolioFieldErrors[fld.key]" class="field-error" data-test="portfolio-field-error">{{ portfolioFieldErrors[fld.key] }}</span>
               </div>
             </div>
           </div>
@@ -981,6 +1031,10 @@ onMounted(loadPortfolios)
 
 <style scoped>
 .group-hint { margin-left: 8px; font-size: 11px; font-weight: 400; color: var(--ink-faint); }
+/* 带说明/行内错误的字段：说明与错误各占一行，避免挤占输入框宽度 */
+.field-row--hinted { flex-wrap: wrap; }
+.field-hint--below { flex: 1 0 100%; margin-top: -2px; }
+.field-error { flex: 1 0 100%; font-size: 11px; color: var(--red); line-height: 1.3; }
 /* 小屏：子策略行内容与操作按钮换行，避免按钮被行内长文本挤出可视区 */
 @media (max-width: 1100px) {
   .sub-strategy-row { flex-wrap: wrap; row-gap: 4px; }

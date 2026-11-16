@@ -231,6 +231,8 @@ class HttpBridgeDispatcher(OrderDispatcher):
         # 最近一次 heartbeat 失败分类：refused=端口无监听 / timeout=已监听但无响应
         # / protocol=应答格式不符 / unreachable=其它网络错误。启动闸据此分级提示。
         self.last_probe_error: Optional[str] = None
+        # 最近一次成功 /ping 的应答体（含 account/account_type），C2 账户键用。
+        self.last_ping: Optional[dict] = None
         # 慢响应阈值（秒，<=0 关闭）与告警窗口（秒）：桥内查询排队时单次调用会
         # 排到数秒~十数秒，超阈值即告警；节流按会话（本实例）维度——每窗口最多
         # 一条，窗口内后续慢请求只累计计数与最慢值，窗口过期后的首条带上汇总。
@@ -385,6 +387,9 @@ class HttpBridgeDispatcher(OrderDispatcher):
         if not isinstance(body, dict) or body.get("ok") is False:
             self.last_probe_error = "protocol"
             return False
+        # C2 账户键独占（2026-11-16）：桥 /ping 自述 account/account_type，
+        # 缓存最近一次成功应答，供 resolve_account_key 取账户身份键。
+        self.last_ping = body
         return True
 
     # ---------------- 下单 ----------------

@@ -510,12 +510,17 @@ def test_get_quote_cache_flag_and_55s_ttl(bridge):
     assert r2["data"] == r1["data"]
     assert len(calls) == 1  # 55s 内不再打云端
 
-    ck = ("600000.SH", "1m", 3)
-    ts, rows = bridge._QUOTE_CACHE[ck]
-    bridge._QUOTE_CACHE[ck] = (ts - 56, rows)  # 推到 56s 前 → 过期
+    ck = ("600000.SH", "1m", 3, None)   # 缓存键含复权模式（缺省=None）
+    ts, rows, _meta = bridge._QUOTE_CACHE[ck]
+    bridge._QUOTE_CACHE[ck] = (ts - 56, rows, _meta)  # 推到 56s 前 → 过期
     r3 = bridge.get_quote(q)
     assert r3["cached"] is False
     assert len(calls) == 2
+    # 换复权模式必须免命中同一缓存（front 与默认 adjust=0 的结果不同）
+    r4 = bridge.get_quote(dict(q, dividend_type="front"))
+    assert r4["cached"] is False
+    assert len(calls) == 3
+    assert r4["meta"]["dividend_type"] == "front"
 
 
 def test_get_quote_empty_result_cached_for_10s(bridge):
@@ -523,7 +528,7 @@ def test_get_quote_empty_result_cached_for_10s(bridge):
     calls = []
     _quote_fake(bridge, [], calls)
     q = {"code": "600000.SH", "period": "1m", "count": 3}
-    ck = ("600000.SH", "1m", 3)
+    ck = ("600000.SH", "1m", 3, None)   # 缓存键含复权模式（缺省=None）
 
     r1 = bridge.get_quote(q)
     assert r1["ok"] is True and r1["cached"] is False
@@ -535,12 +540,12 @@ def test_get_quote_empty_result_cached_for_10s(bridge):
     assert r2["data"]["600000.SH"] == []
     assert len(calls) == 1
 
-    ts, rows = bridge._QUOTE_CACHE[ck]
-    bridge._QUOTE_CACHE[ck] = (ts - 9, rows)   # 9s 前：仍在 10s TTL 内
+    ts, rows, _meta = bridge._QUOTE_CACHE[ck]
+    bridge._QUOTE_CACHE[ck] = (ts - 9, rows, _meta)   # 9s 前：仍在 10s TTL 内
     assert bridge.get_quote(q)["cached"] is True
     assert len(calls) == 1
 
-    bridge._QUOTE_CACHE[ck] = (ts - 11, rows)  # 11s 前：过期重查
+    bridge._QUOTE_CACHE[ck] = (ts - 11, rows, _meta)  # 11s 前：过期重查
     r3 = bridge.get_quote(q)
     assert r3["cached"] is False
     assert len(calls) == 2

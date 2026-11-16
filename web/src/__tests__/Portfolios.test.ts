@@ -1103,3 +1103,100 @@ describe('Portfolios.vue — 子策略列表行预警调度摘要', () => {
     expect(w.text()).not.toContain('信号 5m@')
   })
 })
+
+describe('Portfolios.vue — 单票上限 / 现金下限（仅实盘，默认不限制）', () => {
+  it('新建弹窗默认不限制：输入留空、说明文案可见、提交两字段为 null', async () => {
+    ;(createPortfolio as any).mockResolvedValue({ id: 99 })
+    const w = mount(Portfolios)
+    await flushPromises()
+    await w.find('button.btn-primary').trigger('click')
+
+    const sp = w.find('input[data-field="max_single_position_pct"]')
+    const mc = w.find('input[data-field="min_cash_reserve_pct"]')
+    expect(sp.exists()).toBe(true)
+    expect(mc.exists()).toBe(true)
+    // 默认态：不预填任何值（非 0 默认值会改变次日实际报单结果）
+    expect((sp.element as HTMLInputElement).value).toBe('')
+    expect((mc.element as HTMLInputElement).value).toBe('')
+    expect((sp.element as HTMLInputElement).placeholder).toBe('留空=不限制')
+    // 说明：判定口径 + 仅实盘生效
+    expect(w.text()).toContain('买入后该票市值 ÷ 组合总资产')
+    expect(w.text()).toContain('买入后剩余现金 ÷ 组合总资产')
+    expect(w.text()).toContain('仅实盘生效，回测不读')
+
+    await w.find('input[data-field="name"]').setValue('PS_NOLIMIT')
+    await w.find('select[data-field="stock_pool_id"]').setValue('1')
+    await w.find('.modal-actions button.btn-primary').trigger('click')
+    await flushPromises()
+
+    expect(createPortfolio).toHaveBeenCalledTimes(1)
+    const arg = (createPortfolio as any).mock.calls[0][0]
+    expect(arg.max_single_position_pct).toBeNull()
+    expect(arg.min_cash_reserve_pct).toBeNull()
+  })
+
+  it('填 30% → payload 小数 0.3；填 0 → 归一 null', async () => {
+    ;(createPortfolio as any).mockResolvedValue({ id: 99 })
+    const w = mount(Portfolios)
+    await flushPromises()
+    await w.find('button.btn-primary').trigger('click')
+
+    await w.find('input[data-field="name"]').setValue('PS_LIMIT')
+    await w.find('select[data-field="stock_pool_id"]').setValue('1')
+    await w.find('input[data-field="max_single_position_pct"]').setValue('30')
+    await w.find('input[data-field="min_cash_reserve_pct"]').setValue('0')
+    await w.find('.modal-actions button.btn-primary').trigger('click')
+    await flushPromises()
+
+    const arg = (createPortfolio as any).mock.calls[0][0]
+    expect(arg.max_single_position_pct).toBeCloseTo(0.3)
+    expect(arg.min_cash_reserve_pct).toBeNull()
+  })
+
+  it('非法值（101 / -1）→ 行内提示，不弹 alert 且不发请求', async () => {
+    ;(createPortfolio as any).mockClear()
+    const alertMock = vi.fn()
+    vi.stubGlobal('alert', alertMock)
+    const w = mount(Portfolios)
+    await flushPromises()
+    await w.find('button.btn-primary').trigger('click')
+
+    await w.find('input[data-field="name"]').setValue('PS_BAD')
+    await w.find('select[data-field="stock_pool_id"]').setValue('1')
+    await w.find('input[data-field="max_single_position_pct"]').setValue('101')
+    await w.find('input[data-field="min_cash_reserve_pct"]').setValue('-1')
+    await w.find('.modal-actions button.btn-primary').trigger('click')
+    await flushPromises()
+
+    const errs = w.findAll('[data-test="portfolio-field-error"]')
+    expect(errs.length).toBe(2)
+    expect(errs[0].text()).toContain('单票上限')
+    expect(errs[1].text()).toContain('现金下限')
+    expect(alertMock).not.toHaveBeenCalled()
+    expect(createPortfolio).not.toHaveBeenCalled()
+    vi.unstubAllGlobals()
+  })
+
+  it('编辑回填：0.25 / 0.1 → 显示 25 / 10，提交仍为小数', async () => {
+    ;(updatePortfolio as any).mockResolvedValue({ id: 1 })
+    ;(getPortfolioDetail as any).mockResolvedValue({
+      ...mockPortfolios[0], max_single_position_pct: 0.25, min_cash_reserve_pct: 0.1,
+    })
+    const w = mount(Portfolios)
+    await flushPromises()
+
+    const editBtn = w.findAll('button').find(b => b.text() === '编辑')!
+    await editBtn.trigger('click')
+    await flushPromises()
+
+    expect(Number((w.find('input[data-field="max_single_position_pct"]').element as HTMLInputElement).value)).toBe(25)
+    expect(Number((w.find('input[data-field="min_cash_reserve_pct"]').element as HTMLInputElement).value)).toBe(10)
+
+    await w.find('.modal-actions button.btn-primary').trigger('click')
+    await flushPromises()
+
+    const arg = (updatePortfolio as any).mock.calls[0][1]
+    expect(arg.max_single_position_pct).toBeCloseTo(0.25)
+    expect(arg.min_cash_reserve_pct).toBeCloseTo(0.1)
+  })
+})

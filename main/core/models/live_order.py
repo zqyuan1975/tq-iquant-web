@@ -16,6 +16,11 @@ class LiveOrder(Base):
     order_type = Column(String(10), nullable=False)
     price = Column(Numeric(10, 3), nullable=True)
     quantity = Column(Integer, nullable=False)
+    # 资金基准对齐（2026-11-16）：信号原始目标量。下单链按目标金额动态缩量时，
+    # quantity 可能被比例缩减，orig_quantity 保留信号原意，供审计/复盘对照。
+    orig_quantity = Column(Integer, nullable=True)
+    # 生成该单时的资金基准版本；基准重置后据此识别「旧基准下的顺延单」
+    baseline_version = Column(Integer, nullable=True)
     filled_quantity = Column(Integer, default=0, server_default="0", nullable=False)
     filled_price = Column(Numeric(10, 3), nullable=True)
     status = Column(String(15), nullable=False)

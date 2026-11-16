@@ -299,7 +299,7 @@ def test_market_data_recovery_clears_active_alarms():
     wd = _watchdog({1: eng}, market_stall_seconds=180)
     wd.scan()
     assert wd.status()["active_alarms"] == [
-        {"session_id": 1, "rule": "market_data_stalled"}]
+        {"session_id": 1, "rule": "market_data_stalled", "channel": "tdx_tq"}]
 
     eng._snapshot_synth.last_completed_at = NOW
     wd.scan()

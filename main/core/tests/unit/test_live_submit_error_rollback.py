@@ -215,15 +215,20 @@ def test_submit_error_after_broker_id_keeps_submitted():
 
 
 # ---------------- P1-2 ----------------
-def test_expected_minute_labels_excludes_forming_minute():
-    """now 所在那一分钟正在形成，不计入应有分钟（否则审计恒 partial）。"""
+def test_expected_minute_labels_contract_is_closed_interval():
+    """契约：``(start, end]`` 的**已闭合**分钟标签（end 本身计入）。
+
+    排除「正在形成的那一分钟」不是本函数的职责——调用方 ``_plan_gap_recovery``
+    先把 ``gap_end`` 取成 ``(now − 1s)`` 截到分钟（live_engine.py L1813–1815），
+    再传进来；因此 end 恒为「最近一根已闭合 bar 的标签」，本函数必须把它算进去
+    （2026-11-13 修：旧实现双端各减 1 秒 → 每轮恒少 1 根、action 恒 partial）。
+    """
     start = datetime(2026, 11, 12, 10, 0)
-    # 10:06:00 整 → 10:06 这根刚形成、取数未必可见，只应要求 10:01–10:05
     labels = _expected_minute_labels(start, datetime(2026, 11, 12, 10, 6, 0))
     assert labels == [
-        datetime(2026, 11, 12, 10, m) for m in (1, 2, 3, 4, 5)
+        datetime(2026, 11, 12, 10, m) for m in (1, 2, 3, 4, 5, 6)
     ]
-    # 盘中带秒：10:05:30 所在分钟（标签 10:06）同样不计入
+    # 带秒的 end 按分钟标签比较：10:05:30 → 已闭合到 10:05
     labels2 = _expected_minute_labels(start, datetime(2026, 11, 12, 10, 5, 30))
     assert labels2[-1] == datetime(2026, 11, 12, 10, 5)
 

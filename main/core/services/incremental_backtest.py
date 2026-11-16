@@ -47,6 +47,7 @@ from core.models import (
     IncrementalBacktestValidation,
     LiveAccountSnapshot,
     LiveAccountPositionSnapshot,
+    LiveSession,
     LiveSessionPortfolio,
     LiveTrade,
     PortfolioStrategy,
@@ -67,17 +68,16 @@ logger = logging.getLogger(__name__)
 
 _TZ = ZoneInfo("Asia/Shanghai")
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 # 口径版本（任一语义变化 → 提升 SCHEMA_VERSION 并在注释里写明原因）
 _COST_SCHEMA = "fee_inclusive_v2"    # 成本含佣金/印花税/过户费
 _EXEC_SCHEMA = "next_bar_open_v1"    # 成交价 = 下一根 bar 开盘价
 _T1_SCHEMA = "t1_forced_v1"          # 回测强制 T+1
-# v2（2026-11-12）：①同时间戳周期处理顺序改为细→粗（对齐实盘 periods_on_boundary，
-# 现金/槽位竞争先后与实盘一致）；②"1h" 周期键补齐（旧 60m 别名同权重）；③新增
-# portfolio_strategies.risk_cooldown_days（风控卖出后冷静期，默认 1）改变开仓时点；
-# ④日终估值步按「当日最后时间戳组最细周期」定义。以上任一都会改变逐日净值，
-# 旧 v1 checkpoint 一律作废重建（_invalidation_reasons 报「引擎版本变化」）。
-_ENGINE_SCHEMA = "backtest_engine_v2"
+# v3（2026-11-16）：资金基准对齐——实盘起账基准改为「真实账户总资产」口径，
+# params_fingerprint 新增 sections["baseline"]（baseline_version/baseline_value）；
+# 基准重置会重设 seam_date/seam_cash 并删除旧 checkpoint。旧 checkpoint 的
+# initial_capital/seam 属于旧基准，恢复会把新基准覆盖回去，故整体作废重建。
+_ENGINE_SCHEMA = "backtest_engine_v3"
 
 # 小样本豁免阈值（修复 9）：成交笔数与方向一致率在个位数样本上没有统计意义。
 # 取 5 的依据：n=4 时任意 1 笔不一致 → 一致率 ≤ 0.75，直接击穿 0.9 容差，
@@ -289,8 +289,9 @@ def state_payload(portfolio: Portfolio, as_of_date: date,
 def restore_portfolio(portfolio: Portfolio, payload: dict) -> List[OrderEvent]:
     """把 checkpoint 内存态灌回 Portfolio；返回待继续处理的在途单。"""
     portfolio.account.cash = _dec(payload.get("cash"))
-    portfolio.account.initial_capital = _dec(
-        payload.get("initial_capital"), str(portfolio.account.initial_capital))
+    # 2026-11-16 资金基准对齐：initial_capital 是「当前配置/基准」而非路径依赖
+    # 状态，**不从旧 checkpoint 回灌**（旧基准的 initial_capital 会把新基准覆盖
+    # 回去，导致续跑侧净额凭空多/少一截）。保留装配时按现行基准写入的值。
 
     by_strategy = {ctx.strategy_id: ctx for ctx in portfolio.strategies}
     for sid_str, bucket in (payload.get("positions") or {}).items():
@@ -399,8 +400,9 @@ def schema_fingerprint(dividend_mode: str) -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
-def params_hash(ps, dividend_mode: str, db: Optional[Session] = None) -> str:
-    return params_fingerprint(ps, dividend_mode, db)["hash"]
+def params_hash(ps, dividend_mode: str, db: Optional[Session] = None,
+                baseline: Optional[dict] = None) -> str:
+    return params_fingerprint(ps, dividend_mode, db, baseline=baseline)["hash"]
 
 
 # 参数指纹覆盖三类口径来源（任一变化都会让续跑与当前配置不一致）：
@@ -426,6 +428,7 @@ _FP_PART_LABELS = {
     "params": "组合级参数（资金/费率/滑点/复权模式等）",
     "strategies": "策略参数/公式/角色/周期或策略增删",
     "pool": "股票池成分代码",
+    "baseline": "资金基准（baseline_version / baseline_value）",
 }
 
 # schema_parts 各分项的中文名（checkpoint 作废日志用）
@@ -490,14 +493,40 @@ def _pool_fp(ps, db: Optional[Session]) -> dict:
     return out
 
 
+def baseline_fingerprint(session_row) -> dict:
+    """资金基准指纹（2026-11-16 基准对齐）：baseline_version + baseline_value。
+
+    基准变更 → ``params_fingerprint`` 的 sections["baseline"] 变 → checkpoint
+    作废，防旧 checkpoint 的 initial_capital/seam 把新基准覆盖回去。
+    baseline_value 为空时回退 live_capital（旧会话尚无 baseline_value）。
+    """
+    if session_row is None:
+        return {"baseline_version": 0, "baseline_value": None}
+    value = getattr(session_row, "baseline_value", None)
+    if value is None:
+        value = getattr(session_row, "live_capital", None)
+    return {
+        "baseline_version": int(
+            getattr(session_row, "baseline_version", 0) or 0),
+        "baseline_value": _fp_value(value),
+    }
+
+
 def params_fingerprint(ps, dividend_mode: str,
-                       db: Optional[Session] = None) -> dict:
-    """参数指纹：总体哈希 + 分项哈希（用于定位「哪一类变化」作废 checkpoint）。"""
+                       db: Optional[Session] = None,
+                       baseline: Optional[dict] = None) -> dict:
+    """参数指纹：总体哈希 + 分项哈希（用于定位「哪一类变化」作废 checkpoint）。
+
+    baseline（2026-11-16 资金基准对齐）：{"baseline_version": int,
+    "baseline_value": str|None}。基准变更 → 指纹变 → checkpoint 作废重建，
+    避免旧 checkpoint 的 initial_capital/seam 覆盖新基准。
+    """
     sections = {
         "params": build_params_snapshot(ps, dividend_mode=dividend_mode),
         "strategies": json.dumps(
             _strategy_fp_rows(ps, db), sort_keys=True, ensure_ascii=False),
         "pool": json.dumps(_pool_fp(ps, db), sort_keys=True, ensure_ascii=False),
+        "baseline": json.dumps(baseline or {}, sort_keys=True, ensure_ascii=False),
     }
     payload = json.dumps(sections, sort_keys=True, ensure_ascii=False)
     return {
@@ -659,8 +688,14 @@ def _checkpoint_done(ckpt, today: date) -> bool:
 
 
 # ---------------------------------------------------------------- 接缝锚定
-def capture_seam(db: Session, session_id: int, engine, today: Optional[date] = None) -> None:
-    """实盘启动（recover 之后）写入接缝日与起账状态；已写定则不覆盖。"""
+def capture_seam(db: Session, session_id: int, engine, today: Optional[date] = None,
+                 force: bool = False,
+                 portfolio_id: Optional[int] = None) -> None:
+    """实盘启动（recover 之后）写入接缝日与起账状态；已写定则不覆盖。
+
+    force=True（资金基准重置用）时覆盖已写定的接缝；portfolio_id 限定只重设
+    指定组合的接缝（None=全部）。
+    """
     today = today or datetime.now(_TZ).date()
     links = (
         db.query(LiveSessionPortfolio)
@@ -727,7 +762,9 @@ def capture_seam(db: Session, session_id: int, engine, today: Optional[date] = N
         )
     changed = False
     for link in links:
-        if link.seam_date is not None:
+        if portfolio_id is not None and link.portfolio_strategy_id != portfolio_id:
+            continue
+        if link.seam_date is not None and not force:
             continue
         port = ports.get(link.portfolio_strategy_id)
         if port is None:
@@ -1145,7 +1182,10 @@ def _run_incremental_locked(db: Session, session_id: int,
 
     dividend_mode = cfg.get("dividend_mode", "dual")
     accounting_mode, signal_mode = _resolve_modes(dividend_mode)
-    fp = params_fingerprint(ps, dividend_mode, db)
+    # 资金基准指纹（2026-11-16）：基准变更会让 checkpoint 作废重建，防旧基准覆盖。
+    session_row = db.query(LiveSession).filter_by(id=session_id).first()
+    baseline_fp = baseline_fingerprint(session_row)
+    fp = params_fingerprint(ps, dividend_mode, db, baseline=baseline_fp)
     want_params_hash = fp["hash"]
     want_schema_fp = schema_fingerprint(dividend_mode)
 

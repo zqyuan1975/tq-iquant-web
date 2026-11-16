@@ -37,7 +37,8 @@ from core.db import SessionLocal
 from core.models import (
     LiveSession, LiveSessionPortfolio, PortfolioStrategy, Strategy,
     StockPoolStock, Formula, FormulaSignal, LiveOrder, LiveTrade, LiveDecisionEvent,
-    LiveSignal, LiveAccountSnapshot, LiveCashFlow,
+    LiveSignal, LiveAccountSnapshot, LiveCashFlow, LiveBaselineReset,
+    IncrementalBacktestCheckpoint,
 )
 from core.engine.portfolio_builder import assemble_portfolio
 try:
@@ -214,6 +215,24 @@ def live_sell_scope() -> str:
     return "full"
 
 
+def _pct_or_none(value) -> Optional[Decimal]:
+    """比例型护栏字段归一：None / 0 / 负数 / 非数字 → None（不设限）。
+
+    ``portfolio_strategies.max_single_position_pct`` / ``min_cash_reserve_pct``
+    的默认语义：「NULL 或 0 一律视为不设限」，保证未填写时与接线前行为逐字一致。
+    超出 (0, 1] 的值按原值使用（>1 等价不约束，但保留用户填写值便于审计）。
+    """
+    if value is None:
+        return None
+    try:
+        dec = Decimal(str(value))
+    except (TypeError, ValueError, ArithmeticError):
+        return None
+    if not dec.is_finite() or dec <= 0:
+        return None
+    return dec
+
+
 #: 实盘交易引擎：key -> (渠道标识, 中文名)。渠道标识是 Core 状态机/前端识别的通道名。
 #: 四引擎：QMT 通道 / 掘金量化桥 / 通达信 TQ / 同花顺 UI 自动化。
 ENGINES_META = {
@@ -247,6 +266,60 @@ def session_engine(session) -> str:
     """
     explicit = getattr(session, "engine", None)
     return explicit if explicit in ENGINES_META else default_engine()
+
+
+# ---------------------------------------------------------------------------
+# 资金基准（2026-11-16 实盘资金基准对齐）
+# ---------------------------------------------------------------------------
+
+def session_baseline_value(session_row) -> Optional[float]:
+    """会话资金基准：baseline_value 优先，回退旧列 live_capital。"""
+    if session_row is None:
+        return None
+    for attr in ("baseline_value", "live_capital"):
+        value = getattr(session_row, attr, None)
+        if value is None:
+            continue
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+def latest_account_total_asset(db: Session, session_id: int) -> Optional[float]:
+    """最近一次账户快照的真实总资产（供「只缩不放」的 min 截断与重置锚点）。"""
+    try:
+        row = (
+            db.query(LiveAccountSnapshot)
+            .filter(LiveAccountSnapshot.live_session_id == session_id)
+            .order_by(LiveAccountSnapshot.id.desc())
+            .first()
+        )
+    except Exception:  # noqa: BLE001 — 取不到按无数据，不阻断启动
+        return None
+    if row is None:
+        return None
+    try:
+        total = float(row.total_asset or 0)
+    except (TypeError, ValueError):
+        return None
+    return total if total > 0 else None
+
+
+def resolve_effective_baseline(db: Session, session_row, session_id: int) -> Optional[float]:
+    """起账基准 = min(填写基准, 真实总资产)——只缩不放。
+
+    填写值超过真实总资产时，起账按真实总资产截断（写入侧另由 API 拒绝）；
+    无填写值/无真实快照时返回填写值（可能为 None → 沿用各组合 initial_capital）。
+    """
+    value = session_baseline_value(session_row)
+    if value is None or value <= 0:
+        return None
+    total = latest_account_total_asset(db, session_id)
+    if total is not None and total < value:
+        return total
+    return value
 
 
 def make_dispatcher(engine: str, mode: str = "simulation", session_id: int = 0):
@@ -877,11 +950,12 @@ def build_engine(
         .filter(LiveSessionPortfolio.session_id == session_id)
         .all()
     )
-    # 会话级「真实账户总资产」：只作真实侧总闸的兜底上限（桥快照缺失时），
-    # **不**再覆盖各组合起账——分账不分池（2026-11-11 P1-①）：每个组合虚拟现金
-    # 起账 = 该组合配置的 initial_capital，与回测的单组合资金口径一致。
+    # 会话级「资金基准（元）」：2026-11-16 起 = 真实账户总资产口径，只缩不放。
+    # 起账时按各组合 initial_capital 占比切分给各组合（独占模型下只缩到
+    # 「会话内多组合」；单组合=整额）。取不到填写值时沿用各组合 initial_capital。
     session_row = db.query(LiveSession).filter(LiveSession.id == session_id).first()
     live_capital = getattr(session_row, "live_capital", None)
+    baseline_effective = resolve_effective_baseline(db, session_row, session_id)
     # 外部信号注入（0011）：参数优先；未传回退 session.signal_file_path（会话级配置）
     if signal_file_path is None and session_row is not None:
         signal_file_path = getattr(session_row, "signal_file_path", None)
@@ -908,6 +982,8 @@ def build_engine(
     # 卖出范围口径（config.tq_trade.live_sell_scope）：full=整仓卖（默认，旧行为），
     # platform_only=只卖平台自己买入的部分（外部手工仓不代卖）
     sell_scope = live_sell_scope()
+    # (port, 尽分权重=该组合 initial_capital)：会话基准按此占比切分
+    baseline_weights: list = []
     for link in links:
         ps = db.query(PortfolioStrategy).filter_by(id=link.portfolio_strategy_id).first()
         if ps is None:
@@ -917,11 +993,25 @@ def build_engine(
             ps, strategies, db,
             sell_scope=sell_scope,
         )
+        # 单票集中度上限 / 现金留存下限（2026-11-16 接线，**仅实盘**）：
+        # 两列在 portfolio_strategies 上，NULL 或 0 视为不设限（与接线前逐字一致）。
+        # 回测侧口径冻结——assemble_portfolio 不读这两列，回测调用点也不注入，
+        # 因此历史回测结果不会随填写值漂移。实际约束在
+        # LiveEngine._allocate_batch_buys → _apply_allocation_caps 内执行。
+        port.max_single_position_pct = _pct_or_none(
+            getattr(ps, "max_single_position_pct", None))
+        port.min_cash_reserve_pct = _pct_or_none(
+            getattr(ps, "min_cash_reserve_pct", None))
+        try:
+            weight = float(ps.initial_capital or 0)
+        except (TypeError, ValueError):
+            weight = 0.0
         logger.info(
-            "组合 %s 虚拟起账资金 %s（会话真实账户总资产 %s，仅作总闸上限）",
-            ps.id, ps.initial_capital, live_capital,
+            "组合 %s 起账权重 %s（会话资金基准 %s，按占比切分）",
+            ps.id, weight, baseline_effective,
         )
         portfolios.append(port)
+        baseline_weights.append((port, weight))
         benchmark_codes[ps.id] = getattr(ps, "benchmark_index", None) or DEFAULT_BENCHMARK_CODE
         pool_codes = resolve_stock_codes(db, ps.id)
         stock_codes.update(pool_codes)
@@ -933,6 +1023,38 @@ def build_engine(
             # 累加 (code, period) -> formula_id（跨组合跨策略，同 key 收集所有公式）
             for code in pool_codes:
                 code_period_formula_ids.setdefault((code, strat.period), set()).add(strat.formula_id)
+
+    # 资金基准切分（2026-11-16）：会话基准 = 各组合起账资金之和，按各自
+    # initial_capital 占比分配（最大余数法落到分，最后一组承接余数）。
+    # 只改内存起账，不回写 portfolio_strategies.initial_capital（那是策略配置/
+    # 回测口径；实盘基准是会话级覆盖）。取不到基准时保持旧行为。
+    if baseline_effective is not None and baseline_weights:
+        base_dec = Decimal(str(baseline_effective)).quantize(Decimal("0.01"))
+        total_weight = sum(w for _, w in baseline_weights)
+        remaining = base_dec
+        for idx, (port, weight) in enumerate(baseline_weights):
+            last = idx == len(baseline_weights) - 1
+            if total_weight > 0:
+                if last:
+                    amt = remaining
+                else:
+                    amt = (base_dec * Decimal(str(weight)) / Decimal(str(total_weight))
+                           ).quantize(Decimal("0.01"))
+                    if amt > remaining:
+                        amt = remaining
+                    remaining -= amt
+            else:
+                amt = (base_dec / Decimal(len(baseline_weights))).quantize(Decimal("0.01"))
+                if last:
+                    amt = remaining
+                remaining -= amt
+            port.account.initial_capital = amt
+            port.account.cash = amt
+        logger.info(
+            "资金基准切分：会话 #%s 基准 %s → 各组起账 %s",
+            session_id, base_dec,
+            [str(p.account.initial_capital) for p, _ in baseline_weights],
+        )
 
     # 批量查 Formula，建 {strategy_id: formula_name} + {formula_name: formula_count}
     # formula_count（Q4 决策4）为公式级注入根数：实盘注入 count 来自该字段，非全局 200。
@@ -1086,8 +1208,10 @@ def build_engine(
         # 09:31 deferred 放行「保证成交」开关（默认关=首根 open 限价）
         deferred_release_ensure_fill=bool(
             _tq_cfg.get("deferred_release_ensure_fill", False)),
-        # 真实账户总资产（live_capital）：只作真实侧总闸兜底上限，不覆盖组合起账
-        account_total_capital=live_capital,
+        # 真实账户总资产口径的资金基准（baseline_value/live_capital，min 截断后）：
+        # 只作真实侧总闸兜底上限，不重复覆盖组合起账（起账已按占比切分）。
+        account_total_capital=(
+            baseline_effective if baseline_effective is not None else live_capital),
     )
     # 桥慢响应告警接引擎事件流（risk/bridge_slow，dispatcher 侧已按 endpoint
     # 冷却去重）；仅 HTTP 桥 dispatcher 有 on_slow 钩子，其它通道不受影响。
@@ -1142,6 +1266,24 @@ def list_sessions(db: Session, engines: Optional[Dict[int, LiveEngine]] = None) 
             "engine_running": s.id in engines,
             "started_at": s.started_at,
             "stopped_at": s.stopped_at,
+            # C4（2026-11-16）：账户键 + 占用起始时间，供前端做「引擎/账户占用」
+            # 置灰与多账户并行横幅聚合（running/stopping 才算占用，否则 None）。
+            "account_key": getattr(s, "account_key", None),
+            "account_key_source": getattr(s, "account_key_source", None),
+            "occupied_since": (
+                _occupied_since(s).isoformat()
+                if s.status in ("running", "stopping") and _occupied_since(s)
+                else None
+            ),
+            # 资金基准（真实总资产口径）：baseline_value 优先，回退旧列 live_capital
+            "baseline_mode": getattr(s, "baseline_mode", None),
+            "baseline_value": (
+                float(getattr(s, "baseline_value", None))
+                if getattr(s, "baseline_value", None) is not None
+                else (float(getattr(s, "live_capital", None))
+                      if getattr(s, "live_capital", None) is not None else None)
+            ),
+            "baseline_version": int(getattr(s, "baseline_version", 0) or 0),
             "portfolio_ids": sorted(p["portfolio_id"] for p in by_session.get(s.id, [])),
             "portfolios": by_session.get(s.id, []),
             # I-7（audit）：运行中引擎最近一次对账差异摘要；未运行（无引擎）为 []
@@ -1171,7 +1313,11 @@ def recover_stale_running_live_sessions(
     registry = ENGINES if engines is None else engines
     if registry:
         return 0
-    stale = db.query(LiveSession).filter(LiveSession.status == "running").all()
+    stale = (
+        db.query(LiveSession)
+        .filter(LiveSession.status.in_(("running", "stopping")))
+        .all()
+    )
     if not stale:
         return 0
     now = datetime.now()
@@ -1181,7 +1327,7 @@ def recover_stale_running_live_sessions(
     db.commit()
     for session in stale:
         logger.warning(
-            "启动恢复：实盘会话 #%s「%s」残留 running（引擎未随重启恢复，实际未运行），"
+            "启动恢复：实盘会话 #%s「%s」残留运行态（引擎未随重启恢复，实际未运行），"
             "已置 stopped；如需继续交易请在界面重新启动",
             session.id, session.name,
         )
@@ -1232,11 +1378,27 @@ def create_session(db: Session, data: dict, mode: str) -> dict:
     if signal_file_path is not None:
         signal_file_path = str(signal_file_path).strip() or None
     advance_close_enabled, advance_close_time = normalize_advance_close(data)
+    # 资金基准（2026-11-16）：live_capital 语义 = 实盘资金基准（真实总资产口径）。
+    # baseline_mode：total_asset=起账即用真实总资产（默认）/ manual=显式填写；
+    # 兼容旧叫法 adopt_actual（统一映射到 total_asset），不出现两套口径。
+    baseline_value = data.get("live_capital")
+    if baseline_value is None and data.get("baseline_value") is not None:
+        baseline_value = data.get("baseline_value")
+    baseline_mode = str(data.get("baseline_mode") or "").strip()
+    if baseline_mode == "adopt_actual":
+        baseline_mode = "total_asset"
+    if baseline_mode not in ("total_asset", "manual"):
+        baseline_mode = "manual" if baseline_value is not None else "total_asset"
     session = LiveSession(
         name=data["name"], mode=mode, status="stopped",
         engine=data.get("engine") or default_engine(),
         execution_mode=execution_mode,
-        live_capital=data.get("live_capital"),
+        live_capital=baseline_value,
+        baseline_mode=baseline_mode,
+        baseline_value=baseline_value,
+        baseline_set_at=(datetime.now() if baseline_value is not None else None),
+        baseline_version=0,
+        adopt_inherited_positions=bool(data.get("adopt_inherited_positions", True)),
         # 外部信号注入（0011）：None=不启用；非空=通达信条件预警输出文件路径
         signal_file_path=signal_file_path,
         # 14:50 提前收盘价（仅 1d）：默认关 + 14:51
@@ -1276,6 +1438,14 @@ def get_session(db: Session, session_id: int, engine: Optional[LiveEngine] = Non
         "execution_mode": session.execution_mode,
         # 会话级实盘资金基准：None=各组合用自身 initial_capital
         "live_capital": session.live_capital,
+        "baseline_mode": getattr(session, "baseline_mode", None),
+        "baseline_value": (
+            float(session.baseline_value)
+            if getattr(session, "baseline_value", None) is not None else None),
+        "baseline_version": int(getattr(session, "baseline_version", 0) or 0),
+        "baseline_set_at": getattr(session, "baseline_set_at", None),
+        "adopt_inherited_positions": bool(
+            getattr(session, "adopt_inherited_positions", True)),
         # 外部信号注入（0011）：None=不启用
         "signal_file_path": session.signal_file_path,
         # 14:50 提前收盘价（仅 1d）
@@ -1601,37 +1771,257 @@ def delete_session(db: Session, session_id: int, engines: Dict[int, LiveEngine])
 # start / stop 业务体
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# 并发约束（C1 引擎类型独占 / C2 账户独占 / C3 键鼠软拦 / C4 多账户并行）
+# ---------------------------------------------------------------------------
+
+#: 键鼠 UI 自动化引擎（tdx 走通达信交易窗口、ths 走 xiadan.exe）：同时启动有
+#: 误点风险，属「建议级」而非硬拦（默认软拦，config 可升级为硬拦）。
+KEYBOARD_ENGINES = ("tdx", "ths")
+
+#: stopping 中间态的最长租约（秒）：stop 先置 stopping 并在注册表保留，引擎
+#: stop() 收敛后才置 stopped；超过该时长仍未收敛视为僵尸，允许抢占。
+STOPPING_STALE_SECONDS = 120
+
+
+def _occupied_since(session) -> Optional[datetime]:
+    return getattr(session, "started_at", None) or getattr(session, "updated_at", None)
+
+
+def _is_stale_stopping(session) -> bool:
+    if getattr(session, "status", None) != "stopping":
+        return False
+    ts = getattr(session, "stopped_at", None) or getattr(session, "updated_at", None)
+    if ts is None:
+        return False
+    try:
+        return (datetime.now() - ts).total_seconds() > STOPPING_STALE_SECONDS
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _occupied_sessions(
+    db: Session,
+    engines: Dict[int, LiveEngine],
+    exclude_id: int,
+) -> Dict[int, LiveSession]:
+    """当前占用中的其它会话：内存注册表 ∪ DB status ∈ (running, stopping)。
+
+    为什么必须并入 DB：后端重启后注册表为空，但 DB 仍可能是 running/stopping；
+    以及 stop 已置 stopping、引擎正在异步收敛的窗口。只有 stopped 才释放占用。
+    stopping 超过 ``STOPPING_STALE_SECONDS`` 且无引擎 → 视为僵尸，置 stopped 释放。
+    """
+    occupied: Dict[int, LiveSession] = {}
+    rows = (
+        db.query(LiveSession)
+        .filter(LiveSession.status.in_(("running", "stopping")))
+        .all()
+    )
+    for row in rows:
+        if row.id == exclude_id:
+            continue
+        if row.id not in engines and _is_stale_stopping(row):
+            row.status = "stopped"
+            row.stopped_at = row.stopped_at or datetime.now()
+            db.commit()
+            logger.warning(
+                "实盘会话 #%s「%s」stopping 超 %ss 未收敛，强制释放占用",
+                row.id, row.name, STOPPING_STALE_SECONDS,
+            )
+            continue
+        occupied[row.id] = row
+    # 注册表里有、DB 尚未落到 running 的极短窗口也纳入占用
+    for sid in engines:
+        if sid == exclude_id or sid in occupied:
+            continue
+        row = db.query(LiveSession).filter(LiveSession.id == sid).first()
+        if row is not None:
+            occupied[sid] = row
+    return occupied
+
+
+def _occupied_payload(session) -> dict:
+    since = _occupied_since(session)
+    return {
+        "session_id": session.id,
+        "name": session.name,
+        "engine": session_engine(session),
+        "account_key": getattr(session, "account_key", None),
+        "account_key_source": getattr(session, "account_key_source", None),
+        "status": getattr(session, "status", None),
+        "since": since.isoformat() if since is not None else None,
+    }
+
+
 def _check_channel_conflict(
     db: Session,
     session: LiveSession,
     engines: Dict[int, LiveEngine],
-) -> Optional[Tuple[int, str]]:
-    """同引擎互斥（M1 多会话并行 + 账户全貌对齐安全约束）。
+) -> Optional[Tuple[int, str, dict]]:
+    """C1 引擎类型独占（硬，跨账号）：同一 engine 全平台最多一个 running。
 
-    同一引擎（=同一交易通道/同一真实账户）同时仅允许一个运行中会话：
-    - ths：UI 自动化独占键鼠；
-    - tdx/iquant：同引擎双会话 = 两套虚拟账本交易同一真实账户（双份记账/
-      互相吃单/快照对齐失真），一律 409；
-    - 跨引擎（ths+tdx+iquant 各一）可并行。同组合挂多会话=复制交易语义，
-      请用不同引擎，各会话独立虚拟账本（Per Portfolio）。
-
-    遍历注册表（_START_LOCK 临界区内，注册即运行）中的会话，任一同引擎
-    → 409 拒绝。返回 None 表示无冲突。
+    物理依据：每个 engine 背后只有一个本地入口——tdx=唯一通达信 TQ 客户端、
+    ths=唯一 xiadan.exe、iquant=8790 唯一 QMT 终端、goldminer=7801 唯一掘金终端。
+    同引擎双会话 = 两套虚拟账本交易同一真实账户（双份记账/互相吃单/快照失真），
+    跨账号也不可行（当前架构无多终端实例/多桥端口支持），故一律 409。
     """
     eng = session_engine(session)
-    for running_id in engines:
-        other = db.query(LiveSession).filter(LiveSession.id == running_id).first()
-        if other is not None and session_engine(other) == eng:
+    for other in _occupied_sessions(db, engines, session.id).values():
+        if session_engine(other) == eng:
             label = {
                 "ths": "同花顺通道键鼠独占",
-                "tdx": "通达信 TQ 账户独占（同引擎双会话会双份记账交易同一账户）",
-                "iquant": "QMT 通道账户独占",
+                "tdx": "通达信 TQ 通道独占",
+                "iquant": "QMT 通道独占",
+                "goldminer": "掘金通道独占",
             }.get(eng, "通道独占")
             return (
                 409,
-                "%s：会话 %d 正在使用，请先停止" % (label, running_id),
+                "%s（同一引擎全平台只允许一个运行中会话）：会话 %d「%s」正在运行，"
+                "请先停止该会话" % (label, other.id, other.name),
+                {
+                    "rule": "engine_exclusive",
+                    "engine": eng,
+                    "occupied_by": _occupied_payload(other),
+                },
             )
     return None
+
+
+def resolve_account_key(
+    engine_key: str,
+    dispatcher=None,
+    session=None,
+) -> Tuple[str, str]:
+    """解析会话的账户身份键 (key, source)。
+
+    - iquant/goldminer：桥 ``/ping`` 返回的 account（心跳成功时缓存到
+      ``dispatcher.last_ping``）；取不到再读 config（goldminer.account_id 等）。
+    - tdx：``tq_trade.account``；ths：``ths_ui.account``（如配置）。
+    - 都取不到 → 降级 ``engine:<key>``（同引擎即同账户，宁可多拦）。
+    """
+    source = "degraded"
+    account = ""
+    if engine_key in ("iquant", "goldminer"):
+        body = getattr(dispatcher, "last_ping", None) if dispatcher is not None else None
+        if isinstance(body, dict):
+            account = str(body.get("account") or body.get("account_id") or "").strip()
+        if account:
+            return "%s:%s" % (engine_key, account), "bridge"
+        cfg_section = "iquant_bridge" if engine_key == "iquant" else "goldminer"
+        cfg = load_config().get(cfg_section) or {}
+        if isinstance(cfg, dict):
+            account = str(cfg.get("account_id") or "").strip()
+        if account:
+            return "%s:%s" % (engine_key, account), "config"
+    elif engine_key == "tdx":
+        account = str(tq_trade_config().get("account") or "").strip()
+        if account:
+            return "tdx:%s" % account, "config"
+    elif engine_key == "ths":
+        ths = load_config().get("ths_ui") or {}
+        if isinstance(ths, dict):
+            account = str(ths.get("account") or "").strip()
+        if account:
+            return "ths:%s" % account, "config"
+    return "engine:%s" % engine_key, source
+
+
+def _check_account_conflict(
+    db: Session,
+    session: LiveSession,
+    engines: Dict[int, LiveEngine],
+    own_key: str,
+) -> Optional[Tuple[int, str, dict]]:
+    """C2 账户键独占（硬，跨引擎）：同一账户最多一个 running 会话。
+
+    其它会话的 account_key 缺失时降级为该会话的 ``engine:<key>``（宁可多拦）。
+    """
+    if not own_key:
+        return None
+    for other in _occupied_sessions(db, engines, session.id).values():
+        other_key = getattr(other, "account_key", None) or (
+            "engine:%s" % session_engine(other))
+        if other_key == own_key:
+            return (
+                409,
+                "账户独占：账户 %s 已被会话 %d「%s」占用（%s），请先停止该会话"
+                % (own_key, other.id, other.name, session_engine(other)),
+                {
+                    "rule": "account_exclusive",
+                    "account_key": own_key,
+                    "occupied_by": _occupied_payload(other),
+                },
+            )
+    return None
+
+
+def _check_keyboard_conflict(
+    db: Session,
+    session: LiveSession,
+    engines: Dict[int, LiveEngine],
+    ack_keyboard_risk: bool,
+) -> Optional[Tuple[int, str, dict]]:
+    """C3 键鼠类互斥（tdx / ths）：默认软拦（告警+二次确认），可配置升级硬拦。
+
+    两者都是键鼠 UI 自动化，同时启动有误点风险，但底层已有
+    ``win_dialog_scope`` 的 UI 自动化互斥锁防「同时操作」；真正残留的是
+    「人看错窗口点错」。默认不阻断，仅要求前端二次确认（ack_keyboard_risk）；
+    ``tq_trade.keyboard_conflict_hard_block=true`` 时升级为 409 硬拦。
+    """
+    eng = session_engine(session)
+    if eng not in KEYBOARD_ENGINES:
+        return None
+    peer = None
+    for other in _occupied_sessions(db, engines, session.id).values():
+        other_eng = session_engine(other)
+        if other_eng in KEYBOARD_ENGINES and other_eng != eng:
+            peer = other
+            break
+    if peer is None:
+        return None
+    hard_block = bool(
+        (load_config().get("tq_trade") or {}).get(
+            "keyboard_conflict_hard_block", False))
+    payload = {
+        "rule": "keyboard_exclusive",
+        "engine": eng,
+        "peer_engine": session_engine(peer),
+        "occupied_by": _occupied_payload(peer),
+        "hard_block": hard_block,
+    }
+    message = (
+        "键鼠类通道互斥提醒：会话 %d「%s」（%s）正在运行，同时启动 %s 有误点风险，"
+        "建议先停止一个，或在多设备上分别操作"
+        % (peer.id, peer.name, session_engine(peer), eng)
+    )
+    if hard_block:
+        return 409, message, payload
+    if ack_keyboard_risk:
+        logger.warning("键鼠互斥已确认放行：%s", message)
+        return None
+    logger.warning("%s（未确认，软拦放行）", message)
+    return None
+
+
+def recommended_channel_warnings(
+    db: Session,
+    session: LiveSession,
+    engines: Dict[int, LiveEngine],
+) -> list:
+    """C4 多账户并行提醒（不阻断）：同时运行多个不同账户的会话时给出建议。"""
+    occupied = _occupied_sessions(db, engines, session.id)
+    accounts = set()
+    for other in occupied.values():
+        key = getattr(other, "account_key", None) or (
+            "engine:%s" % session_engine(other))
+        accounts.add(key)
+    if len(accounts) <= 1:
+        return []
+    return [
+        "当前有 %d 个不同账户的会话并行运行（%s）。建议尽量在多台设备上分别操作，"
+        "避免在同一个终端窗口误操作到其它账户。"
+        % (len(accounts), "、".join(sorted(accounts)))
+    ]
 
 
 def start_session(
@@ -1641,7 +2031,8 @@ def start_session(
     mode: str,
     db_session_factory=SessionLocal,
     dispatcher_cls=None,
-) -> Tuple[Optional[LiveEngine], Optional[LiveSession], Optional[Tuple[int, str]]]:
+    ack_keyboard_risk: bool = False,
+) -> Tuple[Optional[LiveEngine], Optional[LiveSession], Optional[Tuple]]:
     """启动 session 的业务体。
 
     返回 (engine, session, error)：
@@ -1755,6 +2146,28 @@ def start_session(
     preflight_err = preflight_signal_config(db, session_id, execution_mode)
     if preflight_err is not None:
         return None, session, preflight_err
+    # C2 账户键独占（硬，跨引擎）：桥心跳成功后账户号已可确定，按「C1 引擎类型
+    # → C2 账户键」顺序校验（C1 已在上方完成）。取不到账号时降级 engine:<key>。
+    own_key, own_source = resolve_account_key(
+        session_engine(session), engine.dispatcher)
+    account_conflict = _check_account_conflict(db, session, engines, own_key)
+    if account_conflict is not None:
+        return None, session, account_conflict
+    # C3 键鼠类互斥（tdx/ths）：默认软拦（未确认也放行，仅告警）；ack_keyboard_risk
+    # 表示前端已二次确认；config 可升级为硬拦（409）。
+    keyboard_conflict = _check_keyboard_conflict(
+        db, session, engines, ack_keyboard_risk)
+    if keyboard_conflict is not None:
+        return None, session, keyboard_conflict
+    # 账户键落库（路由 commit 时随 status=running 一并持久化），供后续会话判定。
+    session.account_key = own_key
+    session.account_key_source = own_source
+    # C4 多账户并行提醒（不阻断）：随启动结果回传给前端做横幅。
+    try:
+        setattr(engine, "start_warnings",
+                recommended_channel_warnings(db, session, engines))
+    except Exception:  # noqa: BLE001
+        setattr(engine, "start_warnings", [])
     if execution_mode != "alert":
         # 重启恢复：从 live_trades 重放虚拟持仓/虚拟现金（alert 无下单/成交）
         engine.recover(db)
@@ -1784,7 +2197,10 @@ def stop_session(
     if not session:
         return None
     engine = engines.pop(session_id, None)
-    session.status = "stopped"
+    # stopping 中间态（2026-11-16）：有引擎时先置 stopping（仍算占用，防「刚停就
+    # 启另一会话」双开），等路由 asyncio 任务里 engine.stop() 收敛后再置 stopped；
+    # 无引擎（已在停止/未运行）直接 stopped。只有 stopped 才释放 C1/C2 占用。
+    session.status = "stopping" if engine is not None else "stopped"
     session.stopped_at = datetime.now()
     db.commit()
     # 会话离开 ENGINES 后 watchdog 再也扫不到它：显式清监控态，否则停止前的
@@ -1797,6 +2213,288 @@ def stop_session(
     except Exception:  # noqa: BLE001 — 观测清理失败不得影响停会话
         logger.exception("clear watchdog state failed (session %s)", session_id)
     return engine
+
+
+def finalize_stopped(session_id: int, db_session_factory=SessionLocal) -> None:
+    """引擎 stop() 收敛后的收尾：stopping → stopped，释放 C1/C2 占用。
+
+    由路由的 asyncio 任务在 ``await engine.stop()``（含异常）后调用；用独立
+    session，避免请求线程的 Session 已关闭。幂等：只处理 stopping。
+    """
+    db = db_session_factory()
+    try:
+        session = db.query(LiveSession).filter(LiveSession.id == session_id).first()
+        if session is not None and session.status == "stopping":
+            session.status = "stopped"
+            session.stopped_at = session.stopped_at or datetime.now()
+            db.commit()
+    except Exception:  # noqa: BLE001 — 收尾失败不得抛给调用方（下次启动会兜底）
+        logger.exception("finalize_stopped failed (session %s)", session_id)
+        db.rollback()
+    finally:
+        db.close()
+
+
+def _baseline_reset_window_allowed(now: datetime) -> bool:
+    """资金基准重置时段闸：盘中（含集合竞价与午盘）禁用，收盘后/盘前允许。
+
+    09:15–11:30、13:00–15:00 为不可重置窗口（含集合竞价 09:15–09:25 与连续竞价），
+    其余时段（含收盘后）允许。非交易日按时间窗判定即可，无副作用。
+    """
+    minutes = now.hour * 60 + now.minute
+    return not (
+        (9 * 60 + 15 <= minutes < 11 * 60 + 30)
+        or (13 * 60 <= minutes < 15 * 60)
+    )
+
+
+def reset_baseline(
+    db: Session,
+    session_id: int,
+    portfolio_id: int,
+    value,
+    engines: Optional[Dict[int, LiveEngine]] = None,
+    note: Optional[str] = None,
+) -> Tuple[bool, Optional[Tuple]]:
+    """收盘后重置资金基准 + 成套重锚风控锚点（2026-11-16）。
+
+    规则（方案 §3.3/§3.4）：
+    - 基准 = 真实账户总资产口径，**只缩不放**：填写值 > 真实总资产 → 400 拒绝；
+      未填写 → 取当日真实总资产。
+    - 成套重锚 ``peak_value`` / ``prev_close_value`` / ``_last_bar_total_value`` /
+      ``_last_bar_date``（DB risk_state 与运行中内存同时更新）。
+    - **不清零** ``circuit_breaker_count``、**不解锁** manual_recovery、不改暂停/
+      熔断挂起标志——只换基准，不伪装成「恢复」。
+    - **绝不**写 ``live_cash_flows`` / 调 ``apply_cash_flow``（会污染
+      ``external_net_inflow`` 与 ``risk_equity``）；只调整基准与审计。
+    - 复位真实-虚拟偏差告警（``_equity_deviation_warned``），让新基准重新比对。
+    - 基准版本 +1，旧 checkpoint 删除、接缝重设，防止旧 checkpoint 覆盖新基准。
+    """
+    session = db.query(LiveSession).filter(LiveSession.id == session_id).first()
+    if session is None:
+        return False, (404, "资源不存在")
+    now = now_shanghai()
+    if not _baseline_reset_window_allowed(now):
+        return False, (403, "盘中禁止重置资金基准：请收盘后（15:00 之后）再操作")
+    link = (
+        db.query(LiveSessionPortfolio)
+        .filter(
+            LiveSessionPortfolio.session_id == session_id,
+            LiveSessionPortfolio.portfolio_strategy_id == portfolio_id,
+        )
+        .first()
+    )
+    if link is None:
+        return False, (404, "会话未关联该组合")
+    total = latest_account_total_asset(db, session_id)
+    if value is not None:
+        try:
+            new_base = Decimal(str(value)).quantize(Decimal("0.01"))
+        except (ArithmeticError, TypeError, ValueError):
+            return False, (400, "资金基准须为数字")
+        if new_base <= 0:
+            return False, (400, "资金基准须大于 0")
+        if total is not None:
+            cap = Decimal(str(total)).quantize(Decimal("0.01"))
+            if new_base > cap:
+                return False, (
+                    400,
+                    "资金基准只缩不放：填写值 %s 超过真实总资产 %s，请填写 ≤ %s 的金额"
+                    % (new_base, cap, cap),
+                )
+    else:
+        if total is None:
+            return False, (
+                400, "取不到真实总资产：请显式填写资金基准（≤ 真实总资产）")
+        new_base = Decimal(str(total)).quantize(Decimal("0.01"))
+
+    # 当前净值：运行中取组合 risk_equity；否则退真实总资产/新基准。
+    engine = (engines or {}).get(session_id)
+    port = None
+    if engine is not None:
+        for p in (getattr(engine, "portfolios", None) or []):
+            if getattr(p, "portfolio_id", None) == portfolio_id:
+                port = p
+                break
+    cur_equity = None
+    if port is not None:
+        try:
+            cur_equity = Decimal(str(port.risk_equity())).quantize(Decimal("0.01"))
+        except Exception:  # noqa: BLE001
+            cur_equity = None
+    if cur_equity is None and total is not None:
+        cur_equity = Decimal(str(total)).quantize(Decimal("0.01"))
+    if cur_equity is None:
+        cur_equity = new_base
+
+    old_base = session_baseline_value(session)
+    old_state: dict = {}
+    try:
+        old_state = json.loads(link.risk_state) if link.risk_state else {}
+    except (TypeError, ValueError):
+        old_state = {}
+    if not isinstance(old_state, dict):
+        old_state = {}
+    old_peak = old_state.get("peak_value")
+    old_prev = old_state.get("prev_close_value")
+    old_seam_date = link.seam_date
+
+    # 成套锚点：只更新四个基准值，暂停/熔断标志与触发日原样保留。
+    new_state = dict(old_state)
+    new_state.setdefault("schema", 2)
+    new_state["peak_value"] = str(cur_equity)
+    new_state["prev_close_value"] = str(cur_equity)
+    new_state["last_bar_total_value"] = str(cur_equity)
+    new_state["last_bar_date"] = now.date().isoformat()
+    link.risk_state = json.dumps(new_state, ensure_ascii=False)
+
+    # 运行中同步内存锚点 + 复位偏差告警，避免重启前继续用旧峰值/旧昨收。
+    if port is not None:
+        rm = getattr(port, "risk_manager", None)
+        if rm is not None:
+            rm.peak_value = cur_equity
+            rm.prev_close_value = cur_equity
+            rm._last_bar_total_value = cur_equity
+            rm._last_bar_date = now.date()
+        try:
+            engine._equity_deviation_warned = False
+        except Exception:  # noqa: BLE001
+            pass
+
+    # 会话基准（live_capital 兼容列同步写，语义 = 实盘资金基准）。
+    session.baseline_value = new_base
+    session.live_capital = new_base
+    session.baseline_mode = "manual" if value is not None else "total_asset"
+    session.baseline_set_at = now
+    session.baseline_version = int(session.baseline_version or 0) + 1
+
+    # 顺延单打上基准版本（保留信号原始目标量）；数量/价格不动——放行时
+    # _allocate_batch_buys 会按真实可用动态比例缩量。
+    deferred = (
+        db.query(LiveOrder)
+        .filter(
+            LiveOrder.live_session_id == session_id,
+            LiveOrder.portfolio_strategy_id == portfolio_id,
+            LiveOrder.status == "deferred",
+        )
+        .all()
+    )
+    for order in deferred:
+        if order.orig_quantity is None:
+            order.orig_quantity = order.quantity
+        order.baseline_version = session.baseline_version
+
+    # 旧 checkpoint 删除 + 接缝重设：确保增量回测不会把新基准覆盖回去。
+    (
+        db.query(IncrementalBacktestCheckpoint)
+        .filter(
+            IncrementalBacktestCheckpoint.session_id == session_id,
+            IncrementalBacktestCheckpoint.portfolio_strategy_id == portfolio_id,
+        )
+        .delete(synchronize_session=False)
+    )
+    new_seam_date = now.date().isoformat()
+    if port is not None:
+        try:
+            from core.services.incremental_backtest import capture_seam
+            capture_seam(db, session_id, engine, today=now.date(),
+                         force=True, portfolio_id=portfolio_id)
+        except Exception:  # noqa: BLE001 — 接缝失败不阻断基准重置
+            logger.exception("reset_baseline capture_seam failed (session %s)", session_id)
+    else:
+        # 未运行：清空接缝，下次启动 recover 后由 capture_seam 重新写定。
+        link.seam_date = None
+        link.seam_cash = None
+        link.seam_positions_json = None
+        link.seam_trade_cursor = 0
+        new_seam_date = None
+
+    db.add(LiveBaselineReset(
+        live_session_id=session_id,
+        portfolio_strategy_id=portfolio_id,
+        old_baseline=Decimal(str(old_base)).quantize(Decimal("0.01")) if old_base else None,
+        new_baseline=new_base,
+        old_peak=Decimal(str(old_peak)) if old_peak is not None else None,
+        new_peak=cur_equity,
+        old_prev_close=Decimal(str(old_prev)) if old_prev is not None else None,
+        new_prev_close=cur_equity,
+        old_seam_date=old_seam_date,
+        new_seam_date=new_seam_date,
+        baseline_version=session.baseline_version,
+        note=note,
+    ))
+    db.commit()
+    logger.info(
+        "资金基准重置：会话 #%s 组合 #%s 基准 %s → %s，锚点重锚到 %s（版本 %s）",
+        session_id, portfolio_id, old_base, new_base, cur_equity,
+        session.baseline_version,
+    )
+    return True, None
+
+
+def account_preview_by_engine(
+    db: Session,
+    engine_key: str,
+) -> Tuple[Optional[dict], Optional[Tuple]]:
+    """A7 资金基准预览（GET /api/live/account-preview?engine=）。
+
+    优先实时探测所选通道的账户资产（桥 /account、通达信 query_stock_asset、
+    同花顺资金标签）；探测失败回退该引擎最近一次账户快照。返回
+    ``{engine,total_asset,available,captured_at,source}``，只读、不下单、不改账。
+    """
+    if engine_key not in ENGINES_META:
+        return None, (400, "engine 非法，仅支持 %s" % " / ".join(ENGINES_META))
+    probe_error = ""
+    try:
+        dispatcher = make_dispatcher(engine_key, "simulation", 0)
+        if engine_key == "ths":
+            rows = dispatcher.get_account()
+            row = rows[0] if isinstance(rows, list) and rows else {}
+        else:
+            row = dispatcher.get_asset() or {}
+        total = row.get("total_asset")
+        if total is not None:
+            available = row.get("available")
+            return {
+                "engine": engine_key,
+                "total_asset": float(total),
+                "available": float(available) if available is not None else None,
+                "captured_at": now_shanghai().isoformat(),
+                "source": "live",
+            }, None
+        probe_error = "通道未返回账户资产（客户端未登录/桥未运行）"
+    except Exception as exc:  # noqa: BLE001 — 预览失败回退快照，不抛给前端
+        probe_error = str(exc) or exc.__class__.__name__
+
+    # 回退：该引擎最近一次会话的账户快照（事后查看/盘后预览）。
+    sessions = (
+        db.query(LiveSession)
+        .filter(LiveSession.engine == engine_key)
+        .order_by(LiveSession.id.desc())
+        .all()
+    )
+    for session in sessions:
+        snap = (
+            db.query(LiveAccountSnapshot)
+            .filter(LiveAccountSnapshot.live_session_id == session.id)
+            .order_by(LiveAccountSnapshot.id.desc())
+            .first()
+        )
+        if snap is None:
+            continue
+        return {
+            "engine": engine_key,
+            "total_asset": (
+                float(snap.total_asset) if snap.total_asset is not None else None),
+            "available": (
+                float(snap.available_cash)
+                if getattr(snap, "available_cash", None) is not None else None),
+            "captured_at": (
+                snap.captured_at.isoformat() if snap.captured_at else None),
+            "source": "snapshot",
+            "warning": probe_error,
+        }, None
+    return None, (503, "取不到账户资产：%s" % (probe_error or "无可用数据"))
 
 
 # ---------------------------------------------------------------------------

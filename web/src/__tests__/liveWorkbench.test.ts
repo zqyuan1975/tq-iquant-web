@@ -5,6 +5,10 @@ import {
   upsertPositionRows, positionHistoryToRows, prependCapped, positionRowKey,
   parseBeijingTime, beijingDayKey, filterRowsByRange, summarizeDecisionRows,
   rangeStartTs, tradeDayLabel,
+  isSessionActive, resolvedSessionEngine, engineOccupants, engineOccupiedText,
+  multiAccountBannerText, keyboardConflictOpponents, parseStartConflict,
+  baselineResetAllowed, shortAccountKey, formatMoney2, BASELINE_RESET_BLOCKED_REASON,
+  type SessionOccupancy,
 } from '../utils/liveWorkbench'
 
 describe('liveWorkbench', () => {
@@ -324,6 +328,152 @@ describe('liveWorkbench', () => {
       expect(summarizeDecisionRows(decRows, filterRowsByRange([oldOrder], 'today', now))[0].filled_count).toBe(0)
       // 全部区间：会计入
       expect(summarizeDecisionRows(decRows, filterRowsByRange([oldOrder], 'all', now))[0].filled_count).toBe(1)
+    })
+  })
+
+  // ---- 实盘并发约束（C1/C2/C3/C4）与资金基准重置窗口 ----
+
+  const session = (over: Record<string, any> = {}) => ({
+    id: 1, name: 'S1', mode: 'live', status: 'running', engine: 'tdx',
+    started_at: '2026-11-16T09:15:00', portfolio_ids: [], ...over,
+  }) as any
+
+  describe('isSessionActive / engineOccupants', () => {
+    it('running/stopping 视为占用，stopped 释放', () => {
+      expect(isSessionActive({ status: 'running' })).toBe(true)
+      expect(isSessionActive({ status: 'stopping' })).toBe(true)
+      expect(isSessionActive({ status: 'stopped' })).toBe(false)
+    })
+
+    it('老数据 engine 缺省 → iquant；占用集合只含占用中会话', () => {
+      expect(resolvedSessionEngine(session({ engine: undefined }))).toBe('iquant')
+      const occ = engineOccupants([
+        session({ id: 3, name: 'TDX 主策略', status: 'running', engine: 'tdx' }),
+        session({ id: 4, name: '已停', status: 'stopped', engine: 'ths' }),
+        session({ id: 5, name: '停止中', status: 'stopping', engine: 'ths' }),
+      ])
+      expect(Object.keys(occ).sort()).toEqual(['tdx', 'ths'])
+      expect(occ.tdx.session_id).toBe(3)
+      expect(occ.ths.session_id).toBe(5)
+    })
+
+    it('占用文案带会话号/名称/起始时间', () => {
+      const occ: SessionOccupancy = {
+        session_id: 3, name: 'TDX 主策略', engine: 'tdx', account_key: null,
+        since: '2026-11-16T09:15:00', status: 'running',
+      }
+      expect(engineOccupiedText('通达信', occ)).toBe('通达信（被 会话 3「TDX 主策略」占用，09:15 起）')
+      expect(engineOccupiedText('通达信', { ...occ, since: null })).toBe('通达信（被 会话 3「TDX 主策略」占用）')
+    })
+  })
+
+  describe('multiAccountBannerText（C4）', () => {
+    it('少于 2 个 running → 不提示', () => {
+      expect(multiAccountBannerText([session()])).toBeNull()
+      expect(multiAccountBannerText([session(), session({ id: 2, status: 'stopped' })])).toBeNull()
+    })
+
+    it('同账户多会话 → 不提示（账户键去重后 <2）', () => {
+      expect(multiAccountBannerText([
+        session({ id: 1, account_key: 'tdx:410038214257' }),
+        session({ id: 2, engine: 'tdx', account_key: 'tdx:410038214257' }),
+      ])).toBeNull()
+    })
+
+    it('多账户并行 → 指名账户键并提示分设备操作', () => {
+      const text = multiAccountBannerText([
+        session({ id: 1, engine: 'tdx', account_key: 'tdx:410038214257' }),
+        session({ id: 2, engine: 'goldminer', account_key: 'gm:0e5343aabb' }),
+      ])!
+      expect(text).toContain('当前同时运行 2 个实盘会话')
+      expect(text).toContain('tdx:410038… / gm:0e5343…')
+      expect(text).toContain('多账户同时下单建议分设备操作')
+    })
+
+    it('旧后端无 account_key → 按 engine:<引擎> 降级（不同引擎仍提示）', () => {
+      const text = multiAccountBannerText([
+        session({ id: 1, engine: 'tdx' }),
+        session({ id: 2, engine: 'ths' }),
+      ])!
+      expect(text).toContain('engine:tdx / engine:ths')
+    })
+
+    it('shortAccountKey：超 10 字符截断加省略号', () => {
+      expect(shortAccountKey('tdx:410038214257')).toBe('tdx:410038…')
+      expect(shortAccountKey('gm:123')).toBe('gm:123')
+    })
+  })
+
+  describe('keyboardConflictOpponents（C3）', () => {
+    it('tdx 目标 → 返回 running/stopping 的 ths 会话；iquant 目标恒空', () => {
+      const sessions = [
+        session({ id: 3, name: 'THS', engine: 'ths', status: 'running' }),
+        session({ id: 4, name: 'THS2', engine: 'ths', status: 'stopping' }),
+        session({ id: 5, name: 'THS3', engine: 'ths', status: 'stopped' }),
+      ]
+      expect(keyboardConflictOpponents(sessions, 'tdx').map((o) => o.session_id)).toEqual([3, 4])
+      expect(keyboardConflictOpponents(sessions, 'ths')).toEqual([])
+      expect(keyboardConflictOpponents(sessions, 'iquant')).toEqual([])
+    })
+  })
+
+  describe('parseStartConflict（结构化 409）', () => {
+    it('后端 message 非空 → 直接采用，同时保留 rule', () => {
+      const r = parseStartConflict({
+        response: { data: { code: 409, message: '引擎独占：会话 3「A」正在使用通达信通道', data: { rule: 'engine_exclusive' } } },
+      })
+      expect(r).toEqual({ rule: 'engine_exclusive', message: '引擎独占：会话 3「A」正在使用通达信通道' })
+    })
+
+    it('message 缺失 → 按 rule + occupied_by 拼指名文案', () => {
+      const r = parseStartConflict({
+        response: { data: { code: 409, message: '', data: {
+          rule: 'engine_exclusive',
+          occupied_by: { session_id: 3, name: 'A', engine: 'tdx', status: 'running' },
+        } } },
+      })
+      expect(r.rule).toBe('engine_exclusive')
+      expect(r.message).toContain('引擎独占')
+      expect(r.message).toContain('会话 3「A」')
+      expect(r.message).toContain('通达信')
+    })
+
+    it('account_exclusive + stopping → 提示稍候；普通错误兜底用原始 message', () => {
+      const r = parseStartConflict({
+        response: { data: { message: '', data: {
+          rule: 'account_exclusive',
+          occupied_by: { session_id: 4, name: 'B', engine: 'tdx', account_key: 'tdx:410038214257', status: 'stopping' },
+        } } },
+      })
+      expect(r.message).toContain('正在停止中')
+      expect(r.message).toContain('tdx:410038214257')
+
+      expect(parseStartConflict(new Error('桥未启动')).message).toBe('桥未启动')
+    })
+  })
+
+  describe('baselineResetAllowed', () => {
+    // 2026-11-16 是周一；北京时间 = UTC+8
+    it('交易日盘中（10:00）→ 禁用并给原因', () => {
+      expect(baselineResetAllowed(Date.parse('2026-11-16T02:00:00Z')))
+        .toEqual({ allowed: false, reason: BASELINE_RESET_BLOCKED_REASON })
+    })
+    it('交易日收盘后（15:00/16:00）→ 允许', () => {
+      expect(baselineResetAllowed(Date.parse('2026-11-16T07:00:00Z')).allowed).toBe(true)
+      expect(baselineResetAllowed(Date.parse('2026-11-16T08:00:00Z')).allowed).toBe(true)
+    })
+    it('周末任意时刻 → 允许', () => {
+      // 2026-11-21 周六 10:00 北京
+      expect(baselineResetAllowed(Date.parse('2026-11-21T02:00:00Z')).allowed).toBe(true)
+    })
+  })
+
+  describe('formatMoney2', () => {
+    it('千分位 + 两位小数；null/非法 → —', () => {
+      expect(formatMoney2(263515.51)).toBe('263,515.51')
+      expect(formatMoney2(300000)).toBe('300,000.00')
+      expect(formatMoney2(null)).toBe('—')
+      expect(formatMoney2(Number.NaN)).toBe('—')
     })
   })
 })

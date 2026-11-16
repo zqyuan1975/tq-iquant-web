@@ -32,6 +32,23 @@ router = APIRouter(prefix="/api/live", tags=["live"])
 _START_LOCK = asyncio.Lock()
 
 
+async def _stop_and_finalize(engine, session_id: int) -> None:
+    """stop 的收尾协程：先让引擎 stop() 收敛（含异常），再把 stopping → stopped。
+
+    收尾用独立 DB session（请求 Session 已随响应关闭）；失败只记日志，
+    由下次启动的 recover_stale_running_live_sessions / 僵尸抢占兜底。
+    """
+    try:
+        await engine.stop()
+    except Exception:  # noqa: BLE001
+        logger.exception("engine.stop() failed (session %s)", session_id)
+    finally:
+        try:
+            await run_in_threadpool(svc.finalize_stopped, session_id)
+        except Exception:  # noqa: BLE001
+            logger.exception("finalize_stopped failed (session %s)", session_id)
+
+
 # ---------------------------------------------------------------------------
 # 兼容 re-export：集成测试 test_live_engine_api.py 直接引用以下 live.py 符号
 # （对齐 core.api.backtest 的 re-export 范式）。
@@ -211,7 +228,10 @@ def session_signals(
 
 
 @router.post("/sessions/{session_id}/start")
-async def start_session(session_id: int, db: Session = Depends(get_db)):
+async def start_session(session_id: int, data: Optional[dict] = None,
+                        db: Session = Depends(get_db)):
+    data = data or {}
+    ack_keyboard_risk = bool(data.get("ack_keyboard_risk"))
     session = db.query(LiveSession).filter(LiveSession.id == session_id).first()
     if not session:
         return err(404, "资源不存在")
@@ -233,11 +253,17 @@ async def start_session(session_id: int, db: Session = Depends(get_db)):
                 db, session_id, _ENGINES, mode,
                 db_session_factory=SessionLocal,
                 dispatcher_cls=None,
+                ack_keyboard_risk=ack_keyboard_risk,
             ),
         )
         if error is not None:
-            status, message = error
-            return err(status, message)
+            # 结构化 409：data.rule ∈ engine_exclusive/account_exclusive/
+            # keyboard_exclusive，data.occupied_by 指认占用方，供前端引导。
+            if len(error) >= 3:
+                status, message, extra = error[0], error[1], error[2]
+            else:
+                status, message, extra = error[0], error[1], None
+            return err(status, message, extra)
         if engine is None:
             # 幂等路径（service 在锁内再查一次注册表，理论上上方已拦，兜底）
             return ok({"id": session.id, "status": "running"})
@@ -250,7 +276,13 @@ async def start_session(session_id: int, db: Session = Depends(get_db)):
         session.status = "running"
         session.started_at = datetime.now()
         db.commit()
-        return ok({"id": session.id, "status": "running"})
+        return ok({
+            "id": session.id,
+            "status": "running",
+            "account_key": getattr(session, "account_key", None),
+            "account_key_source": getattr(session, "account_key_source", None),
+            "warnings": list(getattr(engine, "start_warnings", []) or []),
+        })
 
 
 @router.post("/sessions/{session_id}/stop")
@@ -265,7 +297,7 @@ async def stop_session(session_id: int, db: Session = Depends(get_db)):
         session = db.query(LiveSession).filter(LiveSession.id == session_id).first()
         if not session:
             return err(404, "资源不存在")
-        if session_id not in _ENGINES and session.status != "running":
+        if session_id not in _ENGINES and session.status not in ("running", "stopping"):
             return ok({"id": session_id, "status": "stopped"})
         engine = svc.stop_session(db, session_id, _ENGINES)
         # 先同步置 _running=False，缩小「已置 stopped 但旧循环仍在轮询」的窗口，
@@ -277,8 +309,10 @@ async def stop_session(session_id: int, db: Session = Depends(get_db)):
             # （不等 engine.stop() 协程被调度）。
             if hasattr(engine, "_stop_requested"):
                 engine._stop_requested = True
-            asyncio.create_task(engine.stop())
-        return ok({"id": session_id, "status": "stopped"})
+            # stopping 中间态（2026-11-16）：引擎 stop() 收敛（含异常）后才置
+            # stopped 并释放 C1/C2 占用；期间另有会话启动会被 409 拦。
+            asyncio.create_task(_stop_and_finalize(engine, session_id))
+        return ok({"id": session_id, "status": session.status})
 
 
 @router.post("/sessions/{session_id}/portfolios/{portfolio_id}/recover")
@@ -287,6 +321,50 @@ def recover_breaker(session_id: int, portfolio_id: int, db: Session = Depends(ge
     if not ok_flag:
         return err(404, message)
     return ok({"portfolio_id": portfolio_id, "status": "active", "circuit_breaker_count": 0})
+
+
+@router.get("/account-preview")
+def account_preview(engine: Optional[str] = None, db: Session = Depends(get_db)):
+    """资金基准预览（A7）：按引擎探测真实账户资产（只读，不下单、不改账）。
+
+    返回 {total_asset, available, captured_at}；实时探测失败回退最近账户快照。
+    """
+    data, error = svc.account_preview_by_engine(db, engine or svc.default_engine())
+    if error is not None:
+        return err(error[0], error[1])
+    return ok(data)
+
+
+@router.post("/sessions/{session_id}/portfolios/{portfolio_id}/reset-baseline")
+def reset_baseline(session_id: int, portfolio_id: int,
+                   data: Optional[dict] = None,
+                   db: Session = Depends(get_db)):
+    """收盘后重置资金基准（按组合）+ 成套重锚风控锚点（A1d）。
+
+    - 基准 = 真实账户总资产口径，只缩不放：> 真实总资产 → 400。
+    - 盘中（09:15–11:30 / 13:00–15:00）禁用 → 403。
+    - 不清零熔断累计次数、不解锁手动恢复、不写 live_cash_flows。
+    """
+    data = data or {}
+    value = data.get("value")
+    if value is None:
+        value = data.get("baseline_value")
+    ok_flag, error = svc.reset_baseline(
+        db, session_id, portfolio_id, value,
+        engines=_ENGINES, note=data.get("note"),
+    )
+    if not ok_flag:
+        return err(error[0], error[1])
+    session = db.query(LiveSession).filter(LiveSession.id == session_id).first()
+    return ok({
+        "session_id": session_id,
+        "portfolio_id": portfolio_id,
+        "baseline_value": (
+            float(session.baseline_value)
+            if session is not None and session.baseline_value is not None else None),
+        "baseline_version": int(session.baseline_version or 0) if session else 0,
+        "status": "reset",
+    })
 
 
 @router.get("/channel")

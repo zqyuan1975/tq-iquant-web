@@ -32,7 +32,7 @@ from sqlalchemy.orm.exc import DetachedInstanceError
 
 from .portfolio import Portfolio
 from .position import Position
-from .format import dec_money, dec_price, fmt_money, fmt_price
+from .format import dec_money, dec_price, fmt_money, fmt_pct, fmt_price
 from .execution_engine import ExecutionEngine, LiveT1Checker
 from .event import BarEvent, OrderEvent, TradeEvent
 try:
@@ -108,7 +108,7 @@ from ..config import load_config
 from core.models import (
     LiveAccountPositionSnapshot, LiveAccountSnapshot, LiveCashFlow,
     LiveDecisionEvent, LiveBarOrderMark, LiveOrder, LivePositionPeak,
-    LiveSignal, LiveTrade,
+    LiveSession, LiveSignal, LiveTrade,
 )
 from core.tq.formula import TQFormula
 from core.tq.utils import TDXLockTimeout
@@ -350,6 +350,10 @@ _DEFERRED_RELEASE_GRACE_DAYS = 7
 # 首根 1m bar** 再试；首报 + 2 次重排 = 最多 3 次尝试，仍失败才落终态 rejected。
 # 与「每单每日只尝试一次」不冲突：重排不改变当日已尝试的事实，绝不当日重报。
 _DEFERRED_RETRY_MAX = 2
+# 单只「实际可买金额 / 目标份额」低于该比例 → 视为缩量残仓，整笔跳过（不缩量）。
+# 2026-11-16：仓位份额按「组合总资产 × single_open_ratio」计算，与回测一致；
+# 资金不足时宁可少开一只，也不把 17% 的目标仓位当成正常开仓。阈值做成常量便于调整。
+_MIN_FILL_RATIO = Decimal("0.8")
 # 重排次数落库标记（写 live_orders.error_message，与 deferred_extended: 同惯例，
 # 不新增模型列/迁移）。格式：deferred_retry:n=<次数>; <原因>
 _RETRY_MARKER = "deferred_retry:n="
@@ -4315,6 +4319,16 @@ class LiveEngine:
         out_of_pool = []  # [(code, volume)]：不在任何组合股票池
         no_attr = []  # [(code, volume)]：所有组合都没有策略 → 跳过且不受风控
         pools = self._pool_codes_by_portfolio or {}
+        # 起账是否按当前市值扣减继承仓（会话级开关，默认 1）。取失败按默认开。
+        adopt_inherited = True
+        try:
+            _sess_row = db.query(LiveSession).filter(
+                LiveSession.id == self.session_id).first()
+            if _sess_row is not None:
+                adopt_inherited = bool(
+                    getattr(_sess_row, "adopt_inherited_positions", True))
+        except Exception:  # noqa: BLE001
+            adopt_inherited = True
         for r in positions:
             if not isinstance(r, dict):
                 continue
@@ -4376,13 +4390,43 @@ class LiveEngine:
                 avail = None
             pos.mirror_bridge(vol, avail, cost,
                               now.date() if hasattr(now, "date") else now)
-            # 继承仓市值从起账现金扣除：资金基准（live_capital / 回测初始资金）
-            # 是「账户总资产」口径，继承仓本就包含在该基准里，不扣会双计
-            inherited = _position_market_value(r, vol, cost)
-            if inherited > 0:
-                with self._book_lock:
-                    self._deduct_inherited_value(port, inherited, "import")
-                deducted_value += inherited
+            # 继承仓市值从起账现金扣除：资金基准（baseline_value / live_capital）
+            # 是「账户总资产」口径，继承仓本就包含在该基准里，不扣会双计。
+            # 2026-11-16 资金基准对齐：按**当前市值**扣减（不是成本市值），并把起账
+            # 估值价锚定在同一价格 → 起账净值严格等于资金基准，不产生开机假回撤
+            # （旧口径扣成本、按市价估值，首帧凭空 -2.87%）。价格逐级回退：
+            # recover 从最近账户快照种下的 _price_snapshot → 行内现价字段 →
+            # 行市值÷股数 → 成本；取不到则跳过扣减并保持成本口径（绝不硬造现金）。
+            inherited = Decimal("0")
+            if adopt_inherited:
+                px = None
+                try:
+                    px = port._price_snapshot.get(code)
+                except Exception:  # noqa: BLE001
+                    px = None
+                if px is None or px <= 0:
+                    for _price_key in ("price", "current_price", "last_price", "cur_price"):
+                        raw_px = r.get(_price_key)
+                        if raw_px is None:
+                            continue
+                        try:
+                            cand = Decimal(str(raw_px))
+                        except Exception:  # noqa: BLE001
+                            continue
+                        if cand > 0:
+                            px = cand
+                            break
+                if px is None or px <= 0:
+                    mv = _position_market_value(r, vol, cost)
+                    if mv > 0 and vol > 0:
+                        px = mv / Decimal(int(vol))
+                if px is not None and px > 0:
+                    inherited = (Decimal(int(vol)) * px).quantize(Decimal("0.01"))
+                    port._price_snapshot[code] = px
+                    if inherited > 0:
+                        with self._book_lock:
+                            self._deduct_inherited_value(port, inherited, "import")
+                        deducted_value += inherited
             # 峰值恢复：上次快照记录的历史最高价 > 成本 → 还原（移动止损基准
             # 跨重启不丢）。无历史记录时**用柜台成本兜底**（2026-11-07）：
             # 继承仓若在行情轮询窗口外启动/该票无 bar，`update_high(close)` 从未
@@ -6044,19 +6088,45 @@ class LiveEngine:
                 avail = shared_cap
         return avail
 
+    def _order_target_share(
+        self, portfolio: Portfolio, order: OrderEvent,
+    ) -> Optional[Decimal]:
+        """该单的「目标份额」金额（组合口径）：比例 × 策略资金。
+
+        与 ``Portfolio._signal_to_order`` 的 OPEN 定量公式同源
+        （``single_open_ratio × strategy_fund / close``），故这里乘回价格就是
+        信号当时的完整目标仓位金额（未取整）。ADD 用 ``add_position_ratio``。
+        取不到 ctx / 资金时返回 None，调用方退回「本单目标金额」当参照。
+        """
+        try:
+            ctx = portfolio.find_strategy(order.strategy_id)
+            if ctx is None:
+                return None
+            ratio = ctx.single_open_ratio
+            if order.signal_type == SignalType.ADD:
+                ratio = ctx.add_position_ratio
+            share = Decimal(str(ratio)) * portfolio._strategy_fund(ctx)
+            return share if share > 0 else None
+        except Exception:  # noqa: BLE001 — 参照失败不得阻断下单
+            return None
+
     def _allocate_batch_buys(
         self, portfolio: Portfolio, orders: List[OrderEvent],
         post_close: bool = False,
     ) -> List[OrderEvent]:
-        """同 bar 同组合买单批量资金分配（先预留、再提交，避免 FIFO 饿死）。
+        """同 bar 同组合买单：按「目标份额」整手逐笔下单，资金不足则整笔跳过。
 
-        触发条件：本批可立即提交的 BUY 目标金额合计 > 可用现金。按目标金额比例
-        分配可用现金，再按整手取整、贪心补手吃满零头；分配后不足 1 手的单剔除并
-        记决策事件（不静默丢弃）。deferred 单不参与（其可用资金以放行 bar 为准）；
-        单笔批次不分配，交给既有单笔审批（cap_quantity 逐单复核仍兜底）。
-
-        可用现金口径见 ``_buy_available_cash``；在途预留从 ``_pending_orders`` 派生，
-        成交回填令其收缩、拒单/撤单/全成交令其释放，故分配与逐单复核天然一致。
+        口径（2026-11-16 资金基准对齐，**覆盖旧的按可用等比例瓜分**）：
+          * 每笔目标量来自信号生成时的「比例 × 策略资金」（已整手），回测/实盘
+            同源；目标份额金额 = ``_order_target_share``（未取整的理论仓位）。
+          * 按信号产生顺序（bar_time + 拆单 seq，稳定排序）逐笔检查剩余可用：
+            实际可买金额 < 目标份额 × ``_MIN_FILL_RATIO``（80%）→ 整笔跳过并记
+            ``insufficient_cash/skip`` 事件（含目标份额/可用/可买/比例）；
+            否则按可买额取整手提交，**不做等比缩量**。
+          * deferred 单不参与（其额度以放行 bar 为准）；放行后同走本方法。
+        目的：实盘每只仓位规模与回测一致（组合总资产 × single_open_ratio），
+        而非按可用资金把每只稀释成小仓（那样两端收益不可比）。卖出释放资金只让
+        「更多只买得满」，不抬高单只份额。
         """
         candidates = [
             o for o in (orders or [])
@@ -6066,58 +6136,206 @@ class LiveEngine:
             and o.price is not None and o.price > 0
             and int(o.quantity or 0) > 0
         ]
-        if len(candidates) < 2:
+        if not candidates:
             return orders
-        targets = [o.price * Decimal(int(o.quantity)) for o in candidates]
-        total_target = sum(targets)
         avail = self._buy_available_cash(portfolio)
-        if total_target <= avail:
-            return orders
-        lots = [self._engine._lot(o.stock_code) for o in candidates]
-        # 1) 按目标金额比例分配 → 整手向下取整（不超过各单目标量）
-        qty = []
-        for o, tgt, lot in zip(candidates, targets, lots):
-            raw = avail * tgt / total_target / o.price
-            qty.append(min(int(raw / lot) * lot, int(o.quantity)))
-        # 2) 贪心补手：比例取整的零头按整手回填（仍受各单目标量约束），
-        #    避免"最后一笔"因取整余量而少买。仅回填已分到 ≥1 手的单——按比例
-        #    不足 1 手的单直接跳过（不抢占别人的额度）。
-        eligible = [q >= lot for q, lot in zip(qty, lots)]
-        leftover = avail - sum(Decimal(q) * o.price for q, o in zip(qty, candidates))
-        progressed = True
-        while progressed:
-            progressed = False
-            for i, o in enumerate(candidates):
-                if not eligible[i]:
-                    continue
-                nxt = qty[i] + lots[i]
-                if nxt > int(o.quantity):
-                    continue
-                need = o.price * lots[i]
-                if leftover >= need:
-                    qty[i] = nxt
-                    leftover -= need
-                    progressed = True
+        # 信号产生顺序（bar_time + 拆单 seq；稳定排序，同键保留原列表序）
+        candidates = sorted(
+            candidates,
+            key=lambda o: (o.bar_time or datetime.min, self._bar_mark_seq(o)),
+        )
         skipped = set()
-        for o, q, lot in zip(candidates, qty, lots):
+        # 组合级护栏（仅实盘接线）：分母 = 组合总资产（现金 + 持仓市值）。
+        # 阈值 None/0 = 不设限 → 下面两个 helper 直接返回原 qty（行为与接线前一致）。
+        equity = self._allocation_equity(portfolio)
+        batch_code_value: Dict[str, Decimal] = {}
+        for o in candidates:
             original = int(o.quantity)
-            if q < lot:
+            need = o.price * Decimal(original)
+            target_share = self._order_target_share(portfolio, o)
+            if target_share is None or target_share <= 0:
+                # 取不到参照（无 ctx / 资金）→ 用本单目标金额当参照，保持可运行
+                target_share = need
+            lot = self._engine._lot(o.stock_code)
+            if avail >= need:
+                # 资金足够本单目标量：满额提交（本单目标量小于目标份额时也不拦，
+                # 那不是「资金不足缩量」）
+                qty = original
+            else:
+                affordable = avail
+                min_accept = (target_share * _MIN_FILL_RATIO).quantize(
+                    Decimal("0.01"))
+                if affordable < min_accept:
+                    skipped.add(id(o))
+                    pct = ((affordable / target_share) * Decimal("100")).quantize(
+                        Decimal("0.01")) if target_share > 0 else Decimal("0")
+                    self._recorder.record(
+                        gate="insufficient_cash", layer="live_gate",
+                        action="skip",
+                        portfolio_id=portfolio.portfolio_id,
+                        strategy_id=o.strategy_id,
+                        stock_code=o.stock_code,
+                        bar_time=o.bar_time,
+                        param_name="single_open_ratio",
+                        param_value=float(target_share),
+                        actual_value=float(affordable),
+                        requested_qty=original,
+                        final_qty=0,
+                        message=("资金不足跳过：目标份额 %s（%d 股 @%s），实际可买 %s"
+                                 "（%s%%，低于目标 %d%% 门槛），本笔不下单"
+                                 % (fmt_money(target_share), original,
+                                    fmt_price(o.price), fmt_money(affordable), pct,
+                                    int(_MIN_FILL_RATIO * 100))),
+                    )
+                    continue
+                # 剩余现金 ≥80% 目标份额：按可买额取整手，≥80% 不算残仓
+                qty = min(int(affordable / o.price / lot) * lot, original)
+                if qty < lot:
+                    skipped.add(id(o))
+                    continue
+            # 组合级护栏：单票集中度上限 → 现金留存下限（仅实盘接线，默认不约束）。
+            # 在 insufficient_cash 之后、落 qty 之前执行；截断后不足 1 手 → 跳过。
+            qty = self._apply_allocation_caps(
+                portfolio, o, qty, avail, equity, lot,
+                batch_code_value.get(o.stock_code, Decimal("0")),
+            )
+            if qty < lot:
                 skipped.add(id(o))
-                self._rec_live(
-                    "batch_cash_alloc", "block", portfolio, o,
-                    message="同批资金分配后不足 1 手（目标 %d 股 @%s，本批可用 %s），跳过"
-                            % (original, fmt_price(o.price), fmt_money(avail)),
-                )
                 continue
-            if q < original:
-                self._rec_live(
-                    "batch_cash_alloc", "shrink", portfolio, o,
-                    message="同批资金分配缩量：目标 %d 股 → %d 股（本批可用 %s，"
-                            "同批目标合计 %s）"
-                            % (original, q, fmt_money(avail), fmt_money(total_target)),
-                )
-            o.quantity = q
+            o.quantity = qty
+            avail -= o.price * Decimal(qty)
+            batch_code_value[o.stock_code] = (
+                batch_code_value.get(o.stock_code, Decimal("0"))
+                + o.price * Decimal(qty))
         return [o for o in orders if id(o) not in skipped]
+
+    @staticmethod
+    def _allocation_equity(portfolio: Portfolio) -> Decimal:
+        """分配口径的组合总资产（现金 + 持仓市值，非可用现金）。
+
+        优先用本 bar 已刷新的 ``_bar_equity``（on_bar 顶部 total_value）；未处理 bar
+        （如盘前集合竞价放行前的首轮）回落现场估值。估值异常不阻断下单——
+        退回账本现金，最坏情况是分母偏小、约束偏严（fail-safe）。
+        """
+        equity = getattr(portfolio, "_bar_equity", None)
+        if equity is not None and equity > 0:
+            return Decimal(equity)
+        try:
+            return portfolio.account.cash + portfolio._holdings_value()
+        except Exception:  # noqa: BLE001
+            return portfolio.account.cash
+
+    @staticmethod
+    def _code_market_value(portfolio: Portfolio, code: str) -> Decimal:
+        """组合内**全部策略**该代码持仓市值（单票集中度的分子基数）。
+
+        估值价与净值同口径（``_resolve_price`` 三级兜底）；三级全缺回退成本价，
+        成本也未知按 0 计——与 ``Portfolio.positions_detail`` 一致。
+        """
+        total = Decimal("0")
+        for ctx in getattr(portfolio, "strategies", []):
+            pos = ctx.positions.get(code)
+            if pos is None or pos.quantity <= 0:
+                continue
+            price = portfolio._resolve_price(code, pos)
+            if price is None:
+                cost = getattr(pos, "avg_cost", None)
+                price = cost if cost is not None and cost > 0 else Decimal("0")
+            total += price * pos.quantity
+        return total
+
+    def _apply_allocation_caps(
+        self, portfolio: Portfolio, order: OrderEvent, qty: int,
+        avail: Decimal, equity: Decimal, lot: int, pending_value: Decimal,
+    ) -> int:
+        """组合级护栏：单票集中度上限 + 现金留存下限（**仅实盘**，默认不约束）。
+
+        执行位置（顺序不可颠倒，避免重复扣减/互相覆盖）：
+          1. ``_buy_available_cash``：账本现金 − 在途预留，且 min 真实可用 × 0.98
+             按组合占比切分后的额度；
+          2. ``insufficient_cash``：剩余 < 目标份额 × 80% 整笔跳过（不缩量）；
+          3. **本方法**：先单票集中度、再现金留存，各自独立截断（取更小者，
+             两个都命中就各记一条事件），截断后不足 1 手 → 跳过；
+          4. ``_submit_one_order`` → ``cap_quantity``/``approve_order``（费用感知）
+             最终权威复核：只可能再缩 1~2 手（佣金/过户费），绝不会放大本方法结果。
+
+        口径：
+          * 单票上限：``(组合内该代码全部策略市值 + 本批已分配同代码金额) ÷ equity
+            ≤ max_single_position_pct``；超额按「阈值对应整手」截断。现有持仓也
+            计入分子（加仓时同样受限）。
+          * 现金下限：``(本批可用 avail − 本单买入额) ÷ equity ≥ min_cash_reserve_pct``；
+            不足按可留现金反推整手买入额。用 ``avail``（已扣在途预留与真实侧额度）
+            而非账本现金，比账本口径更保守。
+          * 阈值 None / <=0 → 完全不进入（与接线前逐字一致）；``equity<=0`` 或价格
+            非法 → 原样返回（fail-open，不因护栏把单全拦掉）。
+        """
+        price = order.price
+        if price is None or price <= 0 or equity <= 0:
+            return qty
+        pct = getattr(portfolio, "max_single_position_pct", None)
+        if pct is not None and pct > 0:
+            existing = (
+                self._code_market_value(portfolio, order.stock_code) + pending_value
+            )
+            allowed = pct * equity - existing
+            max_qty = (int(allowed / price / lot) * lot) if allowed > 0 else 0
+            if max_qty < qty:
+                before, qty = qty, max_qty
+                final = qty if qty >= lot else 0
+                after_value = existing + price * Decimal(before)
+                ratio = after_value / equity
+                self._recorder.record(
+                    gate="max_single_position", layer="live_gate",
+                    action="shrink" if final else "block",
+                    portfolio_id=portfolio.portfolio_id,
+                    strategy_id=order.strategy_id,
+                    stock_code=order.stock_code,
+                    bar_time=order.bar_time,
+                    param_name="max_single_position_pct",
+                    param_value=float(pct),
+                    actual_value=float(ratio),
+                    requested_qty=before,
+                    final_qty=final,
+                    message=("单票集中度上限 %s%%：买入后该票市值 %s ÷ 组合总资产 %s"
+                             " = %s%%，%d 股 → %d 股%s"
+                             % (fmt_pct(pct), fmt_money(after_value),
+                                fmt_money(equity), fmt_pct(ratio), before, final,
+                                "（不足 1 手，跳过）" if not final else "")),
+                )
+                if not final:
+                    return 0
+        reserve_pct = getattr(portfolio, "min_cash_reserve_pct", None)
+        if reserve_pct is not None and reserve_pct > 0:
+            floor = reserve_pct * equity
+            spendable = avail - floor
+            max_qty = (int(spendable / price / lot) * lot) if spendable > 0 else 0
+            if max_qty < qty:
+                before, qty = qty, max_qty
+                final = qty if qty >= lot else 0
+                remain_ratio = (avail - price * Decimal(before)) / equity
+                self._recorder.record(
+                    gate="min_cash_reserve", layer="live_gate",
+                    action="shrink" if final else "block",
+                    portfolio_id=portfolio.portfolio_id,
+                    strategy_id=order.strategy_id,
+                    stock_code=order.stock_code,
+                    bar_time=order.bar_time,
+                    param_name="min_cash_reserve_pct",
+                    param_value=float(reserve_pct),
+                    actual_value=float(remain_ratio),
+                    requested_qty=before,
+                    final_qty=final,
+                    message=("现金留存下限 %s%%：买入后剩余现金 %s ÷ 组合总资产 %s"
+                             " = %s%%，%d 股 → %d 股%s"
+                             % (fmt_pct(reserve_pct),
+                                fmt_money(avail - price * Decimal(before)),
+                                fmt_money(equity), fmt_pct(remain_ratio),
+                                before, final,
+                                "（不足 1 手，跳过）" if not final else "")),
+                )
+                if not final:
+                    return 0
+        return qty
 
     @staticmethod
     def _platform_held_count(ctx) -> int:
@@ -8827,10 +9045,12 @@ class LiveEngine:
         # 删旧行建 submitted 新行。这样 recover 之后到放行之前的任何时刻崩溃/
         # 停会话，都能再次从 DB 重建，不再有「内存有、库里无」的丢失窗口。
         # 重建失败的单记日志跳过（防坏行阻断其余恢复，行保留待人工处理）。
+        # order_by(id)：重建顺序 = 信号落库顺序（同 bar 多单按此顺序进内存队列，
+        # 批量分配再按 bar_time+seq 稳定排序，保证「先产生的信号先拿资金」）。
         deferred_rows = db.query(LiveOrder).filter(
             LiveOrder.live_session_id == self.session_id,
             LiveOrder.status == "deferred",
-        ).all()
+        ).order_by(LiveOrder.id).all()
         today = now_shanghai().date()
         # 陈旧阈值 = 「上一交易日」而非日历天 -1（2026-11-09 修正）：旧实现用
         # today - 1 天，周五 defer → 周一启动会被误判陈旧（周五 < 周日）而丢弃。

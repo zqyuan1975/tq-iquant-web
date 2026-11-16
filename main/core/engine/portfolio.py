@@ -192,6 +192,14 @@ class Portfolio:
         # 组合全部策略持仓去重股票数判定，≥ 上限拒绝新开仓。0=不限（直接构造
         # Portfolio 的引擎单测默认不受限）；builder 从组合表装配。
         self.max_holdings: int = 0
+        # 单票集中度上限 / 现金留存下限（组合表字段，**仅实盘接线**，回测恒 None）：
+        # max_single_position_pct = 买入后该代码组合市值 ÷ 组合总资产 ≤ 阈值；
+        # min_cash_reserve_pct   = 买入后剩余现金 ÷ 组合总资产 ≥ 阈值。
+        # None 或 <=0 = 不设限（与接线前行为逐字一致）。回测口径冻结：本类只提供
+        # 默认值，装配端由 live_service.build_engine 按组合行显式注入，回测调用点
+        # （backtest_service/incremental_backtest）**不读这两列**。
+        self.max_single_position_pct: Optional[Decimal] = None
+        self.min_cash_reserve_pct: Optional[Decimal] = None
         # 组合交易时段（full/am/pm，组合表字段，历史死配置首次接线）：
         # am=09:30–11:30、pm=13:00–15:00、full=不筛（默认）。回测按 bar 时间、
         # 实盘按墙钟过滤（窗口定义见 market_rules.session_allows）。
