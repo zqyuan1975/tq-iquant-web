@@ -48,6 +48,8 @@ logs/
 *.log
 main/stdin.empty
 web/stdin.empty
+# 源码版后端运行期写出的实例信息（server.json：端口/pid/版本），运行时产物不入库
+/data/runtime/
 
 # Local machine paths (TDX/iQuant install paths)
 config.yaml
