@@ -8,11 +8,18 @@
 """
 from datetime import date
 from decimal import Decimal
+from types import SimpleNamespace
+
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
+from sqlalchemy.pool import StaticPool
 
 from core.engine.corporate_actions import (
     CorporateActionEvent, CorporateActionTimeline,
 )
 from core.engine.live_engine import LiveEngine
+from core.models import Base, LiveCorporateAction, LiveSession, StockPool
+from core.services import live_service
 
 
 class _Calendar:
@@ -63,3 +70,48 @@ def test_events_up_to_handles_postpone_and_window():
     assert tl.events_up_to(date(2026, 7, 17)) == []
     assert len(tl.events_up_to(date(2026, 7, 20), after=date(2026, 7, 17))) == 1
     assert tl.events_up_to(date(2026, 7, 20), after=date(2026, 7, 20)) == []
+
+
+# ---------------- C5：启发式送转落台账 ----------------
+def _db():
+    engine = create_engine(
+        "sqlite:///:memory:",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+    Base.metadata.create_all(engine)
+    SessionLocal = sessionmaker(bind=engine, expire_on_commit=False)
+    return SessionLocal()
+
+
+def test_heuristic_share_change_recorded_once_per_day():
+    db = _db()
+    try:
+        db.add(StockPool(id=1, code="POOL1", name="池"))
+        db.add(LiveSession(id=1, name="会话", mode="live", status="running"))
+        db.commit()
+
+        class _Shim:
+            session_id = 1
+            _record_heuristic_share_change = \
+                LiveEngine._record_heuristic_share_change
+
+        shim = _Shim()
+        port = SimpleNamespace(portfolio_id=1)
+        shim._record_heuristic_share_change(db, port, "600000.SH", 300)
+        db.commit()
+        rows = db.query(LiveCorporateAction).all()
+        assert len(rows) == 1
+        assert rows[0].event_type == "split" and rows[0].qty_delta == 300
+        assert rows[0].amount == Decimal("0")
+
+        # 同一会话/组合/代码/事件日重复识别 → 幂等，不追加
+        shim._record_heuristic_share_change(db, port, "600000.SH", 300)
+        db.commit()
+        assert db.query(LiveCorporateAction).count() == 1
+
+        listed = live_service.list_live_corporate_actions(db, 1)
+        assert len(listed) == 1 and listed[0]["qty_delta"] == 300
+        assert live_service.list_live_corporate_actions(db, 999) is None
+    finally:
+        db.close()

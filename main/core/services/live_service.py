@@ -39,7 +39,7 @@ from core.models import (
     StockPoolStock, StockPoolMembership, Formula, FormulaSignal, LiveOrder, LiveTrade, LiveDecisionEvent,
     LiveSignal, LiveAccountSnapshot, LiveCashFlow, LiveBaselineReset,
     LiveManualAction, LiveReconciliationDiff, LiveReconciliationReport,
-    LiveOutOfPoolDecision,
+    LiveOutOfPoolDecision, LiveCorporateAction,
     IncrementalBacktestCheckpoint, BacktestRecord,
 )
 from core.engine.portfolio_builder import assemble_portfolio
@@ -2295,6 +2295,47 @@ def list_out_of_pool_decisions(db: Session, session_id: int) -> Optional[list]:
         .all()
     )
     return [serialize_out_of_pool_decision(r) for r in rows]
+
+
+def serialize_live_corporate_action(row) -> dict:
+    """C5 实盘公司行为台账序列化（applied_date 升序展示由调用方决定）。"""
+    return {
+        "id": row.id,
+        "live_session_id": row.live_session_id,
+        "portfolio_strategy_id": row.portfolio_strategy_id,
+        "code": row.code,
+        "event_type": row.event_type,
+        "ex_date": row.ex_date.isoformat() if row.ex_date else None,
+        "applied_date": row.applied_date.isoformat() if row.applied_date else None,
+        "amount": str(row.amount) if row.amount is not None else None,
+        "qty_delta": row.qty_delta,
+        "note": row.note,
+        "created_at": (row.created_at.strftime("%Y-%m-%d %H:%M:%S")
+                       if row.created_at else None),
+    }
+
+
+def list_live_corporate_actions(
+    db: Session, session_id: int, limit: int = 200,
+) -> Optional[list]:
+    """C5 实盘公司行为台账（手工事件 + 启发式送转识别），按生效日倒序。
+
+    台账已应用的事件唯一键幂等；启发式识别的行 `event_type=split` 且
+    `note` 标明来源，便于与回测侧逐条对照。
+    """
+    session = db.query(LiveSession.id).filter(
+        LiveSession.id == session_id).first()
+    if session is None:
+        return None
+    rows = (
+        db.query(LiveCorporateAction)
+        .filter(LiveCorporateAction.live_session_id == session_id)
+        .order_by(LiveCorporateAction.applied_date.desc(),
+                  LiveCorporateAction.id.desc())
+        .limit(max(1, min(int(limit or 200), 1000)))
+        .all()
+    )
+    return [serialize_live_corporate_action(r) for r in rows]
 
 
 def record_manual_action(

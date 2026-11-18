@@ -4329,6 +4329,10 @@ class LiveEngine:
                                     code, before_qty, qty, before_cost, cost,
                                     self.session_id,
                                 )
+                            # C5：启发式识别也落公司行为台账（只记事件、不改账），
+                            # 与手工台账同表同口径，审计可与回测侧对照。
+                            self._record_heuristic_share_change(
+                                db, port, code, int(added))
                         else:
                             self._deduct_inherited_value(
                                 port,
@@ -5987,6 +5991,39 @@ class LiveEngine:
             index_elements=["live_session_id", "portfolio_strategy_id", "code",
                             "event_type", "ex_date"])
         db.execute(stmt)
+
+    def _record_heuristic_share_change(
+        self, db: Session, portfolio, code: str, qty_delta: int,
+    ) -> None:
+        """C5：启发式识别到的送转/拆股落公司行为台账（只记事件，不改账）。
+
+        与手工台账同表同口径：`event_type=split`、`ex_date=applied_date=今天`、
+        `qty_delta` = 柜台增量、`amount=0`。幂等键
+        `(session, 组合, code, split, 今天)` 决定同一天重复镜面只记一次。
+        """
+        if db is None or qty_delta <= 0:
+            return
+        try:
+            today = now_shanghai().date()
+            stmt = sqlite_insert(LiveCorporateAction).values(
+                live_session_id=self.session_id,
+                portfolio_strategy_id=portfolio.portfolio_id,
+                code=code, event_type="split",
+                ex_date=today, applied_date=today,
+                amount=Decimal("0"), qty_delta=int(qty_delta),
+                note="启发式：柜台数量增且合并均价摊薄、总成本未增（送转/拆股）",
+            ).on_conflict_do_nothing(
+                index_elements=["live_session_id", "portfolio_strategy_id",
+                                "code", "event_type", "ex_date"])
+            # 用保存点隔离：镜像主链路在同一事务里还要写持仓/快照，不能在此
+            # 提前 commit（也不允许一条台账失败回滚整轮镜面）。真正提交由
+            # `_apply_bridge_account_snapshot` 末尾统一完成。
+            with db.begin_nested():
+                db.execute(stmt)
+        except Exception:  # noqa: BLE001 — 观测台账失败不影响镜像主链路
+            logger.warning(
+                "heuristic share-change ledger write failed (session %s, %s)",
+                self.session_id, code, exc_info=True)
 
     def _dispatch_ca_actions(self, db: Session, portfolio: Portfolio,
                              actions, now: datetime) -> None:

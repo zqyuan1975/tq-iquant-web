@@ -207,6 +207,7 @@ Web 前端 (Vue 3 + Vite + Pinia) ←HTTP/SSE→ Core (FastAPI)
 - **C4 每日对账日报（默认开启，只读）**：`live_reconciliation_reports`（迁移 `f5c6d7e8f9a0`，唯一键 `(session, report_date)`），`_tick_main` 在 `close_sweep`/`reconcile_after_close` 之后每交易日 15:05 生成一次（内存幂等 + 唯一键兜底，重复生成覆盖更新）。柜台侧取最新 `live_account_snapshots`，虚拟侧取运行中引擎内存；**只在运行中生成**。报表不写 `live_trades`、不改现金/差异台账；API：`GET .../reports`、`POST .../reports`（运行中立即生成，未运行 409）。失败只告警，不影响收盘流程。
 - **I4 手工成交录入**：`submit_manual_trade` 落 `live_orders(order_type="manual", status="filled")` + `live_trades`，再走与真实成交回报完全相同的 `_apply_filled_trade`（持仓/现金/成本/冷静期/归因一次到位）。**不经过桥、不占审批、不做买入闸门**（成交已发生）；仅 `execution_mode=manual` 开放；卖出须有虚拟持仓且 ≤ 持仓（超卖拒绝，不静默缩量）；买入允许负现金（差异进对账）；`commission` 缺省 0。API：`POST /sessions/{id}/manual/trades`。不做撤销——错误用反向手工成交修正，历史只追加。
 - **I3 池外外部仓处置**：`live_out_of_pool_decisions`（迁移 `f6d7e8f9a0b1`，唯一键 `(session, stock_code)`）。默认语义不变（池外=不归属/不风控/不代卖）。`include` 写 `stock_pool_stocks`（PIT 开启时补 `effective_from=今天` 成员区间），下一轮采集按池内继承仓导入；`ignore` 只抑制 `out_of_pool_position` 告警。运行中处置即时刷新引擎内存（`reload_out_of_pool_decisions` / `include_pool_code`），不重启。API：`GET/POST .../out-of-pool/actions`。
+- **C5 启发式送转落台账**：镜面识别「数量增 + 均价摊薄 + 总成本未增」时写 `live_corporate_actions`（`event_type=split`、`ex_date=applied_date=当天`、`qty_delta`、`amount=0`、note 标明启发式）。**只记事件不改账**；唯一键幂等（同一会话/组合/代码/事件日一次）；`begin_nested()` 保存点隔离，台账失败不影响镜面主链路。查询：`GET .../corporate-actions`。
 
 ## 模块复用
 

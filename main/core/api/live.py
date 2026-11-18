@@ -797,6 +797,16 @@ def generate_session_reconciliation_report(session_id: int,
     return ok(row)
 
 
+@router.get("/sessions/{session_id}/corporate-actions")
+def session_corporate_actions(session_id: int, limit: int = 200,
+                              db: Session = Depends(get_db)):
+    """C5 实盘公司行为台账（手工事件 + 启发式送转识别）。"""
+    data = svc.list_live_corporate_actions(db, session_id, limit=limit)
+    if data is None:
+        return err(404, "资源不存在")
+    return ok(data)
+
+
 @router.get("/sessions/{session_id}/out-of-pool/actions")
 def session_out_of_pool_actions(session_id: int, db: Session = Depends(get_db)):
     """I3 池外外部仓处置记录（include / ignore）。"""
