@@ -74,6 +74,7 @@ from core.tq.alert import TQAlert
 from core.engine.live.alert_dispatcher import AlertDataDispatcher
 from core.engine.execution_engine import ShadowDispatcher
 from core.engine.live.market_data import MarketDataService
+from core.engine.live.fallback_quote import FallbackQuoteDispatcher
 from core.engine.live.timing import now_shanghai
 from core.services.live_data_health import (
     health_summary_text,
@@ -406,6 +407,76 @@ def make_dispatcher(engine: str, mode: str = "simulation", session_id: int = 0):
     # 未知引擎明确报错，绝不静默回退
     raise RuntimeError(
         "未知交易引擎：%s（可用：%s）" % (engine, "/".join(ENGINES_META)))
+
+
+#: engine 标识 → 该会话主行情源在降级链中的名称（避免把同一源重复挂在链上）。
+_ENGINE_QUOTE_SOURCE = {
+    "tdx": "tq", "ths": "tq", "alert": "tq",
+    "iquant": "iquant", "goldminer": "goldminer",
+}
+
+
+def build_quote_fallback(primary, engine: str):
+    """J5：按 live.quote_fallback 配置包装 1m 行情源（默认关闭 → 原样返回）。
+
+    只影响 BarPoller 的行情读取；交易/持仓/撤单仍走 ``primary``，降级不改变
+    下单通道。备用源构造失败只告警并跳过，链为空时保持单源运行。
+    """
+    try:
+        live_cfg = (load_config() or {}).get("live") or {}
+    except Exception:  # noqa: BLE001 — 配置异常按未启用
+        return primary
+    section = live_cfg.get("quote_fallback") or {}
+    if not isinstance(section, dict) or not bool(section.get("enabled", False)):
+        return primary
+    chain = section.get("chain") or []
+    own = _ENGINE_QUOTE_SOURCE.get(str(engine or ""), "")
+    providers = [("primary", primary)]
+    for raw_name in chain:
+        name = str(raw_name or "").strip().lower()
+        if not name or name == own:
+            continue
+        try:
+            disp = _build_quote_provider(name)
+        except Exception:  # noqa: BLE001 — 备用源不可构造不影响主链路
+            logger.warning("quote fallback: 备用源 %s 构造失败", name, exc_info=True)
+            continue
+        if disp is not None:
+            providers.append((name, disp))
+    if len(providers) <= 1:
+        logger.warning(
+            "quote fallback: 已启用但没有可用备用源（chain=%s），按单源运行", chain)
+        return primary
+    logger.info("quote fallback enabled: %s", [n for n, _ in providers])
+    return FallbackQuoteDispatcher(providers)
+
+
+def _build_quote_provider(name: str):
+    """构造备用行情源（只读行情；交易方法不参与降级链）。"""
+    if name == "tq":
+        if TdxTqDispatcher is None:
+            return None
+        return TdxTqDispatcher()
+    if name == "iquant":
+        if HttpBridgeDispatcher is None:
+            return None
+        q = iquant_config()
+        return HttpBridgeDispatcher(
+            base_url=q["simulation"], channel="iquant_bridge")
+    if name == "goldminer":
+        if HttpBridgeDispatcher is None:
+            return None
+        g = goldminer_config()
+        return HttpBridgeDispatcher(
+            base_url=g["base_url"],
+            timeout=g["request_timeout_seconds"],
+            slow_threshold=g["slow_response_seconds"],
+            slow_warn_interval=g["slow_warn_interval_seconds"],
+            channel="goldminer_bridge",
+        )
+    logger.warning(
+        "quote fallback: 未知行情源 %s（支持 tq/iquant/goldminer）", name)
+    return None
 
 
 def bridge_probe_message(channel: str, reason: Optional[str], base_url: str) -> str:
@@ -1308,8 +1379,12 @@ def build_engine(
         snapshot_synth = None
         poller = None
     if poller is None:
+        # J5：行情降级链（默认关闭 → build_quote_fallback 原样返回 dispatcher）。
+        # 仅包装 poller 的行情读取；dispatcher 本体仍用于下单/持仓/撤单。
+        quote_dispatcher = build_quote_fallback(dispatcher, engine)
         try:
-            poller = BarPoller(dispatcher, poll_codes, period="1m", count=10)
+            poller = BarPoller(
+                quote_dispatcher, poll_codes, period="1m", count=10)
         except Exception:
             poller = None  # type: ignore
     # 账户全貌快照采集节拍：THS UI 读表重 → 60s；goldminer 交易通道走掘金云
