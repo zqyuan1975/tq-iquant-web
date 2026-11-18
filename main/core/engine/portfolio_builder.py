@@ -165,9 +165,19 @@ def assemble_portfolio(
             # 实盘执行配置（批次1，默认关/保守默认；关闭时行为与原逻辑一致）
             requote_enabled=bool(getattr(strat, "requote_enabled", False)),
             requote_max_attempts=getattr(strat, "requote_max_attempts", None) or 2,
+            requote_price_mode=getattr(strat, "requote_price_mode", None) or "tick",
+            requote_max_slippage_ticks=int(
+                getattr(strat, "requote_max_slippage_ticks", None) or 5),
             split_order_enabled=bool(getattr(strat, "split_order_enabled", False)),
             split_order_threshold=Decimal(str(
                 getattr(strat, "split_order_threshold", None) or "500000")),
+            split_order_count=getattr(strat, "split_order_count", None),
+            split_order_min_qty=getattr(strat, "split_order_min_qty", None),
+            split_order_interval_seconds=getattr(
+                strat, "split_order_interval_seconds", None),
+            split_order_interval_jitter=bool(
+                getattr(strat, "split_order_interval_jitter", False)),
+            split_order_volume_pct=getattr(strat, "split_order_volume_pct", None),
             risk_timing=getattr(strat, "risk_timing", None) or "next_day",
             signal_frequency=strat.signal_frequency,
             signal_at=strat.signal_at,

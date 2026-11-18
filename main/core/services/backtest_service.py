@@ -664,7 +664,10 @@ STRATEGY_SNAPSHOT_FIELDS = (
     "regime_filter_enabled", "trend_trailing_stop_ratio", "trend_max_positions",
     "exposure_cap_enabled", "risk_timing",
     "max_order_amount", "requote_enabled", "requote_max_attempts",
+    "requote_price_mode", "requote_max_slippage_ticks",
     "split_order_enabled", "split_order_threshold",
+    "split_order_count", "split_order_min_qty", "split_order_interval_seconds",
+    "split_order_interval_jitter", "split_order_volume_pct",
 )
 
 

@@ -15,6 +15,7 @@ import functools
 import json
 import logging
 import math
+import random
 import threading
 import time
 from collections import OrderedDict
@@ -140,6 +141,55 @@ logger = logging.getLogger(__name__)
 # 卖出类跳过仓位与资金检查，但受「无持仓不卖」「T+1 可用不足拒单」约束。
 # 其它 signal_type 视为不可解析动作：忽略 + 节流告警，绝不猜方向、不默认买入。
 _BUY_SIGNAL_TYPES = (SignalType.OPEN, SignalType.ADD)
+
+
+def plan_split_count(
+    quantity: int, amount: Decimal, threshold: Decimal, *,
+    count: int = 0, min_qty: int = 0,
+    volume_pct: Optional[float] = None, bar_volume: Optional[int] = None,
+) -> int:
+    """H3 切片笔数推导（纯函数，便于聚焦测试）。
+
+    基线：``ceil(成交额 / 阈值)``；可选约束依次叠加：
+    - ``count``：显式指定笔数（>0 覆盖基线）；
+    - ``volume_pct``：单笔 ≤ bar 成交量 × 比例 → 至少需要多少笔；
+    - ``min_qty``：子单不低于最小股数 → 笔数上限；
+    最终夹到 ``[1, quantity]``，未配置任何增强字段时与旧逻辑逐字一致。
+    """
+    if threshold and threshold > 0:
+        n = int((amount / threshold).to_integral_value(rounding=ROUND_CEILING))
+    else:
+        n = 1
+    if count and count > 0:
+        n = int(count)
+    if volume_pct and float(volume_pct) > 0 and bar_volume:
+        cap_shares = int(int(bar_volume) * float(volume_pct))
+        if cap_shares > 0:
+            n = max(n, int(math.ceil(quantity / cap_shares)))
+    if min_qty and min_qty > 0:
+        n = min(n, max(1, quantity // int(min_qty)))
+    return max(1, min(n, max(1, int(quantity))))
+
+
+def choose_requote_price(
+    orig_price: Decimal, step: Decimal, is_buy: bool,
+    latest: Optional[Decimal], max_ticks: int,
+) -> Decimal:
+    """H4 追价价格：固定 ±1 tick，或按最新价追且不超过 max_ticks 档。
+
+    无最新价 / max_ticks<=0 时退回 ±1 tick（与旧行为一致）。买入方向只向上
+    追、卖出方向只向下追，且至少追一档——防止把最新价算回原价附近。
+    """
+    base = orig_price + step if is_buy else orig_price - step
+    if latest is None or max_ticks <= 0:
+        return base
+    if is_buy:
+        return min(max(latest + step, orig_price + step),
+                   orig_price + step * max_ticks)
+    return max(min(latest - step, orig_price - step),
+               orig_price - step * max_ticks)
+
+
 _SELL_SIGNAL_TYPES = (SignalType.REDUCE, SignalType.CLOSE)
 # 不可解析动作告警节流：每 50 条打印一次（计数从 1 开始，首条即告警）。
 _UNPARSEABLE_WARN_EVERY = 50
@@ -3373,6 +3423,15 @@ class LiveEngine:
                 continue  # 无原价依据，不盲目追价
             price = (orig_price + step if (lo.trade_type or "").lower() == "buy"
                      else orig_price - step)
+            # H4 自适应追价：adaptive 模式按最新价追（穿一档），但追价幅度不超过
+            # requote_max_slippage_ticks 档，防止行情跳变时变成无限追高/杀跌。
+            if (getattr(ctx, "requote_price_mode", "tick") == "adaptive"):
+                price = choose_requote_price(
+                    orig_price, step,
+                    (lo.trade_type or "").lower() == "buy",
+                    self._latest_price_for_requote(lo.stock_code),
+                    int(getattr(ctx, "requote_max_slippage_ticks", 5) or 0),
+                )
             requote = OrderEvent(
                 strategy_id=lo.strategy_id,
                 portfolio_id=lo.portfolio_strategy_id,
@@ -5088,6 +5147,25 @@ class LiveEngine:
             return int(v) * 100
         except (TypeError, ValueError):
             return None
+
+    def _latest_price_for_requote(self, code: str) -> Optional[Decimal]:
+        """H4 自适应追价价源：最近完成 1m bar 收盘价（与成交量同源）。
+
+        无合成器/无 bar/收盘价非法 → None，调用方回退固定 ±1 tick。
+        """
+        if self._snapshot_synth is None:
+            return None
+        try:
+            bars = self._snapshot_synth.completed_bars([code], 2).get(code) or []
+        except Exception:  # noqa: BLE001
+            return None
+        if not bars:
+            return None
+        try:
+            price = Decimal(str(bars[-1].get("close")))
+        except (ArithmeticError, TypeError, ValueError):
+            return None
+        return price if price > 0 else None
 
     def _apply_volume_cap(self, order, portfolio: Portfolio) -> None:
         """成交量约束（实盘化，对齐回测 #2）：本单股数上限 = 最近完成 1m bar
@@ -9212,8 +9290,14 @@ class LiveEngine:
         amount = order.price * order.quantity
         if amount < threshold:
             return False
-        n = int((amount / threshold).to_integral_value(rounding=ROUND_CEILING))
-        n = min(n, order.quantity)  # 防子单 0 股（阈值极小/股数极少时）
+        vol_pct = getattr(ctx, "split_order_volume_pct", None)
+        bar_vol = self._volume_cap_shares(order.stock_code) if vol_pct else None
+        n = plan_split_count(
+            order.quantity, amount, threshold,
+            count=int(getattr(ctx, "split_order_count", 0) or 0),
+            min_qty=int(getattr(ctx, "split_order_min_qty", 0) or 0),
+            volume_pct=vol_pct, bar_volume=bar_vol,
+        )
         if n <= 1:
             return False
         # 子单量必须整手：A 股（含可转债）买卖申报为 100 股（转债 10 张）整数倍
@@ -9306,6 +9390,10 @@ class LiveEngine:
                 "pending": children[1:],
                 "portfolio": portfolio,
                 "period": period,
+                # H3 子单间隔（成交后额外等待；主循环 60s 粒度）
+                "interval": getattr(ctx, "split_order_interval_seconds", None),
+                "jitter": bool(getattr(ctx, "split_order_interval_jitter", False)),
+                "next_emit_at": 0.0,
             }
             # 子单 1 立即提交（走完整闸门链）。提交返回时落库行必已 commit
             # （submitted 或 rejected），deals 池据行状态续发/中止。
@@ -9393,11 +9481,18 @@ class LiveEngine:
                 )
                 self._split_children.pop(key, None)
                 return
+            if time.monotonic() < float(entry.get("next_emit_at") or 0):
+                # H3 子单间隔未到：本轮不续发，等下次主循环 tick（60s 粒度）
+                return
             nxt = pending.pop(0)
             entry["inflight"] = nxt
             entry["pending"] = pending
             self._submit_one_order(db, portfolio, nxt, entry.get("period"),
                                    emit_signal=False)
+            interval = float(entry.get("interval") or 0)
+            if interval > 0:
+                factor = random.uniform(0.5, 1.5) if entry.get("jitter") else 1.0
+                entry["next_emit_at"] = time.monotonic() + interval * factor
             if self._find_split_child_row(db, nxt) is None:
                 # 续发子单未落库（审批/前置闸门拦截）→ 中止剩余，防队列空转
                 self._abort_split_queue(key, portfolio, nxt, 0, pending,

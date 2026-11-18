@@ -976,8 +976,16 @@ export interface StrategyDetail {
   max_order_amount?: number | null  // 单笔最大买入金额（元），null=不限
   requote_enabled: boolean
   requote_max_attempts: number
+  requote_price_mode: string  // tick|adaptive（H4）
+  requote_max_slippage_ticks: number  // H4 最大追价档数
   split_order_enabled: boolean
   split_order_threshold: number
+  // H3 切片增强（null/0 = 按阈值默认推导）
+  split_order_count: number | null
+  split_order_min_qty: number | null
+  split_order_interval_seconds: number | null
+  split_order_interval_jitter: boolean
+  split_order_volume_pct: number | null
   risk_timing: string  // next_day|immediate
   signal_frequency?: string | null
   signal_at?: string | null
@@ -1013,8 +1021,15 @@ export interface StrategyRequest {
   max_order_amount?: number | null  // 单笔最大买入金额（元），null=不限
   requote_enabled?: boolean
   requote_max_attempts?: number
+  requote_price_mode?: string  // tick|adaptive（H4）
+  requote_max_slippage_ticks?: number
   split_order_enabled?: boolean
   split_order_threshold?: number
+  split_order_count?: number | null
+  split_order_min_qty?: number | null
+  split_order_interval_seconds?: number | null
+  split_order_interval_jitter?: boolean
+  split_order_volume_pct?: number | null
   risk_timing?: string  // next_day|immediate
   signal_frequency?: string | null
   signal_at?: string | null

@@ -88,8 +88,17 @@ class StrategyItem(BaseModel):
     # 实盘执行配置（批次1，默认关/保守默认）
     requote_enabled: bool = False
     requote_max_attempts: int = 2
+    # H4 自适应追价：tick=固定一档（默认）/ adaptive=按最新价追
+    requote_price_mode: str = "tick"
+    requote_max_slippage_ticks: int = 5
     split_order_enabled: bool = False
     split_order_threshold: float = 500000.0
+    # H3 切片增强（None/0 = 按阈值默认推导）
+    split_order_count: int | None = None
+    split_order_min_qty: int | None = None
+    split_order_interval_seconds: float | None = None
+    split_order_interval_jitter: bool = False
+    split_order_volume_pct: float | None = None
     risk_timing: str = "next_day"
     signal_frequency: str | None = None
     signal_at: str | None = None
@@ -252,6 +261,31 @@ def _validate_execution_config(req, label: str = "") -> str | None:
         return f"{label}requote_max_attempts 须在 [0,10]，收到 {req.requote_max_attempts}"
     if req.split_order_threshold < 0:
         return f"{label}split_order_threshold 不能为负，收到 {req.split_order_threshold}"
+    # H3 切片参数：None/0 表示不启用；负数/比例越界会静默改变拆单结果，入口拦截
+    if req.split_order_count is not None and req.split_order_count < 0:
+        return f"{label}split_order_count 不能为负，收到 {req.split_order_count}"
+    if req.split_order_min_qty is not None and req.split_order_min_qty < 0:
+        return f"{label}split_order_min_qty 不能为负，收到 {req.split_order_min_qty}"
+    if (req.split_order_interval_seconds is not None
+            and req.split_order_interval_seconds < 0):
+        return (
+            f"{label}split_order_interval_seconds 不能为负，"
+            f"收到 {req.split_order_interval_seconds}"
+        )
+    if (req.split_order_volume_pct is not None
+            and not (0 < req.split_order_volume_pct <= 1)):
+        return (
+            f"{label}split_order_volume_pct 须在 (0,1]，"
+            f"收到 {req.split_order_volume_pct}"
+        )
+    # H4 自适应追价
+    if req.requote_price_mode not in ("tick", "adaptive"):
+        return f"{label}requote_price_mode 必须为 tick/adaptive，收到 {req.requote_price_mode}"
+    if not (0 <= req.requote_max_slippage_ticks <= 100):
+        return (
+            f"{label}requote_max_slippage_ticks 须在 [0,100]，"
+            f"收到 {req.requote_max_slippage_ticks}"
+        )
     if req.risk_timing not in VALID_RISK_TIMINGS:
         return (
             f"{label}risk_timing 必须为 {sorted(VALID_RISK_TIMINGS)}，"
@@ -519,8 +553,17 @@ class StrategyCreate(BaseModel):
     # 实盘执行配置（批次1，默认关/保守默认）
     requote_enabled: bool = False
     requote_max_attempts: int = 2
+    # H4 自适应追价：tick=固定一档（默认）/ adaptive=按最新价追
+    requote_price_mode: str = "tick"
+    requote_max_slippage_ticks: int = 5
     split_order_enabled: bool = False
     split_order_threshold: float = 500000.0
+    # H3 切片增强（None/0 = 按阈值默认推导）
+    split_order_count: int | None = None
+    split_order_min_qty: int | None = None
+    split_order_interval_seconds: float | None = None
+    split_order_interval_jitter: bool = False
+    split_order_volume_pct: float | None = None
     risk_timing: str = "next_day"
     signal_frequency: str | None = None
     signal_at: str | None = None

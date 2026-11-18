@@ -211,8 +211,15 @@ const STRATEGY_GROUPS: { title: string; hint?: string; fields: FieldMeta[] }[] =
     { key: 'max_order_amount', label: '单笔最大金额（元）', span: 1, type: 'number', placeholder: '留空=不限', hint: 'BUY 审批金额超此值缩量到整手股数（回测/实盘双端生效）' },
     { key: 'requote_enabled', label: '撤单追价重下', span: 1, type: 'switch', hint: '超时撤单成功后剩余量按 1 个最小报价单位追价重下（买 +1 tick / 卖 −1 tick）。仅当引擎按 cancel_unfilled_minutes 主动超时撤单、且该单收敛为 canceled 才触发；GUI 手动撤单、收盘自动撤单不触发' },
     { key: 'requote_max_attempts', label: '追价重下次数', span: 1, type: 'number', placeholder: '2', hint: '对应 requote_max_attempts（0–10，默认 2）。与「撤单追价重下」是同一套参数的两个字段（开关 + 次数上限），不是「撤单重试次数」' },
+    { key: 'requote_price_mode', label: '追价价源', span: 1, type: 'select', options: 'requotePriceModes', hint: 'tick=固定追 1 个最小变动价（原行为）；adaptive=按最新 1m 收盘价追，但不超过「最大追价档数」' },
+    { key: 'requote_max_slippage_ticks', label: '最大追价档数', span: 1, type: 'number', placeholder: '5', hint: 'adaptive 模式下追价幅度上限（0–100 档）；0 等同 tick 行为' },
     { key: 'split_order_enabled', label: '大额拆单', span: 1, type: 'switch', hint: '单笔金额超阈值时拆单（TDX 通道，批次2 接线）' },
     { key: 'split_order_threshold', label: '拆单阈值（元）', span: 1, type: 'number', placeholder: '500000' },
+    { key: 'split_order_count', label: '切片笔数', span: 1, type: 'number', placeholder: '留空=按阈值推导', hint: '显式指定拆单笔数；留空/0 按「成交额 ÷ 阈值」向上取整' },
+    { key: 'split_order_min_qty', label: '子单最小量（股）', span: 1, type: 'number', placeholder: '留空=不限', hint: '每笔不低于该股数，超过则减少拆单笔数' },
+    { key: 'split_order_interval_seconds', label: '子单间隔（秒）', span: 1, type: 'number', placeholder: '留空=成交驱动立即续发', hint: '成交后额外等待再发下一笔；受主循环 60s 粒度限制' },
+    { key: 'split_order_interval_jitter', label: '间隔随机化', span: 1, type: 'switch', hint: '间隔按 0.5–1.5 倍随机，避免固定节奏被识别' },
+    { key: 'split_order_volume_pct', label: '单笔量占 bar 比例', span: 1, type: 'number', placeholder: '留空=不限', hint: '0–1：单笔不超过最近完成 1m bar 成交量 × 比例；与阈值共同决定笔数（取更大）' },
     { key: 'risk_timing', label: '风控执行时点', span: 2, type: 'select', options: 'riskTimings', hint: '按子策略生效（不是全局），仅实盘生效、回测不读该键。next_day=次一交易日执行：盘前集合竞价开启时优先在 09:15–09:20（截止 pre_open_auction_end_time）报出，未报成才回落到首根分钟 bar（约 09:31）；immediate=当 bar 即提交。只有 1d/1w/1mon 且 bar_time 为 00:00 的日线信号才进这道闸——分钟周期策略的风控单 signal_bar_date 为空，两种取值没有差别' },
   ]},
 ]
@@ -231,7 +238,11 @@ function emptyStrategyForm(): Record<string, any> {
     exposure_cap_enabled: false,
     max_order_amount: null,
     requote_enabled: false, requote_max_attempts: 2,
+    requote_price_mode: 'tick', requote_max_slippage_ticks: 5,
     split_order_enabled: false, split_order_threshold: 500000,
+    split_order_count: null, split_order_min_qty: null,
+    split_order_interval_seconds: null, split_order_interval_jitter: false,
+    split_order_volume_pct: null,
     risk_timing: 'next_day',
     signal_frequency: null, signal_at: '', signal_weekday: null, signal_data_end: null,
   }
@@ -489,6 +500,20 @@ function validateStrategyPayload(p: Record<string, unknown>): string | null {
   if (moa !== null && moa <= 0) return '单笔最大金额须大于 0'
   const sot = num(p.split_order_threshold)
   if (sot !== null && sot < 0) return '拆单阈值不能为负'
+  // H3/H4：切片与自适应追价（与后端 _validate_execution_config 同口径）
+  const soc = num(p.split_order_count)
+  if (soc !== null && soc < 0) return '切片笔数不能为负'
+  const somq = num(p.split_order_min_qty)
+  if (somq !== null && somq < 0) return '子单最小量不能为负'
+  const soi = num(p.split_order_interval_seconds)
+  if (soi !== null && soi < 0) return '子单间隔不能为负'
+  const sovp = num(p.split_order_volume_pct)
+  if (sovp !== null && !(sovp > 0 && sovp <= 1)) return '单笔量占 bar 比例须在 (0,1]'
+  if (p.requote_price_mode && !['tick', 'adaptive'].includes(String(p.requote_price_mode))) {
+    return '追价价源须为 tick 或 adaptive'
+  }
+  const rms = num(p.requote_max_slippage_ticks)
+  if (rms !== null && !(rms >= 0 && rms <= 100)) return '最大追价档数须在 [0,100]'
   if (p.risk_timing && !['next_day', 'immediate'].includes(String(p.risk_timing))) {
     return '风控执行时点须为 next_day 或 immediate'
   }
@@ -631,8 +656,15 @@ function openEditStrategy(pid: number, s: StrategyDetail) {
     max_order_amount: s.max_order_amount ?? null,
     requote_enabled: s.requote_enabled ?? false,
     requote_max_attempts: s.requote_max_attempts ?? 2,
+    requote_price_mode: s.requote_price_mode ?? 'tick',
+    requote_max_slippage_ticks: s.requote_max_slippage_ticks ?? 5,
     split_order_enabled: s.split_order_enabled ?? false,
     split_order_threshold: s.split_order_threshold ?? 500000,
+    split_order_count: s.split_order_count ?? null,
+    split_order_min_qty: s.split_order_min_qty ?? null,
+    split_order_interval_seconds: s.split_order_interval_seconds ?? null,
+    split_order_interval_jitter: s.split_order_interval_jitter ?? false,
+    split_order_volume_pct: s.split_order_volume_pct ?? null,
     risk_timing: s.risk_timing ?? 'next_day',
     signal_frequency: s.signal_frequency ?? null,
     signal_at: s.signal_at ?? '',
@@ -715,6 +747,10 @@ function optionsOf(src: string | undefined, pid?: number) {
   if (src === 'positionSizings') return POSITION_SIZINGS.map(s => ({ value: s.value, label: s.label }))
   if (src === 'dailyLossBases') return DAILY_LOSS_BASES.map(s => ({ value: s.value, label: s.label }))
   if (src === 'riskTimings') return RISK_TIMINGS.map(t => ({ value: t.value, label: t.label }))
+  if (src === 'requotePriceModes') return [
+    { value: 'tick', label: '固定 1 档（原行为）' },
+    { value: 'adaptive', label: '按最新价自适应（受最大档数限制）' },
+  ]
   if (src === 'gateEngines') return MARKET_GATE_ENGINES.map(e => ({ value: e.value, label: e.label }))
   if (src === 'signalFrequencies') return [
     { value: null, label: '跟随周期（period）' },

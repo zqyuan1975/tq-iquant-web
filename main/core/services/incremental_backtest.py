@@ -483,7 +483,10 @@ def params_hash(ps, dividend_mode: str, db: Optional[Session] = None,
 # （max_order_amount/requote/split_order）不影响回测结果（旧口径）。
 _FP_EXCLUDED_FIELDS = frozenset({
     "name", "max_order_amount", "requote_enabled", "requote_max_attempts",
+    "requote_price_mode", "requote_max_slippage_ticks",
     "split_order_enabled", "split_order_threshold",
+    "split_order_count", "split_order_min_qty", "split_order_interval_seconds",
+    "split_order_interval_jitter", "split_order_volume_pct",
 })
 _FP_STRATEGY_FIELDS = tuple(
     f for f in STRATEGY_SNAPSHOT_FIELDS if f not in _FP_EXCLUDED_FIELDS)

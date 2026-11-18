@@ -56,6 +56,16 @@ def serialize_strategy(s: Strategy) -> dict:
         "requote_max_attempts": s.requote_max_attempts if s.requote_max_attempts is not None else 2,
         "split_order_enabled": bool(s.split_order_enabled) if s.split_order_enabled is not None else False,
         "split_order_threshold": float(s.split_order_threshold) if s.split_order_threshold is not None else 500000.0,
+        # H3/H4 切片与自适应追价
+        "split_order_count": s.split_order_count,
+        "split_order_min_qty": s.split_order_min_qty,
+        "split_order_interval_seconds": s.split_order_interval_seconds,
+        "split_order_interval_jitter": bool(s.split_order_interval_jitter),
+        "split_order_volume_pct": s.split_order_volume_pct,
+        "requote_price_mode": s.requote_price_mode or "tick",
+        "requote_max_slippage_ticks": (
+            s.requote_max_slippage_ticks
+            if s.requote_max_slippage_ticks is not None else 5),
         "risk_timing": s.risk_timing or "next_day",
         "signal_frequency": s.signal_frequency,
         "signal_at": s.signal_at,
@@ -268,8 +278,15 @@ def _create_strategies_two_step(db: Session, pid: int, strategies: list) -> None
             max_order_amount=getattr(s, "max_order_amount", None),
             requote_enabled=getattr(s, "requote_enabled", False),
             requote_max_attempts=getattr(s, "requote_max_attempts", 2),
+            requote_price_mode=getattr(s, "requote_price_mode", None) or "tick",
+            requote_max_slippage_ticks=getattr(s, "requote_max_slippage_ticks", 5) or 5,
             split_order_enabled=getattr(s, "split_order_enabled", False),
             split_order_threshold=getattr(s, "split_order_threshold", 500000.0),
+            split_order_count=getattr(s, "split_order_count", None),
+            split_order_min_qty=getattr(s, "split_order_min_qty", None),
+            split_order_interval_seconds=getattr(s, "split_order_interval_seconds", None),
+            split_order_interval_jitter=getattr(s, "split_order_interval_jitter", False),
+            split_order_volume_pct=getattr(s, "split_order_volume_pct", None),
             risk_timing=getattr(s, "risk_timing", None) or "next_day",
             signal_frequency=getattr(s, "signal_frequency", None),
             signal_at=getattr(s, "signal_at", None),
@@ -406,6 +423,14 @@ def _apply_strategy_fields(s: Strategy, req, is_update: bool = False) -> None:
     s.requote_max_attempts = getattr(req, "requote_max_attempts", 2)
     s.split_order_enabled = getattr(req, "split_order_enabled", False)
     s.split_order_threshold = getattr(req, "split_order_threshold", 500000.0)
+    # H3/H4：None 表示沿用默认推导（切片笔数/最小量/间隔/量比）
+    s.split_order_count = getattr(req, "split_order_count", None)
+    s.split_order_min_qty = getattr(req, "split_order_min_qty", None)
+    s.split_order_interval_seconds = getattr(req, "split_order_interval_seconds", None)
+    s.split_order_interval_jitter = getattr(req, "split_order_interval_jitter", False)
+    s.split_order_volume_pct = getattr(req, "split_order_volume_pct", None)
+    s.requote_price_mode = getattr(req, "requote_price_mode", None) or "tick"
+    s.requote_max_slippage_ticks = getattr(req, "requote_max_slippage_ticks", 5) or 5
     s.risk_timing = getattr(req, "risk_timing", None) or "next_day"
     s.signal_frequency = getattr(req, "signal_frequency", None)
     s.signal_at = getattr(req, "signal_at", None)
