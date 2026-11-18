@@ -18,6 +18,7 @@ from core.services.html_report import build_html_report
 from core.services.backtest_export import (
     CSV_KINDS, PdfExportUnavailable, build_csv, html_to_pdf,
 )
+from core.services.signal_replay import replay_signals as _svc_replay_signals
 
 router = APIRouter(prefix="/api/backtest", tags=["backtest"])
 
@@ -134,6 +135,15 @@ class CompareRecordsRequest(BaseModel):
     record_ids: List[int]
 
 
+class SignalReplayRequest(BaseModel):
+    """N3 信号回放校验：同组合同区间重算信号，可选与实盘会话委托对照。"""
+    portfolio_strategy_id: int
+    start_date: date
+    end_date: date
+    dividend_mode: str = "front"
+    session_id: int | None = None
+
+
 class WalkForwardRequest(BaseModel):
     """C8 walk-forward 滚动验证：滚动 train_years 年训练 + test_years 年验证逐段前移，
     每窗子回测过 IS/OOS 门槛（C7 同一判定），全窗 passed 才 overall_pass。"""
@@ -230,6 +240,21 @@ def compare_records(req: CompareRecordsRequest, db: Session = Depends(get_db)):
     记录不存在 → 404，条数越界/不足 → 400。
     """
     payload, msg = _svc_compare_records(db, req.record_ids)
+    if payload is None:
+        return err(404 if msg and "不存在" in msg else 400, msg)
+    return ok(payload)
+
+
+@router.post("/signal-replay")
+def signal_replay(req: SignalReplayRequest, db: Session = Depends(get_db)):
+    """N3 信号回放校验：重算区间信号，可选与实盘会话委托按 (日期,股票,方向) 对照。
+
+    只读、不落库；组合不存在 → 404，日期区间非法 → 400。
+    """
+    payload, msg = _svc_replay_signals(
+        db, req.portfolio_strategy_id, req.start_date, req.end_date,
+        dividend_mode=req.dividend_mode, session_id=req.session_id,
+    )
     if payload is None:
         return err(404 if msg and "不存在" in msg else 400, msg)
     return ok(payload)

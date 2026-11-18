@@ -2276,6 +2276,58 @@ export async function getTheoryVsLive(
   return res.data.data
 }
 
+// ---- N3 信号回放校验 ----
+export interface SignalReplayRow {
+  bar_time: string
+  date: string | null
+  strategy_id: number
+  stock_code: string
+  signals: Array<{ name: string; signal_type: string | null; value: number }>
+  directions: string[]
+}
+
+export interface SignalReplayResult {
+  portfolio_strategy_id: number
+  portfolio_name: string
+  start_date: string
+  end_date: string
+  dividend_mode: string
+  session_id: number | null
+  rows: SignalReplayRow[]
+  summary: {
+    signal_bars: number
+    signals: number
+    by_date: Array<{ date: string; count: number }>
+    by_strategy: Record<string, number>
+    by_stock: Array<{ stock_code: string; count: number }>
+  }
+  comparison: null | {
+    session_id: number
+    replay_keys: number
+    live_order_keys: number
+    matched: number
+    only_replay_count: number
+    only_live_count: number
+    only_replay: Array<{ date: string; stock_code: string; trade_type: string }>
+    only_live: Array<{ date: string; stock_code: string; trade_type: string }>
+    truncated: boolean
+    note: string
+  }
+  warnings: string[]
+}
+
+export async function replaySignals(payload: {
+  portfolio_strategy_id: number
+  start_date: string
+  end_date: string
+  dividend_mode?: string
+  session_id?: number | null
+}) {
+  const res = await api.post<ApiResponse<SignalReplayResult>>(
+    '/backtest/signal-replay', payload)
+  return res.data.data
+}
+
 // ---- 外部现金流台账（入金/出金/分红/其他）----
 export type LiveCashFlowType = 'deposit' | 'withdraw' | 'dividend' | 'other'
 

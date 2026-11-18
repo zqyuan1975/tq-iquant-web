@@ -7,11 +7,13 @@ import {
   cancelBacktestRecord,
   recomputeRobustness, recomputePersistenceAnalysis, getStockPools, compareBacktestPools,
   compareBacktestRecords,
+  replaySignals,
   sendUserBlock,
 } from '../api'
 import type {
   BacktestRecordItem, BacktestDetailItem, PortfolioItem,
   BacktestCompareResult,
+  SignalReplayResult,
   BacktestEvaluationItem, DecisionSummaryItem, DecisionEventItem,
   CrisisAlphaData, CrisisAlphaBenchmarkResolution,
   MarketRegimeData, MarketRegimeStateRow,
@@ -1009,6 +1011,80 @@ function closeRecordCompare() {
   recordCompareData.value = null
   recordCompareError.value = ''
   if (recordCompareChart) { recordCompareChart.dispose(); recordCompareChart = null }
+}
+
+// ---- N3 信号回放校验（重算信号 + 可选与实盘委托对照）----
+const showReplay = ref(false)
+const replayLoading = ref(false)
+const replayError = ref('')
+const replayResult = ref<SignalReplayResult | null>(null)
+// 回放结果行数可能很多（逐 bar × 股票 × 策略），前端先截断展示
+const REPLAY_ROW_LIMIT = 300
+const replayForm = ref({
+  portfolio_strategy_id: 0,
+  start_date: '',
+  end_date: '',
+  dividend_mode: 'front',
+  session_id: '' as number | string,
+})
+
+/** 相对今天偏移 N 天的 ISO 日期（仅供回放默认区间）。 */
+function _isoDay(offsetDays: number): string {
+  const d = new Date()
+  d.setDate(d.getDate() + offsetDays)
+  return d.toISOString().slice(0, 10)
+}
+
+function openReplay() {
+  replayError.value = ''
+  replayResult.value = null
+  if (!replayForm.value.start_date) replayForm.value.start_date = _isoDay(-30)
+  if (!replayForm.value.end_date) replayForm.value.end_date = _isoDay(0)
+  showReplay.value = true
+}
+
+async function runReplay() {
+  const f = replayForm.value
+  if (!f.portfolio_strategy_id) { replayError.value = '请选择组合策略'; return }
+  if (!f.start_date || !f.end_date) { replayError.value = '请填写起止日期'; return }
+  if (f.start_date > f.end_date) { replayError.value = '开始日期不能晚于结束日期'; return }
+  replayError.value = ''
+  replayResult.value = null
+  replayLoading.value = true
+  try {
+    replayResult.value = await replaySignals({
+      portfolio_strategy_id: f.portfolio_strategy_id,
+      start_date: f.start_date,
+      end_date: f.end_date,
+      dividend_mode: f.dividend_mode,
+      session_id: f.session_id === '' ? null : Number(f.session_id),
+    })
+  } catch (e) {
+    replayError.value = '回放失败：' + errMsg(e)
+  } finally {
+    replayLoading.value = false
+  }
+}
+
+function closeReplay() {
+  showReplay.value = false
+  replayResult.value = null
+  replayError.value = ''
+}
+
+const replayRows = computed(() =>
+  (replayResult.value?.rows ?? []).slice(0, REPLAY_ROW_LIMIT))
+
+function replayStrategyName(id: number): string {
+  for (const p of portfolios.value) {
+    const s = (p.strategies || []).find(it => it.id === id)
+    if (s) return s.name
+  }
+  return `#${id}`
+}
+
+function replayDirectionText(d: string): string {
+  return d === 'BUY' ? '买入' : d === 'SELL' ? '卖出' : d
 }
 
 // ---- K5 成本与容量（详情接口现算块）----
@@ -3136,6 +3212,10 @@ watch(theme, () => {
               title="勾选 2~10 条已完成记录，对比净值曲线 / 指标 / 参数 / 成交差异">
         对比所选{{ recordCompareSelected.length ? ` (${recordCompareSelected.length})` : '' }}
       </button>
+      <button class="btn btn-sm" @click="openReplay"
+              title="重算指定组合区间的公式信号，可选与实盘委托按日期/股票/方向对照">
+        信号回放
+      </button>
       <button @click="openForm" class="btn btn-primary">+ 发起回测</button>
     </PageHeader>
 
@@ -3288,6 +3368,184 @@ watch(theme, () => {
         </div>
         <div class="modal-actions">
           <button class="btn" @click="closeRecordCompare">关闭</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- N3 信号回放校验 Modal -->
+    <div v-if="showReplay" class="modal-overlay modal-lg" @click.self="closeReplay">
+      <div class="modal-content">
+        <div style="display:flex;align-items:center;justify-content:space-between;gap:8px">
+          <h3 style="margin:0">信号回放校验</h3>
+          <button class="btn btn-sm" @click="closeReplay">关闭</button>
+        </div>
+        <div class="modal-body">
+          <p class="note" style="margin-top:0">
+            按所选组合与区间重拉行情、重算公式信号；填写实盘会话 ID 后，额外与
+            `live_orders`（按 日期/股票/方向）对照，区分「疑似漏单」与「口径/人工单」。
+          </p>
+          <div class="field-grid">
+            <div class="field-row field-span-2">
+              <span class="field-label">组合</span>
+              <select v-model="replayForm.portfolio_strategy_id">
+                <option :value="0" disabled>请选择组合</option>
+                <option v-for="p in portfolios" :key="p.id" :value="p.id">{{ p.name }}</option>
+              </select>
+            </div>
+            <div class="field-row">
+              <span class="field-label">开始日期</span>
+              <input v-model="replayForm.start_date" type="date" />
+            </div>
+            <div class="field-row">
+              <span class="field-label">结束日期</span>
+              <input v-model="replayForm.end_date" type="date" />
+            </div>
+            <div class="field-row">
+              <span class="field-label">复权模式</span>
+              <select v-model="replayForm.dividend_mode">
+                <option value="front">前复权（默认）</option>
+                <option value="back">后复权</option>
+                <option value="dual">前复权+后复权记账</option>
+              </select>
+            </div>
+            <div class="field-row">
+              <span class="field-label">实盘会话 ID</span>
+              <input v-model="replayForm.session_id" type="number" min="1"
+                     placeholder="可留空：只回放不对照" />
+            </div>
+          </div>
+          <div style="display:flex;gap:8px;margin:8px 0 12px">
+            <button class="btn btn-primary btn-sm" :disabled="replayLoading" @click="runReplay">
+              {{ replayLoading ? '回放中…' : '开始回放' }}
+            </button>
+          </div>
+          <div v-if="replayError" style="color:var(--red);margin-bottom:8px">{{ replayError }}</div>
+
+          <template v-if="replayResult">
+            <div v-if="replayResult.warnings.length" class="form-hint"
+                 style="color:var(--orange);margin-bottom:8px">
+              <div v-for="(w, i) in replayResult.warnings" :key="i">{{ w }}</div>
+            </div>
+
+            <h4 style="margin:8px 0">回放摘要</h4>
+            <div class="table-container">
+              <table>
+                <tbody>
+                  <tr><td>组合</td><td>{{ replayResult.portfolio_name }}（#{{ replayResult.portfolio_strategy_id }}）</td></tr>
+                  <tr><td>区间</td><td>{{ replayResult.start_date }} ~ {{ replayResult.end_date }}（{{ replayResult.dividend_mode }}）</td></tr>
+                  <tr><td>信号 bar 数</td><td>{{ replayResult.summary.signal_bars }}</td></tr>
+                  <tr><td>信号条数</td><td>{{ replayResult.summary.signals }}</td></tr>
+                  <tr>
+                    <td>按日分布</td>
+                    <td>
+                      <span v-for="(d, i) in replayResult.summary.by_date" :key="i" style="margin-right:10px">
+                        {{ d.date }}：{{ d.count }}
+                      </span>
+                      <span v-if="!replayResult.summary.by_date.length">—</span>
+                    </td>
+                  </tr>
+                  <tr>
+                    <td>按股票（前 20）</td>
+                    <td>
+                      <span v-for="(s, i) in replayResult.summary.by_stock" :key="i" style="margin-right:10px">
+                        {{ s.stock_code }}：{{ s.count }}
+                      </span>
+                      <span v-if="!replayResult.summary.by_stock.length">—</span>
+                    </td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+
+            <template v-if="replayResult.comparison">
+              <h4 style="margin:16px 0 8px">
+                与实盘委托对照（会话 #{{ replayResult.comparison.session_id }}）
+              </h4>
+              <div class="table-container">
+                <table>
+                  <thead>
+                    <tr><th>回放键</th><th>实盘委托键</th><th>一致</th><th>仅回放</th><th>仅实盘</th></tr>
+                  </thead>
+                  <tbody>
+                    <tr>
+                      <td>{{ replayResult.comparison.replay_keys }}</td>
+                      <td>{{ replayResult.comparison.live_order_keys }}</td>
+                      <td>{{ replayResult.comparison.matched }}</td>
+                      <td>{{ replayResult.comparison.only_replay_count }}</td>
+                      <td>{{ replayResult.comparison.only_live_count }}</td>
+                    </tr>
+                  </tbody>
+                </table>
+              </div>
+              <p class="note">{{ replayResult.comparison.note }}</p>
+              <div style="display:flex;gap:12px;align-items:flex-start">
+                <div class="table-container" style="flex:1;max-height:240px;overflow:auto">
+                  <table>
+                    <thead><tr><th>仅回放（疑似漏单）</th></tr></thead>
+                    <tbody>
+                      <tr v-for="(r, i) in replayResult.comparison.only_replay" :key="i">
+                        <td>{{ r.date }} {{ r.stock_code }} {{ replayDirectionText(r.trade_type) }}</td>
+                      </tr>
+                      <tr v-if="!replayResult.comparison.only_replay.length"><td>无</td></tr>
+                    </tbody>
+                  </table>
+                </div>
+                <div class="table-container" style="flex:1;max-height:240px;overflow:auto">
+                  <table>
+                    <thead><tr><th>仅实盘（口径/人工单）</th></tr></thead>
+                    <tbody>
+                      <tr v-for="(r, i) in replayResult.comparison.only_live" :key="i">
+                        <td>{{ r.date }} {{ r.stock_code }} {{ replayDirectionText(r.trade_type) }}</td>
+                      </tr>
+                      <tr v-if="!replayResult.comparison.only_live.length"><td>无</td></tr>
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+              <p v-if="replayResult.comparison.truncated" class="note">
+                差异明细超过 200 条，仅显示前 200 条。
+              </p>
+            </template>
+
+            <h4 style="margin:16px 0 8px">信号明细</h4>
+            <div class="table-container" style="max-height:360px;overflow:auto">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Bar 时间</th><th>日期</th><th>股票</th><th>策略</th>
+                    <th>信号</th><th>方向</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr v-for="(r, i) in replayRows" :key="i">
+                    <td>{{ r.bar_time }}</td>
+                    <td>{{ r.date || '—' }}</td>
+                    <td>{{ r.stock_code }}</td>
+                    <td>{{ replayStrategyName(r.strategy_id) }}</td>
+                    <td>
+                      <span v-for="(s, j) in r.signals" :key="j" style="margin-right:8px">
+                        {{ s.name }}<span v-if="s.signal_type" style="color:var(--ink-faint)">({{ s.signal_type }})</span>
+                      </span>
+                    </td>
+                    <td>
+                      <span v-for="(d, j) in r.directions" :key="j" style="margin-right:6px">
+                        {{ replayDirectionText(d) }}
+                      </span>
+                      <span v-if="!r.directions.length" style="color:var(--ink-faint)">—</span>
+                    </td>
+                  </tr>
+                  <tr v-if="!replayRows.length"><td colspan="6">区间内无触发信号</td></tr>
+                </tbody>
+              </table>
+            </div>
+            <p v-if="replayResult.rows.length > REPLAY_ROW_LIMIT" class="note">
+              共 {{ replayResult.rows.length }} 条，仅展示前 {{ REPLAY_ROW_LIMIT }} 条；
+              请缩小日期区间精确定位。
+            </p>
+          </template>
+        </div>
+        <div class="modal-actions">
+          <button class="btn" @click="closeReplay">关闭</button>
         </div>
       </div>
     </div>
