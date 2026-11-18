@@ -125,6 +125,7 @@ def serialize_portfolio(db: Session, p: PortfolioStrategy) -> dict:
         "delist_force_close_enabled": bool(p.delist_force_close_enabled),
         # 时点股票池（2026-11-18，J7）：按生效区间判定成分，只拦开仓/加仓
         "pool_pit_enabled": bool(p.pool_pit_enabled),
+        "breaker_action": getattr(p, "breaker_action", None) or "halt",
         "status": p.status,
         "created_at": p.created_at,
         "updated_at": p.updated_at,
@@ -223,6 +224,11 @@ def _apply_portfolio_fields(p: PortfolioStrategy, req) -> None:
     # 时点股票池（2026-11-18，J7）：None=请求未携带 → 不动已有值；显式 False 合法
     if getattr(req, "pool_pit_enabled", None) is not None:
         p.pool_pit_enabled = bool(req.pool_pit_enabled)
+    if getattr(req, "breaker_action", None) is not None:
+        action = str(req.breaker_action).strip().lower()
+        if action not in ("notify", "halt", "half", "liquidate"):
+            raise ValueError("breaker_action 需为 notify/halt/half/liquidate")
+        p.breaker_action = action
 
 
 def _create_strategies_two_step(db: Session, pid: int, strategies: list) -> None:

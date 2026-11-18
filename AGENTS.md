@@ -100,6 +100,7 @@ Web 前端 (Vue 3 + Vite + Pinia) ←HTTP/SSE→ Core (FastAPI)
 - **资金模型**：策略资金占比是持仓上限（非预分），多策略上限之和可超过 100%
 - **T+1 约束**：回测强制 T+1，实盘实时查可用股票
 - **熔断规则**：max_drawdown 触发 → 次日恢复（累计触发 3 次后转手动恢复）；daily_loss_limit 触发 → 当日暂停，次日恢复。熔断期间不清仓，仅暂停新开仓
+- **熔断处置动作（D4，2026-11-18）**：`portfolio_strategies.breaker_action` ∈ `notify`/`halt`(默认)/`half`/`liquidate`。触发后 `Portfolio.on_bar` 消费 `pending_disposal` 生成 SELL（回测下一 bar open、实盘当根）；`half` 整手向下取半、不足一手跳过，`liquidate` 全平；`notify` 仍停开仓只额外落 `gate=breaker_action` 事件。写入 `params_snapshot`/增量指纹；默认 `halt` 时两端订单逐字不变
 - **账户级聚合熔断（2026-11-18，默认关闭）**：`live_sessions.account_risk_enabled=1` 时按「Σ 各组合 `risk_equity()`」聚合账户净值，账户最大回撤 / 日亏触发 → 该会话所有组合停新开仓（订单组装后剥 BUY，SELL/风控卖出不受影响），次日自动恢复、累计 3 次转手动（`POST /api/live/sessions/{id}/account-risk/recover`）。60%/80%/100% 分级预警（SSE `risk` + `notify` + `live_decision_events`，`gate=account_risk`）。阈值缺省取 `tq_trade.account_max_drawdown` / `account_daily_loss_limit`（15% / 5%），会话列显式值优先；与组合级熔断独立叠加（任一触发都停开仓）
 - **组合资金日序列（A3，2026-11-18）**：14:30 日终每组合落一行 `live_portfolio_daily`（现金/持仓市值/总市值/风险净值/账户权重/逐仓明细，唯一键 session+portfolio+date，upsert）；`GET /api/live/sessions/{id}/portfolio-daily?days=30` 回看。只做观测，不参与账务或风控判定
 - **风控参数待生效（D3，2026-11-18）**：运行中会话修改组合级 `max_drawdown`/`daily_loss_limit` 或策略级 `stop_loss_ratio`/`take_profit_ratio`/`trailing_stop_ratio` → 写入 `live_session_pending_changes`（pending，同字段覆盖），`start_session` 在建引擎前统一写回并标 applied；未运行会话提交即生效并留 applied 审计。`GET|POST /api/live/sessions/{id}/pending-changes`、`DELETE .../{change_id}`（仅 pending 可放弃）。无 pending 时启动路径与改动前逐字一致

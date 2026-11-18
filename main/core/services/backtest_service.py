@@ -584,6 +584,9 @@ PARAMS_SNAPSHOT_FIELDS = (
     # 风控冷静期（默认 1）：影响开仓时点 → 必须冻结，否则续跑 checkpoint 不因该列
     # 变化作废（params_fingerprint 的 params 分项直接来自本列表）。
     "risk_cooldown_days",
+    # 熔断处置动作（D4，2026-11-18）：notify/halt/half/liquidate 影响触发后的
+    # 卖出行为 → 必须冻结，否则新旧结果不可混比。
+    "breaker_action",
 )
 
 # 复权模式：K线/指数传 dividend_type 字符串（"front"/"back"，通达信 SDK 原样透传）；

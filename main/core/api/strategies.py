@@ -117,6 +117,8 @@ class PortfolioCreate(BaseModel):
     # 时点股票池（2026-11-18，J7）：按 stock_pool_memberships 生效区间判定成分，
     # 只拦开仓/加仓。None=请求未携带（编辑不动已有值 / 新建落默认 False）。
     pool_pit_enabled: bool | None = None
+    # D4（2026-11-18）：熔断处置动作 notify/halt/half/liquidate（None=不改）
+    breaker_action: str | None = None
     initial_capital: float = 500000
     max_drawdown: float = 0.2
     daily_loss_limit: float = 0.05
@@ -309,6 +311,12 @@ def _validate_portfolio(req: PortfolioCreate, db: Session) -> str | None:
             f"daily_loss_basis 必须为 {sorted(VALID_DAILY_LOSS_BASIS)}，"
             f"收到 {req.daily_loss_basis}"
         )
+    # D4 熔断处置动作：None=不改；显式值白名单
+    breaker_action = getattr(req, "breaker_action", None)
+    if breaker_action is not None and breaker_action not in (
+            "notify", "halt", "half", "liquidate"):
+        return ("breaker_action 必须为 notify/halt/half/liquidate，"
+                f"收到 {breaker_action!r}")
     if req.cash_enhance_position_ratio_threshold is not None and not (
         0 < req.cash_enhance_position_ratio_threshold <= 1
     ):

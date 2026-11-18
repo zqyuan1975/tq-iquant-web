@@ -87,6 +87,11 @@ class PortfolioStrategy(Base):
     # 生效区间判定当日成分，只拦 OPEN/ADD；关闭（默认）不读成员表，选股范围仍是
     # stock_pool_stocks 当前成分，行为与改动前逐字一致。
     pool_pit_enabled = Column(Boolean, default=False, server_default="0", nullable=False)
+    # 熔断处置动作（D4，2026-11-18）：notify 只通知（仍停开仓）/halt 停开仓（默认）
+    # /half 减半仓 /liquidate 清仓。触发后本 bar 生成 SELL（回测下一 bar open，
+    # 实盘当根提交），并写入 params_snapshot 冻结口径。
+    breaker_action = Column(String(16), default="halt", server_default="halt",
+                            nullable=False)
     status = Column(String(10), default="active", server_default="active", nullable=False)
     created_at = Column(DateTime, server_default=func.now())
     updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())

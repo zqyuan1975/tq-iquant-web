@@ -59,9 +59,18 @@ class StrategyRiskManager:
 
 
 class PortfolioRiskManager:
-    def __init__(self, max_drawdown: Decimal, daily_loss_limit: Decimal):
+    def __init__(self, max_drawdown: Decimal, daily_loss_limit: Decimal,
+                 breaker_action: str = "halt"):
         self.max_drawdown = max_drawdown
         self.daily_loss_limit = daily_loss_limit
+        # D4（2026-11-18）：熔断/日亏触发后的处置动作（默认 halt = 仅停开仓）。
+        # notify = 只通知（不自动处置仓位，仍停开仓）；half = 减半仓；liquidate = 清仓。
+        # 具体卖单由 Portfolio.on_bar 在本 bar 消费 pending_disposal 生成，
+        # 回测/实盘同源（回测按下一 bar open 成交，实盘当根提交）。
+        self.breaker_action = breaker_action or "halt"
+        if self.breaker_action not in ("notify", "halt", "half", "liquidate"):
+            self.breaker_action = "halt"
+        self.pending_disposal: Optional[str] = None
         self.consecutive_drawdown_triggers = 0
         self.circuit_breaker_active = False
         # 熔断接线新增状态（AGENTS.md §88）
@@ -224,6 +233,18 @@ class PortfolioRiskManager:
                 self.consecutive_drawdown_triggers += 1
                 if self.consecutive_drawdown_triggers >= 3:
                     self.manual_recovery = True
+                if self.breaker_action in ("half", "liquidate"):
+                    self.pending_disposal = self.breaker_action
+                elif self.breaker_action == "notify":
+                    self.recorder.record(
+                        gate="breaker_action", layer="portfolio_risk",
+                        action="notify",
+                        portfolio_id=(self.portfolio_id
+                                      if self.portfolio_id is not None else 0),
+                        bar_time=_midnight(current_date),
+                        param_name="breaker_action",
+                        message="max_drawdown 触发，处置动作=notify（不自动减仓）",
+                    )
                 self._record_halt(
                     "max_drawdown", "max_drawdown", self.max_drawdown, drawdown,
                     current_date,
@@ -291,6 +312,18 @@ class PortfolioRiskManager:
                 self.daily_loss_trigger_date = current_date
                 # P1-1：实盘 14:30 传 resume_after=次一交易日 → 暂停覆盖次日整日
                 self.daily_pause_resume_after = resume_after
+                if self.breaker_action in ("half", "liquidate"):
+                    self.pending_disposal = self.breaker_action
+                elif self.breaker_action == "notify":
+                    self.recorder.record(
+                        gate="breaker_action", layer="portfolio_risk",
+                        action="notify",
+                        portfolio_id=(self.portfolio_id
+                                      if self.portfolio_id is not None else 0),
+                        bar_time=_midnight(current_date),
+                        param_name="breaker_action",
+                        message="daily_loss 触发，处置动作=notify（不自动减仓）",
+                    )
                 self._record_halt(
                     "daily_loss", "daily_loss_limit", self.daily_loss_limit, loss,
                     current_date,

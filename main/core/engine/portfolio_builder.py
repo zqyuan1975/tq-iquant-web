@@ -52,6 +52,8 @@ def assemble_portfolio(
     pm = PortfolioRiskManager(
         max_drawdown=Decimal(str(ps.max_drawdown)),
         daily_loss_limit=Decimal(str(ps.daily_loss_limit)),
+        # D4（2026-11-18）：熔断/日亏处置动作，默认 halt（仅停开仓）
+        breaker_action=getattr(ps, "breaker_action", None) or "halt",
     )
     # 日内亏损熔断分母：equity（默认）=上一交易日收盘净值；initial=初始资金（旧口径）。
     # 回测/实盘共用，故口径在此统一注入。

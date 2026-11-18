@@ -451,7 +451,7 @@ class Portfolio:
         )
         if rot_cap:
             self._feed_price_history(bar, rot_cap + 2)
-        orders: List[OrderEvent] = []
+        orders: List[OrderEvent] = self._breaker_disposal_orders(bar)
         for ctx in self.strategies:
             skip_risk = (inflight_risk_sells or {}).get(ctx.strategy_id) or set()
             if period is not None and ctx.period != period:
@@ -546,6 +546,62 @@ class Portfolio:
                             o.stock_code, o.signal_name),
                     )
             orders = [o for o in orders if o.trade_type != TradeType.BUY]
+        return orders
+
+    def _breaker_disposal_orders(self, bar: BarEvent) -> List[OrderEvent]:
+        """D4（2026-11-18）：熔断/日亏触发后的减半仓或清仓处置单。
+
+        只在 risk_manager.pending_disposal 被置位后的第一根 bar 生成一次；
+        `half` 按整手向下取半（100 股一手，转债按组合 lot），不足一手跳过；
+        `liquidate` 全平。默认 halt/notify 不生成，行为与改动前一致。
+        回测按下一 bar open 成交，实盘当根提交，两端同源。
+        """
+        action = getattr(self.risk_manager, "pending_disposal", None)
+        if action not in ("half", "liquidate"):
+            return []
+        self.risk_manager.pending_disposal = None
+        orders: List[OrderEvent] = []
+        for ctx in self.strategies:
+            for stock_code, pos in self._iter_positions(ctx):
+                quantity = int(getattr(pos, "quantity", 0) or 0)
+                if quantity <= 0:
+                    continue
+                lot = self._lot(stock_code)
+                if action == "liquidate":
+                    sell_qty = quantity
+                else:
+                    sell_qty = ((quantity // 2) // lot) * lot
+                    if sell_qty <= 0:
+                        continue
+                close = (bar.stocks.get(stock_code) or {}).get("close")
+                price = _order_price(bar, stock_code, close)
+                if price is None or price <= 0:
+                    continue
+                orders.append(OrderEvent(
+                    strategy_id=ctx.strategy_id,
+                    portfolio_id=self.portfolio_id,
+                    stock_code=stock_code,
+                    trade_type=TradeType.SELL,
+                    signal_type=SignalType.CLOSE,
+                    signal_name="breaker_%s" % action,
+                    quantity=sell_qty,
+                    price=price,
+                    bar_time=bar.bar_time,
+                    period=bar.period,
+                ))
+                self.recorder.record(
+                    gate="breaker_action", layer="portfolio_risk",
+                    action=action, portfolio_id=self.portfolio_id,
+                    strategy_id=ctx.strategy_id, stock_code=stock_code,
+                    bar_time=bar.bar_time, param_name="breaker_action",
+                    requested_qty=quantity, final_qty=sell_qty,
+                    message="熔断/日亏触发处置（%s）：%s %s → %d 股" % (
+                        action, ctx.strategy_id, stock_code, sell_qty),
+                )
+        if orders:
+            logger.warning(
+                "portfolio %s 熔断处置 %s：生成 %d 个卖出单",
+                self.portfolio_id, action, len(orders))
         return orders
 
     def _process_strategy(
