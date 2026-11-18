@@ -55,3 +55,19 @@ tq_trade:
   cancel_unfilled_minutes: 3
   client_path: ''
   price_mode: my
+# 告警外发（飞书自定义机器人 Webhook）：默认关闭，不填 webhook_url 等于关闭。
+# 只做「熔断/通道离线/账不平/子单丢失/订单未确认/增量回测失败」等既有事件旁路
+# 再发一条，不参与任何交易闸门、不改落库；发送在后台线程、超时 5 秒，失败只写
+# 日志。webhook_url 属敏感信息：只写在本机 config.yaml（该文件不入 git）。
+notify:
+  enabled: false
+  channel: feishu
+  webhook_url: ''
+  # 机器人开启「签名校验」时才需要填；无签名机器人留空
+  secret: ''
+  # info | warn | error | critical（低于该级别不发送）
+  min_level: warn
+  # 同类事件静默期（秒），去重键 =（闸门, 代码, 交易日）
+  silence_seconds: 300
+  # HTTP 超时（秒），实际强制夹在 1~5 秒
+  timeout_seconds: 5

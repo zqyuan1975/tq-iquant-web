@@ -105,6 +105,7 @@ from .market_rules import session_allows_bar, tick_size
 from .decision import DecisionRecorder
 from .regime import CausalRegimeTracker
 from ..config import load_config
+from ..services.notify_service import notify
 from core.models import (
     LiveAccountPositionSnapshot, LiveAccountSnapshot, LiveCashFlow,
     LiveDecisionEvent, LiveBarOrderMark, LiveOrder, LivePositionPeak,
@@ -1554,6 +1555,18 @@ class LiveEngine:
                             % (len(pending), remaining)
                         ),
                         requested_qty=remaining,
+                    )
+                    # 告警外发（旁路）：拆单队列被丢弃（剩余量当天不再提交）
+                    notify(
+                        "warn", "拆单子单丢失（停会话）",
+                        "停会话丢弃拆单队列：剩余 %d 笔子单（%d 股）未提交，"
+                        "不再补发；在途子单由停止撤单/超时 expire 兜底"
+                        % (len(pending), remaining),
+                        gate="split_children_lost",
+                        code=str(getattr(entry.get("portfolio"), "portfolio_id", "")),
+                        trade_date=now_shanghai().date(),
+                        fields={"会话": self.session_id,
+                                "剩余笔数": len(pending), "剩余股数": remaining},
                     )
                 self._split_children.clear()
         # I-5：dispatcher.close 经同一主 executor 执行——在途 tick 持 get_tdx_lock
@@ -3533,6 +3546,17 @@ class LiveEngine:
                         "「现金流」台账" % (fmt_money(real_cash), fmt_money(virtual),
                                            fmt_money(expected), fmt_money(diff))),
         }, persist=True)
+        # 告警外发（旁路）：账不平（只告警不改账），节流口径由既有 10 分钟窗口保证
+        notify(
+            "error", "柜台现金与虚拟账不平",
+            "柜台可用 %s / 虚拟 %s（扣在途冻结后 %s），偏差 %s。仅告警未改账，"
+            "入金/出金请登记「现金流」台账。"
+            % (fmt_money(real_cash), fmt_money(virtual), fmt_money(expected),
+               fmt_money(diff)),
+            gate="cash_diff", code="cash",
+            trade_date=now_shanghai().date(),
+            fields={"会话": self.session_id},
+        )
 
     # ---------------- 真实总资产 vs 虚拟净值（⑥） ----------------
     def virtual_equity(self) -> Decimal:
@@ -3675,6 +3699,16 @@ class LiveEngine:
                             fmt_money(real_total), fmt_money(out_value),
                             fmt_money(virtual), pct * 100)),
         }, persist=True)
+        # 告警外发（旁路）：真实-虚拟净值偏差（每会话只告警一次，不改账）
+        notify(
+            "error", "真实账户与虚拟净值偏差",
+            "真实总资产 %s（剔除池外 %s）与虚拟净值 %s 偏差 %+.2f%%，请人工核对"
+            % (fmt_money(real_total), fmt_money(out_value),
+               fmt_money(virtual), pct * 100),
+            gate="equity_deviation", code="equity",
+            trade_date=now_shanghai().date(),
+            fields={"会话": self.session_id},
+        )
 
     # ---------------- 外部现金流（③） ----------------
     def apply_cash_flow(self, portfolio_id: int, amount: Decimal) -> bool:
@@ -8505,6 +8539,14 @@ class LiveEngine:
                     "final_qty": g["filled"],
                     "message": msg,
                 }, persist=True)
+                # 告警外发（旁路）：重启后拆单队列丢失，剩余量不再提交
+                notify(
+                    "warn", "拆单子单丢失（重启遗留）", msg,
+                    gate="split_children_lost_restart", code=code,
+                    trade_date=now_shanghai().date(),
+                    fields={"会话": self.session_id, "组合": pid,
+                            "剩余未成交": "%d 股" % remaining},
+                )
         except Exception:  # noqa: BLE001 — 观测性校验失败不阻断起账
             db.rollback()
             logger.warning("recover: 拆单一致性校验失败 (session %s)",
@@ -8771,6 +8813,18 @@ class LiveEngine:
                     "（session %s）",
                     lo.trade_type, lo.stock_code, lo.quantity, lo.id,
                     getattr(order, "_deferred_retry_count", 0), self.session_id)
+                # 告警外发（旁路）：点击未生效 → 回 deferred 重排
+                notify(
+                    "error", "订单未确认超时重排",
+                    "%s %s x%s 点击『发送』后 180s 行仍待发送（点击未生效），"
+                    "已回 deferred 重试（第 %d 次重排）。该行仍在通达信「交易信号」"
+                    "窗口待发送，请人工核对后手动『取消』。"
+                    % (lo.trade_type, lo.stock_code, lo.quantity,
+                       getattr(order, "_deferred_retry_count", 0)),
+                    gate="order_unconfirmed", code=lo.stock_code,
+                    trade_date=lo.bar_time.date() if lo.bar_time else None,
+                    fields={"会话": self.session_id, "订单": lo.id},
+                )
             else:
                 logger.warning(
                     "[unconfirmed-recheck] %s %s order_id=%s 行仍待发送但重排次数"
@@ -8778,6 +8832,17 @@ class LiveEngine:
                     "（session %s）",
                     lo.trade_type, lo.stock_code, lo.id,
                     _DEFERRED_RETRY_MAX, self.session_id)
+                # 告警外发（旁路）：重排次数用尽，交 expire
+                notify(
+                    "critical", "订单未确认且重排耗尽",
+                    "%s %s x%s 行仍待发送但重排次数已用尽（%d），将 expire 落 "
+                    "rejected 终态；该行需人工『取消』。"
+                    % (lo.trade_type, lo.stock_code, lo.quantity,
+                       _DEFERRED_RETRY_MAX),
+                    gate="order_unconfirmed_exhausted", code=lo.stock_code,
+                    trade_date=lo.bar_time.date() if lo.bar_time else None,
+                    fields={"会话": self.session_id, "订单": lo.id},
+                )
 
     def _expire_stale_orders(self, db: Session, pending: Optional[list] = None) -> None:
         # 先复核「已受理未认领」的待发送行：仍在待发送 → 回 deferred（不是

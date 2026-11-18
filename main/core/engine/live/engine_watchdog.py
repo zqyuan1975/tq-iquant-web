@@ -41,6 +41,7 @@ from sqlalchemy import func
 from core.config import load_config
 from core.db import SessionLocal
 from core.models import LiveAccountSnapshot, LiveDecisionEvent
+from core.services.notify_service import notify
 
 from .snapshot_bars import default_in_session
 from .timing import now_shanghai
@@ -632,6 +633,19 @@ class EngineWatchdog:
         payload.update(signal.detail)
         logger.error("%s", signal.message)
         self._safe_emit(engine, "risk", payload)
+        # 告警外发（旁路）：只在「进入告警」时发一次（300s 重复周期不再刷屏），
+        # notify 内部另有静默期去重。失败/未启用都不影响监控与交易。
+        if first:
+            notify(
+                "error", "通道离线/停滞",
+                signal.message,
+                gate="channel_%s" % signal.rule,
+                code=channel,
+                trade_date=self._now().date(),
+                fields={"会话": session_id, "通道": channel,
+                        "规则": signal.rule,
+                        "持续": "%d 秒" % int(signal.seconds)},
+            )
         # 单次判定即留痕（不等 300s 重复周期），几分钟闪断也能在库里查到
         if first and signal.rule in _CHANNEL_RULES:
             self._persist_channel_event(
@@ -684,6 +698,14 @@ class EngineWatchdog:
                 session_id, channel, rule, online=True, seconds=seconds,
                 message=("通道恢复：%s（会话 %s，判据=%s，已持续 %d 秒）"
                          % (channel, session_id, rule, int(seconds))))
+        # 告警外发（旁路）：通道恢复（warn 级别，默认 min_level 下可见）
+        notify(
+            "warn", "通道恢复", message,
+            gate="channel_%s_recovered" % rule, code=channel,
+            trade_date=self._now().date(),
+            fields={"会话": session_id, "通道": channel, "规则": rule,
+                    "持续": "%d 秒" % int(seconds)},
+        )
 
     def _recover_if_alerted(self, engine: object, session_id: int, channel: str,
                             channel_probe: bool) -> None:

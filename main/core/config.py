@@ -143,6 +143,25 @@ def _defaults() -> dict:
             "min_free_mb": 500,
             "dir": "data/backup",
         },
+        # 告警外发（core/services/notify_service.py）：默认关闭，未配置时行为与
+        # 接入前逐字一致（不建线程、不发请求）。只做「既有事件旁路再发一条」，
+        # 不参与任何交易闸门、不改落库。发送在独立 daemon 线程内、超时 ≤5 秒，
+        # 失败只写日志（按 600 秒节流），绝不阻塞或回滚交易主链路。
+        #   channel          feishu（目前唯一实现）
+        #   webhook_url      飞书自定义机器人地址（**不要提交进 git**）
+        #   secret           机器人开启「签名校验」时填写；无签名机器人留空
+        #   min_level        info|warn|error|critical，低于该级别全部丢弃
+        #   silence_seconds  同类事件静默期（秒），键=(闸门, 代码, 交易日)
+        #   timeout_seconds  HTTP 超时（秒），强制夹在 1~5 秒
+        "notify": {
+            "enabled": False,
+            "channel": "feishu",
+            "webhook_url": "",
+            "secret": "",
+            "min_level": "warn",
+            "silence_seconds": 300,
+            "timeout_seconds": 5,
+        },
         "iquant_bridge": {
             "simulation": {"base_url": "http://127.0.0.1:8790"},
             "live": {"base_url": "http://127.0.0.1:8791"},

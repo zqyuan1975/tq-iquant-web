@@ -197,10 +197,19 @@ Web 前端 (Vue 3 + Vite + Pinia) ←HTTP/SSE→ Core (FastAPI)
 | `main/core/engine/live/snapshot_bars.py` | 快照合成 1m bar（TQ 盘中分钟线不可得的盘中数据源） |
 | `main/core/runtime.py` | 运行期实例信息 `data/runtime/server.json` + 单实例锁 + 动态端口发现（`/health` 载荷） |
 | `main/core/supervisor.py` | 自带自愈父进程（`--supervise` 父进程 / `--serve` 子进程；探活 + 退避重启 + 孤儿防护） |
+| `main/core/services/notify_service.py` | 告警外发（飞书自定义机器人 Webhook；默认关闭、后台线程、超时 ≤5s、失败只写日志） |
 | `main/desktop.py` | 打包版/桌面壳入口（默认单进程；`--supervise` 自愈；`--serve` 纯后端） |
 | `live/bridge/` | HTTP 桥策略：`iquant_bridge.py`（QMT 通道生产桥，`127.0.0.1:8790`，账号 410038214257 / `STOCK`，**在用**；账户为 **QMT 仿真账户/仿真资金**，切真实资金须改 `ACCOUNT` / `ACCOUNT_TYPE` 并重跑实盘验证）/ `iquant_bridge_live.py`（`8791` + 信用账户 `CREDIT` 410009993017，**非生产、未启用**，仓库保留以维持镜像护栏）/ `goldminer_bridge.py`（掘金量化，掘金终端内运行，`127.0.0.1:7801`）。QMT 与掘金、同花顺、通达信并列为四条生产通道；Core 的 `simulation` / `live` 两个模式位均指向 8790 |
 | `web/` | Vue 3 + Vite 前端 |
 | `config.yaml` | 系统配置（TDX 路径、`ths_ui` / `tq_trade` / `goldminer` / `iquant_bridge` 交易通道） |
+
+## 告警外发（2026-11-18）
+
+- **默认关闭**：`notify.enabled`（默认 `false`）+ `notify.webhook_url` 非空才生效；任一不满足 → `notify()` 立即返回 False（**不建线程、不发请求**），行为与接入前逐字一致。测试/调试用 `TQ_NOTIFY_DISABLED=1` 强制关闭（`conftest.py` 已默认设置，防测试打到真实机器人）。
+- **绝不影响交易主链路**（硬约束）：`main/core/services/notify_service.py` 的 `notify()` 只做「级别过滤 → 静默期去重 → 入队」，HTTP 发送在独立 daemon 线程（队列 `QUEUE_MAX=200`，满则丢弃新事件），超时强制夹 1~5 秒；**所有异常内部吞掉**，失败只写日志且按 600 秒节流。任何接入点都必须在既有事件已经发射/落库**之后**调用，禁止因告警失败改变任何闸门、订单状态机或落库结果。
+- **分级与去重**：`info < warn < error < critical`，低于 `min_level`（默认 `warn`）丢弃；静默期键 = `(gate, code, trade_date)`，`silence_seconds`（默认 300）内同键只发一条。
+- **接入点**（只旁路加一条，不改既有语义）：熔断（`breaker.py` 的 max_drawdown 触发/转手动/自动恢复/手动恢复、daily_loss 触发与次日解除）、通道与桥离线/恢复（`engine_watchdog.py`，只在「进入告警」时发一次）、`cash_diff` 与 `equity_deviation`（`live_engine._note_*`）、拆单子单丢失（`stop` 丢弃队列 / `recover` 重启遗留）、订单未确认超时重排（`_recheck_unconfirmed_pending_rows`，含重排耗尽 `critical`）、增量回测续跑与双跑校验失败（`incremental_backtest._record_scheduler_failure` 旁）。
+- **敏感信息**：`webhook_url` / `secret` **只写本机 `config.yaml`（未入 git）**；`packaging/config.template.yaml` 只留空占位。日志与异常消息经 `mask_sensitive` 脱敏（只留尾部 4~6 位），`_send_one` 失败日志会替换掉文本中出现的完整地址/secret。签名：`timestamp`（秒）+ `sign`=base64(HMAC-SHA256(key=`timestamp\nsecret`, msg=空))。
 
 ## 掘金量化桥（2026-11-04 接入，与 QMT 桥并存）
 

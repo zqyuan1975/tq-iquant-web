@@ -37,6 +37,7 @@ from ...models import LiveSessionPortfolio
 from ..portfolio import Portfolio
 from ..format import fmt_money, fmt_pct
 from ...config import load_config
+from ...services.notify_service import notify
 from .context import EngineContext
 from .timing import now_shanghai
 
@@ -104,6 +105,16 @@ class BreakerService:
                 "(session %s, %s)",
                 portfolio.portfolio_id, self._ctx.session_id, bar_date,
             )
+            # 告警外发（旁路）：熔断自动恢复（用 warn 级别，默认 min_level=warn 下也能收到）
+            notify(
+                "warn", "熔断自动恢复",
+                "组合 %s max_drawdown 熔断已次日自动恢复（解除停新开仓）"
+                % (portfolio.portfolio_id,),
+                gate="breaker_recovered",
+                code=str(portfolio.portfolio_id), trade_date=bar_date,
+                fields={"会话": self._ctx.session_id,
+                        "组合": portfolio.portfolio_id},
+            )
         # H4：熔断计数持久化——update_peak 可能触发 max_drawdown（计数+1），计数变化才落库
         self.persist_count(portfolio, total_value)
 
@@ -162,6 +173,24 @@ class BreakerService:
                     "(累计 %d 次，次日自动恢复) (session %s)",
                     portfolio.portfolio_id, detail, count, self._ctx.session_id,
                 )
+            # 告警外发（旁路，失败/未启用都无副作用）：3 次转手动为 critical
+            notify(
+                "critical" if count >= 3 else "warn",
+                "最大回撤熔断触发",
+                "组合 %s max_drawdown 熔断触发（累计 %d 次）%s"
+                % (portfolio.portfolio_id, count,
+                   "→ 转手动恢复，停新开仓等人工介入" if count >= 3
+                   else "，次日自动恢复"),
+                gate="breaker_max_drawdown",
+                code=str(portfolio.portfolio_id),
+                trade_date=getattr(rm, "breaker_trigger_date", None),
+                fields={
+                    "会话": self._ctx.session_id,
+                    "组合": portfolio.portfolio_id,
+                    "触发次数": "%d 次" % count,
+                    "回撤": detail.strip() or "—",
+                },
+            )
         db = self._ctx.db_session_factory()
         try:
             link = (
@@ -359,6 +388,13 @@ class BreakerService:
             portfolio_id, fmt_money(rm.peak_value) if rm.peak_value is not None else "—",
             reanchored is not None, self._ctx.session_id,
         )
+        # 告警外发（旁路）：人工恢复熔断
+        notify(
+            "warn", "熔断已手动恢复", message,
+            gate="breaker_manual_recovered", code=str(portfolio_id),
+            trade_date=now_shanghai().date(),
+            fields={"会话": self._ctx.session_id, "组合": portfolio_id},
+        )
         return True
 
     # ---------------- 重启读回计数 ----------------
@@ -481,11 +517,33 @@ class BreakerService:
                     "on %s (当日暂停新开仓，次日自动恢复) (session %s)",
                     portfolio.portfolio_id, detail, today, self._ctx.session_id,
                 )
+                # 告警外发（旁路）：日内亏损熔断
+                notify(
+                    "warn", "日内亏损熔断触发",
+                    "组合 %s 日内亏损熔断触发，当日暂停新开仓（次日自动恢复）"
+                    % (portfolio.portfolio_id,),
+                    gate="breaker_daily_loss",
+                    code=str(portfolio.portfolio_id), trade_date=today,
+                    fields={"会话": self._ctx.session_id,
+                            "组合": portfolio.portfolio_id,
+                            "日终市值": fmt_money(total),
+                            "阈值": fmt_pct(portfolio.risk_manager.daily_loss_limit)},
+                )
             elif was_paused and not now_paused:
                 logger.info(
                     "circuit breaker: portfolio %s daily_loss 次日自动恢复 "
                     "on %s (session %s)",
                     portfolio.portfolio_id, today, self._ctx.session_id,
+                )
+                # 告警外发（旁路）：日亏暂停解除
+                notify(
+                    "warn", "日内亏损暂停解除",
+                    "组合 %s 日内亏损熔断已次日自动恢复（解除停新开仓）"
+                    % (portfolio.portfolio_id,),
+                    gate="breaker_daily_loss_recovered",
+                    code=str(portfolio.portfolio_id), trade_date=today,
+                    fields={"会话": self._ctx.session_id,
+                            "组合": portfolio.portfolio_id},
                 )
             # 日终落库风控内存态（每日一次）：重启后可继续沿用同一峰值与暂停基准
             self.persist_risk_state(portfolio)

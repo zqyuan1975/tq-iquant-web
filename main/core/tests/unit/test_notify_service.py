@@ -1,0 +1,323 @@
+"""告警外发通道（飞书 Webhook）单测：**全部 mock，不真发**。
+
+锁定的口径：
+1. 默认关闭 / 无 webhook_url → ``notify()`` 返回 False，不建线程、不发请求；
+2. ``min_level`` 过滤；
+3. 静默期去重键 =（闸门, 代码, 交易日），窗口内不重复、窗口外可再发；
+4. 文本 / 富文本 payload 形状；配置 secret 时带 timestamp+sign；
+5. 发送失败（飞书 code≠0、网络异常）**不抛**，只写日志；
+6. 队列满不阻塞调用方。
+"""
+import json
+import logging
+import queue
+import time
+
+import pytest
+
+from core.services import notify_service as ns
+
+
+# ---------------------------------------------------------------- 假发送端
+class _FakeResp:
+    def __init__(self, payload=None, status_code=200):
+        self.status_code = status_code
+        self._payload = payload if payload is not None else {"code": 0, "msg": "success"}
+
+    def json(self):
+        return self._payload
+
+
+class _FakeClient:
+    """httpx.Client 替身：记录 post 的 json 体。"""
+
+    def __init__(self, payload=None, status_code=200, exc=None):
+        self.calls = []
+        self._payload = payload
+        self._status_code = status_code
+        self._exc = exc
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+    def post(self, url, json=None, **kw):
+        if self._exc is not None:
+            raise self._exc
+        self.calls.append({"url": url, "json": json})
+        return _FakeResp(self._payload, self._status_code)
+
+
+def _cfg(**kw):
+    base = dict(enabled=True, webhook_url="https://example.invalid/hook",
+                secret="", min_level="warn", silence_seconds=300.0,
+                timeout_seconds=5.0)
+    base.update(kw)
+    return ns.NotifyConfig(**base)
+
+
+class _Recorder:
+    """sender_factory 替身：把每条消息记下来（不真发）。"""
+
+    def __init__(self, exc=None):
+        self.sent = []
+        self._exc = exc
+
+    def __call__(self, cfg):
+        return self
+
+    def send_text(self, text):
+        if self._exc is not None:
+            raise self._exc
+        self.sent.append(("text", text))
+        return {"code": 0}
+
+    def send_rich(self, title, lines):
+        if self._exc is not None:
+            raise self._exc
+        self.sent.append(("post", title, list(lines)))
+        return {"code": 0}
+
+
+def _wait(predicate, timeout=3.0):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.01)
+    return predicate()
+
+
+# ---------------------------------------------------------------- 配置解析
+@pytest.fixture(autouse=True)
+def _allow_real_config_parse(monkeypatch):
+    """conftest 会把 TQ_NOTIFY_DISABLED 置 1；本文件要验证真实解析，先清掉。"""
+    monkeypatch.delenv("TQ_NOTIFY_DISABLED", raising=False)
+
+
+def test_env_kill_switch_forces_disabled(monkeypatch):
+    monkeypatch.setenv("TQ_NOTIFY_DISABLED", "1")
+    cfg = ns.from_config({"notify": {"enabled": True,
+                                     "webhook_url": "https://example.invalid/h"}})
+    assert cfg.enabled is False and cfg.usable is False
+
+
+def test_from_config_defaults_closed_when_section_missing():
+    cfg = ns.from_config({})
+    assert cfg.enabled is False and cfg.usable is False
+    assert cfg.min_level == ns.DEFAULT_MIN_LEVEL
+
+
+def test_from_config_clamps_timeout_and_missing_url_is_unusable():
+    cfg = ns.from_config({"notify": {
+        "enabled": True, "webhook_url": "", "timeout_seconds": 60,
+        "silence_seconds": 0, "min_level": "ERROR"}})
+    assert cfg.enabled is True and cfg.usable is False  # 无地址＝关闭
+    assert cfg.timeout_seconds <= 5.0
+    assert cfg.silence_seconds == ns.DEFAULT_SILENCE_SECONDS  # <=0 回退默认
+    assert cfg.min_level == "error"
+
+
+def test_from_config_bad_section_does_not_raise():
+    cfg = ns.from_config({"notify": "not-a-dict"})
+    assert cfg.usable is False
+
+
+# ---------------------------------------------------------------- 关闭/过滤
+def test_notify_is_noop_when_disabled():
+    rec = _Recorder()
+    notifier = ns.Notifier(cfg=_cfg(enabled=False), sender_factory=rec)
+    assert notifier.notify("critical", "t", "m") is False
+    assert notifier._thread is None
+    assert rec.sent == []
+
+
+def test_min_level_filters_out_lower_levels():
+    rec = _Recorder()
+    notifier = ns.Notifier(cfg=_cfg(min_level="error"), sender_factory=rec)
+    try:
+        assert notifier.notify("warn", "t", "m") is False
+        assert notifier.notify("info", "t", "m") is False
+        assert notifier.notify("error", "t", "m") is True
+        assert _wait(lambda: len(rec.sent) == 1)
+    finally:
+        notifier.close()
+
+
+# ---------------------------------------------------------------- 去重
+def test_silence_window_dedupes_same_gate_code_date():
+    rec = _Recorder()
+    notifier = ns.Notifier(cfg=_cfg(), sender_factory=rec)
+    try:
+        assert notifier.notify("error", "t", "m", gate="cash_diff",
+                               code="000001.SZ", trade_date="2026-11-18") is True
+        assert notifier.notify("error", "t", "m", gate="cash_diff",
+                               code="000001.SZ", trade_date="2026-11-18") is False
+        assert _wait(lambda: len(rec.sent) == 1)
+    finally:
+        notifier.close()
+
+
+def test_silence_window_expires_and_different_code_passes():
+    rec = _Recorder()
+    clock = {"t": 1000.0}
+    notifier = ns.Notifier(cfg=_cfg(), sender_factory=rec,
+                           mono_fn=lambda: clock["t"])
+    try:
+        assert notifier.notify("error", "t", "m", gate="cash_diff",
+                               code="A", trade_date="2026-11-18") is True
+        assert notifier.notify("error", "t", "m", gate="cash_diff",
+                               code="B", trade_date="2026-11-18") is True
+        # 静默期内同键再次被拦
+        clock["t"] += 10
+        assert notifier.notify("error", "t", "m", gate="cash_diff",
+                               code="A", trade_date="2026-11-18") is False
+        # 超出静默期后可再发
+        clock["t"] += 400
+        assert notifier.notify("error", "t", "m", gate="cash_diff",
+                               code="A", trade_date="2026-11-18") is True
+        assert _wait(lambda: len(rec.sent) == 3)
+    finally:
+        notifier.close()
+
+
+# ---------------------------------------------------------------- payload
+def test_text_payload_shape():
+    client = _FakeClient()
+    sender = ns.FeishuSender("https://example.invalid/hook",
+                             client_factory=lambda: client)
+    sender.send_text("hello")
+    body = client.calls[0]["json"]
+    assert body == {"msg_type": "text", "content": {"text": "hello"}}
+
+
+def test_rich_payload_shape():
+    client = _FakeClient()
+    sender = ns.FeishuSender("https://example.invalid/hook",
+                             client_factory=lambda: client)
+    sender.send_rich("标题", ["第一行", "第二行"])
+    body = client.calls[0]["json"]
+    post = body["content"]["post"]["zh_cn"]
+    assert body["msg_type"] == "post"
+    assert post["title"] == "标题"
+    assert post["content"] == [[{"tag": "text", "text": "第一行"}],
+                               [{"tag": "text", "text": "第二行"}]]
+
+
+def test_secret_adds_timestamp_and_sign():
+    client = _FakeClient()
+    sender = ns.FeishuSender("https://example.invalid/hook", secret="s3cret",
+                             client_factory=lambda: client)
+    sender.send_text("x")
+    body = client.calls[0]["json"]
+    assert body["timestamp"] and body["sign"]
+    # 签名 = base64(HMAC-SHA256(key=f"{ts}\n{secret}", msg=""))
+    import base64
+    import hashlib
+    import hmac
+    expected = base64.b64encode(hmac.new(
+        ("%s\ns3cret" % body["timestamp"]).encode(), b"",
+        digestmod=hashlib.sha256).digest()).decode()
+    assert body["sign"] == expected
+
+
+# ---------------------------------------------------------------- 失败不影响调用方
+def test_feishu_nonzero_code_raises_notify_error():
+    client = _FakeClient(payload={"code": 19021, "msg": "sign match fail"})
+    sender = ns.FeishuSender("https://example.invalid/hook",
+                             client_factory=lambda: client)
+    with pytest.raises(ns.NotifyError):
+        sender.send_text("x")
+
+
+def test_send_failure_never_propagates_and_throttles_log(caplog):
+    rec = _Recorder(exc=RuntimeError("boom"))
+    notifier = ns.Notifier(cfg=_cfg(), sender_factory=rec)
+    try:
+        with caplog.at_level(logging.WARNING):
+            assert notifier.notify("error", "t", "m", gate="g1") is True
+            assert notifier.notify("error", "t", "m", gate="g2") is True
+            assert _wait(lambda: notifier._last_fail_log > 0)
+            time.sleep(0.1)
+        fails = [r for r in caplog.records if "告警外发失败" in r.getMessage()]
+        assert len(fails) == 1  # 600s 节流：两条失败只打一条
+    finally:
+        notifier.close()
+
+
+def test_network_exception_is_wrapped_as_notify_error():
+    client = _FakeClient(exc=TimeoutError("timed out"))
+    sender = ns.FeishuSender("https://example.invalid/hook",
+                             client_factory=lambda: client)
+    with pytest.raises(ns.NotifyError):
+        sender.send_text("x")
+
+
+# ---------------------------------------------------------------- 敏感信息脱敏
+_FAKE_SECRET = "FAKEsecretABCDEFGH1234"       # 测试用假值（真实 secret 不入库/不入 git）
+_FAKE_URL = "https://example.invalid/hook/abcdef123456"
+
+
+def test_mask_sensitive_keeps_only_tail():
+    masked = ns.mask_sensitive(_FAKE_SECRET)
+    assert masked.startswith("***") and masked.endswith("1234")
+    assert _FAKE_SECRET[:-4] not in masked
+    assert ns.mask_sensitive("") == "—"
+
+
+def test_failure_log_masks_webhook_and_secret(caplog):
+    rec = _Recorder(exc=RuntimeError("connect failed to %s (secret %s)"
+                                     % (_FAKE_URL, _FAKE_SECRET)))
+    notifier = ns.Notifier(cfg=_cfg(webhook_url=_FAKE_URL, secret=_FAKE_SECRET),
+                           sender_factory=rec)
+    try:
+        with caplog.at_level(logging.WARNING):
+            assert notifier.notify("error", "t", "m", gate="leak") is True
+            assert _wait(lambda: notifier._last_fail_log > 0)
+        text = "\n".join(r.getMessage() for r in caplog.records)
+        assert _FAKE_SECRET not in text
+        assert _FAKE_URL not in text
+        assert "告警外发失败" in text
+    finally:
+        notifier.close()
+
+
+# ---------------------------------------------------------------- 队列满
+def test_full_queue_drops_without_raising():
+    rec = _Recorder()
+    notifier = ns.Notifier(cfg=_cfg(), sender_factory=rec)
+    # 塞满队列且不启动发送线程：把 _ensure_thread 变成 no-op 以模拟消费者停摆
+    notifier._ensure_thread = lambda: None
+    for i in range(ns.QUEUE_MAX):
+        notifier._queue.put_nowait(ns.NotifyEvent("warn", "t", str(i)))
+    assert notifier.notify("error", "t", "m", gate="overflow") is False
+    assert notifier._dropped == 1
+
+
+# ---------------------------------------------------------------- 模块级入口
+def test_module_level_notify_swallows_errors(monkeypatch):
+    class _Broken:
+        def notify(self, *a, **kw):
+            raise RuntimeError("boom")
+
+    monkeypatch.setattr(ns, "get_notifier", lambda: _Broken())
+    assert ns.notify("error", "t", "m") is False
+
+
+def test_module_level_notify_uses_singleton(monkeypatch):
+    rec = _Recorder()
+    notifier = ns.Notifier(cfg=_cfg(), sender_factory=rec)
+    ns.reset_notifier(notifier)
+    try:
+        assert ns.notify("error", "t", "m", gate="g") is True
+        assert _wait(lambda: len(rec.sent) == 1)
+    finally:
+        notifier.close()
+        ns.reset_notifier(None)
+
+
+def test_queue_is_non_blocking_type():
+    assert isinstance(ns.Notifier(cfg=_cfg())._queue, queue.Queue)
+    json.dumps({"ok": True})  # 保证 stdlib json 导入不被误删

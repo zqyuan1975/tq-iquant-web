@@ -70,6 +70,7 @@ from core.services.backtest_service import (
 )
 from core.tq.data import no_trade_bar_mask
 from core.engine.market_gate import GATE_FORMULA_VERSION
+from core.services.notify_service import notify
 from tq_iquant_shared.constants import SignalType, TradeType
 
 logger = logging.getLogger(__name__)
@@ -2086,6 +2087,17 @@ class IncrementalBacktestScheduler:
                         _record_scheduler_failure(
                             db, link.session_id, link.portfolio_strategy_id,
                             "incremental_backtest", exc)
+                        # 告警外发（旁路）：增量回测调度失败（同键每日只发一条）
+                        notify(
+                            "warn", "增量回测调度失败",
+                            "会话 %s 组合 %s 增量续跑失败：%s: %s"
+                            % (link.session_id, link.portfolio_strategy_id,
+                               type(exc).__name__, exc),
+                            gate="incremental_backtest", code=str(link.portfolio_strategy_id),
+                            trade_date=today,
+                            fields={"会话": link.session_id,
+                                    "组合": link.portfolio_strategy_id},
+                        )
 
             # 每周双跑校验
             try:
@@ -2114,5 +2126,17 @@ class IncrementalBacktestScheduler:
                                 db, link.session_id,
                                 link.portfolio_strategy_id,
                                 "incremental_validation", exc)
+                            # 告警外发（旁路）：每周双跑校验失败（同键每日一条）
+                            notify(
+                                "warn", "增量回测双跑校验失败",
+                                "会话 %s 组合 %s 双跑校验失败：%s: %s"
+                                % (link.session_id, link.portfolio_strategy_id,
+                                   type(exc).__name__, exc),
+                                gate="incremental_validation",
+                                code=str(link.portfolio_strategy_id),
+                                trade_date=today,
+                                fields={"会话": link.session_id,
+                                        "组合": link.portfolio_strategy_id},
+                            )
                 self._last_validation_date = today
         return {"ran_at": now.isoformat()}

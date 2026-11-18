@@ -5,6 +5,9 @@ import os
 os.environ.setdefault("TQ_BACKUP_SCHEDULER_DISABLED", "1")
 # 同理禁用增量回测调度（每日 15:10 会读真实 DB 并卡通达信取数）。
 os.environ.setdefault("TQ_INCREMENTAL_SCHEDULER_DISABLED", "1")
+# 告警外发（飞书 Webhook）：测试期间强制关闭，绝不给真实机器人发消息
+# （本机 config.yaml 可能已配真实 webhook_url 且 enabled=true）。
+os.environ.setdefault("TQ_NOTIFY_DISABLED", "1")
 
 import pytest
 from sqlalchemy import create_engine
