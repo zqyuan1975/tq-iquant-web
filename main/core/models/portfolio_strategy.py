@@ -73,6 +73,16 @@ class PortfolioStrategy(Base):
     cash_enhance_enabled = Column(Boolean, default=False, server_default="0", nullable=False)
     cash_enhance_equity_threshold = Column(Numeric(15, 2), nullable=True)
     cash_enhance_position_ratio_threshold = Column(Numeric(5, 4), nullable=True)
+    # 公司行为（2026-11-18，J1/J2）：手工事件表 corporate_actions 的总开关与档位。
+    # 全部默认关 —— 关闭时不建 tracker、不改持仓、不写新决策事件（行为逐字一致）。
+    corporate_actions_enabled = Column(Boolean, default=False, server_default="0", nullable=False)
+    # 分红再投资档（仅总开关开启时有意义）：回测按当日收盘价买入整手；
+    # 实盘只记事件 + 告警（真下单属人工/半自动范畴，M1 审批队列上线后再接）。
+    dividend_reinvest_enabled = Column(Boolean, default=False, server_default="0", nullable=False)
+    # 连续停牌超过 N 个交易日才处置（同退市路径）；0 = 不处置（默认）。
+    suspension_dispose_days = Column(Integer, default=0, server_default="0", nullable=False)
+    # 退市强制了结（默认关；与总开关 AND）：按最后可交易价生成 SELL。
+    delist_force_close_enabled = Column(Boolean, default=False, server_default="0", nullable=False)
     status = Column(String(10), default="active", server_default="active", nullable=False)
     created_at = Column(DateTime, server_default=func.now())
     updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())

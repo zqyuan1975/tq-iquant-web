@@ -30,9 +30,12 @@ from core.models import (
     BacktestRecord, BacktestTrade, BacktestDailySnapshot, BacktestEvaluation,
     BacktestDecisionEvent, BacktestCrisisAlpha, BacktestMarketRegimeAnalysis,
     BacktestRobustnessAnalysis, BacktestPersistenceAnalysis, WalkForwardRun,
-    ParamPerturbRun,
+    ParamPerturbRun, CorporateAction,
 )
 from core.engine.backtest_engine import BacktestEngine
+from core.engine.corporate_actions import (
+    CORPORATE_ACTION_VERSION, build_timeline_from_rows,
+)
 from core.engine.execution_engine import STAMP_DUTY_SEGMENTS_VERSION
 from core.engine.evaluator import Evaluator
 from core.engine.crisis_alpha import (
@@ -662,6 +665,29 @@ def _strategy_snapshot_rows(strategies) -> List[dict]:
     return rows
 
 
+def build_corporate_timeline(db: Session, start: Optional[date] = None,
+                             end: Optional[date] = None):
+    """读取手工事件表 → ``CorporateActionTimeline``（None 语义由调用方决定）。
+
+    - ``end``：只取 ``ex_date <= end``（未来事件不能提前生效）；
+    - ``start``：过滤掉起点之前的一次性事件（否则首日会补发历史分红），
+      但保留「起点前开始、起点后仍在停牌」的 suspend 事件（停牌闸需要它）。
+    """
+    query = db.query(CorporateAction)
+    if end is not None:
+        query = query.filter(CorporateAction.ex_date <= end)
+    rows = query.order_by(
+        CorporateAction.ex_date, CorporateAction.code).all()
+    if start is not None:
+        rows = [
+            r for r in rows
+            if r.ex_date >= start
+            or (r.event_type == "suspend"
+                and (r.end_date is None or r.end_date >= start))
+        ]
+    return build_timeline_from_rows(rows)
+
+
 def build_params_snapshot(ps, dividend_mode: str = "front",
                           fee_reserve_enabled: bool = False,
                           bond_t0_enabled: bool = False,
@@ -677,7 +703,8 @@ def build_params_snapshot(ps, dividend_mode: str = "front",
                           strategies: Optional[list] = None,
                           stock_pool_codes: Optional[dict] = None,
                           market_gate_enabled: bool | None = None,
-                          gate_summary: dict | None = None) -> str:
+                          gate_summary: dict | None = None,
+                          corporate_actions: dict | None = None) -> str:
     # 门控开关未显式传入时跟随组合配置（指纹/快照共用同一口径）
     if market_gate_enabled is None:
         market_gate_enabled = bool(getattr(ps, "market_gate_enabled", False))
@@ -741,6 +768,17 @@ def build_params_snapshot(ps, dividend_mode: str = "front",
         payload["gate_formula_version"] = GATE_FORMULA_VERSION
     if gate_summary:
         payload["gate_summary"] = gate_summary
+    # 公司行为（J1/J2，2026-11-18）：显式写否定值，区分「功能关闭」与「旧记录缺键」。
+    # 事件集合摘要 digest 进快照 → 事件内容变更后旧记录不可与新记录混比。
+    payload["corporate_actions"] = corporate_actions or {
+        "version": CORPORATE_ACTION_VERSION,
+        "enabled": False,
+        "dividend_reinvest_enabled": False,
+        "suspension_dispose_days": 0,
+        "delist_force_close_enabled": False,
+        "event_count": 0,
+        "events_digest": None,
+    }
     return json.dumps(payload, ensure_ascii=False, sort_keys=True)
 
 
@@ -3666,6 +3704,27 @@ def run_backtest(db: Session, ps: PortfolioStrategy, req,
         ps, req.start_date, req.end_date, enabled=gate_enabled)
     gate_snapshot = gate_summary(gate_tracker, ps)
 
+    # 公司行为（J1/J2，2026-11-18）：组合开关默认关。关闭时不读事件表、不注入
+    # timeline、只写显式否定值——回测执行路径与改动前逐字一致。
+    ca_enabled = bool(getattr(ps, "corporate_actions_enabled", False))
+    ca_timeline = (
+        build_corporate_timeline(db, req.start_date, req.end_date)
+        if ca_enabled else None
+    )
+    ca_snapshot = {
+        "version": CORPORATE_ACTION_VERSION,
+        "enabled": ca_enabled,
+        "dividend_reinvest_enabled": (
+            bool(getattr(ps, "dividend_reinvest_enabled", False)) if ca_enabled else False),
+        "suspension_dispose_days": (
+            int(getattr(ps, "suspension_dispose_days", 0) or 0) if ca_enabled else 0),
+        "delist_force_close_enabled": (
+            bool(getattr(ps, "delist_force_close_enabled", False)) if ca_enabled else False),
+        "event_count": len(ca_timeline) if ca_timeline is not None else 0,
+        "events_digest": (
+            ca_timeline.digest() if ca_timeline is not None and len(ca_timeline) else None),
+    }
+
     # 写 record（running）
     rec = BacktestRecord(
         portfolio_strategy_id=ps.id,
@@ -3692,6 +3751,7 @@ def run_backtest(db: Session, ps: PortfolioStrategy, req,
             stock_pool_codes=pool_composition(ps, db),
             market_gate_enabled=gate_enabled,
             gate_summary=gate_snapshot,
+            corporate_actions=ca_snapshot,
         ),
         evaluation_profile=evaluation_profile,
         is_oos_gate_enabled=is_oos_gate_enabled,
@@ -3710,6 +3770,13 @@ def run_backtest(db: Session, ps: PortfolioStrategy, req,
     try:
         t0 = datetime.now()
         portfolio = _assemble_portfolio(ps, strategies, db)
+        # 公司行为（J1/J2，默认关）：timeline=None 时引擎整段跳过，行为不变。
+        if ca_timeline is not None and len(ca_timeline):
+            portfolio.corporate_timeline = ca_timeline
+            portfolio.corporate_actions_enabled = True
+            portfolio.dividend_reinvest_enabled = ca_snapshot["dividend_reinvest_enabled"]
+            portfolio.suspension_dispose_days = ca_snapshot["suspension_dispose_days"]
+            portfolio.delist_force_close_enabled = ca_snapshot["delist_force_close_enabled"]
         # run 级覆盖装配：费用预留 + 可转债开关 + 自适应滑点 + 成交量约束 + 容量上限（不改组合表，仅本轮内存生效）
         portfolio.fee_reserve_enabled = fee_reserve_enabled
         portfolio.bond_t0_enabled = bond_t0_enabled

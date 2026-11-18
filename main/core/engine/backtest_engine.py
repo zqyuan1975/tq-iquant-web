@@ -9,6 +9,14 @@ from .execution_engine import ExecutionEngine, SimulatedDispatcher, SimulatedT1C
 from .evaluator import Evaluator
 from .event import BarEvent, OrderEvent, TradeEvent
 from .decision import DecisionRecorder
+from .corporate_actions import (
+    apply_day as apply_corporate_day,
+    KIND_DELIST_CLOSE,
+    KIND_REINVEST,
+    KIND_SKIP_CASH,
+    KIND_SPLIT,
+    KIND_SUSPEND,
+)
 # 涨跌停幅度口径迁至 market_rules（实盘 TdxTqDispatcher 涨跌停前置校验共用）；
 # 此处 re-export 保持既有 import 路径不破。回测改用 limit_rule_for：与实盘
 # price_limit.resolve_limit_rule 同源（ST 5% / 创业板 20% / 北交所 30%）。
@@ -187,6 +195,10 @@ class BacktestEngine:
         # W4.5 regime：喂入"前一交易日"基准收盘（消除当日未来数据），逐日推进。
         last_regime_date: Optional[date] = None
         last_enter_date: Optional[date] = None
+        # 公司行为（J1/J2，默认未启用）：上次生效日（保证每事件只生效一次、非交易日
+        # 顺延）与当日待执行的再投资意图（日终收盘价成交）。
+        last_action_date: Optional[date] = None
+        ca_reinvest: list = []
 
         # 日终估值步：每个交易日的**最后时间戳**组里最细周期的那一步。
         # 细→粗排序下即该组第一步；反之（粗→细）为最后一步。用它定义「当日最后一
@@ -249,6 +261,28 @@ class BacktestEngine:
                     t.date(), portfolio.account.initial_capital
                 )
                 last_enter_date = t.date()
+
+            # 0b. 公司行为（J1/J2，默认未启用 —— timeline=None 时整段跳过）。
+            #     必须在成交步之前：当日待成交的顺延单若碰上送转，股数要先调整，
+            #     否则按旧股数入账。分红现金直接进组合账户；再投资意图留到日终
+            #     按当日收盘价买入（下方 4d）；退市/长期停牌强平在此即时成交。
+            if (portfolio.corporate_timeline is not None
+                    and last_action_date != t.date()):
+                _ca_actions = apply_corporate_day(
+                    portfolio, portfolio.corporate_timeline, t.date(),
+                    recorder, mode="backtest",
+                    reinvest_enabled=portfolio.dividend_reinvest_enabled,
+                    price_resolver=lambda code: self._ca_reference_price(
+                        code, t, period, price_index, prev_close_by_day),
+                    dispose_days=portfolio.suspension_dispose_days,
+                    delist_force_close=portfolio.delist_force_close_enabled,
+                    last_action_date=last_action_date,
+                )
+                last_action_date = t.date()
+                ca_reinvest.extend(
+                    a for a in _ca_actions if a.kind == KIND_REINVEST)
+                self._apply_corporate_actions(
+                    portfolio, _ca_actions, t, trades, recorder)
 
             # 1. 成交上一 bar 的 pending_orders（用 t 的 open 价）
             deferred: List[OrderEvent] = []
@@ -577,6 +611,11 @@ class BacktestEngine:
             # 4. 日终快照（W4.4：每交易日至多一行，取「日终估值步」的末值）
             total_value = portfolio.total_value(bar)
             is_day_end = i in day_end_steps
+            if is_day_end and ca_reinvest:
+                # 4d. 分红再投资（J1，默认关）：当日收盘价买入整手，不足一手留现金。
+                self._execute_ca_reinvest(
+                    portfolio, ca_reinvest, bar, t, trades, recorder)
+                ca_reinvest = []
             if is_day_end:
                 snap = portfolio.snapshot(t.date(), total_value, bar)
                 # 填基准值：benchmark_data 是 {date: Decimal}，按当前 bar 日期取值；
@@ -774,6 +813,183 @@ class BacktestEngine:
                     }
                     index.setdefault((t, period), {})[stock_code] = row
         return index
+
+    # ---------- 公司行为（J1/J2，默认未启用） ----------
+
+    def _ca_reference_price(self, code, t, period, price_index, prev_close_by_day):
+        """分红比例口径的参照前收：优先上一交易日收盘，缺失退回当根 bar 收盘。"""
+        pc = prev_close_by_day.get((code, t.date()))
+        if pc is not None and pc > 0:
+            return pc
+        row = price_index.get((t, period), {}).get(code) or {}
+        close = row.get("close")
+        return close if close and close > 0 else None
+
+    def _ca_cost_params(self, portfolio):
+        cp = portfolio.cost_params or {}
+
+        def _d(key, default):
+            value = cp.get(key)
+            if value is None:
+                return default
+            return value if isinstance(value, Decimal) else Decimal(str(value))
+
+        return {
+            "min_commission": _d("min_commission", Decimal("5")),
+            "buy_rate": _d("buy_commission_rate", Decimal("0.00025")),
+            "sell_rate": _d("sell_commission_rate", Decimal("0.00025")),
+            "stamp_rate": _d("stamp_duty_rate", Decimal("0.0005")),
+            "transfer_rate": _d("transfer_fee_rate", Decimal("0.00001")),
+        }
+
+    def _ca_fees(self, portfolio, amount, is_sell, day):
+        from .execution_engine import stamp_duty_rate_on
+        p = self._ca_cost_params(portfolio)
+        commission = max(p["min_commission"],
+                         amount * (p["sell_rate"] if is_sell else p["buy_rate"]))
+        stamp = amount * stamp_duty_rate_on(day, p["stamp_rate"]) if is_sell else Decimal("0")
+        transfer = amount * p["transfer_rate"]
+        return (commission.quantize(Decimal("0.01")),
+                stamp.quantize(Decimal("0.01")),
+                transfer.quantize(Decimal("0.01")))
+
+    def _apply_corporate_actions(self, portfolio, actions, t, trades, recorder):
+        """落账内核发出的意图：送转/分红已在内核改完，这里只做退市强平与审计事件。"""
+        for act in actions:
+            if act.kind == KIND_DELIST_CLOSE:
+                self._execute_ca_force_close(portfolio, act, t, trades, recorder)
+            elif act.kind == KIND_SKIP_CASH:
+                recorder.record(
+                    gate="corporate_action", layer="execution", action="skip",
+                    portfolio_id=portfolio.portfolio_id,
+                    strategy_id=act.strategy_id, stock_code=act.code, bar_time=t,
+                    message="现金分红未生效（%s）" % act.reason)
+            elif act.kind == KIND_SPLIT:
+                recorder.record(
+                    gate="corporate_action", layer="execution", action="apply",
+                    portfolio_id=portfolio.portfolio_id,
+                    strategy_id=act.strategy_id, stock_code=act.code, bar_time=t,
+                    message="送转调整股数 +%d（%s）" % (act.qty, act.reason))
+            elif act.kind == "dividend_cash":
+                recorder.record(
+                    gate="corporate_action", layer="execution", action="apply",
+                    portfolio_id=portfolio.portfolio_id,
+                    strategy_id=act.strategy_id, stock_code=act.code, bar_time=t,
+                    message="现金分红入账 %s 元（%s）" % (act.cash, act.reason))
+            elif act.kind == "notice":
+                recorder.record(
+                    gate="corporate_action", layer="execution", action="notice",
+                    portfolio_id=portfolio.portfolio_id,
+                    strategy_id=act.strategy_id, stock_code=act.code, bar_time=t,
+                    message=act.reason)
+            elif act.kind == KIND_SUSPEND:
+                recorder.record(
+                    gate="corporate_action", layer="execution", action="block",
+                    portfolio_id=portfolio.portfolio_id, stock_code=act.code,
+                    bar_time=t, message="停牌期间禁止开仓/加仓（%s）" % act.reason)
+
+    def _execute_ca_force_close(self, portfolio, act, t, trades, recorder):
+        """退市/长期停牌强平：按最后可交易价卖出整仓（无价退回成本）。"""
+        ctx = portfolio.find_strategy(act.strategy_id)
+        if ctx is None:
+            return
+        pos = ctx.positions.get(act.code)
+        if pos is None or pos.quantity <= 0:
+            return
+        qty = min(int(act.qty or 0), pos.quantity)
+        if qty <= 0:
+            return
+        price = act.price if act.price and act.price > 0 else pos.avg_cost
+        if price is None or price <= 0:
+            recorder.record(
+                gate="corporate_action", layer="execution", action="skip",
+                portfolio_id=portfolio.portfolio_id, strategy_id=act.strategy_id,
+                stock_code=act.code, bar_time=t,
+                message="强制了结跳过：无可用的成交价（%s）" % act.reason)
+            return
+        amount = price * qty
+        commission, stamp, transfer = self._ca_fees(portfolio, amount, True, t.date())
+        trade = TradeEvent(
+            strategy_id=act.strategy_id,
+            portfolio_id=portfolio.portfolio_id,
+            stock_code=act.code, trade_type=TradeType.SELL, price=price,
+            quantity=qty, amount=amount, commission=commission,
+            stamp_duty=stamp, transfer_fee=transfer, trade_time=t,
+            signal_type=SignalType.CLOSE, signal_name="corporate_action",
+        )
+        applied = pos.apply_trade(trade)
+        account_trade = trade.scaled_to(applied) if applied != qty else trade
+        portfolio.account.apply_trade(account_trade)
+        trades.append(account_trade)
+        portfolio.note_trade(account_trade)
+        recorder.record(
+            gate="corporate_action", layer="execution", action="trigger",
+            portfolio_id=portfolio.portfolio_id, strategy_id=act.strategy_id,
+            stock_code=act.code, bar_time=t, requested_qty=qty, final_qty=applied,
+            message="强制了结 %d 股 @ %s（%s）" % (applied, price, act.reason))
+
+    def _execute_ca_reinvest(self, portfolio, intents, bar, t, trades, recorder):
+        """分红再投资：当日收盘价买入整手，不足一手（或现金不够）留现金并记事件。"""
+        for act in intents:
+            ctx = portfolio.find_strategy(act.strategy_id)
+            if ctx is None:
+                continue
+            row = bar.stocks.get(act.code) or {}
+            price = row.get("close")
+            if price is None or price <= 0:
+                recorder.record(
+                    gate="corporate_action", layer="execution", action="skip_lot",
+                    portfolio_id=portfolio.portfolio_id, strategy_id=act.strategy_id,
+                    stock_code=act.code, bar_time=t,
+                    message="分红再投资跳过：当日无有效收盘价")
+                continue
+            lot = lot_size_for(act.code, portfolio.bond_lot_enabled)
+            cash = act.cash
+            qty = int(cash / price / lot) * lot
+            while qty >= lot:
+                amount = price * qty
+                commission, _stamp, transfer = self._ca_fees(
+                    portfolio, amount, False, t.date())
+                if amount + commission + transfer <= cash:
+                    break
+                qty -= lot
+            if qty < lot:
+                recorder.record(
+                    gate="corporate_action", layer="execution", action="skip_lot",
+                    portfolio_id=portfolio.portfolio_id, strategy_id=act.strategy_id,
+                    stock_code=act.code, bar_time=t,
+                    message="分红再投资跳过：现金 %s 不足一手（价 %s ×%d）"
+                            % (cash, price, lot))
+                continue
+            amount = price * qty
+            commission, _stamp, transfer = self._ca_fees(
+                portfolio, amount, False, t.date())
+            pos = ctx.positions.get(act.code)
+            if pos is None:
+                pos = Position(
+                    act.code,
+                    same_day_sellable=(
+                        portfolio.bond_t0_enabled and is_convertible_bond(act.code)),
+                    lot_size=lot,
+                )
+                ctx.positions[act.code] = pos
+            trade = TradeEvent(
+                strategy_id=act.strategy_id,
+                portfolio_id=portfolio.portfolio_id,
+                stock_code=act.code, trade_type=TradeType.BUY, price=price,
+                quantity=qty, amount=amount, commission=commission,
+                stamp_duty=Decimal("0"), transfer_fee=transfer, trade_time=t,
+                signal_type=SignalType.OPEN, signal_name="corporate_action_reinvest",
+            )
+            pos.apply_trade(trade)
+            portfolio.account.apply_trade(trade)
+            trades.append(trade)
+            portfolio.note_trade(trade)
+            recorder.record(
+                gate="corporate_action", layer="execution", action="apply",
+                portfolio_id=portfolio.portfolio_id, strategy_id=act.strategy_id,
+                stock_code=act.code, bar_time=t, requested_qty=qty,
+                message="分红再投资买入 %d 股 @ %s" % (qty, price))
 
     def _bar_open_prices(self, price_index: dict, t: datetime, period: str) -> Dict[str, Decimal]:
         """O(1) 查表取 (t, period) 下所有股票的 open 价。"""

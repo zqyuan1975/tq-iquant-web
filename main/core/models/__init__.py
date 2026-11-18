@@ -32,6 +32,7 @@ from .incremental_backtest import (
 )
 from .decision_event import BacktestDecisionEvent, LiveDecisionEvent
 from .data_backup import DataBackupRecord
+from .corporate_action import CorporateAction, LiveCorporateAction
 
 __all__ = [
     "Base",
@@ -68,4 +69,6 @@ __all__ = [
     "BacktestDecisionEvent",
     "LiveDecisionEvent",
     "DataBackupRecord",
+    "CorporateAction",
+    "LiveCorporateAction",
 ]

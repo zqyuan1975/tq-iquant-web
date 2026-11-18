@@ -7,6 +7,7 @@ import os
 from core.db import init_db, SessionLocal
 from core.version import APP_VERSION
 from core.api.stock_pools import router as stock_pools_router
+from core.api.corporate_actions import router as corporate_actions_router
 from core.api.formulas import router as formulas_router
 from core.api.strategies import router as strategies_router
 from core.api.backtest import router as backtest_router
@@ -145,6 +146,7 @@ app.include_router(status_router)
 app.include_router(tdx_router)
 app.include_router(incremental_router)
 app.include_router(market_gate_router)
+app.include_router(corporate_actions_router)
 
 
 @app.exception_handler(Exception)

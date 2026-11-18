@@ -981,6 +981,9 @@ def build_engine(
     # build_engine 之后 commit/expire 触发 DetachedInstanceError）。
     # 只收集启用了门控的组合；未启用的组合不进 provider，零额外 TQ 取数。
     gate_specs: Dict[int, dict] = {}
+    # 公司行为（2026-11-18，J1/J2）：组合 → 标量配置；事件内容由 provider 现读
+    # 手工事件表（同一张 corporate_actions，与回测同口径）。默认空 = 未启用。
+    ca_specs: Dict[int, dict] = {}
     formula_ids: set = set()
     strategy_formula: Dict[int, int] = {}  # strategy_id -> formula_id
     # 预热/分发按 (code, period) 取该股票该周期所有公式的 formula_count 最大值（跨组合跨策略）。
@@ -1034,6 +1037,17 @@ def build_engine(
                                     or DEFAULT_BENCHMARK_CODE),
                 "market_gate_engine": getattr(ps, "market_gate_engine", None) or "python",
                 "market_gate_formula_name": getattr(ps, "market_gate_formula_name", None),
+            }
+        # 公司行为（2026-11-18，J1/J2）：只收集启用组合的标量配置（不持有 ORM）。
+        if getattr(ps, "corporate_actions_enabled", False):
+            ca_specs[ps.id] = {
+                "portfolio_id": ps.id,
+                "dividend_reinvest_enabled": bool(
+                    getattr(ps, "dividend_reinvest_enabled", False)),
+                "suspension_dispose_days": int(
+                    getattr(ps, "suspension_dispose_days", 0) or 0),
+                "delist_force_close_enabled": bool(
+                    getattr(ps, "delist_force_close_enabled", False)),
             }
         pool_codes = resolve_stock_codes(db, ps.id)
         stock_codes.update(pool_codes)
@@ -1136,6 +1150,20 @@ def build_engine(
         return build_gate_tracker(
             SimpleNamespace(**spec), end_date - timedelta(days=365), end_date)
 
+    def _corporate_timeline_provider(portfolio_id: int):
+        """公司行为（J1/J2）：现读手工事件表返回时间线（每组合每日一次）。
+
+        每次调用自带会话（引擎在 worker 线程里调用，不能复用请求级 Session）；
+        读失败抛异常 → ``_maybe_apply_corporate_actions`` 捕获后跳过本轮，
+        不影响交易主链路。
+        """
+        from core.services.backtest_service import build_corporate_timeline
+        session = SessionLocal()
+        try:
+            return build_corporate_timeline(session)
+        finally:
+            session.close()
+
     # 股票池为空时给一个占位，避免空列表；首期实盘一般有成分股
     poll_codes = sorted(stock_codes) or ["000001.SZ"]
     # 盘中 1m 数据源（快照合成）：TQ 通道盘中分钟 K 线只到上一交易日
@@ -1227,6 +1255,9 @@ def build_engine(
         benchmark_codes=benchmark_codes,
         gate_provider=_gate_provider if gate_specs else None,
         gate_portfolio_ids=set(gate_specs),
+        corporate_action_specs=ca_specs or None,
+        corporate_timeline_provider=(
+            _corporate_timeline_provider if ca_specs else None),
         execution_mode=execution_mode,
         signal_file_path=signal_file_path,
         advance_close_enabled=bool(advance_close_enabled),

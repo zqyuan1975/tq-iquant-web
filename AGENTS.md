@@ -151,6 +151,19 @@ Web 前端 (Vue 3 + Vite + Pinia) ←HTTP/SSE→ Core (FastAPI)
 - **别把「点过」当「已报」**：`_expire_stale_orders` 在 `OrderStateMachine.expire_stale_orders` 之前调 `_recheck_unconfirmed_pending_rows`——仅对提供 `pending_row_state` 的通道（TDX）生效，条件 = `order_ref is None` + `status ∈ submitted/partial` + `bridge_order_id` 非空 + `created_at` 距今 ≥ `_ORDER_REF_MATCH_TIMEOUT`(180s)；复核 `pending`（行仍在『发送』）→ 重建 `OrderEvent` 调 `_requeue_rejected_order(gate=order_unconfirmed)` 回 deferred；`absent`（行已消失/已转『已发送』）与 `unknown`（无窗口/OCR 不可判/多候选）**保持现行为**交 expire。重排沿用 P1-3 同一套约束：`_DEFERRED_RETRY_MAX=2`、`error_message=deferred_retry:n=<k>` 跨重启读回、`signal_bar_date=bar_time.date()` 使放行必须跨到次一交易日（**当日绝不重报**）。残留未发送行**只告警、不自动点/撤**（日志提示人工核对后手动『取消』）。
 - **`last_unconfirmed_message`**：TDX dispatcher 补齐该属性（此前仅 `HttpBridgeDispatcher` 定义），unconfirmed 分支写入 `confirm()` 的具体 detail（如「已点击『发送』，但该行仍为待发送状态…」），引擎既有 `getattr(..., "last_unconfirmed_message", None)` 口径不变，`live_orders.error_message` 不再只有通用文案。
 
+## 公司行为与退市/停牌处置（2026-11-18）
+
+手工事件表 `corporate_actions`（分红/送转/配股/退市/停牌，唯一键 `(code, event_type, ex_date)`），**不做自动抓取**；表为空或组合开关关闭时回测/实盘执行路径与改动前逐字一致。
+
+- **判定内核唯一**：`core/engine/corporate_actions.py` 的 `apply_day(...)` 被 `BacktestEngine` 与 `LiveEngine` 共用（`CORPORATE_ACTION_VERSION = "manual_events_v1"`）。内核只算「当日应生效什么」并落到 `Position`/`Account`，再返回 `AppliedAction` 意图；两端适配层各自决定再投资成交、退市强平、停牌闸与告警。
+- **组合开关**（`portfolio_strategies` 四列，全默认关）：`corporate_actions_enabled` / `dividend_reinvest_enabled` / `suspension_dispose_days`（0=不处置）/ `delist_force_close_enabled`（与总开关 AND）。
+- **回测接入点**：`BacktestEngine.run` 主循环内、`risk_manager.enter_day` 之后、pending 成交之前（送转必须先改股数，否则顺延单按旧股数入账）；每交易日一次（`last_action_date` 水位）。再投资在 `is_day_end` 分支按当日收盘价买整手，不足一手留现金记 `skip_lot`。
+- **实盘接入点**：`LiveEngine._maybe_apply_corporate_actions`（`_run_daily_schedule` + 每根 `_handle_bar` 开头，每组合每日一次）。**送转不手工改虚拟持仓**（柜台镜面已吸收，`_is_share_count_change` 不扣现金），只记事件；**现金分红 `account.add_cash` + 落 `live_corporate_actions` 台账**（`recover` 按 `applied_date > seam_date` 重放；**绝不走 `live_cash_flows`**，否则被当外部入金从净值抹掉）；再投资只记 `action=notice`（审批队列上线前不下单）；退市/长期停牌强平走 `_submit_one_order` 同一闸门链。
+- **分红口径**：回测只认 `cash_pct`（前复权加性压缩，每股金额不可还原），实盘只认 `cash_per_share`；字段缺失记 `skip_cash`，不猜。事件日为非交易日 → 顺延到下一交易日，只生效一次。
+- **停牌闸**：`Portfolio.suspended_codes` 只拦 `OPEN`/`ADD`（`gate=corporate_suspend`），`CLOSE`/`REDUCE`/止损/止盈一律放行；估值仍走「最后已知价」三级兜底。
+- **口径冻结**：`params_snapshot.corporate_actions`（version/enabled/档位/event_count/events_digest）+ 增量指纹 `corporate_actions` 分项；开关/档位/事件集合任一变化 → 旧接缝判废（不自动重建）。**旧记录缺键 ≠ 关闭**，不混比。
+- **运行中改开关需停止再启动会话**（`build_engine` 只读一次）；事件表内容每日现读，改事件不必重启，当日已应用的不重算。
+
 ## 市场多空门控（2026-11-18）
 
 组合级开关：**基准指数空头状态禁止开仓/加仓，持仓不强平**。回测/实盘同一套闸门（`Portfolio._gate_blocks`），语义只拦 `OPEN`/`ADD`，`CLOSE`/`REDUCE`/止损/止盈/移动止损一律不受影响。
@@ -195,6 +208,8 @@ Web 前端 (Vue 3 + Vite + Pinia) ←HTTP/SSE→ Core (FastAPI)
 | `main/core/engine/live/file_handoff.py` | 执行契约文件交接层（通道无关；signals/risk/orders/results JSONL + cursor.json 游标） |
 | `main/core/engine/live/win_dialog_scope.py` | 双引擎弹窗归属识别 + UI 自动化互斥锁（tdx/ths 并行防串扰） |
 | `main/core/engine/live/snapshot_bars.py` | 快照合成 1m bar（TQ 盘中分钟线不可得的盘中数据源） |
+| `main/core/engine/corporate_actions.py` | 公司行为/停牌/退市判定内核（回测与实盘共用 `apply_day`） |
+| `main/core/services/corporate_action_service.py` | 手工事件台账 CRUD 与校验（`/api/corporate-actions`） |
 | `main/core/runtime.py` | 运行期实例信息 `data/runtime/server.json` + 单实例锁 + 动态端口发现（`/health` 载荷） |
 | `main/core/supervisor.py` | 自带自愈父进程（`--supervise` 父进程 / `--serve` 子进程；探活 + 退避重启 + 孤儿防护） |
 | `main/core/services/notify_service.py` | 告警外发（飞书自定义机器人 Webhook；默认关闭、后台线程、超时 ≤5s、失败只写日志） |

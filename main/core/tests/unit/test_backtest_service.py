@@ -1938,6 +1938,8 @@ _SNAPSHOT_KEYS = {
     "strategies", "stock_pool_codes",
     # 市场多空门控（2026-11-18）：未启用时只冻结开关位
     "market_gate_enabled",
+    # 公司行为（2026-11-18，J1/J2）：未启用时写显式否定值（区分关闭与旧记录缺键）
+    "corporate_actions",
 }
 
 _NO_TRADES_RESULT = {

@@ -159,6 +159,19 @@ class Portfolio:
         # CLOSE/REDUCE/止损/止盈/移动止损一律不受影响。查询一律右移一日
         # （昨日收盘状态管今日开仓），见 core/engine/market_gate.py。
         self.current_market_gate = None
+        # 公司行为（2026-11-18，J1/J2）：手工事件时间线，None = 未启用（默认）。
+        # 由 backtest_service / live_service 在组合开关打开时注入；注入后
+        # BacktestEngine / LiveEngine 每交易日调一次 corporate_actions.apply_day。
+        self.corporate_timeline = None
+        self.corporate_actions_enabled: bool = False
+        self.dividend_reinvest_enabled: bool = False
+        self.suspension_dispose_days: int = 0
+        self.delist_force_close_enabled: bool = False
+        # 当日停牌代码集合（apply_day 每日刷新）：只拦 OPEN/ADD（持仓不强平，
+        # 卖出/风控照常）。默认空集合 → 闸门无任何副作用。
+        self.suspended_codes: frozenset = frozenset()
+        # 长期停牌处置的幂等键集合（(code, suspend_ex_date)），防每日重复发强平。
+        self._ca_disposed: set = set()
         # B4 择优轮动：收盘价历史（code → 最近 N 根有效 close）与去重时间戳
         self._price_history: Dict[str, List[Decimal]] = {}
         self._price_hist_last_t: Dict[str, datetime] = {}
@@ -781,6 +794,14 @@ class Portfolio:
         if close <= Decimal("0"):
             self._rec("halted_bar_no_price", "signal_gate", "block", ctx, sig, bar,
                       message="停牌/无数据 bar close=0，无法定价/计算下单量")
+            return []
+        # 停牌闸（J2，默认集合为空 → 无副作用）：停牌期间禁止开新仓/加仓，
+        # 卖出与风控一律不受影响（停牌本想卖也卖不掉，交给柜台/复牌后处理）。
+        if (self.suspended_codes
+                and sig.stock_code in self.suspended_codes
+                and sig.signal_type in (SignalType.OPEN, SignalType.ADD)):
+            self._rec("corporate_suspend", "signal_gate", "block", ctx, sig, bar,
+                      message="停牌期间禁止开仓/加仓（corporate_actions.suspend）")
             return []
         # 策略资金 = capital_ratio × 组合当前总净值（dynamic）或初始资金（fixed）
         strategy_fund = self._strategy_fund(ctx)

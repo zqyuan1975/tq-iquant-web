@@ -66,10 +66,14 @@ from core.services.backtest_service import (
     build_klines,
     build_gate_tracker,
     build_params_snapshot,
+    build_corporate_timeline,
     build_signal_cache,
 )
 from core.tq.data import no_trade_bar_mask
 from core.engine.market_gate import GATE_FORMULA_VERSION
+from core.engine.corporate_actions import (
+    CORPORATE_ACTION_VERSION, build_timeline_from_rows,
+)
 from core.services.notify_service import notify
 from tq_iquant_shared.constants import SignalType, TradeType
 
@@ -443,6 +447,8 @@ def schema_parts(dividend_mode: str) -> dict:
         # 市场多空门控公式口径（2026-11-18）：公式/参数任何调整都会改变拦单点，
         # 接缝前后必须同口径，否则续跑结果与全量/实盘不可比。
         "market_gate": GATE_FORMULA_VERSION,
+        # 公司行为内核口径（2026-11-18，J1/J2）：判定语义变更同样作废旧接缝。
+        "corporate_actions": CORPORATE_ACTION_VERSION,
     }
 
 
@@ -478,6 +484,7 @@ _FP_PART_LABELS = {
     "strategies": "策略参数/公式/角色/周期或策略增删",
     "formula": "公式正文/引擎/跨周期口径/信号线",
     "pool": "股票池成分代码",
+    "corporate_actions": "公司行为事件集合/处置档位",
     "baseline": "资金基准（baseline_version / baseline_value）",
 }
 
@@ -489,6 +496,7 @@ _SCHEMA_PART_LABELS = {
     "t1": "T+1 口径 _T1_SCHEMA",
     "engine": "引擎版本 _ENGINE_SCHEMA",
     "dividend_mode": "复权模式",
+    "corporate_actions": "公司行为内核口径",
 }
 
 
@@ -586,6 +594,26 @@ def _pool_fp(ps, db: Optional[Session]) -> dict:
     return out
 
 
+def _corporate_actions_fp(ps, db: Optional[Session]) -> str:
+    """公司行为指纹（2026-11-18）：开关 + 处置档位 + 事件集合摘要。
+
+    关闭时返回固定串（"disabled"），开启时附内核版本与事件 digest —— 事件内容
+    或处置档位一变，旧接缝判废（判废不自动重建，由调度器/用户决定）。
+    """
+    if not getattr(ps, "corporate_actions_enabled", False):
+        return "disabled"
+    digest = None
+    if db is not None:
+        digest = build_corporate_timeline(db).digest()
+    return json.dumps({
+        "version": CORPORATE_ACTION_VERSION,
+        "reinvest": bool(getattr(ps, "dividend_reinvest_enabled", False)),
+        "dispose_days": int(getattr(ps, "suspension_dispose_days", 0) or 0),
+        "delist_force_close": bool(getattr(ps, "delist_force_close_enabled", False)),
+        "digest": digest,
+    }, sort_keys=True, ensure_ascii=False)
+
+
 def baseline_fingerprint(session_row) -> dict:
     """资金基准指纹（2026-11-16 基准对齐）：baseline_version + baseline_value。
 
@@ -623,6 +651,9 @@ def params_fingerprint(ps, dividend_mode: str,
         "formula": json.dumps(
             _formula_fp(ps, db), sort_keys=True, ensure_ascii=False),
         "pool": json.dumps(_pool_fp(ps, db), sort_keys=True, ensure_ascii=False),
+        # 公司行为事件集合（2026-11-18）：开关/事件内容/处置档位任一变化，
+        # 接缝前后半段口径就会不一致（历史分红/送转/退市强平无法复现）。
+        "corporate_actions": _corporate_actions_fp(ps, db),
         "baseline": json.dumps(baseline or {}, sort_keys=True, ensure_ascii=False),
     }
     payload = json.dumps(sections, sort_keys=True, ensure_ascii=False)
@@ -1558,6 +1589,19 @@ def _run_incremental_locked(db: Session, session_id: int,
         ps, klines_all, db, start=run_from, dividend_mode=signal_mode)
 
     portfolio = assemble_portfolio(ps, strategies, db)
+    # 公司行为（J1/J2，默认关）：与全量回测同一内核与同一张表，接缝前后同口径
+    # 由 schema_fp 的 corporate_actions 版本 + params 分项保证。
+    if getattr(ps, "corporate_actions_enabled", False):
+        _ca_timeline = build_corporate_timeline(db, run_from, today)
+        if len(_ca_timeline):
+            portfolio.corporate_timeline = _ca_timeline
+            portfolio.corporate_actions_enabled = True
+            portfolio.dividend_reinvest_enabled = bool(
+                getattr(ps, "dividend_reinvest_enabled", False))
+            portfolio.suspension_dispose_days = int(
+                getattr(ps, "suspension_dispose_days", 0) or 0)
+            portfolio.delist_force_close_enabled = bool(
+                getattr(ps, "delist_force_close_enabled", False))
     if state is None:
         if resolve_anchor(link, cfg):
             apply_seam_anchor(portfolio, link.seam_cash, seam_positions)
@@ -1762,6 +1806,18 @@ def run_validation(db: Session, session_id: int, ps_id: int,
                 ps, klines_all, db, start=from_date,
                 dividend_mode=signal_mode)
             portfolio = assemble_portfolio(ps, strategies, db)
+            # 校验侧与续跑侧同口径（公司行为，J1/J2）：否则「全量 vs 续跑」对比恒不一致
+            if getattr(ps, "corporate_actions_enabled", False):
+                _ca_timeline = build_corporate_timeline(db, from_date, to_date)
+                if len(_ca_timeline):
+                    portfolio.corporate_timeline = _ca_timeline
+                    portfolio.corporate_actions_enabled = True
+                    portfolio.dividend_reinvest_enabled = bool(
+                        getattr(ps, "dividend_reinvest_enabled", False))
+                    portfolio.suspension_dispose_days = int(
+                        getattr(ps, "suspension_dispose_days", 0) or 0)
+                    portfolio.delist_force_close_enabled = bool(
+                        getattr(ps, "delist_force_close_enabled", False))
             if resolve_anchor(link, cfg):
                 apply_seam_anchor(portfolio, link.seam_cash, seam_positions)
             # 校验侧与续跑侧必须同口径门控（否则「全量 vs 续跑」对比恒不一致）

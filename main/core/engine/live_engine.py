@@ -35,6 +35,14 @@ from .portfolio import Portfolio
 from .position import Position
 from .format import dec_money, dec_price, fmt_money, fmt_pct, fmt_price
 from .execution_engine import ExecutionEngine, LiveT1Checker
+from .corporate_actions import (
+    apply_day as apply_corporate_day,
+    CorporateActionTimeline,
+    KIND_DELIST_CLOSE,
+    KIND_REINVEST,
+    KIND_SPLIT,
+    KIND_SKIP_CASH,
+)
 from .event import BarEvent, OrderEvent, TradeEvent
 try:
     from .http_bridge_dispatcher import (
@@ -111,6 +119,7 @@ from core.models import (
     LiveAccountPositionSnapshot, LiveAccountSnapshot, LiveCashFlow,
     LiveDecisionEvent, LiveBarOrderMark, LiveOrder, LivePositionPeak,
     LiveSession, LiveSessionPortfolio, LiveSignal, LiveTrade,
+    LiveCorporateAction,
 )
 from core.tq.formula import TQFormula
 from core.tq.utils import TDXLockTimeout
@@ -535,6 +544,11 @@ class LiveEngine:
         # 两者缺省(None/空)=不启用，行为与接线前逐字一致。
         gate_provider: Optional[Callable] = None,
         gate_portfolio_ids: Optional[set] = None,
+        # 公司行为（2026-11-18，J1/J2）：corporate_action_specs 为启用组合的标量
+        # 配置（不持有 ORM 实例）；corporate_timeline_provider(portfolio_id) 现读
+        # 事件表返回 CorporateActionTimeline。两者缺省(None/空)=不启用，行为不变。
+        corporate_action_specs: Optional[Dict[int, dict]] = None,
+        corporate_timeline_provider: Optional[Callable] = None,
         execution_mode: str = "auto",
         signal_monitor=None,
         signal_scheduler=None,
@@ -769,6 +783,11 @@ class LiveEngine:
         self._gate_provider = gate_provider
         self._gate_portfolio_ids: set = set(gate_portfolio_ids or ())
         self._gate_updated: Dict[int, date] = {}
+        # 公司行为（J1/J2，默认关）：组合标量配置 + 时间线提供者 + 每组合每日一次
+        # 的应用水位；specs 为空时 _maybe_apply_corporate_actions 第一行即返回。
+        self._corporate_action_specs: Dict[int, dict] = dict(corporate_action_specs or {})
+        self._corporate_timeline_provider = corporate_timeline_provider
+        self._ca_applied: Dict[int, date] = {}
         # R3：每组合每日首根 bar 已调 enter_day（跨日补算上一日 daily_loss，
         # 与回测对齐——暂停/恢复在日首生效），防混合周期多 bar/日重复调用。
         self._enter_day_updated: Dict[int, date] = {}
@@ -1724,6 +1743,8 @@ class LiveEngine:
         某段取数时桥刚断（BridgeUnavailableError）只跳过该段，不影响其余段与下轮。
         """
         for name, fn in (
+            ("corporate_actions", lambda: self._maybe_apply_corporate_actions(
+                now_shanghai())),
             ("daily_close", self._maybe_daily_close),
             ("daily_bars", self._maybe_daily_bars),
             ("advance_close", self._maybe_advance_daily_close),
@@ -5589,6 +5610,209 @@ class LiveEngine:
                 portfolio.portfolio_id, code, exc_info=True,
             )
 
+    # ---------------- 公司行为（J1/J2，默认关） ----------------
+
+    def _ca_prev_trading_day(self, day: date) -> date:
+        """上一个交易日（最多回退 10 个自然日）：用于「事件顺延到下一交易日」。"""
+        cur = day - timedelta(days=1)
+        for _ in range(10):
+            if self._calendar.is_trading_day(cur):
+                return cur
+            cur -= timedelta(days=1)
+        return day - timedelta(days=1)
+
+    def _ca_applied_keys(self, db: Session, pid: int) -> set:
+        rows = (db.query(LiveCorporateAction.code, LiveCorporateAction.event_type,
+                         LiveCorporateAction.ex_date)
+                .filter(LiveCorporateAction.live_session_id == self.session_id,
+                        LiveCorporateAction.portfolio_strategy_id == pid)
+                .all())
+        return {(r[0], r[1], r[2]) for r in rows}
+
+    def _maybe_apply_corporate_actions(self, now: datetime) -> None:
+        """公司行为：每组合每交易日一次（分红入账 / 送转事件 / 退市停牌处置）。
+
+        **默认关闭**：未配置任何组合时第一行即返回，不读库、不改账、不发事件。
+        落账分工（与方案 §2.4 一致）：
+        - 送转：**不手工改虚拟持仓**，柜台镜面 ``Position.mirror_bridge`` 已按真实
+          数量覆盖（``_is_share_count_change`` 识别"数量增但总成本未增"），只记事件；
+        - 现金分红：内核 ``add_cash`` 落虚拟现金 + 写 ``live_corporate_actions``
+          台账（``recover`` 重放依据；**不走 live_cash_flows**，否则被当外部入金）；
+        - 再投资：M1 审批队列上线前只记事件 + 告警，不下单（真下单属半自动范畴）；
+        - 退市 / 长期停牌处置：按最后已知价生成 SELL 走 ``_submit_one_order``
+          同一闸门链（默认关，``delist_force_close_enabled=0`` 时只记 notice）。
+        """
+        if not self._corporate_action_specs:
+            return
+        if self._corporate_timeline_provider is None:
+            return
+        factory = self._db_session_factory
+        if factory is None:
+            return
+        day = now.date() if isinstance(now, datetime) else now
+        if not self._calendar.is_trading_day(day):
+            return
+        after = self._ca_prev_trading_day(day)
+        for portfolio in self.portfolios:
+            pid = portfolio.portfolio_id
+            spec = self._corporate_action_specs.get(pid)
+            if not spec:
+                continue
+            if self._ca_applied.get(pid) == day:
+                continue
+            try:
+                timeline = self._corporate_timeline_provider(pid)
+            except Exception:  # noqa: BLE001 — 取事件失败不得影响交易主链路
+                logger.warning("组合 %s 公司行为事件读取失败，本轮跳过", pid,
+                               exc_info=True)
+                self._ca_applied[pid] = day
+                continue
+            if timeline is None or timeline.is_empty():
+                self._ca_applied[pid] = day
+                continue
+            db = factory()
+            try:
+                applied = self._ca_applied_keys(db, pid)
+                filtered = CorporateActionTimeline([
+                    ev for ev in timeline.events_up_to(day, after=after)
+                    if (ev.code, ev.event_type, ev.ex_date) not in applied])
+                actions = apply_corporate_day(
+                    portfolio, filtered, day, None, mode="live",
+                    reinvest_enabled=bool(spec.get("dividend_reinvest_enabled")),
+                    price_resolver=lambda code: self._ca_live_price(portfolio, code),
+                    dispose_days=int(spec.get("suspension_dispose_days") or 0),
+                    delist_force_close=bool(spec.get("delist_force_close_enabled")),
+                    apply_split=False,
+                    last_action_date=after,
+                )
+                self._record_ca_ledger(db, portfolio, filtered, actions)
+                self._dispatch_ca_actions(db, portfolio, actions, now)
+                db.commit()
+                self._ca_applied[pid] = day
+            except Exception:  # noqa: BLE001 — 公司行为失败不影响交易主链路
+                db.rollback()
+                logger.exception("组合 %s 公司行为应用失败", pid)
+            finally:
+                db.close()
+
+    def _ca_live_price(self, portfolio: Portfolio, code: str) -> Optional[Decimal]:
+        for ctx in portfolio.strategies:
+            pos = ctx.positions.get(code)
+            if pos is not None:
+                return portfolio._resolve_price(code, pos)
+        return None
+
+    def _record_ca_ledger(self, db: Session, portfolio: Portfolio,
+                          timeline: CorporateActionTimeline, actions) -> None:
+        """把已生效的分红/送转写入台账（幂等键冲突即跳过）。"""
+        by_code: Dict[str, list] = {}
+        for ev in timeline._events:
+            by_code.setdefault(ev.code, []).append(ev)
+        for act in actions:
+            if act.kind == "dividend_cash":
+                ev = self._ca_match_event(by_code, act)
+                if ev is None:
+                    continue
+                self._ca_insert_ledger(
+                    db, portfolio, ev, amount=act.cash, qty_delta=0,
+                    note="分红入账（%s）" % act.reason)
+            elif act.kind == KIND_SPLIT:
+                ev = self._ca_match_event(by_code, act)
+                if ev is None or not act.qty:
+                    continue
+                self._ca_insert_ledger(
+                    db, portfolio, ev, amount=Decimal("0"), qty_delta=act.qty,
+                    note="送转（柜台镜面吸收股数）")
+
+    @staticmethod
+    def _ca_match_event(by_code: Dict[str, list], act):
+        for ev in by_code.get(act.code, ()):
+            if act.kind == "dividend_cash" and ev.event_type == "dividend":
+                return ev
+            if act.kind == KIND_SPLIT and ev.event_type == "split":
+                return ev
+        return None
+
+    def _ca_insert_ledger(self, db: Session, portfolio: Portfolio, ev,
+                          *, amount: Decimal, qty_delta: int, note: str) -> None:
+        stmt = sqlite_insert(LiveCorporateAction).values(
+            live_session_id=self.session_id,
+            portfolio_strategy_id=portfolio.portfolio_id,
+            code=ev.code, event_type=ev.event_type, ex_date=ev.ex_date,
+            applied_date=now_shanghai().date(),
+            amount=amount, qty_delta=qty_delta, note=note[:200],
+        ).on_conflict_do_nothing(
+            index_elements=["live_session_id", "portfolio_strategy_id", "code",
+                            "event_type", "ex_date"])
+        db.execute(stmt)
+
+    def _dispatch_ca_actions(self, db: Session, portfolio: Portfolio,
+                             actions, now: datetime) -> None:
+        """把内核意图落成实盘副作用（事件 / 告警 / 强平委托）。"""
+        for act in actions:
+            if act.kind == KIND_DELIST_CLOSE:
+                self._submit_ca_force_close(db, portfolio, act, now)
+            elif act.kind == KIND_REINVEST:
+                self._emit_risk_safe({
+                    "gate": "corporate_action", "rule": "dividend_reinvest",
+                    "level": "warn", "portfolio_id": portfolio.portfolio_id,
+                    "stock_code": act.code,
+                    "message": "分红再投资建议 %.2f 元：审批队列上线前不下单，请人工决定"
+                               % float(act.cash),
+                }, persist=True)
+            elif act.kind == KIND_SKIP_CASH:
+                self._emit_risk_safe({
+                    "gate": "corporate_action", "rule": "skip_cash",
+                    "level": "warn", "portfolio_id": portfolio.portfolio_id,
+                    "stock_code": act.code,
+                    "message": "现金分红未生效：%s" % act.reason,
+                }, persist=True)
+            elif act.kind == KIND_SPLIT:
+                self._emit_risk_safe({
+                    "gate": "corporate_action", "rule": "split",
+                    "level": "info", "portfolio_id": portfolio.portfolio_id,
+                    "stock_code": act.code,
+                    "message": "送转事件已登记（股数以柜台镜面为准）：%s" % act.reason,
+                }, persist=True)
+            elif act.kind == "notice":
+                self._emit_risk_safe({
+                    "gate": "corporate_action", "rule": "notice",
+                    "level": "info", "portfolio_id": portfolio.portfolio_id,
+                    "stock_code": act.code, "message": act.reason,
+                }, persist=True)
+            elif act.kind == "suspend_block":
+                self._emit_risk_safe({
+                    "gate": "corporate_action", "rule": "suspend",
+                    "level": "warn", "portfolio_id": portfolio.portfolio_id,
+                    "stock_code": act.code,
+                    "message": "停牌期间禁止开仓/加仓（%s）" % act.reason,
+                }, persist=True)
+
+    def _submit_ca_force_close(self, db: Session, portfolio: Portfolio, act,
+                               now: datetime) -> None:
+        """退市/长期停牌强平：生成 SELL 走统一提交闸门（默认关闭）。"""
+        ctx = portfolio.find_strategy(act.strategy_id)
+        if ctx is None:
+            return
+        pos = ctx.positions.get(act.code)
+        if pos is None or pos.quantity <= 0:
+            return
+        qty = min(int(act.qty or 0), pos.quantity)
+        if qty <= 0:
+            return
+        order = OrderEvent(
+            strategy_id=act.strategy_id, portfolio_id=portfolio.portfolio_id,
+            stock_code=act.code, trade_type=TradeType.SELL,
+            signal_type=SignalType.CLOSE, quantity=qty,
+            price=act.price, bar_time=now, signal_name="corporate_action",
+            period="1d",
+        )
+        try:
+            self._submit_one_order(db, portfolio, order, "1d", emit_signal=False)
+        except Exception:  # noqa: BLE001 — 强平失败不得中断其它组合
+            logger.exception("组合 %s 退市/停牌强平提交失败（%s）",
+                             portfolio.portfolio_id, act.code)
+
     def _maybe_update_gate(self, portfolio: Portfolio, bar_date: date) -> None:
         """市场多空门控：每日首根非 baseline bar 更新组合门控状态。
 
@@ -5804,6 +6028,9 @@ class LiveEngine:
         # P1：记录分钟级 bar 的交易日（引擎级，多组合共享同一 bar 只推进一次），
         # 供 _release_signal_bar_deferred 判断「due 当日是否收到过行情」。
         self._note_minute_bar_date(bar)
+        # 公司行为（J1/J2，默认关）：specs 为空时立即返回。必须在镜面刷新与信号
+        # 评估之前——停牌闸（suspended_codes）与分红入账要先于本根 bar 生效。
+        self._maybe_apply_corporate_actions(bar.bar_time)
         # 基线 bar（BarPoller 首次建基线/离线恢复首根）：只放行 deferred + 提交链，
         # 不跑公式信号评估与风控评估（防用历史 bar 重放），也不改风险状态。
         baseline = bool(getattr(bar, "baseline", False))
@@ -9776,6 +10003,45 @@ class LiveEngine:
                     "(session %s)",
                     pid, fmt_money(net), fmt_money(replay),
                     fmt_money(port.account.cash), self.session_id)
+        # 公司行为分红重放（J1，2026-11-18）：现金分红不是成交、不在 live_trades
+        # 里，不重放则重启后虚拟现金少一整笔分红。接缝现金捕获时已含接缝日及之前
+        # 的分红 → 只重放 seam_date 之后的行（无锚点则全量重放，与旧行为一致）。
+        try:
+            ca_rows = (
+                db.query(LiveCorporateAction)
+                .filter(LiveCorporateAction.live_session_id == self.session_id)
+                .order_by(LiveCorporateAction.applied_date, LiveCorporateAction.id)
+                .all()
+            )
+        except Exception:  # noqa: BLE001 — 迁移未执行时无该表：跳过分红重放
+            db.rollback()
+            ca_rows = []
+            logger.warning(
+                "recover: live_corporate_actions 读取失败（是否未执行迁移？）→ "
+                "本次跳过分红重放 (session %s)", self.session_id, exc_info=True)
+        ca_by_pid: Dict[int, Decimal] = {}
+        for row in ca_rows:
+            try:
+                amt = Decimal(str(row.amount or 0))
+            except (TypeError, ValueError):
+                continue
+            if amt == 0:
+                continue
+            anchor = anchors.get(row.portfolio_strategy_id)
+            if anchor is not None and row.applied_date is not None:
+                seam = anchor.get("seam_date")
+                if seam is not None and row.applied_date <= seam:
+                    continue
+            pid = row.portfolio_strategy_id
+            ca_by_pid[pid] = ca_by_pid.get(pid, Decimal("0")) + amt
+        for pid, amt in ca_by_pid.items():
+            port = ports_by_id.get(pid)
+            if port is None:
+                continue
+            port.account.cash += amt
+            logger.info(
+                "recover: 组合 %s 公司行为分红重放 %s → 虚拟现金 %s (session %s)",
+                pid, fmt_money(amt), fmt_money(port.account.cash), self.session_id)
         # P1-8：起账估值种子——从最近一次账户快照的 current_price 回填各组合的
         # 「最后已知价」（跨日持久）。否则重启后到首根 bar 之前，没有 bar 的停牌仓
         # 只能退回成本；成本未知（avg_cost=0）时会被按 0 估值 → 假回撤/假日亏。

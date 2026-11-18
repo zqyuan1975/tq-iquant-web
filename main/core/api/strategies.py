@@ -108,6 +108,12 @@ class PortfolioCreate(BaseModel):
     market_gate_engine: str | None = None
     # tdx 通道公式名（空串或 None = 用内核默认 TQGATE）
     market_gate_formula_name: str | None = None
+    # 公司行为（2026-11-18，J1/J2）：手工事件表总开关与处置档位，全部默认关。
+    # None=请求未携带（编辑不动已有值 / 新建落默认 False/0）。
+    corporate_actions_enabled: bool | None = None
+    dividend_reinvest_enabled: bool | None = None
+    suspension_dispose_days: int | None = None
+    delist_force_close_enabled: bool | None = None
     initial_capital: float = 500000
     max_drawdown: float = 0.2
     daily_loss_limit: float = 0.05

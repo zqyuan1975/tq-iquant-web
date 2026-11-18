@@ -118,6 +118,11 @@ def serialize_portfolio(db: Session, p: PortfolioStrategy) -> dict:
         "market_gate_enabled": bool(p.market_gate_enabled) if p.market_gate_enabled is not None else False,
         "market_gate_engine": p.market_gate_engine or "python",
         "market_gate_formula_name": p.market_gate_formula_name or "",
+        # 公司行为（2026-11-18，J1/J2）：总开关 + 再投资 + 停牌处置 + 退市强平
+        "corporate_actions_enabled": bool(p.corporate_actions_enabled),
+        "dividend_reinvest_enabled": bool(p.dividend_reinvest_enabled),
+        "suspension_dispose_days": int(p.suspension_dispose_days or 0),
+        "delist_force_close_enabled": bool(p.delist_force_close_enabled),
         "status": p.status,
         "created_at": p.created_at,
         "updated_at": p.updated_at,
@@ -203,6 +208,16 @@ def _apply_portfolio_fields(p: PortfolioStrategy, req) -> None:
         p.market_gate_engine = req.market_gate_engine
     if getattr(req, "market_gate_formula_name", None) is not None:
         p.market_gate_formula_name = req.market_gate_formula_name or None
+    # 公司行为（2026-11-18，J1/J2）：None=请求未携带 → 不动已有值（前端隐藏字段
+    # 不提交时不会把已有配置清掉）；显式 False/0 是合法配置，按值落库。
+    if getattr(req, "corporate_actions_enabled", None) is not None:
+        p.corporate_actions_enabled = bool(req.corporate_actions_enabled)
+    if getattr(req, "dividend_reinvest_enabled", None) is not None:
+        p.dividend_reinvest_enabled = bool(req.dividend_reinvest_enabled)
+    if getattr(req, "suspension_dispose_days", None) is not None:
+        p.suspension_dispose_days = max(0, int(req.suspension_dispose_days))
+    if getattr(req, "delist_force_close_enabled", None) is not None:
+        p.delist_force_close_enabled = bool(req.delist_force_close_enabled)
 
 
 def _create_strategies_two_step(db: Session, pid: int, strategies: list) -> None:
