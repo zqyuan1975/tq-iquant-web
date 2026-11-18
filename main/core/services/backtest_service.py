@@ -64,6 +64,7 @@ from core.engine.market_gate import (
     parse_tdx_gate_outputs,
 )
 from core.services.acceptance import ACCEPTANCE_PROFILES, compute_acceptance
+from core.services import backtest_cancel
 from core.engine.regime_alpha import (
     QUADRANT_STYLE_INDICES,
     RegimeAlphaAnalyzer,
@@ -4069,6 +4070,8 @@ def run_backtest(db: Session, ps: PortfolioStrategy, req,
     db.commit()
     db.refresh(rec)
     record_id = rec.id
+    # K1 协作式取消：登记取消令牌（API 取消接口按 record_id 置位，引擎逐 bar 检查）
+    cancel_event = backtest_cancel.register([record_id])
 
     try:
         t0 = datetime.now()
@@ -4224,9 +4227,29 @@ def run_backtest(db: Session, ps: PortfolioStrategy, req,
             pending_order_max_days=int(
                 _bt_cfg.get("pending_order_max_days", 20)),
             run_options=exec_flags,
+            cancel_check=cancel_event.is_set,
         )
         t7 = datetime.now()
         _log_timing(f"[回测#{record_id}] 引擎逐bar回测: {(t7-t6).total_seconds():.1f}s")
+
+        # K1 用户取消：不落部分成交/快照/评估（半截结果会被误当完整回测），
+        # 仅落 canceled 状态 + 进度。
+        if result.get("canceled"):
+            progress = result.get("progress") or {}
+            rec.status = "canceled"
+            rec.error_message = (
+                "用户取消：已跑 %s/%s 根 bar"
+                % (progress.get("done_bars", 0), progress.get("total_bars", 0)))
+            rec.completed_at = datetime.now(timezone.utc).replace(tzinfo=None)
+            db.commit()
+            _log_timing(f"[回测#{record_id}] 用户取消，已中止")
+            return {
+                "record_id": record_id,
+                "trades_count": 0,
+                "snapshots_count": 0,
+                "evaluations": {},
+                "canceled": True,
+            }
 
         # W5-O5：样本不足一年（< 252 交易日）→ 告警年化收益仅供参考
         n_trading_days = len(_dedup_daily_by_date(result.get("snapshots") or []))
@@ -4299,6 +4322,8 @@ def run_backtest(db: Session, ps: PortfolioStrategy, req,
             rec.error_message = str(e) or repr(e)
             db.commit()
         raise
+    finally:
+        backtest_cancel.release([record_id])
 
     safe_compute_crisis_alpha(
         db, rec.id, ps, result["snapshots"], req.start_date, req.end_date
@@ -4606,6 +4631,8 @@ def run_multi_backtest(db: Session, portfolios: list, req) -> dict:
             records[ps.id] = rec.id
 
         _bt_cfg = (load_config() or {}).get("backtest") or {}
+        # K1 协作式取消：整批子记录共享同一令牌（取消任一子记录即中止整批）
+        cancel_event = backtest_cancel.register(list(records.values()))
         results = BacktestEngine().run_multi(
             [e["portfolio"] for e in entries],
             klines=klines_full,
@@ -4615,7 +4642,31 @@ def run_multi_backtest(db: Session, portfolios: list, req) -> dict:
             gate_trackers=gate_trackers,
             pending_order_max_days=int(_bt_cfg.get("pending_order_max_days", 20)),
             run_options=exec_flags,
+            cancel_check=cancel_event.is_set,
         )
+        if results.get("_canceled"):
+            progress = results.get("_progress") or {}
+            msg = ("用户取消：已跑 %s/%s 根 bar"
+                   % (progress.get("done_bars", 0), progress.get("total_bars", 0)))
+            now_utc = datetime.now(timezone.utc).replace(tzinfo=None)
+            for rid in records.values():
+                _rec = db.get(BacktestRecord, rid)
+                if _rec is not None and _rec.status == "running":
+                    _rec.status = "canceled"
+                    _rec.error_message = msg
+                    _rec.completed_at = now_utc
+            _grp = db.get(BacktestRunGroup, group_id)
+            if _grp is not None:
+                _grp.status = "canceled"
+                _grp.error_message = msg
+                _grp.finished_at = now_utc
+            db.commit()
+            return {
+                "run_group_id": group_id,
+                "records": [],
+                "aggregate": None,
+                "canceled": True,
+            }
         decisions = results.pop("_decisions", []) if isinstance(results, dict) else []
         per_portfolio: Dict[int, dict] = {}
         for e in entries:
@@ -4677,6 +4728,8 @@ def run_multi_backtest(db: Session, portfolios: list, req) -> dict:
                 rec.error_message = str(exc) or repr(exc)
         db.commit()
         raise
+    finally:
+        backtest_cancel.release(list(records.values()))
 
 
 def _serialize_run_group(g) -> dict:

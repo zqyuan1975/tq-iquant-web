@@ -11,8 +11,9 @@ from sqlalchemy.orm import Session
 from core.api.response import err, ok
 from core.config import load_config
 from core.db import get_db
-from core.models import PortfolioStrategy
+from core.models import BacktestRecord, PortfolioStrategy
 from core.engine.market_gate import MarketGateUnavailableError
+from core.services import backtest_cancel
 from core.services.html_report import build_html_report
 
 router = APIRouter(prefix="/api/backtest", tags=["backtest"])
@@ -234,6 +235,25 @@ def delete_record(record_id: int, db: Session = Depends(get_db)):
         status = 409 if (msg and "运行中" in msg) else 404
         return err(status, msg)
     return ok()
+
+
+@router.post("/records/{record_id}/cancel")
+def cancel_record(record_id: int, db: Session = Depends(get_db)):
+    """K1 协作式取消：请求中止正在运行的回测（引擎在下一根 bar 前退出）。
+
+    同步内联执行无法强杀，故只置位取消令牌；记录最终由 service 层标
+    ``canceled`` 并写入进度。多组合回测的任一子记录会中止整批。
+    - 404：记录不存在
+    - 409：记录不在运行中，或不在本进程运行列表（已结束/其它实例执行）
+    """
+    rec = db.get(BacktestRecord, record_id)
+    if rec is None:
+        return err(404, "回测记录不存在")
+    if rec.status != "running":
+        return err(409, "回测不在运行中，无法取消")
+    if not backtest_cancel.cancel(record_id):
+        return err(409, "该回测不在本进程运行列表中（可能已结束），无法取消")
+    return ok({"record_id": record_id, "cancel_requested": True})
 
 
 @router.post("/records/{record_id}/crisis-alpha/recompute")

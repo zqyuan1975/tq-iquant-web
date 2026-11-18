@@ -4,6 +4,7 @@ import * as echarts from 'echarts'
 import {
   getBacktestRecords, getBacktestDetail, runBacktest, getPortfolios,
   deleteBacktestRecord, recomputeCrisisAlpha, recomputeMarketRegime,
+  cancelBacktestRecord,
   recomputeRobustness, recomputePersistenceAnalysis, getStockPools, compareBacktestPools,
   sendUserBlock,
 } from '../api'
@@ -879,6 +880,7 @@ function initCaDimChart() {
 // 信号状态标签
 const STATUS_LABEL: Record<string, string> = {
   completed: '已完成', running: '运行中', failed: '失败', pending: '待运行',
+  canceled: '已取消',
 }
 
 // 信号类型 → 中文（公式 OPEN/ADD/REDUCE/CLOSE + 风控 STOP_LOSS/TAKE_PROFIT/TRAILING_STOP）
@@ -1942,6 +1944,24 @@ async function onDelete(id: number) {
     await load()
   } catch (e) {
     alert(`删除失败：${errMsg(e)}`)
+  }
+}
+
+// K1：协作式取消（引擎在下一根 bar 前退出，记录最终标「已取消」+ 进度）
+const canceling = ref<Record<number, boolean>>({})
+async function onCancel(id: number) {
+  if (!confirm('确定取消该回测？已跑部分不会保留（不落半截结果）。')) return
+  canceling.value = { ...canceling.value, [id]: true }
+  try {
+    await cancelBacktestRecord(id)
+    // 引擎在下一根 bar 前响应；轮询一次 promptly 看到 canceled 状态
+    await load()
+  } catch (e) {
+    alert(`取消失败：${errMsg(e)}`)
+  } finally {
+    const next = { ...canceling.value }
+    delete next[id]
+    canceling.value = next
   }
 }
 
@@ -3035,7 +3055,10 @@ watch(theme, () => {
             </td>
             <td>
               <button @click="openDetail(r.id)" class="btn btn-sm btn-primary" :disabled="r.status !== 'completed'">查看</button>
-              <button @click="onDelete(r.id)" class="btn btn-sm">删除</button>
+              <button v-if="r.status === 'running'" @click="onCancel(r.id)" class="btn btn-sm" :disabled="canceling[r.id]" style="margin-left:6px">
+                {{ canceling[r.id] ? '取消中…' : '取消' }}
+              </button>
+              <button @click="onDelete(r.id)" class="btn btn-sm" style="margin-left:6px">删除</button>
             </td>
           </tr>
         </tbody>

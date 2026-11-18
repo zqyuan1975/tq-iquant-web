@@ -1,4 +1,4 @@
-from typing import Dict, List, Optional
+from typing import Callable, Dict, List, Optional
 from datetime import datetime, date
 from decimal import Decimal, ROUND_HALF_UP
 from dataclasses import replace
@@ -124,6 +124,7 @@ class BacktestEngine:
         prev_close_by_day: Optional[Dict[tuple, Decimal]] = None,
         pending_order_max_days: int = PENDING_ORDER_MAX_DAYS,
         run_options: Optional[dict] = None,
+        cancel_check: Optional[Callable[[], bool]] = None,
     ) -> dict:
         """逐 bar 回测主链路。
 
@@ -155,6 +156,8 @@ class BacktestEngine:
         run_options：执行档位展开后的开关（N1，2026-11-18，默认 None=旧行为）：
         ``first_bar_no_fill``（每交易日首根 bar 不生成 BUY）/
         ``partial_fill_enabled``（成交量上限缩量后残量回队续成交）。
+        cancel_check：K1 协作式取消（默认 None=不检查）。每根 bar 处理前调用，
+        返回 True 即中止循环并返回 ``canceled=True`` + ``progress``，不产出部分结果。
         """
         run_options = run_options or {}
         _first_bar_no_fill = bool(run_options.get("first_bar_no_fill", False))
@@ -252,6 +255,18 @@ class BacktestEngine:
         _rule_cache: Dict[tuple, object] = {}
 
         for i, (t, period) in enumerate(times):
+            # K1 协作式取消：每根 bar 前检查一次（粒度=bar，长回测通常秒级响应）
+            if cancel_check is not None and cancel_check():
+                return {
+                    "trades": [], "snapshots": [], "evaluations": {},
+                    "strategy_snapshots": {}, "strategy_evaluations": {},
+                    "decisions": [], "pending_orders": list(pending_orders),
+                    "pending_order_count": len(pending_orders),
+                    "pending_order_summary": [],
+                    "risk_sell_trigger_count": 0, "risk_sell_fill_attempts": 0,
+                    "canceled": True,
+                    "progress": {"done_bars": i, "total_bars": len(times)},
+                }
             # B5 市场状态闸：在新交易日首根 bar 用"前一交易日"基准收盘推进因果状态机
             # （当日收盘在 00:00 尚未确认，喂当日 = 未来函数）。基准缺失日跳过，沿用标签。
             if regime_tracker is not None:
@@ -802,6 +817,7 @@ class BacktestEngine:
         gate_trackers: Optional[Dict[int, object]] = None,
         pending_order_max_days: int = PENDING_ORDER_MAX_DAYS,
         run_options: Optional[dict] = None,
+        cancel_check: Optional[Callable[[], bool]] = None,
     ) -> Dict[int, dict]:
         """多组合共享现金回测（N1，2026-11-18）。
 
@@ -820,6 +836,8 @@ class BacktestEngine:
             保证共享账户语义与账本一致性。
 
         返回 ``{portfolio_id: run() 同构结果}``（不含聚合，聚合由服务层拼）。
+        取消（K1，``cancel_check``）命中时返回 ``{"_canceled": True,
+        "_progress": {...}, "_decisions": []}``，服务层据此把整批标 canceled。
         """
         run_options = run_options or {}
         _first_bar_no_fill = bool(run_options.get("first_bar_no_fill", False))
@@ -904,6 +922,13 @@ class BacktestEngine:
             day_end_steps.add(_group_first)
 
         for i, (t, period) in enumerate(times):
+            # K1 协作式取消：任一组记录的取消令牌置位 → 整批中止
+            if cancel_check is not None and cancel_check():
+                return {
+                    "_canceled": True,
+                    "_progress": {"done_bars": i, "total_bars": len(times)},
+                    "_decisions": [],
+                }
             for s in states:
                 portfolio = s["portfolio"]
                 tracker = (regime_trackers or {}).get(portfolio.portfolio_id)

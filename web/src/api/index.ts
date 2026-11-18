@@ -1208,6 +1208,13 @@ export async function deleteBacktestRecord(id: number) {
   return res.data.data
 }
 
+// K1 协作式取消：请求中止运行中的回测（引擎下一根 bar 前退出，记录标 canceled）
+export async function cancelBacktestRecord(id: number) {
+  const res = await api.post<ApiResponse<{ record_id: number; cancel_requested: boolean }>>(
+    `/backtest/records/${id}/cancel`)
+  return res.data.data
+}
+
 // ===== C8 walk-forward 滚动验证 =====
 export interface WalkForwardRequest {
   portfolio_strategy_id: number
