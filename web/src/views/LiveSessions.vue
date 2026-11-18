@@ -832,7 +832,7 @@ function openCreate() {
   const engine = (!occ[preferred]
     ? preferred
     : (engines.find((e) => e.configured && !occ[e.key])?.key as LiveEngineKey | undefined)) || preferred
-  form.value = { name: '', mode: 'simulation', engine, execution_mode: 'alert', portfolio_ids: [], live_capital: null, signal_file_path: '', advance_close_enabled: false, advance_close_time: '14:51', intraday_mismatched_risk_enabled: null, gate_recheck_on_execute: false }
+  form.value = { name: '', mode: 'simulation', engine, execution_mode: 'alert', capital_pool_mode: 'off', capital_pool_rebalance_enabled: false, portfolio_ids: [], live_capital: null, signal_file_path: '', advance_close_enabled: false, advance_close_time: '14:51', intraday_mismatched_risk_enabled: null, gate_recheck_on_execute: false }
   createError.value = ''
   showCreate.value = true
   loadAccountPreview(engine)

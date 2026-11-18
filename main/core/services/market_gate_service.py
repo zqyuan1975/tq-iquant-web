@@ -19,6 +19,7 @@ from core.engine.market_gate import (
     GATE_WARMUP_DAYS,
     MarketGateUnavailableError,
     compute_gate_states,
+    parse_gate_indices,
 )
 from core.engine.market_rules import trading_days_between
 from core.services.backtest_service import build_gate_ohlcv
@@ -160,3 +161,83 @@ def fetch_gate_status(benchmark_index: Optional[str] = None,
 def clear_cache() -> None:
     """清空缓存（测试/基准切换用）。"""
     _cache.clear()
+
+
+# E5：两套市场状态机制的作用域与优先级（只读说明，前端原样渲染）
+GATE_SCOPE_NOTES = (
+    {
+        "key": "market_gate",
+        "name": "市场多空门控",
+        "scope": "组合级（每个组合独立配置基准/投票指数）",
+        "effect": "空头状态只拦开仓/加仓（OPEN/ADD），持仓不强平；可选按比例减仓一次",
+        "timing": "右移一日（昨日收盘状态管今日开仓）；基准取数失败 fail-open 放行",
+    },
+    {
+        "key": "regime_filter",
+        "name": "市场状态闸（B5）",
+        "scope": "策略级（基准周线 bull / 其它）",
+        "effect": "bull 态用 trend_* 覆盖移动止损与最大持仓；只改风控参数，不拦开仓",
+        "timing": "每日 on_bar 前注入当前状态；未启用时全部回落原参数",
+    },
+    {
+        "key": "precedence",
+        "name": "优先级",
+        "scope": "两套机制并行，不互斥",
+        "effect": "门控先决定能否开仓（策略 off 可豁免）；市场状态闸只调整已开仓位的止损/槽位",
+        "timing": "先门控（开仓闸）→ 后风控参数（状态闸）",
+    },
+)
+
+
+def fetch_gate_overview(db) -> dict:
+    """E5 统一市场状态面板数据（只读，不改任何判定）。
+
+    返回两套机制的静态作用域说明 + 各组合/子策略的当前配置，供前端一屏看清
+    market_gate 与 regime_filter 各自作用域、优先级与生效配置。
+    """
+    from core.models import PortfolioStrategy, Strategy
+
+    strategies = db.query(Strategy).order_by(Strategy.portfolio_id, Strategy.id).all()
+    by_portfolio: Dict[int, list] = {}
+    for s in strategies:
+        by_portfolio.setdefault(s.portfolio_id, []).append(s)
+
+    portfolios = []
+    for p in db.query(PortfolioStrategy).order_by(PortfolioStrategy.id).all():
+        benchmark = getattr(p, "benchmark_index", None) or DEFAULT_GATE_INDEX
+        indices = parse_gate_indices(getattr(p, "market_gate_indices", None))
+        rows = by_portfolio.get(p.id, [])
+        force_on = any(
+            (getattr(s, "market_gate_mode", None) or "inherit") == "on"
+            for s in rows
+        )
+        portfolios.append({
+            "id": p.id,
+            "name": p.name,
+            "market_gate_enabled": bool(getattr(p, "market_gate_enabled", False)),
+            "effective_enabled": bool(
+                getattr(p, "market_gate_enabled", False)) or force_on,
+            "benchmark_index": benchmark,
+            "indices": indices or [benchmark],
+            "vote_mode": getattr(p, "market_gate_vote_mode", None) or "any",
+            "strength_threshold": int(
+                getattr(p, "market_gate_strength_threshold", 0) or 0),
+            "bear_reduce_ratio": float(
+                getattr(p, "market_gate_bear_reduce_ratio", 0) or 0),
+            "engine": getattr(p, "market_gate_engine", None) or "python",
+            "formula_name": getattr(p, "market_gate_formula_name", None) or "",
+            "strategies": [{
+                "id": s.id,
+                "name": s.name,
+                "regime_filter_enabled": bool(
+                    getattr(s, "regime_filter_enabled", False)),
+                "trend_trailing_stop_ratio": (
+                    float(s.trend_trailing_stop_ratio)
+                    if getattr(s, "trend_trailing_stop_ratio", None) is not None
+                    else None),
+                "trend_max_positions": getattr(s, "trend_max_positions", None),
+                "market_gate_mode": (
+                    getattr(s, "market_gate_mode", None) or "inherit"),
+            } for s in rows],
+        })
+    return {"scopes": list(GATE_SCOPE_NOTES), "portfolios": portfolios}

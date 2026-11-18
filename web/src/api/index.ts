@@ -662,6 +662,49 @@ export async function getMarketGateStatus(params: {
   return res.data.data
 }
 
+// E5 统一市场状态面板（GET /market-gate/overview）— 只读，聚合两套机制配置
+export interface MarketGateScopeNote {
+  key: string
+  name: string
+  scope: string
+  effect: string
+  timing: string
+}
+
+export interface MarketGateOverviewStrategy {
+  id: number
+  name: string
+  regime_filter_enabled: boolean
+  trend_trailing_stop_ratio: number | null
+  trend_max_positions: number | null
+  market_gate_mode: string
+}
+
+export interface MarketGateOverviewPortfolio {
+  id: number
+  name: string
+  market_gate_enabled: boolean
+  effective_enabled: boolean
+  benchmark_index: string
+  indices: string[]
+  vote_mode: string
+  strength_threshold: number
+  bear_reduce_ratio: number
+  engine: string
+  formula_name: string
+  strategies: MarketGateOverviewStrategy[]
+}
+
+export interface MarketGateOverview {
+  scopes: MarketGateScopeNote[]
+  portfolios: MarketGateOverviewPortfolio[]
+}
+
+export async function getMarketGateOverview() {
+  const res = await api.get<ApiResponse<MarketGateOverview>>('/market-gate/overview')
+  return res.data.data
+}
+
 export async function getStockPools() {
   const res = await api.get<ApiResponse<StockPoolItem[]>>('/stock-pools')
   return res.data.data

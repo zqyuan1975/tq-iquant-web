@@ -2,8 +2,9 @@
 import { computed, ref, onMounted } from 'vue'
 import {
   getTdxPools, getTdxPoolStocks, syncStockPool, getStockPools, deleteStockPool,
-  getMarketGateStatus,
+  getMarketGateStatus, getMarketGateOverview,
   type TdxPoolItem, type TdxPoolStockItem, type MarketGateStatusItem,
+  type MarketGateOverview,
 } from '../api'
 import PageHeader from '../components/PageHeader.vue'
 import { BENCHMARKS, DEFAULT_BENCHMARK } from '../utils/benchmarks'
@@ -41,6 +42,20 @@ async function loadGateStatus(force = false) {
     gateError.value = '市场状态加载失败：' + errMsg(e)
   } finally {
     gateLoading.value = false
+  }
+}
+
+// ===== E5 统一市场状态面板（只读：两套机制作用域/优先级 + 组合策略配置）=====
+const gateOverview = ref<MarketGateOverview | null>(null)
+const gateOverviewError = ref('')
+
+async function loadGateOverview() {
+  gateOverviewError.value = ''
+  try {
+    gateOverview.value = await getMarketGateOverview()
+  } catch (e) {
+    gateOverview.value = null
+    gateOverviewError.value = '统一市场状态加载失败：' + errMsg(e)
   }
 }
 
@@ -112,6 +127,7 @@ async function remove(p: TdxPoolItem) {
 onMounted(() => {
   load()
   loadGateStatus()
+  loadGateOverview()
 })
 </script>
 
@@ -213,6 +229,67 @@ onMounted(() => {
       </div>
     </template>
     <div v-else class="gate-state">暂无数据</div>
+  </div>
+
+  <!-- E5 统一市场状态面板：market_gate 与 regime_filter 作用域/优先级（只读） -->
+  <div class="card gate-overview">
+    <div class="gate-overview-head">
+      <h3>市场状态统一面板</h3>
+      <span class="gate-overview-hint">market_gate 与 regime_filter 的作用域/优先级与当前配置（只读）</span>
+    </div>
+    <div v-if="gateOverviewError" class="gate-error">{{ gateOverviewError }}</div>
+    <template v-else-if="gateOverview">
+      <div class="scope-grid">
+        <div v-for="s in gateOverview.scopes" :key="s.key" class="scope-item">
+          <div class="scope-title">{{ s.name }}</div>
+          <div class="scope-row"><span>作用域</span>{{ s.scope }}</div>
+          <div class="scope-row"><span>效果</span>{{ s.effect }}</div>
+          <div class="scope-row"><span>时点</span>{{ s.timing }}</div>
+        </div>
+      </div>
+      <div v-if="gateOverview.portfolios.length === 0" class="gate-empty">暂无组合配置</div>
+      <table v-else class="gate-overview-table">
+        <thead>
+          <tr>
+            <th>组合</th><th>门控</th><th>指数 / 投票</th>
+            <th>强度门槛</th><th>空头减仓</th><th>子策略（状态闸 / 门控覆盖）</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr v-for="p in gateOverview.portfolios" :key="p.id">
+            <td>{{ p.name }}</td>
+            <td>
+              <span class="badge" :class="p.effective_enabled ? 'badge-green' : 'badge-gray'">
+                {{ p.effective_enabled ? '启用' : '关闭' }}
+              </span>
+              <div v-if="!p.market_gate_enabled && p.effective_enabled" class="gate-overview-note">由策略 on 强制</div>
+            </td>
+            <td>
+              <div class="num">{{ p.indices.join(' / ') }}</div>
+              <div class="gate-overview-note">{{ p.vote_mode }} · {{ p.engine }}</div>
+            </td>
+            <td class="num">{{ p.strength_threshold > 0 ? p.strength_threshold : '不限' }}</td>
+            <td class="num">{{ p.bear_reduce_ratio > 0 ? Math.round(p.bear_reduce_ratio * 100) + '%' : '关闭' }}</td>
+            <td>
+              <div v-for="s in p.strategies" :key="s.id" class="scope-strategy">
+                <span>{{ s.name }}</span>
+                <span class="badge" :class="s.regime_filter_enabled ? 'badge-green' : 'badge-gray'">
+                  状态闸{{ s.regime_filter_enabled ? '开' : '关' }}
+                </span>
+                <span class="badge" :class="s.market_gate_mode === 'off' ? 'badge-gray' : (s.market_gate_mode === 'on' ? 'badge-green' : '')">
+                  门控 {{ s.market_gate_mode }}
+                </span>
+              </div>
+              <div v-if="p.strategies.length === 0" class="gate-overview-note">无子策略</div>
+            </td>
+          </tr>
+        </tbody>
+      </table>
+      <div class="gate-overview-foot">
+        运行中修改组合/策略配置需停止并重启实盘会话后生效；本面板只读，不改变任何判定。
+      </div>
+    </template>
+    <div v-else class="gate-state">加载中…</div>
   </div>
 
   <div v-if="errorMsg" class="card" style="padding:12px;color:var(--red);margin-bottom:12px">
@@ -378,6 +455,24 @@ onMounted(() => {
   .gate-hero-block + .gate-hero-block { border-left: none; padding-left: 0; border-top: 1px solid var(--line); padding-top: 13px; }
   .gate-foot { flex-direction: column; align-items: flex-start; }
   .gate-foot-tag { margin-left: 0; }
+  .scope-grid { grid-template-columns: minmax(0, 1fr); }
+  .gate-overview-table { display: block; overflow-x: auto; }
 }
 
+/* ===== E5 统一市场状态面板 ===== */
+.gate-overview { margin-bottom: 12px; }
+.gate-overview-head { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; padding: 14px 18px 10px; }
+.gate-overview-head h3 { margin: 0; font-size: 14px; }
+.gate-overview-hint { font-size: 11.5px; color: var(--ink-faint); }
+.scope-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; padding: 0 18px 14px; }
+.scope-item { border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; background: var(--surface-2, transparent); }
+.scope-title { font-size: 12.5px; font-weight: 600; margin-bottom: 6px; }
+.scope-row { font-size: 11.5px; line-height: 1.55; color: var(--ink-soft); }
+.scope-row > span { display: inline-block; min-width: 44px; color: var(--ink-faint); }
+.gate-overview-table { width: 100%; border-collapse: collapse; font-size: 12px; }
+.gate-overview-table th, .gate-overview-table td { text-align: left; padding: 8px 12px; border-top: 1px solid var(--line); vertical-align: top; }
+.gate-overview-table th { font-size: 11px; font-weight: 600; color: var(--ink-faint); }
+.gate-overview-note { font-size: 10.5px; color: var(--ink-faint); margin-top: 3px; }
+.scope-strategy { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; margin-bottom: 4px; }
+.gate-overview-foot { padding: 10px 18px 14px; font-size: 11px; color: var(--ink-faint); }
 </style>

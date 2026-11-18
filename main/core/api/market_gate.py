@@ -6,11 +6,17 @@
 """
 import logging
 
-from fastapi import APIRouter, Query
+from fastapi import APIRouter, Depends, Query
+from sqlalchemy.orm import Session
 
 from core.api.response import err, ok
+from core.db import get_db
 from core.engine.market_gate import MarketGateUnavailableError
-from core.services.market_gate_service import DEFAULT_GATE_INDEX, fetch_gate_status
+from core.services.market_gate_service import (
+    DEFAULT_GATE_INDEX,
+    fetch_gate_overview,
+    fetch_gate_status,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -37,3 +43,13 @@ def market_gate_status(
         logger.exception("市场多空状态计算失败 code=%s", code)
         return err(500, f"市场多空状态计算失败：{exc}")
     return ok(data)
+
+
+@router.get("/overview")
+def market_gate_overview(db: Session = Depends(get_db)):
+    """E5 统一市场状态面板：两套机制作用域/优先级 + 组合与策略配置（只读）。"""
+    try:
+        return ok(fetch_gate_overview(db))
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("市场状态面板聚合失败")
+        return err(500, f"市场状态面板聚合失败：{exc}")
