@@ -3524,6 +3524,24 @@ watch(theme, () => {
          title="下载离线 HTML 单文件报告">
         📄 导出 HTML 报告
       </a>
+      <template v-if="currentRecord.id">
+        <a :href="`/api/backtest/records/${currentRecord.id}/export/csv?kind=trades`"
+           target="_blank" class="btn btn-sm"
+           style="margin-top:8px;display:inline-block;margin-left:6px"
+           title="导出成交明细 CSV（UTF-8 BOM，Excel 可直接打开）">成交 CSV</a>
+        <a :href="`/api/backtest/records/${currentRecord.id}/export/csv?kind=snapshots`"
+           target="_blank" class="btn btn-sm"
+           style="margin-top:8px;display:inline-block;margin-left:6px"
+           title="导出组合日快照 CSV">快照 CSV</a>
+        <a :href="`/api/backtest/records/${currentRecord.id}/export/csv?kind=metrics`"
+           target="_blank" class="btn btn-sm"
+           style="margin-top:8px;display:inline-block;margin-left:6px"
+           title="导出指标汇总 CSV">指标 CSV</a>
+        <a :href="`/api/backtest/records/${currentRecord.id}/export/pdf`"
+           target="_blank" class="btn btn-sm"
+           style="margin-top:8px;display:inline-block;margin-left:6px"
+           title="导出 PDF（调用本机 Edge/Chrome 无头打印；无浏览器时提示改用 CSV/HTML）">导出 PDF</a>
+      </template>
       <button @click="syncPositionsBlock" class="btn btn-sm"
               style="margin-top:8px;display:inline-block;margin-left:6px"
               :disabled="detailStockCodes.length === 0"

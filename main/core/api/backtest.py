@@ -4,7 +4,7 @@ from typing import List, Optional
 from urllib.parse import quote
 
 from fastapi import APIRouter, Depends, HTTPException
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, Response
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
@@ -15,6 +15,9 @@ from core.models import BacktestRecord, PortfolioStrategy
 from core.engine.market_gate import MarketGateUnavailableError
 from core.services import backtest_cancel
 from core.services.html_report import build_html_report
+from core.services.backtest_export import (
+    CSV_KINDS, PdfExportUnavailable, build_csv, html_to_pdf,
+)
 
 router = APIRouter(prefix="/api/backtest", tags=["backtest"])
 
@@ -402,6 +405,55 @@ def export_record_html(record_id: int, db: Session = Depends(get_db)):
     fname = quote(f"回测报告-{rec.get('name') or record_id}.html")
     return HTMLResponse(
         content=report,
+        headers={"Content-Disposition": f"attachment; filename*=UTF-8''{fname}"},
+    )
+
+
+_CSV_KIND_LABEL = {"trades": "成交明细", "snapshots": "日快照", "metrics": "指标汇总"}
+
+
+@router.get("/records/{record_id}/export/csv")
+def export_record_csv(
+    record_id: int, kind: str = "trades", db: Session = Depends(get_db),
+):
+    """K6 导出 CSV（kind=trades|snapshots|metrics）。
+
+    与 HTML 导出一致：文件下载例外于统一 envelope，直接返回 text/csv +
+    Content-Disposition；带 UTF-8 BOM，Excel 打开不乱码。
+    """
+    if kind not in CSV_KINDS:
+        return err(400, f"不支持的导出类型：{kind}（可选 {'/'.join(CSV_KINDS)}）")
+    detail = _svc_get_record_detail(db, record_id)
+    if detail is None:
+        return err(404, "回测记录不存在")
+    text = build_csv(detail, kind)
+    rec = detail.get("record") or {}
+    fname = quote(f"回测-{rec.get('name') or record_id}-{_CSV_KIND_LABEL[kind]}.csv")
+    return Response(
+        content=text.encode("utf-8"),
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": f"attachment; filename*=UTF-8''{fname}"},
+    )
+
+
+@router.get("/records/{record_id}/export/pdf")
+def export_record_pdf(record_id: int, db: Session = Depends(get_db)):
+    """K6 导出 PDF：无头浏览器打印离线 HTML 报告（中文字体/图表与在线一致）。
+
+    离线环境无 Edge/Chrome 时返回 503 并提示改用 CSV/HTML（不静默降级）。
+    """
+    detail = _svc_get_record_detail(db, record_id)
+    if detail is None:
+        return err(404, "回测记录不存在")
+    try:
+        pdf = html_to_pdf(build_html_report(detail))
+    except PdfExportUnavailable as exc:
+        return err(503, str(exc))
+    rec = detail.get("record") or {}
+    fname = quote(f"回测报告-{rec.get('name') or record_id}.pdf")
+    return Response(
+        content=pdf,
+        media_type="application/pdf",
         headers={"Content-Disposition": f"attachment; filename*=UTF-8''{fname}"},
     )
 

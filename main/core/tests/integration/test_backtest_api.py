@@ -1477,3 +1477,62 @@ def test_persistence_recompute_rejects_unknown_benchmark(client, monkeypatch):
     r = c.post(f"/api/backtest/records/{rid}/persistence/recompute?benchmark_code=BAD.CODE")
     assert r.json()["code"] == 400
     assert "BAD.CODE" in r.json()["message"]
+
+
+# ---------------------------------------------------------------------------
+# K6 报告导出（CSV / PDF）
+# ---------------------------------------------------------------------------
+def test_export_csv_kinds_and_errors(client, monkeypatch):
+    """CSV 导出直接返回文件（text/csv + attachment），非法 kind=400、缺记录=404。"""
+    c, Session = client
+    db = Session()
+    ps_id, _, _ = _seed(db)
+    db.close()
+    _mock_data(monkeypatch)
+    rid = _post_backtest(c, ps_id).json()["data"]["record_id"]
+
+    trades = c.get(f"/api/backtest/records/{rid}/export/csv?kind=trades")
+    assert trades.status_code == 200
+    assert trades.headers["content-type"].startswith("text/csv")
+    assert "attachment" in trades.headers["content-disposition"]
+    body = trades.content.decode("utf-8-sig")
+    assert body.startswith("时间,策略,信号,代码,方向")
+    assert "000001.SZ" in body
+
+    snapshots = c.get(f"/api/backtest/records/{rid}/export/csv?kind=snapshots")
+    assert snapshots.content.decode("utf-8-sig").startswith("日期,总资产")
+
+    metrics = c.get(f"/api/backtest/records/{rid}/export/csv?kind=metrics")
+    metrics_text = metrics.content.decode("utf-8-sig")
+    assert metrics_text.startswith("指标,数值")
+    assert "总收益" in metrics_text
+
+    bad = c.get(f"/api/backtest/records/{rid}/export/csv?kind=pdf")
+    assert bad.json()["code"] == 400
+
+    missing = c.get("/api/backtest/records/999999/export/csv")
+    assert missing.json()["code"] == 404
+
+
+def test_export_pdf_returns_file_or_503(client, monkeypatch):
+    """PDF：浏览器可用时返回 application/pdf；不可用时 503 并给出明确提示。"""
+    c, Session = client
+    db = Session()
+    ps_id, _, _ = _seed(db)
+    db.close()
+    _mock_data(monkeypatch)
+    rid = _post_backtest(c, ps_id).json()["data"]["record_id"]
+
+    monkeypatch.setattr(bt_api, "html_to_pdf", lambda html: b"%PDF-1.4 stub")
+    ok = c.get(f"/api/backtest/records/{rid}/export/pdf")
+    assert ok.status_code == 200
+    assert ok.headers["content-type"] == "application/pdf"
+    assert ok.content.startswith(b"%PDF")
+
+    def _unavailable(html):
+        raise bt_api.PdfExportUnavailable("未找到 Edge/Chrome")
+
+    monkeypatch.setattr(bt_api, "html_to_pdf", _unavailable)
+    blocked = c.get(f"/api/backtest/records/{rid}/export/pdf")
+    assert blocked.json()["code"] == 503
+    assert "Edge" in blocked.json()["message"]
