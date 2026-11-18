@@ -38,6 +38,7 @@ from .corporate_action import CorporateAction, LiveCorporateAction
 from .live_approval_queue import LiveApprovalQueue
 from .live_manual_action import LiveManualAction
 from .live_reconciliation_diff import LiveReconciliationDiff
+from .live_reconciliation_report import LiveReconciliationReport
 
 __all__ = [
     "Base",
@@ -81,4 +82,5 @@ __all__ = [
     "LiveApprovalQueue",
     "LiveManualAction",
     "LiveReconciliationDiff",
+    "LiveReconciliationReport",
 ]

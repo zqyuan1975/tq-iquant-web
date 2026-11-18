@@ -38,7 +38,7 @@ from core.models import (
     LiveSession, LiveSessionPortfolio, PortfolioStrategy, Strategy,
     StockPoolStock, StockPoolMembership, Formula, FormulaSignal, LiveOrder, LiveTrade, LiveDecisionEvent,
     LiveSignal, LiveAccountSnapshot, LiveCashFlow, LiveBaselineReset,
-    LiveManualAction, LiveReconciliationDiff,
+    LiveManualAction, LiveReconciliationDiff, LiveReconciliationReport,
     IncrementalBacktestCheckpoint, BacktestRecord,
 )
 from core.engine.portfolio_builder import assemble_portfolio
@@ -2054,6 +2054,119 @@ def _first_strategy_id(db: Session, portfolio_id: Optional[int]) -> Optional[int
            .filter(Strategy.portfolio_id == portfolio_id)
            .order_by(Strategy.id).first())
     return None if row is None else int(row[0])
+
+
+def serialize_reconciliation_report(row) -> dict:
+    """C4 日报序列化：金额统一两位小数字符串，detail 还原为对象。"""
+    detail = None
+    if row.detail:
+        try:
+            detail = json.loads(row.detail)
+        except (TypeError, ValueError):
+            detail = {"raw": row.detail}
+    return {
+        "id": row.id,
+        "live_session_id": row.live_session_id,
+        "report_date": row.report_date.isoformat() if row.report_date else None,
+        "engine": row.engine,
+        "positions_total": row.positions_total,
+        "positions_matched": row.positions_matched,
+        "positions_diff": row.positions_diff,
+        "cash_expected": (str(row.cash_expected)
+                          if row.cash_expected is not None else None),
+        "cash_actual": (str(row.cash_actual)
+                        if row.cash_actual is not None else None),
+        "cash_diff": (str(row.cash_diff)
+                      if row.cash_diff is not None else None),
+        "equity_expected": (str(row.equity_expected)
+                            if row.equity_expected is not None else None),
+        "equity_actual": (str(row.equity_actual)
+                          if row.equity_actual is not None else None),
+        "equity_deviation_pct": (str(row.equity_deviation_pct)
+                                 if row.equity_deviation_pct is not None else None),
+        "order_count": row.order_count,
+        "trade_count": row.trade_count,
+        "detail": detail,
+        "created_at": (row.created_at.strftime("%Y-%m-%d %H:%M:%S")
+                       if row.created_at else None),
+        "updated_at": (row.updated_at.strftime("%Y-%m-%d %H:%M:%S")
+                       if row.updated_at else None),
+    }
+
+
+_REPORT_MONEY_FIELDS = ("cash_expected", "cash_actual", "cash_diff",
+                        "equity_expected", "equity_actual")
+_REPORT_INT_FIELDS = ("positions_total", "positions_matched", "positions_diff",
+                      "order_count", "trade_count")
+
+
+def upsert_reconciliation_report(
+    db: Session, session_id: int, payload: dict,
+) -> Tuple[Optional[dict], Optional[str]]:
+    """C4 每日对账日报：同 `(会话, 日期)` 覆盖更新，不追加重复行。
+
+    payload 由运行中的引擎组装（柜台快照 + 虚拟内存态）；本函数只做落库。
+    报表只读聚合、不改任何账，重复生成安全。
+    """
+    session = db.query(LiveSession).filter(LiveSession.id == session_id).first()
+    if session is None:
+        return None, "资源不存在"
+    report_date = payload.get("report_date") or now_shanghai().date()
+    try:
+        row = (
+            db.query(LiveReconciliationReport)
+            .filter(
+                LiveReconciliationReport.live_session_id == session_id,
+                LiveReconciliationReport.report_date == report_date,
+            )
+            .first()
+        )
+        if row is None:
+            row = LiveReconciliationReport(
+                live_session_id=session_id, report_date=report_date)
+            db.add(row)
+        row.engine = payload.get("engine") or session_engine(session)
+        for field in _REPORT_INT_FIELDS:
+            if field in payload:
+                setattr(row, field, payload.get(field))
+        for field in _REPORT_MONEY_FIELDS:
+            value = payload.get(field)
+            setattr(row, field,
+                    Decimal(str(value)).quantize(Decimal("0.01"))
+                    if value is not None else None)
+        pct = payload.get("equity_deviation_pct")
+        row.equity_deviation_pct = (
+            Decimal(str(pct)).quantize(Decimal("0.0001"))
+            if pct is not None else None)
+        detail = payload.get("detail")
+        row.detail = (json.dumps(detail, ensure_ascii=False, default=str)
+                      if detail is not None else None)
+        db.commit()
+        db.refresh(row)
+        return serialize_reconciliation_report(row), None
+    except Exception:  # noqa: BLE001 — 多为未执行迁移（无表）
+        db.rollback()
+        logger.exception("upsert_reconciliation_report 写入失败 (session %s)",
+                         session_id)
+        return None, "对账日报写入失败"
+
+
+def list_reconciliation_reports(
+    db: Session, session_id: int, limit: int = 30,
+) -> Optional[list]:
+    """C4 日报列表（按报告日倒序）。会话不存在返回 None（路由层映射 404）。"""
+    session = db.query(LiveSession.id).filter(
+        LiveSession.id == session_id).first()
+    if session is None:
+        return None
+    rows = (
+        db.query(LiveReconciliationReport)
+        .filter(LiveReconciliationReport.live_session_id == session_id)
+        .order_by(LiveReconciliationReport.report_date.desc())
+        .limit(max(1, min(int(limit or 30), 365)))
+        .all()
+    )
+    return [serialize_reconciliation_report(r) for r in rows]
 
 
 def record_manual_action(

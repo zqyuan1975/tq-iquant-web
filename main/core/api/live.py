@@ -740,6 +740,32 @@ def resolve_session_diff(session_id: int, diff_id: int, data: dict,
     return ok(row)
 
 
+@router.get("/sessions/{session_id}/reports")
+def session_reconciliation_reports(session_id: int, limit: int = 30,
+                                   db: Session = Depends(get_db)):
+    """C4 每日对账日报列表（按报告日倒序）。"""
+    data = svc.list_reconciliation_reports(db, session_id, limit=limit)
+    if data is None:
+        return err(404, "资源不存在")
+    return ok(data)
+
+
+@router.post("/sessions/{session_id}/reports")
+def generate_session_reconciliation_report(session_id: int,
+                                           db: Session = Depends(get_db)):
+    """C4 立即生成当日对账日报（需会话运行中：柜台快照 + 虚拟内存态同源）。"""
+    engine = _ENGINES.get(session_id)
+    if engine is None:
+        return err(409, "会话未运行，无法生成对账日报（需以运行中的柜台快照为准）")
+    payload = engine._build_reconciliation_report(db)
+    row, error = svc.upsert_reconciliation_report(db, session_id, payload)
+    if error == "资源不存在":
+        return err(404, error)
+    if error is not None:
+        return err(500, error)
+    return ok(row)
+
+
 @router.get("/sessions/{session_id}/manual/actions")
 def session_manual_actions(session_id: int, limit: int = 200,
                            db: Session = Depends(get_db)):

@@ -744,6 +744,8 @@ class LiveEngine:
         self._approval_submitted_id: Optional[int] = None
         # 人工操作节流：action_type -> 上次成功时刻（monotonic）
         self._manual_last_at: Dict[str, float] = {}
+        # C4 每日对账日报：当日已生成日期（内存幂等，DB 侧另有唯一键兜底）
+        self._daily_report_date: Optional[date] = None
         self._formula_id_by_strategy = formula_id_by_strategy or {}
         self._tq_alert = None
         self._signal_monitor = signal_monitor
@@ -2190,6 +2192,8 @@ class LiveEngine:
             # I-7（audit）：收盘流程完成后每交易日一次对账复查（虚拟 vs 桥实际）——
             # 此时在途单已终态收敛、成交已回填，差异最可信。
             _seg("reconcile_after_close", self._maybe_reconcile_after_close)
+            # C4：收盘收口后落当日对账日报（只读聚合，同日报覆盖更新）。
+            _seg("daily_report", self._maybe_daily_report)
         except BridgeUnavailableError as e:
             self._mark_bridge_offline(now)
             logger.warning("bridge unavailable: %s, skip this round", e)
@@ -5508,6 +5512,129 @@ class LiveEngine:
         """
         with self._book_lock:
             self._closer.maybe_close_sweep(now)
+
+    # ---------------- C4 每日对账日报 ----------------
+    def _build_reconciliation_report(self, db: Session) -> dict:
+        """汇总柜台 vs 虚拟的持仓/现金/净值差异与当日委托/成交笔数（只读）。"""
+        now = now_shanghai()
+        today = now.date()
+        snap = (
+            db.query(LiveAccountSnapshot)
+            .filter(LiveAccountSnapshot.live_session_id == self.session_id)
+            .order_by(LiveAccountSnapshot.captured_at.desc(),
+                      LiveAccountSnapshot.id.desc())
+            .first()
+        )
+        counter: Dict[str, int] = {}
+        cash_actual = None
+        equity_actual = None
+        if snap is not None:
+            cash_actual = snap.available_cash
+            equity_actual = snap.total_asset
+            for p in (snap.positions or []):
+                counter[str(p.stock_code)] = int(p.quantity or 0)
+        virtual: Dict[str, int] = {}
+        cash_expected = Decimal("0")
+        for port in self.ctx.portfolios:
+            cash_expected += Decimal(str(port.account.cash or 0))
+            for strat in (getattr(port, "strategies", None) or []):
+                for code, pos in (getattr(strat, "positions", None) or {}).items():
+                    qty = int(getattr(pos, "quantity", 0) or 0)
+                    if qty > 0:
+                        virtual[code] = virtual.get(code, 0) + qty
+        codes = set(counter) | set(virtual)
+        matched = sum(1 for c in codes if counter.get(c, 0) == virtual.get(c, 0))
+        equity_expected = self.virtual_equity()
+        check = self._latest_equity_check or {}
+        # 当日委托/成交：created_at 存 UTC，按上海日界换算（与 out_of_pool 事件同口径）。
+        day_start_utc = (datetime.combine(today, datetime.min.time())
+                         - timedelta(hours=8))
+        order_count = (
+            db.query(func.count(LiveOrder.id))
+            .filter(LiveOrder.live_session_id == self.session_id,
+                    LiveOrder.created_at >= day_start_utc)
+            .scalar() or 0
+        )
+        trade_count = (
+            db.query(func.count(LiveTrade.id))
+            .filter(LiveTrade.live_session_id == self.session_id,
+                    LiveTrade.created_at >= day_start_utc)
+            .scalar() or 0
+        )
+        pct = None
+        if equity_expected > 0 and equity_actual is not None:
+            pct = ((Decimal(str(equity_actual)) - equity_expected)
+                   / equity_expected)
+        return {
+            "report_date": today,
+            "engine": self._engine_key,
+            "positions_total": len(codes),
+            "positions_matched": matched,
+            "positions_diff": len(codes) - matched,
+            "cash_expected": cash_expected,
+            "cash_actual": cash_actual,
+            "cash_diff": (Decimal(str(cash_actual)) - cash_expected
+                          if cash_actual is not None else None),
+            "equity_expected": equity_expected,
+            "equity_actual": equity_actual,
+            "equity_deviation_pct": pct,
+            "order_count": int(order_count),
+            "trade_count": int(trade_count),
+            "detail": {
+                "position_diffs": [
+                    {"stock_code": c, "counter_qty": counter.get(c, 0),
+                     "virtual_qty": virtual.get(c, 0)}
+                    for c in sorted(codes)
+                    if counter.get(c, 0) != virtual.get(c, 0)
+                ],
+                "out_of_pool_value": check.get("out_of_pool_value"),
+                "expected_total_ex_out_of_pool": check.get("expected_total"),
+                "captured_at": now.strftime("%Y-%m-%d %H:%M:%S"),
+                "snapshot_at": (
+                    snap.captured_at.strftime("%Y-%m-%d %H:%M:%S")
+                    if snap is not None and snap.captured_at else None),
+            },
+        }
+
+    def _maybe_daily_report(self, now: Optional[datetime] = None) -> None:
+        """15:05 收盘收口后每交易日生成一次对账日报（失败只告警，不影响交易）。
+
+        与 `_maybe_close_sweep` 同点：此时在途单已终态收敛、成交已回填，
+        柜台快照与虚拟账本的差异最可信。报表只读聚合，不改任何账。
+        """
+        if now is None:
+            now = self._clock()
+        if (now.hour, now.minute) < (15, 5):
+            return
+        today = now.date()
+        if not self._calendar.is_trading_day(today):
+            return
+        if self._daily_report_date == today:
+            return
+        db = None
+        try:
+            from core.services.live_service import upsert_reconciliation_report
+            db = self._db_session_factory()
+            if db is None:
+                return
+            payload = self._build_reconciliation_report(db)
+            _, err = upsert_reconciliation_report(db, self.session_id, payload)
+            if err:
+                logger.warning(
+                    "daily reconciliation report failed (session %s): %s",
+                    self.session_id, err)
+                return
+            self._daily_report_date = today
+            logger.info(
+                "daily reconciliation report written (session %s, %s)",
+                self.session_id, today)
+        except Exception:  # noqa: BLE001 — 观测报表失败不影响交易
+            logger.warning(
+                "daily reconciliation report error (session %s)",
+                self.session_id, exc_info=True)
+        finally:
+            if db is not None:
+                db.close()
 
     # ---------------- bar 驱动 ----------------
     def _on_bar(self, bar: BarEvent) -> None:

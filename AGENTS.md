@@ -2,7 +2,7 @@
 
 ## 项目状态
 
-**已实现（脚手架 + 主链路已通）** — 31 个模型文件（33 张表）、50 个引擎源码文件、11 个 API 模块（10 路由 + `response.py`）、11 个前端视图、64 个 Alembic 迁移（head `f4b5c6d7e8f9`）均已落地；回测/实盘主链路已接线。完整实现状态见 [CLAUDE.md](CLAUDE.md)「实现状态」小节。本文档记录业务规则与设计依据，实现细节以代码与 CLAUDE.md 为准。
+**已实现（脚手架 + 主链路已通）** — 31 个模型文件（33 张表）、50 个引擎源码文件、11 个 API 模块（10 路由 + `response.py`）、11 个前端视图、65 个 Alembic 迁移（head `f5c6d7e8f9a0`）均已落地；回测/实盘主链路已接线。完整实现状态见 [CLAUDE.md](CLAUDE.md)「实现状态」小节。本文档记录业务规则与设计依据，实现细节以代码与 CLAUDE.md 为准。
 
 **单用户系统**：无用户鉴权，所有接口无需登录。
 
@@ -204,6 +204,7 @@ Web 前端 (Vue 3 + Vite + Pinia) ←HTTP/SSE→ Core (FastAPI)
 - **I2 以柜台为准**：`position` + accept 按「柜台量 − 期望量」写合成成交改虚拟持仓（运行中 `engine.accept_counter_truth` 同步内存，停止时 `adjust_position_virtual` 重启重放生效）；`cash`/`equity` + accept **只确认口径不改账**（现金差仍按既有「只告警不改账」规则）。已处理行不能再次处理；改账价格优先请求 `price`，其次 `detail` 的 `price=` 提示。
 - **C2 现金流红冲**：`live_cash_flows` 加 `reversal_of_id` / `reversed_by_id`（自引用 FK SET NULL）/ `voided`。**禁止物理删除**——红冲 = 反向补一笔（金额取反、`reversal_of_id=原行`）+ 原行 `voided=1`；Σamount 自动归零，净值口径无需额外处理。同一笔只能冲一次、红冲行不能再红冲。API：`POST .../cash-flows/{fid}/reverse`。
 - **C3 现金流日期边界**：`flow_date` 晚于今天 → 拒绝；早于会话起账日（`live_sessions.created_at.date()`）→ 拒绝，除非显式 `allow_backfill=true`（会改写历史净值口径，必须操作者确认）。`POST /cash-flows` 透传 `allow_backfill`。
+- **C4 每日对账日报（默认开启，只读）**：`live_reconciliation_reports`（迁移 `f5c6d7e8f9a0`，唯一键 `(session, report_date)`），`_tick_main` 在 `close_sweep`/`reconcile_after_close` 之后每交易日 15:05 生成一次（内存幂等 + 唯一键兜底，重复生成覆盖更新）。柜台侧取最新 `live_account_snapshots`，虚拟侧取运行中引擎内存；**只在运行中生成**。报表不写 `live_trades`、不改现金/差异台账；API：`GET .../reports`、`POST .../reports`（运行中立即生成，未运行 409）。失败只告警，不影响收盘流程。
 
 ## 模块复用
 

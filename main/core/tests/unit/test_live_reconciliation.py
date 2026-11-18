@@ -10,7 +10,7 @@
 - 差异台账开关默认关闭（关闭时不写任何行）。
 """
 
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from decimal import Decimal
 
 from sqlalchemy import create_engine
@@ -201,3 +201,43 @@ def test_cash_flow_pre_start_requires_allow_backfill():
         assert err is None and row["flow_date"] == "2026-10-01"
     finally:
         db.close()
+
+
+# ---------------- C4：每日对账日报 ----------------
+def test_report_upsert_overwrites_same_day_and_lists():
+    db = _db()
+    try:
+        _seed(db)
+        payload = {
+            "report_date": date(2026, 11, 18), "engine": "tdx_tq",
+            "positions_total": 3, "positions_matched": 2, "positions_diff": 1,
+            "cash_expected": "1000", "cash_actual": "1100", "cash_diff": "100",
+            "equity_expected": "5000", "equity_actual": "5100",
+            "equity_deviation_pct": "0.02", "order_count": 4, "trade_count": 3,
+            "detail": {"position_diffs": [{"stock_code": STOCK}]},
+        }
+        row, err = live_service.upsert_reconciliation_report(db, 1, payload)
+        assert err is None
+        assert row["report_date"] == "2026-11-18"
+        assert row["cash_diff"] == "100.00"
+        assert row["detail"]["position_diffs"][0]["stock_code"] == STOCK
+
+        row2, err2 = live_service.upsert_reconciliation_report(
+            db, 1, dict(payload, order_count=9))
+        assert err2 is None
+        assert row2["id"] == row["id"] and row2["order_count"] == 9
+        assert len(live_service.list_reconciliation_reports(db, 1)) == 1
+        assert live_service.list_reconciliation_reports(db, 999) is None
+    finally:
+        db.close()
+
+
+def test_report_requires_existing_session():
+    db = _db()
+    try:
+        _seed(db)
+        row, err = live_service.upsert_reconciliation_report(db, 999, {})
+        assert row is None and err == "资源不存在"
+    finally:
+        db.close()
+
