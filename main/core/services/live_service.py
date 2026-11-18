@@ -6051,6 +6051,20 @@ def _curve_metrics(curve: list) -> dict:
     }
 
 
+def _snapshot_dividend_mode(raw) -> Optional[str]:
+    """从回测 params_snapshot 读 dividend_mode（容错：非法 JSON/缺失返回 None）。"""
+    if not raw:
+        return None
+    try:
+        data = json.loads(raw) if isinstance(raw, (str, bytes, bytearray)) else raw
+    except (TypeError, ValueError):
+        return None
+    if isinstance(data, dict):
+        mode = data.get("dividend_mode")
+        return mode if isinstance(mode, str) else None
+    return None
+
+
 def compute_theory_vs_live(
     db: Session, session, portfolio_id: Optional[int] = None,
     start_date: Optional[date] = None, end_date: Optional[date] = None,
@@ -6139,6 +6153,14 @@ def compute_theory_vs_live(
     if rec is None:
         result["warnings"].append(f"绑定的回测记录 #{rec_id} 不存在")
         return result
+    # J3：显式标注口径差异（实盘桥行情不复权 vs 回测复权），避免把除权日附近的
+    # 理论/实际信号不一致误判为策略或执行缺陷。
+    bt_mode = _snapshot_dividend_mode(getattr(rec, "params_snapshot", None))
+    if bt_mode is not None and bt_mode not in ("none", "exact"):
+        result["warnings"].append(
+            "口径差异（J3）：实盘 1d/1w/1mon 桥行情不复权（adjust=0），"
+            f"回测使用 {bt_mode} 复权；除权日附近理论/实际信号可能天然不一致，"
+            "非执行缺陷")
 
     win_start = start_date or rec.start_date
     win_end = end_date or rec.end_date

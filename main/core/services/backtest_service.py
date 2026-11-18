@@ -785,6 +785,18 @@ PARAMS_SNAPSHOT_FIELDS = (
 DIVIDEND_MODES = ("front", "back", "dual")
 _FORMULA_DIVIDEND_TYPE = {"front": 1, "back": 2}
 
+# J3（2026-11-18）口径显式标记：实盘 1d/1w/1mon 桥 /quote 固定 adjust=0（不复权），
+# 回测按 dividend_mode 复权 → 除权日附近同一日线公式可能给出不同信号。这是已知
+# 口径差异（非缺陷），把两侧口径冻结进 params_snapshot，对照面板据此提示。
+LIVE_BRIDGE_ADJUST_MODE = "none"
+PRICE_CALIBER_VERSION = "price_caliber_v1"
+
+
+def _fetch_adjust_mode(dividend_mode: str) -> str:
+    """回测复权模式 → 实际取数口径（J4 的 exact 档取不复权）。"""
+    return "none" if dividend_mode == "exact" else dividend_mode
+
+
 # W5-O1b(M4) 扰动值域：策略数值参数的有效区间，越界钳制（装配入口统一生效）。
 # capital_ratio 为持仓上限占比 ≤1；比率类 (0,1]；整型 ≥1 在装配处 max(1,·) 已保。
 PERTURB_BOUNDS: dict = {
@@ -940,6 +952,16 @@ def build_params_snapshot(ps, dividend_mode: str = "front",
     payload["fee_threshold_basis"] = (
         "adjusted_price_space_v1"
         if dividend_mode in ("back", "dual") else "raw_price_space_v1")
+    # J3 口径显式声明：回测取数口径 vs 实盘桥行情口径一并冻结，供对照面板/复盘
+    # 判断「除权日附近信号不一致」是口径差异还是策略缺陷。
+    payload["price_caliber"] = {
+        "version": PRICE_CALIBER_VERSION,
+        "backtest_adjust": dividend_mode,
+        "backtest_fetch_adjust": _fetch_adjust_mode(dividend_mode),
+        "live_bridge_adjust": LIVE_BRIDGE_ADJUST_MODE,
+        "aligned_with_live": (
+            _fetch_adjust_mode(dividend_mode) == LIVE_BRIDGE_ADJUST_MODE),
+    }
     # 复权基准随取数窗口变化（同一票同日，2015 起取数 vs 2023 起取数的后复权价
     # 比值可达 0.3154，最大 25.7 倍）——不是缺陷，但跨记录比价必须确认同源。
     # 落「本次取数起始日期 + 复权模式」，日后比对先看这两项是否一致。

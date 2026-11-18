@@ -194,6 +194,13 @@ def test_post_backtest_back_dividend_mode_threaded(client, monkeypatch):
     rec = db.get(BacktestRecord, record_id)
     snap = json.loads(rec.params_snapshot)
     assert snap["dividend_mode"] == "back"
+    # J3：口径显式冻结（回测后复权 vs 实盘桥不复权）
+    caliber = snap["price_caliber"]
+    assert caliber["version"] == "price_caliber_v1"
+    assert caliber["backtest_adjust"] == "back"
+    assert caliber["backtest_fetch_adjust"] == "back"
+    assert caliber["live_bridge_adjust"] == "none"
+    assert caliber["aligned_with_live"] is False
     db.close()
 
 

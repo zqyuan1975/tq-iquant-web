@@ -1,5 +1,6 @@
 """N2/K7 理论 vs 实际对照 单测（service 层，内存 SQLite）。"""
 
+import json
 from datetime import date, datetime, timedelta
 from decimal import Decimal
 
@@ -31,6 +32,7 @@ def _seed(db, bound=True):
         portfolio_strategy_id=1, name="理论回测",
         start_date=date(2026, 7, 1), end_date=date(2026, 7, 31),
         status="completed",
+        params_snapshot=json.dumps({"dividend_mode": "front"}),
     )
     db.add(rec)
     db.flush()
@@ -111,6 +113,8 @@ def test_theory_vs_live_bound_curves_and_slippage(db_session):
     assert dev["slippage"]["matched_pairs"] == 1
     assert dev["slippage"]["weighted_deviation_bps"] == pytest.approx(200.0)
     assert dev["slippage"]["details"][0]["stock_code"] == "000001.SZ"
+    # J3：回测前复权 vs 实盘桥不复权 → 显式口径差异提示
+    assert any("口径差异（J3）" in w for w in out["warnings"])
 
 
 def test_theory_vs_live_unbound_still_returns_live_side(db_session):
