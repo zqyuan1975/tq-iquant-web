@@ -1313,13 +1313,21 @@ onUnmounted(() => {
     <!-- 持仓（序号 + 组合/子策略归属，同票多子策略分多行；来源分级：策略/原有持仓） -->
     <div v-if="wbTab === 'positions'" class="table-wrap">
       <table>
-        <thead><tr><th>序号</th><th>组合策略</th><th>子策略</th><th>代码</th><th>数量</th><th>成本价</th><th>市值</th><th>来源</th></tr></thead>
+        <thead><tr><th>序号</th><th>组合策略</th><th>子策略</th><th>代码</th><th>数量</th><th>成本价</th><th>市值</th><th>峰值</th><th>峰值日期</th><th>峰值来源</th><th>来源</th></tr></thead>
         <tbody>
           <tr v-for="(p, i) in poolPositions" :key="positionRowKey(p)">
             <td style="color:var(--ink-soft)">{{ i + 1 }}</td>
             <td>{{ p.portfolio_id !== null && p.portfolio_id !== undefined ? portfolioName(p.portfolio_id) : '—' }}</td>
             <td>{{ strategyName(p.portfolio_id, p.strategy_id) }}</td>
             <td>{{ p.stock_code }}</td><td>{{ p.quantity }}</td><td>{{ fmtCost(p.avg_cost) }}</td><td>{{ fmtMoney(p.market_value) }}</td>
+            <td>{{ p.highest_price ? fmtCost(p.highest_price) : '—' }}</td>
+            <td>{{ p.peak_bar_time ? String(p.peak_bar_time).replace('T', ' ').slice(0, 16) : '—' }}</td>
+            <td>
+              <span v-if="p.peak_source_label" class="badge badge-gray" :title="`峰值来源：${p.peak_source_label}（${p.peak_source}）`">
+                {{ p.peak_source_label }}
+              </span>
+              <span v-else style="color:var(--ink-soft)">—</span>
+            </td>
             <td>
               <span class="badge" :class="p.source === 'external' ? 'badge-gray' : 'badge-blue'">
                 {{ p.source === 'external' ? '原有持仓' : '策略持仓' }}

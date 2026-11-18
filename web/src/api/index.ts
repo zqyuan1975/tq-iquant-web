@@ -1652,6 +1652,12 @@ export interface LivePositionItem {
   // 池外外部仓（代码不在任何组合股票池）：true 时前端显示「池外·不参与风控」徽章；
   // 旧接口缺省/池信息未知时按 false 降级（不显示徽章）
   out_of_pool?: boolean
+  // D6 峰值（移动止损基准）：峰值价格 / 峰值日期 / 来源（bar/table/period/daily/
+  // snapshot/cost/import）与中文标签；旧接口缺省时前端显示「—」
+  highest_price?: number
+  peak_bar_time?: string | null
+  peak_source?: string | null
+  peak_source_label?: string | null
 }
 
 export async function getLiveOrders(sessionId: number, status?: string) {

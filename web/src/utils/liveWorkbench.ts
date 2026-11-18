@@ -53,6 +53,11 @@ export interface PositionRow {
   attribution?: 'pool' | 'fallback'
   // 池外外部仓（后端 out_of_pool）：只展示/对账，不进风控、不占槽位、不代卖
   out_of_pool?: boolean
+  // D6 峰值（移动止损基准）：价格 / 日期 / 来源标记
+  highest_price?: number
+  peak_bar_time?: string | null
+  peak_source?: string | null
+  peak_source_label?: string | null
 }
 
 /** 决策闸门事件行（调参可观测性）。 */
@@ -397,6 +402,10 @@ export function positionHistoryToRows(items: LivePositionItem[]): PositionRow[] 
     source: i.source || 'strategy',
     attribution: i.attribution,
     out_of_pool: i.out_of_pool === true ? true : undefined,
+    highest_price: i.highest_price,
+    peak_bar_time: i.peak_bar_time,
+    peak_source: i.peak_source,
+    peak_source_label: i.peak_source_label,
   }))
 }
 

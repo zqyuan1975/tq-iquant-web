@@ -799,7 +799,8 @@ class LiveEngine:
         # 由 _flush_position_peaks 在 bar 收尾/快照采集/recover 统一 UPSERT 到
         # live_position_peaks；回测不注入 hook，零影响。_peak_rows = 已知在表里的
         # (组合, 代码) 键，用于清仓删行与空转早退。
-        self._peak_buffer: Dict[Tuple[int, str], Tuple[Decimal, Optional[datetime]]] = {}
+        self._peak_buffer: Dict[
+            Tuple[int, str], Tuple[Decimal, Optional[datetime], str]] = {}
         self._peak_rows: Set[Tuple[int, str]] = set()
         self._peak_lock = threading.Lock()
         for p in portfolios:
@@ -3976,7 +3977,8 @@ class LiveEngine:
                             p.update_high(effective_hp)
                             # 方案 E：快照还原抬峰同样落库（只升不降）
                             self._note_peak_raised(
-                                port.portfolio_id, code, effective_hp, now)
+                                port.portfolio_id, code, effective_hp, now,
+                                "snapshot")
         db.add(snap)
         for _c in stale_peak_codes:
             prev_peaks.pop(_c, None)
@@ -4670,7 +4672,7 @@ class LiveEngine:
             # 方案 E：导入仓的起点峰值同样落库（只升不降），下次重启即可读表
             if (pos.highest_price or Decimal("0")) > before_hp:
                 self._note_peak_raised(
-                    port.portfolio_id, code, pos.highest_price, now)
+                    port.portfolio_id, code, pos.highest_price, now, "import")
             ctx.positions[code] = pos
             imported += 1
             imported_shares += vol
@@ -10433,12 +10435,16 @@ class LiveEngine:
     }
 
     def _note_peak_raised(self, portfolio_id: int, code: str, price,
-                          bar_time: Optional[datetime] = None) -> None:
+                          bar_time: Optional[datetime] = None,
+                          source: str = "bar") -> None:
         """峰值抬高回调（注入 Portfolio.peak_persist_hook，只实盘用）。
 
         只在「新值 > 已缓冲值」时更新内存缓冲（不每 bar 都写库）；真正 UPSERT 由
         ``_flush_position_peaks`` 在 bar 收尾/快照采集/recover 时统一执行。任何异常
         都不得冒泡（风控主链路不能被观测性代码打断）。
+
+        D6：同步记录峰值来源 ``source``（bar/table/period/daily/snapshot/cost/import），
+        随峰值行落库，持仓页据此展示「峰值来自哪里」。
         """
         try:
             value = Decimal(str(price))
@@ -10451,11 +10457,12 @@ class LiveEngine:
             prev = self._peak_buffer.get(key)
             if prev is not None and value <= prev[0]:
                 return
-            self._peak_buffer[key] = (value, bar_time)
+            self._peak_buffer[key] = (value, bar_time, source)
 
     def _load_position_peaks(
-            self, db: Session) -> Dict[Tuple[int, str], Tuple[Decimal, Optional[datetime]]]:
-        """读本会话的 live_position_peaks → {(组合, 代码): (峰值, 抬峰 bar 时间)}。"""
+            self, db: Session
+    ) -> Dict[Tuple[int, str], Tuple[Decimal, Optional[datetime], Optional[str]]]:
+        """读本会话的 live_position_peaks → {(组合, 代码): (峰值, 抬峰 bar 时间, 来源)}。"""
         try:
             rows = (
                 db.query(LivePositionPeak)
@@ -10466,7 +10473,8 @@ class LiveEngine:
             logger.warning("[peak-table] 读取峰值表失败（session %s），走周期补种",
                            self.session_id, exc_info=True)
             return {}
-        out: Dict[Tuple[int, str], Tuple[Decimal, Optional[datetime]]] = {}
+        out: Dict[Tuple[int, str],
+                  Tuple[Decimal, Optional[datetime], Optional[str]]] = {}
         for row in rows:
             try:
                 price = Decimal(str(row.highest_price))
@@ -10475,7 +10483,7 @@ class LiveEngine:
             if price <= 0:
                 continue
             out[(int(row.portfolio_strategy_id), str(row.stock_code))] = (
-                price, row.peak_bar_time)
+                price, row.peak_bar_time, row.peak_source)
         return out
 
     def _cleanup_stale_position_peaks(self, db: Session) -> None:
@@ -10555,13 +10563,14 @@ class LiveEngine:
             with self._peak_lock:
                 pending = list(self._peak_buffer.items())
                 self._peak_buffer.clear()
-            for (pid, code), (price, bar_time) in pending:
+            for (pid, code), (price, bar_time, source) in pending:
                 stmt = sqlite_insert(LivePositionPeak).values(
                     live_session_id=self.session_id,
                     portfolio_strategy_id=pid,
                     stock_code=code,
                     highest_price=price,
                     peak_bar_time=bar_time,
+                    peak_source=source,
                     updated_at=now,
                 )
                 # 等值（excluded == 当前）也命中 WHERE：只刷新 updated_at 心跳，
@@ -10577,6 +10586,9 @@ class LiveEngine:
                         "peak_bar_time": case(
                             (raised, stmt.excluded.peak_bar_time),
                             else_=LivePositionPeak.peak_bar_time),
+                        "peak_source": case(
+                            (raised, stmt.excluded.peak_source),
+                            else_=LivePositionPeak.peak_source),
                         "updated_at": stmt.excluded.updated_at,
                     },
                     where=(
@@ -10821,7 +10833,8 @@ class LiveEngine:
                 if final > cur:
                     pos.update_high(final)
                 # 表值已是持久化峰值，回写（幂等：等值只刷新 updated_at 心跳，不写低）
-                self._note_peak_raised(pid, code, final, table_val[1])
+                self._note_peak_raised(
+                    pid, code, final, table_val[1], table_val[2] or "table")
                 logger.info(
                     "[peak-seed:table] %s 周期=表值 表峰值=%s 快照MAX=%s 现值=%s "
                     "最终=%s （session %s, 组合 %s, 策略 %s）",
@@ -10881,7 +10894,7 @@ class LiveEngine:
                 # 审计行补齐「重算值」（表值/快照MAX 之外的一项）
                 recompute_meta[-1]["final"] = final
             # 落库（只升不降；下一轮重启即可直接读表、不再取数）
-            self._note_peak_raised(pid, code, final, None)
+            self._note_peak_raised(pid, code, final, None, source)
             logger.info(
                 "[peak-seed:%s] %s 锚点=%s(%s) 使用周期=%s 周期峰值=%s 日线峰值=%s "
                 "快照MAX=%s 最终=%s （session %s, 组合 %s, 策略 %s）",

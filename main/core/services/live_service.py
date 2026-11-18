@@ -41,6 +41,7 @@ from core.models import (
     LiveManualAction, LiveReconciliationDiff, LiveReconciliationReport,
     LiveOutOfPoolDecision, LiveCorporateAction,
     LivePortfolioDaily,
+    LivePositionPeak,
     LiveSessionPendingChange,
     LiveGlobalSwitch,
     IncrementalBacktestCheckpoint, BacktestRecord,
@@ -4269,6 +4270,9 @@ def engine_virtual_positions(engine: LiveEngine) -> List[dict]:
                     "quantity": pos.quantity,
                     "avg_cost": _display_price(pos.avg_cost),
                     "market_value": _display_money(pos.market_value),
+                    # D6：内存态峰值（可能比峰值表更新，尚未 flush）
+                    "highest_price": _display_price(
+                        getattr(pos, "highest_price", None) or 0),
                 }
                 # 池信息缺失（旧引擎/测试）时不臆断，省略字段由前端按 pool 降级
                 if pool_codes is not None:
@@ -4455,6 +4459,76 @@ def session_trades(
     return [serialize_trade(t) for t in rows]
 
 
+#: D6 峰值来源中文标签（前端直接展示，避免前端再维护一份枚举）
+_PEAK_SOURCE_LABELS = {
+    "bar": "逐bar抬高",
+    "table": "峰值表",
+    "period": "策略周期补种",
+    "daily": "日线补种",
+    "snapshot": "快照回填",
+    "cost": "成本兜底",
+    "import": "导入仓起点",
+}
+
+
+def attach_peak_info(db: Session, session_id: int,
+                     engine: Optional[LiveEngine], rows: List[dict]) -> None:
+    """D6：给策略持仓行补「峰值 / 峰值日期 / 来源标记」（原地修改）。
+
+    运行中：内存峰值（``Position.highest_price``，可含未 flush 的最新值）与
+    ``live_position_peaks`` 表值取大者；停止后：只用峰值表（``live_trades``
+    重放无法还原历史 bar 峰值）。两者都没有时字段留空，由前端显示「—」。
+    """
+    strategy_rows = [r for r in rows if r.get("source") == "strategy"]
+    if not strategy_rows:
+        return
+    try:
+        table = {
+            (int(r.portfolio_strategy_id), str(r.stock_code)): r
+            for r in db.query(LivePositionPeak).filter(
+                LivePositionPeak.live_session_id == session_id).all()
+        }
+    except Exception:  # noqa: BLE001 — 观测性字段，读取失败不阻断持仓接口
+        table = {}
+    buffer = (dict(getattr(engine, "_peak_buffer", {}) or {})
+              if engine is not None else {})
+    for row in strategy_rows:
+        key = (int(row.get("portfolio_id") or 0), str(row.get("stock_code") or ""))
+        try:
+            peak = Decimal(str(row.get("highest_price") or 0))
+        except (ArithmeticError, TypeError, ValueError):
+            peak = Decimal("0")
+        bar_time = None
+        source = None
+        rec = table.get(key)
+        if rec is not None:
+            try:
+                peak = max(peak, Decimal(str(rec.highest_price or 0)))
+            except (ArithmeticError, TypeError, ValueError):
+                pass
+            bar_time = rec.peak_bar_time
+            source = rec.peak_source
+        buf = buffer.get(key)
+        if buf is not None and buf[0] >= peak:
+            peak, bar_time, source = buf[0], buf[1] or bar_time, buf[2] or source
+        if peak <= 0:
+            row["peak_bar_time"] = None
+            row["peak_source"] = None
+            row["peak_source_label"] = None
+            continue
+        row["highest_price"] = _display_price(peak)
+        row["peak_bar_time"] = _iso_cst(bar_time) if bar_time else None
+        if source is None:
+            # 无持久化来源：峰值不高于成本 → 成本起点；否则视为持仓期逐 bar 抬高
+            try:
+                cost = Decimal(str(row.get("avg_cost") or 0))
+            except (ArithmeticError, TypeError, ValueError):
+                cost = Decimal("0")
+            source = "cost" if peak <= cost else "bar"
+        row["peak_source"] = source
+        row["peak_source_label"] = _PEAK_SOURCE_LABELS.get(source, source)
+
+
 def session_positions(db: Session, session_id: int, engine: Optional[LiveEngine]) -> Optional[List[dict]]:
     """持仓分级（策略持仓/原有持仓）。运行中读引擎内存态虚拟持仓（含未落库当日
     变动，标 source=strategy）+ dispatcher 真实持仓差集（原有持仓，source=external）；
@@ -4470,6 +4544,7 @@ def session_positions(db: Session, session_id: int, engine: Optional[LiveEngine]
         for r in rows:
             r["source"] = "strategy"
         rows.extend(engine_external_positions(engine))
+        attach_peak_info(db, session_id, engine, rows)
         return rows
     trades = (
         db.query(LiveTrade)
@@ -4480,6 +4555,7 @@ def session_positions(db: Session, session_id: int, engine: Optional[LiveEngine]
     rows = aggregate_positions_from_trades(trades)
     for r in rows:
         r["source"] = "strategy"
+    attach_peak_info(db, session_id, None, rows)
     return rows
 
 

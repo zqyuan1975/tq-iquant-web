@@ -31,6 +31,9 @@ class LivePositionPeak(Base):
     highest_price = Column(Numeric(18, 4), nullable=False)
     # 最后一次抬峰所用 bar 的时间（补种/快照路径可能为 None）
     peak_bar_time = Column(DateTime, nullable=True)
+    # D6 峰值来源：bar（逐 bar 抬高）/ table（峰值表）/ period（策略周期补种）
+    # / daily（日线补种）/ snapshot（账户快照回填）/ cost（成本兜底）/ import（导入仓起点）
+    peak_source = Column(String(16), nullable=True)
     updated_at = Column(
         DateTime, nullable=False, server_default=func.now(), onupdate=func.now())
 
