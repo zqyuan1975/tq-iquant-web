@@ -4841,6 +4841,11 @@ def serialize_order(o: LiveOrder) -> dict:
         "bar_time": _iso_cst(o.bar_time),
         "order_ref": o.order_ref,
         "bridge_order_id": o.bridge_order_id,
+        # H5 进度：拆单子单 x/N、追价第 j 次；普通委托为 None
+        "split_group": getattr(o, "split_group", None),
+        "split_seq": getattr(o, "split_seq", None),
+        "split_total": getattr(o, "split_total", None),
+        "requote_attempt": getattr(o, "requote_attempt", None),
         "created_at": _iso_utc(o.created_at),
         "updated_at": _iso_utc(o.updated_at),
     }
@@ -5131,7 +5136,32 @@ def session_orders(db: Session, session_id: int, status: Optional[str] = None) -
     if status:
         q = q.filter(LiveOrder.status == status)
     rows = q.order_by(LiveOrder.created_at.desc(), LiveOrder.id.desc()).all()
-    return [serialize_order(o) for o in rows]
+    items = [serialize_order(o) for o in rows]
+    # H5 进度汇总：同一 split_group 的 N 笔子单 → 已成交笔数/剩余股数（组级，非单行）
+    groups = {o.split_group for o in rows if getattr(o, "split_group", None)}
+    if groups:
+        members = (
+            db.query(LiveOrder)
+            .filter(LiveOrder.live_session_id == session_id,
+                    LiveOrder.split_group.in_(groups))
+            .all()
+        )
+        summary: Dict[str, dict] = {}
+        for g in groups:
+            group_rows = [r for r in members if r.split_group == g]
+            total = max((r.split_total or 0) for r in group_rows) or len(group_rows)
+            summary[g] = {
+                "total": total,
+                "filled_children": sum(
+                    1 for r in group_rows if r.status == "filled"),
+                "remaining_quantity": sum(
+                    max(0, (r.quantity or 0) - (r.filled_quantity or 0))
+                    for r in group_rows),
+            }
+        for item in items:
+            if item.get("split_group"):
+                item["split_summary"] = summary.get(item["split_group"])
+    return items
 
 
 def session_trades(

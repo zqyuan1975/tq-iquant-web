@@ -3444,6 +3444,12 @@ class LiveEngine:
                 signal_name=lo.signal_name or "",
                 signal_bar_date=None,  # 追价单当 bar 提交，不进 deferred 闸门
             )
+            # H5 进度留痕：追价第几次 + 沿用原子单的拆单分组（若原单是子单）
+            requote._requote_attempt = attempts + 1
+            if getattr(lo, "split_group", None):
+                requote._split_group = lo.split_group
+                requote._split_seq = lo.split_seq
+                requote._split_total = lo.split_total
             self._requote_attempts[key] = attempts + 1
             self._requote_fired.add(fired_key)
             self._requote_fired.add(fired_order)
@@ -9325,12 +9331,20 @@ class LiveEngine:
             rem = order.quantity - base * n
             quantities = [base + (1 if i < rem else 0) for i in range(n)]
         children: List[OrderEvent] = []
+        # H5 进度分组：同一大额决策的 N 笔子单共享 group，前端可展示 x/N
+        split_group = "sp-%s-%s-%s-%s" % (
+            order.strategy_id, order.stock_code,
+            getattr(order.trade_type, "value", order.trade_type),
+            int(order.bar_time.timestamp()) if order.bar_time else 0,
+        )
         for i, qty in enumerate(quantities):
             child = replace(order, quantity=qty)
             child._split_child = True
             # 子单序号：持久幂等标记按 seq 区分，同一决策的多笔子单各成一键，
             # 不会第二笔被自己的第一笔挡住（父单固定 seq=0）。
             child._split_seq = i + 1
+            child._split_group = split_group[:64]
+            child._split_total = n
             if child.bar_time is not None:
                 child.bar_time = child.bar_time + timedelta(milliseconds=i)
             children.append(child)

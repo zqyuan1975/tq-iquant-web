@@ -326,6 +326,12 @@ class OrderStateMachine:
             signal_name=order.signal_name or None,
             signal_type=order.signal_type.value if order.signal_type else None,
             bar_time=order.bar_time,
+            # H5 委托详情进度：仅拆单子单/追价单带值，普通委托 NULL
+            split_group=getattr(order, "_split_group", None),
+            split_seq=(getattr(order, "_split_seq", None)
+                       if getattr(order, "_split_child", False) else None),
+            split_total=getattr(order, "_split_total", None),
+            requote_attempt=getattr(order, "_requote_attempt", None),
         )
         db.add(live_order)
         db.flush()  # 取 live_order.id

@@ -23,6 +23,12 @@ export interface OrderRow {
   filled_quantity: number | null
   filled_price: number | null
   error_message: string | null
+  // H5 进度：拆单子单 x/N、组级汇总（已成交笔数/剩余股数）、追价第 j 次
+  split_group?: string | null
+  split_seq?: number | null
+  split_total?: number | null
+  split_summary?: { total: number; filled_children: number; remaining_quantity: number } | null
+  requote_attempt?: number | null
 }
 
 export interface TradeRow {
@@ -314,6 +320,11 @@ export function orderHistoryToRows(items: LiveOrderItem[]): OrderRow[] {
       filled_quantity: i.filled_quantity,
       filled_price: i.filled_price,
       error_message: i.error_message,
+      split_group: i.split_group ?? null,
+      split_seq: i.split_seq ?? null,
+      split_total: i.split_total ?? null,
+      split_summary: i.split_summary ?? null,
+      requote_attempt: i.requote_attempt ?? null,
     }
   })
 }

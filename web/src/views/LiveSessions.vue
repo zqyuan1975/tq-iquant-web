@@ -1613,7 +1613,7 @@ onUnmounted(() => {
         <span style="font-size:12px;color:var(--ink-faint)">按北京时间自然日 · 共 {{ filteredOrders.length }} 条</span>
       </div>
       <table>
-        <thead><tr><th>时间（北京时间）</th><th>方向</th><th>代码</th><th>状态</th><th>数量</th><th>价格</th><th>已成交</th><th>错误</th></tr></thead>
+        <thead><tr><th>时间（北京时间）</th><th>方向</th><th>代码</th><th>状态</th><th>数量</th><th>价格</th><th>已成交</th><th>进度</th><th>错误</th></tr></thead>
         <tbody>
           <tr v-for="o in filteredOrders" :key="o.key">
             <td style="color:var(--ink-soft)">{{ o.time || '—' }}</td>
@@ -1623,6 +1623,16 @@ onUnmounted(() => {
             <td>{{ o.quantity }}</td>
             <td>{{ o.price ?? '-' }}</td>
             <td>{{ o.filled_quantity ?? '-' }}</td>
+            <td style="font-size:12px;color:var(--ink-soft);white-space:nowrap" data-test="order-progress">
+              <template v-if="o.split_seq && o.split_summary">
+                子单 {{ o.split_seq }}/{{ o.split_summary.total }} · 成交 {{ o.split_summary.filled_children }} 笔 · 剩 {{ o.split_summary.remaining_quantity }} 股
+              </template>
+              <template v-else>—</template>
+              <span
+                v-if="o.requote_attempt"
+                class="badge badge-gray" style="margin-left:4px"
+              >追价 {{ o.requote_attempt }} 次</span>
+            </td>
             <td style="color:var(--red);max-width:280px;white-space:normal">{{ o.error_message ?? '-' }}</td>
           </tr>
         </tbody>

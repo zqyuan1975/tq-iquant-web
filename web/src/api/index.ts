@@ -1645,6 +1645,16 @@ export interface LiveOrderItem {
   signal_type: string | null
   bar_time: string | null
   created_at: string | null
+  // H5 进度：拆单分组/序号/总数、追价次数、组级汇总（普通委托为 null）
+  split_group?: string | null
+  split_seq?: number | null
+  split_total?: number | null
+  split_summary?: {
+    total: number
+    filled_children: number
+    remaining_quantity: number
+  } | null
+  requote_attempt?: number | null
 }
 
 export interface LiveTradeItem {

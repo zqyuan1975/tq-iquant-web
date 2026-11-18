@@ -35,6 +35,12 @@ class LiveOrder(Base):
     # 切片5：桥 m_strOrderRef（匹配成交回报，G3 定案键）+ Core 生成的 MD5 order_id（透传桥幂等键）
     order_ref = Column(String(30), nullable=True)
     bridge_order_id = Column(String(32), nullable=True)
+    # H5 委托详情进度：拆单分组（同一大额决策的 N 笔子单同组）、子单序号/总数、
+    # 追价重下第几次。普通委托为 NULL，前端仅在非空时展示。
+    split_group = Column(String(64), nullable=True, index=True)
+    split_seq = Column(Integer, nullable=True)
+    split_total = Column(Integer, nullable=True)
+    requote_attempt = Column(Integer, nullable=True)
     created_at = Column(DateTime, server_default=func.now())
     updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())
 
