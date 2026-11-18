@@ -92,6 +92,10 @@ class PortfolioStrategy(Base):
     # 实盘当根提交），并写入 params_snapshot 冻结口径。
     breaker_action = Column(String(16), default="halt", server_default="halt",
                             nullable=False)
+    # A2 跨组合下单优先级（2026-11-18）：数值越大越先处理/成交，默认 0。
+    # 同一 bar 多组合共享真实侧资金与通道时，按 priority 降序依次走资金分配与
+    # 提交链；默认 0 时保持原有组合顺序（行为与改动前逐字一致）。
+    priority = Column(Integer, default=0, server_default="0", nullable=False)
     status = Column(String(10), default="active", server_default="active", nullable=False)
     created_at = Column(DateTime, server_default=func.now())
     updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())

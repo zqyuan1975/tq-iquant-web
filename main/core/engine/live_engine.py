@@ -829,6 +829,8 @@ class LiveEngine:
         # trading_session（full/am/pm）时段闸：每组合每日首次跳过记 1 条决策
         # 事件防刷屏（内存 set 按 (portfolio_id, date)，Core 重启重记无碍）。
         self._session_skip_recorded: set = set()
+        # A2：跨组合优先级排序键留痕（(portfolio_id, date) 去重，每日每组合一条）
+        self._priority_recorded: set = set()
         # 事件级去重（进度/推送噪声收敛，不影响交易决策与下单）：
         # daily_closer 用同一份日线快照依次驱动 1d/1w/1mon，每次 _handle_bar 都对
         # 全部持仓跑风控 → 同一 (bar_time, 票, 规则) 的 decision/signal 会重复三轮。
@@ -5934,7 +5936,7 @@ class LiveEngine:
             self._handle_alert_bar
             if self.execution_mode == "alert" else self._handle_bar
         )
-        for portfolio in self.portfolios:
+        for portfolio in self._prioritized_portfolios():
             # 基线 bar 只用于放行 deferred（alert 模式无交易、无 deferred）→ 跳过
             if is_baseline and self.execution_mode == "alert":
                 continue
@@ -6498,6 +6500,25 @@ class LiveEngine:
                            "净值与回撤可能偏低",
             }, persist=True)
 
+    def _prioritized_portfolios(self) -> List[Portfolio]:
+        """A2：按组合 priority 降序排列本 bar 的处理顺序（稳定排序，默认 0）。
+
+        跨组合共享真实侧资金/通道时，优先级高的组合先走资金分配与下单链；
+        全部为默认 0 时顺序与 ``self.portfolios`` 完全一致（行为不变）。
+        """
+        ports = list(self.portfolios)
+        if len(ports) <= 1:
+            return ports
+        decorated = []
+        for idx, port in enumerate(ports):
+            try:
+                prio = int(getattr(port, "priority", 0) or 0)
+            except (TypeError, ValueError):
+                prio = 0
+            decorated.append((-prio, idx, port))
+        decorated.sort(key=lambda x: (x[0], x[1]))
+        return [item[2] for item in decorated]
+
     def _handle_bar(
         self,
         portfolio: Portfolio,
@@ -6546,6 +6567,23 @@ class LiveEngine:
         # 实盘按墙钟判定；时段约束仅对日内周期生效——日线及以上由 15:05 closer
         # 收盘落定轮次驱动（am 组合的日线策略若被闸过滤会永久卡死，session_allows_bar 周期判定）。
         # full=不筛（既有全局闸已管）。
+        # A2：跨组合优先级排序键留痕（priority != 0 才记；每日每组合一条防刷屏）
+        try:
+            _prio = int(getattr(portfolio, "priority", 0) or 0)
+        except (TypeError, ValueError):
+            _prio = 0
+        if _prio:
+            _pkey = (portfolio.portfolio_id, bar.bar_time.date())
+            if _pkey not in self._priority_recorded:
+                self._priority_recorded.add(_pkey)
+                self._recorder.record(
+                    gate="capital_priority", layer="portfolio_capital",
+                    action="order", portfolio_id=portfolio.portfolio_id,
+                    strategy_id=None, stock_code=None, bar_time=bar.bar_time,
+                    param_name="priority", param_value=float(_prio),
+                    message="跨组合下单优先级：priority=%d（数值越大越先处理）"
+                            % _prio,
+                )
         # 跳过时每日首次记决策事件（gate=trading_session、layer=portfolio）防刷屏。
         session = getattr(portfolio, "trading_session", None) or "full"
         if session in ("am", "pm") and not session_allows_bar(

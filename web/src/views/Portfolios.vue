@@ -103,6 +103,7 @@ const NULLABLE_NUMERIC_FIELDS = new Set([
   'cash_enhance_equity_threshold', 'cash_enhance_position_ratio_threshold',
   'trend_trailing_stop_ratio', 'trend_max_positions',
   'signal_weekday', 'risk_cooldown_days',
+  'priority',
 ])
 
 // 表单字段元数据：key/名称/一行几个（≤2 保证不溢出）。分组用于弹窗分区。
@@ -122,6 +123,7 @@ const PORTFOLIO_GROUPS: { title: string; hint?: string; fields: FieldMeta[] }[] 
     { key: 'stock_pool_id', label: '股票池', span: 1, type: 'select', options: 'pools' },
     { key: 'benchmark_index', label: '基准指数', span: 1, type: 'select', options: 'benchmarks', hint: '用于回测超额与 crisis alpha 对比，同时作为市场多空门控判别基准；默认中证全指（000985.CSI）' },
     { key: 'initial_capital', label: '初始资金（元）', span: 2, type: 'number' },
+    { key: 'priority', label: '下单优先级', span: 1, type: 'number', placeholder: '0', hint: '同一 bar 多组合并发时数值越大越先分配资金并下单；0=默认顺序' },
   ]},
   { title: '风控参数', fields: [
     { key: 'max_drawdown', label: '最大回撤', span: 1, type: 'percent', placeholder: '20' },
@@ -240,6 +242,7 @@ function emptyPortfolioForm(): Record<string, any> {
     name: '', stock_pool_id: 0, benchmark_index: DEFAULT_BENCHMARK,
     initial_capital: 500000, max_drawdown: 0.2, daily_loss_limit: 0.05,
     max_holdings: 10,
+    priority: 0,
     min_commission: 5, buy_commission_rate: 0.00025, sell_commission_rate: 0.00025,
     stamp_duty_rate: 0.0005, transfer_fee_rate: 0.00001, slippage: 0,
     risk_cooldown_days: 1,
@@ -519,6 +522,7 @@ async function openEditPortfolio(p: PortfolioItem) {
     benchmark_index: detail.benchmark_index || DEFAULT_BENCHMARK,
     initial_capital: detail.initial_capital, max_drawdown: detail.max_drawdown,
     daily_loss_limit: detail.daily_loss_limit, max_holdings: detail.max_holdings,
+    priority: detail.priority ?? 0,
     min_commission: detail.min_commission ?? 5,
     buy_commission_rate: detail.buy_commission_rate ?? 0.00025,
     sell_commission_rate: detail.sell_commission_rate ?? 0.00025,

@@ -126,6 +126,8 @@ def serialize_portfolio(db: Session, p: PortfolioStrategy) -> dict:
         # 时点股票池（2026-11-18，J7）：按生效区间判定成分，只拦开仓/加仓
         "pool_pit_enabled": bool(p.pool_pit_enabled),
         "breaker_action": getattr(p, "breaker_action", None) or "halt",
+        # A2 跨组合下单优先级（数值越大越先处理；默认 0）
+        "priority": int(getattr(p, "priority", 0) or 0),
         "status": p.status,
         "created_at": p.created_at,
         "updated_at": p.updated_at,
@@ -229,6 +231,15 @@ def _apply_portfolio_fields(p: PortfolioStrategy, req) -> None:
         if action not in ("notify", "halt", "half", "liquidate"):
             raise ValueError("breaker_action 需为 notify/halt/half/liquidate")
         p.breaker_action = action
+    # A2 跨组合下单优先级：显式值才改（-1000..1000，防脏值影响排序）
+    if getattr(req, "priority", None) is not None:
+        try:
+            prio = int(req.priority)
+        except (TypeError, ValueError):
+            raise ValueError("priority 需为整数")
+        if not (-1000 <= prio <= 1000):
+            raise ValueError("priority 需在 [-1000, 1000]")
+        p.priority = prio
 
 
 def _create_strategies_two_step(db: Session, pid: int, strategies: list) -> None:

@@ -86,6 +86,11 @@ def assemble_portfolio(
     # 组合级 max_holdings / trading_session（历史死配置首次接线，回测/实盘共用生效）
     port.max_holdings = int(getattr(ps, "max_holdings", 0) or 0)
     port.trading_session = getattr(ps, "trading_session", None) or "full"
+    # A2 跨组合下单优先级（默认 0；回测/实盘共用）
+    try:
+        port.priority = int(getattr(ps, "priority", 0) or 0)
+    except (TypeError, ValueError):
+        port.priority = 0
     # 风控冷静期（默认 1=风控卖出当日不再买回、次日恢复；0=关闭）：回测/实盘共用
     _cooldown = getattr(ps, "risk_cooldown_days", None)
     port.risk_cooldown_days = 1 if _cooldown is None else max(0, int(_cooldown))

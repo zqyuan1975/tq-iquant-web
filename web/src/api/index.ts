@@ -82,6 +82,7 @@ export interface PortfolioItem {
   max_drawdown: number | null
   daily_loss_limit: number | null
   max_holdings: number | null
+  priority?: number | null  // A2 跨组合下单优先级（数值越大越先处理，默认 0）
   min_commission: number | null
   buy_commission_rate: number | null
   sell_commission_rate: number | null
@@ -897,6 +898,7 @@ export interface PortfolioRequest {
   max_drawdown: number
   daily_loss_limit: number
   max_holdings: number
+  priority?: number  // A2 跨组合下单优先级（数值越大越先处理，默认 0）
   min_commission: number
   buy_commission_rate: number
   sell_commission_rate: number
