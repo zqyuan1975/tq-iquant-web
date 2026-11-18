@@ -614,6 +614,37 @@ def manual_order(session_id: int, data: dict):
     return ok(result)
 
 
+@router.post("/sessions/{session_id}/manual/trades")
+def manual_trade(session_id: int, data: dict):
+    """I4 手工成交录入（仅 execution_mode=manual）：柜台已成交，补进虚拟账本。
+
+    不经过桥、不占审批、不做买入闸门检查；卖出要求虚拟持仓足额。
+    """
+    eng, error = _running_engine(session_id)
+    if error is not None:
+        return error
+    try:
+        portfolio_id = int(data.get("portfolio_strategy_id") or data.get("portfolio_id"))
+    except (TypeError, ValueError):
+        return err(400, "portfolio_strategy_id 必填且为整数")
+    try:
+        result = eng.submit_manual_trade(
+            portfolio_id,
+            data.get("stock_code"),
+            data.get("trade_type"),
+            data.get("quantity"),
+            price=data.get("price"),
+            strategy_id=data.get("strategy_id"),
+            commission=data.get("commission"),
+            note=data.get("note"),
+        )
+    except Exception as exc:  # noqa: BLE001 — ManualActionError 带状态码
+        if hasattr(exc, "http_status"):
+            return _manual_error(exc)
+        raise
+    return ok(result)
+
+
 @router.post("/sessions/{session_id}/manual/close")
 def manual_close(session_id: int, data: dict):
     """I1 人工平仓：按虚拟持仓全额卖出（T+1 可用量由提交链收窄）。"""

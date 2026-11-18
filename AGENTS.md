@@ -205,6 +205,7 @@ Web 前端 (Vue 3 + Vite + Pinia) ←HTTP/SSE→ Core (FastAPI)
 - **C2 现金流红冲**：`live_cash_flows` 加 `reversal_of_id` / `reversed_by_id`（自引用 FK SET NULL）/ `voided`。**禁止物理删除**——红冲 = 反向补一笔（金额取反、`reversal_of_id=原行`）+ 原行 `voided=1`；Σamount 自动归零，净值口径无需额外处理。同一笔只能冲一次、红冲行不能再红冲。API：`POST .../cash-flows/{fid}/reverse`。
 - **C3 现金流日期边界**：`flow_date` 晚于今天 → 拒绝；早于会话起账日（`live_sessions.created_at.date()`）→ 拒绝，除非显式 `allow_backfill=true`（会改写历史净值口径，必须操作者确认）。`POST /cash-flows` 透传 `allow_backfill`。
 - **C4 每日对账日报（默认开启，只读）**：`live_reconciliation_reports`（迁移 `f5c6d7e8f9a0`，唯一键 `(session, report_date)`），`_tick_main` 在 `close_sweep`/`reconcile_after_close` 之后每交易日 15:05 生成一次（内存幂等 + 唯一键兜底，重复生成覆盖更新）。柜台侧取最新 `live_account_snapshots`，虚拟侧取运行中引擎内存；**只在运行中生成**。报表不写 `live_trades`、不改现金/差异台账；API：`GET .../reports`、`POST .../reports`（运行中立即生成，未运行 409）。失败只告警，不影响收盘流程。
+- **I4 手工成交录入**：`submit_manual_trade` 落 `live_orders(order_type="manual", status="filled")` + `live_trades`，再走与真实成交回报完全相同的 `_apply_filled_trade`（持仓/现金/成本/冷静期/归因一次到位）。**不经过桥、不占审批、不做买入闸门**（成交已发生）；仅 `execution_mode=manual` 开放；卖出须有虚拟持仓且 ≤ 持仓（超卖拒绝，不静默缩量）；买入允许负现金（差异进对账）；`commission` 缺省 0。API：`POST /sessions/{id}/manual/trades`。不做撤销——错误用反向手工成交修正，历史只追加。
 
 ## 模块复用
 

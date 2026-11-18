@@ -403,3 +403,73 @@ def test_adjust_position_virtual_writes_trade_and_audit():
         assert bad is None and "不能为 0" in message
     finally:
         db.close()
+
+
+# ---------------- I4：手工成交录入 ----------------
+def test_manual_trade_buy_books_position_cash_and_audit():
+    factory, _ = _db_factory()
+    port, ctx = _portfolio()
+    engine, disp = _engine(factory, port, mode="manual")
+    cash_before = port.account.cash
+
+    result = engine.submit_manual_trade(
+        1, STOCK, "BUY", 1000, price=Decimal("10"), commission=Decimal("5"),
+        note="电话委托买入")
+
+    assert result["status"] == "filled"
+    assert result["signal_type"] == "OPEN"
+    assert disp.orders == []  # 不重新下单，只记账
+    orders = _query(factory, LiveOrder)
+    assert len(orders) == 1
+    assert orders[0].order_type == "manual" and orders[0].status == "filled"
+    trades = _query(factory, LiveTrade)
+    assert len(trades) == 1 and trades[0].quantity == 1000
+    pos = ctx.positions[STOCK]
+    assert pos.quantity == 1000 and pos.avg_cost == Decimal("10.005")
+    assert port.account.cash == cash_before - Decimal("10005")
+    actions = _query(factory, LiveManualAction)
+    assert len(actions) == 1 and actions[0].action_type == "manual_trade"
+    assert actions[0].result == "accepted"
+    assert actions[0].cash_delta == Decimal("-10005.00")
+
+
+def test_manual_trade_sell_requires_virtual_position():
+    factory, _ = _db_factory()
+    port, ctx = _portfolio()
+    engine, _ = _engine(factory, port, mode="manual")
+
+    try:
+        engine.submit_manual_trade(1, STOCK, "SELL", 100, price=Decimal("10"))
+        assert False, "无虚拟持仓的手工卖出应被拒绝"
+    except ManualActionError as exc:
+        assert exc.http_status == 409
+    assert _query(factory, LiveTrade) == []
+
+
+def test_manual_trade_rejects_sell_over_position():
+    factory, _ = _db_factory()
+    port, ctx = _portfolio()
+    pos = Position(STOCK)
+    pos.quantity = 500
+    pos.avg_cost = Decimal("10")
+    ctx.positions[STOCK] = pos
+    engine, _ = _engine(factory, port, mode="manual")
+
+    try:
+        engine.submit_manual_trade(1, STOCK, "SELL", 600, price=Decimal("10"))
+        assert False, "超过虚拟持仓的手工卖出应被拒绝"
+    except ManualActionError as exc:
+        assert exc.http_status == 400
+
+
+def test_manual_trade_requires_manual_mode():
+    factory, _ = _db_factory()
+    port, _ctx = _portfolio()
+    engine, _ = _engine(factory, port, mode="auto")
+
+    try:
+        engine.submit_manual_trade(1, STOCK, "BUY", 100, price=Decimal("10"))
+        assert False, "auto 会话不开放手工成交录入"
+    except ManualActionError as exc:
+        assert exc.http_status == 409
+

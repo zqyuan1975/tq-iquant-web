@@ -5603,7 +5603,7 @@ class LiveEngine:
         柜台快照与虚拟账本的差异最可信。报表只读聚合，不改任何账。
         """
         if now is None:
-            now = self._clock()
+            now = self.ctx.clock()
         if (now.hour, now.minute) < (15, 5):
             return
         today = now.date()
@@ -6844,6 +6844,142 @@ class LiveEngine:
             db.rollback()
             logger.warning("live_manual_actions 写入失败 action=%s (session %s)",
                            action_type, self.session_id, exc_info=True)
+        finally:
+            db.close()
+
+    def submit_manual_trade(self, portfolio_id: int, stock_code: str,
+                            trade_type, quantity: int, price=None,
+                            strategy_id: Optional[int] = None,
+                            commission=None,
+                            note: Optional[str] = None) -> dict:
+        """I4 手工成交录入：柜台已成交（电话/其他终端），把成交补进虚拟账本。
+
+        与 I1 人工补单不同：**不经过桥、不占审批、不做闸门检查**——成交已经发生，
+        这里只是把既成事实落成 `live_orders(order_type='manual', status='filled')`
+        + `live_trades`，再走与真实成交回报完全相同的 `_apply_filled_trade`
+        （持仓/现金/成本/风控冷静期/策略归因一次到位）。
+
+        仅在 `execution_mode=manual` 的会话开放（半自动的人工兜底场景）。
+        卖出要求虚拟持仓足额；买入不检查虚拟现金（柜台已扣款，允许负现金，
+        差异由每日对账暴露）。费用缺省 0，应按柜台实际填写，否则现金差会进对账。
+        """
+        if not self._is_manual_mode():
+            raise ManualActionError(
+                "手工成交录入仅在 execution_mode=manual 的会话可用", 409)
+        portfolio = self._approval_portfolio(portfolio_id)
+        if portfolio is None:
+            raise ManualActionError("组合 %s 不在本会话运行实例中" % portfolio_id, 409)
+        code = str(stock_code or "").strip().upper()
+        if not code:
+            raise ManualActionError("stock_code 不能为空")
+        try:
+            tt = TradeType(str(trade_type or "").strip().upper())
+        except ValueError:
+            raise ManualActionError("trade_type 仅支持 BUY/SELL")
+        try:
+            qty = int(quantity or 0)
+        except (TypeError, ValueError):
+            raise ManualActionError("quantity 非法：%r" % (quantity,))
+        if qty <= 0:
+            raise ManualActionError("quantity 必须为正整数")
+        ctx = self._manual_ctx(portfolio, strategy_id)
+        px = self._manual_price(portfolio, code, price, tt)
+        try:
+            comm = Decimal(str(commission)) if commission is not None \
+                else Decimal("0")
+        except (ArithmeticError, TypeError, ValueError):
+            raise ManualActionError("commission 非法：%r" % (commission,))
+        if not comm.is_finite() or comm < 0:
+            raise ManualActionError("commission 不能为负数")
+        pos = (getattr(ctx, "positions", None) or {}).get(code)
+        held = int(getattr(pos, "quantity", 0) or 0) if pos is not None else 0
+        if tt == TradeType.SELL and held <= 0:
+            raise ManualActionError(
+                "%s 无虚拟持仓，不能录入手工卖出（外部仓请先纳入管理）" % code, 409)
+        if tt == TradeType.SELL and qty > held:
+            raise ManualActionError(
+                "卖出 %s 股超过虚拟持仓 %s 股（%s）" % (qty, held, code))
+        if tt == TradeType.BUY:
+            signal_type = SignalType.ADD if held > 0 else SignalType.OPEN
+        else:
+            signal_type = SignalType.CLOSE if qty >= held else SignalType.REDUCE
+
+        amount = (px * Decimal(qty)).quantize(Decimal("0.01"))
+        now = self.ctx.clock()
+        remark = "手工成交录入" + ("：" + str(note) if note else "")
+        db = self._db_session_factory()
+        if db is None:
+            raise ManualActionError("会话未绑定数据库，无法录入手工成交", 503)
+        try:
+            live_order = LiveOrder(
+                live_session_id=self.session_id,
+                portfolio_strategy_id=portfolio.portfolio_id,
+                strategy_id=ctx.strategy_id,
+                stock_code=code,
+                trade_type=tt.value,
+                order_type="manual",
+                price=px,
+                quantity=qty,
+                filled_quantity=qty,
+                filled_price=px,
+                status="filled",
+                signal_name=remark[:50],
+                signal_type=signal_type.value,
+                bar_time=now,
+            )
+            db.add(live_order)
+            db.commit()
+            db.refresh(live_order)
+
+            trade = LiveTrade(
+                live_session_id=self.session_id,
+                live_order_id=live_order.id,
+                portfolio_strategy_id=portfolio.portfolio_id,
+                strategy_id=ctx.strategy_id,
+                stock_code=code,
+                trade_type=tt.value,
+                price=px,
+                quantity=qty,
+                amount=amount,
+                commission=comm,
+                stamp_duty=Decimal("0"),
+                trade_time=now,
+            )
+            db.add(trade)
+            db.commit()
+            db.refresh(trade)
+
+            self._apply_filled_trade(live_order, px, qty, amount, comm)
+            self._record_manual_action(
+                action_type="manual_trade", portfolio_id=portfolio.portfolio_id,
+                stock_code=code, trade_type=tt, quantity=qty, price=px,
+                live_order_id=live_order.id,
+                cash_delta=(-amount - comm if tt == TradeType.BUY
+                            else amount - comm),
+                reason=note,
+            )
+            logger.info(
+                "[manual-trade] %s %s %s @ %s (order=%s trade=%s session=%s)",
+                tt.value, qty, code, px, live_order.id, trade.id, self.session_id)
+            return {
+                "status": "filled",
+                "live_order_id": live_order.id,
+                "trade_id": trade.id,
+                "stock_code": code,
+                "trade_type": tt.value,
+                "quantity": qty,
+                "price": str(px),
+                "amount": str(amount),
+                "commission": str(comm),
+                "signal_type": signal_type.value,
+            }
+        except ManualActionError:
+            db.rollback()
+            raise
+        except Exception:  # noqa: BLE001
+            db.rollback()
+            logger.exception("[manual-trade] 落库失败 (session %s)", self.session_id)
+            raise ManualActionError("手工成交落库失败", 500)
         finally:
             db.close()
 
