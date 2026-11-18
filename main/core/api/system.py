@@ -2,9 +2,18 @@ from fastapi import APIRouter
 
 from core.api.response import err, ok
 from core.services.system_service import get_config, update_config
-from core.services import auto_shutdown, backup_service
+from core.services import auto_shutdown, backup_service, health_service
 
 router = APIRouter(prefix="/api/system", tags=["system"])
+
+
+@router.get("/health-overview")
+def health_overview_route():
+    """统一健康总览（批次21 L3）：Core / 通道 / 数据新鲜度 / 当日任务 / 磁盘 / 待处理告警。
+
+    纯只读聚合：不新建轮询、不发交易、不改库；单项读取失败只在 problems 中降级提示。
+    """
+    return ok(health_service.overview())
 
 
 @router.get("/configs")

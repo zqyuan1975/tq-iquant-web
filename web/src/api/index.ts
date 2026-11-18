@@ -2742,6 +2742,76 @@ export async function getSystemStatus() {
   return res.data.data
 }
 
+// ---------------------------------------------------------------------------
+// 统一健康总览（批次21 L3，GET /system/health-overview）
+// ---------------------------------------------------------------------------
+export interface HealthChannelInfo {
+  configured?: boolean
+  online?: boolean | null
+  engine?: string
+  detail?: string
+}
+
+export interface HealthSessionItem {
+  id: number
+  name: string
+  mode: string
+  status: string
+  engine: string | null
+  backup_engine: string | null
+  registered: boolean
+  bridge: { online: boolean | null; status: string }
+  channel: { primary: HealthChannelInfo | null; backup: HealthChannelInfo | null }
+  channel_ok: boolean
+  channel_guard: { available: boolean; ok: boolean; failed: string[] }
+  data: {
+    available: boolean
+    healthy?: boolean
+    unavailable?: boolean
+    reason?: string | null
+    codes_total?: number | null
+    periods?: Record<string, { stale: number; empty: number; total: number }>
+    bad_total?: number
+  }
+  today: { orders: number; trades: number }
+  alerts: { open_decisions: number; deferred_orders: number; pending_approvals: number }
+}
+
+export interface HealthProblem {
+  level: 'warn' | 'error'
+  text: string
+}
+
+export interface HealthOverview {
+  generated_at: string
+  level: 'ok' | 'warn' | 'error'
+  problems: HealthProblem[]
+  core: { online: boolean; version: string | null; uptime: string | null }
+  watchdog: {
+    running: boolean
+    last_scan_at: string | null
+    active_alarms: unknown[]
+  }
+  channels: Record<string, unknown>
+  sessions: HealthSessionItem[]
+  tasks: {
+    trade_date: string
+    running_sessions: number
+    backup_at: string | null
+    backup_done_today: boolean
+  }
+  backup: Partial<BackupStatus>
+  disk: { free_mb: number | null; min_free_mb: number; ok: boolean; path: string }
+  notify: { enabled: boolean; usable: boolean; channels: string[]; min_level: string }
+  alert_totals: { open_decisions: number; deferred_orders: number; pending_approvals: number }
+}
+
+/** 统一健康总览：Core / 通道 / 数据新鲜度 / 当日任务 / 磁盘 / 待处理告警（只读）。 */
+export async function getHealthOverview() {
+  const res = await api.get<ApiResponse<HealthOverview>>('/system/health-overview')
+  return res.data.data
+}
+
 export async function getSystemConfigs() {
   const res = await api.get<ApiResponse<SystemConfig>>('/system/configs')
   return res.data.data

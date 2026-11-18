@@ -11,7 +11,8 @@ const { theme, toggle: toggleTheme } = useTheme()
 
 const titles: Record<string, string> = {
   'dashboard': '状态总览', 'stock-pools': '备选股池', 'formulas': '公式管理', 'portfolios': '组合策略',
-  'backtest': '回测管理', 'backtest-analysis': '回归验证', 'incremental': '增量回测', 'live': '实盘交易', 'system': '系统配置',
+  'backtest': '回测管理', 'backtest-analysis': '回归验证', 'incremental': '增量回测', 'live': '实盘交易',
+  'health': '健康总览', 'system': '系统配置',
 }
 
 interface NavEntry { to: string; label: string; icon: string }
@@ -41,6 +42,7 @@ const NAV_GROUPS: NavGroup[] = [
   {
     label: '系统',
     items: [
+      { to: '/health', label: '健康总览', icon: 'health' },
       { to: '/system', label: '系统配置', icon: 'system' },
     ],
   },
