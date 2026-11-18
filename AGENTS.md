@@ -2,7 +2,7 @@
 
 ## 项目状态
 
-**已实现（脚手架 + 主链路已通）** — 31 个模型文件（33 张表）、50 个引擎源码文件、11 个 API 模块（10 路由 + `response.py`）、11 个前端视图、65 个 Alembic 迁移（head `f5c6d7e8f9a0`）均已落地；回测/实盘主链路已接线。完整实现状态见 [CLAUDE.md](CLAUDE.md)「实现状态」小节。本文档记录业务规则与设计依据，实现细节以代码与 CLAUDE.md 为准。
+**已实现（脚手架 + 主链路已通）** — 31 个模型文件（33 张表）、50 个引擎源码文件、11 个 API 模块（10 路由 + `response.py`）、11 个前端视图、66 个 Alembic 迁移（head `f6d7e8f9a0b1`）均已落地；回测/实盘主链路已接线。完整实现状态见 [CLAUDE.md](CLAUDE.md)「实现状态」小节。本文档记录业务规则与设计依据，实现细节以代码与 CLAUDE.md 为准。
 
 **单用户系统**：无用户鉴权，所有接口无需登录。
 
@@ -206,6 +206,7 @@ Web 前端 (Vue 3 + Vite + Pinia) ←HTTP/SSE→ Core (FastAPI)
 - **C3 现金流日期边界**：`flow_date` 晚于今天 → 拒绝；早于会话起账日（`live_sessions.created_at.date()`）→ 拒绝，除非显式 `allow_backfill=true`（会改写历史净值口径，必须操作者确认）。`POST /cash-flows` 透传 `allow_backfill`。
 - **C4 每日对账日报（默认开启，只读）**：`live_reconciliation_reports`（迁移 `f5c6d7e8f9a0`，唯一键 `(session, report_date)`），`_tick_main` 在 `close_sweep`/`reconcile_after_close` 之后每交易日 15:05 生成一次（内存幂等 + 唯一键兜底，重复生成覆盖更新）。柜台侧取最新 `live_account_snapshots`，虚拟侧取运行中引擎内存；**只在运行中生成**。报表不写 `live_trades`、不改现金/差异台账；API：`GET .../reports`、`POST .../reports`（运行中立即生成，未运行 409）。失败只告警，不影响收盘流程。
 - **I4 手工成交录入**：`submit_manual_trade` 落 `live_orders(order_type="manual", status="filled")` + `live_trades`，再走与真实成交回报完全相同的 `_apply_filled_trade`（持仓/现金/成本/冷静期/归因一次到位）。**不经过桥、不占审批、不做买入闸门**（成交已发生）；仅 `execution_mode=manual` 开放；卖出须有虚拟持仓且 ≤ 持仓（超卖拒绝，不静默缩量）；买入允许负现金（差异进对账）；`commission` 缺省 0。API：`POST /sessions/{id}/manual/trades`。不做撤销——错误用反向手工成交修正，历史只追加。
+- **I3 池外外部仓处置**：`live_out_of_pool_decisions`（迁移 `f6d7e8f9a0b1`，唯一键 `(session, stock_code)`）。默认语义不变（池外=不归属/不风控/不代卖）。`include` 写 `stock_pool_stocks`（PIT 开启时补 `effective_from=今天` 成员区间），下一轮采集按池内继承仓导入；`ignore` 只抑制 `out_of_pool_position` 告警。运行中处置即时刷新引擎内存（`reload_out_of_pool_decisions` / `include_pool_code`），不重启。API：`GET/POST .../out-of-pool/actions`。
 
 ## 模块复用
 

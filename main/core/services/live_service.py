@@ -39,6 +39,7 @@ from core.models import (
     StockPoolStock, StockPoolMembership, Formula, FormulaSignal, LiveOrder, LiveTrade, LiveDecisionEvent,
     LiveSignal, LiveAccountSnapshot, LiveCashFlow, LiveBaselineReset,
     LiveManualAction, LiveReconciliationDiff, LiveReconciliationReport,
+    LiveOutOfPoolDecision,
     IncrementalBacktestCheckpoint, BacktestRecord,
 )
 from core.engine.portfolio_builder import assemble_portfolio
@@ -2167,6 +2168,133 @@ def list_reconciliation_reports(
         .all()
     )
     return [serialize_reconciliation_report(r) for r in rows]
+
+
+def serialize_out_of_pool_decision(row) -> dict:
+    return {
+        "id": row.id,
+        "live_session_id": row.live_session_id,
+        "stock_code": row.stock_code,
+        "action": row.action,
+        "portfolio_strategy_id": row.portfolio_strategy_id,
+        "note": row.note,
+        "created_at": (row.created_at.strftime("%Y-%m-%d %H:%M:%S")
+                       if row.created_at else None),
+        "updated_at": (row.updated_at.strftime("%Y-%m-%d %H:%M:%S")
+                       if row.updated_at else None),
+    }
+
+
+def record_out_of_pool_decision(
+    db: Session, session_id: int, stock_code: str, action: str,
+    *, portfolio_id: Optional[int] = None, note: Optional[str] = None,
+    engine=None,
+) -> Tuple[Optional[dict], Optional[str]]:
+    """I3 池外外部仓处置：include（纳入组合池）/ ignore（永久忽略告警）。
+
+    - include：把代码加入该组合当前股票池（`stock_pool_stocks`）；组合开启
+      PIT 时同步补一条 `effective_from=今天` 的成员区间。下一轮持仓采集会
+      自动按池内继承仓导入虚拟账本（并按既有规则扣减配置资金）。
+    - ignore：只抑制 `out_of_pool_position` 告警；仓位仍在展示层可见、仍不
+      参与风控/不代卖（默认语义不变）。
+    运行中会话额外刷新引擎内存（过滤集合 / 池代码），立即生效。
+    """
+    session = db.query(LiveSession).filter(LiveSession.id == session_id).first()
+    if session is None:
+        return None, "资源不存在"
+    code = str(stock_code or "").strip().upper()
+    if not code:
+        return None, "stock_code 不能为空"
+    act = str(action or "").strip().lower()
+    if act not in ("include", "ignore"):
+        return None, "action 仅支持 include / ignore"
+    pool_id = None
+    ps = None
+    if act == "include":
+        if portfolio_id is None:
+            return None, "include 需要 portfolio_strategy_id"
+        link = (
+            db.query(LiveSessionPortfolio)
+            .filter(LiveSessionPortfolio.session_id == session_id,
+                    LiveSessionPortfolio.portfolio_strategy_id == portfolio_id)
+            .first()
+        )
+        ps = (db.query(PortfolioStrategy)
+              .filter(PortfolioStrategy.id == portfolio_id).first())
+        if link is None or ps is None:
+            return None, "组合不在该会话中"
+        if ps.stock_pool_id is None:
+            return None, "组合未绑定股票池，无法纳入"
+        pool_id = ps.stock_pool_id
+        exists = (
+            db.query(StockPoolStock.id)
+            .filter(StockPoolStock.pool_id == pool_id,
+                    StockPoolStock.stock_code == code)
+            .first()
+        )
+        if exists is None:
+            db.add(StockPoolStock(pool_id=pool_id, stock_code=code))
+        if bool(getattr(ps, "pool_pit_enabled", False)):
+            open_row = (
+                db.query(StockPoolMembership.id)
+                .filter(StockPoolMembership.pool_id == pool_id,
+                        StockPoolMembership.stock_code == code,
+                        StockPoolMembership.effective_to.is_(None))
+                .first()
+            )
+            if open_row is None:
+                db.add(StockPoolMembership(
+                    pool_id=pool_id, stock_code=code,
+                    effective_from=now_shanghai().date(),
+                    effective_to=None, source="manual",
+                    note=(note or "池外仓纳入")[:200]))
+    try:
+        row = (
+            db.query(LiveOutOfPoolDecision)
+            .filter(LiveOutOfPoolDecision.live_session_id == session_id,
+                    LiveOutOfPoolDecision.stock_code == code)
+            .first()
+        )
+        if row is None:
+            row = LiveOutOfPoolDecision(
+                live_session_id=session_id, stock_code=code)
+            db.add(row)
+        row.action = act
+        row.portfolio_strategy_id = portfolio_id if act == "include" else None
+        row.note = (str(note)[:200] if note else None)
+        db.commit()
+        db.refresh(row)
+    except Exception:  # noqa: BLE001
+        db.rollback()
+        logger.exception("out_of_pool decision 写入失败 (session %s, %s)",
+                         session_id, code)
+        return None, "处置记录写入失败"
+    if engine is not None:
+        try:
+            engine.reload_out_of_pool_decisions(db)
+            if act == "include":
+                engine.include_pool_code(portfolio_id, code)
+        except Exception:  # noqa: BLE001 — 内存刷新失败不影响落库
+            logger.warning("out_of_pool engine refresh failed (session %s)",
+                           session_id, exc_info=True)
+    data = serialize_out_of_pool_decision(row)
+    data["pool_id"] = pool_id
+    return data, None
+
+
+def list_out_of_pool_decisions(db: Session, session_id: int) -> Optional[list]:
+    session = db.query(LiveSession.id).filter(
+        LiveSession.id == session_id).first()
+    if session is None:
+        return None
+    rows = (
+        db.query(LiveOutOfPoolDecision)
+        .filter(LiveOutOfPoolDecision.live_session_id == session_id)
+        .order_by(LiveOutOfPoolDecision.updated_at.desc(),
+                  LiveOutOfPoolDecision.id.desc())
+        .all()
+    )
+    return [serialize_out_of_pool_decision(r) for r in rows]
 
 
 def record_manual_action(

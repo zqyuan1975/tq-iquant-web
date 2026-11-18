@@ -124,7 +124,7 @@ from core.models import (
     LiveDecisionEvent, LiveBarOrderMark, LiveOrder, LivePositionPeak,
     LiveSession, LiveSessionPortfolio, LiveSignal, LiveTrade,
     LiveCorporateAction,
-    LiveApprovalQueue, LiveManualAction,
+    LiveApprovalQueue, LiveManualAction, LiveOutOfPoolDecision,
 )
 from core.tq.formula import TQFormula
 from core.tq.utils import TDXLockTimeout
@@ -704,6 +704,9 @@ class LiveEngine:
         self._pool_codes_by_portfolio = pool_codes_by_portfolio or {}
         # 池外持仓上报去重（同一批代码只报一次，避免 5s 节拍刷屏）
         self._out_of_pool_reported: set = set()
+        # I3：被人工「永久忽略」的池外代码 + 是否已从库加载（懒加载）
+        self._out_of_pool_ignored: set = set()
+        self._out_of_pool_ignored_loaded: bool = False
         # 池外持仓汇总决策事件（live_decision_events）去重：每会话每日最多一条
         self._out_of_pool_event_day: Optional[date] = None
         # 外部持仓快照（只读展示用）：真实账户行中未进入任何虚拟账本的部分
@@ -4760,6 +4763,9 @@ class LiveEngine:
         让工作台「决策/拦截」列表可见，每会话每日最多一条（逐票明细只走
         日志 + SSE risk，不逐票落表）。
         """
+        self._ensure_out_of_pool_ignored(db)
+        rows = [(c, v) for c, v in rows
+                if str(c).upper() not in self._out_of_pool_ignored]
         codes = {c for c, _ in rows}
         if not rows:
             self._out_of_pool_reported = set()  # 恢复后可再次上报
@@ -4790,6 +4796,55 @@ class LiveEngine:
             "message": message,
         })
         self._note_out_of_pool_decision(db, rows, message)
+
+    # ---------------- I3 池外外部仓处置 ----------------
+    def _ensure_out_of_pool_ignored(self, db=None) -> None:
+        """首次上报前从库加载「永久忽略」集合（每引擎实例只查一次）。"""
+        if self._out_of_pool_ignored_loaded:
+            return
+        self.reload_out_of_pool_decisions(db)
+
+    def reload_out_of_pool_decisions(self, db=None) -> None:
+        """重载 ignore 集合（人工处置后立即生效；未迁移时静默为空集）。"""
+        own = False
+        try:
+            if db is None:
+                db = self._db_session_factory()
+                own = db is not None
+            if db is None:
+                return
+            try:
+                rows = (
+                    db.query(LiveOutOfPoolDecision)
+                    .filter(
+                        LiveOutOfPoolDecision.live_session_id == self.session_id,
+                        LiveOutOfPoolDecision.action == "ignore",
+                    )
+                    .all()
+                )
+            except Exception:  # noqa: BLE001 — 未执行迁移时按无忽略处理
+                rows = []
+            self._out_of_pool_ignored = {
+                str(r.stock_code).upper() for r in rows}
+            self._out_of_pool_ignored_loaded = True
+        finally:
+            if own and db is not None:
+                db.close()
+
+    def include_pool_code(self, portfolio_id: int, code: str) -> None:
+        """一键纳入后刷新内存：池代码立即生效、解除忽略、允许重新上报。"""
+        code = str(code or "").upper()
+        pid = int(portfolio_id)
+        bucket = self._pool_codes_by_portfolio.get(pid)
+        if bucket is None:
+            bucket = set()
+            self._pool_codes_by_portfolio[pid] = bucket
+        elif not isinstance(bucket, set):
+            bucket = set(bucket)
+            self._pool_codes_by_portfolio[pid] = bucket
+        bucket.add(code)
+        self._out_of_pool_ignored.discard(code)
+        self._out_of_pool_reported = set()
 
     def _note_out_of_pool_decision(self, db, rows: list, message: str) -> None:
         """落一条汇总型决策事件（每会话每日最多一条，防 60s 轮询刷表）。

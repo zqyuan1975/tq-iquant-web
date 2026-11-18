@@ -797,6 +797,36 @@ def generate_session_reconciliation_report(session_id: int,
     return ok(row)
 
 
+@router.get("/sessions/{session_id}/out-of-pool/actions")
+def session_out_of_pool_actions(session_id: int, db: Session = Depends(get_db)):
+    """I3 池外外部仓处置记录（include / ignore）。"""
+    data = svc.list_out_of_pool_decisions(db, session_id)
+    if data is None:
+        return err(404, "资源不存在")
+    return ok(data)
+
+
+@router.post("/sessions/{session_id}/out-of-pool/actions")
+def dispose_out_of_pool_position(session_id: int, data: dict,
+                                 db: Session = Depends(get_db)):
+    """I3 池外仓处置：include（纳入组合池，下一轮采集导入）/ ignore（永久忽略告警）。"""
+    portfolio_id = data.get("portfolio_strategy_id") or data.get("portfolio_id")
+    if portfolio_id is not None:
+        try:
+            portfolio_id = int(portfolio_id)
+        except (TypeError, ValueError):
+            return err(400, "portfolio_strategy_id 必须为整数")
+    row, error = svc.record_out_of_pool_decision(
+        db, session_id, data.get("stock_code"), data.get("action"),
+        portfolio_id=portfolio_id, note=data.get("note"),
+        engine=_ENGINES.get(session_id))
+    if error == "资源不存在":
+        return err(404, error)
+    if error is not None:
+        return err(400, error)
+    return ok(row)
+
+
 @router.get("/sessions/{session_id}/manual/actions")
 def session_manual_actions(session_id: int, limit: int = 200,
                            db: Session = Depends(get_db)):

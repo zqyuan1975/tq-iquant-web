@@ -18,8 +18,9 @@ from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
 from core.models import (
-    Base, LiveCashFlow, LiveReconciliationDiff, LiveSession,
-    LiveSessionPortfolio, LiveTrade, PortfolioStrategy, StockPool, Strategy,
+    Base, LiveCashFlow, LiveOutOfPoolDecision, LiveReconciliationDiff,
+    LiveSession, LiveSessionPortfolio, LiveTrade, PortfolioStrategy,
+    StockPool, StockPoolMembership, StockPoolStock, Strategy,
 )
 from core.services import live_service
 from core.engine.live_engine import LiveEngine
@@ -240,4 +241,86 @@ def test_report_requires_existing_session():
         assert row is None and err == "资源不存在"
     finally:
         db.close()
+
+
+# ---------------- I3：池外外部仓处置 ----------------
+def test_out_of_pool_include_adds_pool_member_and_pit_range():
+    db = _db()
+    try:
+        _seed(db)
+        ps = db.query(PortfolioStrategy).filter_by(id=1).one()
+        ps.pool_pit_enabled = True
+        db.commit()
+
+        row, err = live_service.record_out_of_pool_decision(
+            db, 1, STOCK, "include", portfolio_id=1, note="纳入风控")
+        assert err is None
+        assert row["action"] == "include" and row["pool_id"] == 1
+        assert (db.query(StockPoolStock)
+                .filter_by(pool_id=1, stock_code=STOCK).count() == 1)
+        ms = db.query(StockPoolMembership).filter_by(
+            pool_id=1, stock_code=STOCK).one()
+        assert ms.effective_to is None and ms.source == "manual"
+
+        again, err2 = live_service.record_out_of_pool_decision(
+            db, 1, STOCK, "include", portfolio_id=1)
+        assert err2 is None and again["id"] == row["id"]
+        assert db.query(LiveOutOfPoolDecision).count() == 1
+        assert db.query(StockPoolStock).count() == 1
+        assert db.query(StockPoolMembership).count() == 1
+    finally:
+        db.close()
+
+
+def test_out_of_pool_ignore_upserts_and_engine_reloads():
+    db = _db()
+    try:
+        _seed(db)
+        row, err = live_service.record_out_of_pool_decision(
+            db, 1, STOCK.lower(), "ignore", note="长期不动")
+        assert err is None and row["action"] == "ignore"
+        again, err2 = live_service.record_out_of_pool_decision(
+            db, 1, STOCK, "ignore", note="长期不动-2")
+        assert err2 is None and again["id"] == row["id"]
+        assert again["note"] == "长期不动-2"
+
+        class _Shim:
+            session_id = 1
+            _out_of_pool_ignored: set = set()
+            _out_of_pool_ignored_loaded = False
+            _pool_codes_by_portfolio: dict = {}
+            _out_of_pool_reported = {STOCK}
+
+            reload_out_of_pool_decisions = LiveEngine.reload_out_of_pool_decisions
+            include_pool_code = LiveEngine.include_pool_code
+
+        shim = _Shim()
+        shim.reload_out_of_pool_decisions(db)
+        assert STOCK in shim._out_of_pool_ignored
+
+        shim.include_pool_code(1, STOCK)
+        assert STOCK not in shim._out_of_pool_ignored
+        assert STOCK in shim._pool_codes_by_portfolio[1]
+        assert shim._out_of_pool_reported == set()
+
+        listed = live_service.list_out_of_pool_decisions(db, 1)
+        assert len(listed) == 1 and listed[0]["action"] == "ignore"
+        assert live_service.list_out_of_pool_decisions(db, 999) is None
+    finally:
+        db.close()
+
+
+def test_out_of_pool_include_validates_portfolio():
+    db = _db()
+    try:
+        _seed(db)
+        row, err = live_service.record_out_of_pool_decision(
+            db, 1, STOCK, "include", portfolio_id=999)
+        assert row is None and err == "组合不在该会话中"
+        bad, err2 = live_service.record_out_of_pool_decision(
+            db, 1, STOCK, "drop")
+        assert bad is None and "include / ignore" in err2
+    finally:
+        db.close()
+
 

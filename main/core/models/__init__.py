@@ -39,6 +39,7 @@ from .live_approval_queue import LiveApprovalQueue
 from .live_manual_action import LiveManualAction
 from .live_reconciliation_diff import LiveReconciliationDiff
 from .live_reconciliation_report import LiveReconciliationReport
+from .live_out_of_pool_decision import LiveOutOfPoolDecision
 
 __all__ = [
     "Base",
@@ -83,4 +84,5 @@ __all__ = [
     "LiveManualAction",
     "LiveReconciliationDiff",
     "LiveReconciliationReport",
+    "LiveOutOfPoolDecision",
 ]
