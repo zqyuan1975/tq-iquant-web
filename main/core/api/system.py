@@ -37,6 +37,54 @@ def create_backup_route():
     return ok(result)
 
 
+@router.get("/backup/records")
+def list_backup_records_route(limit: int = 20):
+    """最近备份记录（恢复入口的选择列表）。"""
+    return ok(backup_service.list_records(limit))
+
+
+@router.post("/backup/verify")
+def verify_backup_route(data: dict):
+    """只读校验备份文件（不触碰当前库）：完整性 + 表数 + 各表行数。"""
+    result = _resolve_backup_file(data)
+    if isinstance(result, dict):
+        return err(400, result.get("message") or "备份文件无法解析", result)
+    verify = backup_service.verify_backup(result)
+    if not verify.get("ok"):
+        return err(400, verify.get("message") or "备份文件校验未通过", verify)
+    return ok(verify)
+
+
+@router.post("/backup/restore")
+def restore_backup_route(data: dict):
+    """从备份恢复当前库：需显式 confirm=true 且 backup.restore_enabled=true。
+
+    前置校验全部通过才会动手；恢复前先自动备份当前库（失败即中止）。
+    """
+    result = backup_service.restore_backup(
+        record_id=data.get("record_id"),
+        path=data.get("path") or None,
+        confirm=bool(data.get("confirm")),
+    )
+    if not result.get("ok"):
+        return err(400, result.get("message") or "数据恢复失败", result)
+    return ok(result)
+
+
+def _resolve_backup_file(data: dict):
+    """API 入参 → 备份文件路径；解析失败返回 ``{"message": ...}``。"""
+    record_id = data.get("record_id")
+    if record_id not in (None, ""):
+        row = backup_service.find_record(record_id)
+        if row is None or not row.path:
+            return {"message": "备份记录不存在或缺少文件路径：id=%s" % record_id}
+        return row.path
+    path = str(data.get("path") or "").strip()
+    if not path:
+        return {"message": "请指定备份记录 id 或备份文件路径"}
+    return path
+
+
 @router.api_route("/heartbeat", methods=["GET", "POST"])
 def heartbeat_route():
     """前端标签页存活心跳（打包版自动退出用；页面打开时每 5s 发送一次）。

@@ -2580,6 +2580,7 @@ export interface BackupConfig {
   keep: number          // 自动备份保留份数（手动备份不参与自动清理）
   min_free_mb: number   // 磁盘保护阈值：剩余空间低于该值跳过备份
   dir: string           // 备份目录（相对 main/ 解析，默认 data/backup）
+  restore_enabled?: boolean  // 批次21 L2：从备份恢复（破坏性，默认关闭）
 }
 
 export interface SystemConfig {
@@ -2620,9 +2621,39 @@ export interface BackupStatus {
   keep: number
   min_free_mb: number
   backup_dir: string
+  restore_enabled: boolean   // 恢复功能开关（config.backup.restore_enabled，默认 false）
   last_auto: BackupRecord | null
   last_manual: BackupRecord | null
   auto_done_today: boolean
+}
+
+/** 备份文件只读校验结果（POST /system/backup/verify）。 */
+export interface BackupVerifyResult {
+  ok: boolean
+  path: string
+  exists: boolean
+  size_bytes: number | null
+  integrity: string
+  table_count: number
+  tables: string[]
+  row_counts: Record<string, number>
+  latest_record: string | null
+  message: string
+}
+
+/** 恢复结果（POST /system/backup/restore）。 */
+export interface BackupRestoreResult {
+  ok: boolean
+  message: string
+  restored_from: string | null
+  safety_backup: {
+    id: number | null
+    filename: string | null
+    path: string | null
+    status: string | null
+  } | null
+  verify: BackupVerifyResult | null
+  matched: boolean
 }
 
 // 下单通道类型：ths_ui / iquant_bridge / tdx_tq 为老三类；goldminer_bridge 为掘金桥，
@@ -2729,6 +2760,26 @@ export async function getBackupStatus() {
 /** 立即备份（手动）。失败时后端返回非 0 code，前端拦截器会 reject。 */
 export async function createBackup() {
   const res = await api.post<ApiResponse<BackupRecord>>('/system/backup')
+  return res.data.data
+}
+
+/** 最近备份记录（恢复入口的选择列表）。 */
+export async function listBackupRecords(limit = 20) {
+  const res = await api.get<ApiResponse<BackupRecord[]>>('/system/backup/records', {
+    params: { limit },
+  })
+  return res.data.data
+}
+
+/** 只读校验备份文件（完整性 + 表数 + 行数），不触碰当前库。 */
+export async function verifyBackup(payload: { record_id?: number; path?: string }) {
+  const res = await api.post<ApiResponse<BackupVerifyResult>>('/system/backup/verify', payload)
+  return res.data.data
+}
+
+/** 从备份恢复当前库：需 confirm=true 且后端 backup.restore_enabled=true。 */
+export async function restoreBackup(payload: { record_id?: number; path?: string; confirm: boolean }) {
+  const res = await api.post<ApiResponse<BackupRestoreResult>>('/system/backup/restore', payload)
   return res.data.data
 }
 

@@ -2,8 +2,8 @@
 import { ref, computed, onMounted } from 'vue'
 import {
   getSystemConfigs, updateSystemConfigs, testLiveChannel,
-  getBackupStatus, createBackup,
-  type SystemConfig, type BackupStatus, type BackupRecord,
+  getBackupStatus, createBackup, listBackupRecords, verifyBackup, restoreBackup,
+  type SystemConfig, type BackupStatus, type BackupRecord, type BackupVerifyResult,
 } from '../api'
 import { fmtBytes } from '../utils/format'
 import PageHeader from '../components/PageHeader.vue'
@@ -23,6 +23,7 @@ const DEFAULTS: SystemConfig = {
     keep: 10,
     min_free_mb: 500,
     dir: 'data/backup',
+    restore_enabled: false,
   },
   iquant_bridge: {
     simulation: { base_url: '' },
@@ -87,6 +88,8 @@ onMounted(async () => {
         keep: data.backup?.keep ?? DEFAULTS.backup.keep,
         min_free_mb: data.backup?.min_free_mb ?? DEFAULTS.backup.min_free_mb,
         dir: data.backup?.dir ?? DEFAULTS.backup.dir,
+        restore_enabled:
+          data.backup?.restore_enabled ?? DEFAULTS.backup.restore_enabled,
       },
       iquant_bridge: {
         simulation: { base_url: data.iquant_bridge?.simulation?.base_url ?? DEFAULTS.iquant_bridge.simulation.base_url },
@@ -132,6 +135,7 @@ onMounted(async () => {
     loading.value = false
   }
   await loadBackupStatus()
+  await loadBackupRecords()
 })
 
 // ---- 数据备份（内嵌：VACUUM INTO 一致性副本 + WAL 收敛）----
@@ -182,10 +186,87 @@ async function runBackup() {
     const rec = await createBackup()
     backupMsg.value = `备份完成${rec?.filename ? '：' + rec.filename : ''}`
     await loadBackupStatus()
+    await loadBackupRecords()
   } catch (e) {
     backupErr.value = '备份失败: ' + (e instanceof Error ? e.message : String(e))
   } finally {
     backupBusy.value = false
+  }
+}
+
+// ---- 从备份恢复（批次21 L2，破坏性操作，需后端 backup.restore_enabled=true）----
+// 交互锁定：先选备份 → 只读校验 → 勾选确认 → 恢复；恢复前后端会自动备份当前库。
+const backupRecords = ref<BackupRecord[]>([])
+const selectedRecordId = ref<number | null>(null)
+const verifyResult = ref<BackupVerifyResult | null>(null)
+const restoreConfirm = ref(false)
+const restoreBusy = ref(false)
+const restoreMsg = ref('')
+const restoreErr = ref('')
+
+const restoreEnabled = computed(() => backupStatus.value?.restore_enabled === true)
+const selectedRecord = computed(
+  () => backupRecords.value.find((r) => r.id === selectedRecordId.value) ?? null,
+)
+
+async function loadBackupRecords() {
+  try {
+    const rows = await listBackupRecords(20)
+    backupRecords.value = rows.filter((r) => r.status === 'success' && !!r.path)
+  } catch {
+    backupRecords.value = []  // 记录读取失败不阻塞配置页其它功能
+  }
+}
+
+function backupOptionLabel(r: BackupRecord): string {
+  const t = r.started_at ? r.started_at.replace('T', ' ').slice(0, 19) : '—'
+  const kind = r.kind === 'auto' ? '自动' : '手动'
+  return `${t} / ${kind} / ${r.filename || '—'}`
+}
+
+function onSelectBackup() {
+  verifyResult.value = null
+  restoreConfirm.value = false
+  restoreMsg.value = ''
+  restoreErr.value = ''
+}
+
+async function doVerify() {
+  if (!selectedRecordId.value) return
+  restoreBusy.value = true
+  restoreMsg.value = ''
+  restoreErr.value = ''
+  try {
+    verifyResult.value = await verifyBackup({ record_id: selectedRecordId.value })
+  } catch (e) {
+    verifyResult.value = null
+    restoreErr.value = '校验失败: ' + (e instanceof Error ? e.message : String(e))
+  } finally {
+    restoreBusy.value = false
+  }
+}
+
+async function doRestore() {
+  const rec = selectedRecord.value
+  if (!rec?.id || !restoreConfirm.value) return
+  const label = backupOptionLabel(rec)
+  if (!window.confirm(`确认用以下备份覆盖当前数据库？\n${label}\n\n恢复前会自动备份当前库。`)) {
+    return
+  }
+  restoreBusy.value = true
+  restoreMsg.value = ''
+  restoreErr.value = ''
+  try {
+    const res = await restoreBackup({ record_id: rec.id, confirm: true })
+    restoreMsg.value = res.message || '恢复完成'
+    restoreConfirm.value = false
+    verifyResult.value = res.verify ?? verifyResult.value
+    await loadBackupStatus()
+    await loadBackupRecords()
+  } catch (e) {
+    restoreErr.value = '恢复失败: ' + (e instanceof Error ? e.message : String(e))
+  } finally {
+    restoreBusy.value = false
   }
 }
 
@@ -508,6 +589,68 @@ function testTdx() { return testChannel('tdx_tq') }
               </span>
               <span v-if="backupMsg" style="color:var(--green);font-size:13px">{{ backupMsg }}</span>
               <span v-if="backupErr" style="color:var(--red);font-size:13px">{{ backupErr }}</span>
+            </div>
+
+            <h3 class="cfg-h">从备份恢复</h3>
+            <p class="cfg-desc">
+              恢复会用所选备份<b>覆盖当前数据库</b>（破坏性）。需在 config.yaml 设置
+              <code>restore_enabled: true</code>；存在运行中/停止中的实盘会话时后端直接拒绝；
+              恢复前会先自动备份当前库，备份失败即中止，恢复后重开连接校验表数与行数。
+            </p>
+            <div class="field">
+              <label>选择备份</label>
+              <select v-model="selectedRecordId" @change="onSelectBackup" style="max-width:460px">
+                <option :value="null">— 请选择 —</option>
+                <option v-for="r in backupRecords" :key="r.id ?? r.path ?? ''" :value="r.id">
+                  {{ backupOptionLabel(r) }}
+                </option>
+              </select>
+              <p class="cfg-hint">仅列出成功且带文件路径的备份（最近 20 条）</p>
+            </div>
+            <div class="cfg-test">
+              <button class="btn btn-sm" @click="doVerify" :disabled="!selectedRecordId || restoreBusy">
+                {{ restoreBusy ? '处理中…' : '校验所选备份（只读）' }}
+              </button>
+            </div>
+            <div v-if="verifyResult" class="backup-status">
+              <div class="backup-row">
+                <span class="backup-label">完整性</span>
+                <span>{{ verifyResult.integrity || '—' }}</span>
+              </div>
+              <div class="backup-row">
+                <span class="backup-label">表数</span>
+                <span>{{ verifyResult.table_count }}</span>
+              </div>
+              <div class="backup-row">
+                <span class="backup-label">最新备份记录</span>
+                <span>{{ verifyResult.latest_record || '—' }}</span>
+              </div>
+              <div class="backup-row">
+                <span class="backup-label">行数预览</span>
+                <span>
+                  {{ Object.entries(verifyResult.row_counts).slice(0, 6)
+                    .map(([k, v]) => `${k}=${v}`).join('，') || '—' }}
+                </span>
+              </div>
+            </div>
+            <div class="field">
+              <label class="cfg-check">
+                <input v-model="restoreConfirm" type="checkbox" :disabled="!restoreEnabled" />
+                我已了解恢复会覆盖当前数据库（恢复前会自动备份当前库）
+              </label>
+            </div>
+            <div class="cfg-test">
+              <button
+                class="btn btn-sm btn-danger" @click="doRestore"
+                :disabled="!restoreEnabled || !restoreConfirm || !selectedRecordId || restoreBusy"
+              >
+                {{ restoreBusy ? '恢复中…' : '从所选备份恢复' }}
+              </button>
+              <span v-if="!restoreEnabled" class="cfg-hint">
+                恢复功能未启用（config.yaml backup.restore_enabled=false）
+              </span>
+              <span v-if="restoreMsg" style="color:var(--green);font-size:13px">{{ restoreMsg }}</span>
+              <span v-if="restoreErr" style="color:var(--red);font-size:13px">{{ restoreErr }}</span>
             </div>
           </section>
 

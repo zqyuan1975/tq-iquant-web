@@ -142,6 +142,10 @@ def _defaults() -> dict:
             "keep": 10,
             "min_free_mb": 500,
             "dir": "data/backup",
+            # 批次21 L2：从备份恢复当前库（破坏性操作）。默认关闭；开启后仍要求
+            # 前端显式确认、无 running/stopping 实盘会话、备份校验通过，
+            # 并在替换前自动备份当前库（备份失败即中止）。
+            "restore_enabled": False,
         },
         # 告警外发（core/services/notify_service.py）：默认关闭，未配置时行为与
         # 接入前逐字一致（不建线程、不发请求）。只做「既有事件旁路再发一条」，

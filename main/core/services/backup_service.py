@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import re
 import shutil
 import sqlite3
@@ -26,7 +27,7 @@ from typing import Callable, Optional
 from core.config import app_root, load_config, use_app_root
 from core.db import SessionLocal, engine
 from core.engine.live.timing import now_shanghai
-from core.models import DataBackupRecord
+from core.models import DataBackupRecord, LiveSession
 
 logger = logging.getLogger(__name__)
 
@@ -43,6 +44,10 @@ DEFAULT_KEEP = 10
 DEFAULT_MIN_FREE_MB = 500
 DEFAULT_BACKUP_DIR = "data/backup"
 DEFAULT_RETRY_COOLDOWN = timedelta(minutes=10)
+#: 恢复功能默认关闭：需在 config.yaml backup.restore_enabled=true 才允许走 API 恢复。
+DEFAULT_RESTORE_ENABLED = False
+#: 校验时最多统计多少张表的行数（防御异常库把单次校验拖死）。
+MAX_VERIFY_TABLES = 200
 
 # main/（本文件位于 main/core/services/）
 _MAIN_DIR = Path(__file__).resolve().parent.parent.parent
@@ -95,6 +100,8 @@ def backup_settings(cfg: Optional[dict] = None) -> dict:
         "keep": _as_int(raw.get("keep"), DEFAULT_KEEP),
         "min_free_mb": _as_float(raw.get("min_free_mb"), DEFAULT_MIN_FREE_MB),
         "dir": str(raw.get("dir") or DEFAULT_BACKUP_DIR),
+        "restore_enabled": bool(raw.get(
+            "restore_enabled", DEFAULT_RESTORE_ENABLED)),
     }
 
 
@@ -181,6 +188,29 @@ def latest_record(kind: str, session_factory=None) -> Optional[DataBackupRecord]
         if row is not None:
             db.expunge(row)
         return row
+    finally:
+        db.close()
+
+
+def list_records(limit: int = 20, session_factory=None) -> list:
+    """最近备份记录（系统配置页恢复入口用；按时间倒序，limit 夹在 1~200）。"""
+    try:
+        limit = int(limit)
+    except (TypeError, ValueError):
+        limit = 20
+    limit = min(max(limit, 1), 200)
+    factory = session_factory or SessionLocal
+    db = factory()
+    try:
+        rows = (db.query(DataBackupRecord)
+                .order_by(DataBackupRecord.started_at.desc(),
+                          DataBackupRecord.id.desc())
+                .limit(limit)
+                .all())
+        data = [record_to_dict(r) for r in rows]
+        for r in rows:
+            db.expunge(r)
+        return data
     finally:
         db.close()
 
@@ -365,10 +395,246 @@ def get_status(now_fn: Callable[[], datetime] = now_shanghai,
         "keep": settings["keep"],
         "min_free_mb": settings["min_free_mb"],
         "backup_dir": str(resolve_path(settings["dir"])),
+        "restore_enabled": settings["restore_enabled"],
         "last_auto": record_to_dict(last_auto) if last_auto else None,
         "last_manual": record_to_dict(last_manual) if last_manual else None,
         "auto_done_today": auto_done_today,
     }
+
+
+# ---------------------------------------------------------------- 校验 / 恢复
+def verify_backup(path) -> dict:
+    """只读校验一个备份文件：``PRAGMA integrity_check`` + 表清单 + 各表行数。
+
+    返回 ``{ok, path, exists, size_bytes, integrity, table_count, tables,
+    row_counts, latest_record, message}``；任何失败都返回 ``ok=False`` 而不是抛异常
+    （校验是恢复前的准入检查，调用方按 ok 判定）。
+    """
+    p = Path(path)
+    result = {
+        "ok": False, "path": str(p), "exists": p.exists(), "size_bytes": None,
+        "integrity": "", "table_count": 0, "tables": [], "row_counts": {},
+        "latest_record": None, "message": "",
+    }
+    if not p.exists():
+        result["message"] = "备份文件不存在"
+        return result
+    result["size_bytes"] = p.stat().st_size
+    tables = []
+    try:
+        conn = sqlite3.connect(
+            "file:%s?mode=ro" % p.as_posix(), uri=True, timeout=30.0)
+        try:
+            row = conn.execute("PRAGMA integrity_check").fetchone()
+            integrity = str(row[0]) if row else ""
+            result["integrity"] = integrity
+            tables = [r[0] for r in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' "
+                "AND name NOT LIKE 'sqlite_%' ORDER BY name LIMIT ?",
+                (MAX_VERIFY_TABLES,))]
+            result["tables"] = tables
+            result["table_count"] = len(tables)
+            counts = {}
+            for name in tables:
+                safe = str(name).replace('"', '""')
+                counts[str(name)] = int(conn.execute(
+                    'SELECT COUNT(*) FROM "%s"' % safe).fetchone()[0])
+            result["row_counts"] = counts
+            if "data_backup_records" in counts:
+                row = conn.execute(
+                    "SELECT MAX(started_at) FROM data_backup_records").fetchone()
+                result["latest_record"] = row[0] if row else None
+        finally:
+            conn.close()
+    except sqlite3.Error as e:
+        result["message"] = "备份文件校验失败：%s" % e
+        return result
+    if result["integrity"] != "ok":
+        result["message"] = "备份文件完整性校验未通过（%s）" % result["integrity"]
+        return result
+    if not tables:
+        result["message"] = "备份文件中没有业务表"
+        return result
+    result["ok"] = True
+    result["message"] = "校验通过（%d 张表）" % len(tables)
+    return result
+
+
+def find_record(record_id: int, session_factory=None) -> Optional[DataBackupRecord]:
+    factory = session_factory or SessionLocal
+    db = factory()
+    try:
+        row = (db.query(DataBackupRecord)
+               .filter(DataBackupRecord.id == int(record_id)).first())
+        if row is not None:
+            db.expunge(row)
+        return row
+    finally:
+        db.close()
+
+
+def running_live_sessions(session_factory=None) -> list:
+    """存在 running/stopping 的实盘会话时禁止恢复（库文件正被交易链路使用）。"""
+    factory = session_factory or SessionLocal
+    db = factory()
+    try:
+        rows = (db.query(LiveSession)
+                .filter(LiveSession.status.in_(("running", "stopping")))
+                .order_by(LiveSession.id)
+                .all())
+        data = [{"id": r.id, "name": r.name, "status": r.status} for r in rows]
+        for r in rows:
+            db.expunge(r)
+        return data
+    finally:
+        db.close()
+
+
+def _remove_sqlite_sidecars(db_path: Path) -> None:
+    """删除 ``-wal`` / ``-shm``：换库前必须清掉旧库的 WAL，否则会污染新库。"""
+    for suffix in ("-wal", "-shm"):
+        side = Path(str(db_path) + suffix)
+        if side.exists():
+            side.unlink()
+
+
+def restore_backup(record_id: Optional[int] = None, path=None, *,
+                   confirm: bool = False,
+                   cfg: Optional[dict] = None,
+                   db_path=None,
+                   backup_dir=None,
+                   session_factory=None,
+                   backup_fn: Optional[Callable[..., dict]] = None,
+                   now_fn: Callable[[], datetime] = now_shanghai,
+                   dispose_fn: Optional[Callable[[], None]] = None) -> dict:
+    """从备份文件恢复当前库（**破坏性操作，多重前置校验全部通过才执行**）。
+
+    顺序：显式 ``confirm`` → 功能开关 ``backup.restore_enabled``（默认关闭）→
+    定位备份文件 → 拒绝存在 running/stopping 实盘会话 → 只读校验备份文件 →
+    先给当前库做一份手动备份（失败即中止）→ 收敛 WAL → 关闭连接 →
+    原子替换 → 重开连接校验表数与行数。
+
+    返回 ``{ok, message, restored_from, safety_backup, verify, matched, ...}``；
+    任何失败都 ``ok=False`` 并给出原因，绝不抛异常、绝不删除旧库（替换前先备份）。
+    """
+    settings = backup_settings(cfg)
+    target = Path(db_path) if db_path is not None else database_path()
+    result = {"ok": False, "message": "", "restored_from": None,
+              "safety_backup": None, "verify": None, "source_verify": None,
+              "matched": False}
+
+    if not confirm:
+        result["message"] = "恢复数据库属于破坏性操作，需显式确认（confirm=true）"
+        return result
+    if not settings["restore_enabled"]:
+        result["message"] = ("恢复功能未启用：请在 config.yaml 设置 "
+                             "backup.restore_enabled=true 后重试")
+        return result
+
+    # ---- 定位备份文件 ----
+    src: Optional[Path] = None
+    if record_id is not None:
+        rec = find_record(record_id, session_factory)
+        if rec is None or not rec.path:
+            result["message"] = "备份记录不存在或缺少文件路径：id=%s" % record_id
+            return result
+        src = Path(rec.path)
+    elif path:
+        src = Path(path)
+    else:
+        result["message"] = "请指定备份记录 id 或备份文件路径"
+        return result
+    result["restored_from"] = str(src)
+    if not src.exists():
+        result["message"] = "备份文件不存在：%s" % src
+        return result
+    if src.resolve() == target.resolve():
+        result["message"] = "备份文件与当前库是同一个文件，无需恢复"
+        return result
+
+    # ---- 实盘会话保护 ----
+    running = running_live_sessions(session_factory)
+    if running:
+        names = "、".join("%s(%s)" % (r["name"], r["status"]) for r in running[:5])
+        result["message"] = "存在运行中/停止中的实盘会话（%s），请先手动停止后再恢复" % names
+        return result
+
+    # ---- 备份文件准入 ----
+    source_verify = verify_backup(src)
+    result["verify"] = source_verify
+    result["source_verify"] = source_verify
+    if not source_verify["ok"]:
+        result["message"] = "恢复前校验未通过：%s" % source_verify["message"]
+        return result
+
+    # ---- 先备份当前库（失败即中止，绝不无副本直接覆盖）----
+    backup = (backup_fn or run_backup)(
+        KIND_MANUAL, db_path=target, backup_dir=backup_dir, cfg=cfg,
+        session_factory=session_factory, now_fn=now_fn)
+    result["safety_backup"] = {
+        "id": backup.get("id"), "filename": backup.get("filename"),
+        "path": backup.get("path"), "status": backup.get("status"),
+    }
+    if backup.get("status") != STATUS_SUCCESS:
+        result["message"] = ("恢复前自动备份当前库失败（%s），已中止恢复"
+                             % (backup.get("message") or backup.get("status")))
+        return result
+
+    # ---- 收敛 WAL → 关连接 → 原子替换 ----
+    temp = target.with_name(".%s.restore-%s.tmp" % (
+        target.name, now_fn().strftime("%Y%m%d%H%M%S")))
+    dispose = dispose_fn
+    if dispose is None and db_path is None:
+        dispose = engine.dispose
+    try:
+        checkpoint_wal(target)
+        if dispose is not None:
+            dispose()
+        shutil.copy2(src, temp)
+        copy_verify = verify_backup(temp)
+        if not copy_verify["ok"]:
+            result["message"] = "临时副本校验失败：%s" % copy_verify["message"]
+            return result
+        _remove_sqlite_sidecars(target)
+        os.replace(temp, target)
+    except Exception as e:  # noqa: BLE001 — 失败必须保留现场并给出原因
+        logger.exception("恢复数据库失败：%s -> %s", src, target)
+        try:
+            if temp.exists():
+                temp.unlink()
+        except OSError:
+            logger.warning("清理恢复临时文件失败：%s", temp, exc_info=True)
+        result["message"] = "恢复失败：%s" % e
+        return result
+    finally:
+        if dispose is not None:
+            # 替换后再次清池，确保后续连接打开的是新库文件
+            try:
+                dispose()
+            except Exception:  # noqa: BLE001
+                logger.warning("恢复后清理连接池失败", exc_info=True)
+
+    # ---- 重开连接校验：表数与行数必须与备份文件一致 ----
+    after = verify_backup(target)
+    result["verify"] = after
+    matched = bool(
+        after["ok"]
+        and after["tables"] == source_verify["tables"]
+        and after["row_counts"] == source_verify["row_counts"])
+    result["matched"] = matched
+    if not after["ok"]:
+        result["message"] = "恢复后校验失败：%s" % after["message"]
+        return result
+    if not matched:
+        result["message"] = "恢复后校验不一致（表数/行数与备份文件不符），请人工核查"
+        logger.error("恢复后校验不一致：%s", target)
+        return result
+    result["ok"] = True
+    result["message"] = "恢复完成并通过校验（%d 张表，%d 行）" % (
+        after["table_count"], sum(after["row_counts"].values()))
+    logger.warning("数据库已从备份恢复：%s -> %s（恢复前副本 %s）",
+                   src, target, backup.get("filename"))
+    return result
 
 
 # ---------------------------------------------------------------- 调度

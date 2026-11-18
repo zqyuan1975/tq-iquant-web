@@ -11,7 +11,7 @@ import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
-from core.models import Base
+from core.models import Base, LiveSession
 from core.services import backup_service as bs
 
 NOW = datetime(2026, 11, 10, 15, 10, 0)
@@ -339,3 +339,216 @@ def test_backup_api_reports_failure(monkeypatch):
     body = asyncio.run(_call()).json()
     assert body["code"] == 500
     assert "磁盘" in body["message"]
+
+
+# ================================================================ 批次21 L2
+# 备份校验 / 恢复：默认关闭，任何前置校验失败都不得改动当前库。
+def _restore_cfg(**over):
+    cfg = _cfg(restore_enabled=True)
+    cfg["backup"].update(over)
+    return cfg
+
+
+def _make_db(path, values=("v1",)):
+    conn = sqlite3.connect(path)
+    conn.execute("CREATE TABLE a (id INTEGER PRIMARY KEY, v TEXT)")
+    conn.executemany("INSERT INTO a (v) VALUES (?)", [(v,) for v in values])
+    conn.commit()
+    conn.close()
+    return path
+
+
+def _values(path):
+    with sqlite3.connect(path) as c:
+        return [r[0] for r in c.execute("SELECT v FROM a ORDER BY id")]
+
+
+@pytest.fixture
+def target_db(tmp_path):
+    return _make_db(tmp_path / "live.db", ("current",))
+
+
+def test_verify_backup_ok_and_missing_and_garbage(tmp_path):
+    good = _make_db(tmp_path / "good.db", ("x", "y"))
+
+    res = bs.verify_backup(good)
+    assert res["ok"] is True
+    assert res["integrity"] == "ok"
+    assert res["table_count"] == 1 and res["tables"] == ["a"]
+    assert res["row_counts"] == {"a": 2}
+    assert res["size_bytes"] > 0
+
+    missing = bs.verify_backup(tmp_path / "nope.db")
+    assert missing["ok"] is False and "不存在" in missing["message"]
+
+    garbage = tmp_path / "bad.db"
+    garbage.write_bytes(b"this is not a sqlite file" * 100)
+    bad = bs.verify_backup(garbage)
+    assert bad["ok"] is False and bad["message"]
+
+
+def test_restore_requires_confirm_and_switch(tmp_path, session_factory, target_db):
+    src = _make_db(tmp_path / "snapshot.db", ("old1", "old2"))
+
+    no_confirm = bs.restore_backup(
+        path=src, confirm=False, cfg=_restore_cfg(), db_path=target_db,
+        session_factory=session_factory, now_fn=lambda: NOW)
+    assert no_confirm["ok"] is False and "confirm" in no_confirm["message"]
+
+    switch_off = bs.restore_backup(
+        path=src, confirm=True, cfg=_cfg(), db_path=target_db,
+        session_factory=session_factory, now_fn=lambda: NOW)
+    assert switch_off["ok"] is False
+    assert "restore_enabled" in switch_off["message"]
+    assert _values(target_db) == ["current"]  # 当前库未被改动
+
+
+def test_restore_replaces_target_and_keeps_safety_copy(
+        tmp_path, session_factory, target_db):
+    src = _make_db(tmp_path / "snapshot.db", ("old1", "old2"))
+    backup_dir = tmp_path / "backup"
+
+    res = bs.restore_backup(
+        path=src, confirm=True, cfg=_restore_cfg(), db_path=target_db,
+        backup_dir=backup_dir, session_factory=session_factory,
+        now_fn=lambda: NOW)
+
+    assert res["ok"] is True and res["matched"] is True
+    assert res["restored_from"] == str(src)
+    assert res["safety_backup"]["status"] == bs.STATUS_SUCCESS
+    assert _values(target_db) == ["old1", "old2"]  # 已换成备份内容
+    safety = Path(res["safety_backup"]["path"])
+    assert safety.exists()
+    assert _values(safety) == ["current"]  # 恢复前副本保存旧数据
+    assert not list(tmp_path.glob(".live.db.restore-*.tmp"))
+
+
+def test_restore_refuses_running_live_session(
+        tmp_path, session_factory, target_db):
+    src = _make_db(tmp_path / "snapshot.db", ("old",))
+    db = session_factory()
+    db.add(LiveSession(name="实盘A", mode="paper", status="running"))
+    db.commit()
+    db.close()
+
+    res = bs.restore_backup(
+        path=src, confirm=True, cfg=_restore_cfg(), db_path=target_db,
+        backup_dir=tmp_path / "backup", session_factory=session_factory,
+        now_fn=lambda: NOW)
+    assert res["ok"] is False and "实盘会话" in res["message"]
+    assert _values(target_db) == ["current"]
+
+
+def test_restore_aborts_when_safety_backup_fails(
+        tmp_path, session_factory, target_db):
+    src = _make_db(tmp_path / "snapshot.db", ("old",))
+
+    def _fail_backup(kind, **kw):
+        return {"status": bs.STATUS_FAILED, "message": "磁盘剩余空间不足"}
+
+    res = bs.restore_backup(
+        path=src, confirm=True, cfg=_restore_cfg(), db_path=target_db,
+        session_factory=session_factory, backup_fn=_fail_backup,
+        now_fn=lambda: NOW)
+    assert res["ok"] is False and "已中止" in res["message"]
+    assert _values(target_db) == ["current"]
+
+
+def test_restore_rejects_missing_source_and_bad_record(
+        tmp_path, session_factory, target_db):
+    res = bs.restore_backup(
+        path=tmp_path / "nope.db", confirm=True, cfg=_restore_cfg(),
+        db_path=target_db, session_factory=session_factory, now_fn=lambda: NOW)
+    assert res["ok"] is False and "不存在" in res["message"]
+
+    res = bs.restore_backup(
+        record_id=999, confirm=True, cfg=_restore_cfg(), db_path=target_db,
+        session_factory=session_factory, now_fn=lambda: NOW)
+    assert res["ok"] is False and "备份记录不存在" in res["message"]
+
+
+def test_restore_by_record_id(tmp_path, session_factory, target_db):
+    src = _make_db(tmp_path / "snapshot.db", ("from-record",))
+    rec = bs.save_record(
+        session_factory, kind=bs.KIND_MANUAL, status=bs.STATUS_SUCCESS,
+        started_at=NOW, finished_at=NOW, filename=src.name, path=str(src))
+
+    res = bs.restore_backup(
+        record_id=rec["id"], confirm=True, cfg=_restore_cfg(),
+        db_path=target_db, backup_dir=tmp_path / "backup",
+        session_factory=session_factory, now_fn=lambda: NOW)
+    assert res["ok"] is True
+    assert _values(target_db) == ["from-record"]
+
+
+def test_list_records_newest_first_and_limited(session_factory):
+    for i in range(3):
+        bs.save_record(
+            session_factory, kind=bs.KIND_AUTO, status=bs.STATUS_SUCCESS,
+            started_at=NOW + timedelta(minutes=i))
+    rows = bs.list_records(2, session_factory)
+    assert len(rows) == 2
+    assert rows[0]["started_at"] > rows[1]["started_at"]
+
+
+def test_backup_restore_switch_defaults_off():
+    assert bs.backup_settings({})["restore_enabled"] is False
+
+
+def test_verify_and_restore_api(monkeypatch):
+    from httpx import ASGITransport, AsyncClient
+
+    from core.api import system as system_api
+    from core.main import app
+
+    monkeypatch.setattr(system_api.backup_service, "list_records",
+                        lambda limit=20: [{"id": 3, "filename": "x.db"}])
+    monkeypatch.setattr(system_api.backup_service, "verify_backup",
+                        lambda p: {"ok": True, "path": str(p),
+                                   "message": "校验通过", "table_count": 1})
+    monkeypatch.setattr(system_api.backup_service, "restore_backup",
+                        lambda **kw: {"ok": kw.get("confirm") is True,
+                                      "matched": True, "message": "恢复完成"})
+
+    async def _call():
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as c:
+            return (await c.get("/api/system/backup/records"),
+                    await c.post("/api/system/backup/verify",
+                                 json={"path": "data/backup/x.db"}),
+                    await c.post("/api/system/backup/restore",
+                                 json={"path": "data/backup/x.db",
+                                       "confirm": True}))
+
+    import asyncio
+    rec, ver, res = asyncio.run(_call())
+    assert rec.json()["code"] == 0 and rec.json()["data"][0]["id"] == 3
+    assert ver.json()["code"] == 0 and ver.json()["data"]["table_count"] == 1
+    assert res.json()["code"] == 0 and res.json()["data"]["matched"] is True
+
+
+def test_restore_api_reports_refusal(monkeypatch):
+    from httpx import ASGITransport, AsyncClient
+
+    from core.api import system as system_api
+    from core.main import app
+
+    monkeypatch.setattr(
+        system_api.backup_service, "verify_backup",
+        lambda p: {"ok": False, "message": "备份文件不存在"})
+    monkeypatch.setattr(
+        system_api.backup_service, "restore_backup",
+        lambda **kw: {"ok": False, "message": "恢复功能未启用"})
+
+    async def _call():
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as c:
+            return (await c.post("/api/system/backup/verify",
+                                 json={"path": "nope.db"}),
+                    await c.post("/api/system/backup/restore",
+                                 json={"path": "nope.db"}))
+
+    import asyncio
+    ver, res = asyncio.run(_call())
+    assert ver.json()["code"] == 400 and "不存在" in ver.json()["message"]
+    assert res.json()["code"] == 400 and "未启用" in res.json()["message"]
