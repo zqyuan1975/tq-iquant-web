@@ -6,6 +6,7 @@ B4b：/orders、/trades、/positions 三个历史查询端点。
 """
 from datetime import datetime
 from decimal import Decimal
+import logging
 
 import httpx
 import pytest
@@ -19,7 +20,7 @@ from core.db import get_db
 from core.models import (
     Base, StockPool, StockPoolStock, Formula, FormulaSignal,
     PortfolioStrategy, Strategy, LiveOrder, LiveTrade, LiveSessionPortfolio,
-    LiveDecisionEvent,
+    LiveDecisionEvent, LiveSession,
 )
 from core.engine.position import Position
 import core.api.live as live_api
@@ -414,6 +415,56 @@ def test_stop_session_is_idempotent(client, mock_bridge):
     assert resp.status_code == 200
     assert resp.json()["code"] == 0
     assert resp.json()["data"]["status"] == "stopped"
+
+
+def test_stop_with_missing_engine_warns_process_tag(client, caplog):
+    """DB 显示 running 但本进程无引擎（另一进程持有）→ 必须 WARNING 带 pid/port。"""
+    c, Session = client
+    db = Session()
+    ps_id = _seed(db)
+    db.close()
+
+    sid = _create_session(c, portfolio_ids=(ps_id,))
+    db = Session()
+    row = db.get(LiveSession, sid)
+    row.status = "running"  # 模拟 stop 打到了没有引擎的进程
+    db.commit()
+    db.close()
+
+    with caplog.at_level(logging.WARNING, logger="core.api.live"):
+        resp = c.post("/api/live/sessions/%d/stop" % sid)
+    assert resp.status_code == 200
+    assert resp.json()["code"] == 0
+    assert resp.json()["data"]["status"] == "stopped"
+
+    msgs = [r.getMessage() for r in caplog.records
+            if "注册表未找到" in r.getMessage()]
+    assert len(msgs) == 1
+    assert "pid=" in msgs[0] and "port=" in msgs[0]
+    assert "另一后端进程" in msgs[0]
+
+
+def test_engine_registry_diagnostic_lists_pid_and_db_status(client, mock_bridge):
+    """只读诊断接口并排返回本进程引擎与 DB 状态，便于排查进程错配。"""
+    c, Session = client
+    db = Session()
+    ps_id = _seed(db)
+    db.close()
+
+    sid = _create_session(c, portfolio_ids=(ps_id,))
+    c.post("/api/live/sessions/%d/start" % sid)
+    try:
+        data = c.get("/api/live/engine-registry").json()["data"]
+        assert data["pid"] > 0
+        assert "port" in data
+        item = next(e for e in data["engines"] if e["session_id"] == sid)
+        assert item["running"] is True
+        assert item["db_status"] == "running"
+        assert item["mismatch"] is False
+        assert all(x["session_id"] != sid
+                   for x in data["db_active_without_engine"])
+    finally:
+        c.post("/api/live/sessions/%d/stop" % sid)
 
 
 def test_create_session_rejects_duplicate_and_missing_portfolio(client, mock_bridge):

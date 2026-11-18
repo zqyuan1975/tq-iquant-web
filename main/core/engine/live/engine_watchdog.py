@@ -40,7 +40,8 @@ from sqlalchemy import func
 
 from core.config import load_config
 from core.db import SessionLocal
-from core.models import LiveAccountSnapshot, LiveDecisionEvent
+from core.models import LiveAccountSnapshot, LiveDecisionEvent, LiveSession
+from core.runtime import process_tag
 from core.services.notify_service import notify
 
 from .snapshot_bars import default_in_session
@@ -83,6 +84,10 @@ _CHANNEL_RULES = frozenset({
 
 #: 日线及以上周期（bar_time 为 00:00:00，不具备分钟级行情新鲜度语义）
 _LONG_PERIODS = frozenset({"1d", "1w", "1mon", "day", "week", "month"})
+
+#: DB 状态判定「会话不应在跑」的取值（正常 stop 路由会同步置 _running=False，
+#: 因此引擎仍在跑即为进程/状态错配；见 _check_owner_mismatch）。
+_NOT_RUNNING_STATUSES = frozenset({"stopped", "stopping"})
 
 #: 连续竞价边界（用于把「墙钟静默」折算成「有效交易静默」）
 _AM_OPEN = _dtime(9, 30)
@@ -179,6 +184,21 @@ def latest_snapshot_at(session_id: int) -> Optional[datetime]:
         db.close()
 
 
+def live_session_status(session_id: int) -> Optional[str]:
+    """该会话在 ``live_sessions.status`` 的当前值；无记录/失败 → None。
+
+    用于「DB 说已停、本进程引擎还在跑」的错配自检（2026-11-18 实证：stop
+    打到了没有引擎的进程，DB 置 stopped 后另一进程快照仍每 5s 写入）。
+    """
+    db = SessionLocal()
+    try:
+        row = db.query(LiveSession.status).filter(
+            LiveSession.id == session_id).first()
+        return str(row[0]) if row else None
+    finally:
+        db.close()
+
+
 @dataclass
 class StallSignal:
     """通道探针命中结果。"""
@@ -206,6 +226,7 @@ class EngineWatchdog:
         now_fn: Callable[[], datetime] = now_shanghai,
         mono_fn: Callable[[], float] = time.monotonic,
         snapshot_fn: Callable[[int], Optional[datetime]] = latest_snapshot_at,
+        session_status_fn: Callable[[int], Optional[str]] = live_session_status,
         in_session_fn: Callable[[datetime], bool] = default_in_session,
         client_online_fn: Callable[[str], bool] = client_window_present,
         persist_fn: Optional[Callable[..., None]] = None,
@@ -228,6 +249,8 @@ class EngineWatchdog:
         self._now = now_fn
         self._mono = mono_fn
         self._snapshot = snapshot_fn
+        # 会话 DB 状态探针（错配自检用；单测可注入，避免读真实库）
+        self._session_status = session_status_fn
         self._in_session = in_session_fn
         # 客户端窗口/进程探针（tdx/ths）：毫秒级 ctypes，不初始化 TQ
         self._client_online = client_online_fn
@@ -237,6 +260,8 @@ class EngineWatchdog:
         self._states: Dict[tuple, dict] = {}
         # 探针用的持续态：cursor 未推进起点 / 桥离线起点 / 回执积压起点
         self._probe_state: Dict[tuple, float] = {}
+        # 进程错配态：session_id -> {"alerted", "first_mono", "last_log_mono"}
+        self._owner_mismatch: Dict[int, dict] = {}
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self._lock = threading.Lock()
@@ -288,6 +313,11 @@ class EngineWatchdog:
             "last_scan_duration_ms": self._last_scan_duration_ms,
             "scan_count": self._scan_count,
             "active_alarms": active,
+            "owner_mismatch": [
+                {"session_id": sid, "db_status": state.get("db_status")}
+                for sid, state in list(self._owner_mismatch.items())
+                if state.get("alerted")
+            ],
             "interval_seconds": self._interval,
             "thresholds": {
                 "heartbeat_timeout_seconds": self._timeout,
@@ -317,6 +347,10 @@ class EngineWatchdog:
             except Exception:  # noqa: BLE001 — 单会话异常不影响其它会话
                 logger.exception(
                     "engine watchdog session scan error (session %s)", session_id)
+        # 引擎已从注册表移除的会话：清掉错配态（停止/重启都算收敛，不发 recovered）
+        for session_id in list(self._owner_mismatch):
+            if session_id not in sessions:
+                self._owner_mismatch.pop(session_id, None)
         self._scan_count += 1
         self._last_scan_at = now
         self._last_scan_duration_ms = (time.perf_counter() - t0) * 1000.0
@@ -329,6 +363,7 @@ class EngineWatchdog:
     def _scan_one(self, now: datetime, session_id: int, engine: object) -> None:
         if not getattr(engine, "_running", False):
             self._clear_session(session_id)
+            self._owner_mismatch.pop(session_id, None)
             return
         started = getattr(engine, "_started_at", None)
         if started is not None and (now - started).total_seconds() < self._grace:
@@ -336,6 +371,9 @@ class EngineWatchdog:
 
         self._scan_stats["sessions"] += 1
         channel = self._channel(engine)
+        # 进程/会话状态错配（DB 已 stopped/stopping 但本进程引擎仍在跑）：
+        # 不受交易时段限制——盘后照样会继续写快照，必须能报出来。
+        self._check_owner_mismatch(session_id, engine, channel)
         # 引擎层卡死：仅交易时段判定（无 bar/无快照在盘外是正常）
         if self._in_session(now):
             self._scan_stats["rules_checked"] += 1
@@ -353,6 +391,101 @@ class EngineWatchdog:
     def _channel(engine: object) -> str:
         dispatcher = getattr(engine, "_dispatcher", None)
         return str(getattr(dispatcher, "channel", "") or "unknown")
+
+    # ------------------------------------------------------------ 进程错配自检
+    def _check_owner_mismatch(self, session_id: int, engine: object,
+                              channel: str) -> None:
+        """DB 已 stopped/stopping，但本进程引擎仍在跑 → 进程/状态错配。
+
+        正常 stop 一定由持有引擎的进程处理：路由同步置 ``_running=False``，
+        因此本检查只在异常分支命中（预热宽限已在 ``_scan_one`` 扣掉）。命中
+        即 ERROR + SSE risk + 落 ``engine_owner_mismatch`` 决策事件，供事后
+        把「哪个进程在写、哪个进程收到 stop」对上号。不在此处停机——停机兜底
+        由自愈逻辑单独处理。
+        """
+        try:
+            status = self._session_status(session_id)
+        except Exception:  # noqa: BLE001 — DB 抖动不应当成错配
+            logger.warning(
+                "engine watchdog: 读取会话状态失败 (session %s)", session_id,
+                exc_info=True)
+            return
+        if status is None:
+            # 会话行不存在（删除/尚未落库）：不做错配判定
+            self._owner_mismatch.pop(session_id, None)
+            return
+        if status not in _NOT_RUNNING_STATUSES:
+            self._recover_owner_mismatch(session_id, engine, channel, status)
+            return
+        mono = self._mono()
+        state = self._owner_mismatch.get(session_id)
+        if state is None:
+            state = {"alerted": False, "first_mono": mono,
+                     "last_log_mono": 0.0, "db_status": status}
+            self._owner_mismatch[session_id] = state
+        state["db_status"] = status
+        if state["alerted"] and mono - state["last_log_mono"] < self._repeat:
+            return
+        first = not state["alerted"]
+        state["alerted"] = True
+        state["last_log_mono"] = mono
+        seconds = max(mono - state.get("first_mono", mono), 0.0)
+        self._scan_stats["alarms"] += 1
+        message = (
+            "进程/会话状态错配：会话 %s 在 DB 已 %s，但本进程引擎仍在运行"
+            "（%s，已持续 %.0f 秒）——快照/成交回填会继续写入。"
+            "请确认是否有另一个后端进程持有该引擎（stop 打到了没有引擎的进程）"
+            % (session_id, status, process_tag(), seconds))
+        logger.error("%s", message)
+        self._safe_emit(engine, "risk", {
+            "session_id": session_id,
+            "engine": channel,
+            "rule": "engine_owner_mismatch",
+            "seconds": int(seconds),
+            "db_status": status,
+            "message": message,
+        })
+        if first:
+            self._persist_owner_event(
+                session_id, channel, "engine_owner_mismatch", "trigger",
+                seconds, "db_status=%s" % status, message)
+
+    def _recover_owner_mismatch(self, session_id: int, engine: object,
+                                channel: str, status: str) -> None:
+        state = self._owner_mismatch.pop(session_id, None)
+        if not state or not state.get("alerted"):
+            return
+        seconds = max(self._mono() - state.get("first_mono", self._mono()), 0.0)
+        message = (
+            "进程/会话状态一致恢复：会话 %s DB=%s，本进程引擎在运行（%s）"
+            % (session_id, status, process_tag()))
+        logger.info("%s", message)
+        self._safe_emit(engine, "engine_owner_recovered", {
+            "session_id": session_id,
+            "engine": channel,
+            "rule": "engine_owner_recovered",
+            "db_status": status,
+            "message": message,
+        })
+        self._persist_owner_event(
+            session_id, channel, "engine_owner_recovered", "recover",
+            seconds, "db_status=%s" % status, message)
+
+    def _persist_owner_event(self, session_id: int, channel: str, gate: str,
+                             action: str, seconds: float, basis: str,
+                             message: str) -> None:
+        """错配事件落 ``live_decision_events``（复用通道事件写入路径）。"""
+        if self._persist is None:
+            return
+        try:
+            self._persist(
+                session_id=session_id, channel=channel, gate=gate,
+                action=action, seconds=seconds, basis=basis,
+                message=message)
+        except Exception:  # noqa: BLE001 — 观测链路失败不影响监控/交易
+            logger.exception(
+                "engine watchdog persist owner event failed (session %s, %s)",
+                session_id, gate)
 
     # ---------------------------------------------------------------- 引擎层
     def _check_engine_heartbeat(self, now: datetime, session_id: int, engine: object,

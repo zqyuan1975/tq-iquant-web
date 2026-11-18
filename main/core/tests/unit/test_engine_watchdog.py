@@ -42,6 +42,8 @@ def _watchdog(engines, **kw):
     kw.setdefault("now_fn", lambda: NOW)
     kw.setdefault("mono_fn", lambda: 0.0)
     kw.setdefault("snapshot_fn", lambda sid: None)
+    # 默认注入「DB running」：单测不读真实 dev.db，也避免错配自检干扰既有断言
+    kw.setdefault("session_status_fn", lambda sid: "running")
     kw.setdefault("in_session_fn", lambda dt: True)
     # 客户端窗口探针注入固定「在线」：单测不依赖本机是否真的开着通达信
     kw.setdefault("client_online_fn", lambda ch: True)
@@ -363,3 +365,95 @@ def test_config_seconds_invalid_falls_back_to_default():
     assert config_seconds(
         "heartbeat_timeout_seconds", 90,
         {"live": {"heartbeat_timeout_seconds": 45}}) == 45
+
+
+# ---------------- 进程/会话状态错配（DB stopped，本进程引擎仍在跑） ----------------
+
+def _running_engine():
+    """引擎处于运行态且行情新鲜，避免其它探针产生告警干扰断言。"""
+    eng = _Engine(channel="tdx_tq", started=NOW - timedelta(seconds=3600), tick=NOW)
+    eng._available_bar = SimpleNamespace(bar_time=NOW, period="1m")
+    return eng
+
+
+def test_owner_mismatch_alerts_once_and_persists():
+    eng = _running_engine()
+    persisted = []
+    wd = _watchdog({1: eng}, session_status_fn=lambda sid: "stopped",
+                   persist_fn=lambda **kw: persisted.append(kw))
+    wd.scan()
+
+    alerts = _risk(eng, "engine_owner_mismatch")
+    assert len(alerts) == 1
+    assert alerts[0]["db_status"] == "stopped"
+    assert "进程/会话状态错配" in alerts[0]["message"]
+    assert "pid=" in alerts[0]["message"]
+    assert len(persisted) == 1
+    assert persisted[0]["gate"] == "engine_owner_mismatch"
+    assert persisted[0]["action"] == "trigger"
+    assert wd.status()["owner_mismatch"] == [
+        {"session_id": 1, "db_status": "stopped"}]
+
+    wd.scan()  # 重复周期内不重复 ERROR/落库
+    assert len(_risk(eng, "engine_owner_mismatch")) == 1
+    assert len(persisted) == 1
+
+
+def test_owner_mismatch_stopping_status_also_detected():
+    eng = _running_engine()
+    wd = _watchdog({1: eng}, session_status_fn=lambda sid: "stopping")
+    wd.scan()
+    assert len(_risk(eng, "engine_owner_mismatch")) == 1
+
+
+def test_owner_mismatch_recovers_when_db_running_again():
+    eng = _running_engine()
+    status = {"value": "stopped"}
+    persisted = []
+    wd = _watchdog({1: eng}, session_status_fn=lambda sid: status["value"],
+                   persist_fn=lambda **kw: persisted.append(kw))
+    wd.scan()
+    assert len(_risk(eng, "engine_owner_mismatch")) == 1
+
+    status["value"] = "running"
+    wd.scan()
+    recovered = [e for e in eng.events
+                 if e["type"] == "engine_owner_recovered"]
+    assert len(recovered) == 1
+    assert persisted[-1]["gate"] == "engine_owner_recovered"
+    assert wd.status()["owner_mismatch"] == []
+
+
+def test_owner_mismatch_silenced_by_startup_grace():
+    eng = _Engine(channel="tdx_tq", started=NOW - timedelta(seconds=30), tick=NOW)
+    eng._available_bar = SimpleNamespace(bar_time=NOW, period="1m")
+    wd = _watchdog({1: eng}, session_status_fn=lambda sid: "stopped",
+                   grace_seconds=120)
+    wd.scan()
+    assert eng.events == []
+
+
+def test_owner_mismatch_not_checked_when_engine_stopped():
+    eng = _Engine(channel="tdx_tq", started=NOW - timedelta(seconds=3600),
+                  tick=NOW, running=False)
+    wd = _watchdog({1: eng}, session_status_fn=lambda sid: "stopped")
+    wd.scan()
+    assert eng.events == []
+
+
+def test_owner_mismatch_status_probe_failure_is_ignored():
+    eng = _running_engine()
+
+    def boom(sid):
+        raise RuntimeError("db down")
+
+    wd = _watchdog({1: eng}, session_status_fn=boom)
+    wd.scan()
+    assert _risk(eng, "engine_owner_mismatch") == []
+
+
+def test_process_tag_contains_pid():
+    from core.runtime import process_tag
+    tag = process_tag()
+    assert tag.startswith("pid=")
+    assert "port=" in tag

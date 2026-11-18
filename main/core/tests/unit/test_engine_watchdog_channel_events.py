@@ -59,6 +59,8 @@ def _watchdog(engines, **kw):
     kw.setdefault("now_fn", lambda: NOW)
     kw.setdefault("mono_fn", lambda: 0.0)
     kw.setdefault("snapshot_fn", lambda sid: None)
+    # 默认注入「DB running」：单测不读真实 dev.db，也避免错配自检污染通道事件断言
+    kw.setdefault("session_status_fn", lambda sid: "running")
     kw.setdefault("in_session_fn", lambda dt: True)
     kw.setdefault("client_online_fn", lambda ch: True)
     kw.setdefault("timeout_seconds", 10 ** 9)

@@ -34,6 +34,7 @@ from sqlalchemy.orm.exc import DetachedInstanceError
 
 from .portfolio import Portfolio
 from .position import Position
+from core.runtime import process_tag
 from .format import dec_money, dec_price, fmt_money, fmt_pct, fmt_price
 from .execution_engine import ExecutionEngine, LiveT1Checker
 from .cash_allocator import (
@@ -774,6 +775,9 @@ class LiveEngine:
         # 账户读取不可信导致的「快照跳过」日志节流：连续跳过只在首次打 WARNING，
         # 之后降为 DEBUG，成功采集一轮后重置（详见 _capture_account_snapshot）。
         self._acct_snapshot_skip_logged = False
+        # 快照写入日志节流：每进程首条 INFO（带 pid/port），其余降 DEBUG——
+        # 用于从日志区分「哪个进程在写快照」（2026-11-18 进程错配排查）。
+        self._acct_snapshot_write_logged = False
         self._last_intraday_reconcile = 0.0
         self._latest_account_cash: Optional[Decimal] = None
         # 最新账户快照的采集时刻（上海 naive，与 LiveAccountSnapshot.captured_at 同口径）。
@@ -1654,6 +1658,10 @@ class LiveEngine:
 
     async def stop(self) -> None:
         """停循环任务。"""
+        logger.info(
+            "engine.stop begin: session=%s %s main_task=%s deals_task=%s",
+            self.session_id, process_tag(),
+            self._task is not None, self._deals_task is not None)
         self._running = False
         # I-5：先置拒单闸——cancel 期间在途 tick 若再走 _handle_bar 不发新单
         self._stop_requested = True
@@ -1774,6 +1782,9 @@ class LiveEngine:
             self._executor.shutdown(wait=False)
         if self._deals_executor is not None:
             self._deals_executor.shutdown(wait=False)
+        logger.info(
+            "engine.stop done: session=%s %s（两循环已停止，快照/成交回填不再写入）",
+            self.session_id, process_tag())
 
     async def _loop(self) -> None:
         """主循环：心跳 → 拉 bar → 日终 → sleep。桥离线则暂停下单、标状态，不抛异常。
@@ -4139,11 +4150,12 @@ class LiveEngine:
             skip_msg = (
                 "account snapshot skipped: positions empty but account asset "
                 "unavailable/inconsistent (session %s; total_asset=%r "
-                "market_value=%r available=%r)"
+                "market_value=%r available=%r; %s)"
             )
             skip_args = (
                 self.session_id, asset.get("total_asset"),
-                asset.get("market_value"), asset.get("available"))
+                asset.get("market_value"), asset.get("available"),
+                process_tag())
             if self._acct_snapshot_skip_logged:
                 logger.debug(skip_msg, *skip_args)
             else:
@@ -4362,6 +4374,19 @@ class LiveEngine:
         # 镜面/导入已完成，持仓集合完整 → 允许清仓删行。
         self._flush_position_peaks(db, allow_delete=True)
         db.commit()
+        if self._acct_snapshot_write_logged:
+            logger.debug(
+                "account snapshot written: session=%s %s total_asset=%s "
+                "positions=%d",
+                self.session_id, process_tag(),
+                asset.get("total_asset"), len(positions))
+        else:
+            self._acct_snapshot_write_logged = True
+            logger.info(
+                "account snapshot 写入中：session=%s %s total_asset=%s "
+                "positions=%d（进程内后续写入降为 DEBUG）",
+                self.session_id, process_tag(),
+                asset.get("total_asset"), len(positions))
         if mirrored:
             logger.info(
                 "bridge mirror applied to %d holding(s) (session %s)",

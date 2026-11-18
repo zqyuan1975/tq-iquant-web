@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+import os
 from datetime import date, datetime, timedelta
 from typing import Dict, Optional
 
@@ -12,6 +13,7 @@ from core.api.response import err, ok
 from core.db import SessionLocal, get_db
 from core.models import BacktestRecord, LiveSession, PortfolioStrategy
 from core.config import load_config
+from core import runtime
 from core.engine.http_bridge_dispatcher import HttpBridgeDispatcher
 from core.engine.live_engine import LiveEngine
 try:
@@ -39,12 +41,18 @@ async def _stop_and_finalize(engine, session_id: int) -> None:
     由下次启动的 recover_stale_running_live_sessions / 僵尸抢占兜底。
     """
     try:
+        logger.info(
+            "stop 收敛开始：会话 %s engine.stop()（%s）", session_id,
+            runtime.process_tag())
         await engine.stop()
     except Exception:  # noqa: BLE001
         logger.exception("engine.stop() failed (session %s)", session_id)
     finally:
         try:
             await run_in_threadpool(svc.finalize_stopped, session_id)
+            logger.info(
+                "stop 收敛完成：会话 %s 已置 stopped（%s）", session_id,
+                runtime.process_tag())
         except Exception:  # noqa: BLE001
             logger.exception("finalize_stopped failed (session %s)", session_id)
 
@@ -417,8 +425,26 @@ async def stop_session(session_id: int, db: Session = Depends(get_db)):
         if not session:
             return err(404, "资源不存在")
         if session_id not in _ENGINES and session.status not in ("running", "stopping"):
+            logger.info(
+                "stop 请求：会话 %s 已是 %s 且本进程无引擎，按幂等成功返回（%s）",
+                session_id, session.status, runtime.process_tag())
             return ok({"id": session_id, "status": "stopped"})
+        prev_status = session.status
         engine = svc.stop_session(db, session_id, _ENGINES)
+        if engine is None:
+            # 关键诊断：本进程没有该会话的引擎却仍把 DB 置 stopped——若另一进程
+            # 持有引擎，它会继续写快照/可能继续交易（2026-11-18 实证形态）。
+            logger.warning(
+                "stop 请求：本进程注册表未找到会话 %s 的引擎（%s，"
+                "registry_sessions=%s，db_status_before=%s）——仍置 stopped；"
+                "若另一后端进程持有该引擎，快照/循环不会随之停止",
+                session_id, runtime.process_tag(), sorted(_ENGINES),
+                prev_status)
+        else:
+            logger.info(
+                "stop 请求：本进程注册表命中会话 %s 的引擎（%s，"
+                "db_status_before=%s），置 _running=False 并调度收敛",
+                session_id, runtime.process_tag(), prev_status)
         # 先同步置 _running=False，缩小「已置 stopped 但旧循环仍在轮询」的窗口，
         # 避免用户立刻 start 后新旧引擎并存各下一笔委托。
         if engine is not None:
@@ -1341,6 +1367,41 @@ async def session_stream(session_id: int, request: Request, db: Session = Depend
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
     )
+
+
+@router.get("/engine-registry")
+def engine_registry(db: Session = Depends(get_db)):
+    """只读诊断：本进程引擎注册表 vs DB 会话状态并排返回。
+
+    用于排查「DB 已 stopped 但另一进程仍在写快照/交易」这类进程错配：
+    ``db_active_without_engine`` 非空 = 本进程没有引擎、但 DB 认为会话在跑
+    （stop 会静默成功而不停机）；``engines[*].mismatch`` = 本进程有运行中的
+    引擎、DB 却已 stopped/stopping（应由 watchdog 自检报 ERROR）。
+    """
+    engines = []
+    for session_id, engine in list(_ENGINES.items()):
+        row = db.query(LiveSession).filter(LiveSession.id == session_id).first()
+        db_status = row.status if row else None
+        running = bool(getattr(engine, "_running", False))
+        engines.append({
+            "session_id": session_id,
+            "running": running,
+            "started_at": getattr(engine, "_started_at", None),
+            "last_tick_at": getattr(engine, "_last_tick_at", None),
+            "db_status": db_status,
+            "mismatch": running and db_status in ("stopped", "stopping"),
+        })
+    db_active = db.query(LiveSession).filter(
+        LiveSession.status.in_(("running", "stopping"))).all()
+    return ok({
+        "pid": os.getpid(),
+        "port": runtime.bound_port(),
+        "engines": engines,
+        "db_active_without_engine": [
+            {"session_id": r.id, "db_status": r.status}
+            for r in db_active if r.id not in _ENGINES
+        ],
+    })
 
 
 @router.get("/watchdog-status")

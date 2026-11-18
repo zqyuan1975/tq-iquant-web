@@ -134,6 +134,22 @@ def mark_stopped() -> None:
     clear_server_info(os.getpid())
 
 
+def bound_port() -> Optional[int]:
+    """本进程实际监听端口（``mark_serving`` 之前为 None）。"""
+    return _BOUND_PORT
+
+
+def process_tag() -> str:
+    """日志用进程标识 ``pid=<pid> port=<port|?>``。
+
+    排查「stop 落到了不持有引擎的进程」这类错配时，日志里必须能一眼区分
+    是哪个后端进程在写快照、哪个进程收到了 stop（2026-11-18 实证：DB 已
+    stopped 但快照仍每 5s 写入，仅凭会话号无法定位进程）。
+    """
+    port = _BOUND_PORT
+    return "pid=%d port=%s" % (os.getpid(), port if port else "?")
+
+
 def health_payload() -> dict:
     """``GET /health`` 的响应体（版本 / 运行时长 / 实际端口 / pid）。"""
     info = read_server_info() or {}
