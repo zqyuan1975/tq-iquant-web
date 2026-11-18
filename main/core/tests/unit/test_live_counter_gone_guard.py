@@ -12,6 +12,7 @@
 """
 from datetime import datetime
 from decimal import Decimal
+import logging
 
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
@@ -181,6 +182,52 @@ def test_empty_positions_with_inconsistent_asset_only_notices():
     assert _position_qty(port) == 2500
     assert snapshots == 0
     assert [e.action for e in events] == ["notice"]
+
+
+# ---------------- 5. 不可信读取的跳过日志：连续只告警一次，恢复后重置 ----------------
+def test_repeated_untrusted_skip_warning_is_throttled(caplog):
+    """终端关闭/未就绪导致的持续跳过不得每 5s 刷 WARNING（2026-11-18 实证）。"""
+    factory, _ = _db_factory()
+    port = _portfolio()
+    _with_position(port)
+    disp = _StubDispatcher(positions=[], asset=None)
+    engine = _engine(factory, disp, port)
+    db = factory()
+
+    with caplog.at_level(logging.DEBUG, logger="core.engine.live_engine"):
+        engine._capture_account_snapshot(db)
+        engine._capture_account_snapshot(db)
+        engine._capture_account_snapshot(db)
+        skips = [
+            r for r in caplog.records
+            if "account snapshot skipped" in r.getMessage()
+        ]
+        assert [r.levelno for r in skips] == [
+            logging.WARNING, logging.DEBUG, logging.DEBUG]
+
+        # 账户恢复可读（真实持仓 + 资产口径一致）→ 成功写快照并重置节流
+        disp._positions = [{"symbol": _STOCK, "volume": 2500, "available": 2500,
+                            "cost": "22.00"}]
+        disp._asset = {"total_asset": Decimal("555000"),
+                       "available": Decimal("505000"),
+                       "market_value": Decimal("50000")}
+        caplog.clear()
+        engine._capture_account_snapshot(db)
+        assert not [r for r in caplog.records
+                    if "account snapshot skipped" in r.getMessage()]
+
+        # 再次进入不可信状态 → 重新给出首条 WARNING
+        disp._positions = []
+        disp._asset = None
+        caplog.clear()
+        engine._capture_account_snapshot(db)
+        skips = [
+            r for r in caplog.records
+            if "account snapshot skipped" in r.getMessage()
+        ]
+        assert [r.levelno for r in skips] == [logging.WARNING]
+
+    db.close()
 
 
 # ---------------- 3. 真实清仓（资产可读、市值 0）仍按 2 次确认清仓 ----------------

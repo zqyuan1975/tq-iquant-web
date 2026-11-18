@@ -771,6 +771,9 @@ class LiveEngine:
         self._engine_key = engine_key
         self._acct_snap_interval = account_snapshot_interval
         self._last_acct_capture = 0.0
+        # 账户读取不可信导致的「快照跳过」日志节流：连续跳过只在首次打 WARNING，
+        # 之后降为 DEBUG，成功采集一轮后重置（详见 _capture_account_snapshot）。
+        self._acct_snapshot_skip_logged = False
         self._last_intraday_reconcile = 0.0
         self._latest_account_cash: Optional[Decimal] = None
         # 最新账户快照的采集时刻（上海 naive，与 LiveAccountSnapshot.captured_at 同口径）。
@@ -4108,7 +4111,16 @@ class LiveEngine:
 
         同时持久化移动止损峰值（highest_price）：写入 = max(上次快照记录,
         当前虚拟账本峰值)；恢复 = 上次记录 > 账本峰值（重启丢峰）时还原——
-        移动止损基准跨重启单调，不从启动价重新起算。"""
+        移动止损基准跨重启单调，不从启动价重新起算。
+
+        采集归属：账户快照是**会话引擎级**采集，不是独立的账户级后台任务——唯一
+        调用方是 ``_deals_loop``（``while self._running``），会话 stop 时路由同步
+        置 ``_running=False`` 并 cancel ``_deals_task``，采集随之停止。2026-11-18
+        实证（会话 #1 于 19:10 停、快照仍写到 21:05）不是「缺少 stop 判断」，而是
+        stop 请求未落到持有引擎的进程/注册表（根因待运行时证据，见工单记录）。
+        交易终端关闭/未就绪时读到「空持仓 + 资产不可信」属预期跳过，故重复跳过
+        只告警一次，避免 5s 节拍刷屏。
+        """
         # 读取前的下界时刻：读账户/持仓本身要花时间（桥 HTTP / THS 读表可达数秒），
         # 期间提交的单可能还没被柜台冻结进这份快照 → 在途预留去重只认「早于本时刻」
         # 提交的单（保守：读取期间提交的单仍计入预留）。
@@ -4122,12 +4134,21 @@ class LiveEngine:
             # 持仓空表 + 资产不可信 = 读取失败（引擎未就绪/查询异常），不是真空仓。
             # 跳过本轮：不写空快照（会污染峰值/对账源）、不累计清仓确认；只对账内
             # 仍有虚拟仓的代码发一条 notice（每日去重），绝不进 apply 清仓分支。
-            logger.warning(
+            # 日志节流：终端关闭/未就绪时该状态会持续数小时，5s 节拍全量 WARNING
+            # 会淹没日志；连续跳过仅首条 WARNING，其余 DEBUG，成功采集后重置。
+            skip_msg = (
                 "account snapshot skipped: positions empty but account asset "
                 "unavailable/inconsistent (session %s; total_asset=%r "
-                "market_value=%r available=%r)",
+                "market_value=%r available=%r)"
+            )
+            skip_args = (
                 self.session_id, asset.get("total_asset"),
                 asset.get("market_value"), asset.get("available"))
+            if self._acct_snapshot_skip_logged:
+                logger.debug(skip_msg, *skip_args)
+            else:
+                self._acct_snapshot_skip_logged = True
+                logger.warning(skip_msg + "；后续相同状态降为 DEBUG", *skip_args)
             try:
                 self._detect_counter_cleared_holdings(
                     db, positions, read_at, account_ok=False)
@@ -4136,6 +4157,8 @@ class LiveEngine:
                     "detect counter cleared holdings failed (session %s)",
                     self.session_id)
             return
+        # 本轮采集成功（写快照）：重置跳过日志节流状态。
+        self._acct_snapshot_skip_logged = False
         # 复用本轮真实持仓回读结果作为 live_service.engine_external_positions 的
         # 60s TTL 缓存：快照线程已每 60s 读一次真实持仓，/positions 请求不应再
         # 独立等一次 GUI 读表（THS 单次 6-10s，冷读会顶到前端 20s 超时）。
@@ -4725,7 +4748,10 @@ class LiveEngine:
                             reason="counter_position_gone_unverified",
                             action="notice", source="counter_gone",
                             portfolio_id=port.portfolio_id)
-                        logger.warning(
+                        # 与上面的「account snapshot skipped」同源：不可信读取会持续
+                        # 数小时，逐圈 WARNING 属重复噪音；人工干预本身已由
+                        # _note_manual_intervention 每代码每日打一条 WARNING + 落库。
+                        logger.debug(
                             "counter position row missing but account read "
                             "untrusted → notice only: %s (virtual=%d, session %s)",
                             code, pos.quantity, self.session_id)
