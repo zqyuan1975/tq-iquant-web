@@ -251,6 +251,24 @@ def failover_session(session_id: int, data: dict, db: Session = Depends(get_db))
     return ok(result)
 
 
+@router.get("/sessions/{session_id}/channel-guard")
+def session_channel_guard(session_id: int, db: Session = Depends(get_db)):
+    """B3：通道级守护检查清单（只读，不自动拉起终端/重启会话）。"""
+    data = svc.session_channel_guard(db, session_id, _ENGINES)
+    if data is None:
+        return err(404, "资源不存在")
+    return ok(data)
+
+
+@router.post("/sessions/{session_id}/channel-guard/reconnect")
+def reconnect_session_channel(session_id: int, db: Session = Depends(get_db)):
+    """B3：一键重新探活（清 30s 缓存强制探一次，离线回人工处置建议）。"""
+    ok_flag, result = svc.reconnect_session_channel(db, session_id, _ENGINES)
+    if not ok_flag:
+        return err(result[0], result[1])
+    return ok(result)
+
+
 @router.get("/sessions/{session_id}/signals")
 def session_signals(
     session_id: int,

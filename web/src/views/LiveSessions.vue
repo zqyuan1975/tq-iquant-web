@@ -20,7 +20,8 @@ import {
   ackLiveDecision, ackAllLiveDecisions,
   getLiveSessions, getLiveSession, createLiveSession, updateLiveSession, startLiveSession, stopLiveSession, deleteLiveSession,
   getLiveSessionChannelHealth, failoverLiveSession,
-  type LiveSessionChannelHealth,
+  getLiveChannelGuard, reconnectLiveChannel,
+  type LiveSessionChannelHealth, type LiveChannelGuard,
   recoverLiveBreaker, getLiveChannel, testLiveChannel, sendUserBlock, getFormulas, getWatchdogStatus,
   getLiveAccountPreview, resetLiveBaseline,
   getLiveParamsDrift, getLiveCashFlows, createLiveCashFlow,
@@ -1009,6 +1010,47 @@ async function stopSession(id: number) {
   }
 }
 
+// ---- B3 通道守护（只读检查清单 + 一键重新探活）----
+const guardModal = ref<LiveSessionItem | null>(null)
+const guard = ref<LiveChannelGuard | null>(null)
+const guardLoading = ref(false)
+const guardMessage = ref('')
+async function openGuard(s: LiveSessionItem) {
+  guardModal.value = s
+  guard.value = null
+  guardMessage.value = ''
+  guardLoading.value = true
+  try {
+    guard.value = await getLiveChannelGuard(s.id)
+  } catch (e: any) {
+    guardMessage.value = e?.response?.data?.message || e?.message || '读取检查清单失败'
+  } finally {
+    guardLoading.value = false
+  }
+}
+async function recheckChannel() {
+  if (!guardModal.value) return
+  guardLoading.value = true
+  guardMessage.value = ''
+  try {
+    const res = await reconnectLiveChannel(guardModal.value.id)
+    guardMessage.value = res.online
+      ? `${res.message}（${guardModal.value.name}）`
+      : `${res.message}：${res.manual_action}`
+    guard.value = await getLiveChannelGuard(guardModal.value.id)
+  } catch (e: any) {
+    guardMessage.value = e?.response?.data?.message || e?.message || '重新探活失败'
+  } finally {
+    guardLoading.value = false
+  }
+}
+async function switchFromGuard() {
+  if (!guardModal.value) return
+  await openEdit(guardModal.value)
+  guardModal.value = null
+  editResult.value = { effective_at: 'now', message: '请在编辑弹窗确认备用通道后点「一键切换备用通道」' }
+}
+
 async function deleteSession(s: LiveSessionItem) {
   if (!confirm(`确定删除实盘 session「${s.name}」？该 session 的历史委托/成交将一并清除，且不可恢复。`)) return
   try {
@@ -1328,6 +1370,11 @@ onUnmounted(() => {
               class="btn btn-sm" data-test="cash-flow-open"
               title="登记入金/出金/分红等外部现金流（不记台账会扭曲净值、收益率、回撤、日亏）"
             >存取款/分红</button>
+            <button
+              v-if="s.status !== 'stopping'"
+              @click="openGuard(s)" class="btn btn-sm" data-test="channel-guard-open"
+              title="通道级守护：检查客户端/桥、运行态引擎、备用通道与待生效配置"
+            >通道守护</button>
             <button
               v-if="s.status !== 'stopping'"
               @click="openEdit(s)" class="btn btn-sm" data-test="session-edit-open"
@@ -1844,6 +1891,40 @@ onUnmounted(() => {
     </div>
   </div>
 
+  <!-- B3 通道守护：前置检查清单 + 一键重新探活（不自动拉起终端/重启会话） -->
+  <div v-if="guardModal" class="modal-overlay" data-test="channel-guard-modal" @click.self="guardModal = null">
+    <div class="modal-content">
+      <h3>通道守护「{{ guardModal.name }}」（{{ engineLabel(guard?.engine || guardModal.engine) }}）</h3>
+      <div class="modal-body">
+        <p v-if="guardLoading" class="muted">检查中…</p>
+        <template v-else-if="guard">
+          <ul class="guard-check-list">
+            <li v-for="c in guard.checks" :key="c.key" :class="{ ok: c.ok }" data-guard-check>
+              <b>{{ c.ok ? '✓' : '✗' }} {{ c.label }}</b>
+              <span>{{ c.detail }}</span>
+            </li>
+          </ul>
+          <div v-if="guard.actions.length" class="baseline-preview warn" data-test="channel-guard-actions">
+            <div v-for="(a, i) in guard.actions" :key="i">· {{ a }}</div>
+          </div>
+          <p v-else class="muted">未发现阻断项。</p>
+          <p v-if="guardMessage" class="baseline-preview" data-test="channel-guard-message">{{ guardMessage }}</p>
+        </template>
+      </div>
+      <div class="modal-actions">
+        <button class="btn btn-primary" :disabled="guardLoading" data-test="channel-guard-reconnect" @click="recheckChannel">
+          {{ guardLoading ? '检查中…' : '重新探活' }}
+        </button>
+        <button
+          v-if="guard?.ready_to_switch"
+          class="btn" data-test="channel-guard-switch"
+          @click="switchFromGuard"
+        >去切换备用通道</button>
+        <button class="btn" @click="guardModal = null">关闭</button>
+      </div>
+    </div>
+  </div>
+
   <!-- B1 + A4 编辑会话：未运行立即生效；运行中除名称外入待生效队列 -->
   <div v-if="editModal" class="modal-overlay modal-lg" data-test="session-edit-modal" @click.self="editModal = null">
     <div class="modal-content">
@@ -2265,6 +2346,16 @@ onUnmounted(() => {
 /* 新建弹窗真实总资产预览 / 内联校验错误 */
 .baseline-preview { font-size: 12px; color: var(--ink-soft); margin: -6px 0 12px; }
 .baseline-preview.warn { color: var(--orange, #e67e22); }
+.muted { font-size: 12px; color: var(--ink-faint); }
+/* B3 通道守护检查清单 */
+.guard-check-list { list-style: none; padding: 0; margin: 0 0 12px; }
+.guard-check-list li {
+  display: flex; justify-content: space-between; gap: 12px;
+  font-size: 12px; padding: 4px 0; border-bottom: 1px dashed var(--line, #2a2f3a);
+  color: var(--red);
+}
+.guard-check-list li.ok { color: var(--ink-soft); }
+.guard-check-list li span { color: var(--ink-faint); text-align: right; }
 .form-error { font-size: 12px; color: var(--red); margin: -6px 0 12px; }
 /* start 409 行内红字：指名占用者，不笼统报「启动失败」 */
 .start-error {

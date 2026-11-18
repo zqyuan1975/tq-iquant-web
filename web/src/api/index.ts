@@ -1982,6 +1982,44 @@ export async function getLiveSessionChannelHealth(id: number) {
   return res.data.data
 }
 
+/** B3：通道级守护检查清单（只读提示，不自动拉起终端）。 */
+export interface LiveChannelGuardCheck {
+  key: string
+  ok: boolean
+  label: string
+  detail: string
+}
+
+export interface LiveChannelGuard {
+  session_id: number
+  status: string
+  engine: string
+  checks: LiveChannelGuardCheck[]
+  ready_to_switch: boolean
+  actions: string[]
+  guard_mode: string
+  checked_at: string
+}
+
+export async function getLiveChannelGuard(id: number) {
+  const res = await api.get<ApiResponse<LiveChannelGuard>>(
+    `/live/sessions/${id}/channel-guard`)
+  return res.data.data
+}
+
+/** B3：一键重新探活（清 30s 缓存强制探一次）。 */
+export async function reconnectLiveChannel(id: number) {
+  const res = await api.post<ApiResponse<{
+    session_id: number
+    engine: string
+    online: boolean | null
+    stale: boolean
+    message: string
+    manual_action: string
+  }>>(`/live/sessions/${id}/channel-guard/reconnect`)
+  return res.data.data
+}
+
 /** B2：人工确认后切换主备通道（confirm 必填；运行中下次启动生效）。 */
 export async function failoverLiveSession(id: number, targetEngine?: string) {
   const res = await api.post<ApiResponse<{

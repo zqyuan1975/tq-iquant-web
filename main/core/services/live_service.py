@@ -1969,6 +1969,116 @@ def switch_session_channel(db: Session, session_id: int,
 
 
 # ---------------------------------------------------------------------------
+# B3：通道级守护检查清单 + 一键重新探活（不自动拉起终端）
+# ---------------------------------------------------------------------------
+
+_MANUAL_CHANNEL_HINT = {
+    "tdx": "打开并登录通达信客户端，确认「交易信号」窗口可用后点「重新探活」",
+    "ths": "打开并登录同花顺网上股票交易系统，确认窗口标题匹配后点「重新探活」",
+    "iquant": "启动 QMT 客户端并确认 8790 桥服务可访问后点「重新探活」",
+    "goldminer": "启动掘金终端并确认桥策略服务可访问后点「重新探活」",
+}
+
+
+def _force_channel_probe(engine_key: str) -> Tuple[Optional[bool], bool]:
+    """清掉 30s 探活缓存后强制探一次（B3「一键重新探活」）。"""
+    with _PROBE_CACHE_LOCK:
+        _PROBE_CACHE.pop(engine_key, None)
+    dispatcher = _probe_dispatcher_for(engine_key)
+    if dispatcher is None:
+        return None, False
+    return _probe_online_quick(engine_key, dispatcher)
+
+
+def session_channel_guard(db: Session, session_id: int,
+                          engines: Optional[Dict[int, LiveEngine]] = None):
+    """B3：前置通道检查清单（只读）。
+
+    只提示、不自动拉起终端、不自动重启会话；每项给 ``ok`` 与人工处置建议。
+    """
+    session = db.query(LiveSession).filter(LiveSession.id == session_id).first()
+    if session is None:
+        return None
+    engines = engines or ENGINES
+    health = session_channel_health(db, session_id, engines)
+    primary = health["primary"] or {}
+    backup = health["backup"]
+    running_status = session.status in ("running", "stopping")
+    engine_key = primary.get("engine") or session_engine(session)
+    registered = session_id in engines
+    pending_count = (
+        db.query(LiveSessionPendingChange)
+        .filter(LiveSessionPendingChange.live_session_id == session_id,
+                LiveSessionPendingChange.field.isnot(None),
+                LiveSessionPendingChange.portfolio_strategy_id.is_(None),
+                LiveSessionPendingChange.status == "pending")
+        .count()
+    )
+    checks = [
+        {"key": "primary_configured", "ok": bool(primary.get("configured")),
+         "label": "主通道已配置",
+         "detail": primary.get("detail") or engine_key},
+        {"key": "client_online", "ok": bool(primary.get("online")),
+         "label": "客户端/桥在线",
+         "detail": ("在线" if primary.get("online") else
+                    (primary.get("detail") or "离线"))},
+        {"key": "engine_registered", "ok": (not running_status) or registered,
+         "label": "运行态引擎已注册",
+         "detail": ("未运行（不需要）" if not running_status else
+                    ("已注册" if registered else "会话运行中但后端无引擎实例，需停止后重新启动"))},
+        {"key": "backup_ready", "ok": bool(backup and backup.get("online")),
+         "label": "备用通道可用",
+         "detail": ("未配置" if backup is None else
+                    ("在线" if backup.get("online") else "离线"))},
+        {"key": "pending_changes", "ok": pending_count == 0,
+         "label": "无待生效配置",
+         "detail": ("无" if pending_count == 0 else
+                    "%d 项待下次启动生效" % pending_count)},
+    ]
+    actions: List[str] = []
+    if not primary.get("online"):
+        actions.append(_MANUAL_CHANNEL_HINT.get(
+            engine_key, "确认交易终端已启动并登录后点「重新探活」"))
+    if running_status and not registered:
+        actions.append("后端可能重启过：先在页面停止该会话，再重新启动以恢复引擎")
+    if backup is not None and not backup.get("online"):
+        actions.append("备用通道当前离线，暂不建议切换")
+    ready_to_switch = bool(
+        not primary.get("online") and backup and backup.get("online")
+        and session.status != "stopping")
+    return {
+        "session_id": session_id,
+        "status": session.status,
+        "engine": engine_key,
+        "checks": checks,
+        "ready_to_switch": ready_to_switch,
+        "actions": actions,
+        "guard_mode": "advisory",
+        "checked_at": datetime.now().isoformat(timespec="seconds"),
+    }
+
+
+def reconnect_session_channel(db: Session, session_id: int,
+                              engines: Optional[Dict[int, LiveEngine]] = None):
+    """B3：一键重新探活（不做危险的重启/拉起动作，结果回显人工处置建议）。"""
+    session = db.query(LiveSession).filter(LiveSession.id == session_id).first()
+    if session is None:
+        return False, (404, "资源不存在")
+    engine_key = session_engine(session)
+    online, stale = _force_channel_probe(engine_key)
+    hint = "" if online else _MANUAL_CHANNEL_HINT.get(
+        engine_key, "确认交易终端已启动并登录")
+    return True, {
+        "session_id": session_id,
+        "engine": engine_key,
+        "online": online,
+        "stale": stale,
+        "message": ("通道在线" if online else "通道仍离线"),
+        "manual_action": hint,
+    }
+
+
+# ---------------------------------------------------------------------------
 # 外部现金流台账（③）
 # ---------------------------------------------------------------------------
 # 入金/出金/分红/其他。金额落库为**有符号**：>0 流入，<0 流出；调用方对
