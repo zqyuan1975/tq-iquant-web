@@ -89,6 +89,7 @@ from .live.timing import (
     periods_on_boundary,
 )
 from .live.event_bus import EventBus
+from .live.gap_report import compress_missing_segments
 # 外部信号注入源（通达信条件预警文件 → 公式名匹配策略 → 注入 signal_cache）
 from .live.external_signal_source import (
     ExternalSignalFileSource,
@@ -1031,6 +1032,8 @@ class LiveEngine:
             snapshot_synth=self._snapshot_synth,
             # A3（2026-11-18）：14:30 日终写组合资金日序列
             on_daily_snapshot=self._write_daily_portfolio_snapshots,
+            # F3（2026-11-18）：15:05 收盘清扫后输出当日缺失分钟段清单（只观测）
+            on_daily_gap_report=self._report_daily_gap,
         )
 
         # 已分发过周期边界的 1m stime 集合——同根 bar 二次触发时挡掉重复周期分发。
@@ -1045,6 +1048,9 @@ class LiveEngine:
         # （gate=period_bar_freshness）整批跳过时登记；后续 1m bar 触发时重试，
         # 拿到当日 bar 派发成功即移除；超 _PENDING_BOUNDARY_TTL 放弃（记 WARNING）。
         self._pending_boundaries: Dict[datetime, Set[str]] = {}
+        # F3：当日「仍缺」的分钟时间点（缺口补派后仍缺 + 周期边界超窗放弃），
+        # 日终压缩为缺失分钟段清单（gate=bar_gap_daily）供人工判断影响。
+        self._day_missing_minutes: Dict[date, Set[datetime]] = {}
 
         self._running = False
         # I-5：stop 请求标记（stop() 首行置 True、start() 重置 False）。提交链入口
@@ -2159,6 +2165,8 @@ class LiveEngine:
                expected, replayed, len(missing))
         )
         payload["message"] = text
+        # F3：把「补派后仍缺」的分钟进入当日清单（日终统一输出缺失段）。
+        self._record_missing_minutes(missing)
         if action == "replay":
             logger.info("[bar-gap] %s (session %s)", text, self.session_id)
         else:
@@ -10681,6 +10689,8 @@ class LiveEngine:
                     bt, sorted(self._pending_boundaries[bt]),
                     int(self._PENDING_BOUNDARY_TTL.total_seconds() // 60),
                 )
+                # F3：放弃的周期边界即当日永久缺失的分钟，进入日终缺失段清单。
+                self._record_missing_minutes([bt])
                 self._pending_boundaries.pop(bt, None)
                 continue
             for period in list(self._pending_boundaries[bt]):
@@ -10695,6 +10705,63 @@ class LiveEngine:
                     self._pending_boundaries[bt].discard(period)
             if not self._pending_boundaries.get(bt):
                 self._pending_boundaries.pop(bt, None)
+
+    # ---------------- F3：日终缺失分钟段清单 ----------------
+    def _record_missing_minutes(self, missing) -> None:
+        """登记「仍缺」的分钟时间点（按交易日分桶，只留最近 5 天防无限增长）。"""
+        if not missing:
+            return
+        if getattr(self, "_day_missing_minutes", None) is None:
+            self._day_missing_minutes = {}
+        for m in missing:
+            if not isinstance(m, datetime):
+                continue
+            self._day_missing_minutes.setdefault(m.date(), set()).add(m)
+        if len(self._day_missing_minutes) > 5:
+            for d in sorted(self._day_missing_minutes)[:-5]:
+                self._day_missing_minutes.pop(d, None)
+
+    def _report_daily_gap(self, today: date) -> None:
+        """日终输出当日缺失分钟段清单（gate=bar_gap_daily，落库 + 通知）。
+
+        只观测：不补派、不改账本、不影响任何交易判定；报告后清空该日记录，
+        保证同一交易日只输出一次（DailyCloser 15:05 清扫完成后回调）。
+        """
+        bucket = getattr(self, "_day_missing_minutes", None)
+        minutes = sorted(bucket.pop(today, set())) if bucket else []
+        if not minutes:
+            return
+        segments = compress_missing_segments(minutes)
+        shown = segments[:20]
+        text = (
+            "日终缺失分钟段：%d 段 / %d 分钟（%s ~ %s）"
+            % (len(segments), len(minutes),
+               minutes[0].strftime("%H:%M"), minutes[-1].strftime("%H:%M"))
+        )
+        if len(segments) > len(shown):
+            text += "，仅列前 %d 段" % len(shown)
+        if shown:
+            text += "；段首：" + "、".join(
+                s["start"][11:16] for s in shown)
+        payload = {
+            "session_id": self.session_id,
+            "engine": self._engine_key,
+            "gate": "bar_gap_daily",
+            "action": "missing_report",
+            "rule": "daily_missing_minutes",
+            "trade_date": today.isoformat(),
+            "missing_minutes": len(minutes),
+            "segment_count": len(segments),
+            "segments": shown,
+            "message": text,
+        }
+        logger.warning("[bar-gap-daily] %s (session %s)", text, self.session_id)
+        self._emit_risk_safe(payload, persist=True)
+        try:
+            notify("warn", "实盘当日缺失分钟段", text,
+                   gate="bar_gap_daily", trade_date=today)
+        except Exception:  # noqa: BLE001 — 通知失败不影响日终
+            logger.debug("daily gap notify failed", exc_info=True)
 
     # ---------------- F5：桥可用持仓（SELL 减仓上限）----------------
     def _refresh_available_map(self) -> None:
