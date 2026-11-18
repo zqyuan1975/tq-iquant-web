@@ -665,6 +665,10 @@ class LiveEngine:
         # 次日盘前（集合竞价）执行日线级信号单（config.tq_trade.pre_open_auction*）。
         # None/缺键 → 默认开启；显式 false 关闭，完全走「次日首根完成 1m bar 放行」。
         pre_open_auction: Optional[Dict] = None,
+        # G2（2026-11-18）：盘前参数的来源标记（session=会话级覆盖 / global=全局），
+        # 启动时落一条 gate=pre_open_auction_config/action=effective 决策事件。
+        pre_open_config_source: str = "global",
+        pre_open_config_overrides: Tuple[str, ...] = (),
         # 错周期 bar 是否跑风控（会话级三态已在 live_service 解析为布尔）：
         # False（默认，对齐回测）→ 错周期 bar 只更新价格快照、不跑风控；
         # True → 旧行为（任何 bar 都按 close 评估持仓风险）。
@@ -698,6 +702,11 @@ class LiveEngine:
             lambda d: self._calendar.session_close_time(d))
         # 盘前竞价执行窗口（默认开启）+ 当日已尝试集合（at-most-once 幂等）
         self._pre_open = PreOpenAuctionConfig.from_config(pre_open_auction)
+        # G2：会话级覆盖来源（供启动事件留痕；不影响判定）
+        self._pre_open_config_source = str(pre_open_config_source or "global")
+        self._pre_open_config_overrides = tuple(pre_open_config_overrides or ())
+        # G2：盘前生效配置只公告一次（start 时）
+        self._pre_open_config_announced = False
         # 错周期 bar 风控（False=只更新价格快照，对齐回测）
         self._intraday_mismatched_risk = bool(intraday_mismatched_risk_enabled)
         # 09:31 deferred 兜底放行定价：False=首根 1m open 限价；True=对手价保成交
@@ -1455,6 +1464,8 @@ class LiveEngine:
         await self._loop_ref.run_in_executor(self._executor, self._sync_startup)
         # 通道价格模式声明（盘前强制 approval 时记一条决策事件，工作台可见）
         self._announce_pre_open_price_mode()
+        # G2：盘前参数生效值（含会话级来源）只公告一次
+        self._announce_pre_open_config()
         self._bar_poller.on_bar = self._on_bar
         # 基线那根（首次建基线/离线恢复首根）也交付引擎：只放行 deferred，不跑公式
         self._bar_poller.on_baseline_bar = self._on_bar
@@ -2550,6 +2561,28 @@ class LiveEngine:
             "channel": getattr(self._dispatcher, "channel", ""),
             "price_mode": getattr(self._dispatcher, "ths_price_mode", "approval"),
             "message": msg,
+        })
+
+    def _announce_pre_open_config(self) -> None:
+        """G2：启动声明本次生效的盘前参数（含来源），只落一条决策事件。
+
+        live_sessions 没有 params_snapshot 列，用决策事件留痕「这次到底用了
+        什么窗口/让价、是会话覆盖还是全局」，供事后回溯与工作台展示。
+        """
+        if self._pre_open_config_announced:
+            return
+        self._pre_open_config_announced = True
+        end_h, end_m = self._pre_open.end_time
+        self._emit("decision", {
+            "session_id": self.session_id,
+            "engine": self._engine_key,
+            "gate": "pre_open_auction_config",
+            "action": "effective",
+            "enabled": bool(self._pre_open.enabled),
+            "end_time": "%02d:%02d" % (end_h, end_m),
+            "price_bias_pct": str(self._pre_open.price_bias_pct),
+            "source": self._pre_open_config_source,
+            "overrides": list(self._pre_open_config_overrides),
         })
 
     def _pre_open_release(self, portfolio: Portfolio, now: datetime) -> None:

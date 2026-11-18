@@ -64,6 +64,7 @@ from core.services.live_service import (  # noqa: E402
     serialize_trade as _serialize_trade,
     aggregate_positions_from_trades as _aggregate_positions_from_trades,
     engine_virtual_positions as _engine_virtual_positions,
+    normalize_pre_open_overrides,
 )
 
 
@@ -184,6 +185,11 @@ def create_session(data: dict, db: Session = Depends(get_db)):
     else:
         return err(400,
                    "intraday_mismatched_risk_enabled 仅支持 null / true / false")
+    # G2：盘前参数会话级覆盖（三态；NULL=跟随全局）
+    pre_open_patch, pre_open_error = normalize_pre_open_overrides(data)
+    if pre_open_error:
+        return err(*pre_open_error)
+    data.update(pre_open_patch)
     # 组合关联预校验：重复/不存在的 portfolio_id 此前会由 FK/唯一约束抛
     # IntegrityError 变成 500，这里统一拦截成 400 并给出具体 id。
     pids = data.get("portfolio_ids") or []

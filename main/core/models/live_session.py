@@ -93,6 +93,13 @@ class LiveSession(Base):
         String(16), nullable=False, server_default="off", default="off")
     capital_pool_rebalance_enabled = Column(
         Boolean, nullable=False, server_default="0", default=False)
+    # ---- G2 盘前集合竞价参数会话级覆盖（2026-11-18）----
+    # 三列均可空：NULL = 跟随 config.tq_trade.pre_open_auction_* 全局值；
+    # 非空 = 本会话显式覆盖（仅作用于本会话，不改全局配置）。
+    # 历史会话保持 NULL，行为与升级前逐字一致。
+    pre_open_auction_enabled = Column(Boolean, nullable=True)
+    pre_open_auction_end_time = Column(String(5), nullable=True)
+    pre_open_auction_price_bias_pct = Column(Numeric(9, 6), nullable=True)
     # B2 主备通道（默认关闭）：NULL=未配置备用引擎；failover_enabled=1 时主通道
     # 心跳失败逐日写 channel_failover 建议事件，实际切换仍需人工确认。
     backup_engine = Column(String(16), nullable=True)

@@ -87,6 +87,10 @@ const form = ref({
   intraday_mismatched_risk_enabled: null as boolean | null,
   // E1：执行前重判门控（默认关）——顺延次日单/盘前竞价单提交前再判一次
   gate_recheck_on_execute: false as boolean,
+  // G2：盘前参数会话级覆盖（null / '' = 跟随全局）
+  pre_open_auction_enabled: null as boolean | null,
+  pre_open_auction_end_time: '' as string,
+  pre_open_auction_price_bias_pct: null as number | string | null,
 })
 
 /** live_capital 归一化：空串/未填 → null（以真实总资产为基准），否则转数值透传。 */
@@ -865,7 +869,7 @@ function openCreate() {
   const engine = (!occ[preferred]
     ? preferred
     : (engines.find((e) => e.configured && !occ[e.key])?.key as LiveEngineKey | undefined)) || preferred
-  form.value = { name: '', mode: 'simulation', engine, execution_mode: 'alert', capital_pool_mode: 'off', capital_pool_rebalance_enabled: false, portfolio_ids: [], live_capital: null, signal_file_path: '', advance_close_enabled: false, advance_close_time: '14:51', intraday_mismatched_risk_enabled: null, gate_recheck_on_execute: false }
+  form.value = { name: '', mode: 'simulation', engine, execution_mode: 'alert', capital_pool_mode: 'off', capital_pool_rebalance_enabled: false, portfolio_ids: [], live_capital: null, signal_file_path: '', advance_close_enabled: false, advance_close_time: '14:51', intraday_mismatched_risk_enabled: null, gate_recheck_on_execute: false, pre_open_auction_enabled: null, pre_open_auction_end_time: '', pre_open_auction_price_bias_pct: null }
   createError.value = ''
   showCreate.value = true
   loadAccountPreview(engine)
@@ -898,7 +902,7 @@ async function create() {
     // A1 软校验：目标引擎已被其它会话占用等提示（不阻断创建，但必须让用户看见）
     createWarnings.value = Array.isArray(res?.warnings) ? res.warnings : []
     showCreate.value = false
-    form.value = { name: '', mode: 'simulation', engine: defaultEngineKey(), execution_mode: 'alert', capital_pool_mode: 'off', capital_pool_rebalance_enabled: false, portfolio_ids: [], live_capital: null, signal_file_path: '', advance_close_enabled: false, advance_close_time: '14:51', intraday_mismatched_risk_enabled: null, gate_recheck_on_execute: false }
+    form.value = { name: '', mode: 'simulation', engine: defaultEngineKey(), execution_mode: 'alert', capital_pool_mode: 'off', capital_pool_rebalance_enabled: false, portfolio_ids: [], live_capital: null, signal_file_path: '', advance_close_enabled: false, advance_close_time: '14:51', intraday_mismatched_risk_enabled: null, gate_recheck_on_execute: false, pre_open_auction_enabled: null, pre_open_auction_end_time: '', pre_open_auction_price_bias_pct: null }
     load()
   } catch (e: any) {
     // 后端参数校验失败（名称空/资金≤0 等）返回 code!==0 → 拦截器 reject，
@@ -1189,6 +1193,10 @@ const editForm = ref({
   capital_pool_mode: 'off' as 'off' | 'equal' | 'risk_budget' | 'priority',
   capital_pool_rebalance_enabled: false,
   gate_recheck_on_execute: false,
+  // G2：盘前参数会话级覆盖（null / '' = 跟随全局）
+  pre_open_auction_enabled: null as boolean | null,
+  pre_open_auction_end_time: '',
+  pre_open_auction_price_bias_pct: null as number | string | null,
   portfolio_ids: [] as number[],
 })
 const editHealth = ref<LiveSessionChannelHealth | null>(null)
@@ -1215,6 +1223,10 @@ function openEdit(s: LiveSessionItem) {
     capital_pool_mode: (s.capital_pool_mode || 'off') as 'off' | 'equal' | 'risk_budget' | 'priority',
     capital_pool_rebalance_enabled: !!s.capital_pool_rebalance_enabled,
     gate_recheck_on_execute: !!s.gate_recheck_on_execute,
+    // G2：原始三态回填（null=跟随全局）
+    pre_open_auction_enabled: s.pre_open_auction_enabled ?? null,
+    pre_open_auction_end_time: s.pre_open_auction_end_time || '',
+    pre_open_auction_price_bias_pct: s.pre_open_auction_price_bias_pct ?? null,
     portfolio_ids: [...(s.portfolio_ids || [])],
   }
   loadEditHealth(s.id)
@@ -1250,6 +1262,13 @@ async function submitEdit() {
       capital_pool_mode: editForm.value.capital_pool_mode,
       capital_pool_rebalance_enabled: editForm.value.capital_pool_rebalance_enabled,
       gate_recheck_on_execute: editForm.value.gate_recheck_on_execute,
+      // G2：空串/null = 清除覆盖（跟随全局）
+      pre_open_auction_enabled: editForm.value.pre_open_auction_enabled,
+      pre_open_auction_end_time: editForm.value.pre_open_auction_end_time || null,
+      pre_open_auction_price_bias_pct: (
+        editForm.value.pre_open_auction_price_bias_pct === '' ||
+        editForm.value.pre_open_auction_price_bias_pct === null
+          ? null : Number(editForm.value.pre_open_auction_price_bias_pct)),
       portfolio_ids: editForm.value.portfolio_ids,
     })
     editResult.value = { effective_at: res.effective_at, message: res.message }
@@ -2089,6 +2108,19 @@ onUnmounted(() => {
       <p style="font-size:12px;color:var(--ink-faint);margin:2px 0 12px">
         默认关闭：信号日门控通过即按原决策执行。开启后，顺延次日单与盘前集合竞价单在真正提交前用「执行日前一收盘」的门控状态再判一次；若为空头则直接取消并落决策事件（gate=market_gate_recheck），不拿旧决策硬执行。仅对启用市场门控的组合生效。
       </p>
+      <label>盘前集合竞价参数（会话级覆盖）</label>
+      <select v-model="form.pre_open_auction_enabled" data-field="pre_open_auction_enabled">
+        <option :value="null">跟随全局（默认开启，09:15–09:20 / 让价 2%）</option>
+        <option :value="true">本会话开启</option>
+        <option :value="false">本会话关闭（走次日首根 1m bar 放行）</option>
+      </select>
+      <p style="font-size:12px;color:var(--ink-faint);margin:2px 0 8px">
+        仅覆盖本会话，不改全局 config.yaml。关闭后该会话日线级信号不再报集合竞价，统一等次一交易日首根完成 1m bar（约 09:31）放行。
+      </p>
+      <label>盘前窗口结束时间（HH:MM，留空跟随全局 09:20）</label>
+      <input v-model="form.pre_open_auction_end_time" placeholder="09:20（可选 09:15–09:30）" data-field="pre_open_auction_end_time" />
+      <label>盘前让价 %（留空跟随全局 2%）</label>
+      <input v-model="form.pre_open_auction_price_bias_pct" type="number" step="0.1" min="0" max="10" placeholder="2（0–10）" data-field="pre_open_auction_price_bias_pct" />
       <label>组合策略（可多选）</label>
       <div class="portfolio-check-list">
         <label v-for="p in portfolios" :key="p.id" class="portfolio-check">
@@ -2250,6 +2282,16 @@ onUnmounted(() => {
           <input v-model="editForm.gate_recheck_on_execute" type="checkbox" style="width:auto" data-field="edit-gate-recheck" />
           执行前重判门控（顺延次日单 / 盘前竞价单提交前再判一次，默认关）
         </label>
+        <label>盘前集合竞价参数（会话级覆盖）</label>
+        <select v-model="editForm.pre_open_auction_enabled" data-field="edit-pre-open-enabled">
+          <option :value="null">跟随全局（默认开启，09:15–09:20 / 让价 2%）</option>
+          <option :value="true">本会话开启</option>
+          <option :value="false">本会话关闭（走次日首根 1m bar 放行）</option>
+        </select>
+        <label>盘前窗口结束时间（HH:MM，留空跟随全局）</label>
+        <input v-model="editForm.pre_open_auction_end_time" placeholder="09:20（可选 09:15–09:30）" data-field="edit-pre-open-end-time" />
+        <label>盘前让价 %（留空跟随全局）</label>
+        <input v-model="editForm.pre_open_auction_price_bias_pct" type="number" step="0.1" min="0" max="10" placeholder="2（0–10）" data-field="edit-pre-open-bias" />
         <label>组合策略（可多选，运行中下次启动生效）</label>
         <div class="portfolio-check-list">
           <label v-for="p in portfolios" :key="p.id" class="portfolio-check">

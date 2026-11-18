@@ -1411,6 +1411,9 @@ def build_engine(
     _tq_cfg = load_config().get("tq_trade") or {}
     if not isinstance(_tq_cfg, dict):
         _tq_cfg = {}
+    # G2：会话级盘前参数覆盖（NULL=跟随全局；非空=本会话覆盖）。
+    _pre_open_cfg, _pre_open_overrides = resolve_pre_open_auction_config(
+        session_row, _tq_cfg)
     # 错周期 bar 风控：会话三态 NULL → 跟随全局默认（默认 False，对齐回测）
     if session_mismatch_risk is None:
         session_mismatch_risk = bool(
@@ -1470,9 +1473,13 @@ def build_engine(
         # 行情轮询窗口（config.live.quote_polling）：缺键时引擎侧回落安全默认
         # （交易日 09:15–15:05 之外不轮询，收盘后停对桥/TQ 的行情拉取）
         quote_polling=(load_config().get("live") or {}).get("quote_polling"),
-        # 次日盘前（集合竞价）执行日线级信号单：config.tq_trade.pre_open_auction*
-        # 缺键 → 引擎侧 PreOpenAuctionConfig 默认开启（对齐回测次日开盘执行）
-        pre_open_auction=(_tq_cfg),
+        # 次日盘前（集合竞价）执行日线级信号单：全局 config.tq_trade.pre_open_auction*
+        # + 会话级覆盖（G2）。缺键 → 引擎侧 PreOpenAuctionConfig 默认开启。
+        pre_open_auction=_pre_open_cfg,
+        # G2：来源标记（session=至少一项被会话覆盖），启动时落一条生效事件。
+        pre_open_config_source=(
+            "session" if _pre_open_overrides else "global"),
+        pre_open_config_overrides=tuple(_pre_open_overrides),
         # 错周期 bar 风控（会话三态：NULL=跟随全局默认；0/1=显式覆盖）
         intraday_mismatched_risk_enabled=(
             bool(session_mismatch_risk)
@@ -1532,6 +1539,9 @@ def list_sessions(db: Session, engines: Optional[Dict[int, LiveEngine]] = None) 
         .group_by(LiveSessionPendingChange.live_session_id)
         .all()
     )
+    # G2：全局盘前配置只读一次（避免每个会话重复读文件）
+    _tq_raw = load_config().get("tq_trade") or {}
+    _tq_cfg = _tq_raw if isinstance(_tq_raw, dict) else {}
     return [
         {
             "id": s.id,
@@ -1553,6 +1563,15 @@ def list_sessions(db: Session, engines: Optional[Dict[int, LiveEngine]] = None) 
             # E1：执行前重判门控（默认关）
             "gate_recheck_on_execute": bool(
                 getattr(s, "gate_recheck_on_execute", False)),
+            # G2：盘前参数会话级覆盖（原始三态）+ 生效值（含来源）
+            "pre_open_auction_enabled": getattr(
+                s, "pre_open_auction_enabled", None),
+            "pre_open_auction_end_time": getattr(
+                s, "pre_open_auction_end_time", None),
+            "pre_open_auction_price_bias_pct": (
+                None if getattr(s, "pre_open_auction_price_bias_pct", None) is None
+                else float(s.pre_open_auction_price_bias_pct)),
+            "pre_open_auction_effective": pre_open_auction_effective(s, _tq_cfg),
             # A1 资金池：列表回显，编辑弹窗据此预填
             "capital_pool_mode": getattr(s, "capital_pool_mode", None) or "off",
             "capital_pool_rebalance_enabled": bool(
@@ -1637,6 +1656,121 @@ def recover_stale_running_live_sessions(
     return len(stale)
 
 
+# ---- G2 盘前集合竞价参数会话级覆盖（2026-11-18）----
+# 三列均可空：NULL = 跟随 config.tq_trade.pre_open_auction_* 全局值；
+# 非空 = 本会话显式覆盖。仅作用于本会话，不改全局配置。
+_PRE_OPEN_OVERRIDE_FIELDS = (
+    "pre_open_auction_enabled",
+    "pre_open_auction_end_time",
+    "pre_open_auction_price_bias_pct",
+)
+
+
+def _normalize_pre_open_end_time(value) -> Optional[str]:
+    """HH:MM → 规范化文本；仅接受 09:15–09:30（窗口起点固定 09:15）。"""
+    text = str(value or "").strip()
+    try:
+        hh, mm = text.split(":", 1)
+        h, m = int(hh), int(mm)
+    except (TypeError, ValueError):
+        return None
+    if not (0 <= h <= 23 and 0 <= m <= 59):
+        return None
+    if (h, m) < (9, 15) or (h, m) > (9, 30):
+        return None
+    return "%02d:%02d" % (h, m)
+
+
+def normalize_pre_open_overrides(data: dict):
+    """G2：校验三个覆盖字段；返回 (patch, (status, message) | None)。
+
+    缺键 = 不改；显式 null = 清除覆盖（跟随全局）。
+    """
+    patch: dict = {}
+    if "pre_open_auction_enabled" in data:
+        raw = data.get("pre_open_auction_enabled")
+        if raw is None:
+            patch["pre_open_auction_enabled"] = None
+        elif isinstance(raw, bool):
+            patch["pre_open_auction_enabled"] = raw
+        elif isinstance(raw, int) and raw in (0, 1):
+            patch["pre_open_auction_enabled"] = bool(raw)
+        else:
+            return None, (
+                400, "pre_open_auction_enabled 仅支持 null / true / false")
+    if "pre_open_auction_end_time" in data:
+        raw = data.get("pre_open_auction_end_time")
+        if raw is None or str(raw).strip() == "":
+            patch["pre_open_auction_end_time"] = None
+        else:
+            text = _normalize_pre_open_end_time(raw)
+            if text is None:
+                return None, (
+                    400, "pre_open_auction_end_time 须为 09:15–09:30 的 HH:MM")
+            patch["pre_open_auction_end_time"] = text
+    if "pre_open_auction_price_bias_pct" in data:
+        raw = data.get("pre_open_auction_price_bias_pct")
+        if raw is None:
+            patch["pre_open_auction_price_bias_pct"] = None
+        else:
+            try:
+                bias = float(raw)
+            except (TypeError, ValueError):
+                return None, (
+                    400, "pre_open_auction_price_bias_pct 须为 0–10 的数字")
+            if not (0 <= bias <= 10):
+                return None, (
+                    400, "pre_open_auction_price_bias_pct 须在 0–10 之间")
+            patch["pre_open_auction_price_bias_pct"] = (
+                Decimal(str(bias)).quantize(Decimal("0.000001")))
+    return patch, None
+
+
+def resolve_pre_open_auction_config(session_row, tq_cfg: dict) -> tuple:
+    """G2：全局 tq_trade 配置 + 会话非 NULL 覆盖 → (effective, overrides)。
+
+    overrides 只含被会话覆盖的字段名，供启动事件/前端说明「哪些值是会话级」。
+    """
+    cfg = dict(tq_cfg) if isinstance(tq_cfg, dict) else {}
+    overrides: List[str] = []
+    if session_row is not None:
+        enabled = getattr(session_row, "pre_open_auction_enabled", None)
+        if enabled is not None:
+            cfg["pre_open_auction_enabled"] = bool(enabled)
+            overrides.append("enabled")
+        end_time = getattr(session_row, "pre_open_auction_end_time", None)
+        if end_time:
+            cfg["pre_open_auction_end_time"] = str(end_time)
+            overrides.append("end_time")
+        bias = getattr(session_row, "pre_open_auction_price_bias_pct", None)
+        if bias is not None:
+            cfg["pre_open_auction_price_bias_pct"] = float(bias)
+            overrides.append("price_bias_pct")
+    return cfg, overrides
+
+
+def pre_open_auction_effective(session_row, tq_cfg: Optional[dict] = None) -> dict:
+    """G2：会话详情回显的生效盘前配置（含来源标记）。
+
+    source=session 表示至少一项被会话覆盖；global 表示全部跟随全局。
+    """
+    if tq_cfg is None:
+        raw = load_config().get("tq_trade") or {}
+        tq_cfg = raw if isinstance(raw, dict) else {}
+    cfg, overrides = resolve_pre_open_auction_config(session_row, tq_cfg)
+    default = {"enabled": True, "end_time": "09:20", "price_bias_pct": 2.0}
+    return {
+        "enabled": bool(cfg.get("pre_open_auction_enabled", default["enabled"])),
+        "end_time": str(cfg.get("pre_open_auction_end_time")
+                        or default["end_time"]),
+        "price_bias_pct": float(cfg.get("pre_open_auction_price_bias_pct")
+                                if cfg.get("pre_open_auction_price_bias_pct")
+                                is not None else default["price_bias_pct"]),
+        "source": "session" if overrides else "global",
+        "overrides": overrides,
+    }
+
+
 def normalize_advance_close(data: dict) -> tuple:
     """14:50 提前收盘价配置归一：开关默认 False；时点默认 14:51，限定 14:51–14:59。
 
@@ -1681,6 +1815,8 @@ def create_session(db: Session, data: dict, mode: str) -> dict:
     if signal_file_path is not None:
         signal_file_path = str(signal_file_path).strip() or None
     advance_close_enabled, advance_close_time = normalize_advance_close(data)
+    # G2：盘前参数会话级覆盖（非法值由 API 层 400；服务层只取合法键）
+    pre_open_patch, _ = normalize_pre_open_overrides(data)
     # 资金基准（2026-11-16）：live_capital 语义 = 实盘资金基准（真实总资产口径）。
     # baseline_mode：total_asset=起账即用真实总资产（默认）/ manual=显式填写；
     # 兼容旧叫法 adopt_actual（统一映射到 total_asset），不出现两套口径。
@@ -1728,6 +1864,13 @@ def create_session(db: Session, data: dict, mode: str) -> dict:
             data.get("intraday_mismatched_risk_enabled")),
         # E1：执行前重判门控（默认关）
         gate_recheck_on_execute=bool(data.get("gate_recheck_on_execute")),
+        # G2：盘前参数会话级覆盖（NULL=跟随全局）
+        pre_open_auction_enabled=pre_open_patch.get(
+            "pre_open_auction_enabled"),
+        pre_open_auction_end_time=pre_open_patch.get(
+            "pre_open_auction_end_time"),
+        pre_open_auction_price_bias_pct=pre_open_patch.get(
+            "pre_open_auction_price_bias_pct"),
         backtest_record_id=backtest_record_id,
     )
     db.add(session)
@@ -1746,6 +1889,13 @@ def create_session(db: Session, data: dict, mode: str) -> dict:
             "capital_pool_rebalance_enabled": pool_rebalance,
             "gate_recheck_on_execute": bool(
                 session.gate_recheck_on_execute),
+            # G2：盘前参数（原始三态 + 生效值）
+            "pre_open_auction_enabled": session.pre_open_auction_enabled,
+            "pre_open_auction_end_time": session.pre_open_auction_end_time,
+            "pre_open_auction_price_bias_pct": (
+                None if session.pre_open_auction_price_bias_pct is None
+                else float(session.pre_open_auction_price_bias_pct)),
+            "pre_open_auction_effective": pre_open_auction_effective(session),
             "warnings": _engine_occupancy_warnings(db, session)}
 
 
@@ -1807,6 +1957,15 @@ def get_session(db: Session, session_id: int, engine: Optional[LiveEngine] = Non
         # E1：执行前重判门控（默认关）
         "gate_recheck_on_execute": bool(
             getattr(session, "gate_recheck_on_execute", False)),
+        # G2：盘前参数会话级覆盖（原始三态）+ 生效值（含来源）
+        "pre_open_auction_enabled": getattr(
+            session, "pre_open_auction_enabled", None),
+        "pre_open_auction_end_time": getattr(
+            session, "pre_open_auction_end_time", None),
+        "pre_open_auction_price_bias_pct": (
+            None if getattr(session, "pre_open_auction_price_bias_pct", None)
+            is None else float(session.pre_open_auction_price_bias_pct)),
+        "pre_open_auction_effective": pre_open_auction_effective(session),
         "status": session.status,
         "started_at": session.started_at,
         "stopped_at": session.stopped_at,
@@ -1878,6 +2037,9 @@ SESSION_EDIT_FIELDS = (
     "intraday_mismatched_risk_enabled", "capital_pool_mode",
     "capital_pool_rebalance_enabled", "portfolio_ids",
     "gate_recheck_on_execute",
+    # G2：盘前参数会话级覆盖（NULL=跟随全局）
+    "pre_open_auction_enabled", "pre_open_auction_end_time",
+    "pre_open_auction_price_bias_pct",
 )
 #: 运行中只能「下次启动生效」的字段（name 为纯展示字段，立即生效）。
 SESSION_NEXT_START_FIELDS = frozenset(SESSION_EDIT_FIELDS) - {"name"}
@@ -1968,6 +2130,13 @@ def _normalize_session_patch(db: Session, data: dict,
         else:
             return None, (
                 400, "intraday_mismatched_risk_enabled 仅支持 null / true / false")
+    if "pre_open_auction_enabled" in data or \
+            "pre_open_auction_end_time" in data or \
+            "pre_open_auction_price_bias_pct" in data:
+        pre_open_patch, pre_open_error = normalize_pre_open_overrides(data)
+        if pre_open_error:
+            return None, pre_open_error
+        patch.update(pre_open_patch)
     if "capital_pool_mode" in data:
         mode = str(data.get("capital_pool_mode") or "off").strip()
         if mode not in ("off", "equal", "risk_budget", "priority"):

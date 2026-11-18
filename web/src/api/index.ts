@@ -1929,6 +1929,18 @@ export interface LiveSessionItem {
   split_remainder_count?: number
   // E1 执行前重判门控（默认关）：顺延次日单/盘前竞价单提交前再判一次
   gate_recheck_on_execute?: boolean
+  // G2 盘前参数会话级覆盖（原始三态，null=跟随全局）
+  pre_open_auction_enabled?: boolean | null
+  pre_open_auction_end_time?: string | null
+  pre_open_auction_price_bias_pct?: number | null
+  // 生效值（含来源 source=session|global 与被覆盖字段清单）
+  pre_open_auction_effective?: {
+    enabled: boolean
+    end_time: string
+    price_bias_pct: number
+    source: 'session' | 'global'
+    overrides: string[]
+  }
 }
 
 // H2 拆单剩余量（停会话时未提交的子单快照）
@@ -1998,6 +2010,10 @@ export interface LiveSessionCreate {
   intraday_mismatched_risk_enabled?: boolean | null
   // E1 执行前重判门控（默认关）
   gate_recheck_on_execute?: boolean
+  // G2 盘前参数会话级覆盖：null=跟随全局；显式值=本会话覆盖
+  pre_open_auction_enabled?: boolean | null
+  pre_open_auction_end_time?: string | null
+  pre_open_auction_price_bias_pct?: number | null
 }
 
 /** 真实总资产预览（GET /live/account-preview）：只读；通道未就绪时后端 503。 */
