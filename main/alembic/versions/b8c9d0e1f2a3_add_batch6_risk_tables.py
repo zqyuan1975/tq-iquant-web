@@ -60,6 +60,7 @@ def upgrade() -> None:
                   sa.ForeignKey("live_sessions.id", ondelete="CASCADE"),
                   nullable=False),
         sa.Column("portfolio_strategy_id", sa.Integer(), nullable=True),
+        sa.Column("strategy_id", sa.Integer(), nullable=True),
         sa.Column("field", sa.String(length=64), nullable=False),
         sa.Column("old_value", sa.String(length=64), nullable=True),
         sa.Column("new_value", sa.String(length=64), nullable=True),

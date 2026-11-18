@@ -409,6 +409,37 @@ def portfolio_daily(session_id: int, days: int = 30,
     return ok(rows)
 
 
+@router.get("/sessions/{session_id}/pending-changes")
+def list_pending_changes(session_id: int, db: Session = Depends(get_db)):
+    """D3：风控参数待生效队列（运行中变更在此排队，下次启动生效）。"""
+    rows = svc.list_pending_changes(db, session_id)
+    if rows is None:
+        return err(404, "资源不存在")
+    return ok(rows)
+
+
+@router.post("/sessions/{session_id}/pending-changes")
+def create_pending_change(session_id: int, data: Optional[dict] = None,
+                          db: Session = Depends(get_db)):
+    """D3：提交一条风控参数变更（运行中→入队；未运行→立即生效并留审计）。"""
+    ok_flag, result = svc.enqueue_pending_change(
+        db, session_id, data or {}, _ENGINES)
+    if not ok_flag:
+        return err(result[0], result[1])
+    return ok(result)
+
+
+@router.delete("/sessions/{session_id}/pending-changes/{change_id}")
+def delete_pending_change(session_id: int, change_id: int,
+                          db: Session = Depends(get_db)):
+    """D3：放弃一条 pending 变更（不改参数，保留审计）。"""
+    ok_flag, result = svc.discard_pending_change(
+        db, session_id, change_id, _ENGINES)
+    if not ok_flag:
+        return err(result[0], result[1])
+    return ok(result)
+
+
 @router.get("/sessions/{session_id}/params-drift")
 def session_params_drift(session_id: int, db: Session = Depends(get_db)):
     """H2 参数漂移（A7）：绑定回测记录时返回当前参数与 params_snapshot 的差异。

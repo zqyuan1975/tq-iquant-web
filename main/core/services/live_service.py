@@ -41,6 +41,7 @@ from core.models import (
     LiveManualAction, LiveReconciliationDiff, LiveReconciliationReport,
     LiveOutOfPoolDecision, LiveCorporateAction,
     LivePortfolioDaily,
+    LiveSessionPendingChange,
     IncrementalBacktestCheckpoint, BacktestRecord,
 )
 from core.engine.portfolio_builder import assemble_portfolio
@@ -3084,6 +3085,14 @@ def start_session(
     if session_id in engines:
         # 幂等：已在跑，直接返回（无 engine 新建，路由据此返回 ok running）
         return None, session, None
+    # D3（2026-11-18）：建引擎前应用本会话待生效风控参数变更。
+    # 无 pending 时行为与改动前逐字一致；应用失败不阻断启动（只告警）。
+    try:
+        apply_pending_changes(db, session_id)
+    except Exception:  # noqa: BLE001
+        logger.warning(
+            "apply_pending_changes failed before start (session %s)",
+            session_id, exc_info=True)
     # A1 运行中会话总量硬上限（显式常量，不用「四引擎各一」隐式推论）：
     # 本会话之外已有 MAX_ACTIVE_LIVE_SESSIONS 个占用 → 409。
     occupied = _occupied_sessions(db, engines, session_id)
@@ -3805,6 +3814,203 @@ def _loads_or_none(raw):
         return json.loads(raw)
     except (TypeError, ValueError):
         return None
+
+
+# ---------------------------------------------------------------------------
+# D3 待生效变更队列（2026-11-18）
+# ---------------------------------------------------------------------------
+# 组合级参数落在 portfolio_strategies；策略级风控参数落在 strategies。
+PENDING_PORTFOLIO_FIELDS = ("max_drawdown", "daily_loss_limit")
+PENDING_STRATEGY_FIELDS = ("stop_loss_ratio", "take_profit_ratio",
+                           "trailing_stop_ratio")
+
+
+def _pending_target(db: Session, session_id: int, portfolio_id: int,
+                    strategy_id: Optional[int], field: str):
+    """解析变更目标对象；返回 (obj, error)。"""
+    if field not in PENDING_PORTFOLIO_FIELDS + PENDING_STRATEGY_FIELDS:
+        return None, (400, "不支持的风控字段：%s" % field)
+    link = db.query(LiveSessionPortfolio).filter_by(
+        session_id=session_id, portfolio_strategy_id=portfolio_id).first()
+    if link is None:
+        return None, (404, "该组合不在此 session 中")
+    if field in PENDING_PORTFOLIO_FIELDS:
+        obj = db.query(PortfolioStrategy).filter_by(id=portfolio_id).first()
+        if obj is None:
+            return None, (404, "组合不存在")
+        return obj, None
+    if strategy_id is None:
+        return None, (400, "策略级字段需提供 strategy_id")
+    obj = db.query(Strategy).filter_by(
+        id=int(strategy_id), portfolio_id=portfolio_id).first()
+    if obj is None:
+        return None, (404, "该策略不在此组合中")
+    return obj, None
+
+
+def _pending_ratio(raw):
+    try:
+        value = Decimal(str(raw))
+    except Exception:  # noqa: BLE001
+        return None, (400, "value 非法")
+    if not (Decimal("0") <= value <= Decimal("1")):
+        return None, (400, "value 需在 [0, 1] 区间")
+    return value, None
+
+
+def list_pending_changes(db: Session, session_id: int):
+    """D3：待生效队列（含已应用/已放弃近 100 条）；会话不存在返回 None。"""
+    exists = db.query(LiveSession.id).filter(LiveSession.id == session_id).first()
+    if exists is None:
+        return None
+    rows = (
+        db.query(LiveSessionPendingChange)
+        .filter(LiveSessionPendingChange.live_session_id == session_id)
+        .order_by(LiveSessionPendingChange.id.desc())
+        .limit(100)
+        .all()
+    )
+    return [{
+        "id": row.id,
+        "portfolio_strategy_id": row.portfolio_strategy_id,
+        "strategy_id": row.strategy_id,
+        "field": row.field,
+        "old_value": row.old_value,
+        "new_value": row.new_value,
+        "status": row.status,
+        "note": row.note,
+        "created_at": _iso_utc(row.created_at),
+        "applied_at": _iso_utc(row.applied_at),
+    } for row in rows]
+
+
+def enqueue_pending_change(db: Session, session_id: int, payload: dict,
+                           engines: Dict[int, LiveEngine]):
+    """入队/立即应用一条风控参数变更；返回 (ok, data_or_error)。"""
+    session = db.query(LiveSession).filter(LiveSession.id == session_id).first()
+    if session is None:
+        return False, (404, "资源不存在")
+    try:
+        portfolio_id = int(payload.get("portfolio_strategy_id"))
+    except (TypeError, ValueError):
+        return False, (400, "portfolio_strategy_id 非法")
+    field = str(payload.get("field") or "").strip()
+    strategy_id = payload.get("strategy_id")
+    if strategy_id is not None:
+        try:
+            strategy_id = int(strategy_id)
+        except (TypeError, ValueError):
+            return False, (400, "strategy_id 非法")
+    value, error = _pending_ratio(payload.get("value"))
+    if error:
+        return False, error
+    target, error = _pending_target(
+        db, session_id, portfolio_id, strategy_id, field)
+    if error:
+        return False, error
+    old_value = getattr(target, field, None)
+    note = payload.get("note")
+    running = (session_id in engines
+               or session.status in ("running", "stopping"))
+    if running:
+        query = db.query(LiveSessionPendingChange).filter(
+            LiveSessionPendingChange.live_session_id == session_id,
+            LiveSessionPendingChange.portfolio_strategy_id == portfolio_id,
+            LiveSessionPendingChange.field == field,
+            LiveSessionPendingChange.status == "pending",
+        )
+        query = (query.filter(LiveSessionPendingChange.strategy_id == strategy_id)
+                 if strategy_id is not None
+                 else query.filter(LiveSessionPendingChange.strategy_id.is_(None)))
+        row = query.first()
+        if row is None:
+            row = LiveSessionPendingChange(
+                live_session_id=session_id,
+                portfolio_strategy_id=portfolio_id,
+                strategy_id=strategy_id, field=field,
+            )
+            db.add(row)
+        row.old_value = None if old_value is None else str(old_value)
+        row.new_value = str(value)
+        row.note = note
+        row.status = "pending"
+        row.applied_at = None
+        db.commit()
+        return True, {
+            "id": row.id, "field": field, "old_value": row.old_value,
+            "new_value": row.new_value, "status": "pending",
+            "effective_at": "next_start",
+            "message": "会话运行中：已加入待生效队列，下次启动生效",
+        }
+    # 未运行：立即应用并留一条 applied 审计
+    setattr(target, field, value)
+    row = LiveSessionPendingChange(
+        live_session_id=session_id, portfolio_strategy_id=portfolio_id,
+        strategy_id=strategy_id, field=field,
+        old_value=None if old_value is None else str(old_value),
+        new_value=str(value), note=note, status="applied",
+        applied_at=datetime.now(),
+    )
+    db.add(row)
+    db.commit()
+    logger.info("pending change applied immediately (session %s, %s=%s)",
+                session_id, field, value)
+    return True, {
+        "id": row.id, "field": field,
+        "old_value": row.old_value, "new_value": row.new_value,
+        "status": "applied", "effective_at": "now",
+        "message": "会话未运行：已立即生效",
+    }
+
+
+def discard_pending_change(db: Session, session_id: int, change_id: int,
+                           engines: Dict[int, LiveEngine]):
+    """放弃一条 pending 变更（不改参数，保留审计）。"""
+    row = db.query(LiveSessionPendingChange).filter_by(
+        id=change_id, live_session_id=session_id).first()
+    if row is None:
+        return False, (404, "资源不存在")
+    if row.status != "pending":
+        return False, (400, "仅 pending 状态可放弃")
+    row.status = "discarded"
+    db.commit()
+    return True, {"id": row.id, "status": "discarded"}
+
+
+def apply_pending_changes(db: Session, session_id: int) -> int:
+    """启动建引擎前应用本会话全部 pending 变更；返回应用条数。"""
+    rows = (
+        db.query(LiveSessionPendingChange)
+        .filter(LiveSessionPendingChange.live_session_id == session_id,
+                LiveSessionPendingChange.status == "pending")
+        .order_by(LiveSessionPendingChange.id.asc())
+        .all()
+    )
+    applied = 0
+    for row in rows:
+        target, error = _pending_target(
+            db, session_id, row.portfolio_strategy_id,
+            row.strategy_id, row.field)
+        if error or row.new_value is None:
+            row.status = "discarded"
+            logger.warning(
+                "pending change discarded (session %s id=%s field=%s): %s",
+                session_id, row.id, row.field, error)
+            continue
+        try:
+            value = Decimal(str(row.new_value))
+        except Exception:  # noqa: BLE001
+            row.status = "discarded"
+            continue
+        setattr(target, row.field, value)
+        row.status = "applied"
+        row.applied_at = datetime.now()
+        applied += 1
+    db.commit()
+    if applied:
+        logger.info("pending changes applied before start (session %s): %d",
+                    session_id, applied)
+    return applied
 
 
 def bridge_status(session_id: int, status: str, engine: Optional[LiveEngine]) -> dict:

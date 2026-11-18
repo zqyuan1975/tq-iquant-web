@@ -23,6 +23,8 @@ class LiveSessionPendingChange(Base):
         nullable=False, index=True,
     )
     portfolio_strategy_id = Column(Integer, nullable=True, index=True)
+    # 策略级字段（stop_loss_ratio 等）的目标策略；组合级字段为 NULL
+    strategy_id = Column(Integer, nullable=True)
     field = Column(String(64), nullable=False)
     old_value = Column(String(64), nullable=True)
     new_value = Column(String(64), nullable=True)
