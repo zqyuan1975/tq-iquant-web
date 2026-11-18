@@ -1480,6 +1480,11 @@ def build_engine(
         pre_open_config_source=(
             "session" if _pre_open_overrides else "global"),
         pre_open_config_overrides=tuple(_pre_open_overrides),
+        # G3：顺延单积压告警阈值（0=关闭；默认全关）
+        deferred_backlog_warn_count=int(
+            _tq_cfg.get("deferred_backlog_warn_count") or 0),
+        deferred_backlog_warn_days=int(
+            _tq_cfg.get("deferred_backlog_warn_days") or 0),
         # 错周期 bar 风控（会话三态：NULL=跟随全局默认；0/1=显式覆盖）
         intraday_mismatched_risk_enabled=(
             bool(session_mismatch_risk)

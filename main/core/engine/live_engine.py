@@ -669,6 +669,10 @@ class LiveEngine:
         # 启动时落一条 gate=pre_open_auction_config/action=effective 决策事件。
         pre_open_config_source: str = "global",
         pre_open_config_overrides: Tuple[str, ...] = (),
+        # G3（2026-11-18）：顺延单积压告警阈值，0=关闭；按数量/交易日年龄
+        # 每交易日每规则最多一条 risk 事件 + 一次外发通知。
+        deferred_backlog_warn_count: int = 0,
+        deferred_backlog_warn_days: int = 0,
         # 错周期 bar 是否跑风控（会话级三态已在 live_service 解析为布尔）：
         # False（默认，对齐回测）→ 错周期 bar 只更新价格快照、不跑风控；
         # True → 旧行为（任何 bar 都按 close 评估持仓风险）。
@@ -707,6 +711,12 @@ class LiveEngine:
         self._pre_open_config_overrides = tuple(pre_open_config_overrides or ())
         # G2：盘前生效配置只公告一次（start 时）
         self._pre_open_config_announced = False
+        # G3：顺延单积压告警（0=关闭）+ 每交易日每规则去重标记
+        self._deferred_backlog_warn_count = max(
+            int(deferred_backlog_warn_count or 0), 0)
+        self._deferred_backlog_warn_days = max(
+            int(deferred_backlog_warn_days or 0), 0)
+        self._deferred_backlog_warned: set = set()
         # 错周期 bar 风控（False=只更新价格快照，对齐回测）
         self._intraday_mismatched_risk = bool(intraday_mismatched_risk_enabled)
         # 09:31 deferred 兜底放行定价：False=首根 1m open 限价；True=对手价保成交
@@ -2273,6 +2283,8 @@ class LiveEngine:
             # 之前——09:15 一开窗就把昨日 deferred 日线单报进集合竞价。关闭时
             # 方法首行 return，队列/DB/价格/事件一律不动（旧行为逐字不变）。
             self._maybe_pre_open_auction(now)
+            # G3：顺延单积压告警（默认关闭；每交易日每规则最多一条）
+            self._check_deferred_backlog(now)
             # poll() 内部对每根完成的 bar 触发 self._on_bar 回调
             # 行情轮询窗口（收盘后停拉行情）：窗口外（交易日 15:05 后 / 次日 09:15 前 /
             # 非交易日）整轮不拉行情、不注入外部信号——这是收盘后对掘金桥 /quote
@@ -2584,6 +2596,79 @@ class LiveEngine:
             "source": self._pre_open_config_source,
             "overrides": list(self._pre_open_config_overrides),
         })
+
+    def _trading_day_age(self, start: date, end: date) -> int:
+        """start（不含）到 end（含）之间的交易日数，最多统计 30 天。"""
+        if start >= end:
+            return 0
+        age = 0
+        cursor = start
+        while cursor < end and age < 30:
+            cursor += timedelta(days=1)
+            try:
+                if self._calendar.is_trading_day(cursor):
+                    age += 1
+            except Exception:  # noqa: BLE001 — 日历异常按自然日兜底
+                age += 1
+        return age
+
+    def _check_deferred_backlog(self, now: datetime) -> None:
+        """G3：顺延队列积压告警（数量 / 交易日年龄），默认全关。
+
+        两个阈值任一 >0 才生效；每交易日每规则最多一条 risk 事件并外发一次，
+        去重键 (交易日, rule) 仅保存在进程内（重启后当天会重新提醒一次）。
+        """
+        if (self._deferred_backlog_warn_count <= 0
+                and self._deferred_backlog_warn_days <= 0):
+            return
+        queue = list(self._signal_bar_deferred)
+        if not queue:
+            return
+        today = now.date()
+        oldest = min(
+            (getattr(o, "bar_time", now) or now).date() for o in queue)
+
+        def _warn(rule: str, text: str, **extra) -> None:
+            key = (today, rule)
+            if key in self._deferred_backlog_warned:
+                return
+            self._deferred_backlog_warned.add(key)
+            payload = {
+                "session_id": self.session_id,
+                "engine": self._engine_key,
+                "gate": "deferred_backlog",
+                "action": "warn",
+                "rule": rule,
+                "count": len(queue),
+                "oldest_signal_date": oldest.isoformat(),
+            }
+            payload.update(extra)
+            self._emit("risk", payload)
+            try:
+                notify("warn", "顺延单积压", text,
+                       gate="deferred_backlog", trade_date=today)
+            except Exception:  # noqa: BLE001 — 通知失败不影响主链路
+                logger.debug("deferred backlog notify failed", exc_info=True)
+
+        if (self._deferred_backlog_warn_count > 0
+                and len(queue) >= self._deferred_backlog_warn_count):
+            _warn(
+                "count",
+                "顺延委托 %d 笔，已达阈值 %d；请在工作台「待放行委托」处理。"
+                % (len(queue), self._deferred_backlog_warn_count),
+                threshold=self._deferred_backlog_warn_count,
+            )
+        age = self._trading_day_age(oldest, today)
+        if (self._deferred_backlog_warn_days > 0
+                and age > self._deferred_backlog_warn_days):
+            _warn(
+                "age",
+                "最早顺延委托已积压 %d 个交易日（信号日 %s，阈值 %d）；"
+                "请在工作台「待放行委托」处理。"
+                % (age, oldest.isoformat(), self._deferred_backlog_warn_days),
+                age_trading_days=age,
+                threshold=self._deferred_backlog_warn_days,
+            )
 
     def _pre_open_release(self, portfolio: Portfolio, now: datetime) -> None:
         """单组合的盘前放行：摘单 → 定价 → 批量资金分配 → 逐单提交 → 未报出回队。"""

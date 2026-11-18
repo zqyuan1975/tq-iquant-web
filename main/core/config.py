@@ -285,6 +285,12 @@ def _defaults() -> dict:
             # 不推到涨停价/跌停价：集合竞价按统一开盘价成交，限价只作上限；
             # 但未成交的余量会以该限价挂在连续竞价簿上，推到涨跌停等于全天追价。
             "pre_open_auction_price_bias_pct": 2.0,
+            # G3（2026-11-18）顺延单积压告警：待放行委托数量达到该值即告警，
+            # 0=关闭（默认）。每交易日最多一条 risk 事件 + 一次外发通知。
+            "deferred_backlog_warn_count": 0,
+            # G3：最早一笔顺延单的「交易日年龄」超过该值即告警，0=关闭（默认）。
+            # 与数量阈值相互独立，可同时开启（各自去重）。
+            "deferred_backlog_warn_days": 0,
             # 卖出范围口径（止损/止盈/移动止损与 SELL/REDUCE/CLOSE 公式卖单）：
             #   full          （默认）按整仓卖出——与改动前逐字一致，行为零变化
             #   platform_only 只卖平台自己买入的股数（Position.platform_quantity）；
