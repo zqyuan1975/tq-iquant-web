@@ -32,7 +32,6 @@ const DEFAULTS: SystemConfig = {
     enabled: false,
     window_title: '网上股票交易系统5.0',
     client_exe_path: '',
-    driver: 'clipboard',
     captcha_ocr: false,
     execute_mode: 'file_builtin',
     execute_interval_seconds: 5,
@@ -102,7 +101,6 @@ onMounted(async () => {
         enabled: data.ths_ui?.enabled ?? DEFAULTS.ths_ui.enabled,
         window_title: data.ths_ui?.window_title ?? DEFAULTS.ths_ui.window_title,
         client_exe_path: data.ths_ui?.client_exe_path ?? DEFAULTS.ths_ui.client_exe_path,
-        driver: data.ths_ui?.driver ?? DEFAULTS.ths_ui.driver,
         captcha_ocr: data.ths_ui?.captcha_ocr ?? DEFAULTS.ths_ui.captcha_ocr,
         execute_mode: data.ths_ui?.execute_mode ?? DEFAULTS.ths_ui.execute_mode,
         execute_interval_seconds:
@@ -300,10 +298,6 @@ function testTdx() { return testChannel('tdx_tq') }
               <input v-model="config.ths_ui.window_title" placeholder="网上股票交易系统5.0" />
             </div>
             <div class="field">
-              <label>表格读取方式</label>
-              <input v-model="config.ths_ui.driver" placeholder="clipboard" />
-            </div>
-            <div class="field">
               <label style="display:flex;align-items:center;gap:8px;cursor:pointer">
                 <input v-model="config.ths_ui.captcha_ocr" type="checkbox" style="width:auto" />
                 启用验证码 OCR（使用 Windows 内置 OCR，默认关闭）
@@ -457,6 +451,7 @@ function testTdx() { return testChannel('tdx_tq') }
             <div class="field">
               <label>数据库文件路径</label>
               <input v-model="config.database.sqlite_path" placeholder="data/dev.db" />
+              <p class="cfg-hint">修改后需重启后端进程生效（数据库连接在进程启动时建立）</p>
             </div>
           </section>
 

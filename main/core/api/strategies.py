@@ -142,6 +142,10 @@ class PortfolioCreate(BaseModel):
     cash_enhance_position_ratio_threshold: float | None = None
     # W3 容量上限（可选，默认 None）：dynamic 仓位资金封顶，超净值部分闲置（撤回/封盘）
     equity_cap: float | None = None
+    # 实盘风控闸（仅实盘生效，回测不读）：None=不限制；按「买入后该票市值 ÷ 总资产」
+    # 「买入后剩余现金 ÷ 总资产」判定，实盘 LiveEngine 从列读取
+    max_single_position_pct: float | None = None
+    min_cash_reserve_pct: float | None = None
     status: str = "active"
     strategies: list[StrategyItem] = []
 
@@ -305,6 +309,11 @@ def _validate_portfolio(req: PortfolioCreate, db: Session) -> str | None:
         )
     if req.equity_cap is not None and req.equity_cap <= 0:
         return f"equity_cap 必须 > 0（None=不设上限），收到 {req.equity_cap}"
+    # 实盘单票上限 / 现金下限：None/0=不限制；显式值须在 [0,1]
+    for _k in ("max_single_position_pct", "min_cash_reserve_pct"):
+        _v = getattr(req, _k, None)
+        if _v is not None and not (0 <= _v <= 1):
+            return f"{_k} 必须在 [0,1]（None/0=不限制），收到 {_v}"
     # 风控冷静期：0=关闭；上限 60 交易日（约 3 个月，超长冷却意味着该 sign 永久失效）
     if req.risk_cooldown_days is not None and not (0 <= req.risk_cooldown_days <= 60):
         return (f"risk_cooldown_days 须在 [0,60]（0=关闭），"

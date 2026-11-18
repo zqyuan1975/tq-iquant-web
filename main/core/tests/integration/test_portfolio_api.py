@@ -205,6 +205,57 @@ def test_create_portfolio_with_strategies(client):
     db.close()
 
 
+def test_create_portfolio_persists_live_position_limits(client):
+    """单票上限/现金下限必须真正落库（曾因后端 schema 缺字段被 pydantic 静默丢弃）。"""
+    c, Session = client
+    db = Session()
+    _seed_pool(db); _seed_formula(db)
+    db.close()
+
+    body = c.post("/api/portfolios", json=_create_payload(
+        max_single_position_pct=0.3, min_cash_reserve_pct=0.05)).json()
+    assert body["code"] == 0
+    data = body["data"]
+    assert data["max_single_position_pct"] == pytest.approx(0.3)
+    assert data["min_cash_reserve_pct"] == pytest.approx(0.05)
+
+    db = Session()
+    row = db.query(PortfolioStrategy).first()
+    assert float(row.max_single_position_pct) == pytest.approx(0.3)
+    assert float(row.min_cash_reserve_pct) == pytest.approx(0.05)
+    db.close()
+
+
+def test_create_portfolio_position_limit_out_of_range_rejected(client):
+    c, Session = client
+    db = Session()
+    _seed_pool(db); _seed_formula(db)
+    db.close()
+
+    body = c.post("/api/portfolios", json=_create_payload(
+        max_single_position_pct=1.5)).json()
+    assert body["code"] != 0
+    assert "max_single_position_pct" in body["message"]
+
+
+def test_update_portfolio_keeps_equity_cap_when_field_omitted(client):
+    """仓位模型切 fixed 时前端不携带 equity_cap，编辑保存不得清空已有上限。"""
+    c, Session = client
+    db = Session()
+    _seed_pool(db); _seed_formula(db)
+    db.close()
+
+    created = c.post("/api/portfolios", json=_create_payload(equity_cap=200000)).json()
+    assert created["code"] == 0
+    pid = created["data"]["id"]
+
+    payload = _create_payload()
+    assert "equity_cap" not in payload  # 模拟 fixed 仓位（字段被 showIf 隐藏）
+    body = c.put(f"/api/portfolios/{pid}", json=payload).json()
+    assert body["code"] == 0
+    assert body["data"]["equity_cap"] == pytest.approx(200000)
+
+
 def test_create_portfolio_pool_not_found(client):
     c, Session = client
     db = Session()

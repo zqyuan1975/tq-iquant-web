@@ -1945,7 +1945,8 @@ export interface ThsUiConfig {
   enabled: boolean
   window_title: string
   client_exe_path: string
-  driver: string
+  /** @deprecated 引擎不使用该配置（UI 自动化固定走键盘/控件读表），界面已移除该项。 */
+  driver?: string
   captcha_ocr: boolean
   execute_mode: string             // file_builtin=文件内置执行器 | direct=直接执行
   execute_interval_seconds: number // 内置执行器轮询指令文件间隔（秒）

@@ -105,6 +105,15 @@ def serialize_portfolio(db: Session, p: PortfolioStrategy) -> dict:
             if p.cash_enhance_position_ratio_threshold is not None else None
         ),
         "equity_cap": (float(p.equity_cap) if p.equity_cap is not None else None),
+        # 实盘单票上限 / 现金下限：NULL=不限制，原样回给前端（百分比由前端换算）
+        "max_single_position_pct": (
+            float(p.max_single_position_pct)
+            if p.max_single_position_pct is not None else None
+        ),
+        "min_cash_reserve_pct": (
+            float(p.min_cash_reserve_pct)
+            if p.min_cash_reserve_pct is not None else None
+        ),
         # 市场多空门控（2026-11-18）：开关 + 通道 + 公式名（NULL 归一成空串给前端）
         "market_gate_enabled": bool(p.market_gate_enabled) if p.market_gate_enabled is not None else False,
         "market_gate_engine": p.market_gate_engine or "python",
@@ -114,6 +123,12 @@ def serialize_portfolio(db: Session, p: PortfolioStrategy) -> dict:
         "updated_at": p.updated_at,
         "strategies": [serialize_strategy(s) for s in subs],
     }
+
+
+def _field_sent(req, name: str) -> bool:
+    """请求是否显式携带该字段（pydantic v2 model_fields_set；假对象按携带处理）。"""
+    fields_set = getattr(req, "model_fields_set", None)
+    return True if fields_set is None else name in fields_set
 
 
 def _apply_portfolio_fields(p: PortfolioStrategy, req) -> None:
@@ -171,8 +186,15 @@ def _apply_portfolio_fields(p: PortfolioStrategy, req) -> None:
     if getattr(req, "cash_enhance_position_ratio_threshold", None) is not None:
         p.cash_enhance_position_ratio_threshold = (
             req.cash_enhance_position_ratio_threshold)
-    # W3 容量上限（可选，None=不设上限）
-    p.equity_cap = getattr(req, "equity_cap", None)
+    # W3 容量上限（可选，None=不设上限）。前端只在「仓位模型=dynamic」时携带该字段，
+    # 切到 fixed 保存时字段缺失——此时必须保留已有值，否则再切回 dynamic 上限已被清空。
+    if _field_sent(req, "equity_cap"):
+        p.equity_cap = getattr(req, "equity_cap", None)
+    # 实盘单票上限 / 现金下限（NULL=不限制）：显式携带才落库，未携带不动；0 归一为 NULL
+    for _k in ("max_single_position_pct", "min_cash_reserve_pct"):
+        if _field_sent(req, _k):
+            _v = getattr(req, _k, None)
+            setattr(p, _k, None if not _v else _v)
     # 市场多空门控（2026-11-18）：None=请求未携带 → 不动已有值（与相邻开关口径一致，
     # 前端隐藏字段不 put 时不会把已有配置清掉）
     if getattr(req, "market_gate_enabled", None) is not None:
