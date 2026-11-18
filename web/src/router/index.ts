@@ -14,6 +14,7 @@ const router = createRouter({
     { path: '/live', name: 'live', component: () => import('../views/LiveSessions.vue') },
     { path: '/health', name: 'health', component: () => import('../views/HealthOverview.vue') },
     { path: '/events', name: 'events', component: () => import('../views/EventSearch.vue') },
+    { path: '/troubleshooting', name: 'troubleshooting', component: () => import('../views/Troubleshooting.vue') },
     { path: '/system', name: 'system', component: () => import('../views/SystemConfig.vue') },
   ],
 })

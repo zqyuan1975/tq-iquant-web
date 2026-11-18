@@ -44,6 +44,7 @@ const NAV_GROUPS: NavGroup[] = [
     items: [
       { to: '/health', label: '健康总览', icon: 'health' },
       { to: '/events', label: '关键事件', icon: 'search' },
+      { to: '/troubleshooting', label: '故障向导', icon: 'system' },
       { to: '/system', label: '系统配置', icon: 'system' },
     ],
   },
