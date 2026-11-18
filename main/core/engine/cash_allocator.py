@@ -138,3 +138,43 @@ def allocate_batch_buys(
             available_before=avail + price * Decimal(qty),
             remaining_after=avail))
     return decisions
+
+def compute_capital_pool_weights(portfolios, mode: str) -> List[float]:
+    """A1 资金池权重（纯函数，实盘/回测共用口径）。
+
+    - ``equal``：等权 1/n；
+    - ``risk_budget``：按 1/组合最大回撤 归一（回撤上限越小 → 风险预算越大；
+      缺失/非法回撤按 0.15 兜底，与账户级默认一致）；
+    - ``priority``：按组合 ``priority`` 归一（全 0 → 回退等权）；
+    - 其他（含 ``off``）：等权（调用方本就不该在 off 时调用，兜底不抛错）。
+    """
+    n = len(portfolios)
+    if n == 0:
+        return []
+    if mode == "priority":
+        vals = []
+        for p in portfolios:
+            try:
+                vals.append(max(0, int(getattr(p, "priority", 0) or 0)))
+            except (TypeError, ValueError):
+                vals.append(0)
+        total = sum(vals)
+        if total > 0:
+            return [v / total for v in vals]
+        return [1.0 / n] * n
+    if mode == "risk_budget":
+        inv = []
+        for p in portfolios:
+            rm = getattr(p, "risk_manager", None)
+            try:
+                dd = Decimal(str(getattr(rm, "max_drawdown", None) or "0.15"))
+            except (ArithmeticError, TypeError, ValueError):
+                dd = Decimal("0.15")
+            if dd <= 0:
+                dd = Decimal("0.15")
+            inv.append(Decimal("1") / dd)
+        total = sum(inv)
+        if total > 0:
+            return [float(v / total) for v in inv]
+        return [1.0 / n] * n
+    return [1.0 / n] * n

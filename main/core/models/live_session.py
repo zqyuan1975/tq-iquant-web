@@ -79,6 +79,14 @@ class LiveSession(Base):
     account_daily_loss_limit = Column(Numeric(9, 6), nullable=True)
     # 账户级内存态 JSON（峰值/昨收/暂停态/已预警级别），跨重启读回。
     account_risk_state = Column(Text, nullable=True)
+    # A1 资金池模式（2026-11-18）：off（默认，分账不分池）/ equal（等权池）/
+    # risk_budget（按 1/组合最大回撤 分配）/ priority（按组合 priority 分配）。
+    # 开启后启动首 bar 做一次现金再分配；rebalance_enabled=1 时每个交易日首 bar
+    # 再平衡一次（只挪虚拟现金，不强制卖出）。
+    capital_pool_mode = Column(
+        String(16), nullable=False, server_default="off", default="off")
+    capital_pool_rebalance_enabled = Column(
+        Boolean, nullable=False, server_default="0", default=False)
     status = Column(String(10), nullable=False)
     created_at = Column(DateTime, server_default=func.now())
     updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())

@@ -123,6 +123,14 @@ def create_session(data: dict, db: Session = Depends(get_db)):
     if execution_mode not in ("alert", "auto", "manual"):
         return err(400, "execution_mode 非法，仅支持 alert(信号) / auto(全自动) / manual(人工审批)")
     data["execution_mode"] = execution_mode
+    # A1 资金池模式（默认 off=分账不分池）：off/equal/risk_budget/priority；
+    # 开启后首 bar 按权重分配各组合虚拟现金，再平衡开关按交易日重复执行。
+    pool_mode = str(data.get("capital_pool_mode") or "off").strip()
+    if pool_mode not in ("off", "equal", "risk_budget", "priority"):
+        return err(400, "capital_pool_mode 非法，仅支持 off/equal/risk_budget/priority")
+    data["capital_pool_mode"] = pool_mode
+    data["capital_pool_rebalance_enabled"] = bool(
+        data.get("capital_pool_rebalance_enabled"))
     # 会话级实盘资金基准（账户总资产口径）：None=各组合用自身 initial_capital；
     # 提供时须 >0。继承持仓的市值由引擎从起账现金扣除，避免重复计入。
     live_capital = data.get("live_capital")

@@ -1322,6 +1322,11 @@ def build_engine(
         # 只作真实侧总闸兜底上限，不重复覆盖组合起账（起账已按占比切分）。
         account_total_capital=(
             baseline_effective if baseline_effective is not None else live_capital),
+        # A1 资金池：会话级开关（默认 off/不分池），首 bar 分配一次；
+        # 开启再平衡后每交易日首 bar 再平衡（只挪虚拟现金）。
+        capital_pool_mode=(getattr(session_row, "capital_pool_mode", None) or "off"),
+        capital_pool_rebalance_enabled=bool(
+            getattr(session_row, "capital_pool_rebalance_enabled", False)),
     )
     # 桥慢响应告警接引擎事件流（risk/bridge_slow，dispatcher 侧已按 endpoint
     # 冷却去重）；仅 HTTP 桥 dispatcher 有 on_slow 钩子，其它通道不受影响。
@@ -1507,10 +1512,18 @@ def create_session(db: Session, data: dict, mode: str) -> dict:
             backtest_record_id = int(backtest_record_id)
         except (TypeError, ValueError):
             backtest_record_id = None
+    # A1 资金池模式（默认 off；非法值静默回退 off，API 层已做 400 校验）
+    pool_mode = str(data.get("capital_pool_mode") or "off").strip()
+    if pool_mode not in ("off", "equal", "risk_budget", "priority"):
+        pool_mode = "off"
+    pool_rebalance = bool(data.get("capital_pool_rebalance_enabled"))
     session = LiveSession(
         name=data["name"], mode=mode, status="stopped",
         engine=data.get("engine") or default_engine(),
         execution_mode=execution_mode,
+        # A1 资金池：off 默认（分账不分池）；其余模式首 bar 按权重分配
+        capital_pool_mode=pool_mode,
+        capital_pool_rebalance_enabled=pool_rebalance,
         live_capital=baseline_value,
         baseline_mode=baseline_mode,
         baseline_value=baseline_value,
@@ -1539,6 +1552,8 @@ def create_session(db: Session, data: dict, mode: str) -> dict:
             "engine": session_engine(session),
             "execution_mode": session.execution_mode,
             "backtest_record_id": backtest_record_id,
+            "capital_pool_mode": pool_mode,
+            "capital_pool_rebalance_enabled": pool_rebalance,
             "warnings": _engine_occupancy_warnings(db, session)}
 
 
@@ -1574,6 +1589,10 @@ def get_session(db: Session, session_id: int, engine: Optional[LiveEngine] = Non
         "params_drift": compute_params_drift(db, session),
         # 外部信号注入（0011）：None=不启用
         "signal_file_path": session.signal_file_path,
+        # A1 资金池模式与日再平衡开关（默认 off/false）
+        "capital_pool_mode": getattr(session, "capital_pool_mode", None) or "off",
+        "capital_pool_rebalance_enabled": bool(
+            getattr(session, "capital_pool_rebalance_enabled", False)),
         # 14:50 提前收盘价（仅 1d）
         "advance_close_enabled": bool(session.advance_close_enabled),
         "advance_close_time": session.advance_close_time or "14:51",

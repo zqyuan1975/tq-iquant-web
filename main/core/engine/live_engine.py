@@ -38,6 +38,7 @@ from .execution_engine import ExecutionEngine, LiveT1Checker
 from .cash_allocator import (
     REASON_INSUFFICIENT_CASH,
     allocate_batch_buys,
+    compute_capital_pool_weights,
 )
 from .corporate_actions import (
     apply_day as apply_corporate_day,
@@ -617,6 +618,10 @@ class LiveEngine:
         # 总闸**的兜底上限（桥账户快照缺失时），**不再**覆盖各组合的虚拟起账资金
         # ——分账不分池（2026-11-11 P1-①）：每个组合起账 = 该组合配置资金。
         account_total_capital: Optional[Decimal] = None,
+        # A1 资金池（2026-11-18）：off/equal/risk_budget/priority；
+        # rebalance_enabled=True 时每交易日首 bar 再平衡（默认关闭）。
+        capital_pool_mode: str = "off",
+        capital_pool_rebalance_enabled: bool = False,
     ):
         # 交易日历（下单总闸）：默认桥 xtdata 权威日历，桥离线时 TradingCalendar
         # fail-open（工作日放行），测试可注入假日历。
@@ -704,6 +709,14 @@ class LiveEngine:
         self._account_total_capital = (
             Decimal(str(account_total_capital))
             if account_total_capital is not None else None)
+        # A1 资金池：默认 off（不改既有分账语义）。首 bar 分配一次；开启再平衡后
+        # 每个交易日首 bar 按当前总现金重新分配（只挪虚拟现金，不强制卖出）。
+        self.capital_pool_mode = (
+            capital_pool_mode
+            if capital_pool_mode in ("equal", "risk_budget", "priority")
+            else "off")
+        self._capital_pool_rebalance = bool(capital_pool_rebalance_enabled)
+        self._capital_pool_day: Optional[date] = None
         # 「真实侧按资金占比缩量」事件节流：同一 (组合, 交易日) 只记一条
         self._cash_share_scale_days: Dict[tuple, date] = {}
         self._pool_codes_by_portfolio = pool_codes_by_portfolio or {}
@@ -5936,6 +5949,8 @@ class LiveEngine:
             self._handle_alert_bar
             if self.execution_mode == "alert" else self._handle_bar
         )
+        # A1：当日首 bar 做一次资金池分配/再平衡（off 时直接返回，零开销）
+        self._maybe_apply_capital_pool(bar.bar_time)
         for portfolio in self._prioritized_portfolios():
             # 基线 bar 只用于放行 deferred（alert 模式无交易、无 deferred）→ 跳过
             if is_baseline and self.execution_mode == "alert":
@@ -6499,6 +6514,59 @@ class LiveEngine:
                 "message": "持仓无可用估值价（最后已知价/成本/前收全缺），市值按 0 计；"
                            "净值与回撤可能偏低",
             }, persist=True)
+
+    def _maybe_apply_capital_pool(self, bar_time) -> None:
+        """A1：交易日首 bar 触发一次资金池分配/日再平衡（默认 off 直接返回）。"""
+        if self.capital_pool_mode == "off" or not self.portfolios:
+            return
+        day = bar_time.date()
+        if self._capital_pool_day == day:
+            return
+        if self._capital_pool_day is not None and not self._capital_pool_rebalance:
+            return
+        try:
+            self._apply_capital_pool(bar_time)
+        except Exception:  # noqa: BLE001 — 资金池是增强项，失败不得打断主循环
+            logger.exception("capital pool allocation failed (session %s)",
+                             self.session_id)
+
+    def _apply_capital_pool(self, bar_time) -> None:
+        """按模式权重把「各组合现金合计」重新分配到各组合（只挪虚拟现金）。
+
+        分配结果天然落在当日日终快照的 ``cash`` / ``weight`` 字段（A3 日序列），
+        另外逐组合写一条 ``gate=capital_pool`` 决策事件留痕（含权重与前后现金）。
+        """
+        ports = [p for p in self.portfolios
+                 if getattr(p, "account", None) is not None]
+        if not ports:
+            return
+        weights = compute_capital_pool_weights(ports, self.capital_pool_mode)
+        total = sum(Decimal(str(p.account.cash)) for p in ports)
+        plan = [(p, weight, Decimal(str(p.account.cash)))
+                for p, weight in zip(ports, weights)]
+        db = self._db_session_factory()
+        try:
+            for port, weight, before in plan:
+                after = (total * Decimal(str(weight))).quantize(Decimal("0.01"))
+                port.account.cash = after
+                try:
+                    self._recorder.record(
+                        gate="capital_pool", layer="portfolio_capital",
+                        action="rebalance", portfolio_id=port.portfolio_id,
+                        strategy_id=None, stock_code=None, bar_time=bar_time,
+                        param_name="weight", param_value=float(weight),
+                        actual_value=float(after),
+                        message=("资金池分配 mode=%s weight=%.4f cash %s -> %s"
+                                 % (self.capital_pool_mode, weight,
+                                    dec_money(before), dec_money(after))),
+                    )
+                except Exception:  # noqa: BLE001
+                    logger.exception("capital pool decision record failed")
+            self._drain_decisions(db, None)
+            db.commit()
+        finally:
+            db.close()
+        self._capital_pool_day = bar_time.date()
 
     def _prioritized_portfolios(self) -> List[Portfolio]:
         """A2：按组合 priority 降序排列本 bar 的处理顺序（稳定排序，默认 0）。

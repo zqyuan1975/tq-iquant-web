@@ -58,6 +58,9 @@ const form = ref({
   name: '', mode: 'simulation',
   engine: 'tdx' as LiveEngineKey,
   execution_mode: 'alert' as LiveExecutionMode,
+  // A1 资金池：off 默认；其余模式启动首 bar 按权重分配各组合虚拟现金
+  capital_pool_mode: 'off' as 'off' | 'equal' | 'risk_budget' | 'priority',
+  capital_pool_rebalance_enabled: false,
   portfolio_ids: [] as number[],
   // 实盘资金基准（元）：null/空=以真实通道总资产为基准（只缩不放）；number=固定上限
   live_capital: null as number | string | null,
@@ -816,7 +819,7 @@ async function create() {
     // A1 软校验：目标引擎已被其它会话占用等提示（不阻断创建，但必须让用户看见）
     createWarnings.value = Array.isArray(res?.warnings) ? res.warnings : []
     showCreate.value = false
-    form.value = { name: '', mode: 'simulation', engine: defaultEngineKey(), execution_mode: 'alert', portfolio_ids: [], live_capital: null, signal_file_path: '', advance_close_enabled: false, advance_close_time: '14:51', intraday_mismatched_risk_enabled: null }
+    form.value = { name: '', mode: 'simulation', engine: defaultEngineKey(), execution_mode: 'alert', capital_pool_mode: 'off', capital_pool_rebalance_enabled: false, portfolio_ids: [], live_capital: null, signal_file_path: '', advance_close_enabled: false, advance_close_time: '14:51', intraday_mismatched_risk_enabled: null }
     load()
   } catch (e: any) {
     // 后端参数校验失败（名称空/资金≤0 等）返回 code!==0 → 拦截器 reject，
@@ -1649,6 +1652,17 @@ onUnmounted(() => {
           {{ engineOptionText(e) }}
         </option>
       </select>
+      <label>资金池模式（可选增强，默认关闭）</label>
+      <select v-model="form.capital_pool_mode" data-field="create-capital-pool">
+        <option value="off">关闭（分账不分池）</option>
+        <option value="equal">等权池（各组合均分现金）</option>
+        <option value="risk_budget">风险预算（按 1/最大回撤分配）</option>
+        <option value="priority">优先级池（按组合下单优先级分配）</option>
+      </select>
+      <label v-if="form.capital_pool_mode !== 'off'" style="display:flex;align-items:center;gap:8px">
+        <input v-model="form.capital_pool_rebalance_enabled" type="checkbox" style="width:auto" />
+        每交易日首 bar 再平衡（只挪虚拟现金，不强制卖出）
+      </label>
       <div v-for="item in occupiedEngineList" :key="`occ-${item.engine.key}`" class="engine-occupied-hint" data-test="engine-occupied-hint">
         <span>{{ item.engine.label }} 已被 会话 #{{ item.occ.session_id }}「{{ item.occ.name }}」占用（{{ opponentAccountText(item.occ) }}，{{ occupiedSinceText(item.occ) }}，{{ item.occ.status === 'stopping' ? '停止中' : '运行中' }}）。</span>
         <button class="btn btn-sm" :disabled="item.occ.status === 'stopping'" @click="stopSession(item.occ.session_id)">先停止该会话</button>
