@@ -33,6 +33,8 @@ import {
   recoverLiveBreaker, getLiveChannel, testLiveChannel, sendUserBlock, getFormulas, getWatchdogStatus,
   getLiveAccountPreview, resetLiveBaseline,
   getLiveParamsDrift, getLiveCashFlows, createLiveCashFlow,
+  getTheoryVsLive,
+  type TheoryVsLiveResult,
   type PortfolioItem, type LiveSessionItem,
   type LiveChannelInfo, type LiveChannelEngine, type LiveEngineKey, type LiveExecutionMode, type LiveSignalItem,
   type FormulaItem, type WatchdogAlarm, type ParamsDrift, type LiveCashFlowList, type LiveCashFlowType,
@@ -901,6 +903,71 @@ async function checkDataHealth() {
   }
 }
 
+// ---- N2/K7 理论 vs 实际对照 ----
+const showTvl = ref(false)
+const tvlLoading = ref(false)
+const tvlError = ref('')
+const theoryVsLive = ref<TheoryVsLiveResult | null>(null)
+
+const _tvlPct = (v: number | null) => (v === null ? '—' : `${(v * 100).toFixed(2)}%`)
+
+async function openTheoryVsLive() {
+  const sid = watchedSessionId.value ?? activeSessionId
+  if (sid === null) return
+  showTvl.value = true
+  tvlLoading.value = true
+  tvlError.value = ''
+  theoryVsLive.value = null
+  try {
+    theoryVsLive.value = await getTheoryVsLive(sid)
+  } catch (e: any) {
+    tvlError.value = '加载失败：' + (e?.response?.data?.message || e?.message || e)
+  } finally {
+    tvlLoading.value = false
+  }
+}
+
+const tvlChart = computed(() => {
+  const d = theoryVsLive.value
+  if (!d) return null
+  const series = [
+    { key: 'theory', label: '理论', color: 'var(--blue)', points: d.theory.curve },
+    { key: 'live', label: '实盘', color: 'var(--red)', points: d.live.curve },
+  ]
+  const dates = Array.from(new Set(
+    series.flatMap(s => s.points.map(p => p.date)))).sort()
+  const values = series.flatMap(s => s.points.map(p => p.index_value))
+    .filter((v): v is number => v !== null && v !== undefined)
+  if (!dates.length || !values.length) return null
+  const W = 560
+  const H = 150
+  const pad = 8
+  const min = Math.min(...values)
+  const max = Math.max(...values)
+  const span = (max - min) || 1
+  const xOf = (date: string) => {
+    const i = dates.indexOf(date)
+    return pad + (dates.length === 1 ? 0 : (i / (dates.length - 1)) * (W - 2 * pad))
+  }
+  const paths = series.map(s => ({
+    ...s,
+    path: s.points
+      .filter(p => p.index_value !== null)
+      .map((p, i) => {
+        const y = H - pad - ((p.index_value as number) - min) / span * (H - 2 * pad)
+        return `${i === 0 ? 'M' : 'L'}${xOf(p.date).toFixed(1)},${y.toFixed(1)}`
+      })
+      .join(' '),
+  }))
+  return { W, H, min, max, paths }
+})
+
+function tvlMetric(side: 'theory' | 'live', key: string): string {
+  const v = theoryVsLive.value?.[side].metrics?.[key]
+  if (v === null || v === undefined) return '—'
+  return String(v)
+}
+
 /** 切换工作台聚焦会话：清空工作台、拉该会话历史；事件流不动（多会话并行常开）。 */
 const watchedSessionId = ref<number | null>(null)
 
@@ -1673,6 +1740,12 @@ onUnmounted(() => {
           @click="reloadDecisions()"
           title="重新拉取决策/拦截历史（含 move-stop、顺延、持久化风控事件）"
         >{{ decisionsLoading ? '刷新中…' : '↻ 刷新决策' }}</button>
+        <button
+          class="btn btn-sm" style="margin-left:8px"
+          :disabled="watchedSessionId === null"
+          @click="openTheoryVsLive"
+          title="绑定回测记录（理论）与实盘净值/成交同窗对照"
+        >理论 vs 实盘</button>
       </div>
     </div>
 
@@ -2172,6 +2245,125 @@ onUnmounted(() => {
         <span class="event-time">{{ ev.time }}</span>
         <span class="badge" :class="`badge-${EVENT_TYPE_COLOR[ev.type] || 'gray'}`">{{ ev.type }}</span>
         <span class="event-text">{{ ev.text }}</span>
+      </div>
+    </div>
+  </div>
+
+  <!-- N2/K7 理论 vs 实际对照 -->
+  <div v-if="showTvl" class="modal-overlay modal-lg" @click.self="showTvl = false">
+    <div class="modal-content">
+      <div style="display:flex;align-items:center;justify-content:space-between;gap:8px">
+        <h3 style="margin:0">理论 vs 实盘</h3>
+        <button class="btn btn-sm" @click="showTvl = false">关闭</button>
+      </div>
+      <div class="modal-body">
+        <div v-if="tvlLoading"><p>加载中…</p></div>
+        <div v-else-if="tvlError" style="color:var(--red)">{{ tvlError }}</div>
+        <template v-else-if="theoryVsLive">
+          <p v-if="!theoryVsLive.bound" class="note" style="color:var(--red)">
+            会话未绑定回测记录：以下仅为实盘侧。请在会话配置中绑定回测记录后重试。
+          </p>
+          <p v-else class="note">
+            理论基准：#{{ theoryVsLive.backtest_record_id }} {{ theoryVsLive.backtest_name }}
+            <span v-if="theoryVsLive.window.start">
+              （{{ theoryVsLive.window.start }} ~ {{ theoryVsLive.window.end }}）
+            </span>
+          </p>
+          <p v-for="(w, i) in theoryVsLive.warnings" :key="i" class="note" style="color:var(--orange)">
+            {{ w }}
+          </p>
+
+          <h4 style="margin:8px 0">归一净值叠加（首日=1）</h4>
+          <div v-if="tvlChart" style="overflow-x:auto">
+            <svg :width="tvlChart.W" :height="tvlChart.H" role="img">
+              <line :x1="0" :y1="tvlChart.H / 2" :x2="tvlChart.W" :y2="tvlChart.H / 2"
+                    stroke="var(--line)" stroke-dasharray="3,3" />
+              <path v-for="s in tvlChart.paths" :key="s.key" :d="s.path"
+                    fill="none" :stroke="s.color" stroke-width="1.5" />
+            </svg>
+            <div style="display:flex;gap:16px;font-size:12px;color:var(--ink-soft)">
+              <span v-for="s in tvlChart.paths" :key="s.key">
+                <span :style="{ color: s.color }">■</span> {{ s.label }}
+              </span>
+              <span>区间 {{ tvlChart.min.toFixed(3) }} ~ {{ tvlChart.max.toFixed(3) }}</span>
+            </div>
+          </div>
+          <p v-else class="note">两侧均无日序列，暂无可绘曲线。</p>
+
+          <h4 style="margin:16px 0 8px">指标对照</h4>
+          <div class="table-container">
+            <table>
+              <thead><tr><th>指标</th><th>理论</th><th>实盘</th><th>差异</th></tr></thead>
+              <tbody>
+                <tr>
+                  <td>累计收益</td>
+                  <td>{{ _tvlPct(theoryVsLive.theory.metrics.total_return ?? null) }}</td>
+                  <td>{{ _tvlPct(theoryVsLive.live.metrics.total_return ?? null) }}</td>
+                  <td>{{ _tvlPct(theoryVsLive.deviation?.return_gap ?? null) }}</td>
+                </tr>
+                <tr>
+                  <td>最大回撤</td>
+                  <td>{{ _tvlPct(theoryVsLive.theory.metrics.max_drawdown ?? null) }}</td>
+                  <td>{{ _tvlPct(theoryVsLive.live.metrics.max_drawdown ?? null) }}</td>
+                  <td>{{ _tvlPct(theoryVsLive.deviation?.max_drawdown_gap ?? null) }}</td>
+                </tr>
+                <tr>
+                  <td>成交笔数</td>
+                  <td>{{ tvlMetric('theory', 'trades_count') }}</td>
+                  <td>{{ tvlMetric('live', 'trades_count') }}</td>
+                  <td>{{ theoryVsLive.deviation?.trades_gap ?? '—' }}</td>
+                </tr>
+                <tr>
+                  <td>委托 / 完全成交 / 部分成交</td>
+                  <td>—</td>
+                  <td>
+                    {{ tvlMetric('live', 'orders_count') }} /
+                    {{ tvlMetric('live', 'filled_orders') }} /
+                    {{ tvlMetric('live', 'partial_orders') }}
+                  </td>
+                  <td>{{ _tvlPct(theoryVsLive.live.metrics.fill_rate ?? null) }} 成交率</td>
+                </tr>
+                <tr>
+                  <td>成交滑移（买贵/卖贱为正）</td>
+                  <td>—</td>
+                  <td colspan="2">
+                    <span v-if="theoryVsLive.deviation?.slippage.weighted_deviation_bps !== null">
+                      {{ theoryVsLive.deviation?.slippage.weighted_deviation_bps }} bps
+                      （匹配 {{ theoryVsLive.deviation?.slippage.matched_pairs }} 对）
+                    </span>
+                    <span v-else>无可匹配成交</span>
+                  </td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+
+          <template v-if="theoryVsLive.deviation?.slippage.details.length">
+            <h4 style="margin:16px 0 8px">滑移明细（前 20 对）</h4>
+            <div class="table-container" style="max-height:260px;overflow:auto">
+              <table>
+                <thead>
+                  <tr><th>日期</th><th>股票</th><th>方向</th><th>理论价</th><th>实盘价</th><th>偏差 bps</th></tr>
+                </thead>
+                <tbody>
+                  <tr v-for="(p, i) in theoryVsLive.deviation.slippage.details" :key="i">
+                    <td>{{ p.date }}</td>
+                    <td>{{ p.stock_code }}</td>
+                    <td>{{ tradeTypeLabel(p.trade_type) }}</td>
+                    <td>{{ p.theory_price }}</td>
+                    <td>{{ p.live_price }}</td>
+                    <td :style="{ color: p.deviation_bps > 0 ? 'var(--red)' : 'var(--green)' }">
+                      {{ p.deviation_bps }}
+                    </td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+          </template>
+        </template>
+      </div>
+      <div class="modal-actions">
+        <button class="btn" @click="showTvl = false">关闭</button>
       </div>
     </div>
   </div>

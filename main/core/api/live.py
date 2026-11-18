@@ -618,6 +618,37 @@ def session_params_drift(session_id: int, db: Session = Depends(get_db)):
     return ok(data)
 
 
+@router.get("/sessions/{session_id}/theory-vs-live")
+def session_theory_vs_live(
+    session_id: int, portfolio_id: Optional[int] = None,
+    start: Optional[str] = None, end: Optional[str] = None,
+    db: Session = Depends(get_db),
+):
+    """N2/K7 理论 vs 实际：绑定回测记录的净值/回撤/成交 vs 实盘。
+
+    实盘侧来自 ``live_portfolio_daily`` / ``live_trades`` / ``live_orders``；
+    未绑定回测记录时 bound=False，仍返回实际侧（实盘页可常驻展示）。
+    """
+    session = db.query(LiveSession).filter(LiveSession.id == session_id).first()
+    if session is None:
+        return err(404, "资源不存在")
+    parsed = {}
+    for name, value in (("start", start), ("end", end)):
+        if not value:
+            parsed[name] = None
+            continue
+        try:
+            parsed[name] = date.fromisoformat(value)
+        except ValueError:
+            return err(400, f"{name} 日期格式须为 YYYY-MM-DD")
+    if parsed["start"] and parsed["end"] and parsed["start"] > parsed["end"]:
+        return err(400, "开始日期不能晚于结束日期")
+    return ok(svc.compute_theory_vs_live(
+        db, session, portfolio_id=portfolio_id,
+        start_date=parsed["start"], end_date=parsed["end"],
+    ))
+
+
 @router.post("/sessions/{session_id}/portfolios/{portfolio_id}/reset-baseline")
 def reset_baseline(session_id: int, portfolio_id: int,
                    data: Optional[dict] = None,

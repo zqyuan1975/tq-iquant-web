@@ -2227,6 +2227,55 @@ export async function getLiveParamsDrift(sessionId: number) {
   return res.data.data
 }
 
+// ---- N2/K7 理论 vs 实际对照 ----
+export interface TheoryVsLiveCurvePoint {
+  date: string
+  total_value: number | null
+  index_value: number | null
+}
+
+export interface TheoryVsLiveSide {
+  curve: TheoryVsLiveCurvePoint[]
+  metrics: Record<string, number | null>
+}
+
+export interface TheoryVsLiveSlippagePair {
+  stock_code: string
+  date: string
+  trade_type: string
+  theory_price: number
+  live_price: number
+  deviation_bps: number
+}
+
+export interface TheoryVsLiveResult {
+  bound: boolean
+  backtest_record_id: number | null
+  backtest_name: string | null
+  window: { start: string | null; end: string | null }
+  theory: TheoryVsLiveSide
+  live: TheoryVsLiveSide
+  deviation: null | {
+    return_gap: number | null
+    max_drawdown_gap: number | null
+    trades_gap: number
+    slippage: {
+      matched_pairs: number
+      weighted_deviation_bps: number | null
+      details: TheoryVsLiveSlippagePair[]
+    }
+  }
+  warnings: string[]
+}
+
+export async function getTheoryVsLive(
+  sessionId: number, params: { portfolio_id?: number; start?: string; end?: string } = {},
+) {
+  const res = await api.get<ApiResponse<TheoryVsLiveResult>>(
+    `/live/sessions/${sessionId}/theory-vs-live`, { params })
+  return res.data.data
+}
+
 // ---- 外部现金流台账（入金/出金/分红/其他）----
 export type LiveCashFlowType = 'deposit' | 'withdraw' | 'dividend' | 'other'
 

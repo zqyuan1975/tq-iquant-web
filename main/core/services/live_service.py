@@ -46,6 +46,7 @@ from core.models import (
     LiveSessionPendingChange,
     LiveGlobalSwitch,
     IncrementalBacktestCheckpoint, BacktestRecord,
+    BacktestDailySnapshot, BacktestTrade,
 )
 from core.engine.portfolio_builder import assemble_portfolio
 try:
@@ -6013,3 +6014,224 @@ def session_signals(db, session_id, strategy_id=None, stock_code=None,
     rows = (q.order_by(LiveSignal.bar_time.desc(), LiveSignal.id.desc())
             .offset(offset).limit(min(max(limit, 1), 500)).all())
     return {"items": [serialize_signal(r) for r in rows], "total": total}
+
+
+# ---------------------------------------------------------------------------
+# N2 / K7 理论 vs 实际对照
+# ---------------------------------------------------------------------------
+def _curve_points(rows) -> list:
+    """[(date, total_value)] → 首点归一曲线（跨初始资金可叠加）。"""
+    points = [(d, float(v)) for d, v in rows if v is not None]
+    base = next((v for _, v in points if v > 0), None)
+    return [
+        {
+            "date": d.isoformat(),
+            "total_value": round(v, 2),
+            "index_value": round(v / base, 6) if base else None,
+        }
+        for d, v in points
+    ]
+
+
+def _curve_metrics(curve: list) -> dict:
+    """曲线口径指标：累计收益 / 最大回撤（基于归一净值，与初始资金无关）。"""
+    values = [p["total_value"] for p in curve if p["total_value"] is not None]
+    if not values:
+        return {"total_return": None, "max_drawdown": None}
+    peak = values[0]
+    max_dd = 0.0
+    for v in values:
+        peak = max(peak, v)
+        if peak > 0:
+            max_dd = min(max_dd, v / peak - 1)
+    return {
+        "total_return": (round(values[-1] / values[0] - 1, 6)
+                         if values[0] else None),
+        "max_drawdown": round(max_dd, 6),
+    }
+
+
+def compute_theory_vs_live(
+    db: Session, session, portfolio_id: Optional[int] = None,
+    start_date: Optional[date] = None, end_date: Optional[date] = None,
+) -> dict:
+    """N2：绑定回测记录（理论）与实盘日序列/成交（实际）的同窗对照。
+
+    - 理论侧：``backtest_records`` 绑定的组合日快照 + 成交
+    - 实际侧：``live_portfolio_daily`` + ``live_trades`` + ``live_orders``
+    - 滑移：同股票/同日/同方向的理论均价 vs 实盘均价，买贵卖贱记为正
+    - 未绑定回测记录时不报错（bound=False，只回实际侧），便于实盘页常驻展示
+    """
+    result: dict = {
+        "bound": False, "backtest_record_id": None, "backtest_name": None,
+        "window": {"start": None, "end": None},
+        "theory": {"curve": [], "metrics": {}},
+        "live": {"curve": [], "metrics": {}},
+        "deviation": None,
+        "warnings": [],
+    }
+
+    live_q = db.query(LivePortfolioDaily).filter(
+        LivePortfolioDaily.live_session_id == session.id)
+    if portfolio_id:
+        live_q = live_q.filter(
+            LivePortfolioDaily.portfolio_strategy_id == portfolio_id)
+    if start_date:
+        live_q = live_q.filter(LivePortfolioDaily.trade_date >= start_date)
+    if end_date:
+        live_q = live_q.filter(LivePortfolioDaily.trade_date <= end_date)
+    live_rows = live_q.order_by(LivePortfolioDaily.trade_date).all()
+    if not live_rows:
+        result["warnings"].append(
+            "无实盘日序列（live_portfolio_daily 尚未生成），实际侧曲线为空")
+
+    live_curve = _curve_points(
+        [(r.trade_date, r.total_value) for r in live_rows])
+
+    trade_q = db.query(LiveTrade).filter(
+        LiveTrade.live_session_id == session.id)
+    if portfolio_id:
+        trade_q = trade_q.filter(
+            LiveTrade.portfolio_strategy_id == portfolio_id)
+    if start_date:
+        trade_q = trade_q.filter(LiveTrade.trade_time >= datetime.combine(
+            start_date, datetime.min.time()))
+    if end_date:
+        trade_q = trade_q.filter(LiveTrade.trade_time <= datetime.combine(
+            end_date, datetime.max.time()))
+    live_trades = trade_q.all()
+
+    order_q = db.query(LiveOrder).filter(
+        LiveOrder.live_session_id == session.id)
+    if portfolio_id:
+        order_q = order_q.filter(
+            LiveOrder.portfolio_strategy_id == portfolio_id)
+    if start_date:
+        order_q = order_q.filter(LiveOrder.created_at >= datetime.combine(
+            start_date, datetime.min.time()))
+    if end_date:
+        order_q = order_q.filter(LiveOrder.created_at <= datetime.combine(
+            end_date, datetime.max.time()))
+    live_orders = order_q.all()
+
+    filled = sum(1 for o in live_orders
+                 if (o.filled_quantity or 0) >= (o.quantity or 0)
+                 and (o.quantity or 0) > 0)
+    partial = sum(1 for o in live_orders
+                  if 0 < (o.filled_quantity or 0) < (o.quantity or 0))
+    live_metrics = _curve_metrics(live_curve)
+    live_metrics.update({
+        "trades_count": len(live_trades),
+        "orders_count": len(live_orders),
+        "filled_orders": filled,
+        "partial_orders": partial,
+        "fill_rate": (round(filled / len(live_orders), 4)
+                      if live_orders else None),
+    })
+    result["live"] = {"curve": live_curve, "metrics": live_metrics}
+
+    rec_id = getattr(session, "backtest_record_id", None)
+    if not rec_id:
+        result["warnings"].append(
+            "会话未绑定回测记录：只展示实际侧，无法做理论对照")
+        return result
+    rec = db.query(BacktestRecord).filter(BacktestRecord.id == rec_id).first()
+    if rec is None:
+        result["warnings"].append(f"绑定的回测记录 #{rec_id} 不存在")
+        return result
+
+    win_start = start_date or rec.start_date
+    win_end = end_date or rec.end_date
+    if live_rows:
+        win_start = start_date or live_rows[0].trade_date
+        win_end = end_date or live_rows[-1].trade_date
+    result.update({
+        "bound": True,
+        "backtest_record_id": int(rec.id),
+        "backtest_name": rec.name,
+        "window": {
+            "start": win_start.isoformat() if win_start else None,
+            "end": win_end.isoformat() if win_end else None,
+        },
+    })
+
+    snap_q = db.query(BacktestDailySnapshot).filter_by(
+        backtest_record_id=rec.id, target_type="portfolio")
+    if win_start:
+        snap_q = snap_q.filter(BacktestDailySnapshot.snap_date >= win_start)
+    if win_end:
+        snap_q = snap_q.filter(BacktestDailySnapshot.snap_date <= win_end)
+    snaps = snap_q.order_by(BacktestDailySnapshot.snap_date).all()
+    theory_curve = _curve_points(
+        [(s.snap_date, s.total_value) for s in snaps])
+
+    bt_q = db.query(BacktestTrade).filter(
+        BacktestTrade.backtest_record_id == rec.id)
+    if win_start:
+        bt_q = bt_q.filter(BacktestTrade.bar_time >= datetime.combine(
+            win_start, datetime.min.time()))
+    if win_end:
+        bt_q = bt_q.filter(BacktestTrade.bar_time <= datetime.combine(
+            win_end, datetime.max.time()))
+    theory_trades = bt_q.all()
+
+    theory_metrics = _curve_metrics(theory_curve)
+    theory_metrics["trades_count"] = len(theory_trades)
+    result["theory"] = {"curve": theory_curve, "metrics": theory_metrics}
+
+    # ---- 成交滑移：同股票/同日/同方向的理论均价 vs 实盘均价 ----
+    def _avg_by_key(trades, time_attr):
+        acc: Dict[tuple, list] = {}
+        for t in trades:
+            ts = getattr(t, time_attr, None)
+            if ts is None:
+                continue
+            key = (t.stock_code, ts.date(), t.trade_type)
+            amt, qty = acc.get(key, (0.0, 0.0))
+            acc[key] = (amt + float(t.amount or 0), qty + float(t.quantity or 0))
+        return acc
+
+    theory_px = _avg_by_key(theory_trades, "bar_time")
+    live_px = _avg_by_key(live_trades, "trade_time")
+    weighted_dev = 0.0
+    weight_sum = 0.0
+    pairs = []
+    for key in set(theory_px) & set(live_px):
+        t_amt, t_qty = theory_px[key]
+        l_amt, l_qty = live_px[key]
+        if t_qty <= 0 or l_qty <= 0:
+            continue
+        t_px, l_px = t_amt / t_qty, l_amt / l_qty
+        if t_px <= 0:
+            continue
+        sign = 1.0 if key[2] == "BUY" else -1.0
+        dev = sign * (l_px - t_px) / t_px
+        weighted_dev += dev * l_amt
+        weight_sum += l_amt
+        pairs.append({
+            "stock_code": key[0], "date": key[1].isoformat(),
+            "trade_type": key[2], "theory_price": round(t_px, 4),
+            "live_price": round(l_px, 4), "deviation_bps": round(dev * 10000, 2),
+        })
+    pairs.sort(key=lambda p: abs(p["deviation_bps"]), reverse=True)
+    result["deviation"] = {
+        "return_gap": (
+            round(live_metrics["total_return"] - theory_metrics["total_return"], 6)
+            if (live_metrics.get("total_return") is not None
+                and theory_metrics.get("total_return") is not None) else None),
+        "max_drawdown_gap": (
+            round(live_metrics["max_drawdown"] - theory_metrics["max_drawdown"], 6)
+            if (live_metrics.get("max_drawdown") is not None
+                and theory_metrics.get("max_drawdown") is not None) else None),
+        "trades_gap": len(live_trades) - len(theory_trades),
+        "slippage": {
+            "matched_pairs": len(pairs),
+            "weighted_deviation_bps": (
+                round(weighted_dev / weight_sum * 10000, 2)
+                if weight_sum else None),
+            "details": pairs[:20],
+        },
+    }
+    if not snaps:
+        result["warnings"].append("绑定回测记录在该窗口内无日快照，理论侧曲线为空")
+    return result
