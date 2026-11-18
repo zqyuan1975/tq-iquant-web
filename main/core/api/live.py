@@ -1209,6 +1209,34 @@ def session_decisions(session_id: int, ack_status: Optional[str] = None,
     return ok(data)
 
 
+@router.get("/decision-events")
+def search_decision_events(session_id: Optional[int] = None,
+                           gate: Optional[str] = None,
+                           layer: Optional[str] = None,
+                           action: Optional[str] = None,
+                           ack_status: Optional[str] = None,
+                           keyword: Optional[str] = None,
+                           start: Optional[str] = None,
+                           end: Optional[str] = None,
+                           limit: int = 200,
+                           offset: int = 0,
+                           db: Session = Depends(get_db)):
+    """L4 关键事件检索：跨会话只读查询决策事件（默认最近 200 条）。"""
+    if ack_status not in (None, "", "open", "acked"):
+        return err(400, "ack_status 仅支持 open / acked")
+    try:
+        start_date = date.fromisoformat(start) if start else None
+        end_date = date.fromisoformat(end) if end else None
+    except ValueError:
+        return err(400, "start/end 需为 YYYY-MM-DD")
+    if start_date and end_date and start_date > end_date:
+        return err(400, "start 不能晚于 end")
+    return ok(svc.search_decision_events(
+        db, session_id=session_id, gate=gate, layer=layer, action=action,
+        ack_status=ack_status or None, keyword=keyword,
+        start=start_date, end=end_date, limit=limit, offset=offset))
+
+
 @router.post("/sessions/{session_id}/decisions/{event_id}/ack")
 def ack_decision(session_id: int, event_id: int,
                  data: Optional[dict] = None,

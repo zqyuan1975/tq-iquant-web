@@ -361,6 +361,32 @@ export interface DecisionData {
   events: DecisionEventItem[]
 }
 
+// L4 关键事件检索（GET /live/decision-events，跨会话只读）
+export interface DecisionEventSearchItem extends DecisionEventItem {
+  session_id: number
+  session_name: string | null
+}
+
+export interface DecisionEventSearchFilters {
+  session_id?: number
+  gate?: string
+  layer?: string
+  action?: string
+  ack_status?: 'open' | 'acked'
+  keyword?: string
+  start?: string  // YYYY-MM-DD
+  end?: string    // YYYY-MM-DD
+  limit?: number
+  offset?: number
+}
+
+export interface DecisionEventSearchResult {
+  items: DecisionEventSearchItem[]
+  total: number
+  limit: number
+  offset: number
+}
+
 // 月度收益热力图矩阵（年度×12月）
 export interface BacktestMonthlyMatrix {
   years: number[]
@@ -1998,6 +2024,13 @@ export async function ackAllLiveDecisions(
     `/live/sessions/${sessionId}/decisions/ack-all`,
     opts || {},
   )
+  return res.data.data
+}
+
+/** L4：关键事件检索（跨会话只读，按 created_at 倒序，limit 上限 1000）。 */
+export async function searchDecisionEvents(filters: DecisionEventSearchFilters = {}) {
+  const res = await api.get<ApiResponse<DecisionEventSearchResult>>(
+    '/live/decision-events', { params: filters })
   return res.data.data
 }
 

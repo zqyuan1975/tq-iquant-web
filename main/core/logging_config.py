@@ -12,6 +12,27 @@ def _under_pytest() -> bool:
     return os.environ.get("PYTEST_CURRENT_TEST") is not None or "pytest" in sys.modules
 
 
+def _rotate_settings() -> tuple:
+    """日志轮转配置：``logging.daily_rotate``（默认 false）+ ``backup_count``（默认 14）。
+
+    默认关闭 → 走原 ``RotatingFileHandler``（10MB×5），与改动前逐字一致；
+    开启 → 按日切分（``TimedRotatingFileHandler``，midnight）。配置读取失败一律回退关闭。
+    """
+    try:
+        from core.config import load_config
+
+        raw = (load_config() or {}).get("logging")
+        raw = raw if isinstance(raw, dict) else {}
+        daily = bool(raw.get("daily_rotate", False))
+        try:
+            count = int(raw.get("backup_count", 14))
+        except (TypeError, ValueError):
+            count = 14
+        return daily, max(count, 1)
+    except Exception:  # noqa: BLE001 — 配置异常不得阻断日志初始化
+        return False, 14
+
+
 def setup_logging():
     formatter = logging.Formatter(
         "%(asctime)s [%(levelname)s] %(name)s: %(message)s",
@@ -33,9 +54,17 @@ def setup_logging():
                 log_dir = Path(__file__).resolve().parent.parent.parent / "logs"
             log_dir.mkdir(parents=True, exist_ok=True)
             log_file = log_dir / "core.log"
-            file_handler = logging.handlers.RotatingFileHandler(
-                log_file, maxBytes=10 * 1024 * 1024, backupCount=5, encoding="utf-8"
-            )
+            daily, backup_count = _rotate_settings()
+            if daily:
+                file_handler = logging.handlers.TimedRotatingFileHandler(
+                    log_file, when="midnight", backupCount=backup_count,
+                    encoding="utf-8",
+                )
+            else:
+                file_handler = logging.handlers.RotatingFileHandler(
+                    log_file, maxBytes=10 * 1024 * 1024, backupCount=5,
+                    encoding="utf-8",
+                )
             file_handler.setFormatter(formatter)
             file_handler._core_logging = True
             root.addHandler(file_handler)

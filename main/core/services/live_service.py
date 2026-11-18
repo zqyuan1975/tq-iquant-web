@@ -5965,6 +5965,91 @@ def ack_all_decisions(db: Session, session_id: int,
     return {"acked": len(rows), "ack_status": "acked", "note": resolved_note}
 
 
+def search_decision_events(db: Session, *, session_id: Optional[int] = None,
+                           gate: Optional[str] = None,
+                           layer: Optional[str] = None,
+                           action: Optional[str] = None,
+                           ack_status: Optional[str] = None,
+                           keyword: Optional[str] = None,
+                           start: Optional[date] = None,
+                           end: Optional[date] = None,
+                           limit: int = 200,
+                           offset: int = 0) -> dict:
+    """L4 关键事件检索：跨会话只读查询 ``live_decision_events``。
+
+    过滤维度：会话 / gate / layer / action / ack 状态 / 关键字（message、stock_code、
+    param_name）/ ``created_at`` 自然日闭区间（``start``、``end`` 为 Asia/Shanghai
+    日期，按数据库本地时间比较）。按 ``created_at``、``id`` 倒序，``limit`` 夹在
+    1~1000；bar_time 历史脏行沿用 ``session_decisions`` 同一年份下限过滤。
+
+    纯只读：不写库、不改 ack、不触发任何交易路径。
+    """
+    try:
+        limit = int(limit)
+    except (TypeError, ValueError):
+        limit = 200
+    try:
+        offset = int(offset)
+    except (TypeError, ValueError):
+        offset = 0
+    limit = min(max(limit, 1), 1000)
+    offset = max(offset, 0)
+
+    query = db.query(LiveDecisionEvent).filter(
+        or_(
+            LiveDecisionEvent.bar_time.is_(None),
+            LiveDecisionEvent.bar_time >= _MIN_DECISION_BAR_TIME,
+        )
+    )
+    if session_id is not None:
+        query = query.filter(LiveDecisionEvent.live_session_id == int(session_id))
+    if gate:
+        query = query.filter(LiveDecisionEvent.gate == str(gate))
+    if layer:
+        query = query.filter(LiveDecisionEvent.layer == str(layer))
+    if action:
+        query = query.filter(LiveDecisionEvent.action == str(action))
+    if ack_status == "open":
+        query = query.filter(or_(LiveDecisionEvent.ack_status == "open",
+                                 LiveDecisionEvent.ack_status.is_(None)))
+    elif ack_status == "acked":
+        query = query.filter(LiveDecisionEvent.ack_status == "acked")
+    text = str(keyword or "").strip()
+    if text:
+        like = "%%%s%%" % text
+        query = query.filter(or_(
+            LiveDecisionEvent.message.like(like),
+            LiveDecisionEvent.stock_code.like(like),
+            LiveDecisionEvent.param_name.like(like),
+            LiveDecisionEvent.gate.like(like),
+        ))
+    if start is not None:
+        query = query.filter(
+            LiveDecisionEvent.created_at >= datetime.combine(start, datetime.min.time()))
+    if end is not None:
+        query = query.filter(
+            LiveDecisionEvent.created_at
+            < datetime.combine(end + timedelta(days=1), datetime.min.time()))
+
+    total = query.count()
+    rows = (query.order_by(LiveDecisionEvent.created_at.desc(),
+                           LiveDecisionEvent.id.desc())
+            .offset(offset).limit(limit).all())
+    session_ids = {int(d.live_session_id) for d in rows}
+    names = {}
+    if session_ids:
+        names = dict(
+            db.query(LiveSession.id, LiveSession.name)
+            .filter(LiveSession.id.in_(session_ids)).all())
+    items = []
+    for d in rows:
+        item = serialize_decision(d)
+        item["session_id"] = d.live_session_id
+        item["session_name"] = names.get(d.live_session_id)
+        items.append(item)
+    return {"items": items, "total": total, "limit": limit, "offset": offset}
+
+
 def serialize_signal(s: LiveSignal) -> dict:
     return {
         "id": s.id,
