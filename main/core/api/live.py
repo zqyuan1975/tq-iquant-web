@@ -1,7 +1,7 @@
 import asyncio
 import json
 import logging
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from typing import Dict, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Request
@@ -873,6 +873,26 @@ def abandon_session_deferred_order(
         return err(404, str(exc))
     except ValueError as exc:
         return err(409, str(exc))
+
+
+@router.get("/sessions/{session_id}/pre-open-stats")
+def session_pre_open_stats(session_id: int,
+                           start: Optional[date] = None,
+                           end: Optional[date] = None,
+                           group_by: str = "day",
+                           db: Session = Depends(get_db)):
+    """G4：盘前效果统计（只读）。按日/周聚合报出/成交/越价撤单/重排/积压。"""
+    if end is None:
+        end = datetime.now().date()
+    if start is None:
+        start = end - timedelta(days=6)
+    try:
+        data = svc.pre_open_stats(db, session_id, start, end, group_by)
+    except ValueError as exc:
+        return err(400, str(exc))
+    if data is None:
+        return err(404, "资源不存在")
+    return ok(data)
 
 
 def _manual_error(exc: Exception):

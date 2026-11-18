@@ -1835,6 +1835,32 @@ export async function abandonLiveDeferredOrder(
   return res.data.data
 }
 
+/** G4：盘前效果统计（只读，按日/周）。 */
+export interface LivePreOpenBucket {
+  bucket: string
+  reported: number
+  filled: number
+  cancel_crossed: number
+  requeued: number
+  blocked: number
+  deferred: number
+}
+
+export async function getLivePreOpenStats(
+  sessionId: number,
+  params: { start?: string; end?: string; group_by?: 'day' | 'week' } = {},
+) {
+  const res = await api.get<ApiResponse<{
+    session_id: number
+    start: string
+    end: string
+    group_by: string
+    items: LivePreOpenBucket[]
+    totals: Omit<LivePreOpenBucket, 'bucket'>
+  }>>(`/live/sessions/${sessionId}/pre-open-stats`, { params })
+  return res.data.data
+}
+
 /** 成交历史。可选 start_date/end_date（YYYY-MM-DD，北京自然日闭区间）服务端预筛；
  *  不传=全量（与旧行为一致，向后兼容）。 */
 export async function getLiveTrades(

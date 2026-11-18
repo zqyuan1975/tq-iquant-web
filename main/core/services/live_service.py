@@ -5617,6 +5617,102 @@ def session_deferred_orders(db: Session, session_id: int) -> Optional[List[dict]
     return items
 
 
+# G4：盘前效果统计（只读聚合，不改任何账）
+_PRE_OPEN_METRICS = (
+    "reported", "filled", "cancel_crossed", "requeued", "blocked", "deferred",
+)
+
+
+def _pre_open_bucket_key(day: date, group_by: str) -> str:
+    if group_by == "week":
+        iso = day.isocalendar()
+        return "%04d-W%02d" % (iso[0], iso[1])
+    return day.isoformat()
+
+
+def pre_open_stats(db: Session, session_id: int, start: date, end: date,
+                   group_by: str = "day") -> Optional[dict]:
+    """G4：按日/周聚合盘前集合竞价的报出、成交、越价撤单、重排与积压。
+
+    数据源只读：
+    - `live_decision_events`（gate=pre_open_auction）：release=报出，
+      block=提交异常/拦截，cancel_requeue=开盘越价撤单后重排；
+    - `live_orders`：bar_time 落在 09:15–09:25 且状态 filled=盘前成交，
+      status=deferred 按信号日归桶=仍积压的顺延单。
+    会话不存在返回 None；空区间返回各桶零值（不伪造行）。
+    """
+    if group_by not in ("day", "week"):
+        raise ValueError("group_by 仅支持 day / week")
+    if start > end:
+        raise ValueError("start 不能晚于 end")
+    session = db.query(LiveSession).filter(LiveSession.id == session_id).first()
+    if not session:
+        return None
+    start_dt = datetime.combine(start, datetime.min.time())
+    end_dt = datetime.combine(end + timedelta(days=1), datetime.min.time())
+
+    buckets: Dict[str, dict] = {}
+
+    def _bucket(day: date) -> dict:
+        key = _pre_open_bucket_key(day, group_by)
+        item = buckets.get(key)
+        if item is None:
+            item = {"bucket": key}
+            for name in _PRE_OPEN_METRICS:
+                item[name] = 0
+            buckets[key] = item
+        return item
+
+    decisions = (
+        db.query(LiveDecisionEvent)
+        .filter(LiveDecisionEvent.live_session_id == session_id,
+                LiveDecisionEvent.gate == "pre_open_auction",
+                LiveDecisionEvent.bar_time >= start_dt,
+                LiveDecisionEvent.bar_time < end_dt)
+        .all()
+    )
+    for event in decisions:
+        if event.bar_time is None:
+            continue
+        item = _bucket(event.bar_time.date())
+        if event.action == "release":
+            item["reported"] += 1
+        elif event.action == "block":
+            item["blocked"] += 1
+        elif event.action == "cancel_requeue":
+            # 越价撤单确认并成功重排：同一次结果同时计入两项
+            item["cancel_crossed"] += 1
+            item["requeued"] += 1
+
+    orders = (
+        db.query(LiveOrder)
+        .filter(LiveOrder.live_session_id == session_id,
+                LiveOrder.bar_time >= start_dt,
+                LiveOrder.bar_time < end_dt)
+        .all()
+    )
+    for row in orders:
+        if row.bar_time is None:
+            continue
+        item = _bucket(row.bar_time.date())
+        clock = (row.bar_time.hour, row.bar_time.minute)
+        if row.status == "filled" and (9, 15) <= clock < (9, 25):
+            item["filled"] += 1
+        elif row.status == "deferred":
+            item["deferred"] += 1
+
+    items = [buckets[k] for k in sorted(buckets)]
+    totals = {name: sum(i[name] for i in items) for name in _PRE_OPEN_METRICS}
+    return {
+        "session_id": session_id,
+        "start": start.isoformat(),
+        "end": end.isoformat(),
+        "group_by": group_by,
+        "items": items,
+        "totals": totals,
+    }
+
+
 def session_trades(
     db: Session, session_id: int,
     start_date: Optional[date] = None, end_date: Optional[date] = None,

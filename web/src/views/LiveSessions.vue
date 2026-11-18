@@ -24,7 +24,8 @@ import {
   getLiveChannelGuard, reconnectLiveChannel,
   getLiveSplitRemainders, reorderLiveSplitRemainders,
   getLiveDeferredOrders, releaseLiveDeferredOrder, abandonLiveDeferredOrder,
-  type LiveDeferredOrderItem,
+  getLivePreOpenStats,
+  type LiveDeferredOrderItem, type LivePreOpenBucket,
   getLiveGateSnapshots,
   type LiveSplitRemainderItem,
   type LiveGateSnapshotItem,
@@ -317,6 +318,10 @@ const orders = ref<OrderRow[]>([])
 const deferredOrders = ref<LiveDeferredOrderItem[]>([])
 const deferredRunning = ref(false)
 const deferredBusy = ref<number | null>(null)
+// G4：盘前效果统计（按日/周，只读）
+const preOpenStats = ref<LivePreOpenBucket[]>([])
+const preOpenTotals = ref<Omit<LivePreOpenBucket, 'bucket'> | null>(null)
+const preOpenGroupBy = ref<'day' | 'week'>('day')
 const trades = ref<TradeRow[]>([])
 const decisions = ref<DecisionRow[]>([])
 // 时间区间筛选（默认今日；聚合统计随筛选区间重算，不再显示全时段累计）
@@ -694,6 +699,8 @@ async function loadHistory(id: number) {
     signalsTotal.value = sig?.total ?? 0
     // G1：待放行顺延委托（独立端点；失败静默，不阻塞主工作台）
     loadDeferredOrders(id)
+    // G4：盘前效果统计（与委托同屏，失败静默）
+    loadPreOpenStats(id)
     // 账户全貌快照 + 交易日历来源/退化状态（同一详情请求，采集于 deals 节拍）——失败静默（辅助卡）
     try {
       getLiveSession(id).then(d => {
@@ -781,6 +788,28 @@ async function onAbandonDeferred(o: LiveDeferredOrderItem) {
   } finally {
     deferredBusy.value = null
   }
+}
+
+/** G4：盘前效果统计（只读；日期区间缺省=服务端最近 7 天）。 */
+async function loadPreOpenStats(id: number | null = activeSessionId) {
+  if (id === null) {
+    preOpenStats.value = []
+    preOpenTotals.value = null
+    return
+  }
+  try {
+    const data = await getLivePreOpenStats(id, { group_by: preOpenGroupBy.value })
+    if (activeSessionId !== id) return
+    preOpenStats.value = data.items || []
+    preOpenTotals.value = data.totals || null
+  } catch {
+    preOpenStats.value = []
+    preOpenTotals.value = null
+  }
+}
+
+function onPreOpenGroupChange() {
+  loadPreOpenStats()
 }
 
 function startEventStreams() {
@@ -960,10 +989,14 @@ async function create() {
     return
   }
   createError.value = ''
+  const biasRaw = form.value.pre_open_auction_price_bias_pct
+  const bias = (biasRaw === null || biasRaw === undefined || biasRaw === '')
+    ? null : Number(biasRaw)
   try {
     const res = await createLiveSession({
       ...form.value,
       live_capital: cap,
+      pre_open_auction_price_bias_pct: bias,
       baseline_mode: cap === null ? 'total_asset' : 'manual',
       baseline_value: cap,
     })
@@ -1836,6 +1869,47 @@ onUnmounted(() => {
         </table>
         <div v-else class="empty-state" style="padding:6px 0">
           <p style="margin:0">当前没有待放行的顺延委托</p>
+        </div>
+      </div>
+      <!-- G4：盘前效果统计（只读；报出/成交/越价撤单/重排/积压） -->
+      <div style="border:1px solid var(--line);border-radius:6px;padding:10px;margin-bottom:14px" data-test="pre-open-stats">
+        <div style="display:flex;align-items:center;gap:8px;margin:0 0 6px;flex-wrap:wrap">
+          <strong style="font-size:13px">盘前效果</strong>
+          <span style="font-size:12px;color:var(--ink-faint)">最近 7 天（北京时间；只读聚合，口径与决策/委托一致）</span>
+          <select
+            v-model="preOpenGroupBy" style="font-size:12px;padding:2px 6px;margin-left:auto"
+            aria-label="盘前效果聚合粒度" @change="onPreOpenGroupChange"
+          >
+            <option value="day">按日</option>
+            <option value="week">按周</option>
+          </select>
+          <button class="btn btn-sm" type="button" @click="loadPreOpenStats()">刷新</button>
+        </div>
+        <table v-if="preOpenStats.length">
+          <thead><tr><th>{{ preOpenGroupBy === 'week' ? '周' : '日期' }}</th><th>报出</th><th>成交</th><th>越价撤单</th><th>重排</th><th>拦截</th><th>积压</th></tr></thead>
+          <tbody>
+            <tr v-for="row in preOpenStats" :key="row.bucket">
+              <td>{{ row.bucket }}</td>
+              <td>{{ row.reported }}</td>
+              <td>{{ row.filled }}</td>
+              <td>{{ row.cancel_crossed }}</td>
+              <td>{{ row.requeued }}</td>
+              <td>{{ row.blocked }}</td>
+              <td>{{ row.deferred }}</td>
+            </tr>
+            <tr v-if="preOpenTotals" style="font-weight:600">
+              <td>合计</td>
+              <td>{{ preOpenTotals.reported }}</td>
+              <td>{{ preOpenTotals.filled }}</td>
+              <td>{{ preOpenTotals.cancel_crossed }}</td>
+              <td>{{ preOpenTotals.requeued }}</td>
+              <td>{{ preOpenTotals.blocked }}</td>
+              <td>{{ preOpenTotals.deferred }}</td>
+            </tr>
+          </tbody>
+        </table>
+        <div v-else class="empty-state" style="padding:6px 0">
+          <p style="margin:0">区间内没有盘前活动</p>
         </div>
       </div>
       <div style="display:flex;align-items:center;gap:8px;margin:0 0 8px">

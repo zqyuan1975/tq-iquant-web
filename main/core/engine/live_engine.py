@@ -5939,6 +5939,15 @@ class LiveEngine:
         if equity_expected > 0 and equity_actual is not None:
             pct = ((Decimal(str(equity_actual)) - equity_expected)
                    / equity_expected)
+        # G4：当日盘前效果（只读；失败不影响日报主体）
+        pre_open_today = None
+        try:
+            from core.services.live_service import pre_open_stats
+            stats = pre_open_stats(db, self.session_id, today, today, "day")
+            if stats and stats.get("items"):
+                pre_open_today = stats["items"][0]
+        except Exception:  # noqa: BLE001 — 统计失败不阻断对账
+            logger.debug("pre_open_stats failed in daily report", exc_info=True)
         return {
             "report_date": today,
             "engine": self._engine_key,
@@ -5964,6 +5973,8 @@ class LiveEngine:
                 "out_of_pool_value": check.get("out_of_pool_value"),
                 "expected_total_ex_out_of_pool": check.get("expected_total"),
                 "captured_at": now.strftime("%Y-%m-%d %H:%M:%S"),
+                # G4：盘前报出/成交/越价撤单/重排/积压（当日，可能为 None）
+                "pre_open": pre_open_today,
                 "snapshot_at": (
                     snap.captured_at.strftime("%Y-%m-%d %H:%M:%S")
                     if snap is not None and snap.captured_at else None),
