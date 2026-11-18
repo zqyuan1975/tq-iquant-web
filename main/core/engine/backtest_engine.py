@@ -68,6 +68,12 @@ _RISK_SELL_TYPES = frozenset({
 PENDING_ORDER_MAX_DAYS = 20
 
 
+def _ca_mode(portfolio) -> str:
+    """公司行为记账口径：J4 exact 档为未复权价空间（backtest_raw），其余沿用
+    backtest（复权价 + 比例分红）。"""
+    return getattr(portfolio, "corporate_action_mode", None) or "backtest"
+
+
 def build_prev_close_by_day(klines: dict) -> Dict[tuple, Decimal]:
     """按 ``(code, 交易日)`` 预计算「上一交易日最后一根 bar 的收盘」（任意周期）。
 
@@ -298,7 +304,7 @@ class BacktestEngine:
                     and last_action_date != t.date()):
                 _ca_actions = apply_corporate_day(
                     portfolio, portfolio.corporate_timeline, t.date(),
-                    recorder, mode="backtest",
+                    recorder, mode=_ca_mode(portfolio),
                     reinvest_enabled=portfolio.dividend_reinvest_enabled,
                     price_resolver=lambda code: self._ca_reference_price(
                         code, t, period, price_index, prev_close_by_day),
@@ -953,7 +959,7 @@ class BacktestEngine:
                         and s["last_action_date"] != t.date()):
                     _ca_actions = apply_corporate_day(
                         portfolio, portfolio.corporate_timeline, t.date(),
-                        recorder, mode="backtest",
+                        recorder, mode=_ca_mode(portfolio),
                         reinvest_enabled=portfolio.dividend_reinvest_enabled,
                         price_resolver=lambda code: self._ca_reference_price(
                             code, t, period, price_index, prev_close_by_day),

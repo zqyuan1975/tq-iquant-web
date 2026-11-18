@@ -160,6 +160,8 @@ def _dividend_amount(event: CorporateActionEvent, price: Optional[Decimal],
 
     - ``mode="backtest"``：复权价空间只能用比例口径 ``cash_pct``（前复权是加性
       压缩，每股金额不可还原），金额 = cash_pct × 参照前收 × 持股数；
+    - ``mode="backtest_raw"``：不复权原始价空间（J4 exact 档），优先按每股税后
+      金额 ``cash_per_share`` 入账，缺失时回落比例口径；
     - ``mode="live"``：柜台口径只能给每股税后金额 ``cash_per_share``；
     - 对应字段缺失 → None（适配层记 skip_cash 事件，绝不猜）。
     """
@@ -168,6 +170,8 @@ def _dividend_amount(event: CorporateActionEvent, price: Optional[Decimal],
     if mode == "live":
         if event.cash_per_share is None:
             return None
+        return (event.cash_per_share * Decimal(quantity)).quantize(Decimal("0.01"))
+    if mode == "backtest_raw" and event.cash_per_share is not None:
         return (event.cash_per_share * Decimal(quantity)).quantize(Decimal("0.01"))
     if event.cash_pct is None:
         return None
@@ -187,7 +191,8 @@ def apply_day(portfolio, timeline: Optional[CorporateActionTimeline], day: date,
     """把当日公司行为落到 ``portfolio``，返回意图列表。
 
     参数：
-    - ``mode``：``backtest`` / ``live``（决定分红用比例还是每股金额口径）。
+    - ``mode``：``backtest`` / ``backtest_raw`` / ``live``（决定分红用比例还是
+      每股金额口径）。
     - ``apply_split``：False = 不手工改持仓数量（实盘交给柜台镜面），只发 split 意图。
     - ``dispose_days``：连续停牌超过 N 个交易日 → 发一次 delist_close 意图；0 = 不处置。
     - ``delist_force_close``：退市事件是否强平（False = 只发 notice）。

@@ -292,7 +292,7 @@ onMounted(load)
               <div class="field-row">
                 <span class="field-label">复权模式</span>
                 <select v-model="form.dividend_mode">
-                  <option value="front">前复权（默认）</option><option value="back">后复权</option><option value="dual">前复权+后复权记账（推荐）</option>
+                  <option value="front">前复权（默认）</option><option value="back">后复权</option><option value="dual">前复权+后复权记账（推荐）</option><option value="exact">不复权+显式公司行为（对账基准）</option>
                 </select>
               </div>
             </div>

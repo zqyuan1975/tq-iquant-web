@@ -1,4 +1,4 @@
-﻿import axios from 'axios'
+import axios from 'axios'
 
 export const api = axios.create({ baseURL: '/api' })
 
@@ -1242,7 +1242,7 @@ export interface BacktestRequest {
   name: string
   start_date: string  // YYYY-MM-DD
   end_date: string    // YYYY-MM-DD
-  dividend_mode?: 'front' | 'back' | 'dual'  // 复权模式：前复权(默认)/后复权/前复权信号+后复权记账
+  dividend_mode?: 'front' | 'back' | 'dual' | 'exact'  // 复权模式：前复权(默认)/后复权/前复权信号+后复权记账
   evaluation_profile?: 'absolute' | 'relative'  // B6 考核口径（默认 absolute）
   is_oos_gate_enabled?: boolean                 // C7 IS/OOS 采纳门槛（默认关）
   oos_gate_min_ratio?: number                   // (0,2]，默认 0.5
@@ -1305,7 +1305,7 @@ export interface WalkForwardRequest {
   train_years: number
   test_years: number
   oos_gate_min_ratio: number
-  dividend_mode: 'front' | 'back' | 'dual'
+  dividend_mode: 'front' | 'back' | 'dual' | 'exact'
   evaluation_profile: 'absolute' | 'relative'
 }
 export interface WalkForwardWindow {
@@ -1372,7 +1372,7 @@ export interface ParamPerturbRequest {
   start_date: string
   end_date: string
   perturb_pct: number  // (0,0.5]
-  dividend_mode: 'front' | 'back' | 'dual'
+  dividend_mode: 'front' | 'back' | 'dual' | 'exact'
   evaluation_profile: 'absolute' | 'relative'
 }
 export interface PerturbRoundMetrics {
@@ -1780,7 +1780,7 @@ export interface PoolCompareRequest {
   start_date: string
   end_date: string
   name_prefix?: string
-  dividend_mode?: 'front' | 'back' | 'dual'
+  dividend_mode?: 'front' | 'back' | 'dual' | 'exact'
 }
 
 export interface PoolCompareItem {

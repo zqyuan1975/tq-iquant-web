@@ -525,13 +525,15 @@ def build_klines(ps, start: date, end: date, db: Session = None,
             fetch_start = start - timedelta(days=span)
     start_str = fetch_start.strftime("%Y%m%d")
     end_str = end.strftime("%Y%m%d")
+    # J4 exact 档：不复权取数（公司行为由 corporate_actions 显式记账）
+    fetch_mode = _fetch_adjust_mode(dividend_mode)
     cache = KlineCache.from_config()
     raw_by_period: Optional[dict] = None
     if cache is not None:
         cached: Dict[str, dict] = {}
         for period in periods:
             raw = cache.load_period(
-                stocks, period, start_str, end_str, dividend_mode)
+                stocks, period, start_str, end_str, fetch_mode)
             if raw is None:
                 cached = None  # type: ignore[assignment]
                 break
@@ -540,12 +542,12 @@ def build_klines(ps, start: date, end: date, db: Session = None,
     if raw_by_period is None:
         raw_by_period = TQData().get_history_raw(
             stocks=stocks, periods=periods,
-            start=start_str, end=end_str, dividend_type=dividend_mode, count=-1,
+            start=start_str, end=end_str, dividend_type=fetch_mode, count=-1,
         )
         if cache is not None:
             for period, raw in raw_by_period.items():
                 cache.store_period(
-                    raw, stocks, period, start_str, end_str, dividend_mode)
+                    raw, stocks, period, start_str, end_str, fetch_mode)
     return _convert_market_data_multi(
         raw_by_period, stocks, stats=stats, window=(start, end))
 
@@ -560,6 +562,8 @@ def build_index_close_series(
         return {}
     start_str = start.strftime("%Y%m%d")
     end_str = end.strftime("%Y%m%d")
+    # J4 exact 档：指数同样按不复权取（无公司行为，仅口径统一）
+    fetch_mode = _fetch_adjust_mode(dividend_mode)
     chunks = ([wanted[i:i + batch_size]
                for i in range(0, len(wanted), batch_size)]
               if batch_size else [wanted])
@@ -571,7 +575,7 @@ def build_index_close_series(
                 periods=["1d"],
                 start=start_str,
                 end=end_str,
-                dividend_type=dividend_mode,
+                dividend_type=fetch_mode,
                 count=-1,
             )
         except Exception:
@@ -782,8 +786,9 @@ PARAMS_SNAPSHOT_FIELDS = (
 # 复权模式：K线/指数传 dividend_type 字符串（"front"/"back"，通达信 SDK 原样透传）；
 # 公式信号传整数（front=1/back=2）。缺省前复权，保持历史行为。
 # "dual" = 信号前复权 + 执行/记账后复权（模拟实盘口径：公式按前复权出信号、真实价成交）。
-DIVIDEND_MODES = ("front", "back", "dual")
-_FORMULA_DIVIDEND_TYPE = {"front": 1, "back": 2}
+# "exact" = 不复权取数 + 显式公司行为记账（对账基准档，默认关闭，需 J1 事件表）。
+DIVIDEND_MODES = ("front", "back", "dual", "exact")
+_FORMULA_DIVIDEND_TYPE = {"front": 1, "back": 2, "exact": 0}
 
 # J3（2026-11-18）口径显式标记：实盘 1d/1w/1mon 桥 /quote 固定 adjust=0（不复权），
 # 回测按 dividend_mode 复权 → 除权日附近同一日线公式可能给出不同信号。这是已知
@@ -4366,7 +4371,10 @@ def run_backtest(db: Session, ps: PortfolioStrategy, req,
 
     # 公司行为（J1/J2，2026-11-18）：组合开关默认关。关闭时不读事件表、不注入
     # timeline、只写显式否定值——回测执行路径与改动前逐字一致。
-    ca_enabled = bool(getattr(ps, "corporate_actions_enabled", False))
+    # J4 exact 档（opt-in）：不复权价空间必须配显式公司行为，故强制启用事件表
+    # （事件为空时等价于纯不复权，快照 event_count=0 可辨识）。
+    exact_mode = dividend_mode == "exact"
+    ca_enabled = bool(getattr(ps, "corporate_actions_enabled", False)) or exact_mode
     ca_timeline = (
         build_corporate_timeline(db, req.start_date, req.end_date)
         if ca_enabled else None
@@ -4374,6 +4382,7 @@ def run_backtest(db: Session, ps: PortfolioStrategy, req,
     ca_snapshot = {
         "version": CORPORATE_ACTION_VERSION,
         "enabled": ca_enabled,
+        "forced_by_exact_mode": exact_mode,
         "dividend_reinvest_enabled": (
             bool(getattr(ps, "dividend_reinvest_enabled", False)) if ca_enabled else False),
         "suspension_dispose_days": (
@@ -4468,6 +4477,10 @@ def run_backtest(db: Session, ps: PortfolioStrategy, req,
             portfolio.dividend_reinvest_enabled = ca_snapshot["dividend_reinvest_enabled"]
             portfolio.suspension_dispose_days = ca_snapshot["suspension_dispose_days"]
             portfolio.delist_force_close_enabled = ca_snapshot["delist_force_close_enabled"]
+            # J4：exact 档价格是未复权原始价 → 现金分红按每股派息入账（无每股
+            # 派息时才回落到比例口径），其余模式保持既有口径。
+            if exact_mode:
+                portfolio.corporate_action_mode = "backtest_raw"
         # 时点股票池（J7，默认关）：timeline 仅在有区间时注入；未注入时
         # Portfolio.pool_timeline=None → _signal_to_order 闸门整段跳过。
         if pit_timeline is not None and len(pit_timeline):
@@ -4863,7 +4876,9 @@ def run_multi_backtest(db: Session, portfolios: list, req) -> dict:
             .order_by(Strategy.id).all()
         )
         portfolio = _assemble_portfolio(ps, strategies, db)
-        ca_enabled = bool(getattr(ps, "corporate_actions_enabled", False))
+        exact_mode = dividend_mode == "exact"
+        ca_enabled = (
+            bool(getattr(ps, "corporate_actions_enabled", False)) or exact_mode)
         if ca_enabled and ca_timeline is None:
             # 事件表是全局的（按 code/ex_date 索引），一个组合启用即构建一次，
             # 各组合只作用于自己持仓的代码，共享同一 timeline 安全。
@@ -4877,6 +4892,8 @@ def run_multi_backtest(db: Session, portfolios: list, req) -> dict:
                 getattr(ps, "suspension_dispose_days", 0) or 0)
             portfolio.delist_force_close_enabled = bool(
                 getattr(ps, "delist_force_close_enabled", False))
+            if exact_mode:
+                portfolio.corporate_action_mode = "backtest_raw"
         pit_enabled = bool(getattr(ps, "pool_pit_enabled", False))
         pit_timeline = build_pool_timeline(db, ps, end_date) if pit_enabled else None
         if pit_timeline is not None and len(pit_timeline):
@@ -4993,7 +5010,10 @@ def run_multi_backtest(db: Session, portfolios: list, req) -> dict:
                     gate_summary=e["gate_summary"],
                     corporate_actions={
                         "version": CORPORATE_ACTION_VERSION,
-                        "enabled": bool(getattr(ps, "corporate_actions_enabled", False)),
+                        "enabled": (
+                            bool(getattr(ps, "corporate_actions_enabled", False))
+                            or dividend_mode == "exact"),
+                        "forced_by_exact_mode": dividend_mode == "exact",
                         "dividend_reinvest_enabled": bool(
                             getattr(ps, "dividend_reinvest_enabled", False)),
                         "suspension_dispose_days": int(

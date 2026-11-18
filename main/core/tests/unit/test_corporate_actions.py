@@ -122,6 +122,39 @@ def test_dividend_live_uses_per_share_amount():
     assert port.account.cash == cash0 + Decimal("350")
 
 
+def test_dividend_backtest_raw_prefers_per_share():
+    """J4 exact 档（不复权价空间）：优先按每股税后金额入账。"""
+    port = _portfolio()
+    cash0 = port.account.cash
+    _hold(port)
+    tl = CorporateActionTimeline([
+        CorporateActionEvent(code=STOCK, event_type="dividend",
+                             ex_date=date(2026, 7, 20),
+                             cash_per_share=Decimal("0.35"),
+                             cash_pct=Decimal("0.99")),
+    ])
+    apply_day(port, tl, date(2026, 7, 20), mode="backtest_raw",
+              price_resolver=lambda code: Decimal("10"),
+              last_action_date=date(2026, 7, 17))
+    assert port.account.cash == cash0 + Decimal("350")
+
+
+def test_dividend_backtest_raw_falls_back_to_pct():
+    """J4 exact 档缺每股金额时回落比例口径（与 backtest 相同算式）。"""
+    port = _portfolio()
+    cash0 = port.account.cash
+    _hold(port)
+    tl = CorporateActionTimeline([
+        CorporateActionEvent(code=STOCK, event_type="dividend",
+                             ex_date=date(2026, 7, 20),
+                             cash_pct=Decimal("0.01")),
+    ])
+    apply_day(port, tl, date(2026, 7, 20), mode="backtest_raw",
+              price_resolver=lambda code: Decimal("10"),
+              last_action_date=date(2026, 7, 17))
+    assert port.account.cash == cash0 + Decimal("100")
+
+
 def test_dividend_missing_field_is_skip_not_guess():
     port = _portfolio()
     cash0 = port.account.cash

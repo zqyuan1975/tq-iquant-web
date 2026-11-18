@@ -592,6 +592,29 @@ def test_build_klines_passes_dividend_mode_through(db_session, monkeypatch):
     assert calls == ["back"]
 
 
+def test_build_klines_exact_fetches_unadjusted(db_session, monkeypatch):
+    """J4 exact 档 → get_history_raw dividend_type='none'（不复权原始价空间）。"""
+    import pandas as pd
+    db = db_session
+    ps, _, _ = _seed_db(db)
+    ts = [datetime(2026, 7, 29)]
+    raw = {
+        "Open": pd.DataFrame({"000001.SZ": [10.0]}, index=ts),
+        "High": pd.DataFrame({"000001.SZ": [10.3]}, index=ts),
+        "Low": pd.DataFrame({"000001.SZ": [9.9]}, index=ts),
+        "Close": pd.DataFrame({"000001.SZ": [10.2]}, index=ts),
+        "Volume": pd.DataFrame({"000001.SZ": [1000]}, index=ts),
+        "Amount": pd.DataFrame({"000001.SZ": [10200.0]}, index=ts),
+    }
+    calls = []
+    def fake_get_history_raw(self, stocks, periods, start, end, dividend_type, count):
+        calls.append(dividend_type)
+        return {"1d": raw}
+    monkeypatch.setattr(bt_api.TQData, "get_history_raw", fake_get_history_raw)
+    bt_api.build_klines(ps, date(2026, 7, 29), date(2026, 7, 31), db, dividend_mode="exact")
+    assert calls == ["none"]
+
+
 def test_build_signal_cache_back_dividend_passes_2(db_session, monkeypatch):
     """dividend_mode='back' → TQFormula.compute dividend_type=2（后复权）。"""
     db = db_session
@@ -610,6 +633,26 @@ def test_build_signal_cache_back_dividend_passes_2(db_session, monkeypatch):
     monkeypatch.setattr(bt_api.TQFormula, "compute", fake_compute)
     bt_api.build_signal_cache(ps, klines, db, dividend_mode="back")
     assert captured["dividend_type"] == 2
+
+
+def test_build_signal_cache_exact_passes_0(db_session, monkeypatch):
+    """J4 exact 档 → TQFormula.compute dividend_type=0（不复权算信号）。"""
+    db = db_session
+    ps, _, _ = _seed_db(db)
+    klines = {"000001.SZ": {"1d": pl.DataFrame({
+        "datetime": [datetime(2026, 7, 29)],
+        "Open": [Decimal("10")], "High": [Decimal("10.3")],
+        "Low": [Decimal("9.9")], "Close": [Decimal("10.2")],
+        "Volume": [1000],
+    })}}
+    captured = {}
+    def fake_compute(self, formula_name, formula_arg, stocks, period, count, dividend_type,
+                      start_time="", end_time="", return_count=-1, return_date=True):
+        captured["dividend_type"] = dividend_type
+        return {}
+    monkeypatch.setattr(bt_api.TQFormula, "compute", fake_compute)
+    bt_api.build_signal_cache(ps, klines, db, dividend_mode="exact")
+    assert captured["dividend_type"] == 0
 
 
 def test_build_signal_cache_orchestration(db_session, monkeypatch):

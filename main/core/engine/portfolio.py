@@ -172,6 +172,9 @@ class Portfolio:
         self.dividend_reinvest_enabled: bool = False
         self.suspension_dispose_days: int = 0
         self.delist_force_close_enabled: bool = False
+        # 分红记账口径（J4，2026-11-18）：backtest=复权价 + 比例分红（默认）；
+        # backtest_raw=不复权原始价空间（exact 档），优先按每股金额入账。
+        self.corporate_action_mode: str = "backtest"
         # 当日停牌代码集合（apply_day 每日刷新）：只拦 OPEN/ADD（持仓不强平，
         # 卖出/风控照常）。默认空集合 → 闸门无任何副作用。
         self.suspended_codes: frozenset = frozenset()

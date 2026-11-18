@@ -1165,7 +1165,7 @@ async function submit() {
       name: form.value.name,
       start_date: form.value.start_date,
       end_date: form.value.end_date,
-      dividend_mode: form.value.dividend_mode as 'front' | 'back' | 'dual',
+      dividend_mode: form.value.dividend_mode as 'front' | 'back' | 'dual' | 'exact',
       evaluation_profile: form.value.evaluation_profile as 'absolute' | 'relative',
       is_oos_gate_enabled: form.value.is_oos_gate_enabled,
       oos_gate_min_ratio: Number(form.value.oos_gate_min_ratio) || 0.5,
@@ -1927,7 +1927,7 @@ async function submitCompare() {
       pool_ids: compareForm.value.pool_ids,
       start_date: compareForm.value.start_date,
       end_date: compareForm.value.end_date,
-      dividend_mode: compareForm.value.dividend_mode as 'front' | 'back' | 'dual',
+      dividend_mode: compareForm.value.dividend_mode as 'front' | 'back' | 'dual' | 'exact',
     })
     compareResult.value = res
   } catch (e) {
@@ -3405,7 +3405,9 @@ watch(theme, () => {
               <select v-model="replayForm.dividend_mode">
                 <option value="front">前复权（默认）</option>
                 <option value="back">后复权</option>
+                <option value="exact">不复权+显式公司行为（对账基准）</option>
                 <option value="dual">前复权+后复权记账</option>
+                <option value="exact">不复权+显式公司行为（对账基准）</option>
               </select>
             </div>
             <div class="field-row">
@@ -3587,6 +3589,7 @@ watch(theme, () => {
                   <option value="front">前复权（默认，通达信口径）</option>
                   <option value="back">后复权（长区间更真实、可复现）</option>
                   <option value="dual">前复权+后复权记账（推荐，模拟实盘）</option>
+                <option value="exact">不复权+显式公司行为（对账基准）</option>
                 </select>
               </div>
               <div class="field-row field-span-2">
@@ -5719,8 +5722,10 @@ watch(theme, () => {
               <label>复权模式</label>
               <select v-model="compareForm.dividend_mode">
                 <option value="dual">前复权+后复权记账（推荐，模拟实盘）</option>
+                <option value="exact">不复权+显式公司行为（对账基准）</option>
                 <option value="front">前复权（默认）</option>
                 <option value="back">后复权</option>
+                <option value="exact">不复权+显式公司行为（对账基准）</option>
               </select>
             </div>
           </div>

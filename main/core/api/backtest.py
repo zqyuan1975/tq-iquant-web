@@ -184,6 +184,7 @@ from core.services.backtest_service import (  # noqa: E402
     build_klines,
     build_benchmark_data,
     build_signal_cache,
+    DIVIDEND_MODES,
     warmup_counts_by_period,
     _convert_market_data,
     _convert_market_data_multi,
@@ -396,8 +397,8 @@ def compare_pool_robustness(req: PoolCompareRequest, db: Session = Depends(get_d
         return err(400, f"开始日期不可在未来，收到 {req.start_date}（今天 {today}）")
     if req.end_date > today:
         return err(400, f"结束日期不可在未来，收到 {req.end_date}（今天 {today}）")
-    if req.dividend_mode not in ("front", "back", "dual"):
-        return err(400, f"复权模式仅支持 front/back/dual，收到 {req.dividend_mode!r}")
+    if req.dividend_mode not in DIVIDEND_MODES:
+        return err(400, f"复权模式仅支持 {'/'.join(DIVIDEND_MODES)}，收到 {req.dividend_mode!r}")
 
     if not _try_acquire_slot():
         raise HTTPException(
@@ -496,8 +497,8 @@ def _validate_backtest_request(req: BacktestRequest) -> Optional[str]:
         return f"结束日期不可在未来，收到 {req.end_date}（今天 {today}）"
     if not req.name.strip():
         return "回测名称不能为空"
-    if req.dividend_mode not in ("front", "back", "dual"):
-        return f"复权模式仅支持 front/back/dual，收到 {req.dividend_mode!r}"
+    if req.dividend_mode not in DIVIDEND_MODES:
+        return f"复权模式仅支持 {'/'.join(DIVIDEND_MODES)}，收到 {req.dividend_mode!r}"
     if req.evaluation_profile not in ("absolute", "relative"):
         return f"评估口径仅支持 absolute/relative，收到 {req.evaluation_profile!r}"
     # C7：门槛比例须在 [0.1, 2]（<0.1 过松失意义，>2 要求 OOS 两倍于 IS 已失合理性）
@@ -573,8 +574,8 @@ def _validate_multi_request(req: MultiBacktestRequest) -> Optional[str]:
         return f"开始日期不可在未来，收到 {req.start_date}（今天 {today}）"
     if req.end_date > today:
         return f"结束日期不可在未来，收到 {req.end_date}（今天 {today}）"
-    if req.dividend_mode not in ("front", "back", "dual"):
-        return f"复权模式仅支持 front/back/dual，收到 {req.dividend_mode!r}"
+    if req.dividend_mode not in DIVIDEND_MODES:
+        return f"复权模式仅支持 {'/'.join(DIVIDEND_MODES)}，收到 {req.dividend_mode!r}"
     if req.evaluation_profile not in ("absolute", "relative"):
         return f"评估口径仅支持 absolute/relative，收到 {req.evaluation_profile!r}"
     if req.daily_loss_basis not in (None, "equity", "initial"):
@@ -661,8 +662,8 @@ def _validate_walk_forward_request(req: WalkForwardRequest) -> Optional[str]:
         return f"开始日期不可在未来，收到 {req.start_date}（今天 {today}）"
     if req.end_date > today:
         return f"结束日期不可在未来，收到 {req.end_date}（今天 {today}）"
-    if req.dividend_mode not in ("front", "back", "dual"):
-        return f"复权模式仅支持 front/back/dual，收到 {req.dividend_mode!r}"
+    if req.dividend_mode not in DIVIDEND_MODES:
+        return f"复权模式仅支持 {'/'.join(DIVIDEND_MODES)}，收到 {req.dividend_mode!r}"
     if req.evaluation_profile not in ("absolute", "relative"):
         return f"评估口径仅支持 absolute/relative，收到 {req.evaluation_profile!r}"
     if req.train_years < 1:
@@ -737,8 +738,8 @@ def _validate_param_perturb_request(req: ParamPerturbRequest) -> Optional[str]:
         return f"开始日期不可在未来，收到 {req.start_date}（今天 {today}）"
     if req.end_date > today:
         return f"结束日期不可在未来，收到 {req.end_date}（今天 {today}）"
-    if req.dividend_mode not in ("front", "back", "dual"):
-        return f"复权模式仅支持 front/back/dual，收到 {req.dividend_mode!r}"
+    if req.dividend_mode not in DIVIDEND_MODES:
+        return f"复权模式仅支持 {'/'.join(DIVIDEND_MODES)}，收到 {req.dividend_mode!r}"
     if req.evaluation_profile not in ("absolute", "relative"):
         return f"评估口径仅支持 absolute/relative，收到 {req.evaluation_profile!r}"
     # 扰动幅度上限 50%：再大已不是"微"扰，且 int 参数缩放失真严重

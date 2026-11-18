@@ -204,6 +204,59 @@ def test_post_backtest_back_dividend_mode_threaded(client, monkeypatch):
     db.close()
 
 
+def test_post_backtest_exact_mode_forces_corporate_actions(client, monkeypatch):
+    """J4 exact 档：接受该模式、强制启用公司行为并冻结口径（默认档行为不变）。"""
+    c, Session = client
+    db = Session()
+    ps_id, _, _ = _seed(db)
+    db.close()
+
+    seen = {}
+
+    def _fake_klines(ps, start, end, db=None, dividend_mode="front", **kw):
+        seen["klines"] = dividend_mode
+        return _mock_klines()
+
+    def _fake_cache(ps, klines, db=None, start=None, diagnostics=None, dividend_mode="front"):
+        seen["cache"] = dividend_mode
+        return {}
+
+    def _fake_bench(ps, start, end, db=None, dividend_mode="front"):
+        seen["bench"] = dividend_mode
+        return {}
+
+    monkeypatch.setattr(svc, "build_klines", _fake_klines)
+    monkeypatch.setattr(svc, "build_signal_cache", _fake_cache)
+    monkeypatch.setattr(svc, "build_benchmark_data", _fake_bench)
+
+    payload = {
+        "portfolio_strategy_id": ps_id,
+        "name": "bt_exact",
+        "start_date": "2026-07-29",
+        "end_date": "2026-07-31",
+        "dividend_mode": "exact",
+    }
+    resp = c.post("/api/backtest", json=payload)
+    assert resp.status_code == 200
+    assert resp.json()["code"] == 0
+    assert seen == {"klines": "exact", "cache": "exact", "bench": "exact"}
+
+    record_id = resp.json()["data"]["record_id"]
+    db = Session()
+    rec = db.get(BacktestRecord, record_id)
+    snap = json.loads(rec.params_snapshot)
+    assert snap["dividend_mode"] == "exact"
+    assert snap["fee_threshold_basis"] == "raw_price_space_v1"
+    caliber = snap["price_caliber"]
+    assert caliber["backtest_fetch_adjust"] == "none"
+    assert caliber["aligned_with_live"] is True
+    ca = snap["corporate_actions"]
+    assert ca["enabled"] is True
+    assert ca["forced_by_exact_mode"] is True
+    assert ca["event_count"] == 0
+    db.close()
+
+
 def test_post_backtest_invalid_dividend_mode_returns_400(client):
     c, Session = client
     db = Session()
