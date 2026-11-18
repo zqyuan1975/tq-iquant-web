@@ -195,6 +195,9 @@ _MIN_TRADE_PRICE = Decimal("0.01")
 # 收盘的「停牌/上市前」补行整行剔除，不参与成交/估值/日快照。写入 params_snapshot，
 # 旧结果（含假 bar）不与新结果混比。
 NO_TRADE_BAR_POLICY = "drop_volume0_carryforward_v1"
+# N1 多组合回测口径版本：共用「资金审批内核」（cash_allocator，80% 门槛、不做等比
+# 缩量），各组合虚拟现金独立、不跨组合划转。分配语义一变必须改版本号并判废旧结果。
+MULTI_PORTFOLIO_VERSION = "shared_cash_allocator_v1"
 
 
 def _to_decimal(val) -> Decimal:
@@ -4185,14 +4188,15 @@ def aggregate_run_group(per_portfolio: dict, initial_total: Decimal) -> dict:
 
 
 def run_multi_backtest(db: Session, portfolios: list, req) -> dict:
-    """多组合组合回测（N1，2026-11-18）：共享现金池 + 统一逐笔资金审批。
+    """多组合组合回测（N1，2026-11-18）：单时间轴多组合 + 统一资金审批内核。
 
     与 ``run_backtest`` 的关系：单组合路径**完全不走这里**（``run`` 与
     ``run_backtest`` 未改默认行为）。差异只有「资金」一层：
     ``BacktestEngine.run_multi`` 在同一时间轴上驱动多个 Portfolio，各组合保留
-    自己的 ``Account``，但审批用「共享可用额」（Σ cash − Σ 在途 BUY 金额），
-    新买单统一过 ``cash_allocator.allocate_batch_buys``（80% 门槛、不做等比
-    缩量），成交时跨组合转账保持 Σ 现金守恒。
+    自己的 ``Account``（虚拟现金独立、**不跨组合划转**——划转会让出资组合的
+    虚拟净值凭空下跌，构成假回撤），买单统一过
+    ``cash_allocator.allocate_batch_buys``（按请求顺序串行审批、80% 门槛、
+    不做等比缩量），与实盘共用同一份资金审批内核。
 
     落库：一个 ``backtest_run_group`` + 每组合一条 ``backtest_records``
     （``run_group_id`` 关联），聚合曲线写 ``aggregate_json``。
@@ -4321,6 +4325,10 @@ def run_multi_backtest(db: Session, portfolios: list, req) -> dict:
             "execution": exec_snapshot,
             "portfolios": [e["ps"].id for e in entries],
             "initial_capital": str(initial_total),
+            # N1 口径标记：多组合共用「资金审批内核」（cash_allocator），但各组合
+            # 虚拟现金独立、不跨组合划转；算法语义一变必须改版本号。
+            "multi_portfolio": True,
+            "multi_portfolio_version": MULTI_PORTFOLIO_VERSION,
         }, ensure_ascii=False, sort_keys=True),
     )
     db.add(group)

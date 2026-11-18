@@ -188,6 +188,16 @@ Web 前端 (Vue 3 + Vite + Pinia) ←HTTP/SSE→ Core (FastAPI)
 
 **N1 执行档位**：`core/engine/execution_profile.py`（`EXECUTION_PROFILE_VERSION="execution_profile_v1"`）；`legacy`（默认，旧成交口径）/ `realistic`（涨跌停校验 + 成交量约束 10% + 自适应滑点 + 日终抬峰），逐开关 `partial_fill_enabled` / `first_bar_no_fill` 可覆盖（**默认 false**）。`partial_fill` **只作用于 BUY**（卖出残量仍走既有顺延/超时撤单）。档位写 `params_snapshot.execution` 并进增量指纹 `execution` 分项（切档位判废旧接缝，不自动重建）。缺省值必须与改动前逐字一致——回归基线是「不传任何新参数时结果与旧版相同」。
 
+## 半自动审批队列与人工操作（2026-11-18）
+
+- **M1 审批队列（默认关闭）**：`live_sessions.execution_mode="manual"` 时，买入信号在 `LiveEngine._submit_one_order` 的「① 审批+拆单+落库注册」之前写入 `live_approval_queue`（pending，`expires_at=now+approval_ttl_seconds`）并返回，**不写 `live_orders`**；`alert`/`auto` 会话入队分支第一行即返回，行为与改动前逐字一致。`GET|POST /api/live/sessions/{id}/approvals[/{aid}/approve|reject]`，未运行会话返回 409。
+- **豁免口径**：风控信号（止损/止盈/移动止损）与 `CLOSE`/`REDUCE` **永不入队**（人工延迟止损不可接受）；其余卖出按 `tq_trade.approval_exempt_sells`（默认 `true`）。人工补单（`_manual_order`）、拆单子单、追价重下、批准回放（`_approval_passed`）均不重复入队。
+- **批准 = 以当下重走全部闸门**：重建 `OrderEvent(bar_time=now, signal_bar_date=行内原值, period=行内周期)` 调 `_submit_one_order`（资金/在途/槽位/T+1/涨跌停/拆单/bought_today 全生效）；`signal_bar_date` **必须随行落库**——按 `bar_time.date()` 重建会把 15:05 日线信号误顺延次日、分钟信号误当每日信号。过期 → `expired`；`stop()` 把 pending 置 `dropped`（重启不重放）；`recover()` 只告警残留 pending 计数。
+- **I1 人工补单/平仓/改账**（`live_manual_actions` 审计，`tq_trade.manual_order_max_amount` 默认 0 不限、`manual_action_min_interval_ms` 默认 1000）：
+  - `submit_manual_order` 仅 `manual` 会话开放；`_manual_order=True` → 不入审批队列、不参与 `bought_today` 信号级排重、**不让价**（人工定价原样报出），但仍走全部闸门与拆单/落库链；归因策略 = 请求 `strategy_id` 或组合内第一个策略。
+  - `force_close_position` 按虚拟持仓全额 SELL CLOSE，**不绕过 `live_sell_scope`**（`platform_only` 下纯外部仓 409 + `blocked` 审计）。
+  - 现金改账复用 `record_cash_flow`（运行中即时生效）；**持仓改账仅停止的会话**：写一条合成 `live_trades`（`live_order_id=NULL`、费用 0），重启 `recover` 重放即生效——虚拟持仓/现金的唯一权威来源就是 `live_trades` 重放，新增账本会造成双口径。
+
 ## 模块复用
 
 引擎层核心逻辑（风控、信号优先级排序、资金审批、持仓更新）回测/实盘共用，集中在 `portfolio.py`/`risk_manager.py`/`strategy_context.py`。实盘独有逻辑（对账告警、熔断次日恢复、SSE 事件流、周期边界 1m/1d 14:30/1w·1mon 处理）在 `live_engine.py`。差异通过策略模式隔离下单与 T+1 检查：

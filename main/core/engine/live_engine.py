@@ -124,6 +124,7 @@ from core.models import (
     LiveDecisionEvent, LiveBarOrderMark, LiveOrder, LivePositionPeak,
     LiveSession, LiveSessionPortfolio, LiveSignal, LiveTrade,
     LiveCorporateAction,
+    LiveApprovalQueue, LiveManualAction,
 )
 from core.tq.formula import TQFormula
 from core.tq.utils import TDXLockTimeout
@@ -212,6 +213,18 @@ def _allocate_proportional(weights: list, total: int) -> list:
     for i in range(remainder):
         alloc[order[i % len(order)]] += 1
     return alloc
+
+
+class ManualActionError(RuntimeError):
+    """I1 人工操作被拒（携带建议 HTTP 状态码，路由层直接映射）。
+
+    - 400 参数/额度非法；409 会话状态或组合/持仓不允许；
+    - 429 操作过于频繁（防误触连点）。
+    """
+
+    def __init__(self, message: str, http_status: int = 400):
+        super().__init__(message)
+        self.http_status = http_status
 
 
 def _expected_minute_labels(start: Optional[datetime],
@@ -724,6 +737,13 @@ class LiveEngine:
         )
         # alert/auto mode
         self.execution_mode = execution_mode
+        # M1 半自动审批队列（2026-11-18）：manual 模式下开仓类新单不直接下发，
+        # 先入 live_approval_queue 等人工批准。配置惰性读取（缺键回退默认）。
+        self._approval_cfg_cache: Optional[dict] = None
+        # 批准路径最近一次真正提交的 live_orders.id（None=被闸门拦下）
+        self._approval_submitted_id: Optional[int] = None
+        # 人工操作节流：action_type -> 上次成功时刻（monotonic）
+        self._manual_last_at: Dict[str, float] = {}
         self._formula_id_by_strategy = formula_id_by_strategy or {}
         self._tq_alert = None
         self._signal_monitor = signal_monitor
@@ -1550,6 +1570,9 @@ class LiveEngine:
                 attempted, kept, self.session_id,
             )
         self._signal_bar_deferred.clear()
+        # M1：停会话作废未审批单（status=dropped）——批准动作依赖运行中实例，
+        # 重启不重放（旧待批单可能已过时效/价格环境已变，宁可作废让人重新决策）。
+        self._drop_pending_approvals()
         # 批次2：清空拆单队列。在途子单（已落库 submitted）由 I-3 stop 撤单与
         # 超时撤单兜底；未提交子单不落库，随队列丢弃（预期行为）。
         # P1#2（2026-11-16）：旧实现只打一行 INFO 就 clear，工作台完全看不出
@@ -2150,6 +2173,9 @@ class LiveEngine:
             db_tick = self._db_session_factory()
             try:
                 _seg("sweep_timeout", lambda: self._sweep_timeout_orders(db_tick))
+                # M1 半自动审批队列：超时未批准的开仓单转 expired（60s 节拍）。
+                # 只在 manual 模式有队列；方法自身按表查询、无行即返回。
+                _seg("expire_approvals", lambda: self._expire_approvals(db_tick))
             except Exception:  # noqa: BLE001
                 db_tick.rollback()
                 logger.exception("expire stale orders error (session %s)", self.session_id)
@@ -5160,6 +5186,10 @@ class LiveEngine:
             return
         if getattr(order, "_pre_open_bar_time", None) is not None:
             return
+        # I1（2026-11-18）：人工补单是「人已定价」的显式指令，不让价（让价属策略
+        # 提交口径，人工单按填写价/实时价原样报出，避免人以为报了 A 价实际报 A+1 跳）。
+        if getattr(order, "_manual_order", False):
+            return
         period = self._order_period(portfolio, order)
         if period and period.lower() in _DAILY_PERIODS:
             return
@@ -6287,6 +6317,551 @@ class LiveEngine:
                     continue
                 self._signal_bar_deferred.append(order)
 
+    # ------------------------------------------------------------------ M1 审批队列
+    def _is_manual_mode(self) -> bool:
+        return (self.execution_mode or "").strip().lower() == "manual"
+
+    def _approval_cfg(self) -> dict:
+        """审批/人工操作配置（tq_trade 段，缺键回退默认；解析失败不抛异常）。"""
+        if self._approval_cfg_cache is not None:
+            return self._approval_cfg_cache
+        tq = (load_config() or {}).get("tq_trade") or {}
+        if not isinstance(tq, dict):
+            tq = {}
+        try:
+            ttl = float(tq.get("approval_ttl_seconds") or 900)
+        except (TypeError, ValueError):
+            ttl = 900.0
+        try:
+            max_amount = Decimal(str(tq.get("manual_order_max_amount") or 0))
+        except (ArithmeticError, TypeError, ValueError):
+            max_amount = Decimal("0")
+        try:
+            interval_ms = int(tq.get("manual_action_min_interval_ms") or 1000)
+        except (TypeError, ValueError):
+            interval_ms = 1000
+        self._approval_cfg_cache = {
+            "ttl_seconds": ttl if ttl > 0 else 900.0,
+            # 卖出是否整体豁免审批（默认 true：人为延迟止损等于让风控失效）
+            "exempt_sells": bool(tq.get("approval_exempt_sells", True)),
+            # 人工补单单笔金额上限（<=0 不限）
+            "manual_max_amount": max_amount if max_amount > 0 else Decimal("0"),
+            # 同名人工操作最小间隔（毫秒，防误触连点）
+            "min_interval_ms": interval_ms if interval_ms >= 0 else 0,
+        }
+        return self._approval_cfg_cache
+
+    def _approval_exempt(self, order: OrderEvent) -> bool:
+        """不需要人工批准的订单：风控卖出 / CLOSE / REDUCE；可配全部卖出豁免。
+
+        买入（OPEN/ADD）一律要批——半自动的语义就是「开仓由人把关」。
+        """
+        if order.trade_type != TradeType.SELL:
+            return False
+        if order.signal_type in (
+                SignalType.STOP_LOSS, SignalType.TAKE_PROFIT,
+                SignalType.TRAILING_STOP, SignalType.CLOSE, SignalType.REDUCE):
+            return True
+        return bool(self._approval_cfg()["exempt_sells"])
+
+    def _enqueue_approval(self, db: Session, portfolio: Portfolio,
+                          order: OrderEvent, period: Optional[str]) -> None:
+        """把已过全部非资金闸门的开仓单写进 live_approval_queue（不落 live_orders）。
+
+        批准时以「当下」重走完整闸门链（含资金），所以这里只记录信号意图与目标量。
+        """
+        cfg = self._approval_cfg()
+        now = self.ctx.clock()
+        row = LiveApprovalQueue(
+            live_session_id=self.session_id,
+            portfolio_strategy_id=portfolio.portfolio_id,
+            strategy_id=order.strategy_id,
+            stock_code=order.stock_code,
+            trade_type=order.trade_type.value,
+            price=order.price,
+            quantity=int(order.quantity or 0),
+            signal_type=(order.signal_type.value if order.signal_type else None),
+            signal_name=(order.signal_name or None),
+            period=period,
+            bar_time=order.bar_time,
+            signal_bar_date=getattr(order, "signal_bar_date", None),
+            status="pending",
+            expires_at=now + timedelta(seconds=cfg["ttl_seconds"]),
+            created_at=now,
+        )
+        try:
+            db.add(row)
+            db.commit()
+            db.refresh(row)
+        except Exception:  # noqa: BLE001 — 多为未执行迁移
+            db.rollback()
+            logger.exception("approval: 入队失败（未执行迁移？）session=%s",
+                             self.session_id)
+            self._emit_risk_safe({
+                "gate": "approval_queue", "rule": "approval_queue",
+                "level": "error", "portfolio_id": portfolio.portfolio_id,
+                "stock_code": order.stock_code,
+                "message": "审批队列不可用：请先执行数据库迁移（alembic upgrade head）",
+            }, persist=True)
+            return
+        self._emit_risk_safe({
+            "gate": "approval_queue", "rule": "approval_queue",
+            "action": "queue", "level": "info",
+            "portfolio_id": portfolio.portfolio_id,
+            "strategy_id": order.strategy_id,
+            "stock_code": order.stock_code,
+            "approval_id": row.id,
+            "requested_qty": int(order.quantity or 0),
+            "message": "半自动模式：开仓单已进入审批队列（%d 秒内有效）"
+                       % int(cfg["ttl_seconds"]),
+        }, persist=False)
+        logger.info("[approval] queued id=%s %s %s %s股",
+                    row.id, order.stock_code, order.trade_type.value,
+                    order.quantity)
+
+    def list_approvals(self) -> list:
+        """当前会话待批队列（按创建时间升序）。"""
+        db = self._db_session_factory()
+        try:
+            rows = (
+                db.query(LiveApprovalQueue)
+                .filter_by(live_session_id=self.session_id, status="pending")
+                .order_by(LiveApprovalQueue.id)
+                .all()
+            )
+            return [self.serialize_approval(r) for r in rows]
+        finally:
+            db.close()
+
+    @staticmethod
+    def serialize_approval(row) -> dict:
+        return {
+            "id": row.id,
+            "portfolio_strategy_id": row.portfolio_strategy_id,
+            "strategy_id": row.strategy_id,
+            "stock_code": row.stock_code,
+            "trade_type": row.trade_type,
+            "price": (None if row.price is None else float(row.price)),
+            "quantity": row.quantity,
+            "signal_type": row.signal_type,
+            "signal_name": row.signal_name,
+            "period": row.period,
+            "bar_time": (None if row.bar_time is None else row.bar_time.isoformat()),
+            "signal_bar_date": (None if row.signal_bar_date is None
+                                else row.signal_bar_date.isoformat()),
+            "status": row.status,
+            "reason": row.reason,
+            "expires_at": (None if row.expires_at is None
+                           else row.expires_at.isoformat()),
+            "created_at": (None if row.created_at is None
+                           else row.created_at.isoformat()),
+        }
+
+    def _approval_portfolio(self, portfolio_id: int) -> Optional[Portfolio]:
+        for p in self.portfolios:
+            if p.portfolio_id == portfolio_id:
+                return p
+        return None
+
+    def approve_approval(self, approval_id: int) -> dict:
+        """批准一条审批单：以当下时间重建订单并**重走全部闸门**后提交。
+
+        返回 ``{"status": approved|rejected|expired|blocked, ...}``。
+        """
+        db = self._db_session_factory()
+        try:
+            row = db.get(LiveApprovalQueue, approval_id)
+            if row is None or row.live_session_id != self.session_id:
+                raise LookupError("审批单不存在")
+            if row.status != "pending":
+                raise ValueError("审批单状态为 %s，不可再批准" % row.status)
+            now = self.ctx.clock()
+            if row.expires_at is not None and now > row.expires_at:
+                row.status = "expired"
+                row.reason = "超过审批时限"
+                row.decided_at = now
+                db.commit()
+                return {"status": "expired", "approval_id": approval_id}
+            portfolio = self._approval_portfolio(row.portfolio_strategy_id)
+            if portfolio is None:
+                raise ValueError("组合不在本会话运行实例中，请停止后重新启动会话")
+            signal_type = (
+                SignalType(row.signal_type) if row.signal_type else SignalType.OPEN)
+            order = OrderEvent(
+                strategy_id=row.strategy_id,
+                portfolio_id=row.portfolio_strategy_id,
+                stock_code=row.stock_code,
+                trade_type=TradeType(row.trade_type),
+                signal_type=signal_type,
+                quantity=int(row.quantity or 0),
+                price=(Decimal(str(row.price)) if row.price is not None else None),
+                # 批准即「当下」下单：bar_time 用当前时刻，信号日保留用于 B-1 判定
+                bar_time=now,
+                signal_name=(row.signal_name or ""),
+                signal_bar_date=row.signal_bar_date,
+                period=row.period,
+            )
+            order._approval_passed = True
+            self._approval_submitted_id = None
+            self._submit_one_order(db, portfolio, order, row.period,
+                                   emit_signal=False)
+            submitted_id = self._approval_submitted_id
+            row.decided_at = now
+            if submitted_id is None:
+                row.status = "rejected"
+                row.reason = "已批准，但重走闸门未通过（详见决策事件）"
+            else:
+                row.status = "approved"
+                row.reason = None
+            db.commit()
+            return {
+                "status": row.status,
+                "approval_id": approval_id,
+                "live_order_id": submitted_id,
+                "reason": row.reason,
+            }
+        finally:
+            db.close()
+
+    def reject_approval(self, approval_id: int, reason: Optional[str] = None) -> dict:
+        """拒绝一条审批单（幂等：非 pending 状态直接报错，不改历史）。"""
+        db = self._db_session_factory()
+        try:
+            row = db.get(LiveApprovalQueue, approval_id)
+            if row is None or row.live_session_id != self.session_id:
+                raise LookupError("审批单不存在")
+            if row.status != "pending":
+                raise ValueError("审批单状态为 %s，不可再拒绝" % row.status)
+            row.status = "rejected"
+            row.reason = (reason or "人工拒绝")[:200]
+            row.decided_at = self.ctx.clock()
+            db.commit()
+            logger.info("[approval] rejected id=%s reason=%s", approval_id, row.reason)
+            return {"status": "rejected", "approval_id": approval_id}
+        finally:
+            db.close()
+
+    def _expire_approvals(self, db: Session) -> int:
+        """超时审批单转 expired（主循环调用；整批一条日志，不刷屏）。"""
+        now = self.ctx.clock()
+        try:
+            rows = (
+                db.query(LiveApprovalQueue)
+                .filter(LiveApprovalQueue.live_session_id == self.session_id,
+                        LiveApprovalQueue.status == "pending",
+                        LiveApprovalQueue.expires_at < now)
+                .all()
+            )
+            if not rows:
+                return 0
+            for row in rows:
+                row.status = "expired"
+                row.reason = "超过审批时限"
+                row.decided_at = now
+            db.commit()
+            logger.warning("[approval] %d 条审批单超时失效（session %s）",
+                           len(rows), self.session_id)
+            return len(rows)
+        except Exception:  # noqa: BLE001
+            db.rollback()
+            logger.exception("[approval] 超时清理失败（session %s）", self.session_id)
+            return 0
+
+    def _drop_pending_approvals(self) -> None:
+        """停止会话：清空待批队列（dropped），重启不重放。"""
+        if self._db_session_factory is None:  # 单测/无库实例（stop 不受影响）
+            return
+        db = self._db_session_factory()
+        if db is None:  # 测试里 factory 是 Mock → 返回 None，不做队列清理
+            return
+        try:
+            rows = (
+                db.query(LiveApprovalQueue)
+                .filter_by(live_session_id=self.session_id, status="pending")
+                .all()
+            )
+            if not rows:
+                return
+            now = self.ctx.clock()
+            for row in rows:
+                row.status = "dropped"
+                row.reason = "会话已停止，未审批单作废"
+                row.decided_at = now
+            db.commit()
+            logger.warning("[approval] 停止会话：%d 条未审批单作废（session %s）",
+                           len(rows), self.session_id)
+        except Exception:  # noqa: BLE001
+            db.rollback()
+            logger.exception("[approval] 停止清理失败（session %s）", self.session_id)
+        finally:
+            db.close()
+
+    def _count_pending_approvals(self) -> int:
+        if self._db_session_factory is None:
+            return 0
+        db = self._db_session_factory()
+        try:
+            return (
+                db.query(LiveApprovalQueue)
+                .filter_by(live_session_id=self.session_id, status="pending")
+                .count()
+            )
+        except Exception:  # noqa: BLE001
+            return 0
+        finally:
+            db.close()
+
+    # ------------------------------------------------------- I1 人工补单 / 强平
+    def _manual_ctx(self, portfolio: Portfolio,
+                    strategy_id: Optional[int] = None):
+        """人工操作归因的策略上下文：显式 strategy_id 优先，否则组合内第一个策略。"""
+        if strategy_id is not None:
+            ctx = portfolio.find_strategy(int(strategy_id))
+            if ctx is None:
+                raise ManualActionError(
+                    "strategy_id=%s 不属于组合 %s" % (strategy_id, portfolio.portfolio_id))
+            return ctx
+        strategies = list(getattr(portfolio, "strategies", None) or [])
+        if not strategies:
+            raise ManualActionError(
+                "组合 %s 内没有可用策略，无法归因人工单" % portfolio.portfolio_id, 409)
+        return strategies[0]
+
+    def _manual_throttle(self, key: str) -> None:
+        """同名人工操作最小间隔（`manual_action_min_interval_ms`，<=0 不限制）。"""
+        interval_ms = int(self._approval_cfg().get("min_interval_ms") or 0)
+        if interval_ms <= 0:
+            return
+        now = time.monotonic()
+        last = self._manual_last_at.get(key)
+        if last is not None and (now - last) * 1000.0 < interval_ms:
+            raise ManualActionError(
+                "人工操作过于频繁（同一操作最小间隔 %d ms），请稍后重试" % interval_ms, 429)
+        self._manual_last_at[key] = now
+
+    def _manual_price(self, portfolio: Portfolio, code: str,
+                      price, trade_type: TradeType) -> Decimal:
+        """人工单价格：显式价格优先；缺省取最后已知价（持仓/快照），都缺则拒绝。"""
+        if price is not None:
+            try:
+                px = Decimal(str(price))
+            except (ArithmeticError, TypeError, ValueError):
+                raise ManualActionError("price 非法：%r" % (price,))
+            if not px.is_finite() or px <= 0:
+                raise ManualActionError("price 必须为正数：%r" % (price,))
+            return px
+        ctx = None
+        for strategy in getattr(portfolio, "strategies", None) or []:
+            pos = (getattr(strategy, "positions", None) or {}).get(code)
+            if pos is not None:
+                ctx = strategy
+                break
+        px = portfolio._resolve_price(code, pos if ctx is not None else None) \
+            if hasattr(portfolio, "_resolve_price") else None
+        if px is None or px <= 0:
+            raise ManualActionError("缺少 %s 的可用价格，请显式传 price" % code)
+        return Decimal(px)
+
+    def _record_manual_action(
+        self, *, action_type: str, portfolio_id: int,
+        stock_code: Optional[str] = None, trade_type: Optional[str] = None,
+        quantity: Optional[int] = None, price: Optional[Decimal] = None,
+        result: str = "accepted", live_order_id: Optional[int] = None,
+        cash_delta: Optional[Decimal] = None, reason: Optional[str] = None,
+    ) -> None:
+        """写 `live_manual_actions` 审计行（含被拦下的尝试）；失败只告警。"""
+        db = self._db_session_factory()
+        try:
+            db.add(LiveManualAction(
+                live_session_id=self.session_id,
+                portfolio_strategy_id=portfolio_id,
+                action_type=action_type,
+                stock_code=stock_code,
+                trade_type=(trade_type.value if isinstance(trade_type, TradeType)
+                            else trade_type),
+                quantity=quantity,
+                price=price,
+                result=result,
+                live_order_id=live_order_id,
+                cash_delta=cash_delta,
+                reason=(str(reason)[:200] if reason else None),
+            ))
+            db.commit()
+        except Exception:  # noqa: BLE001 — 审计失败绝不改变交易结果
+            db.rollback()
+            logger.warning("live_manual_actions 写入失败 action=%s (session %s)",
+                           action_type, self.session_id, exc_info=True)
+        finally:
+            db.close()
+
+    def submit_manual_order(self, portfolio_id: int, stock_code: str,
+                            trade_type, quantity: int,
+                            price=None, strategy_id: Optional[int] = None,
+                            note: Optional[str] = None) -> dict:
+        """I1 人工补单：走与策略单相同的提交链（闸门/去重/资金/T+1 全生效）。
+
+        仅在 `execution_mode=manual` 的会话开放（半自动会话的「人工补一手」）；
+        单笔金额上限 `tq_trade.manual_order_max_amount`（<=0 不限），同名操作
+        最小间隔 `tq_trade.manual_action_min_interval_ms`。人工单不参与
+        bought_today 信号级排重、不让价（`_manual_order` 标记）。
+        """
+        if not self._is_manual_mode():
+            raise ManualActionError(
+                "人工补单仅在 execution_mode=manual 的会话可用", 409)
+        portfolio = self._approval_portfolio(portfolio_id)
+        if portfolio is None:
+            raise ManualActionError("组合 %s 不在本会话运行实例中" % portfolio_id, 409)
+        code = str(stock_code or "").strip().upper()
+        if not code:
+            raise ManualActionError("stock_code 不能为空")
+        try:
+            tt = TradeType(str(trade_type or "").strip().upper())
+        except ValueError:
+            raise ManualActionError("trade_type 仅支持 BUY/SELL")
+        try:
+            qty = int(quantity or 0)
+        except (TypeError, ValueError):
+            raise ManualActionError("quantity 非法：%r" % (quantity,))
+        if qty <= 0:
+            raise ManualActionError("quantity 必须为正整数")
+        ctx = self._manual_ctx(portfolio, strategy_id)
+        px = self._manual_price(portfolio, code, price, tt)
+        max_amount = self._approval_cfg()["manual_max_amount"]
+        if max_amount > 0 and px * Decimal(qty) > max_amount:
+            self._record_manual_action(
+                action_type="manual_order", portfolio_id=portfolio_id,
+                stock_code=code, trade_type=tt, quantity=qty, price=px,
+                result="rejected",
+                reason="单笔金额 %s 超过上限 %s" % (px * Decimal(qty), max_amount))
+            raise ManualActionError(
+                "人工单金额 %s 超过上限 %s（tq_trade.manual_order_max_amount）"
+                % (px * Decimal(qty), max_amount), 400)
+        self._manual_throttle("order:%s" % portfolio_id)
+        order = OrderEvent(
+            strategy_id=ctx.strategy_id,
+            portfolio_id=portfolio_id,
+            stock_code=code,
+            trade_type=tt,
+            signal_type=(SignalType.CLOSE if tt == TradeType.SELL
+                         else SignalType.OPEN),
+            quantity=qty,
+            price=px,
+            bar_time=self.ctx.clock(),
+            signal_name="manual",
+            period=None,
+        )
+        order._manual_order = True
+        db = self._db_session_factory()
+        try:
+            self._submit_one_order(db, portfolio, order, period=None,
+                                   emit_signal=False)
+        except ManualActionError:
+            raise
+        except Exception as exc:  # noqa: BLE001 — 交给路由层转 500
+            self._record_manual_action(
+                action_type="manual_order", portfolio_id=portfolio_id,
+                stock_code=code, trade_type=tt, quantity=qty, price=px,
+                result="rejected", reason="提交异常: %s: %s"
+                % (type(exc).__name__, exc))
+            raise
+        finally:
+            db.close()
+        order_id = getattr(order, "_live_order_id", None)
+        status = "accepted" if order_id else "blocked"
+        self._record_manual_action(
+            action_type="manual_order", portfolio_id=portfolio_id,
+            stock_code=code, trade_type=tt, quantity=qty, price=px,
+            result=status, live_order_id=order_id,
+            reason=(note if order_id else "提交链闸门拦截（详见决策事件）"))
+        return {
+            "status": status,
+            "live_order_id": order_id,
+            "stock_code": code,
+            "trade_type": tt.value,
+            "quantity": qty,
+            "price": str(px),
+            "strategy_id": ctx.strategy_id,
+        }
+
+    def force_close_position(self, portfolio_id: int, stock_code: str,
+                             strategy_id: Optional[int] = None,
+                             price=None, note: Optional[str] = None) -> dict:
+        """I1 人工平仓：按虚拟持仓全额生成 SELL CLOSE 单（T+1 由提交链收窄）。
+
+        `live_sell_scope=platform_only` 下纯外部仓（platform_quantity<=0）拒绝——
+        与策略卖单同一口径，人工也不能绕过该配置（要卖请先改配置或在柜台操作）。
+        """
+        portfolio = self._approval_portfolio(portfolio_id)
+        if portfolio is None:
+            raise ManualActionError("组合 %s 不在本会话运行实例中" % portfolio_id, 409)
+        code = str(stock_code or "").strip().upper()
+        if not code:
+            raise ManualActionError("stock_code 不能为空")
+        ctx = self._manual_ctx(portfolio, strategy_id)
+        pos = (getattr(ctx, "positions", None) or {}).get(code)
+        if pos is None or int(getattr(pos, "quantity", 0) or 0) <= 0:
+            self._record_manual_action(
+                action_type="force_close", portfolio_id=portfolio_id,
+                stock_code=code, trade_type="SELL", quantity=0,
+                result="rejected", reason="该组合策略无持仓")
+            raise ManualActionError(
+                "组合 %s 策略 %s 无 %s 持仓" % (portfolio_id, ctx.strategy_id, code), 409)
+        if (getattr(portfolio, "sell_scope", "full") == "platform_only"
+                and int(getattr(pos, "platform_quantity", 0) or 0) <= 0):
+            self._record_manual_action(
+                action_type="force_close", portfolio_id=portfolio_id,
+                stock_code=code, trade_type="SELL", quantity=int(pos.quantity),
+                result="blocked",
+                reason="live_sell_scope=platform_only：纯外部仓不代卖")
+            raise ManualActionError(
+                "live_sell_scope=platform_only：%s 为纯外部仓，不代卖" % code, 409)
+        qty = int(pos.quantity)
+        self._manual_throttle("close:%s:%s" % (portfolio_id, code))
+        px = self._manual_price(portfolio, code, price, TradeType.SELL)
+        order = OrderEvent(
+            strategy_id=ctx.strategy_id,
+            portfolio_id=portfolio_id,
+            stock_code=code,
+            trade_type=TradeType.SELL,
+            signal_type=SignalType.CLOSE,
+            quantity=qty,
+            price=px,
+            bar_time=self.ctx.clock(),
+            signal_name="manual_close",
+            period=None,
+        )
+        order._manual_order = True
+        db = self._db_session_factory()
+        try:
+            self._submit_one_order(db, portfolio, order, period=None,
+                                   emit_signal=False)
+        except ManualActionError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            self._record_manual_action(
+                action_type="force_close", portfolio_id=portfolio_id,
+                stock_code=code, trade_type="SELL", quantity=qty, price=px,
+                result="rejected", reason="提交异常: %s: %s"
+                % (type(exc).__name__, exc))
+            raise
+        finally:
+            db.close()
+        order_id = getattr(order, "_live_order_id", None)
+        status = "accepted" if order_id else "blocked"
+        self._record_manual_action(
+            action_type="force_close", portfolio_id=portfolio_id,
+            stock_code=code, trade_type="SELL", quantity=qty, price=px,
+            result=status, live_order_id=order_id,
+            reason=(note if order_id else "提交链闸门拦截（详见决策事件）"))
+        return {
+            "status": status,
+            "live_order_id": order_id,
+            "stock_code": code,
+            "quantity": qty,
+            "price": str(px),
+            "strategy_id": ctx.strategy_id,
+        }
+
     def _should_defer_order(
         self, portfolio: Portfolio, order: OrderEvent, post_close: bool = False
     ) -> bool:
@@ -7237,6 +7812,9 @@ class LiveEngine:
                 bool(getattr(order, "_requote", False))
                 or bool(getattr(order, "_requeued_for_retry", False))
                 or int(getattr(order, "_deferred_retry_count", 0) or 0) > 0
+                # 人工补单/人工平仓（I1）：人工明确要求，不受「当日同股只买一次」
+                # 信号级排重约束（槽位/在途/资金闸照旧）
+                or bool(getattr(order, "_manual_order", False))
             )
             if same_order_continuation:
                 logger.info(
@@ -7271,6 +7849,20 @@ class LiveEngine:
                                 % bought_today.id,
                     )
                     return
+        # ①' M1 半自动审批队列（2026-11-18）：manual 模式下的**开仓类**新单不直接
+        # 下发，先入队等人工批准。入队点选在「全部非资金闸门已过、尚未拆单/落库」
+        # 处：资金/T+1/涨跌停/在途/时段等闸门在批准时以「当下」重走一遍（见
+        # approve_approval），因此队列里存的只是信号意图与目标量。
+        # 卖出默认豁免（延迟止损 = 让风控失效）；批准回放（_approval_passed）与
+        # 追价/拆单子单/人工单同样不得再次入队。
+        if (self._is_manual_mode()
+                and not getattr(order, "_approval_passed", False)
+                and not getattr(order, "_manual_order", False)
+                and not getattr(order, "_split_child", False)
+                and not getattr(order, "_requote", False)
+                and not self._approval_exempt(order)):
+            self._enqueue_approval(db, portfolio, order, period)
+            return
         # ① 审批 + 拆单 + submitted 落库注册：整段在 _book_lock 内完成
         # （P1#5，2026-11-16）。旧实现 BUY 资金上限（读 _pending_orders 预留）在锁外
         # 算、pending 注册在锁内做；deals 池的 requote 重下与主池新单并发时会同时
@@ -7291,6 +7883,11 @@ class LiveEngine:
         if registered is None:
             return
         live_order, bar_mark_key, had_deferred_row = registered
+        # I1：把落库行 id 挂回订单，人工补单 / 人工平仓据此判断「已受理 vs 闸门拦截」
+        order._live_order_id = live_order.id
+        # M1：批准回放路径把真正提交的 live_orders.id 回传 approve_approval
+        if getattr(order, "_approval_passed", False):
+            self._approval_submitted_id = live_order.id
         # 审批用的 Position 在临界区内取得；这里重取同一对象供 execute 二次审批/回填用
         # （approve 中 BUY 首次建仓已保证存在，SELL 取不到则为 None，语义与旧代码一致）。
         pos = ctx.positions.get(order.stock_code)
@@ -10079,6 +10676,18 @@ class LiveEngine:
             db.commit()
         except Exception:  # noqa: BLE001 — 提交失败不阻断起账（下次重启重算）
             logger.warning("recover: commit peak seed failed (session %s)",
+                           self.session_id, exc_info=True)
+        # M1：待批队列只做提示，不自动重放（停止已把未批单置 dropped；残留 pending
+        # 多为异常停机留下的行，批准动作需要运行中实例与「当下」行情，交人工处理）。
+        try:
+            pending_approvals = self._count_pending_approvals()
+            if pending_approvals:
+                logger.warning(
+                    "recover: %d 条审批单仍为 pending（异常停机会残留），列表可见、"
+                    "可批准/拒绝，超时后自动失效 (session %s)",
+                    pending_approvals, self.session_id)
+        except Exception:  # noqa: BLE001
+            logger.warning("recover: 待批审批计数失败 (session %s)",
                            self.session_id, exc_info=True)
         # P2 持久化恢复：deferred 日线单重建内存队列，**DB 行保留**（2026-11-09
         # 起不再「转移删除」）——行 id 挂 order._deferred_row_id，放行提交成功时

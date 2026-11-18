@@ -38,6 +38,7 @@ from core.models import (
     LiveSession, LiveSessionPortfolio, PortfolioStrategy, Strategy,
     StockPoolStock, StockPoolMembership, Formula, FormulaSignal, LiveOrder, LiveTrade, LiveDecisionEvent,
     LiveSignal, LiveAccountSnapshot, LiveCashFlow, LiveBaselineReset,
+    LiveManualAction,
     IncrementalBacktestCheckpoint, BacktestRecord,
 )
 from core.engine.portfolio_builder import assemble_portfolio
@@ -863,8 +864,8 @@ def preflight_signal_config(db: Session, session_id: int, execution_mode: str):
     auto（P0 兼容）: 只查 TQ engine + 频率规则，不做 TQ 试算/告警探测，
     避免历史自动会话因客户端未就绪而无法启动。
     """
-    if execution_mode not in ("alert", "auto"):
-        return (400, "execution_mode 必须为 alert/auto")
+    if execution_mode not in ("alert", "auto", "manual"):
+        return (400, "execution_mode 必须为 alert/auto/manual")
     for pid, st in _session_strategies(db, session_id):
         if st.formula_id is None:
             if execution_mode == "alert":
@@ -1751,6 +1752,166 @@ def record_cash_flow(
         "note": row.note,
         "net_inflow": str(net),
         "engine_applied": applied,
+    }, None
+
+
+def record_manual_action(
+    db: Session, session_id: int, portfolio_id: int, action_type: str, *,
+    stock_code: Optional[str] = None, trade_type: Optional[str] = None,
+    quantity: Optional[int] = None, price=None, result: str = "applied",
+    live_order_id: Optional[int] = None, cash_delta=None,
+    reason: Optional[str] = None,
+) -> Optional[dict]:
+    """I1 人工操作审计行（改账类动作由 service 直接写；下单类由引擎写）。
+
+    返回行 dict；写库失败返回 None（审计失败绝不改变交易结果）。
+    """
+    try:
+        row = LiveManualAction(
+            live_session_id=session_id,
+            portfolio_strategy_id=portfolio_id,
+            action_type=action_type,
+            stock_code=stock_code,
+            trade_type=trade_type,
+            quantity=quantity,
+            price=price,
+            result=result,
+            live_order_id=live_order_id,
+            cash_delta=cash_delta,
+            reason=(str(reason)[:200] if reason else None),
+        )
+        db.add(row)
+        db.commit()
+        db.refresh(row)
+        return serialize_manual_action(row)
+    except Exception:  # noqa: BLE001 — 多为未执行迁移（无表）
+        db.rollback()
+        logger.exception("record_manual_action 写入失败 (session %s)", session_id)
+        return None
+
+
+def serialize_manual_action(row) -> dict:
+    return {
+        "id": row.id,
+        "action_type": row.action_type,
+        "portfolio_id": row.portfolio_strategy_id,
+        "stock_code": row.stock_code,
+        "trade_type": row.trade_type,
+        "quantity": row.quantity,
+        "price": str(row.price) if row.price is not None else None,
+        "cash_delta": (str(row.cash_delta) if row.cash_delta is not None else None),
+        "result": row.result,
+        "live_order_id": row.live_order_id,
+        "reason": row.reason,
+        "created_at": (row.created_at.strftime("%Y-%m-%d %H:%M:%S")
+                       if row.created_at else None),
+    }
+
+
+def list_manual_actions(db: Session, session_id: int, limit: int = 200) -> Optional[dict]:
+    """I1 人工操作审计列表（倒序）。session 不存在返回 None。"""
+    session = db.query(LiveSession.id).filter(LiveSession.id == session_id).first()
+    if session is None:
+        return None
+    try:
+        rows = (
+            db.query(LiveManualAction)
+            .filter(LiveManualAction.live_session_id == session_id)
+            .order_by(LiveManualAction.id.desc())
+            .limit(max(1, min(int(limit), 1000)))
+            .all()
+        )
+    except Exception:  # noqa: BLE001 — 未执行迁移 → 空列表
+        db.rollback()
+        rows = []
+    return {"actions": [serialize_manual_action(r) for r in rows]}
+
+
+def adjust_position_virtual(
+    db: Session, session_id: int, portfolio_id: int, strategy_id: int,
+    stock_code: str, quantity_delta: int, price, note: Optional[str] = None,
+) -> Tuple[Optional[dict], Optional[str]]:
+    """I1 持仓改账（仅停止的会话）：写一笔合成成交，重启 recover 重放即生效。
+
+    为什么用合成 `live_trades` 而不是直接改内存/另建表：虚拟持仓与虚拟现金的唯一
+    权威来源就是 live_trades 重放（recover），写合成行 = 与真实成交同一条口径，
+    净值/回测对账不需要新增读取路径。`live_order_id=None` + commission/stamp=0，
+    方向由 quantity_delta 符号决定；BUY 扣现金、SELL 加现金（均按传入价格）。
+    """
+    code = str(stock_code or "").strip().upper()
+    if not code:
+        return None, "stock_code 不能为空"
+    try:
+        delta = int(quantity_delta)
+    except (TypeError, ValueError):
+        return None, "quantity_delta 须为整数"
+    if delta == 0:
+        return None, "quantity_delta 不能为 0"
+    try:
+        px = Decimal(str(price))
+    except (ArithmeticError, TypeError, ValueError):
+        return None, "price 非法"
+    if not px.is_finite() or px <= 0:
+        return None, "price 必须为正数"
+    session = db.query(LiveSession.id).filter(LiveSession.id == session_id).first()
+    if session is None:
+        return None, "资源不存在"
+    link = (
+        db.query(LiveSessionPortfolio)
+        .filter_by(session_id=session_id, portfolio_strategy_id=portfolio_id)
+        .first()
+    )
+    if link is None:
+        return None, "组合未关联本会话"
+    if not db.query(Strategy.id).filter(
+            Strategy.id == strategy_id,
+            Strategy.portfolio_id == portfolio_id).first():
+        return None, "strategy_id 不属于该组合"
+    qty = abs(delta)
+    amount = (px * Decimal(qty)).quantize(Decimal("0.01"))
+    direction = "BUY" if delta > 0 else "SELL"
+    row = LiveTrade(
+        live_session_id=session_id,
+        live_order_id=None,
+        portfolio_strategy_id=portfolio_id,
+        strategy_id=strategy_id,
+        stock_code=code,
+        trade_type=direction,
+        price=px,
+        quantity=qty,
+        amount=amount,
+        commission=Decimal("0"),
+        stamp_duty=Decimal("0"),
+        trade_time=now_shanghai(),
+    )
+    db.add(row)
+    try:
+        db.commit()
+        db.refresh(row)
+    except Exception:  # noqa: BLE001
+        db.rollback()
+        logger.exception("adjust_position_virtual: 合成成交写入失败 (session %s)",
+                         session_id)
+        return None, "持仓改账写入失败：请确认已执行数据库迁移"
+    cash_delta = (-amount) if delta > 0 else amount
+    action = record_manual_action(
+        db, session_id, portfolio_id, "position_adjust",
+        stock_code=code, trade_type=direction, quantity=qty, price=px,
+        result="applied", cash_delta=cash_delta,
+        reason=(note or "人工持仓改账（合成成交，重启生效）"))
+    logger.info(
+        "position adjust: session %s 组合 %s %s %s %d 股 @ %s（合成成交 id=%s）",
+        session_id, portfolio_id, code, direction, qty, px, row.id)
+    return {
+        "trade_id": row.id,
+        "stock_code": code,
+        "trade_type": direction,
+        "quantity": qty,
+        "price": str(px),
+        "amount": str(amount),
+        "cash_delta": str(cash_delta),
+        "manual_action": action,
+        "effective": "重启会话后由 live_trades 重放生效",
     }, None
 
 

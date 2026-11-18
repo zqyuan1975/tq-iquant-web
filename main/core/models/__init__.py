@@ -35,6 +35,8 @@ from .incremental_backtest import (
 from .decision_event import BacktestDecisionEvent, LiveDecisionEvent
 from .data_backup import DataBackupRecord
 from .corporate_action import CorporateAction, LiveCorporateAction
+from .live_approval_queue import LiveApprovalQueue
+from .live_manual_action import LiveManualAction
 
 __all__ = [
     "Base",
@@ -75,4 +77,6 @@ __all__ = [
     "DataBackupRecord",
     "CorporateAction",
     "LiveCorporateAction",
+    "LiveApprovalQueue",
+    "LiveManualAction",
 ]

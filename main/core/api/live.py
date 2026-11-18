@@ -120,8 +120,8 @@ def create_session(data: dict, db: Session = Depends(get_db)):
     data["name"] = name
     data["engine"] = engine
     execution_mode = str(data.get("execution_mode") or "alert")
-    if execution_mode not in ("alert", "auto"):
-        return err(400, "execution_mode 非法，仅支持 alert(半自动) / auto(全自动)")
+    if execution_mode not in ("alert", "auto", "manual"):
+        return err(400, "execution_mode 非法，仅支持 alert(信号) / auto(全自动) / manual(人工审批)")
     data["execution_mode"] = execution_mode
     # 会话级实盘资金基准（账户总资产口径）：None=各组合用自身 initial_capital；
     # 提供时须 >0。继承持仓的市值由引擎从起账现金扣除，避免重复计入。
@@ -526,6 +526,183 @@ def create_cash_flow(session_id: int, data: dict, db: Session = Depends(get_db))
     if error is not None:
         return err(400, error)
     return ok(row)
+
+
+# ---------------------------------------------------------------------------
+# M1 半自动审批队列 + I1 人工补单/平仓/改账（2026-11-18）
+# 默认关闭：approval 入队只在 execution_mode=manual 时发生，其它模式这些端点
+# 要么返回 409（未运行/非 manual），要么不改变任何既有语义。
+# ---------------------------------------------------------------------------
+
+
+def _running_engine(session_id: int):
+    """取运行中的引擎；返回 (engine, error_response)。"""
+    eng = _ENGINES.get(session_id)
+    if eng is None:
+        return None, err(409, "会话未运行：该操作需要运行中的引擎")
+    return eng, None
+
+
+@router.get("/sessions/{session_id}/approvals")
+def session_approvals(session_id: int):
+    """待批 + 已决策审批单（M1）。非 manual 会话返回空列表。"""
+    eng, error = _running_engine(session_id)
+    if error is not None:
+        return error
+    return ok({
+        "manual_mode": bool(eng._is_manual_mode()),
+        "approvals": eng.list_approvals(),
+    })
+
+
+@router.post("/sessions/{session_id}/approvals/{approval_id}/approve")
+def approve_session_approval(session_id: int, approval_id: int):
+    """批准一条审批单：以「当下」重走完整闸门链（资金/T+1/涨跌停/在途全生效）。"""
+    eng, error = _running_engine(session_id)
+    if error is not None:
+        return error
+    try:
+        return ok(eng.approve_approval(approval_id))
+    except ValueError as exc:
+        return err(404 if "不存在" in str(exc) else 409, str(exc))
+
+
+@router.post("/sessions/{session_id}/approvals/{approval_id}/reject")
+def reject_session_approval(session_id: int, approval_id: int,
+                            data: Optional[dict] = None):
+    eng, error = _running_engine(session_id)
+    if error is not None:
+        return error
+    reason = (data or {}).get("reason")
+    try:
+        return ok(eng.reject_approval(approval_id, reason))
+    except ValueError as exc:
+        return err(404 if "不存在" in str(exc) else 409, str(exc))
+
+
+def _manual_error(exc: Exception):
+    """ManualActionError → envelope；其它异常交给全局 500。"""
+    status = getattr(exc, "http_status", 400)
+    return err(status, str(exc))
+
+
+@router.post("/sessions/{session_id}/manual/orders")
+def manual_order(session_id: int, data: dict):
+    """I1 人工补单（仅 execution_mode=manual）：走与策略单完全相同的提交链。"""
+    eng, error = _running_engine(session_id)
+    if error is not None:
+        return error
+    try:
+        portfolio_id = int(data.get("portfolio_strategy_id") or data.get("portfolio_id"))
+    except (TypeError, ValueError):
+        return err(400, "portfolio_strategy_id 必填且为整数")
+    try:
+        result = eng.submit_manual_order(
+            portfolio_id,
+            data.get("stock_code"),
+            data.get("trade_type"),
+            data.get("quantity"),
+            price=data.get("price"),
+            strategy_id=data.get("strategy_id"),
+            note=data.get("note"),
+        )
+    except Exception as exc:  # noqa: BLE001 — ManualActionError 带状态码
+        if hasattr(exc, "http_status"):
+            return _manual_error(exc)
+        raise
+    return ok(result)
+
+
+@router.post("/sessions/{session_id}/manual/close")
+def manual_close(session_id: int, data: dict):
+    """I1 人工平仓：按虚拟持仓全额卖出（T+1 可用量由提交链收窄）。"""
+    eng, error = _running_engine(session_id)
+    if error is not None:
+        return error
+    try:
+        portfolio_id = int(data.get("portfolio_strategy_id") or data.get("portfolio_id"))
+    except (TypeError, ValueError):
+        return err(400, "portfolio_strategy_id 必填且为整数")
+    try:
+        result = eng.force_close_position(
+            portfolio_id,
+            data.get("stock_code"),
+            strategy_id=data.get("strategy_id"),
+            price=data.get("price"),
+            note=data.get("note"),
+        )
+    except Exception as exc:  # noqa: BLE001
+        if hasattr(exc, "http_status"):
+            return _manual_error(exc)
+        raise
+    return ok(result)
+
+
+@router.post("/sessions/{session_id}/manual/cash-adjust")
+def manual_cash_adjust(session_id: int, data: dict,
+                       db: Session = Depends(get_db)):
+    """I1 现金改账：复用外部现金流台账（运行中立即生效，停止时下次启动重放）。"""
+    try:
+        portfolio_id = int(data.get("portfolio_strategy_id") or data.get("portfolio_id"))
+    except (TypeError, ValueError):
+        return err(400, "portfolio_strategy_id 必填且为整数")
+    row, error = svc.record_cash_flow(
+        db, session_id, portfolio_id,
+        str(data.get("flow_type") or ""),
+        data.get("amount"),
+        flow_date=data.get("flow_date"),
+        note=data.get("note") or "人工现金改账",
+        engine=_ENGINES.get(session_id),
+    )
+    if error == "资源不存在":
+        return err(404, error)
+    if error is not None:
+        return err(400, error)
+    signed = data.get("amount")
+    action = svc.record_manual_action(
+        db, session_id, portfolio_id, "cash_adjust",
+        quantity=None, price=None, result="applied",
+        cash_delta=row["amount"],
+        reason=(data.get("note") or ("%s %s（有符号实际入账 %s）"
+                                     % (row["flow_type"], signed, row["amount"]))))
+    return ok({"flow": row, "manual_action": action})
+
+
+@router.post("/sessions/{session_id}/manual/position-adjust")
+def manual_position_adjust(session_id: int, data: dict,
+                           db: Session = Depends(get_db)):
+    """I1 持仓改账（仅停止的会话）：写合成成交，重启 recover 重放生效。
+
+    运行中会话拒绝——内存态持仓与虚拟账本正被引擎使用，直接改库会出现
+    「本次运行与重启后不一致」的双口径。
+    """
+    if session_id in _ENGINES:
+        return err(409, "会话运行中：持仓改账需先停止会话再操作")
+    try:
+        portfolio_id = int(data.get("portfolio_strategy_id") or data.get("portfolio_id"))
+        strategy_id = int(data.get("strategy_id"))
+    except (TypeError, ValueError):
+        return err(400, "portfolio_strategy_id / strategy_id 必填且为整数")
+    row, error = svc.adjust_position_virtual(
+        db, session_id, portfolio_id, strategy_id,
+        data.get("stock_code"), data.get("quantity_delta"),
+        data.get("price"), note=data.get("note"),
+    )
+    if error == "资源不存在":
+        return err(404, error)
+    if error is not None:
+        return err(400, error)
+    return ok(row)
+
+
+@router.get("/sessions/{session_id}/manual/actions")
+def session_manual_actions(session_id: int, limit: int = 200,
+                           db: Session = Depends(get_db)):
+    """I1 人工操作审计（补单/平仓/改账，含被闸门拦下的尝试）。"""
+    data = svc.list_manual_actions(db, session_id, limit=limit)
+    if data is None:
+        return err(404, "资源不存在")
+    return ok(data)
 
 
 @router.get("/sessions/{session_id}/decisions")
