@@ -41,5 +41,8 @@ class BacktestRecord(Base):
     # N1 多组合回测（2026-11-18）：非空表示该记录是某次多组合 run 的成员记录
     # （成员各自是完整记录，详情/分析可直接复用；聚合曲线存 run group）。
     run_group_id = Column(Integer, ForeignKey("backtest_run_groups.id", ondelete="SET NULL"), nullable=True, index=True)
+    # F1 数据质量（2026-11-18）：JSON 汇总（覆盖率/缺根/伪影价与无成交假 bar 剔除数/
+    # 整只缺失股票）。只做观测展示，不参与回测判定；历史记录为 NULL。
+    data_quality_json = Column(Text, nullable=True)
     created_at = Column(DateTime, server_default=func.now())
     completed_at = Column(DateTime, nullable=True)

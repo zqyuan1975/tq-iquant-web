@@ -138,6 +138,36 @@ export interface BacktestRecordItem {
   completed_at: string | null
   // 验证结论（容量健康 + 危机防御 + 样本外引用），回测完成时冻结；老记录为 null
   validation: ValidationVerdict | null
+  // F1 数据质量（覆盖率/缺根/被剔除假 bar），老记录为 null
+  data_quality: DataQuality | null
+}
+
+// F1 回测数据质量（对齐 backtest_service.summarize_data_quality）
+export interface DataQualityPeriod {
+  union_bars: number
+  expected_bars: number
+  kept_bars: number
+  raw_bars: number
+  missing_bars: number
+  coverage_ratio: number
+  dropped_artifact_bars: number
+  dropped_no_trade_bars: number
+}
+
+export interface DataQuality {
+  version: string
+  window: { start: string; end: string }
+  requested_stocks: number
+  stocks_with_data: number
+  missing_stocks: string[]
+  periods: Record<string, DataQualityPeriod>
+  summary: {
+    coverage_ratio: number
+    kept_bars: number
+    missing_bars: number
+    dropped_artifact_bars: number
+    dropped_no_trade_bars: number
+  }
 }
 
 // 回测"验证结论"（对齐 backtest_service.build_validation_verdict）

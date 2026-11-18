@@ -1657,3 +1657,91 @@ def test_convert_market_data_keeps_real_one_word_limit_board():
     }
     out = svc._convert_market_data(raw, ["000001.SZ"], ["1d"])
     assert out["000001.SZ"]["1d"]["datetime"].to_list() == ts
+
+
+# ---------------------------------------------------------------------------
+# F1 数据质量：取数统计累计 + 覆盖率/缺根汇总（只观测，不影响回测结果）
+# ---------------------------------------------------------------------------
+def test_data_quality_stats_accumulate_dropped_fake_bars():
+    """停牌补行计入 dropped_no_trade_bars，其余计 kept/raw。"""
+    _ts, raw = _fake_bar_raw()
+    stats: dict = {}
+    svc._convert_market_data(raw, ["000001.SZ"], ["1d"], stats=stats)
+    bucket = stats["000001.SZ"]["1d"]
+    assert bucket == {
+        "raw_bars": 4, "kept_bars": 2,
+        "dropped_artifact_bars": 0, "dropped_no_trade_bars": 2,
+    }
+
+
+def test_data_quality_stats_window_excludes_warmup():
+    """统计窗口只含主区间：预热段（7/29-7/30）不计入。"""
+    _ts, raw = _fake_bar_raw()
+    stats: dict = {}
+    svc._convert_market_data(
+        raw, ["000001.SZ"], ["1d"], stats=stats,
+        window=(date(2026, 7, 31), date(2026, 8, 3)),
+    )
+    bucket = stats["000001.SZ"]["1d"]
+    assert bucket["raw_bars"] == 2
+    assert bucket["kept_bars"] == 1
+    assert bucket["dropped_no_trade_bars"] == 1
+
+
+def _dq_klines(rows_by_code: dict) -> dict:
+    return {
+        code: {"1d": pl.DataFrame({"datetime": ts})}
+        for code, ts in rows_by_code.items()
+    }
+
+
+def test_summarize_data_quality_pool_union_missing_bars():
+    """缺根按池内并集统计；新上市前段（首末区间之外）不算缺根。"""
+    ts = [datetime(2026, 7, 29), datetime(2026, 7, 30), datetime(2026, 7, 31)]
+    klines = _dq_klines({"A": ts, "B": ts[1:]})
+    dq = svc.summarize_data_quality({}, klines, ["A", "B"],
+                                    date(2026, 7, 29), date(2026, 7, 31))
+    p = dq["periods"]["1d"]
+    assert dq["version"] == svc.DATA_QUALITY_VERSION
+    assert p["union_bars"] == 3
+    assert p["kept_bars"] == 5
+    assert p["expected_bars"] == 6
+    assert p["missing_bars"] == 0  # B 从 7/30 起有数据，7/29 属上市前，不计缺根
+    assert p["coverage_ratio"] == 0.8333
+    assert dq["missing_stocks"] == []
+    assert dq["stocks_with_data"] == 2
+
+
+def test_summarize_data_quality_internal_gap_and_missing_stock():
+    """区间内缺根计入 missing_bars；整只无数据计入 missing_stocks 并拉低覆盖率。"""
+    ts = [datetime(2026, 7, 29), datetime(2026, 7, 30), datetime(2026, 7, 31)]
+    klines = _dq_klines({"A": ts, "B": [ts[0], ts[2]]})  # B 中间缺 7/30
+    dq = svc.summarize_data_quality({}, klines, ["A", "B", "C"],
+                                    date(2026, 7, 29), date(2026, 7, 31))
+    p = dq["periods"]["1d"]
+    assert p["missing_bars"] == 1
+    assert p["kept_bars"] == 5
+    assert p["expected_bars"] == 9
+    assert dq["missing_stocks"] == ["C"]
+    assert dq["requested_stocks"] == 3
+    assert dq["stocks_with_data"] == 2
+    assert p["coverage_ratio"] == 0.5556
+
+
+def test_summarize_data_quality_sums_dropped_counts():
+    """剔除数按股票维度求和，汇总到 period 与 summary。"""
+    ts = [datetime(2026, 7, 29), datetime(2026, 7, 30)]
+    klines = _dq_klines({"A": ts})
+    stats = {"A": {"1d": {
+        "raw_bars": 5, "kept_bars": 2,
+        "dropped_artifact_bars": 1, "dropped_no_trade_bars": 2,
+    }}}
+    dq = svc.summarize_data_quality(stats, klines, ["A"],
+                                    date(2026, 7, 29), date(2026, 7, 30))
+    p = dq["periods"]["1d"]
+    assert p["dropped_artifact_bars"] == 1
+    assert p["dropped_no_trade_bars"] == 2
+    assert dq["summary"]["dropped_artifact_bars"] == 1
+    assert dq["summary"]["dropped_no_trade_bars"] == 2
+    assert dq["summary"]["kept_bars"] == 2
+    assert dq["summary"]["coverage_ratio"] == 1.0

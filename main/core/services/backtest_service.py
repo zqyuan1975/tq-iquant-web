@@ -97,8 +97,20 @@ logger = logging.getLogger(__name__)
 _OHLCV_FIELDS = ("Open", "High", "Low", "Close", "Volume", "Amount")
 
 
+def _ts_in_window(ts, window) -> bool:
+    """统计窗口判定：window=(start,end) 为 date；无 window 时全部计入。"""
+    if window is None:
+        return True
+    try:
+        d = ts.date() if hasattr(ts, "date") else ts
+    except Exception:  # noqa: BLE001 — 非法时间戳不参与统计，避免脏数据中断回测
+        return False
+    return window[0] <= d <= window[1]
+
+
 def _convert_market_data(
-    raw: dict, stocks: list, periods: list
+    raw: dict, stocks: list, periods: list,
+    stats: Optional[dict] = None, window: Optional[tuple] = None,
 ) -> dict:
     """单周期 TQ 原始行情 → 引擎 klines（单周期入口）。
 
@@ -118,7 +130,8 @@ def _convert_market_data(
     for code in stocks:
         per_period: dict = {}
         for period in periods:
-            df = _build_polars_kline(raw, code, timestamps)
+            df = _build_polars_kline(
+                raw, code, timestamps, stats=stats, period=period, window=window)
             if df is not None:
                 per_period[period] = df
         if per_period:
@@ -126,7 +139,9 @@ def _convert_market_data(
     return result
 
 
-def _build_polars_kline(raw: dict, code: str, timestamps: list):
+def _build_polars_kline(raw: dict, code: str, timestamps: list,
+                        stats: Optional[dict] = None, period: Optional[str] = None,
+                        window: Optional[tuple] = None):
     """从 TQ raw 抽取单股票 polars DataFrame；该股票无数据返回 None。
 
     TQ 真机返回的 Volume/Amount 可能是 str（如 "1000"），polars 构造时若混入
@@ -160,7 +175,7 @@ def _build_polars_kline(raw: dict, code: str, timestamps: list):
     }
     # 伪影过滤：Open/Close ≤0（负价/零价）或 Close 近零（<1分）——前复权加性压缩产物，
     # 会放大收益/巨量股数，直接丢弃该 bar（不进信号/成交/估值）。
-    keep = [
+    price_ok = [
         o > 0 and c > 0 and c >= _MIN_TRADE_PRICE
         for o, c in zip(converted["Open"], converted["Close"])
     ]
@@ -172,7 +187,23 @@ def _build_polars_kline(raw: dict, code: str, timestamps: list):
         converted["Open"], converted["High"], converted["Low"],
         converted["Close"], converted["Volume"],
     )
-    keep = [k and not nt for k, nt in zip(keep, no_trade)]
+    keep = [k and not nt for k, nt in zip(price_ok, no_trade)]
+    # F1 数据质量统计（只观测）：主区间内原始根数 / 保留根数 / 两类剔除数分开计。
+    if stats is not None and period:
+        bucket = stats.setdefault(code, {}).setdefault(period, {
+            "raw_bars": 0, "kept_bars": 0,
+            "dropped_artifact_bars": 0, "dropped_no_trade_bars": 0,
+        })
+        for ts, p_ok, nt, k in zip(timestamps, price_ok, no_trade, keep):
+            if not _ts_in_window(ts, window):
+                continue
+            bucket["raw_bars"] += 1
+            if k:
+                bucket["kept_bars"] += 1
+            elif not p_ok:
+                bucket["dropped_artifact_bars"] += 1
+            elif nt:
+                bucket["dropped_no_trade_bars"] += 1
     if not any(keep):
         return None
     col_data: dict = {"datetime": [ts for ts, k in zip(timestamps, keep) if k]}
@@ -232,20 +263,122 @@ def _to_int(val) -> int:
         return 0
 
 
-def _convert_market_data_multi(raw_by_period: dict, stocks: list) -> dict:
+def _convert_market_data_multi(raw_by_period: dict, stocks: list,
+                               stats: Optional[dict] = None,
+                               window: Optional[tuple] = None) -> dict:
     """多周期 TQ 原始行情 → 引擎 klines。
 
     raw_by_period: {period: {field: pandas.DataFrame}}（每个周期一次 TQ 调用）。
     返回: {stock_code: {period: pl.DataFrame}}。
+    stats/window：F1 数据质量统计累计（可选，不传时行为与改动前一致）。
     """
     result: dict = {}
     for period, raw in raw_by_period.items():
-        single = _convert_market_data(raw, stocks, [period])
+        single = _convert_market_data(
+            raw, stocks, [period], stats=stats, window=window)
         for code, per_period in single.items():
             if code not in result:
                 result[code] = {}
             result[code].update(per_period)
     return result
+
+
+# F1 数据质量口径版本：缺根按「池内并集 ∩ 个股首末 bar 区间」统计。口径变化必须改
+# 版本号，避免新旧结果混比。
+DATA_QUALITY_VERSION = "data_quality_v1"
+
+
+def summarize_data_quality(per_stock: dict, klines: dict, stocks: list,
+                           start: date, end: date) -> dict:
+    """汇总回测取数质量（只观测，不参与回测判定）。
+
+    - per_stock: {code: {period: {raw_bars/kept_bars/dropped_artifact_bars/
+      dropped_no_trade_bars}}}，由 _build_polars_kline 在**主区间内**累计；
+    - klines: 转换后的 klines（可含预热段，这里按 [start, end] 过滤）；
+    - 缺根口径：同一周期下，池内各股 bar 时间戳并集 ∩ 该股自身首末 bar 区间；
+      新股上市前/退市后不算缺根（区间外），整只无数据的股票计入 missing_stocks。
+
+    返回可直接 JSON 序列化的 dict。
+    """
+    stocks = list(dict.fromkeys(stocks or []))
+    periods = sorted({p for ps in (per_stock or {}).values() for p in ps})
+    if not periods:
+        periods = sorted({p for per in (klines or {}).values() for p in per})
+    per_period: dict = {}
+    total_kept = 0
+    total_expected = 0
+    total_missing = 0
+    total_dropped_artifact = 0
+    total_dropped_no_trade = 0
+    for period in periods:
+        by_code: dict = {}
+        for code in stocks:
+            df = ((klines or {}).get(code) or {}).get(period)
+            if df is None or "datetime" not in df.columns:
+                continue
+            by_code[code] = {
+                _normalize_ts(ts) for ts in df["datetime"].to_list()
+                if _ts_in_window(ts, (start, end))
+            }
+        union: set = set()
+        for own in by_code.values():
+            union |= own
+        kept = 0
+        missing = 0
+        for own in by_code.values():
+            kept += len(own)
+            if own:
+                lo, hi = min(own), max(own)
+                missing += len([t for t in union if lo <= t <= hi and t not in own])
+        expected = len(union) * len(stocks)
+        coverage = (kept / expected) if expected else (1.0 if not stocks else 0.0)
+        raw_bars = sum(
+            int(((per_stock or {}).get(c) or {}).get(period, {}).get("raw_bars", 0))
+            for c in stocks)
+        dropped_artifact = sum(
+            int(((per_stock or {}).get(c) or {}).get(period, {}).get(
+                "dropped_artifact_bars", 0)) for c in stocks)
+        dropped_no_trade = sum(
+            int(((per_stock or {}).get(c) or {}).get(period, {}).get(
+                "dropped_no_trade_bars", 0)) for c in stocks)
+        per_period[period] = {
+            "union_bars": len(union),
+            "expected_bars": expected,
+            "kept_bars": kept,
+            "raw_bars": raw_bars,
+            "missing_bars": missing,
+            "coverage_ratio": round(coverage, 4),
+            "dropped_artifact_bars": dropped_artifact,
+            "dropped_no_trade_bars": dropped_no_trade,
+        }
+        total_kept += kept
+        total_expected += expected
+        total_missing += missing
+        total_dropped_artifact += dropped_artifact
+        total_dropped_no_trade += dropped_no_trade
+    stocks_with_data = sum(1 for c in stocks if (klines or {}).get(c))
+    coverage_all = (total_kept / total_expected) if total_expected else (
+        1.0 if not stocks else 0.0)
+    return {
+        "version": DATA_QUALITY_VERSION,
+        "window": {"start": start.isoformat(), "end": end.isoformat()},
+        "requested_stocks": len(stocks),
+        "stocks_with_data": stocks_with_data,
+        "missing_stocks": [c for c in stocks if not (klines or {}).get(c)],
+        "periods": per_period,
+        "summary": {
+            "coverage_ratio": round(coverage_all, 4),
+            "kept_bars": total_kept,
+            "missing_bars": total_missing,
+            "dropped_artifact_bars": total_dropped_artifact,
+            "dropped_no_trade_bars": total_dropped_no_trade,
+        },
+    }
+
+
+def _normalize_ts(ts):
+    """时间戳归一（pandas Timestamp/date/datetime 统一为 datetime 可比较对象）。"""
+    return ts.to_pydatetime() if hasattr(ts, "to_pydatetime") else ts
 
 
 def warmup_counts_by_period(ps, db: Session = None) -> Dict[str, int]:
@@ -344,7 +477,8 @@ def _slice_klines_from(klines: dict, start: date) -> dict:
 
 def build_klines(ps, start: date, end: date, db: Session = None,
                  dividend_mode: str = "front",
-                 pool_codes: Optional[list] = None) -> dict:
+                 pool_codes: Optional[list] = None,
+                 stats: Optional[dict] = None) -> dict:
     """从 TQ 取历史 K 线：{stock_code: {period: pl.DataFrame}}（含公式预热段）。
 
     股票来自 ps.stock_pool_id 对应的 stock_pool_stocks；周期取所有策略的 period 去重。
@@ -356,6 +490,8 @@ def build_klines(ps, start: date, end: date, db: Session = None,
     覆盖 max(formula_count) 的自然日窗口，一次取全量后由调用方 _slice_klines_from
     切回主区间（预热 bar 只喂 build_signal_cache，不进引擎时间轴）。
     dividend_mode：复权模式（"front" 前复权 / "back" 后复权），K线取数透传给 TQ。
+    stats：F1 数据质量累计容器（可选）；传入后按主区间 [start, end] 统计原始/保留/
+        剔除根数，不传时取数行为与改动前逐字一致。
     """
     stocks = pool_codes if pool_codes is not None else _pool_stocks(ps, db)
     if not stocks:
@@ -392,7 +528,8 @@ def build_klines(ps, start: date, end: date, db: Session = None,
         stocks=stocks, periods=periods,
         start=start_str, end=end_str, dividend_type=dividend_mode, count=-1,
     )
-    return _convert_market_data_multi(raw_by_period, stocks)
+    return _convert_market_data_multi(
+        raw_by_period, stocks, stats=stats, window=(start, end))
 
 
 def build_index_close_series(
@@ -2824,6 +2961,11 @@ def _serialize_record(r: BacktestRecord) -> dict:
         "validation": (
             json.loads(r.validation_json) if getattr(r, "validation_json", None) else None
         ),
+        # F1 数据质量（历史记录无该列值为 None，前端整块隐藏）
+        "data_quality": (
+            json.loads(r.data_quality_json)
+            if getattr(r, "data_quality_json", None) else None
+        ),
         "created_at": r.created_at.isoformat() if r.created_at else None,
         "completed_at": r.completed_at.isoformat() if r.completed_at else None,
     }
@@ -3956,8 +4098,11 @@ def run_backtest(db: Session, ps: PortfolioStrategy, req,
         if pit_enabled:
             _kl_kwargs["pool_codes"] = _pool_stocks(
                 ps, db, include_historical=True)
+        # F1 数据质量：取数/转换阶段累计，最终写入 data_quality_json（只观测）
+        dq_stats: dict = {}
         klines_full = build_klines(
             ps, req.start_date, req.end_date, db, dividend_mode=accounting_mode,
+            stats=dq_stats,
             **_kl_kwargs,
         )
         t2 = datetime.now()
@@ -4110,6 +4255,15 @@ def run_backtest(db: Session, ps: PortfolioStrategy, req,
         # 告警：行情跳过 + 信号预检（公式报错/输出线缺失/区间零信号）：非致命，回测仍 completed
         rec.warnings_json = (
             json.dumps(warnings, ensure_ascii=False) if warnings else None
+        )
+        # F1 数据质量冻结（覆盖率/缺根/剔除假 bar）：只展示，不参与回测判定。
+        rec.data_quality_json = json.dumps(
+            summarize_data_quality(
+                dq_stats, klines_full,
+                _kl_kwargs.get("pool_codes") or pool_codes,
+                req.start_date, req.end_date,
+            ),
+            ensure_ascii=False, default=str,
         )
         # 验证结论冻结：容量健康 + 危机防御 + 样本外引用（随记录审计）
         rec.validation_json = json.dumps(
@@ -4331,13 +4485,19 @@ def run_multi_backtest(db: Session, portfolios: list, req) -> dict:
 
     klines_by_ps: Dict[int, dict] = {}
     signal_by_ps: Dict[int, dict] = {}
+    dq_by_ps: Dict[int, dict] = {}
     names: Dict[str, str] = {}
     for e in entries:
         ps = e["ps"]
+        pool_for_kl = _pool_stocks(ps, db, include_historical=e["pit_enabled"])
+        # F1 数据质量：每个成员组合独立统计（池/口径可能不同）
+        dq_stats: dict = {}
         full = build_klines(
             ps, start_date, end_date, db, dividend_mode=accounting_mode,
-            pool_codes=_pool_stocks(ps, db, include_historical=e["pit_enabled"]),
+            pool_codes=pool_for_kl, stats=dq_stats,
         )
+        dq_by_ps[ps.id] = summarize_data_quality(
+            dq_stats, full, pool_for_kl, start_date, end_date)
         klines_by_ps[ps.id] = full
         signal_by_ps[ps.id] = build_signal_cache(
             ps, full, db, start=start_date, dividend_mode=signal_mode)
@@ -4458,6 +4618,9 @@ def run_multi_backtest(db: Session, portfolios: list, req) -> dict:
             rec = db.get(BacktestRecord, records[ps.id])
             if rec is not None:
                 rec.status = "completed"
+                # F1 数据质量冻结（只观测）：成员记录各自保存自己的取数质量。
+                rec.data_quality_json = json.dumps(
+                    dq_by_ps.get(ps.id), ensure_ascii=False, default=str)
                 if res.get("pending_order_count"):
                     rec.warnings_json = json.dumps(
                         [f"回测结束时仍有 {res['pending_order_count']} 笔信号未成交"],

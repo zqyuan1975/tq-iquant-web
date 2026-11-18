@@ -17,6 +17,7 @@ import type {
   RobustnessBlock, RobustWindow, RobustSensitivityRow,
   BacktestRobustnessItem, BacktestGateResult, AcceptanceResult,
   ValidationVerdict,
+  DataQuality, DataQualityPeriod,
 } from '../api'
 import { gateLabel, LAYER_LABEL, ACTION_LABEL } from '../utils/liveEvents'
 import { deriveBlockCode } from '../utils/blockCode'
@@ -167,6 +168,11 @@ const crisisAlpha = computed(() => detail.value?.crisis_alpha ?? null)
 const caStatus = computed(() => crisisAlpha.value?.status ?? null)
 // 验证结论（容量健康 + 危机防御 + 样本外引用），随回测完成冻结在 record.validation
 const validation = computed<ValidationVerdict | null>(() => currentRecord.value?.validation ?? null)
+// F1 数据质量（覆盖率/缺根/剔除假 bar），历史记录为 null → 整块隐藏
+const dataQuality = computed<DataQuality | null>(() => currentRecord.value?.data_quality ?? null)
+const dqPeriods = computed<[string, DataQualityPeriod][]>(() =>
+  Object.entries(dataQuality.value?.periods ?? {}) as [string, DataQualityPeriod][])
+const dqMissingStocks = computed(() => dataQuality.value?.missing_stocks ?? [])
 const caSkipped = computed(() => crisisAlpha.value?.skipped_benchmarks || [])
 const ca = computed<CrisisAlphaData | null>(() => {
   const item = crisisAlpha.value
@@ -3287,6 +3293,45 @@ watch(theme, () => {
       <ul class="spb-list">
         <li v-for="(w, i) in currentRecord.warnings" :key="i">{{ w }}</li>
       </ul>
+    </div>
+
+    <!-- F1 数据质量：覆盖率 / 缺根 / 被剔除假 bar（只展示，不影响回测结果） -->
+    <div v-if="dataQuality" class="card" style="margin-top:12px;padding:14px">
+      <div style="display:flex;align-items:center;gap:8px;margin-bottom:10px">
+        <span style="font-weight:600;font-size:14px">🧹 数据质量</span>
+        <span style="font-size:12px;color:var(--ink-soft)">
+          取数覆盖率 · 缺根 · 剔除假 bar（{{ dataQuality.window.start }} ~ {{ dataQuality.window.end }}，只观测不影响回测）
+        </span>
+      </div>
+      <div style="display:flex;flex-wrap:wrap;gap:16px;font-size:13px;margin-bottom:10px">
+        <span>覆盖率 <b>{{ fmtPct(dataQuality.summary.coverage_ratio) }}</b></span>
+        <span>有数据股票 <b>{{ dataQuality.stocks_with_data }}/{{ dataQuality.requested_stocks }}</b></span>
+        <span>缺根 <b>{{ dataQuality.summary.missing_bars }}</b> 根</span>
+        <span>剔除伪影价 <b>{{ dataQuality.summary.dropped_artifact_bars }}</b> 根</span>
+        <span>剔除无成交假 bar <b>{{ dataQuality.summary.dropped_no_trade_bars }}</b> 根</span>
+      </div>
+      <table v-if="dqPeriods.length">
+        <thead><tr>
+          <th>周期</th><th>池并集</th><th>应有</th><th>实有</th><th>缺根</th>
+          <th>覆盖率</th><th>伪影剔除</th><th>假 bar 剔除</th>
+        </tr></thead>
+        <tbody>
+          <tr v-for="[p, q] in dqPeriods" :key="p">
+            <td>{{ p }}</td>
+            <td>{{ q.union_bars }}</td>
+            <td>{{ q.expected_bars }}</td>
+            <td>{{ q.kept_bars }}</td>
+            <td>{{ q.missing_bars }}</td>
+            <td>{{ fmtPct(q.coverage_ratio) }}</td>
+            <td>{{ q.dropped_artifact_bars }}</td>
+            <td>{{ q.dropped_no_trade_bars }}</td>
+          </tr>
+        </tbody>
+      </table>
+      <div v-if="dqMissingStocks.length" style="margin-top:8px;font-size:12px;color:var(--ink-soft)">
+        整只无行情（{{ dqMissingStocks.length }}）：{{ dqMissingStocks.slice(0, 20).join('、') }}
+        <template v-if="dqMissingStocks.length > 20"> 等</template>
+      </div>
     </div>
 
     <!-- 验证结论：容量健康 + 危机防御 + 样本外引用（自动流程化） -->
