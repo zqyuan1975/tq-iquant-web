@@ -75,6 +75,10 @@ from core.engine.live.alert_dispatcher import AlertDataDispatcher
 from core.engine.execution_engine import ShadowDispatcher
 from core.engine.live.market_data import MarketDataService
 from core.engine.live.timing import now_shanghai
+from core.services.live_data_health import (
+    health_summary_text,
+    run_health_check,
+)
 from core.services.signal_schedule import (
     effective_signal_frequency, validate_signal_config,
 )
@@ -2033,6 +2037,66 @@ def session_channel_health(db: Session, session_id: int,
     }
 
 
+def session_data_health(db: Session, session_id: int,
+                        engines: Optional[Dict[int, LiveEngine]] = None,
+                        auto_fill: bool = True,
+                        now: Optional[datetime] = None):
+    """F2：会话数据体检 + 非盘中自动补齐（只读，不改交易语义）。
+
+    - 运行中：用引擎 dispatcher/日历（与实盘同一通道口径）；
+    - 未运行：按会话引擎临时构造 dispatcher（tdx/ths 走本机 TQ；桥走 HTTP），
+      构造失败返回 available=False 与原因；
+    - 周期取会话内策略实际使用的 period（至少 1d），代码取组合股票池并集。
+    """
+    session = db.query(LiveSession).filter(LiveSession.id == session_id).first()
+    if session is None:
+        return None
+    periods = sorted({
+        getattr(st, "period", None)
+        for _pid, st in _session_strategies(db, session_id)
+        if getattr(st, "period", None)
+    }) or ["1d"]
+    links = (
+        db.query(LiveSessionPortfolio)
+        .filter(LiveSessionPortfolio.session_id == session_id)
+        .all()
+    )
+    pool_codes: set = set()
+    for link in links:
+        ps = db.query(PortfolioStrategy).filter_by(
+            id=link.portfolio_strategy_id).first()
+        if ps is not None:
+            pool_codes.update(resolve_stock_codes(db, ps.id))
+    engine = (engines or {}).get(session_id)
+    dispatcher = getattr(engine, "dispatcher", None) if engine is not None else None
+    calendar = getattr(engine, "_calendar", None) if engine is not None else None
+    if dispatcher is None:
+        try:
+            dispatcher = make_dispatcher(
+                session_engine(session),
+                getattr(session, "mode", None) or "simulation", session_id)
+        except Exception as exc:  # noqa: BLE001 — 通道依赖缺失如实返回
+            return {
+                "session_id": session_id, "available": False,
+                "engine": session_engine(session), "engine_running": False,
+                "reason": str(exc) or "交易通道未就绪",
+                "periods_checked": periods,
+            }
+    result = run_health_check(
+        dispatcher, sorted(pool_codes), periods,
+        auto_fill=auto_fill, now=now, calendar=calendar)
+    return {
+        "session_id": session_id,
+        "available": True,
+        "engine": session_engine(session),
+        "engine_running": engine is not None,
+        "periods_checked": periods,
+        "codes_total": len(pool_codes),
+        "health": result["health"],
+        "auto_fill": result["auto_fill"],
+    }
+
+
 def switch_session_channel(db: Session, session_id: int,
                            target_engine: Optional[str] = None,
                            engines: Optional[Dict[int, LiveEngine]] = None):
@@ -3822,6 +3886,34 @@ def start_session(
             db, session_id, gate="split_order", layer="live_gate",
             action="unsupported", message=msg,
         )
+    # F2 启动前数据体检（只读，不阻断启动）：检查本次会话策略周期在本地是否有
+    # 最新数据；非盘中自动重读一次已落盘数据。缺数据时明确提示「需在通达信客户端
+    # 补下载」，而不是等盘中新鲜度闸静默跳过。
+    try:
+        health_periods = sorted({
+            getattr(st, "period", None)
+            for _pid, st in _session_strategies(db, session_id)
+            if getattr(st, "period", None)
+        }) or ["1d"]
+        health = run_health_check(
+            engine.dispatcher, sorted(pool_codes), health_periods,
+            auto_fill=True, calendar=getattr(engine, "_calendar", None),
+        )["health"]
+        if not health.get("healthy"):
+            msg = health_summary_text(health)
+            start_warnings.append(msg)
+            _record_decision_event(
+                db, session_id, gate="data_health", layer="live_gate",
+                action="notify", message=msg,
+            )
+            try:
+                from core.services.notify_service import notify as _notify
+                _notify("warn", "实盘数据体检异常", msg,
+                        gate="data_health", trade_date=now_shanghai().date())
+            except Exception:  # noqa: BLE001 — 通知失败不影响启动
+                logger.debug("data health notify failed", exc_info=True)
+    except Exception:  # noqa: BLE001 — 体检失败只告警，绝不阻断启动
+        logger.warning("启动前数据体检失败 (session %s)", session_id, exc_info=True)
     setattr(engine, "start_warnings", start_warnings)
     if execution_mode != "alert":
         # 重启恢复：从 live_trades 重放虚拟持仓/虚拟现金（alert 无下单/成交）

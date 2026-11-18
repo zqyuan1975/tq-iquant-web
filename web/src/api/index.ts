@@ -2012,6 +2012,15 @@ export async function getLiveSession(sessionId: number) {
   return res.data.data
 }
 
+/** F2 数据体检 + 非盘中自动补齐（GET /live/sessions/{id}/data-health，只读）。 */
+export async function getLiveDataHealth(sessionId: number, autoFill = true) {
+  const res = await api.get<ApiResponse<Record<string, any>>>(
+    `/live/sessions/${sessionId}/data-health`,
+    { params: { auto_fill: autoFill } },
+  )
+  return res.data.data
+}
+
 export async function getLiveSessions() {
   const res = await api.get<ApiResponse<LiveSessionItem[]>>('/live/sessions')
   return res.data.data

@@ -239,6 +239,20 @@ def session_channel_health(session_id: int, db: Session = Depends(get_db)):
     return ok(data)
 
 
+@router.get("/sessions/{session_id}/data-health")
+def session_data_health(session_id: int, auto_fill: bool = True,
+                        db: Session = Depends(get_db)):
+    """F2：数据体检 + 非盘中自动补齐（只读，不改交易语义）。
+
+    逐 code × 策略周期读取本地最新 bar，列出缺失/陈旧清单；非盘中（非交易日或
+    <09:15 / >15:10）对缺失项重读一次已落盘数据（平台无法程序化触发通达信下载）。
+    """
+    data = svc.session_data_health(db, session_id, _ENGINES, auto_fill=auto_fill)
+    if data is None:
+        return err(404, "资源不存在")
+    return ok(data)
+
+
 @router.post("/sessions/{session_id}/failover")
 def failover_session(session_id: int, data: dict, db: Session = Depends(get_db)):
     """B2：人工确认后切换主备通道（运行中于下次启动生效）。"""

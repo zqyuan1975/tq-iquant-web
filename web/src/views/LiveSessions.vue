@@ -20,6 +20,7 @@ import {
   ackLiveDecision, ackAllLiveDecisions,
   getLiveSessions, getLiveSession, createLiveSession, updateLiveSession, startLiveSession, stopLiveSession, deleteLiveSession,
   getLiveSessionChannelHealth, failoverLiveSession,
+  getLiveDataHealth,
   getLiveChannelGuard, reconnectLiveChannel,
   getLiveSplitRemainders, reorderLiveSplitRemainders,
   getLiveGateSnapshots,
@@ -768,6 +769,37 @@ function closeEventStreams() {
   connState.value = 'closed'
 }
 
+// ---- F2：数据体检（只读；非盘中自动重读本地已落盘数据，不触发下载）----
+const dataHealth = ref<Record<string, any> | null>(null)
+const dataHealthLoading = ref(false)
+// 逐周期「缺失/陈旧」摘要（stale + empty）
+const dataHealthProblems = computed(() => {
+  const periods = dataHealth.value?.health?.periods as Record<string, any> | undefined
+  if (!periods) return []
+  return Object.entries(periods)
+    .filter(([, s]) => (Number(s?.stale) || 0) + (Number(s?.empty) || 0) > 0)
+    .map(([p, s]) => `${p} 缺/陈旧 ${(Number(s?.stale) || 0) + (Number(s?.empty) || 0)} 只`)
+})
+
+async function checkDataHealth() {
+  const id = activeSessionId
+  if (id === null) return
+  dataHealthLoading.value = true
+  try {
+    const d = await getLiveDataHealth(id, true)
+    if (activeSessionId !== id) return
+    dataHealth.value = d ?? null
+  } catch (e: any) {
+    if (activeSessionId !== id) return
+    dataHealth.value = {
+      available: false,
+      reason: e?.response?.data?.error || e?.message || '体检请求失败',
+    }
+  } finally {
+    dataHealthLoading.value = false
+  }
+}
+
 /** 切换工作台聚焦会话：清空工作台、拉该会话历史；事件流不动（多会话并行常开）。 */
 const watchedSessionId = ref<number | null>(null)
 
@@ -775,6 +807,7 @@ function watchSession(id: number) {
   watchedSessionId.value = id
   activeSessionId = id
   bridgeOnline.value = null  // 切换会话先置未知，避免显示上一个会话的在线态
+  dataHealth.value = null  // 数据体检结果按会话隔离
   const target = sessions.value.find((s) => s.id === id)
   if (target) {
     runningEngine.value = (target.engine as LiveEngineKey) || null
@@ -1521,6 +1554,36 @@ onUnmounted(() => {
           title="重新拉取决策/拦截历史（含 move-stop、顺延、持久化风控事件）"
         >{{ decisionsLoading ? '刷新中…' : '↻ 刷新决策' }}</button>
       </div>
+    </div>
+
+    <!-- F2 数据体检：本地数据缺失/陈旧自查；非盘中自动重读一次已落盘数据 -->
+    <div
+      v-if="watchedSessionId !== null"
+      style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin:0 0 12px;font-size:13px"
+    >
+      <button class="btn btn-sm" :disabled="dataHealthLoading" @click="checkDataHealth">
+        {{ dataHealthLoading ? '体检中…' : '数据体检' }}
+      </button>
+      <template v-if="dataHealth">
+        <span v-if="dataHealth.available === false" class="badge badge-red">不可用：{{ dataHealth.reason }}</span>
+        <template v-else>
+          <span class="badge" :class="dataHealth.health?.healthy ? 'badge-green' : 'badge-orange'">
+            {{ dataHealth.health?.healthy ? '本地数据齐全' : `缺失/陈旧 ${dataHealth.health?.missing_count ?? 0} 只` }}
+          </span>
+          <span style="color:var(--ink-soft)">
+            {{ (dataHealth.periods_checked || []).join('/') }} · {{ dataHealth.codes_total }} 只
+            <template v-if="dataHealth.health?.intraday">（盘中只报告，不自动补齐）</template>
+          </span>
+          <span v-if="dataHealthProblems.length" style="color:var(--orange, #b45309)">{{ dataHealthProblems.join('；') }}</span>
+          <span v-if="dataHealth.auto_fill?.triggered" style="color:var(--ink-soft)">
+            非盘中已重读 {{ dataHealth.auto_fill.warmed }}/{{ dataHealth.auto_fill.requested }} 项
+          </span>
+          <span v-if="!dataHealth.health?.healthy" style="color:var(--ink-soft)">
+            缺失：{{ (dataHealth.health?.missing_codes || []).slice(0, 10).join('、') }}{{ (dataHealth.health?.missing_count || 0) > 10 ? ' 等' : '' }}；请在通达信客户端补下载对应周期数据
+          </span>
+        </template>
+      </template>
+      <span v-else style="color:var(--ink-soft)">检查本地是否已下载策略周期数据（平台只重读已落盘数据，不能代替通达信下载）</span>
     </div>
 
     <!-- 账户全貌（多会话并行：每个运行中会话一张卡，不同账号分列） -->
