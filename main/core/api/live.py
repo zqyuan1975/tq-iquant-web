@@ -269,6 +269,32 @@ def reconnect_session_channel(session_id: int, db: Session = Depends(get_db)):
     return ok(result)
 
 
+@router.get("/sessions/{session_id}/split-remainders")
+def session_split_remainders(session_id: int, db: Session = Depends(get_db)):
+    """H2：停会话时丢失的拆单剩余量（待人工一键补发）。"""
+    items = svc.list_split_remainders(db, session_id)
+    if items is None:
+        return err(404, "资源不存在")
+    return ok({"items": items, "count": len(items)})
+
+
+@router.post("/sessions/{session_id}/split-remainders/reorder")
+def reorder_session_split_remainders(
+    session_id: int, data: dict, db: Session = Depends(get_db),
+):
+    """H2：一键补发拆单剩余量（需运行中引擎 + confirm=true）。"""
+    if not data.get("confirm"):
+        return err(400, "补发拆单剩余需显式确认（confirm=true）")
+    eng, error = _running_engine(session_id)
+    if error is not None:
+        return error
+    result, error = svc.reorder_split_remainders(
+        db, session_id, eng, data.get("change_ids"))
+    if error is not None:
+        return err(error[0], error[1])
+    return ok(result)
+
+
 @router.get("/sessions/{session_id}/signals")
 def session_signals(
     session_id: int,

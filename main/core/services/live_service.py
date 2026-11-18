@@ -29,7 +29,7 @@ from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Dict, List, Optional, Tuple
 
-from sqlalchemy import or_
+from sqlalchemy import func, or_
 from sqlalchemy.orm import Session
 
 from core.config import load_config
@@ -1427,6 +1427,17 @@ def list_sessions(db: Session, engines: Optional[Dict[int, LiveEngine]] = None) 
         by_session.setdefault(l.session_id, []).append(
             {"portfolio_id": l.portfolio_strategy_id, "status": l.status}
         )
+    # H2：各会话待补发拆单剩余笔数（仅 pending；列表/编辑弹窗提示用）
+    split_counts: Dict[int, int] = dict(
+        db.query(LiveSessionPendingChange.live_session_id,
+                 func.count(LiveSessionPendingChange.id))
+        .filter(
+            LiveSessionPendingChange.field == "split_remainder",
+            LiveSessionPendingChange.status == "pending",
+        )
+        .group_by(LiveSessionPendingChange.live_session_id)
+        .all()
+    )
     return [
         {
             "id": s.id,
@@ -1452,6 +1463,8 @@ def list_sessions(db: Session, engines: Optional[Dict[int, LiveEngine]] = None) 
             # B2 主备通道
             "backup_engine": getattr(s, "backup_engine", None),
             "failover_enabled": bool(getattr(s, "failover_enabled", False)),
+            # H2：待补发拆单剩余笔数（>0 时会话行显示「补发拆单剩余」入口）
+            "split_remainder_count": int(split_counts.get(s.id, 0)),
             "status": s.status,
             # 引擎是否真的在本进程注册表中运行（工作台据此区分「状态陈旧」与
             # 真正运行中：status=running 但 engine_running=false = 后端重启后
@@ -1674,6 +1687,15 @@ def get_session(db: Session, session_id: int, engine: Optional[LiveEngine] = Non
         # B2 主备通道（默认 NULL / 0）
         "backup_engine": getattr(session, "backup_engine", None),
         "failover_enabled": bool(getattr(session, "failover_enabled", False)),
+        # H2：待补发拆单剩余笔数
+        "split_remainder_count": int(
+            db.query(func.count(LiveSessionPendingChange.id))
+            .filter(
+                LiveSessionPendingChange.live_session_id == session_id,
+                LiveSessionPendingChange.field == "split_remainder",
+                LiveSessionPendingChange.status == "pending",
+            )
+            .scalar() or 0),
         # 14:50 提前收盘价（仅 1d）
         "advance_close_enabled": bool(session.advance_close_enabled),
         "advance_close_time": session.advance_close_time or "14:51",
@@ -4412,7 +4434,11 @@ def list_pending_changes(db: Session, session_id: int):
         return None
     rows = (
         db.query(LiveSessionPendingChange)
-        .filter(LiveSessionPendingChange.live_session_id == session_id)
+        .filter(
+            LiveSessionPendingChange.live_session_id == session_id,
+            # H2 拆单补发行通过 split-remainders 接口展示，不混入参数队列
+            LiveSessionPendingChange.field != "split_remainder",
+        )
         .order_by(LiveSessionPendingChange.id.desc())
         .limit(100)
         .all()
@@ -4525,6 +4551,113 @@ def discard_pending_change(db: Session, session_id: int, change_id: int,
     return True, {"id": row.id, "status": "discarded"}
 
 
+def list_split_remainders(db: Session, session_id: int):
+    """H2：待补发的拆单剩余快照（停会话时写入，逐条可补发）。"""
+    exists = db.query(LiveSession.id).filter(LiveSession.id == session_id).first()
+    if exists is None:
+        return None
+    rows = (
+        db.query(LiveSessionPendingChange)
+        .filter(
+            LiveSessionPendingChange.live_session_id == session_id,
+            LiveSessionPendingChange.field == "split_remainder",
+            LiveSessionPendingChange.status == "pending",
+        )
+        .order_by(LiveSessionPendingChange.id.asc())
+        .all()
+    )
+    items = []
+    for row in rows:
+        code, _, signal_name = (row.old_value or "").partition("|")
+        parts = (row.new_value or "").split("|")
+        if len(parts) < 2 or not code:
+            continue
+        try:
+            qty = int(parts[1])
+        except (TypeError, ValueError):
+            continue
+        price = None
+        if len(parts) > 2 and parts[2]:
+            try:
+                price = float(Decimal(parts[2]))
+            except (ArithmeticError, TypeError, ValueError):
+                price = None
+        items.append({
+            "id": row.id,
+            "portfolio_strategy_id": row.portfolio_strategy_id,
+            "strategy_id": row.strategy_id,
+            "stock_code": code,
+            "trade_type": parts[0],
+            "quantity": qty,
+            "price": price,
+            "signal_type": parts[3] if len(parts) > 3 else "",
+            "period": parts[4] if len(parts) > 4 else "",
+            "signal_name": signal_name,
+            "created_at": _iso_utc(row.created_at),
+        })
+    return items
+
+
+def reorder_split_remainders(
+    db: Session, session_id: int, engine: LiveEngine,
+    change_ids: Optional[list] = None,
+):
+    """H2：一键补发拆单剩余量（须运行中引擎；逐笔重走完整提交链）。
+
+    返回 ``(data, error)``；成功补发的行置 applied，被闸门拦截/失败的行保留
+    pending 便于人工处理后重试。
+    """
+    items = list_split_remainders(db, session_id)
+    if items is None:
+        return None, (404, "资源不存在")
+    if change_ids:
+        try:
+            wanted = {int(i) for i in change_ids}
+        except (TypeError, ValueError):
+            return None, (400, "change_ids 必须为整数数组")
+        items = [i for i in items if i["id"] in wanted]
+    if not items:
+        return None, (400, "没有待补发的拆单剩余量")
+    payload = engine.reorder_split_remainders([dict(i) for i in items])
+    results = payload.get("results") or []
+    applied_ids = [
+        r["id"] for r in results
+        if r.get("status") == "accepted" and r.get("id") is not None
+    ]
+    if applied_ids:
+        (
+            db.query(LiveSessionPendingChange)
+            .filter(LiveSessionPendingChange.id.in_(applied_ids))
+            .update(
+                {LiveSessionPendingChange.status: "applied",
+                 LiveSessionPendingChange.applied_at: datetime.now()},
+                synchronize_session=False,
+            )
+        )
+    accepted = len(applied_ids)
+    _record_decision_event(
+        db, session_id, gate="split_reorder", layer="live_gate",
+        action="submit" if accepted else "skip",
+        message="拆单剩余补发：提交 %d 笔，成功 %d 笔，剩余 %d 笔"
+                % (len(results), accepted, len(results) - accepted),
+    )
+    db.commit()
+    remaining = (
+        db.query(func.count(LiveSessionPendingChange.id))
+        .filter(
+            LiveSessionPendingChange.live_session_id == session_id,
+            LiveSessionPendingChange.field == "split_remainder",
+            LiveSessionPendingChange.status == "pending",
+        )
+        .scalar() or 0
+    )
+    return {
+        "results": results,
+        "accepted": accepted,
+        "remaining": int(remaining),
+    }, None
+
+
 def apply_pending_changes(db: Session, session_id: int) -> int:
     """启动建引擎前应用本会话全部 pending 变更；返回应用条数。
 
@@ -4535,8 +4668,12 @@ def apply_pending_changes(db: Session, session_id: int) -> int:
     """
     rows = (
         db.query(LiveSessionPendingChange)
-        .filter(LiveSessionPendingChange.live_session_id == session_id,
-                LiveSessionPendingChange.status == "pending")
+        .filter(
+            LiveSessionPendingChange.live_session_id == session_id,
+            LiveSessionPendingChange.status == "pending",
+            # H2 拆单剩余补发行单独消费，不参与参数应用
+            LiveSessionPendingChange.field != "split_remainder",
+        )
         .order_by(LiveSessionPendingChange.id.asc())
         .all()
     )

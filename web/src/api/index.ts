@@ -1807,6 +1807,28 @@ export interface LiveSessionItem {
   // B2 主备通道（后续批次使用；旧数据缺省）
   backup_engine?: LiveEngineKey | null
   failover_enabled?: boolean
+  // H2 待补发拆单剩余笔数（>0 显示「补发拆单剩余」入口）
+  split_remainder_count?: number
+}
+
+// H2 拆单剩余量（停会话时未提交的子单快照）
+export interface LiveSplitRemainderItem {
+  id: number
+  portfolio_strategy_id: number | null
+  strategy_id: number | null
+  stock_code: string
+  trade_type: string
+  quantity: number
+  price: number | null
+  signal_type: string
+  period: string
+  signal_name: string
+  created_at: string | null
+}
+
+export interface LiveSplitRemainderList {
+  items: LiveSplitRemainderItem[]
+  count: number
 }
 
 // I-7（audit）：对账差异摘要（LiveEngine._reconcile_positions 产出）
@@ -1953,6 +1975,24 @@ export async function updateLiveSession(id: number, req: Record<string, unknown>
     effective_at: 'now' | 'next_start'
     message: string
   }>>(`/live/sessions/${id}`, req)
+  return res.data.data
+}
+
+/** H2：停会话时未提交的拆单剩余量（待一键补发）。 */
+export async function getLiveSplitRemainders(id: number) {
+  const res = await api.get<ApiResponse<LiveSplitRemainderList>>(
+    `/live/sessions/${id}/split-remainders`)
+  return res.data.data
+}
+
+/** H2：一键补发拆单剩余量（需 confirm=true + 会话运行中）。 */
+export async function reorderLiveSplitRemainders(id: number, changeIds?: number[]) {
+  const res = await api.post<ApiResponse<{
+    results: { id: number | null; status: string; reason?: string }[]
+    accepted: number
+    remaining: number
+  }>>(`/live/sessions/${id}/split-remainders/reorder`,
+    { confirm: true, change_ids: changeIds })
   return res.data.data
 }
 

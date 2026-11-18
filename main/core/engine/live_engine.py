@@ -128,6 +128,7 @@ from core.models import (
     LiveCorporateAction,
     LiveApprovalQueue, LiveManualAction, LiveOutOfPoolDecision,
     LivePortfolioDaily,
+    LiveSessionPendingChange,
 )
 from core.tq.formula import TQFormula
 from core.tq.utils import TDXLockTimeout
@@ -1658,6 +1659,8 @@ class LiveEngine:
                         fields={"会话": self.session_id,
                                 "剩余笔数": len(pending), "剩余股数": remaining},
                     )
+                # H2：把剩余子单持久化为「待补发」快照，供重启后一键补发
+                self._persist_split_remainders_now(entries)
                 self._split_children.clear()
         # I-5：dispatcher.close 经同一主 executor 执行——在途 tick 持 get_tdx_lock
         # 跑完后 close 自然获得锁（同池 max_workers=1 串行排队），事件循环不被
@@ -10157,6 +10160,147 @@ class LiveEngine:
         finally:
             if db is not None:
                 db.close()
+
+    # ------------------------------------------------------------------
+    # H2 拆单剩余量持久化 / 一键补发
+    # ------------------------------------------------------------------
+    def _persist_split_remainders_now(self, entries) -> None:
+        """停会话时把未提交子单写成 ``split_remainder`` 待补发行（best-effort）。
+
+        写一张 ``live_session_pending_changes`` 行/子单：old_value 存
+        ``code|signal_name``，new_value 存 ``trade_type|qty|price|signal_type|period``。
+        不用 JSON 是因为 new_value 只有 64 字符；拆成列存可避免截断关键字段。
+        本次快照会先作废旧 pending 快照（避免重启后重复补发历史剩余量）。
+        """
+        if self._db_session_factory is None:
+            return
+        db = None
+        try:
+            db = self._db_session_factory()
+            db.query(LiveSessionPendingChange).filter(
+                LiveSessionPendingChange.live_session_id == self.session_id,
+                LiveSessionPendingChange.field == "split_remainder",
+                LiveSessionPendingChange.status == "pending",
+            ).update(
+                {LiveSessionPendingChange.status: "discarded"},
+                synchronize_session=False,
+            )
+            for entry in entries:
+                portfolio = entry.get("portfolio")
+                pid = getattr(portfolio, "portfolio_id", None)
+                for child in entry.get("pending") or []:
+                    qty = int(getattr(child, "quantity", 0) or 0)
+                    if qty <= 0:
+                        continue
+                    tt = getattr(child, "trade_type", None)
+                    st = getattr(child, "signal_type", None)
+                    price = getattr(child, "price", None)
+                    code = str(getattr(child, "stock_code", "") or "")
+                    sig_name = str(getattr(child, "signal_name", "") or "")
+                    period = str(
+                        getattr(child, "period", None)
+                        or entry.get("period") or "")
+                    new_value = "|".join([
+                        str(getattr(tt, "value", tt) or ""),
+                        str(qty),
+                        "" if price is None else str(price),
+                        str(getattr(st, "value", st) or ""),
+                        period[:10],
+                    ])
+                    db.add(LiveSessionPendingChange(
+                        live_session_id=self.session_id,
+                        portfolio_strategy_id=pid,
+                        strategy_id=getattr(child, "strategy_id", None),
+                        field="split_remainder",
+                        old_value=("%s|%s" % (code, sig_name))[:64],
+                        new_value=new_value[:64],
+                        status="pending",
+                        note="停会话丢失拆单剩余，待人工一键补发",
+                    ))
+            db.commit()
+        except Exception:  # noqa: BLE001
+            if db is not None:
+                db.rollback()
+            logger.warning(
+                "persist split remainders failed (session %s)",
+                self.session_id, exc_info=True)
+        finally:
+            if db is not None:
+                db.close()
+
+    def reorder_split_remainders(self, items: List[dict]) -> dict:
+        """H2 一键补发：逐笔重建订单并重走完整提交链（须运行中引擎）。
+
+        ``items`` 由 service 解析待补发行得到：portfolio_strategy_id / strategy_id /
+        stock_code / trade_type / quantity / price / signal_type / period / id。
+        与人工补单共用 ``_submit_one_order``（闸门/去重/资金/T+1 全生效），
+        但**不要求 manual 模式**——这是对停止丢弃子单的补偿，不是人工新单。
+        """
+        results: List[dict] = []
+        for item in items:
+            row_id = item.get("id")
+            try:
+                pid = int(item.get("portfolio_strategy_id"))
+                portfolio = self._approval_portfolio(pid)
+                if portfolio is None:
+                    raise ManualActionError(
+                        "组合 %s 不在本会话运行实例中" % pid, 409)
+                code = str(item.get("stock_code") or "").strip().upper()
+                if not code:
+                    raise ManualActionError("stock_code 不能为空")
+                try:
+                    tt = TradeType(str(item.get("trade_type") or "").upper())
+                except ValueError:
+                    raise ManualActionError("trade_type 仅支持 BUY/SELL")
+                qty = int(item.get("quantity") or 0)
+                if qty <= 0:
+                    raise ManualActionError("quantity 必须为正整数")
+                ctx = self._manual_ctx(portfolio, item.get("strategy_id"))
+                px = self._manual_price(portfolio, code, item.get("price"), tt)
+                try:
+                    st = SignalType(
+                        str(item.get("signal_type") or "").upper()
+                        or (SignalType.CLOSE.value if tt == TradeType.SELL
+                            else SignalType.OPEN.value))
+                except ValueError:
+                    st = SignalType.CLOSE if tt == TradeType.SELL else SignalType.OPEN
+                order = OrderEvent(
+                    strategy_id=ctx.strategy_id,
+                    portfolio_id=pid,
+                    stock_code=code,
+                    trade_type=tt,
+                    signal_type=st,
+                    quantity=qty,
+                    price=px,
+                    bar_time=self.ctx.clock(),
+                    signal_name="split_reorder",
+                    period=item.get("period") or None,
+                )
+                db = self._db_session_factory()
+                try:
+                    self._submit_one_order(db, portfolio, order, period=None,
+                                           emit_signal=False)
+                finally:
+                    db.close()
+                accepted = bool(getattr(order, "_live_order_id", None))
+                results.append({
+                    "id": row_id,
+                    "stock_code": code,
+                    "trade_type": tt.value,
+                    "quantity": qty,
+                    "price": float(px),
+                    "status": "accepted" if accepted else "blocked",
+                })
+            except Exception as exc:  # noqa: BLE001 — 逐笔互不影响
+                results.append({
+                    "id": row_id,
+                    "stock_code": item.get("stock_code"),
+                    "trade_type": item.get("trade_type"),
+                    "quantity": item.get("quantity"),
+                    "status": "rejected",
+                    "reason": "%s: %s" % (type(exc).__name__, exc),
+                })
+        return {"results": results}
 
     # 重启恢复拆单一致性校验的回溯窗口：拆单子单通常当日/次日成交完毕，10 天足够
     # 覆盖「停机跨周末」，同时避免全表扫描。

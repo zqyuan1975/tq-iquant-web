@@ -21,6 +21,8 @@ import {
   getLiveSessions, getLiveSession, createLiveSession, updateLiveSession, startLiveSession, stopLiveSession, deleteLiveSession,
   getLiveSessionChannelHealth, failoverLiveSession,
   getLiveChannelGuard, reconnectLiveChannel,
+  getLiveSplitRemainders, reorderLiveSplitRemainders,
+  type LiveSplitRemainderItem,
   type LiveSessionChannelHealth, type LiveChannelGuard,
   recoverLiveBreaker, getLiveChannel, testLiveChannel, sendUserBlock, getFormulas, getWatchdogStatus,
   getLiveAccountPreview, resetLiveBaseline,
@@ -1057,6 +1059,43 @@ async function switchFromGuard() {
   editResult.value = { effective_at: 'now', message: '请在编辑弹窗确认备用通道后点「一键切换备用通道」' }
 }
 
+// ---- H2 拆单剩余量补发 ----
+const splitModal = ref<LiveSessionItem | null>(null)
+const splitItems = ref<LiveSplitRemainderItem[]>([])
+const splitLoading = ref(false)
+const splitMessage = ref('')
+async function openSplitRemainders(s: LiveSessionItem) {
+  splitModal.value = s
+  splitItems.value = []
+  splitMessage.value = ''
+  splitLoading.value = true
+  try {
+    const res = await getLiveSplitRemainders(s.id)
+    splitItems.value = res.items
+    if (res.count === 0) splitMessage.value = '当前没有待补发的拆单剩余量'
+  } catch (e: any) {
+    splitMessage.value = e?.response?.data?.message || e?.message || '读取拆单剩余量失败'
+  } finally {
+    splitLoading.value = false
+  }
+}
+async function submitSplitReorder() {
+  if (!splitModal.value || splitItems.value.length === 0) return
+  splitLoading.value = true
+  splitMessage.value = ''
+  try {
+    const res = await reorderLiveSplitRemainders(splitModal.value.id)
+    splitMessage.value = `已提交 ${res.results.length} 笔，成功 ${res.accepted} 笔，剩余 ${res.remaining} 笔待补发`
+    const refreshed = await getLiveSplitRemainders(splitModal.value.id)
+    splitItems.value = refreshed.items
+    load()
+  } catch (e: any) {
+    splitMessage.value = e?.response?.data?.message || e?.message || '补发失败'
+  } finally {
+    splitLoading.value = false
+  }
+}
+
 async function deleteSession(s: LiveSessionItem) {
   if (!confirm(`确定删除实盘 session「${s.name}」？该 session 的历史委托/成交将一并清除，且不可恢复。`)) return
   try {
@@ -1381,6 +1420,11 @@ onUnmounted(() => {
               @click="openGuard(s)" class="btn btn-sm" data-test="channel-guard-open"
               title="通道级守护：检查客户端/桥、运行态引擎、备用通道与待生效配置"
             >通道守护</button>
+            <button
+              v-if="(s.split_remainder_count || 0) > 0"
+              @click="openSplitRemainders(s)" class="btn btn-sm" data-test="split-reorder-open"
+              title="停止时丢失的拆单子单剩余量；需会话运行中才能补发"
+            >补发拆单剩余（{{ s.split_remainder_count }}）</button>
             <button
               v-if="s.status !== 'stopping'"
               @click="openEdit(s)" class="btn btn-sm" data-test="session-edit-open"
@@ -1943,6 +1987,43 @@ onUnmounted(() => {
           @click="switchFromGuard"
         >去切换备用通道</button>
         <button class="btn" @click="guardModal = null">关闭</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- H2 拆单剩余量：停止时未提交的子单，运行中可一键补发 -->
+  <div v-if="splitModal" class="modal-overlay" data-test="split-reorder-modal" @click.self="splitModal = null">
+    <div class="modal-content">
+      <h3>补发拆单剩余「{{ splitModal.name }}」</h3>
+      <div class="modal-body">
+        <p v-if="splitModal.status !== 'running'" class="baseline-preview warn" data-test="split-reorder-need-running">
+          会话当前未运行：请先启动会话，补发会逐笔重走资金/风控/T+1 闸门。
+        </p>
+        <p v-if="splitLoading" class="muted">读取中…</p>
+        <table v-else-if="splitItems.length" class="data-table" data-test="split-reorder-table">
+          <thead>
+            <tr><th>股票</th><th>方向</th><th>剩余数量</th><th>参考价</th><th>信号</th><th>丢失时间</th></tr>
+          </thead>
+          <tbody>
+            <tr v-for="it in splitItems" :key="it.id">
+              <td>{{ it.stock_code }}</td>
+              <td>{{ it.trade_type === 'SELL' ? '卖出' : '买入' }}</td>
+              <td>{{ it.quantity }}</td>
+              <td>{{ it.price ?? '—' }}</td>
+              <td>{{ it.signal_name || it.signal_type || '—' }}</td>
+              <td>{{ it.created_at || '—' }}</td>
+            </tr>
+          </tbody>
+        </table>
+        <p v-if="splitMessage" class="baseline-preview" data-test="split-reorder-message">{{ splitMessage }}</p>
+      </div>
+      <div class="modal-actions">
+        <button
+          class="btn btn-primary" data-test="split-reorder-submit"
+          :disabled="splitLoading || splitItems.length === 0 || splitModal.status !== 'running'"
+          @click="submitSplitReorder"
+        >确认补发</button>
+        <button class="btn" @click="splitModal = null">关闭</button>
       </div>
     </div>
   </div>
