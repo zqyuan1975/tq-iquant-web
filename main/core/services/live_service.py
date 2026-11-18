@@ -1327,6 +1327,9 @@ def build_engine(
         capital_pool_mode=(getattr(session_row, "capital_pool_mode", None) or "off"),
         capital_pool_rebalance_enabled=bool(
             getattr(session_row, "capital_pool_rebalance_enabled", False)),
+        # B2 主备通道：主通道心跳失败时按需写建议切换事件（不自动热切换）
+        backup_engine=getattr(session_row, "backup_engine", None),
+        failover_enabled=bool(getattr(session_row, "failover_enabled", False)),
     )
     # 桥慢响应告警接引擎事件流（risk/bridge_slow，dispatcher 侧已按 endpoint
     # 冷却去重）；仅 HTTP 桥 dispatcher 有 on_slow 钩子，其它通道不受影响。
@@ -1378,6 +1381,9 @@ def list_sessions(db: Session, engines: Optional[Dict[int, LiveEngine]] = None) 
             "capital_pool_mode": getattr(s, "capital_pool_mode", None) or "off",
             "capital_pool_rebalance_enabled": bool(
                 getattr(s, "capital_pool_rebalance_enabled", False)),
+            # B2 主备通道
+            "backup_engine": getattr(s, "backup_engine", None),
+            "failover_enabled": bool(getattr(s, "failover_enabled", False)),
             "status": s.status,
             # 引擎是否真的在本进程注册表中运行（工作台据此区分「状态陈旧」与
             # 真正运行中：status=running 但 engine_running=false = 后端重启后
@@ -1597,6 +1603,9 @@ def get_session(db: Session, session_id: int, engine: Optional[LiveEngine] = Non
         "capital_pool_mode": getattr(session, "capital_pool_mode", None) or "off",
         "capital_pool_rebalance_enabled": bool(
             getattr(session, "capital_pool_rebalance_enabled", False)),
+        # B2 主备通道（默认 NULL / 0）
+        "backup_engine": getattr(session, "backup_engine", None),
+        "failover_enabled": bool(getattr(session, "failover_enabled", False)),
         # 14:50 提前收盘价（仅 1d）
         "advance_close_enabled": bool(session.advance_close_enabled),
         "advance_close_time": session.advance_close_time or "14:51",
@@ -1669,7 +1678,8 @@ def get_session(db: Session, session_id: int, engine: Optional[LiveEngine] = Non
 # ---------------------------------------------------------------------------
 #: PUT /sessions/{id} 允许编辑的字段（白名单，未知字段忽略）。
 SESSION_EDIT_FIELDS = (
-    "name", "engine", "execution_mode", "signal_file_path",
+    "name", "engine", "backup_engine", "failover_enabled",
+    "execution_mode", "signal_file_path",
     "advance_close_enabled", "advance_close_time",
     "intraday_mismatched_risk_enabled", "capital_pool_mode",
     "capital_pool_rebalance_enabled", "portfolio_ids",
@@ -1703,7 +1713,8 @@ def _apply_session_field(db: Session, session: LiveSession, field: str, value) -
     setattr(session, field, value)
 
 
-def _normalize_session_patch(db: Session, data: dict):
+def _normalize_session_patch(db: Session, data: dict,
+                             current_engine: Optional[str] = None):
     """校验并归一 PUT body；返回 (patch, (status, message) | None)。"""
     patch: dict = {}
     if "name" in data:
@@ -1716,6 +1727,20 @@ def _normalize_session_patch(db: Session, data: dict):
         if engine not in ENGINES_META:
             return None, (400, "engine 非法，仅支持 %s" % " / ".join(ENGINES_META))
         patch["engine"] = engine
+    if "backup_engine" in data:
+        raw = data.get("backup_engine")
+        if raw is None or str(raw).strip() == "":
+            patch["backup_engine"] = None
+        else:
+            backup = str(raw).strip()
+            if backup not in ENGINES_META:
+                return None, (400, "backup_engine 非法，仅支持 %s"
+                              % " / ".join(ENGINES_META))
+            if backup == patch.get("engine", current_engine):
+                return None, (400, "备用引擎不能与主引擎相同")
+            patch["backup_engine"] = backup
+    if "failover_enabled" in data:
+        patch["failover_enabled"] = bool(data.get("failover_enabled"))
     if "execution_mode" in data:
         execution_mode = str(data.get("execution_mode") or "").strip()
         if execution_mode not in ("alert", "auto", "manual"):
@@ -1818,7 +1843,7 @@ def update_session(db: Session, session_id: int, data: dict,
     session = db.query(LiveSession).filter(LiveSession.id == session_id).first()
     if session is None:
         return False, (404, "资源不存在")
-    patch, error = _normalize_session_patch(db, data)
+    patch, error = _normalize_session_patch(db, data, session_engine(session))
     if error:
         return False, error
     running = (session_id in engines
@@ -1841,6 +1866,105 @@ def update_session(db: Session, session_id: int, data: dict,
         "effective_at": "next_start" if pending else "now",
         "message": ("会话运行中：%s 已加入待生效队列，下次启动生效"
                     % "、".join(pending)) if pending else "已立即生效",
+    }
+
+
+# ---------------------------------------------------------------------------
+# B2：主备通道健康探活 + 人工确认切换
+# ---------------------------------------------------------------------------
+
+def _channel_health_one(engine_key: Optional[str],
+                        engines: Optional[Dict[int, LiveEngine]]) -> Optional[dict]:
+    if not engine_key:
+        return None
+    data = channel_status(engine_key=engine_key, engines=engines)
+    return {
+        "engine": engine_key,
+        "label": data.get("label") or ENGINES_META.get(engine_key, (None, engine_key))[1],
+        "online": data.get("online"),
+        "online_source": data.get("online_source"),
+        "engine_running": bool(data.get("engine_running")),
+        "configured": bool(data.get("configured")),
+        "detail": data.get("detail") or "",
+        "stale": bool(data.get("stale")),
+        "checked_at": data.get("checked_at"),
+    }
+
+
+def session_channel_health(db: Session, session_id: int,
+                           engines: Optional[Dict[int, LiveEngine]] = None):
+    """B2：主/备通道健康探活（只读，不新建轮询）。
+
+    - 主通道：会话生效引擎；运行中优先读引擎内存在线态，未运行真实探活；
+    - 备用通道：未配置返回 None；配置后同样真实探活（tdx/ths 看窗口，
+      iquant/goldminer 探 HTTP 桥）。
+    """
+    session = db.query(LiveSession).filter(LiveSession.id == session_id).first()
+    if session is None:
+        return None
+    primary = session_engine(session)
+    backup = getattr(session, "backup_engine", None)
+    return {
+        "session_id": session_id,
+        "primary": _channel_health_one(primary, engines),
+        "backup": _channel_health_one(backup, engines),
+        "failover_enabled": bool(getattr(session, "failover_enabled", False)),
+        "advice": ("主通道离线时可一键切换备用通道；运行中切换于下次启动生效"
+                   if backup else "未配置备用通道（编辑会话可设置）"),
+    }
+
+
+def switch_session_channel(db: Session, session_id: int,
+                           target_engine: Optional[str] = None,
+                           engines: Optional[Dict[int, LiveEngine]] = None):
+    """B2：人工确认后切换主通道。
+
+    - 目标默认取会话 `backup_engine`；运行中入待生效队列（下次启动建新引擎），
+      未运行立即改 engine；
+    - 切换写一条 `channel_failover` 决策事件留痕（谁在何时切到哪条通道）；
+    - 不做自动热切换：dispatcher 不能在持有在途委托/持仓内存态时被替换。
+    """
+    engines = engines or ENGINES
+    session = db.query(LiveSession).filter(LiveSession.id == session_id).first()
+    if session is None:
+        return False, (404, "资源不存在")
+    current = session_engine(session)
+    target = str(target_engine or getattr(session, "backup_engine", None) or "").strip()
+    if not target:
+        return False, (400, "未配置备用通道，无法切换")
+    if target not in ENGINES_META:
+        return False, (400, "target_engine 非法，仅支持 %s"
+                       % " / ".join(ENGINES_META))
+    if target == current:
+        return False, (400, "目标通道与当前主通道相同")
+    if session.status == "stopping":
+        return False, (409, "会话正在停止中，请等待停止完成后再切换")
+    running = session_id in engines or session.status == "running"
+    if running:
+        _enqueue_session_pending(db, session, "engine", target)
+        effective_at = "next_start"
+        message = ("已提交切换：%s → %s，运行中会话将在下次启动生效"
+                   % (current, target))
+    else:
+        session.engine = target
+        effective_at = "now"
+        message = "已切换主通道：%s → %s" % (current, target)
+    db.add(LiveDecisionEvent(
+        live_session_id=session_id,
+        gate="channel_failover",
+        layer="live_gate",
+        action=("switch_pending" if running else "switch"),
+        param_name="engine",
+        message=("%s（操作人=人工确认，时点=%s）"
+                 % (message, datetime.now().strftime("%Y-%m-%d %H:%M:%S")))[:200],
+    ))
+    db.commit()
+    return True, {
+        "session_id": session_id,
+        "from_engine": current,
+        "to_engine": target,
+        "effective_at": effective_at,
+        "message": message,
     }
 
 

@@ -230,6 +230,27 @@ def update_session(session_id: int, data: dict, db: Session = Depends(get_db)):
     return ok(result)
 
 
+@router.get("/sessions/{session_id}/channel-health")
+def session_channel_health(session_id: int, db: Session = Depends(get_db)):
+    """B2：主/备通道健康探活（只读；运行中优先读引擎在线态）。"""
+    data = svc.session_channel_health(db, session_id, _ENGINES)
+    if data is None:
+        return err(404, "资源不存在")
+    return ok(data)
+
+
+@router.post("/sessions/{session_id}/failover")
+def failover_session(session_id: int, data: dict, db: Session = Depends(get_db)):
+    """B2：人工确认后切换主备通道（运行中于下次启动生效）。"""
+    if not data.get("confirm"):
+        return err(400, "切换主备通道需显式确认（confirm=true）")
+    ok_flag, result = svc.switch_session_channel(
+        db, session_id, data.get("target_engine"), _ENGINES)
+    if not ok_flag:
+        return err(result[0], result[1])
+    return ok(result)
+
+
 @router.get("/sessions/{session_id}/signals")
 def session_signals(
     session_id: int,

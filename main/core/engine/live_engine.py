@@ -622,6 +622,8 @@ class LiveEngine:
         # rebalance_enabled=True 时每交易日首 bar 再平衡（默认关闭）。
         capital_pool_mode: str = "off",
         capital_pool_rebalance_enabled: bool = False,
+        backup_engine: Optional[str] = None,
+        failover_enabled: bool = False,
     ):
         # 交易日历（下单总闸）：默认桥 xtdata 权威日历，桥离线时 TradingCalendar
         # fail-open（工作日放行），测试可注入假日历。
@@ -717,6 +719,11 @@ class LiveEngine:
             else "off")
         self._capital_pool_rebalance = bool(capital_pool_rebalance_enabled)
         self._capital_pool_day: Optional[date] = None
+        # B2 主备通道：主通道心跳失败时逐日写一条建议切换事件（不自动热切换；
+        # 运行中切换必须经 stop/start 重建 dispatcher，由人工确认后走待生效队列）。
+        self.backup_engine = backup_engine or None
+        self._failover_enabled = bool(failover_enabled and self.backup_engine)
+        self._failover_advised_day: Optional[date] = None
         # 「真实侧按资金占比缩量」事件节流：同一 (组合, 交易日) 只记一条
         self._cash_share_scale_days: Dict[tuple, date] = {}
         self._pool_codes_by_portfolio = pool_codes_by_portfolio or {}
@@ -1834,6 +1841,47 @@ class LiveEngine:
         if was_online:
             self._record_channel_state(
                 online=False, reason="heartbeat_failed", now=now)
+            self._maybe_advise_failover(now)
+
+    def _maybe_advise_failover(self, now: datetime) -> None:
+        """B2：主通道心跳失败时逐日写一条建议切换备用通道的决策事件。
+
+        不自动热切换 dispatcher（运行中切换必须 stop/start 重建引擎，避免
+        在途委托/持仓状态错配）；事件只做提示，人工确认后经
+        ``POST /sessions/{id}/failover`` 切换（运行中入待生效队列）。
+        """
+        if not self._failover_enabled or not self.backup_engine:
+            return
+        day = now.date()
+        if self._failover_advised_day == day:
+            return
+        self._failover_advised_day = day
+        message = (
+            "主通道离线，建议切换备用通道 %s（会话 %s，%s）；"
+            "切换需人工确认，运行中于下次启动生效"
+            % (self.backup_engine, self.session_id,
+               now.strftime("%Y-%m-%d %H:%M:%S")))
+        factory = self._db_session_factory
+        if factory is None:
+            logger.warning("%s", message)
+            return
+        try:
+            db = factory()
+            try:
+                db.add(LiveDecisionEvent(
+                    live_session_id=self.session_id,
+                    gate="channel_failover",
+                    layer="live_gate",
+                    action="manual_required",
+                    param_name="backup_engine",
+                    message=message[:200],
+                ))
+                db.commit()
+            finally:
+                db.close()
+        except Exception:  # noqa: BLE001 — 提示链路失败不得影响交易
+            logger.exception(
+                "record failover advice failed (session %s)", self.session_id)
 
     def _mark_bridge_online(self, now: datetime) -> None:
         """置在线状态；仅 False→True 翻转时落一条 ``channel_recovered``。

@@ -87,6 +87,11 @@ class LiveSession(Base):
         String(16), nullable=False, server_default="off", default="off")
     capital_pool_rebalance_enabled = Column(
         Boolean, nullable=False, server_default="0", default=False)
+    # B2 主备通道（默认关闭）：NULL=未配置备用引擎；failover_enabled=1 时主通道
+    # 心跳失败逐日写 channel_failover 建议事件，实际切换仍需人工确认。
+    backup_engine = Column(String(16), nullable=True)
+    failover_enabled = Column(
+        Boolean, nullable=False, server_default="0", default=False)
     status = Column(String(10), nullable=False)
     created_at = Column(DateTime, server_default=func.now())
     updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())

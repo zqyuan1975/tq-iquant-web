@@ -19,6 +19,8 @@ import {
   getLiveOrders, getLiveTrades, getLivePositions, getLiveDecisions, getLiveSignals, getPortfolios,
   ackLiveDecision, ackAllLiveDecisions,
   getLiveSessions, getLiveSession, createLiveSession, updateLiveSession, startLiveSession, stopLiveSession, deleteLiveSession,
+  getLiveSessionChannelHealth, failoverLiveSession,
+  type LiveSessionChannelHealth,
   recoverLiveBreaker, getLiveChannel, testLiveChannel, sendUserBlock, getFormulas, getWatchdogStatus,
   getLiveAccountPreview, resetLiveBaseline,
   getLiveParamsDrift, getLiveCashFlows, createLiveCashFlow,
@@ -1025,12 +1027,24 @@ const editResult = ref<{ effective_at: string; message: string } | null>(null)
 const editForm = ref({
   name: '',
   engine: 'tdx' as LiveEngineKey,
+  backup_engine: '' as '' | LiveEngineKey,
+  failover_enabled: false,
   execution_mode: 'alert' as LiveExecutionMode,
   signal_file_path: '',
   capital_pool_mode: 'off' as 'off' | 'equal' | 'risk_budget' | 'priority',
   capital_pool_rebalance_enabled: false,
   portfolio_ids: [] as number[],
 })
+const editHealth = ref<LiveSessionChannelHealth | null>(null)
+const editSwitching = ref(false)
+async function loadEditHealth(sessionId: number) {
+  editHealth.value = null
+  try {
+    editHealth.value = await getLiveSessionChannelHealth(sessionId)
+  } catch {
+    editHealth.value = null
+  }
+}
 function openEdit(s: LiveSessionItem) {
   editModal.value = s
   editError.value = ''
@@ -1038,11 +1052,29 @@ function openEdit(s: LiveSessionItem) {
   editForm.value = {
     name: s.name,
     engine: (s.engine || defaultEngineKey()) as LiveEngineKey,
+    backup_engine: (s.backup_engine || '') as '' | LiveEngineKey,
+    failover_enabled: !!s.failover_enabled,
     execution_mode: (s.execution_mode || 'auto') as LiveExecutionMode,
     signal_file_path: s.signal_file_path || '',
     capital_pool_mode: (s.capital_pool_mode || 'off') as 'off' | 'equal' | 'risk_budget' | 'priority',
     capital_pool_rebalance_enabled: !!s.capital_pool_rebalance_enabled,
     portfolio_ids: [...(s.portfolio_ids || [])],
+  }
+  loadEditHealth(s.id)
+}
+async function switchToBackup() {
+  if (!editModal.value || !editForm.value.backup_engine) return
+  if (!confirm(`确认把会话「${editModal.value.name}」切换到备用通道 ${engineLabel(editForm.value.backup_engine)}？运行中会话将在下次启动生效。`)) return
+  editSwitching.value = true
+  editError.value = ''
+  try {
+    const res = await failoverLiveSession(editModal.value.id, editForm.value.backup_engine)
+    editResult.value = { effective_at: res.effective_at, message: res.message }
+    load()
+  } catch (e: any) {
+    editError.value = e?.response?.data?.message || e?.message || '切换失败'
+  } finally {
+    editSwitching.value = false
   }
 }
 async function submitEdit() {
@@ -1054,6 +1086,8 @@ async function submitEdit() {
     const res = await updateLiveSession(editModal.value.id, {
       name: editForm.value.name,
       engine: editForm.value.engine,
+      backup_engine: editForm.value.backup_engine || null,
+      failover_enabled: editForm.value.failover_enabled,
       execution_mode: editForm.value.execution_mode,
       signal_file_path: editForm.value.signal_file_path,
       capital_pool_mode: editForm.value.capital_pool_mode,
@@ -1832,6 +1866,36 @@ onUnmounted(() => {
           <option value="alert">预警（半自动，不下单）</option>
           <option value="auto">自动（按交易引擎下单）</option>
         </select>
+        <label>备用通道（主备切换，可选）</label>
+        <select v-model="editForm.backup_engine" data-field="edit-backup-engine">
+          <option value="">未配置</option>
+          <option v-for="e in channel?.engines || []" :key="e.key" :value="e.key" :disabled="e.key === editForm.engine">
+            {{ e.label }}
+          </option>
+        </select>
+        <label style="display:flex;align-items:center;gap:8px">
+          <input v-model="editForm.failover_enabled" type="checkbox" style="width:auto" data-field="edit-failover-enabled" />
+          主通道离线时提示切换备用通道（默认仅提示，实际切换需人工确认）
+        </label>
+        <div v-if="editHealth" class="baseline-preview" data-test="channel-health">
+          主通道 {{ editHealth.primary?.label || '—' }}：
+          <b :style="{ color: editHealth.primary?.online ? 'var(--green)' : 'var(--red)' }">
+            {{ editHealth.primary?.online ? '在线' : '离线' }}
+          </b>
+          <span v-if="editHealth.backup">
+            ｜备用 {{ editHealth.backup.label }}：
+            <b :style="{ color: editHealth.backup.online ? 'var(--green)' : 'var(--red)' }">
+              {{ editHealth.backup.online ? '在线' : '离线' }}
+            </b>
+          </span>
+          <button
+            v-if="editHealth.backup"
+            class="btn btn-sm" style="margin-left:8px"
+            :disabled="editSwitching" data-test="channel-failover"
+            @click="switchToBackup"
+          >{{ editSwitching ? '切换中…' : '一键切换备用通道' }}</button>
+          <div style="font-size:11px;color:var(--ink-faint);margin-top:4px">{{ editHealth.advice }}</div>
+        </div>
         <label>资金池模式</label>
         <select v-model="editForm.capital_pool_mode" data-field="edit-capital-pool">
           <option value="off">关闭（分账不分池）</option>

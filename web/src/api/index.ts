@@ -1955,6 +1955,48 @@ export async function updateLiveSession(id: number, req: Record<string, unknown>
   return res.data.data
 }
 
+/** B2：主/备通道健康探活（只读）。 */
+export interface LiveChannelHealth {
+  engine: string
+  label: string
+  online: boolean | null
+  online_source?: string
+  engine_running?: boolean
+  configured?: boolean
+  detail?: string
+  stale?: boolean
+  checked_at?: string | null
+}
+
+export interface LiveSessionChannelHealth {
+  session_id: number
+  primary: LiveChannelHealth | null
+  backup: LiveChannelHealth | null
+  failover_enabled: boolean
+  advice: string
+}
+
+export async function getLiveSessionChannelHealth(id: number) {
+  const res = await api.get<ApiResponse<LiveSessionChannelHealth>>(
+    `/live/sessions/${id}/channel-health`)
+  return res.data.data
+}
+
+/** B2：人工确认后切换主备通道（confirm 必填；运行中下次启动生效）。 */
+export async function failoverLiveSession(id: number, targetEngine?: string) {
+  const res = await api.post<ApiResponse<{
+    session_id: number
+    from_engine: string
+    to_engine: string
+    effective_at: 'now' | 'next_start'
+    message: string
+  }>>(`/live/sessions/${id}/failover`, {
+    confirm: true,
+    ...(targetEngine ? { target_engine: targetEngine } : {}),
+  })
+  return res.data.data
+}
+
 /** 启动实盘会话；键鼠冲突（C3）软拦时带 ack_keyboard_risk=true 二次确认。 */
 export async function startLiveSession(id: number, opts?: { ack_keyboard_risk?: boolean }) {
   const res = await api.post<ApiResponse<{
