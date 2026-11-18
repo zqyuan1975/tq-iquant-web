@@ -147,12 +147,16 @@ def _defaults() -> dict:
         # 接入前逐字一致（不建线程、不发请求）。只做「既有事件旁路再发一条」，
         # 不参与任何交易闸门、不改落库。发送在独立 daemon 线程内、超时 ≤5 秒，
         # 失败只写日志（按 600 秒节流），绝不阻塞或回滚交易主链路。
-        #   channel          feishu（目前唯一实现）
+        #   channel          feishu（既有飞书渠道；企微/邮件/提示音为可选附加渠道）
         #   webhook_url      飞书自定义机器人地址（**不要提交进 git**）
         #   secret           机器人开启「签名校验」时填写；无签名机器人留空
         #   min_level        info|warn|error|critical，低于该级别全部丢弃
         #   silence_seconds  同类事件静默期（秒），键=(闸门, 代码, 交易日)
         #   timeout_seconds  HTTP 超时（秒），强制夹在 1~5 秒
+        #   wecom.webhook_url  企微群机器人地址（可选，留空＝不发）
+        #   email.smtp_host/smtp_port/username/from/to/use_ssl  邮件（可选，
+        #                     password 建议用环境变量 TQ_NOTIFY_EMAIL_PASSWORD）
+        #   sound.enabled/path 本地提示音（可选，默认关闭；path 留空＝系统提示音）
         "notify": {
             "enabled": False,
             "channel": "feishu",
@@ -161,6 +165,17 @@ def _defaults() -> dict:
             "min_level": "warn",
             "silence_seconds": 300,
             "timeout_seconds": 5,
+            "wecom": {"webhook_url": ""},
+            "email": {
+                "smtp_host": "",
+                "smtp_port": 465,
+                "username": "",
+                "password": "",
+                "from": "",
+                "to": [],
+                "use_ssl": True,
+            },
+            "sound": {"enabled": False, "path": ""},
         },
         "iquant_bridge": {
             "simulation": {"base_url": "http://127.0.0.1:8790"},

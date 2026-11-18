@@ -321,3 +321,251 @@ def test_module_level_notify_uses_singleton(monkeypatch):
 def test_queue_is_non_blocking_type():
     assert isinstance(ns.Notifier(cfg=_cfg())._queue, queue.Queue)
     json.dumps({"ok": True})  # 保证 stdlib json 导入不被误删
+
+
+# ================================================================ 批次21 L1
+# 多渠道（企微 / 邮件 / 本地提示音）：默认关闭，未配置时与旧行为逐字一致。
+def test_from_config_defaults_keep_single_channel_semantics():
+    """只配飞书（旧配置）→ 解析结果与旧实现等价，可选渠道全部关闭。"""
+    cfg = ns.from_config({"notify": {
+        "enabled": True, "webhook_url": "https://example.invalid/h",
+        "secret": "s", "min_level": "warn"}})
+    assert cfg.usable is True
+    assert cfg.wecom_webhook_url == ""
+    assert cfg.email_host == "" and cfg.email_to == ()
+    assert cfg.sound_enabled is False
+    assert cfg.sound_usable is False
+
+
+def test_from_config_parses_optional_channels(monkeypatch):
+    monkeypatch.delenv("TQ_NOTIFY_EMAIL_PASSWORD", raising=False)
+    cfg = ns.from_config({"notify": {
+        "enabled": True,  # 没有任何 webhook，仅企微+邮件也可用
+        "wecom": {"webhook_url": "https://example.invalid/wecom"},
+        "email": {
+            "smtp_host": "smtp.example.invalid", "smtp_port": "587",
+            "username": "alarm@example.invalid", "password": "pw",
+            "from": "alarm@example.invalid",
+            "to": "a@example.invalid; b@example.invalid",
+            "use_ssl": False,
+        },
+        "sound": {"enabled": True, "path": "C:/alarm.wav"},
+    }})
+    assert cfg.usable is True
+    assert cfg.wecom_usable is True and cfg.feishu_usable is False
+    assert cfg.email_port == 587 and cfg.email_use_ssl is False
+    assert cfg.email_to == ("a@example.invalid", "b@example.invalid")
+    assert cfg.sound_enabled is True and cfg.sound_path == "C:/alarm.wav"
+    assert cfg.email_usable is True
+
+
+def test_from_config_email_password_env_overrides(monkeypatch):
+    monkeypatch.setenv("TQ_NOTIFY_EMAIL_PASSWORD", "from-env")
+    cfg = ns.from_config({"notify": {"enabled": True, "email": {
+        "smtp_host": "h", "to": ["a@b.c"], "password": "from-yaml"}}})
+    assert cfg.email_password == "from-env"
+
+
+def test_from_config_invalid_port_falls_back(monkeypatch):
+    monkeypatch.delenv("TQ_NOTIFY_EMAIL_PASSWORD", raising=False)
+    cfg = ns.from_config({"notify": {"enabled": True, "email": {
+        "smtp_host": "h", "smtp_port": "not-a-port", "to": ["a@b.c"]}}})
+    assert cfg.email_port == 465
+
+
+class _CountRecorder(_Recorder):
+    """多渠道各自一个实例：记录各自收到几条。"""
+
+
+def _multi_cfg(**kw):
+    base = dict(enabled=True, webhook_url="https://example.invalid/feishu",
+                wecom_webhook_url="https://example.invalid/wecom",
+                email_host="smtp.example.invalid", email_to=("a@b.c",),
+                sound_enabled=True)
+    base.update(kw)
+    return ns.NotifyConfig(**base)
+
+
+def test_notifier_delivers_to_every_configured_channel():
+    feishu, wecom, email, sound = (_CountRecorder(), _CountRecorder(),
+                                   _CountRecorder(), _CountRecorder())
+    notifier = ns.Notifier(cfg=_multi_cfg(), sender_factory=feishu,
+                           wecom_factory=wecom, email_factory=email,
+                           sound_factory=sound)
+    try:
+        assert notifier.notify("error", "t", "m", gate="multi") is True
+        assert _wait(lambda: all(len(r.sent) == 1
+                                 for r in (feishu, wecom, email, sound)))
+    finally:
+        notifier.close()
+
+
+def test_one_channel_failure_does_not_block_others():
+    feishu = _CountRecorder(exc=RuntimeError("feishu down"))
+    wecom = _CountRecorder()
+    notifier = ns.Notifier(
+        cfg=_multi_cfg(email_host="", sound_enabled=False),
+        sender_factory=feishu, wecom_factory=wecom)
+    try:
+        assert notifier.notify("error", "t", "m", gate="partial") is True
+        assert _wait(lambda: len(wecom.sent) == 1)
+        # 有渠道成功 → 不写失败日志
+        assert notifier._last_fail_log == 0.0
+    finally:
+        notifier.close()
+
+
+def test_all_channels_failure_still_throttles_log(caplog):
+    feishu = _CountRecorder(exc=RuntimeError("boom1"))
+    wecom = _CountRecorder(exc=RuntimeError("boom2"))
+    notifier = ns.Notifier(
+        cfg=_multi_cfg(email_host="", sound_enabled=False),
+        sender_factory=feishu, wecom_factory=wecom)
+    try:
+        with caplog.at_level(logging.WARNING):
+            assert notifier.notify("error", "t", "m", gate="all-fail") is True
+            assert _wait(lambda: any(
+                "告警外发失败" in r.getMessage() for r in caplog.records))
+        fails = [r for r in caplog.records if "告警外发失败" in r.getMessage()]
+        assert len(fails) == 1
+    finally:
+        notifier.close()
+
+
+def test_unconfigured_optional_channels_are_not_built():
+    """只配飞书时不构造企微/邮件/提示音发送器（与旧行为一致）。"""
+    feishu = _CountRecorder()
+    calls = []
+
+    def _record(kind):
+        def _factory(cfg):
+            calls.append(kind)
+            return _CountRecorder()
+        return _factory
+
+    notifier = ns.Notifier(cfg=_cfg(), sender_factory=feishu,
+                           wecom_factory=_record("wecom"),
+                           email_factory=_record("email"),
+                           sound_factory=_record("sound"))
+    try:
+        assert notifier.notify("error", "t", "m", gate="only-feishu") is True
+        assert _wait(lambda: len(feishu.sent) == 1)
+        assert calls == []
+    finally:
+        notifier.close()
+
+
+# ---------------------------------------------------------------- 企微 payload
+def test_wecom_text_and_markdown_payload():
+    client = _FakeClient(payload={"errcode": 0, "errmsg": "ok"})
+    sender = ns.WecomSender("https://example.invalid/wecom",
+                            client_factory=lambda: client)
+    sender.send_text("hello")
+    assert client.calls[0]["json"] == {
+        "msgtype": "text", "text": {"content": "hello"}}
+    sender.send_rich("标题", ["第一行", "第二行"])
+    body = client.calls[1]["json"]
+    assert body["msgtype"] == "markdown"
+    assert "**标题**" in body["markdown"]["content"]
+    assert "> 第一行" in body["markdown"]["content"]
+
+
+def test_wecom_errcode_raises_notify_error():
+    client = _FakeClient(payload={"errcode": 93000, "errmsg": "invalid webhook"})
+    sender = ns.WecomSender("https://example.invalid/wecom",
+                            client_factory=lambda: client)
+    with pytest.raises(ns.NotifyError):
+        sender.send_text("x")
+
+
+# ---------------------------------------------------------------- 邮件
+class _FakeSMTP:
+    def __init__(self):
+        self.tls = False
+        self.login_args = None
+        self.messages = []
+        self.quit_called = False
+
+    def starttls(self):
+        self.tls = True
+
+    def login(self, user, password):
+        self.login_args = (user, password)
+
+    def send_message(self, msg):
+        self.messages.append(msg)
+
+    def quit(self):
+        self.quit_called = True
+
+
+def test_email_sender_builds_and_sends_message():
+    smtp = _FakeSMTP()
+    sender = ns.EmailSender(
+        "smtp.example.invalid", 465, "alarm@example.invalid", "pw",
+        ("a@b.c", "d@e.f"), "alarm@example.invalid", True,
+        smtp_factory=lambda h, p, t: smtp)
+    sender.send_text("第一行\n第二行")
+    assert smtp.login_args == ("alarm@example.invalid", "pw")
+    assert smtp.quit_called is True and smtp.tls is False  # SSL 模式不走 starttls
+    msg = smtp.messages[0]
+    assert msg["To"] == "a@b.c, d@e.f"
+    assert msg["From"] == "alarm@example.invalid"
+    assert "第一行" in msg.get_content()
+
+
+def test_email_sender_starttls_when_not_ssl():
+    smtp = _FakeSMTP()
+    sender = ns.EmailSender("h", 587, "", "", ("a@b.c",), use_ssl=False,
+                            smtp_factory=lambda h, p, t: smtp)
+    sender.send_rich("标题", ["行1"])
+    assert smtp.tls is True
+    assert smtp.login_args is None  # 未配置用户不登录
+
+
+def test_email_sender_wraps_failure_as_notify_error():
+    def _boom(h, p, t):
+        raise OSError("connection refused")
+
+    sender = ns.EmailSender("h", 465, to=("a@b.c",), smtp_factory=_boom)
+    with pytest.raises(ns.NotifyError):
+        sender.send_text("x")
+
+
+# ---------------------------------------------------------------- 提示音
+def test_sound_sender_invokes_player_with_path():
+    played = []
+    sender = ns.SoundSender("C:/alarm.wav", player=played.append)
+    sender.send_text("x")
+    sender.send_rich("t", ["line"])
+    assert played == ["C:/alarm.wav", "C:/alarm.wav"]
+
+
+def test_sound_sender_propagates_player_failure_as_notify_error():
+    def _boom(_path):
+        raise ns.NotifyError("当前平台不支持本地提示音")
+
+    sender = ns.SoundSender(player=_boom)
+    with pytest.raises(ns.NotifyError):
+        sender.send_text("x")
+
+
+# ---------------------------------------------------------------- 脱敏扩展
+_FAKE_WECOM = "https://example.invalid/wecom/abcdef123456"
+
+
+def test_failure_log_masks_wecom_url_and_email_password(caplog):
+    leaker = _CountRecorder(exc=RuntimeError(
+        "wecom %s email pw %s" % (_FAKE_WECOM, "EmAilPw9876")))
+    notifier = ns.Notifier(
+        cfg=ns.NotifyConfig(enabled=True, wecom_webhook_url=_FAKE_WECOM,
+                            email_password="EmAilPw9876"),
+        wecom_factory=leaker)
+    try:
+        with caplog.at_level(logging.WARNING):
+            assert notifier.notify("error", "t", "m", gate="leak2") is True
+            assert _wait(lambda: notifier._last_fail_log > 0)
+        text = "\n".join(r.getMessage() for r in caplog.records)
+        assert _FAKE_WECOM not in text and "EmAilPw9876" not in text
+    finally:
+        notifier.close()
