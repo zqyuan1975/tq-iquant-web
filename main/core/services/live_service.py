@@ -308,14 +308,23 @@ def latest_account_total_asset(db: Session, session_id: int) -> Optional[float]:
 
 
 def resolve_effective_baseline(db: Session, session_row, session_id: int) -> Optional[float]:
-    """起账基准 = min(填写基准, 真实总资产)——只缩不放。
+    """起账基准 = min(填写基准, 真实总资产)——只缩不放，且**只在未起账时截断一次**。
 
     填写值超过真实总资产时，起账按真实总资产截断（写入侧另由 API 拒绝）；
     无填写值/无真实快照时返回填写值（可能为 None → 沿用各组合 initial_capital）。
+
+    P0（2026-11-18）：基准一经设定（``baseline_set_at`` 非空）必须冻结，后续重启
+    只重读账本。旧实现每次 build_engine 都拿「当前最新账户快照总资产」重新截断，
+    而快照总资产随盘中持仓市值波动 → 每次重启都把虚拟现金重新锚到当日的真实
+    总资产，表现为「重启一次账本变一个数」（实测同一会话柜台可用恒 10,414.71，
+    虚拟现金 7,464.19 → 7,134.19 → 8,183.19 → 6,942.19）。需要重设基准只能走
+    reset_baseline（会递增 baseline_version 并重捕接缝）。
     """
     value = session_baseline_value(session_row)
     if value is None or value <= 0:
         return None
+    if getattr(session_row, "baseline_set_at", None) is not None:
+        return value
     total = latest_account_total_asset(db, session_id)
     if total is not None and total < value:
         return total

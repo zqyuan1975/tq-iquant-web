@@ -12,6 +12,7 @@
 """
 import asyncio
 import functools
+import json
 import logging
 import math
 import threading
@@ -109,7 +110,7 @@ from ..services.notify_service import notify
 from core.models import (
     LiveAccountPositionSnapshot, LiveAccountSnapshot, LiveCashFlow,
     LiveDecisionEvent, LiveBarOrderMark, LiveOrder, LivePositionPeak,
-    LiveSession, LiveSignal, LiveTrade,
+    LiveSession, LiveSessionPortfolio, LiveSignal, LiveTrade,
 )
 from core.tq.formula import TQFormula
 from core.tq.utils import TDXLockTimeout
@@ -4415,6 +4416,7 @@ class LiveEngine:
     def _import_external_positions(
         self, db: Session, positions: list, now,
         prev_peaks: Optional[Dict[str, Decimal]] = None,
+        anchored_codes: Optional[Set[str]] = None,
     ) -> int:
         """真实持仓中虚拟账本缺失的代码 → 导入为对齐仓（挂主策略，纳入风控）。
 
@@ -4483,6 +4485,10 @@ class LiveEngine:
             port, ctx = target
             held = ctx.positions.get(code)
             if held is not None and held.quantity > 0:
+                continue
+            if anchored_codes and code in anchored_codes:
+                # 接缝锚点已含该仓（重启从 seam_cash 起账时已按起账价扣过一次），
+                # 不得再按当日现价扣一次——否则每次重启虚拟现金都随行情变一个数。
                 continue
             inflight = db.query(LiveOrder).filter(
                 LiveOrder.live_session_id == self.session_id,
@@ -9398,14 +9404,202 @@ class LiveEngine:
 
 
     # ---------------- 持仓恢复 ----------------
+    @staticmethod
+    def _seam_anchor_payload(raw) -> Tuple[list, Optional[int]]:
+        """解析接缝存量仓 JSON → ``(positions, flow_cursor)``。
+
+        兼容两代格式：v3 为 ``{"positions": [...], "seam_bar_time", "flow_cursor"}``；
+        旧格式为纯 list（无流水水位 → flow_cursor=None，调用方按接缝日保守过滤）。
+        解析失败一律当空（不影响起账）。
+        """
+        if not raw:
+            return [], None
+        try:
+            data = json.loads(raw)
+        except (TypeError, ValueError):
+            return [], None
+        if isinstance(data, dict):
+            cursor = data.get("flow_cursor")
+            try:
+                cursor = int(cursor) if cursor is not None else None
+            except (TypeError, ValueError):
+                cursor = None
+            return list(data.get("positions") or []), cursor
+        if isinstance(data, list):
+            return data, None
+        return [], None
+
+    def _load_seam_anchors(
+            self, db: Session, ports_by_id: Dict[int, Portfolio]) -> Dict[int, dict]:
+        """读取各组合的接缝锚点：首次起账落库的虚拟现金 / 存量仓 / 重放水位。
+
+        P0（2026-11-18）：重启只允许「锚点 + 之后新增成交/流水」重放。旧实现每次
+        重启都拿当日真实总资产重新截断起账基准、并按当日现价重新扣一遍继承仓，
+        账户市值随盘中价格波动 → 同一会话每次重启虚拟现金都会变一个数（实测柜台
+        可用恒 10,414.71，虚拟现金 7,464.19 → 7,134.19 → 8,183.19 → 6,942.19）。
+
+        锚点可信判定（防「已计入锚点」的成交/流水再算一次）：
+        - ``seam_trade_cursor > 0`` → 按该水位右开重放（精确，capture_seam 落在
+          recover 之后，锚点已含水位内全部成交）；
+        - ``seam_trade_cursor`` 为 NULL/0 → 仅当「接缝日及之前没有任何成交」时可用
+          （此时锚点必然未含任何成交）；否则整组跳过并告警，退回旧的全量重放路径。
+        取不到表/解析失败 → 返回空（不阻断启动）。
+        """
+        result: Dict[int, dict] = {}
+        try:
+            links = (
+                db.query(LiveSessionPortfolio)
+                .filter(LiveSessionPortfolio.session_id == self.session_id)
+                .all()
+            )
+        except Exception:  # noqa: BLE001 — 迁移未执行/读失败：退回旧全量重放
+            db.rollback()
+            logger.warning(
+                "recover: live_session_portfolios 读取失败 → 接缝锚点不可用，"
+                "本次按全量重放起账 (session %s)", self.session_id, exc_info=True)
+            return result
+        for link in links:
+            pid = link.portfolio_strategy_id
+            if pid not in ports_by_id:
+                continue
+            if link.seam_date is None or link.seam_cash is None:
+                continue
+            positions, flow_cursor = self._seam_anchor_payload(link.seam_positions_json)
+            try:
+                cursor = int(getattr(link, "seam_trade_cursor", None) or 0)
+            except (TypeError, ValueError):
+                cursor = 0
+            if cursor <= 0:
+                seam_start = datetime.combine(
+                    link.seam_date, datetime.min.time()) + timedelta(days=1)
+                prior = (
+                    db.query(LiveTrade.id)
+                    .filter(
+                        LiveTrade.live_session_id == self.session_id,
+                        LiveTrade.portfolio_strategy_id == pid,
+                        LiveTrade.trade_time < seam_start,
+                    )
+                    .first()
+                )
+                if prior is not None:
+                    logger.warning(
+                        "recover: 组合 %s 接缝无成交水位（旧接缝）且接缝日及之前已有"
+                        "成交，锚点不可信 → 退回全量重放 (session %s)",
+                        pid, self.session_id)
+                    logger.warning(
+                        "[seam] portfolio=%s legacy_anchor_skipped (session %s)",
+                        pid, self.session_id)
+                    continue
+            try:
+                cash = Decimal(str(link.seam_cash))
+            except (TypeError, ValueError):
+                continue
+            result[pid] = {
+                "cash": cash,
+                "positions": positions,
+                "trade_cursor": cursor,
+                "flow_cursor": flow_cursor,
+                "seam_date": link.seam_date,
+            }
+        return result
+
+    def _restore_seam_positions(self, port: Portfolio, items: list) -> Set[str]:
+        """把接缝存量仓灌回组合（字段与 capture_seam 落库一一对应）。
+
+        返回实际灌回的代码集合——recover 末尾的继承仓导入据此跳过这些代码，
+        防「锚点已按起账价扣过一次，重启又按当日现价再扣一次」。
+        """
+        by_strategy = {ctx.strategy_id: ctx for ctx in port.strategies}
+        default_ctx = port.strategies[0] if port.strategies else None
+        restored: Set[str] = set()
+        for item in items or []:
+            if not isinstance(item, dict):
+                continue
+            code = item.get("stock_code")
+            if not code:
+                continue
+            try:
+                qty = int(item.get("quantity") or 0)
+            except (TypeError, ValueError):
+                continue
+            if qty <= 0:
+                continue
+            sid = item.get("strategy_id")
+            try:
+                ctx = by_strategy.get(int(sid)) if sid is not None else default_ctx
+            except (TypeError, ValueError):
+                ctx = default_ctx
+            if ctx is None:
+                ctx = default_ctx
+            if ctx is None:
+                continue
+            try:
+                cost = Decimal(str(item.get("avg_cost") or 0))
+            except (TypeError, ValueError):
+                cost = Decimal("0")
+            try:
+                hp = Decimal(str(item.get("highest_price") or 0))
+            except (TypeError, ValueError):
+                hp = Decimal("0")
+            pos = Position(code, lot_size=self._engine._lot(code))
+            pos.quantity = qty
+            pos.avg_cost = cost
+            pos.highest_price = hp if hp > 0 else cost
+            buy_date = item.get("buy_date")
+            if buy_date:
+                try:
+                    bd = date.fromisoformat(str(buy_date)[:10])
+                except ValueError:
+                    bd = None
+                if bd is not None:
+                    pos.buy_time = datetime.combine(bd, datetime.min.time())
+                    # T+1：「接缝日及之前买入」在重启当日即可卖（_lots 按买入日）
+                    pos._lots = {bd: qty}
+            ctx.positions[code] = pos
+            restored.add(code)
+        return restored
+
+    @staticmethod
+    def _flow_included_in_anchor(flow, anchor: Optional[dict]) -> bool:
+        """该笔外部现金流是否已含在接缝现金里（含则重启不得再加减一次）。"""
+        if anchor is None:
+            return False
+        cursor = anchor.get("flow_cursor")
+        fid = getattr(flow, "id", None)
+        if cursor is not None:
+            return fid is not None and fid <= cursor
+        # 旧接缝无流水水位：按 flow_date > seam_date 保守过滤（与增量侧重放同口径）
+        fdate = getattr(flow, "flow_date", None)
+        seam_date = anchor.get("seam_date")
+        return (fdate is not None and seam_date is not None and fdate <= seam_date)
+
     def recover(self, db: Session) -> None:
         """Core 重启后从 live_trades 重放，重建各组合虚拟持仓/虚拟现金。
 
         按 trade_time 顺序重放本 session 全部 live_trades：BUY 累加持仓+扣现金，
         SELL 减持仓+加现金。signal_type 从关联 LiveOrder 取（LiveTrade 无此列），
         用于 Position.apply_trade 区分 ADD（影响 add_count）。虚拟现金以成本计（§93）。
+
+        P0（2026-11-18）起账锚点：有接缝（live_session_portfolios.seam_*，首次起账
+        时 capture_seam 落库）时，现金/存量仓直接从锚点恢复，只重放水位之后的新增
+        成交/流水——重启 = 只重读账本，绝不因当日总资产/当日现价变化而改数。
         """
         ports_by_id = {p.portfolio_id: p for p in self.portfolios}
+        # 接缝锚点（见 _load_seam_anchors）：无锚点/锚点不可信时为 {}，走旧全量重放。
+        anchors = self._load_seam_anchors(db, ports_by_id)
+        anchored_codes: Set[str] = set()
+        for pid, anchor in anchors.items():
+            port = ports_by_id.get(pid)
+            if port is None:
+                continue
+            port.account.cash = anchor["cash"]
+            restored = self._restore_seam_positions(port, anchor["positions"])
+            anchored_codes |= restored
+            logger.info(
+                "recover: 组合 %s 从接缝锚点起账（现金 %s，存量仓 %d 笔，成交水位 %s，"
+                "session %s）",
+                pid, fmt_money(anchor["cash"]), len(restored),
+                anchor["trade_cursor"], self.session_id)
         trades = (
             db.query(LiveTrade)
             .filter(LiveTrade.live_session_id == self.session_id)
@@ -9457,6 +9651,12 @@ class LiveEngine:
                 trade_time=tr.trade_time,
                 signal_type=SignalType(sig_type_str) if sig_type_str else None,
             )
+            anchor = anchors.get(tr.portfolio_strategy_id)
+            if (anchor is not None and tr.id is not None
+                    and tr.id <= anchor["trade_cursor"]):
+                # 该笔已含在接缝现金/存量仓里：只补冷静期，不重复计账（P0-1 口径）
+                port.note_trade(trade)
+                continue
             pos = ctx.positions.get(tr.stock_code)
             if pos is None:
                 pos = Position(tr.stock_code)
@@ -9548,22 +9748,34 @@ class LiveEngine:
                 "recover: live_cash_flows 读取失败（是否未执行迁移？）→ 本次按无外部"
                 "现金流重放 (session %s)", self.session_id, exc_info=True)
         net_by_portfolio: Dict[int, Decimal] = {}
+        replay_by_portfolio: Dict[int, Decimal] = {}
         for flow in flows:
             try:
                 amt = Decimal(str(flow.amount or 0))
             except (TypeError, ValueError):
                 continue
-            net_by_portfolio[flow.portfolio_strategy_id] = (
-                net_by_portfolio.get(flow.portfolio_strategy_id, Decimal("0")) + amt)
+            pid = flow.portfolio_strategy_id
+            # 累计净流入按**全量**台账（净值/收益率/回撤要剔除全部历史流入）
+            net_by_portfolio[pid] = net_by_portfolio.get(pid, Decimal("0")) + amt
+            # 现金重放只补接缝水位之后的流水（水位内已含在接缝现金里，防重复加减）
+            if self._flow_included_in_anchor(flow, anchors.get(pid)):
+                continue
+            replay_by_portfolio[pid] = (
+                replay_by_portfolio.get(pid, Decimal("0")) + amt)
         for pid, net in net_by_portfolio.items():
             port = ports_by_id.get(pid)
-            if port is None or net == 0:
+            if port is None:
                 continue
-            port.account.cash += net
+            replay = replay_by_portfolio.get(pid, Decimal("0"))
+            if replay != 0:
+                port.account.cash += replay
             port.external_net_inflow = net
-            logger.info(
-                "recover: 组合 %s 外部现金流累计净流入 %s → 虚拟现金 %s (session %s)",
-                pid, fmt_money(net), fmt_money(port.account.cash), self.session_id)
+            if replay != 0:
+                logger.info(
+                    "recover: 组合 %s 外部现金流累计净流入 %s（本次重放 %s）→ 虚拟现金 %s "
+                    "(session %s)",
+                    pid, fmt_money(net), fmt_money(replay),
+                    fmt_money(port.account.cash), self.session_id)
         # P1-8：起账估值种子——从最近一次账户快照的 current_price 回填各组合的
         # 「最后已知价」（跨日持久）。否则重启后到首根 bar 之前，没有 bar 的停牌仓
         # 只能退回成本；成本未知（avg_cost=0）时会被按 0 估值 → 假回撤/假日亏。
@@ -9838,7 +10050,9 @@ class LiveEngine:
             overview = self._read_account_overview()
             if overview is not None:
                 _, positions = overview
-                self._import_external_positions(db, positions, now_shanghai())
+                self._import_external_positions(
+                    db, positions, now_shanghai(),
+                    anchored_codes=anchored_codes)
                 # 继承仓（有仓无账）在上一轮补种时还不在 ctx.positions 里，三级重算
                 # 全被跳过，峰值只能靠导入路径的 prev_hp/成本兜底。导入后补一次，
                 # skip_keys 排除已补过的票（不重复取数、不重复写表）。

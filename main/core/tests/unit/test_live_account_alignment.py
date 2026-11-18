@@ -6,8 +6,9 @@
 - BUY 审批资金对齐：min(虚拟现金, 真实可用×0.98)（approve_order cash_override）；
 - 提交前价格刷新：order.price 用实时最新价（回测继承价为信号 bar 收盘，跨日过期）。
 """
-from datetime import datetime, time, timedelta
+from datetime import date, datetime, time, timedelta
 from decimal import Decimal
+import json
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -19,7 +20,7 @@ from core.engine.live_engine import LiveEngine
 from core.engine.position import Position
 from core.models import (
     LiveAccountPositionSnapshot, LiveAccountSnapshot, LiveDecisionEvent, LiveOrder,
-    LiveTrade,
+    LiveSessionPortfolio, LiveTrade,
 )
 from core.engine.live.timing import now_shanghai
 from tq_iquant_shared.constants import TradeType
@@ -1958,6 +1959,72 @@ def test_equity_deviation_excludes_out_of_pool_positions():
     assert Decimal(check["out_of_pool_value"]) == Decimal("10000")
     assert Decimal(check["expected_total"]) == Decimal("100000")
     assert events == []
+
+
+# ---- ⑦ 重启 = 只重读账本：起账锚点（seam）不受当日总资产/当日现价影响 ----
+
+def test_recover_uses_seam_anchor_and_ignores_daily_price_drift():
+    """P0（2026-11-18）：同一会话多次重启，虚拟现金必须逐分不变。
+
+    实证缺陷：柜台可用恒 10,414.71、持仓不动，虚拟现金却 7,464.19 → 7,134.19
+    → 8,183.19 → 6,942.19。根因是每次 build_engine 都用「当前快照总资产」重新
+    截断起账基准、recover 又用「当前快照现价」重扣一遍继承仓。正确口径：
+    seam_cash（首次起账落库）+ 水位之后的成交/流水重放，存量仓从锚点恢复，
+    当日现价不参与任何现金扣减。
+    """
+    factory, _ = _db_factory()
+    stock, inherited = "600000.SH", "002745.SZ"
+
+    db = factory()
+    lo = LiveOrder(
+        live_session_id=1, portfolio_strategy_id=1, strategy_id=1, stock_code=stock,
+        trade_type="buy", order_type="limit", price=Decimal("10"), quantity=100,
+        filled_quantity=100, filled_price=Decimal("10"), status="accepted",
+        signal_name="open_sig", signal_type="OPEN",
+        bar_time=datetime(2026, 11, 18, 10, 0),
+    )
+    db.add(lo)
+    db.flush()
+    db.add(LiveTrade(
+        live_session_id=1, live_order_id=lo.id, portfolio_strategy_id=1, strategy_id=1,
+        stock_code=stock, trade_type="buy", price=Decimal("10"), quantity=100,
+        amount=Decimal("1000"), commission=Decimal("0"), stamp_duty=Decimal("0"),
+        trade_time=datetime(2026, 11, 18, 10, 0),
+    ))
+    db.add(LiveSessionPortfolio(
+        session_id=1, portfolio_strategy_id=1,
+        seam_date=date(2026, 11, 17), seam_cash=Decimal("5000"),
+        seam_trade_cursor=0,
+        seam_positions_json=json.dumps([{
+            "strategy_id": 1, "stock_code": inherited, "quantity": 300,
+            "avg_cost": 10.0, "buy_date": "2026-11-15", "highest_price": 10.0,
+        }]),
+    ))
+    db.commit()
+    db.close()
+
+    # 同样的账本、两次重启之间只有持仓市价不同 → 虚拟现金必须一致
+    for px in (Decimal("8"), Decimal("20")):
+        port, ctx = _portfolio_single()
+        disp = _AcctDispatcher(
+            positions=[{"symbol": inherited, "volume": 300, "available": 300,
+                        "cost": 10.0, "market_value": float(px * 300)}],
+            asset={"total_asset": 5000 + float(px * 300),
+                   "available": 5000.0, "market_value": float(px * 300)},
+        )
+        engine = _mk_engine(disp, factory, port, engine_key="tdx")
+        db = factory()
+        try:
+            engine.recover(db)
+        finally:
+            db.close()
+
+        # 5000 起账锚点 − 水位后 1 笔买入 1000；继承仓不得按当日现价再扣一次
+        assert port.account.cash == Decimal("4000"), f"px={px}"
+        assert ctx.positions[inherited].quantity == 300
+        assert ctx.positions[inherited].avg_cost == Decimal("10")
+        assert ctx.positions[stock].quantity == 100
+
 
 
 
