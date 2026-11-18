@@ -1112,6 +1112,14 @@ def build_engine(
                                     or DEFAULT_BENCHMARK_CODE),
                 "market_gate_engine": getattr(ps, "market_gate_engine", None) or "python",
                 "market_gate_formula_name": getattr(ps, "market_gate_formula_name", None),
+                # E3 多指数投票 / 强度分档 / 空头减仓（默认值=旧语义）
+                "market_gate_indices": getattr(ps, "market_gate_indices", None),
+                "market_gate_vote_mode": (
+                    getattr(ps, "market_gate_vote_mode", None) or "any"),
+                "market_gate_strength_threshold": int(
+                    getattr(ps, "market_gate_strength_threshold", 0) or 0),
+                "market_gate_bear_reduce_ratio": getattr(
+                    ps, "market_gate_bear_reduce_ratio", 0),
             }
         # 公司行为（2026-11-18，J1/J2）：只收集启用组合的标量配置（不持有 ORM）。
         if getattr(ps, "corporate_actions_enabled", False):

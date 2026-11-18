@@ -117,6 +117,12 @@ class PortfolioCreate(BaseModel):
     market_gate_engine: str | None = None
     # tdx 通道公式名（空串或 None = 用内核默认 TQGATE）
     market_gate_formula_name: str | None = None
+    # E3 门控维度扩展（2026-11-18）：None=请求未携带（编辑不动已有值）。
+    # 多指数投票（空列表=仅 benchmark_index）/ 投票模式 / 强度门槛 / 空头减仓比例
+    market_gate_indices: list[str] | None = None
+    market_gate_vote_mode: str | None = None
+    market_gate_strength_threshold: int | None = None
+    market_gate_bear_reduce_ratio: float | None = None
     # 公司行为（2026-11-18，J1/J2）：手工事件表总开关与处置档位，全部默认关。
     # None=请求未携带（编辑不动已有值 / 新建落默认 False/0）。
     corporate_actions_enabled: bool | None = None

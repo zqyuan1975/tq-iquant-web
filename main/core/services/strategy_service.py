@@ -15,8 +15,14 @@
 """
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
+import json
+import re
 
 from core.models import PortfolioStrategy, Strategy
+from core.engine.market_gate import parse_gate_indices
+
+_GATE_INDEX_RE = re.compile(r"^[0-9A-Za-z]{6}\.[A-Za-z]{2,4}$")
+MAX_GATE_INDICES = 10
 
 
 def serialize_strategy(s: Strategy) -> dict:
@@ -128,6 +134,14 @@ def serialize_portfolio(db: Session, p: PortfolioStrategy) -> dict:
         "market_gate_enabled": bool(p.market_gate_enabled) if p.market_gate_enabled is not None else False,
         "market_gate_engine": p.market_gate_engine or "python",
         "market_gate_formula_name": p.market_gate_formula_name or "",
+        # E3 门控维度扩展（默认值=旧语义）：多指数投票 / 强度门槛 / 空头减仓
+        "market_gate_indices": parse_gate_indices(
+            getattr(p, "market_gate_indices", None)),
+        "market_gate_vote_mode": getattr(p, "market_gate_vote_mode", None) or "any",
+        "market_gate_strength_threshold": int(
+            getattr(p, "market_gate_strength_threshold", 0) or 0),
+        "market_gate_bear_reduce_ratio": float(
+            getattr(p, "market_gate_bear_reduce_ratio", 0) or 0),
         # 公司行为（2026-11-18，J1/J2）：总开关 + 再投资 + 停牌处置 + 退市强平
         "corporate_actions_enabled": bool(p.corporate_actions_enabled),
         "dividend_reinvest_enabled": bool(p.dividend_reinvest_enabled),
@@ -223,6 +237,32 @@ def _apply_portfolio_fields(p: PortfolioStrategy, req) -> None:
         p.market_gate_engine = req.market_gate_engine
     if getattr(req, "market_gate_formula_name", None) is not None:
         p.market_gate_formula_name = req.market_gate_formula_name or None
+    # E3 门控维度扩展：None=请求未携带 → 不动已有值；显式空列表/0 是合法配置
+    if _field_sent(req, "market_gate_indices"):
+        codes = parse_gate_indices(getattr(req, "market_gate_indices", None))
+        if len(codes) > MAX_GATE_INDICES:
+            raise ValueError("market_gate_indices 最多 %d 个指数" % MAX_GATE_INDICES)
+        bad = [c for c in codes if not _GATE_INDEX_RE.match(c)]
+        if bad:
+            raise ValueError(
+                "market_gate_indices 代码格式需为 XXXXXX.XX：%s" % ", ".join(bad))
+        p.market_gate_indices = (
+            json.dumps(codes, ensure_ascii=False) if codes else None)
+    if getattr(req, "market_gate_vote_mode", None) is not None:
+        mode = str(req.market_gate_vote_mode).strip().lower()
+        if mode not in ("any", "majority", "all"):
+            raise ValueError("market_gate_vote_mode 需为 any/majority/all")
+        p.market_gate_vote_mode = mode
+    if getattr(req, "market_gate_strength_threshold", None) is not None:
+        threshold = int(req.market_gate_strength_threshold)
+        if not (0 <= threshold <= 100):
+            raise ValueError("market_gate_strength_threshold 需在 [0, 100]")
+        p.market_gate_strength_threshold = threshold
+    if getattr(req, "market_gate_bear_reduce_ratio", None) is not None:
+        ratio = float(req.market_gate_bear_reduce_ratio)
+        if not (0 <= ratio <= 1):
+            raise ValueError("market_gate_bear_reduce_ratio 需在 [0, 1]")
+        p.market_gate_bear_reduce_ratio = ratio
     # 公司行为（2026-11-18，J1/J2）：None=请求未携带 → 不动已有值（前端隐藏字段
     # 不提交时不会把已有配置清掉）；显式 False/0 是合法配置，按值落库。
     if getattr(req, "corporate_actions_enabled", None) is not None:

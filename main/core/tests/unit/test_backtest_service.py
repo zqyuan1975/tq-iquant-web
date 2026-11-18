@@ -1938,6 +1938,11 @@ _SNAPSHOT_KEYS = {
     "strategies", "stock_pool_codes",
     # 市场多空门控（2026-11-18）：未启用时只冻结开关位
     "market_gate_enabled",
+    # E3 门控维度扩展（2026-11-18，默认值=旧语义，列自动进快照）
+    "market_gate_indices", "market_gate_vote_mode",
+    "market_gate_strength_threshold", "market_gate_bear_reduce_ratio",
+    # D4 熔断处置动作（2026-11-18）：触发后卖出行为口径
+    "breaker_action",
     # 公司行为（2026-11-18，J1/J2）：未启用时写显式否定值（区分关闭与旧记录缺键）
     "corporate_actions",
     # 时点股票池（J7）+ 执行档位（N1，2026-11-18）：未启用/legacy 时同样写块

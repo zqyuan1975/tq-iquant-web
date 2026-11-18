@@ -9,7 +9,7 @@ import {
 } from '../api'
 import PageHeader from '../components/PageHeader.vue'
 import { BENCHMARKS, DEFAULT_BENCHMARK } from '../utils/benchmarks'
-import { MARKET_GATE_ENGINES } from '../utils/marketGate'
+import { MARKET_GATE_ENGINES, MARKET_GATE_VOTE_MODES } from '../utils/marketGate'
 
 // ===== 数据 =====
 const portfolios = ref<PortfolioItem[]>([])
@@ -85,6 +85,7 @@ const PORTFOLIO_RATIO_FIELDS = new Set([
   'volume_limit_ratio', 'cash_enhance_position_ratio_threshold',
   'slippage_impact_coef',
   'max_single_position_pct', 'min_cash_reserve_pct',
+  'market_gate_bear_reduce_ratio',
 ])
 const STRATEGY_RATIO_FIELDS = new Set([
   'capital_ratio', 'single_open_ratio',
@@ -104,6 +105,7 @@ const NULLABLE_NUMERIC_FIELDS = new Set([
   'trend_trailing_stop_ratio', 'trend_max_positions',
   'signal_weekday', 'risk_cooldown_days',
   'priority',
+  'market_gate_strength_threshold',
 ])
 
 // 表单字段元数据：key/名称/一行几个（≤2 保证不溢出）。分组用于弹窗分区。
@@ -163,6 +165,10 @@ const PORTFOLIO_GROUPS: { title: string; hint?: string; fields: FieldMeta[] }[] 
     { key: 'market_gate_enabled', label: '启用门控', span: 2, type: 'switch', hint: '空头状态拦截 OPEN/ADD；CLOSE/REDUCE/止损/止盈/移动止损不受影响；未定状态放行' },
     { key: 'market_gate_engine', label: '判别引擎', span: 2, type: 'select', options: 'gateEngines', showIf: (f: Record<string, any>) => !!f.market_gate_enabled, hint: 'python=内置公式（回测/实盘均可用）；tdx=通达信客户端公式库（按公式名取状态列）' },
     { key: 'market_gate_formula_name', label: '通达信公式名', span: 2, type: 'text', placeholder: '留空=TQGATE', showIf: (f: Record<string, any>) => !!f.market_gate_enabled && f.market_gate_engine === 'tdx', hint: '仅判别引擎=通达信时生效，留空使用默认公式名 TQGATE' },
+    { key: 'market_gate_indices', label: '投票指数列表', span: 2, type: 'text', placeholder: '留空=仅基准指数，如 000300.SH,000985.CSI', showIf: (f: Record<string, any>) => !!f.market_gate_enabled, hint: '逗号分隔的指数代码；留空=只用组合基准指数（旧语义）。每个指数独立判 M 状态后按投票模式聚合。' },
+    { key: 'market_gate_vote_mode', label: '投票模式', span: 2, type: 'select', options: 'gateVoteModes', showIf: (f: Record<string, any>) => !!f.market_gate_enabled, hint: '任一空头即拦（默认，与单指数旧语义一致）/ 过半 / 全部空头才拦' },
+    { key: 'market_gate_strength_threshold', label: '空头强度门槛', span: 1, type: 'number', placeholder: '0=不设门槛', showIf: (f: Record<string, any>) => !!f.market_gate_enabled, hint: '只有空头强度 ≥ 该值（0-100）才计入空头票；0=不设门槛' },
+    { key: 'market_gate_bear_reduce_ratio', label: '空头减仓比例', span: 1, type: 'percent', placeholder: '0=关闭', showIf: (f: Record<string, any>) => !!f.market_gate_enabled, hint: '空头连续段内每只持仓按该比例减仓一次（0=只拦开仓，不减仓）' },
   ]},
 ]
 
@@ -268,6 +274,9 @@ function emptyPortfolioForm(): Record<string, any> {
     max_single_position_pct: null, min_cash_reserve_pct: null,
     // 市场多空门控默认关（回测/实盘同口径）
     market_gate_enabled: false, market_gate_engine: 'python', market_gate_formula_name: '',
+    // E3 门控维度扩展：默认值 = 单指数 / any / 不设门槛 / 不减仓（旧语义）
+    market_gate_indices: '', market_gate_vote_mode: 'any',
+    market_gate_strength_threshold: null, market_gate_bear_reduce_ratio: 0,
     strategies: [],
   }
 }
@@ -355,6 +364,11 @@ function buildPortfolioPayload(): PortfolioRequest {
     out[fld.key] = payloadValue(fld, f)
   }
   out.status = f.status
+  // E3：投票指数列表在表单里是逗号分隔文本，提交转字符串数组（空数组=仅基准指数）
+  if (typeof out.market_gate_indices === 'string') {
+    out.market_gate_indices = (out.market_gate_indices as string)
+      .split(/[,，\s]+/).map(s => s.trim()).filter(Boolean)
+  }
   // equity_cap 容量上限：0 归一为 null（不设上限），后端校验须 >0
   if (out.equity_cap === 0) out.equity_cap = null
   // 单票上限 / 现金下限：留空或 0 一律归一 null（后端 NULL=不限制）
@@ -572,6 +586,10 @@ async function openEditPortfolio(p: PortfolioItem) {
     market_gate_enabled: detail.market_gate_enabled ?? false,
     market_gate_engine: detail.market_gate_engine || 'python',
     market_gate_formula_name: detail.market_gate_formula_name || '',
+    market_gate_indices: (detail.market_gate_indices || []).join(','),
+    market_gate_vote_mode: detail.market_gate_vote_mode || 'any',
+    market_gate_strength_threshold: detail.market_gate_strength_threshold ?? null,
+    market_gate_bear_reduce_ratio: detail.market_gate_bear_reduce_ratio ?? 0,
     strategies: [],
   }
   // 比例字段转百分比显示
@@ -752,6 +770,7 @@ function optionsOf(src: string | undefined, pid?: number) {
     { value: 'adaptive', label: '按最新价自适应（受最大档数限制）' },
   ]
   if (src === 'gateEngines') return MARKET_GATE_ENGINES.map(e => ({ value: e.value, label: e.label }))
+  if (src === 'gateVoteModes') return MARKET_GATE_VOTE_MODES.map(e => ({ value: e.value, label: e.label }))
   if (src === 'signalFrequencies') return [
     { value: null, label: '跟随周期（period）' },
     ...SIGNAL_FREQUENCIES.map(f => ({ value: f, label: f })),

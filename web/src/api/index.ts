@@ -108,6 +108,11 @@ export interface PortfolioItem {
   market_gate_enabled: boolean
   market_gate_engine: string  // python（默认）| tdx
   market_gate_formula_name: string  // 空串=默认公式名 TQGATE
+  // E3 门控维度扩展（默认值=旧语义）
+  market_gate_indices: string[]        // 多指数投票；空=仅 benchmark_index
+  market_gate_vote_mode: string        // any（默认）| majority | all
+  market_gate_strength_threshold: number  // 空头强度门槛 0-100；0=不设门槛
+  market_gate_bear_reduce_ratio: number   // 空头减仓比例 0-1；0=关闭
   status: string  // active|archived
   created_at: string | null
   updated_at: string | null
@@ -926,6 +931,11 @@ export interface PortfolioRequest {
   market_gate_enabled?: boolean | null         // 市场多空门控开关（null=请求未携带，编辑不动）
   market_gate_engine?: string | null           // python（默认）| tdx
   market_gate_formula_name?: string | null     // 通达信公式名，空=默认 TQGATE
+  // E3 门控维度扩展（null=请求未携带，编辑不动）
+  market_gate_indices?: string[] | null        // 多指数投票；空数组=仅 benchmark_index
+  market_gate_vote_mode?: string | null        // any（默认）| majority | all
+  market_gate_strength_threshold?: number | null // 空头强度门槛 0-100；0=不设门槛
+  market_gate_bear_reduce_ratio?: number | null  // 空头减仓比例 0-1；0=关闭
   status: string  // active|archived
   strategies?: StrategyItem[]  // 创建时携带；更新组合时后端忽略（策略单独 CRUD）
 }

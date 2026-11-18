@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, DateTime, Numeric, ForeignKey, Boolean
+from sqlalchemy import Column, Integer, String, Text, DateTime, Numeric, ForeignKey, Boolean
 from sqlalchemy.sql import func
 
 from .base import Base
@@ -19,6 +19,18 @@ class PortfolioStrategy(Base):
     market_gate_engine = Column(String(10), default="python", server_default="python", nullable=False)
     # tdx 通道的公式名（空=用内核默认 TQGATE）
     market_gate_formula_name = Column(String(50), nullable=True)
+    # E3 门控维度扩展（2026-11-18）：全部默认值 = 旧语义。
+    # 多指数投票：JSON 数组文本；NULL/空 = 只用 benchmark_index。
+    market_gate_indices = Column(Text, nullable=True)
+    # any（任一空头即拦，默认）/ majority（过半）/ all（全部空头）
+    market_gate_vote_mode = Column(String(10), default="any", server_default="any",
+                                   nullable=False)
+    # 空头强度分档：只有空头强度 ≥ 该值才投票拦截；0=不设门槛
+    market_gate_strength_threshold = Column(Integer, default=0, server_default="0",
+                                            nullable=False)
+    # 空头减仓档：0=关闭；>0 时空头连续段内每只持仓按该比例减仓一次
+    market_gate_bear_reduce_ratio = Column(Numeric(5, 4), default=0, server_default="0",
+                                           nullable=False)
     initial_capital = Column(Numeric(15, 2), default=500000, server_default="500000", nullable=False)
     max_drawdown = Column(Numeric(5, 4), default=0.2000, server_default="0.2000", nullable=False)
     daily_loss_limit = Column(Numeric(5, 4), default=0.0500, server_default="0.0500", nullable=False)

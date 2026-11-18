@@ -27,7 +27,8 @@ class LiveGateSnapshot(Base):
     portfolio_strategy_id = Column(Integer, nullable=False, index=True)
     snap_date = Column(Date, nullable=False, index=True)
     # 门控基准指数代码（如 000300.SH）；历史/未配置为 NULL
-    benchmark_index = Column(String(16), nullable=True)
+    # 多指数投票时存逗号拼接的指数列表；单指数时与旧值一致
+    benchmark_index = Column(String(64), nullable=True)
     # python | tdx
     gate_engine = Column(String(16), nullable=True)
     # 当日生效方向：1=多头 / 0=中性 / -1=空头（右移一日的收盘状态）

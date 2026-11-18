@@ -14,6 +14,7 @@ MarketGateTracker 消费 {date: 方向} 序列，查询一律右移一日
 from __future__ import annotations
 
 import bisect
+import json
 import logging
 from datetime import date, datetime
 from itertools import pairwise
@@ -83,6 +84,105 @@ class MarketGateTracker:
         if not self._sorted_days:
             return None
         return (self._sorted_days[0], self._sorted_days[-1])
+
+
+# ---------------- E3 多指数投票（组合级维度扩展） ----------------
+
+def parse_gate_indices(raw) -> list:
+    """组合门控指数列表：JSON 数组 / 逗号分隔 / None → 去重保序的代码列表。
+
+    无法解析的项忽略（配置层负责格式校验并返回 400）。
+    """
+    if not raw:
+        return []
+    if isinstance(raw, (list, tuple)):
+        items = list(raw)
+    else:
+        text = str(raw).strip()
+        if not text:
+            return []
+        if text.startswith("["):
+            try:
+                parsed = json.loads(text)
+            except (TypeError, ValueError):
+                return []
+            items = parsed if isinstance(parsed, list) else []
+        else:
+            items = text.split(",")
+    out: list = []
+    for item in items:
+        code = str(item).strip()
+        if code and code not in out:
+            out.append(code)
+    return out
+
+
+class CompositeGateTracker:
+    """E3：多指数投票门控（接口与 MarketGateTracker 对齐）。
+
+    每个指数先按自身 M 状态机得到 (方向, 强度)，再按票型聚合：
+    - 空头票：state == -1 且 strength >= strength_threshold；
+    - 多头票：state in (1, 2)；
+    - vote_mode: any=任一空头即拦 / majority=过半 / all=全部空头才拦。
+
+    右移一日语义由各子 tracker 负责（查询日期 < 状态日），此处不再平移。
+    单指数 + any + threshold=0 时与直接使用 MarketGateTracker 判定等价
+    （仅在 state 细化值 2→1，方向语义不变）。
+    """
+
+    def __init__(self, trackers, vote_mode: str = "any",
+                 strength_threshold: int = 0):
+        self._trackers = [t for t in (trackers or []) if t is not None]
+        self._vote_mode = (vote_mode or "any").lower()
+        self._threshold = max(0, int(strength_threshold or 0))
+        days = set()
+        for t in self._trackers:
+            days.update(getattr(t, "_sorted_days", []) or [])
+        self._days = sorted(days)
+
+    def _votes(self, d: date) -> tuple:
+        bears, bulls = [], []
+        for t in self._trackers:
+            state = int(t.state_for(d))
+            strength = int(t.strength_for(d))
+            if state == -1:
+                if strength >= self._threshold:
+                    bears.append(strength)
+            elif state in (1, 2):
+                bulls.append(strength)
+        return bears, bulls
+
+    def blocks(self, d: date) -> bool:
+        if not self._trackers:
+            return False
+        bears, _ = self._votes(d)
+        n = len(self._trackers)
+        if self._vote_mode == "all":
+            return len(bears) == n
+        if self._vote_mode == "majority":
+            return len(bears) * 2 > n
+        return bool(bears)
+
+    def state_for(self, d: date) -> int:
+        if self.blocks(d):
+            return -1
+        _, bulls = self._votes(d)
+        return 1 if bulls else 0
+
+    def strength_for(self, d: date) -> int:
+        bears, bulls = self._votes(d)
+        return max(bears) if bears else (max(bulls) if bulls else 0)
+
+    def switches(self) -> int:
+        seq = [self.state_for(d) for d in self._days]
+        nz = [v for v in seq if v != 0]
+        return sum(1 for a, b in pairwise(nz) if a != b)
+
+    def span(self) -> Optional[tuple]:
+        spans = [t.span() for t in self._trackers if t.span()]
+        if not spans:
+            return None
+        return (min(s[0] for s in spans), max(s[1] for s in spans))
 
 
 # ---------------- TDX 数值语义辅助（numpy/pandas，NaN=null） ----------------

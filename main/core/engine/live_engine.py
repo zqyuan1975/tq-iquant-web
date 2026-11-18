@@ -6586,7 +6586,10 @@ class LiveEngine:
             span = tracker.span()
             as_of = span[1] if span else None
             spec = self._gate_specs.get(pid) or {}
-            benchmark = spec.get("benchmark_index")
+            from core.engine.market_gate import parse_gate_indices
+            _codes = parse_gate_indices(spec.get("market_gate_indices"))
+            benchmark = (",".join(_codes) if _codes
+                         else spec.get("benchmark_index"))
             engine_name = spec.get("market_gate_engine") or "python"
             db = self._db_session_factory()
             try:

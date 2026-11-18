@@ -22,6 +22,13 @@ export const MARKET_GATE_ENGINES = [
   { value: 'tdx', label: '通达信公式库（tdx）' },
 ]
 
+// E3 多指数投票模式（与后端 market_gate_vote_mode 同集合）
+export const MARKET_GATE_VOTE_MODES = [
+  { value: 'any', label: '任一空头即拦（any，默认）' },
+  { value: 'majority', label: '过半指数空头才拦（majority）' },
+  { value: 'all', label: '全部指数空头才拦（all）' },
+]
+
 // 回测 run 级三态覆盖：空串=跟随组合配置，提交时展开为布尔
 export const MARKET_GATE_OVERRIDES = [
   { value: '', label: '跟随组合' },

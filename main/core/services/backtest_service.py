@@ -55,9 +55,11 @@ from core.engine.market_gate import (
     GATE_FORMULA_NAME_DEFAULT,
     GATE_FORMULA_VERSION,
     GATE_WARMUP_DAYS,
+    CompositeGateTracker,
     MarketGateTracker,
     MarketGateUnavailableError,
     compute_gate_states,
+    parse_gate_indices,
     parse_tdx_gate_outputs,
 )
 from core.services.acceptance import ACCEPTANCE_PROFILES, compute_acceptance
@@ -487,24 +489,16 @@ def build_gate_ohlcv(code: str, start: date, end: date,
     return df.drop_nulls().sort("datetime")
 
 
-def build_gate_tracker(ps, start: date, end: date, enabled: bool | None = None):
-    """构建市场多空门控跟踪器（None=未启用）。
+def build_single_gate_tracker(code: str, engine: str, formula_name: str | None,
+                              start: date, end: date):
+    """单指数门控 tracker（python=内置 M 状态机 / tdx=客户端公式库）。
 
-    enabled=None 跟随组合 market_gate_enabled；显式 bool 为 run 级覆盖。
-    取数起点提前 GATE_WARMUP_DAYS 自然日（MA288 预热）。
-    取数/公式无结果一律 ValueError——门控开启却静默放行等于没开，
-    宁可让本轮回测失败并给出可操作提示（路由层转 HTTP 400）。
+    取数/公式无结果一律抛 ValueError——门控开启却静默放行等于没开，
+    宁可让本轮失败并给出可操作提示（路由层转 HTTP 400）。
     """
-    if enabled is None:
-        enabled = bool(getattr(ps, "market_gate_enabled", False))
-    if not enabled:
-        return None
-    code = getattr(ps, "benchmark_index", None) or DEFAULT_BENCHMARK_CODE
     fetch_start = start - timedelta(days=GATE_WARMUP_DAYS)
-    engine = (getattr(ps, "market_gate_engine", None) or "python").lower()
-    if engine == "tdx":
-        fname = (getattr(ps, "market_gate_formula_name", None)
-                 or GATE_FORMULA_NAME_DEFAULT)
+    if (engine or "python").lower() == "tdx":
+        fname = formula_name or GATE_FORMULA_NAME_DEFAULT
         raw = TQFormula().compute(
             fname, "", [code], period="1d", count=-1,
             start_time=fetch_start.strftime("%Y%m%d"),
@@ -529,13 +523,47 @@ def build_gate_tracker(ps, start: date, end: date, enabled: bool | None = None):
     return tracker
 
 
+def build_gate_tracker(ps, start: date, end: date, enabled: bool | None = None):
+    """构建市场多空门控跟踪器（None=未启用）。
+
+    enabled=None 跟随组合 market_gate_enabled；显式 bool 为 run 级覆盖。
+    E3：market_gate_indices 非空时按列表逐指数构建并投票；单指数 + any +
+    threshold=0 时返回原 MarketGateTracker（旧语义逐字一致）。
+    """
+    if enabled is None:
+        enabled = bool(getattr(ps, "market_gate_enabled", False))
+    if not enabled:
+        return None
+    codes = parse_gate_indices(getattr(ps, "market_gate_indices", None))
+    if not codes:
+        codes = [getattr(ps, "benchmark_index", None) or DEFAULT_BENCHMARK_CODE]
+    engine = (getattr(ps, "market_gate_engine", None) or "python").lower()
+    fname = getattr(ps, "market_gate_formula_name", None)
+    vote_mode = (getattr(ps, "market_gate_vote_mode", None) or "any").lower()
+    threshold = int(getattr(ps, "market_gate_strength_threshold", 0) or 0)
+    if len(codes) == 1 and vote_mode == "any" and threshold <= 0:
+        return build_single_gate_tracker(codes[0], engine, fname, start, end)
+    trackers = [
+        build_single_gate_tracker(code, engine, fname, start, end)
+        for code in codes
+    ]
+    return CompositeGateTracker(
+        trackers, vote_mode=vote_mode, strength_threshold=threshold)
+
+
 def gate_summary(tracker, ps) -> dict | None:
     """门控摘要（冻结入 params_snapshot，供跨记录口径核对）。"""
     if tracker is None:
         return None
     span = tracker.span()
+    codes = parse_gate_indices(getattr(ps, "market_gate_indices", None))
     return {
         "index": getattr(ps, "benchmark_index", None) or DEFAULT_BENCHMARK_CODE,
+        "indices": codes or [getattr(ps, "benchmark_index", None)
+                             or DEFAULT_BENCHMARK_CODE],
+        "vote_mode": (getattr(ps, "market_gate_vote_mode", None) or "any"),
+        "strength_threshold": int(
+            getattr(ps, "market_gate_strength_threshold", 0) or 0),
         "engine": (getattr(ps, "market_gate_engine", None) or "python"),
         "formula_version": GATE_FORMULA_VERSION,
         "switches": tracker.switches(),
@@ -587,6 +615,12 @@ PARAMS_SNAPSHOT_FIELDS = (
     # 熔断处置动作（D4，2026-11-18）：notify/halt/half/liquidate 影响触发后的
     # 卖出行为 → 必须冻结，否则新旧结果不可混比。
     "breaker_action",
+    # E3 门控维度扩展（2026-11-18，默认值=旧语义）：多指数投票/强度门槛/
+    # 空头减仓都会改变判定或卖出行为 → 必须冻结进快照。
+    "market_gate_indices",
+    "market_gate_vote_mode",
+    "market_gate_strength_threshold",
+    "market_gate_bear_reduce_ratio",
 )
 
 # 复权模式：K线/指数传 dividend_type 字符串（"front"/"back"，通达信 SDK 原样透传）；
@@ -662,6 +696,8 @@ STRATEGY_SNAPSHOT_FIELDS = (
     "reduce_position_ratio",
     "rotation_enabled", "rotation_momentum_bars", "rotation_hysteresis",
     "regime_filter_enabled", "trend_trailing_stop_ratio", "trend_max_positions",
+    # E3 策略级门控覆盖（默认 inherit=跟随组合）：改变开仓拦截 → 进指纹
+    "market_gate_mode",
     "exposure_cap_enabled", "risk_timing",
     "max_order_amount", "requote_enabled", "requote_max_attempts",
     "requote_price_mode", "requote_max_slippage_ticks",
@@ -785,6 +821,15 @@ def build_params_snapshot(ps, dividend_mode: str = "front",
     if market_gate_enabled:
         payload["gate_index"] = getattr(ps, "benchmark_index", None)
         payload["gate_formula_version"] = GATE_FORMULA_VERSION
+        # E3 门控扩展口径（默认值 = 单指数 / any / 不设门槛 / 不减仓）
+        payload["gate_config"] = {
+            "indices": parse_gate_indices(getattr(ps, "market_gate_indices", None)),
+            "vote_mode": (getattr(ps, "market_gate_vote_mode", None) or "any"),
+            "strength_threshold": int(
+                getattr(ps, "market_gate_strength_threshold", 0) or 0),
+            "bear_reduce_ratio": float(
+                getattr(ps, "market_gate_bear_reduce_ratio", 0) or 0),
+        }
     if gate_summary:
         payload["gate_summary"] = gate_summary
     # 公司行为（J1/J2，2026-11-18）：显式写否定值，区分「功能关闭」与「旧记录缺键」。

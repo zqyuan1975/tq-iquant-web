@@ -49,6 +49,10 @@ class Strategy(Base):
     regime_filter_enabled = Column(Boolean, default=False, server_default=text("0"), nullable=False)
     trend_trailing_stop_ratio = Column(Numeric(5, 4), nullable=True)
     trend_max_positions = Column(Integer, nullable=True)
+    # E3 策略级门控覆盖（2026-11-18，默认 inherit=跟随组合）：
+    # inherit=跟随组合 market_gate_enabled / off=本策略不受门控 / on=组合未开也强制
+    market_gate_mode = Column(String(10), default="inherit",
+                              server_default="inherit", nullable=False)
     # #3 策略级敞口上限（默认关）：回测 BUY 审批加卡策略总持仓市值
     # ≤ capital_ratio × 组合初始资金（仅回测成交步生效；实盘不接）
     exposure_cap_enabled = Column(Boolean, default=False, server_default=text("0"), nullable=False)
