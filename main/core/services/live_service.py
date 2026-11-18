@@ -944,6 +944,28 @@ def preflight_signal_config(db: Session, session_id: int, execution_mode: str):
     return None
 
 
+def split_channel_warnings(
+    db: Session, session_id: int, execution_mode: str, channel: str,
+) -> List[str]:
+    """H1：启用拆单但通道不支持时的启动软提示（不阻断）。
+
+    拆单在 ``LiveEngine._maybe_split_order`` 里只对 ``tdx_tq`` 生效；alert 模式
+    本身不下单，无需提示。返回空列表 = 无需提示。
+    """
+    if execution_mode == "alert" or channel == "tdx_tq":
+        return []
+    names = [
+        st.name for _, st in _session_strategies(db, session_id)
+        if getattr(st, "split_order_enabled", False)
+    ]
+    if not names:
+        return []
+    return [
+        "通道 %s 不支持拆单：策略 %s 已启用大额拆单，启动后不会拆单"
+        "（拆单仅通达信 TQ 支持）" % (channel or "-", "、".join(names))
+    ]
+
+
 def build_engine(
     session_id: int,
     db: Session,
@@ -3737,10 +3759,19 @@ def start_session(
     session.account_key_source = None if is_shadow else own_source
     # C4 多账户并行提醒（不阻断）：随启动结果回传给前端做横幅。
     try:
-        setattr(engine, "start_warnings",
-                recommended_channel_warnings(db, session, engines))
+        start_warnings = recommended_channel_warnings(db, session, engines)
     except Exception:  # noqa: BLE001
-        setattr(engine, "start_warnings", [])
+        start_warnings = []
+    # H1 拆单能力一致性：拆单仅通达信 TQ 实现；其它通道静默不拆会让「大额单
+    # 一笔打满」与预期不符，这里在启动结果里明确软提示（不阻断启动）。
+    channel = getattr(engine.dispatcher, "channel", "")
+    for msg in split_channel_warnings(db, session_id, execution_mode, channel):
+        start_warnings.append(msg)
+        _record_decision_event(
+            db, session_id, gate="split_order", layer="live_gate",
+            action="unsupported", message=msg,
+        )
+    setattr(engine, "start_warnings", start_warnings)
     if execution_mode != "alert":
         # 重启恢复：从 live_trades 重放虚拟持仓/虚拟现金（alert 无下单/成交）
         engine.recover(db)

@@ -1809,6 +1809,12 @@ onUnmounted(() => {
           :title="ok ? '支持' : '该通道不支持'"
         >{{ ok ? '✓' : '✗' }} {{ capabilityLabel(String(key)) }}</span>
       </div>
+      <p
+        v-if="selectedEngineCaps.split_order === false"
+        class="capability-hint" data-test="split-unsupported-hint"
+      >
+        该通道不支持大额拆单：组合策略里的「拆单」开关在此通道不会生效（仅通达信 TQ 支持）。
+      </p>
       <label>资金池模式（可选增强，默认关闭）</label>
       <select v-model="form.capital_pool_mode" data-field="create-capital-pool">
         <option value="off">关闭（分账不分池）</option>
@@ -2381,6 +2387,7 @@ onUnmounted(() => {
   border: 1px solid var(--line, #2a2f3a); color: var(--ink-soft);
 }
 .capability-chip.off { color: var(--ink-faint); opacity: .65; text-decoration: line-through; }
+.capability-hint { font-size: 12px; color: var(--ink-faint); margin: 2px 0 10px; }
 .form-error { font-size: 12px; color: var(--red); margin: -6px 0 12px; }
 /* start 409 行内红字：指名占用者，不笼统报「启动失败」 */
 .start-error {
