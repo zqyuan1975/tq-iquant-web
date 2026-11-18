@@ -107,6 +107,8 @@ export const GATE_LABEL: Record<string, string> = {
   pre_open_price_mode: '盘前价型不支持',
   deferred_release: '顺延单放行',
   submit_price: '提交价刷新',
+  // 点击『发送』已受理但柜台认领不到（180s 复检仍待发送 → 回 deferred 重排）
+  order_unconfirmed: '已受理未认领',
   // 周期线 / 日线新鲜度与兜底（market_data、daily_closer）
   period_bar_freshness: '周期线不新鲜',
   period_bar_fallback: '周期线聚合兜底',
@@ -168,6 +170,8 @@ export const LAYER_LABEL: Record<string, string> = {
   t1: 'T+1',
   live_gate: '实盘闸门',
   formula: '公式计算',
+  // 持久化风控事件（_emit_risk_safe(persist=True) 落 layer=risk）
+  risk: '风控事件',
 }
 
 // 闸门动作 → 中文
@@ -293,6 +297,8 @@ export const RISK_RULE_LABEL: Record<string, string> = {
   // 盘前 / 资金
   pre_open_price_capability: '盘前定价能力不足',
   real_account_insufficient: '真实可用资金不足',
+  // 确认点击未生效（行仍在『发送』）后按 deferred 重排
+  order_requeued: '点击未生效重排',
   // watchdog 运行健康（engine_watchdog 每 30s 扫描）
   engine_stale: '引擎主循环停摆',
   client_offline: '交易客户端离线',

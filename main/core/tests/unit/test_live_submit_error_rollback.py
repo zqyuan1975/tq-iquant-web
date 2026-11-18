@@ -7,7 +7,7 @@
 - P1-2：`_expected_minute_labels` 不把正在形成的分钟算进应有分钟。
 - P1-6：分钟让价在重排（deferred_retry）路径不重复叠加。
 """
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
 import pytest
@@ -249,3 +249,108 @@ def test_minute_price_bias_not_reapplied_on_requeue():
     engine._apply_minute_price_bias(port, order, ctx)
     assert order.price == first       # 重排路径不再叠加第二跳
     assert getattr(order, "_price_biased", False) is True
+
+
+# ===========================================================================
+# 端到端（真引擎链路 + 伪通道）：TDX 已点击未生效不再静默吃 rejected（2026-11-18）
+# ===========================================================================
+class _UnconfirmedTdxDispatcher(_StubDispatcher):
+    """模拟 TDX：place_order 返回 None + last_unconfirmed_message，行仍待发送。"""
+
+    def __init__(self, row_state="pending",
+                 message="已受理未认领：已点击『发送』，但该行仍为待发送状态"):
+        super().__init__()
+        self._row_state = row_state
+        self.last_unconfirmed_message = message
+        self.row_checks = []
+
+    def place_order(self, order, price_type=None):
+        self.placed.append(order)
+        self.last_unconfirmed_order_id = self.order_id(order)
+        return None
+
+    def query_deals(self):
+        return []
+
+    def pending_row_state(self, live_order):
+        self.row_checks.append(live_order.id)
+        return self._row_state
+
+
+def _submit_unconfirmed(factory, port, disp):
+    engine = _engine(factory, port, disp)
+    db = factory()
+    order = _order()
+    engine._submit_one_order(db, port, order, "1m")
+    return engine, db
+
+
+def _age_to_timeout(db):
+    lo = db.query(LiveOrder).one()
+    lo.created_at = datetime.now(timezone.utc).replace(tzinfo=None) \
+        - timedelta(seconds=200)
+    db.commit()
+    db.expire_all()
+    return db.query(LiveOrder).one()
+
+
+def test_unconfirmed_row_still_pending_requeues_instead_of_rejected():
+    """点击未生效 → error_message 带真实原因；180s 复核仍待发送 → deferred 重排。"""
+    factory, _ = _db_factory()
+    port, _ctx = _portfolio()
+    disp = _UnconfirmedTdxDispatcher("pending")
+    engine, db = _submit_unconfirmed(factory, port, disp)
+
+    lo = db.query(LiveOrder).one()
+    assert lo.status == "submitted"
+    # 改动 4：TDX 的 last_unconfirmed_message 落进 live_orders.error_message
+    assert "已点击『发送』" in (lo.error_message or "")
+    assert lo.id in engine._pending_orders
+
+    _age_to_timeout(db)
+    engine._expire_stale_orders(db)      # 真引擎：复核 → 重排 → 再 expire
+    db.expire_all()
+    lo = db.query(LiveOrder).one()
+    assert lo.status == "deferred"       # 不再是静默 rejected
+    assert (lo.error_message or "").startswith("deferred_retry:n=1")
+    assert lo.id not in engine._pending_orders
+    assert engine._signal_bar_deferred, "应回内存 deferred 队列等下一交易日放行"
+    assert disp.row_checks, "必须真的复核过该行"
+    db.close()
+
+
+def test_unconfirmed_row_absent_keeps_expire_rejected():
+    """行已消失/已转『已发送』→ 视为已报出，保持既有 expire 行为（不重报）。"""
+    factory, _ = _db_factory()
+    port, _ctx = _portfolio()
+    disp = _UnconfirmedTdxDispatcher("absent")
+    engine, db = _submit_unconfirmed(factory, port, disp)
+    _age_to_timeout(db)
+    engine._expire_stale_orders(db)
+    db.commit()          # expire 的调用方负责 commit（与 _tick_main 同口径）
+    db.expire_all()
+    lo = db.query(LiveOrder).one()
+    assert lo.status == "rejected"
+    assert "order match timeout" in (lo.error_message or "")
+    assert not engine._signal_bar_deferred
+    db.close()
+
+
+def test_unconfirmed_requeue_respects_retry_cap():
+    """重排次数上限 _DEFERRED_RETRY_MAX=2：用尽后仍待发送 → 交 expire 终态。"""
+    factory, _ = _db_factory()
+    port, _ctx = _portfolio()
+    disp = _UnconfirmedTdxDispatcher("pending")
+    engine, db = _submit_unconfirmed(factory, port, disp)
+    lo = _age_to_timeout(db)
+    lo.error_message = "deferred_retry:n=2; 已重排两次"
+    db.commit()
+
+    engine._expire_stale_orders(db)
+    db.commit()
+    db.expire_all()
+    lo = db.query(LiveOrder).one()
+    assert lo.status == "rejected"
+    assert not engine._signal_bar_deferred
+    db.close()
+

@@ -103,6 +103,10 @@ export interface PortfolioItem {
   equity_cap: number | null            // W3 容量上限（dynamic 仓位资金封顶，None=不设上限）
   max_single_position_pct: number | null  // 单票上限（0~1 比例，null=不限制；仅实盘生效）
   min_cash_reserve_pct: number | null     // 现金下限（0~1 比例，null=不限制；仅实盘生效）
+  // 市场多空门控（默认关）：基准指数空头时禁止开仓/加仓，持仓不强平
+  market_gate_enabled: boolean
+  market_gate_engine: string  // python（默认）| tdx
+  market_gate_formula_name: string  // 空串=默认公式名 TQGATE
   status: string  // active|archived
   created_at: string | null
   updated_at: string | null
@@ -610,6 +614,38 @@ export interface OosSegment {
   benchmark_return: number | null
 }
 
+// 市场多空状态卡（GET /market-gate/status）— 对齐 market_gate_service.fetch_gate_status
+export interface MarketGateTransition {
+  date: string
+  state: number  // -1 空头 / 0 未定 / 1 多头 / 2 多头强势
+}
+
+export interface MarketGateStatusItem {
+  code: string
+  benchmark_name: string
+  period: string
+  as_of: string              // 最新一根 K 线日期（YYYY-MM-DD）
+  direction: number          // -1 空头 / 0 未定 / 1 多头 / 2 多头强势
+  direction_label: string
+  strength: number           // 0–100
+  since: string              // 当前状态起始日
+  duration_bars: number      // 持续交易日数（含起始日与 as_of）
+  transitions: MarketGateTransition[]  // 最近 N 次转折（新→旧）
+  bars: number               // 参与计算的 K 线根数
+  cached: boolean
+}
+
+export async function getMarketGateStatus(params: {
+  code?: string
+  period?: string
+  count?: number
+  history?: number
+  refresh?: boolean
+} = {}) {
+  const res = await api.get<ApiResponse<MarketGateStatusItem>>('/market-gate/status', { params })
+  return res.data.data
+}
+
 export async function getStockPools() {
   const res = await api.get<ApiResponse<StockPoolItem[]>>('/stock-pools')
   return res.data.data
@@ -875,6 +911,9 @@ export interface PortfolioRequest {
   equity_cap?: number | null  // W3 容量上限（dynamic 仓位资金封顶，None=不设上限）
   max_single_position_pct?: number | null  // 单票上限（0~1 比例，null=不限制；仅实盘生效）
   min_cash_reserve_pct?: number | null     // 现金下限（0~1 比例，null=不限制；仅实盘生效）
+  market_gate_enabled?: boolean | null         // 市场多空门控开关（null=请求未携带，编辑不动）
+  market_gate_engine?: string | null           // python（默认）| tdx
+  market_gate_formula_name?: string | null     // 通达信公式名，空=默认 TQGATE
   status: string  // active|archived
   strategies?: StrategyItem[]  // 创建时携带；更新组合时后端忽略（策略单独 CRUD）
 }
@@ -1020,6 +1059,7 @@ export interface BacktestRequest {
   equity_cap?: number                           // 容量上限 run 级覆盖，>0（undefined=用组合默认）
   daily_close_peak_enabled?: boolean            // 日末 peak 保护（默认关）：仅当日最后一根 bar 更新峰值/回撤
   daily_loss_basis?: 'equity' | 'initial' | null   // 日内亏损分母 run 级覆盖（null/undefined=跟随组合）
+  market_gate_enabled?: boolean | null             // 市场多空门控 run 级三态覆盖（null/undefined=跟随组合）
 }
 
 // C7 IS/OOS 采纳门槛评估结果（回测完成时返回；未启用为 null）

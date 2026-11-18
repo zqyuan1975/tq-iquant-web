@@ -23,11 +23,17 @@
    失败退回 BitBlt；截图失败才退回屏幕抓取。
 3. OCR 行匹配：代码（OCR 混淆归一 S→5/O→0）+ 数量 + 方向 + 时间（±45s，
    防同代码同量的历史残留待发送行被误点——误点会真的报单）。
-4. 点击：若该点真有 ``Button`` 型 HWND → BM_CLICK；否则校验点击点未被其它
-   窗口遮挡（``WindowFromPoint``）后，用真实鼠标点击（CEF 唯一可靠方式）。
-   点击前先复查行仍匹配、坐标落在窗口内；点击后复查该行「发送」是否消失。
-5. 单次调用**最多点一次**（风控单宁可判失败等下一根 bar 重发，也不冒重复
-   报单风险）；失败落盘截图 + 窗口树 + OCR 文本到 ``logs/tdx_confirm/``。
+   整行 OCR 把价格读丢时（真机 2026-11-18：64.83 只剩「·83」），按列锚点裁
+   价格列 ROI 单独 OCR（限字符集 + Otsu 自适应二值化 + 多帧投票），采纳价还
+   须落在当日涨跌停区间内且与委托价偏离 ≤2%；推不出列区间则回退整行路径。
+4. 点击：若该点真有 ``Button`` 型 HWND → BM_CLICK；否则先 ``SetWindowPos``
+   把目标窗口置顶并用 ``WindowFromPoint`` 复核（不成立重试，仍失败则 fail-
+   closed 放弃），再用真实鼠标点击（CEF 唯一可靠方式）；点击完成后还原为
+   ``HWND_NOTOPMOST``。点击后复查该行是否消失/转「已发送」，再由委托表回查
+   二次确认（2026-11-18 加固）。
+5. 单次调用**最多点两次**（首次 + 复核仍读作『发送』时补点一次；风控单宁可
+   判失败等下一根 bar 重发，也不冒重复报单风险）；失败落盘截图 + 窗口树 +
+   OCR 文本到 ``logs/tdx_confirm/``。
 6. 全程受 deadline 约束，不会阻塞引擎主循环无限等待。
 """
 from __future__ import annotations
@@ -51,6 +57,38 @@ logger = logging.getLogger(__name__)
 _OCR_SCALE = 4
 #: 反色后的二值化阈值（真机截图校准）
 _OCR_THRESHOLD = 140
+#: 价格列 ROI 读不出时的换档重抓参数（放大倍率 + 二值化阈值各换一档）
+_OCR_SCALE_ALT = 3
+_OCR_THRESHOLD_ALT = 115
+#: 价格列 ROI 单独识别的参数（只裁价格列小图、限定字符集、按块自适应阈值）
+_PRICE_ROI_SCALE = 6
+_PRICE_ROI_MARGIN_Y = 3.0
+#: 价格列多帧投票帧数与帧间隔（沿用既有轮询节奏，整体只多 ~0.3s）
+_PRICE_VOTE_FRAMES = 3
+_PRICE_VOTE_INTERVAL = 0.15
+#: 每次 confirm 最多做几轮价格列 ROI 投票（避免每轮循环都重抓拉长等待）
+_PRICE_ROI_MAX_TRIES = 2
+#: 价格块允许的字符集（数字/小数点/负号；其余字符一律丢弃）
+_PRICE_BLOCK_CHARS = frozenset("0123456789.．·-")
+_PRICE_BLOCK_RE = re.compile(r"^(-?)(\d{1,4})[.．·](\d{1,3})$")
+#: 识别价与本次委托价的允许偏离（比例，2%）
+_PRICE_DEVIATION_MAX = 0.02
+#: 价格碎片与数量列的最大间距（按字符宽自适应，下限 12px）
+_PRICE_FRAG_GAP = 12.0
+#: 目标窗口置顶重试次数与间隔（2026-11-18 实证：平台 Edge 窗口最大化压住
+#: 「发送」按钮像素，单次 SetForegroundWindow 拿不到前台）
+_TOPMOST_ATTEMPTS = 3
+_TOPMOST_RETRY_DELAY = 0.2
+#: 画面就绪等待（2026-11-18）：窗口刚被强制显示时 CEF 仍在重绘，固定 sleep
+#: 0.2s 后点击会「点空」（真机：价格列整体缺失、点击未生效）。等到「行非空 +
+#: 价格列区间可推 + 连续两帧行指纹一致」再点，上限 _READY_TIMEOUT。
+_READY_TIMEOUT = 4.0
+_READY_INTERVAL = 0.3
+#: 窗口被 _force_show 强制显示后多久内仍视为「刚显示」（snapshot_rows 与
+#: confirm 共用同一 confirmer 实例，时间戳跨调用有效）
+_READY_GRACE = 10.0
+#: 点击后复核仍为「发送」时的补点次数上限（绝不多点，防重复报单）
+_CLICK_RETRY_MAX = 1
 #: 同一行的 y 向容差（窗口坐标，px）
 _ROW_TOL = 10.0
 #: 订单发出时间与信号行时间的允许偏差（秒）。引擎按 bar 节奏下单（~60s/次），
@@ -63,6 +101,16 @@ MOUSEEVENTF_LEFTDOWN = 0x0002
 MOUSEEVENTF_LEFTUP = 0x0004
 MOUSEEVENTF_WHEEL = 0x0800
 GA_ROOT = 2
+
+# ---- SetWindowPos 置顶相关（点击前把目标窗口提到最前，点击后还原）----
+HWND_TOPMOST = -1
+HWND_NOTOPMOST = -2
+SWP_NOSIZE = 0x0001
+SWP_NOMOVE = 0x0002
+SWP_NOACTIVATE = 0x0010
+SWP_SHOWWINDOW = 0x0040
+GWL_EXSTYLE = -20
+WS_EX_TOPMOST = 0x00000008
 
 #: OCR 常见数字混淆（仅用于纯数字/近数字文本）
 _DIGIT_CONFUSION = str.maketrans({
@@ -152,6 +200,9 @@ class SignalSpec:
     volume: int
     price: float = 0.0
     sent_at: Optional[datetime] = None
+    #: 当日涨跌停（可选；调用方已有 /price_limit 数据时传入，缺省 0=未知）
+    limit_up: float = 0.0
+    limit_down: float = 0.0
 
     @property
     def seconds(self) -> Optional[int]:
@@ -202,6 +253,9 @@ class Cell:
 @dataclass
 class Row:
     cells: List[Cell] = field(default_factory=list)
+    #: 价格列 ROI 多帧投票得到的价格（整行 OCR 读不出时由确认循环回填；
+    #: 非空即以此为准，避免整行混排识别丢字）
+    price_override: Optional[float] = None
 
     @property
     def cy(self) -> float:
@@ -291,6 +345,16 @@ class Row:
     @property
     def price(self) -> Optional[float]:
         """行内委托价（限价）。读不出/市价行返回 None（调用方按「不可判读」处理）。
+
+        ``price_override``（价格列 ROI 多帧投票值）优先；否则走整行 OCR 拼接。
+        """
+        if self.price_override is not None:
+            return self.price_override
+        return self.raw_price
+
+    @property
+    def raw_price(self) -> Optional[float]:
+        """整行 OCR 直接拼出的价格（不受 ROI 投票回填影响，行指纹用）。
 
         OCR 常把 17.64 拆成「1」「7」「·」「64」多个词，必须按 x 邻近拼接后
         再取正则（``_row_text`` 只在列间距大时才插空格）；间距大导致拼不上时
@@ -476,6 +540,43 @@ def _has_cef_child(hwnd: int) -> bool:
     return False
 
 
+def _front_root_at(sx: float, sy: float) -> int:
+    """点 (sx,sy) 处最上层窗口的顶层句柄（0 = 该点无窗口）。"""
+    try:
+        hwnd = _user32.WindowFromPoint(wt.POINT(int(sx), int(sy)))
+        return int(_user32.GetAncestor(hwnd, GA_ROOT) or 0)
+    except Exception:  # noqa: BLE001
+        return 0
+
+
+def _is_topmost(hwnd: int) -> bool:
+    """窗口是否已是置顶（WS_EX_TOPMOST）。读失败按「非置顶」处理。"""
+    try:
+        ex = int(_user32.GetWindowLongW(wt.HWND(hwnd), GWL_EXSTYLE) or 0)
+        return bool(ex & WS_EX_TOPMOST)
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _set_topmost(hwnd: int, topmost: bool) -> bool:
+    """SetWindowPos 置顶/取消置顶（不动尺寸/位置/焦点）。
+
+    后台进程也能用（不像 SetForegroundWindow 受前台权限限制）；点击完成后
+    调用方必须用 ``topmost=False`` 还原，避免通达信长期悬浮在其它窗口之上。
+    """
+    try:
+        flag = HWND_TOPMOST if topmost else HWND_NOTOPMOST
+        insert_after = ctypes.c_void_p(flag & 0xFFFFFFFFFFFFFFFF)
+        cmd = SWP_NOSIZE | SWP_NOMOVE | SWP_NOACTIVATE
+        if topmost:
+            cmd |= SWP_SHOWWINDOW
+        return bool(_user32.SetWindowPos(
+            wt.HWND(hwnd), insert_after, 0, 0, 0, 0, cmd))
+    except Exception:  # noqa: BLE001
+        logger.exception("tdx 交易信号窗口 SetWindowPos 失败（topmost=%s）", topmost)
+        return False
+
+
 def _pick_window_impl(items: Sequence[WindowRef]) -> Optional[WindowRef]:
     """从候选中挑本次要操作的「交易信号」窗口。
 
@@ -539,9 +640,11 @@ def _row_fingerprint(row: Row) -> tuple:
     """行指纹（基线扣除用）：代码/方向/数量/价格/行时间 全同视为同一旧行。
 
     时间精确到秒、价格精确到分；基线在 order_stock 之前拍，新行时间必然
-    不同，因此不会把本次新行误当旧行排除。
+    不同，因此不会把本次新行误当旧行排除。价格取整行 OCR 原值（``raw_price``），
+    不受价格列 ROI 投票回填影响——否则点击后复核会因「回填价 vs 未回填价」
+    指纹不同误判成「行已消失」。
     """
-    price = row.price
+    price = row.raw_price
     return (row.code, row.direction, row.volume,
             round(price, 2) if price is not None else None, row.seconds)
 
@@ -564,11 +667,16 @@ def _subtract_baseline(rows: Sequence[Row],
 
 def _match_row(rows: Sequence[Row], spec: SignalSpec,
                tol_seconds: int = _TIME_TOL_SECONDS,
-               baseline: Optional[Sequence[tuple]] = None) -> Optional[Row]:
+               baseline: Optional[Sequence[tuple]] = None,
+               allow_price_missing: bool = True) -> Optional[Row]:
     """定位「本次委托」对应的待发送行（找不到 → None，宁可不点也不误点）。
 
     硬条件：代码 6 位一致 + 数量一致 + 方向一致（读不出方向则放行）+
-    **价格一致**（限价对限价，±1 分钱；读不出价格一律不放行）。
+    **价格一致**（限价对限价，±1 分钱）。
+    价格兜底（2026-11-18 实证：OCR 把 64.83 读成「·83」整行丢价格）：价格列
+    读不出时，若「代码+方向+数量+行时间」在当帧窗口里**唯一**命中一行则认这
+    一行；多行候选一律放弃（不许猜）。价格列 ROI 已给出价但与委托价不符时
+    调用方传 ``allow_price_missing=False``，此时不再走该兜底（冲突证据不放行）。
     基线条件：``baseline``（下单前已存在的行指纹）里的行全部排除——只点
     基线之后新出现的行，哪怕旧行时间更接近本次下单。
     时间条件：行时间不得早于本次下单前 ``_TIME_FLOOR_TOL_SECONDS`` 秒，且
@@ -582,6 +690,8 @@ def _match_row(rows: Sequence[Row], spec: SignalSpec,
     floor = (spec.seconds - _TIME_FLOOR_TOL_SECONDS
              if spec.seconds is not None else None)
     cands: List[Tuple[float, float, Row]] = []
+    # 价格列 OCR 读不出的行：只在全窗口唯一命中时降级放行（见函数末尾）
+    no_price: List[Tuple[float, float, Row]] = []
     # 代码列 OCR 完全不可读的行（重组后仍为空）：只作为「唯一命中」的降级候选，
     # 需同时满足 数量+方向+价格+时间 全一致，且窗口内唯一（见下）。
     loose: List[Tuple[float, float, Row]] = []
@@ -607,10 +717,6 @@ def _match_row(rows: Sequence[Row], spec: SignalSpec,
             continue
         if row.send is None:
             continue
-        if want_price > 0:
-            row_price = row.price
-            if row_price is None or abs(row_price - want_price) > _PRICE_TOL:
-                continue
         t = row.seconds
         if t is None:
             if spec.seconds is not None:
@@ -623,21 +729,249 @@ def _match_row(rows: Sequence[Row], spec: SignalSpec,
                 continue
         delta = (_seconds_diff(t, spec.seconds)
                  if (t is not None and spec.seconds is not None) else 0)
+        if want_price > 0:
+            row_price = row.price
+            if row_price is None:
+                no_price.append((delta, row.cy, row))
+                continue
+            if abs(row_price - want_price) > _PRICE_TOL:
+                continue
         cands.append((delta, row.cy, row))
-    if not cands:
+    if cands:
+        if spec.seconds is None:
+            # 无时间基准：仅唯一候选放行（历史残留行可能真的报单）
+            return cands[0][2] if len(cands) == 1 else None
+        return min(cands, key=lambda c: (c[0], -c[1]))[2]
+    # 价格列读不出但「代码+方向+数量+时间」唯一命中 → 认这一行（重抓一档后
+    # 仍唯一才到这里；多候选一律放弃，绝不对坐标做猜测偏移）。
+    if not loose and len(no_price) == 1:
+        if not allow_price_missing:
+            logger.warning(
+                "tdx 交易信号：价格列 ROI 给出的价格无法确认本行，"
+                "放弃「唯一命中」降级放行（宁漏不误）")
+            return None
+        logger.warning(
+            "tdx 交易信号：本行价格列 OCR 缺失，按「代码+方向+数量+行时间」"
+            "唯一命中放行（行时间 %s 数量 %s）",
+            _fmt_row_seconds(no_price[0][2].seconds), vol)
+        return no_price[0][2]
+    if len(loose) == 1 and not no_price:
         # 降级：代码列读不出但时间+价格+数量唯一命中（宁可不点也不误点）——
         # 多候选时不放行，等下一轮渲染。
-        if len(loose) == 1:
-            logger.warning(
-                "tdx 交易信号：本次行代码列 OCR 不可读，按「时间+价格+数量」"
-                "唯一命中降级匹配（行时间 %s 价格 %s 数量 %s）",
-                _fmt_row_seconds(loose[0][2].seconds), loose[0][2].price, vol)
-            return loose[0][2]
+        logger.warning(
+            "tdx 交易信号：本次行代码列 OCR 不可读，按「时间+价格+数量」"
+            "唯一命中降级匹配（行时间 %s 价格 %s 数量 %s）",
+            _fmt_row_seconds(loose[0][2].seconds), loose[0][2].price, vol)
+        return loose[0][2]
+    return None
+
+
+def _count_price_unreadable_rows(rows: Sequence[Row], spec: SignalSpec,
+                                 baseline: Optional[Sequence[tuple]] = None,
+                                 tol_seconds: int = _TIME_TOL_SECONDS) -> int:
+    """失败文案区分用：同代码/方向/数量/时间窗、但价格列 OCR 读不出的行数。
+
+    >0 说明匹配失败的原因是「价格读不出（或候选不唯一）」，而不是「可视区
+    未见本次委托行」——两类原因必须分开提示，否则排查会被带偏。
+    """
+    return len(_price_unreadable_rows(rows, spec, baseline, tol_seconds))
+
+
+def _price_unreadable_rows(rows: Sequence[Row], spec: SignalSpec,
+                           baseline: Optional[Sequence[tuple]] = None,
+                           tol_seconds: int = _TIME_TOL_SECONDS) -> List[Row]:
+    """「代码+方向+数量+时间」都对得上、只缺价格的行（ROI 价格回填的候选）。"""
+    vol = str(int(spec.volume))
+    out: List[Row] = []
+    for row in _subtract_baseline(rows, baseline or ()):
+        if row.code != spec.code6 or row.volume != vol or row.send is None:
+            continue
+        if row.direction and row.direction != spec.direction:
+            continue
+        if row.price is not None:
+            continue
+        t = row.seconds
+        if spec.seconds is not None:
+            if t is None or _seconds_diff(t, spec.seconds) > tol_seconds:
+                continue
+        out.append(row)
+    return out
+
+
+def _pending_unsent_row(rows: Sequence[Row], spec: SignalSpec,
+                        tol_seconds: int = _TIME_TOL_SECONDS) -> Optional[bool]:
+    """本单行是否仍停在「待发送」（点击是否真的生效的判定口径）。
+
+    True=唯一候选且行尾仍读作『发送』（未点出去）；False=候选不存在或已转
+    『已发送』；None=多候选/无法唯一判定（不猜，调用方按 unknown 处理）。
+    只看「代码（可读时）+方向+数量+行时间」：待发送帧的价格列常整体缺失
+    （2026-11-18 实证），带价格条件会把「仍在待发送」误判成「行不存在」。
+    """
+    vol = str(int(spec.volume))
+    cands: List[Row] = []
+    for row in rows:
+        if row.code and row.code != spec.code6:
+            continue
+        if row.volume != vol:
+            continue
+        if row.direction and row.direction != spec.direction:
+            continue
+        t = row.seconds
+        if spec.seconds is not None:
+            if t is None or _seconds_diff(t, spec.seconds) > tol_seconds:
+                continue
+        cands.append(row)
+    if not cands:
+        return False
+    if len(cands) > 1:
         return None
-    if spec.seconds is None:
-        # 无时间基准：仅唯一候选放行（历史残留行可能真的报单）
-        return cands[0][2] if len(cands) == 1 else None
-    return min(cands, key=lambda c: (c[0], -c[1]))[2]
+    row = cands[0]
+    # 「已发送」文本包含子串「发送」，必须先判 sent 再判 send
+    if row.sent:
+        return False
+    if row.send is not None:
+        return True
+    return None
+
+
+def _parse_price_block(text: str) -> Optional[float]:
+    """价格块文本 → 价格（限定字符集：数字/小数点/负号，其余一律丢弃）。
+
+    丢弃后必须恰好是「[-]整数(1~4位).小数(1~3位)」；拼接后出现多个小数点、
+    缺整数位（如只读到「·83」）、混入数量等多段数字，一律判不可用。
+    """
+    s = "".join(ch for ch in (text or "") if ch in _PRICE_BLOCK_CHARS and
+                not ch.isspace())
+    m = _PRICE_BLOCK_RE.match(s)
+    if not m:
+        return None
+    try:
+        val = float("%s%s.%s" % (m.group(1), m.group(2), m.group(3)))
+    except ValueError:
+        return None
+    return val if val > 0 else None
+
+
+def _otsu_threshold(gray) -> Optional[int]:
+    """按块自算 Otsu 二值化阈值（覆盖深色反色后各列亮度不一致）。
+
+    图像近乎单峰/全黑全白时返回 None，由调用方回退到固定阈值。
+    """
+    try:
+        hist = gray.histogram()
+    except Exception:  # noqa: BLE001
+        return None
+    total = sum(hist)
+    if total <= 0:
+        return None
+    used = [i for i, n in enumerate(hist) if n]
+    if len(used) < 2 or (used[-1] - used[0]) < 20:
+        return None
+    sum_all = sum(i * n for i, n in enumerate(hist))
+    sum_b = 0.0
+    w_b = 0
+    best, best_t = -1.0, None
+    for t in range(256):
+        w_b += hist[t]
+        if w_b == 0:
+            continue
+        w_f = total - w_b
+        if w_f <= 0:
+            break
+        sum_b += t * hist[t]
+        m_b = sum_b / w_b
+        m_f = (sum_all - sum_b) / w_f
+        var = float(w_b) * w_f * (m_b - m_f) ** 2
+        if var > best:
+            best, best_t = var, t
+    return best_t
+
+
+def _price_column_band(rows: Sequence[Row]) -> Optional[Tuple[float, float]]:
+    """从当帧行锚点推算价格列 x 区间（含容错边距）；推不出 → None。
+
+    锚点：每行「发送」左侧的数量列（右锚）+ 紧邻数量列左侧、只含价格字符
+    的连续碎片（左锚，OCR 丢字时可能只剩「·83」）。左边界再向左留 3 个
+    字符宽（覆盖整行识别时被丢掉的「64」）；右侧止于数量列左沿，避免把
+    数量拼进价格。任一帧推不出（如价格全部读不出）→ None，调用方回退到
+    整行识别路径，不得因此直接判失败。
+    """
+    lefts: List[float] = []
+    rights: List[float] = []
+    char_ws: List[float] = []
+    for row in rows:
+        if row.send is None:
+            continue
+        before = [c for c in row.cells if c.x < row.send.x - 2]
+        vol = None
+        for c in sorted(before, key=lambda c: c.x, reverse=True):
+            t = c.text.strip()
+            if not t or ":" in t or "：" in t:
+                continue
+            n = _norm_digits(t)
+            if n.isdigit() and 1 <= len(n) <= 6:
+                vol = c
+                break
+        if vol is None:
+            continue
+        gap_limit = max(_PRICE_FRAG_GAP,
+                        2.5 * (vol.w / max(len(vol.text.strip()), 1)))
+        frags: List[Cell] = []
+        edge = vol.x
+        for c in sorted(before, key=lambda c: c.x, reverse=True):
+            if c.x >= vol.x:
+                continue
+            t = c.text.strip()
+            if edge - c.right > gap_limit:
+                break
+            if not t or ":" in t or "：" in t:
+                break
+            if not all(ch in _PRICE_BLOCK_CHARS for ch in t):
+                break
+            frags.append(c)
+            edge = c.x
+        if not frags:
+            continue
+        lefts.append(min(c.x for c in frags))
+        rights.append(vol.x - 1.0)
+        char_ws.extend(c.w / max(len(c.text.strip()), 1) for c in frags)
+    if not lefts:
+        return None
+    char_w = sorted(char_ws)[len(char_ws) // 2] if char_ws else 7.0
+    x0 = min(lefts) - 3.0 * char_w
+    x1 = max(rights)
+    if x1 - x0 < 8.0:
+        return None
+    return x0, x1
+
+
+def _majority_price(votes: Sequence[Optional[float]]) -> Optional[float]:
+    """多帧投票：取出现 ≥2 帧的一致价格（按分取整）；无多数 → None。"""
+    from collections import Counter
+    vals = [round(v, 2) for v in votes if v is not None]
+    if not vals:
+        return None
+    val, n = Counter(vals).most_common(1)[0]
+    return val if n >= 2 else None
+
+
+def _price_within_deviation(price: Optional[float], spec: SignalSpec) -> bool:
+    """识别价与本次委托价的偏离 ≤ ``_PRICE_DEVIATION_MAX``（默认 2%）。"""
+    want = float(spec.price or 0.0)
+    if want <= 0 or price is None or float(price) <= 0:
+        return False
+    return abs(float(price) - want) <= want * _PRICE_DEVIATION_MAX + 1e-9
+
+
+def _price_within_daily_limits(price: float, spec: SignalSpec) -> bool:
+    """识别价须落在当日涨跌停区间内（调用方未提供涨跌停时跳过该条）。"""
+    lo = float(getattr(spec, "limit_down", 0.0) or 0.0)
+    hi = float(getattr(spec, "limit_up", 0.0) or 0.0)
+    if lo > 0 and float(price) < lo - _PRICE_TOL:
+        return False
+    if hi > 0 and float(price) > hi + _PRICE_TOL:
+        return False
+    return True
 
 
 def _fmt_row_seconds(seconds: Optional[int]) -> str:
@@ -722,6 +1056,13 @@ class TdxSignalConfirmer:
         self.enable_ocr = bool(enable_ocr)
         self._ocr_engine = None
         self._last_img = None
+        #: 被本次调用置顶的窗口句柄（0=无）；点击结束由 _restore_topmost 还原
+        self._topmost_raised = 0
+        #: 最近一次价格列 ROI 探测结果（band/每帧价格/采纳值），随诊断包落盘
+        self._price_probe: Optional[dict] = None
+        #: 最近一次「强制显示」的时刻（0=从未）：显示后 CEF 仍在重绘，确认流程
+        #: 据此在点击前等画面就绪（见 _wait_frame_ready）
+        self._force_shown_at = 0.0
 
     # ---- 公开入口
 
@@ -754,6 +1095,15 @@ class TdxSignalConfirmer:
         clicked = 0
         clicked_row: Optional[Row] = None
         stale = 0
+        # 换档 OCR 只重抓一次（每次 confirm 调用）
+        alt_tried = False
+        # 价格列 ROI 冲突证据是「粘性」的：一旦读出与委托价不符的价，本次
+        # confirm 不再走「价格缺失唯一命中」降级放行
+        price_conflict = False
+        roi_tries = 0
+        # 画面就绪等待每次 confirm 只做一次（窗口刚被强制显示时才等）
+        ready_waited = False
+        self._price_probe = None
         # 最后一次成功读到的行（仅用于失败时记录「可能残留的未发送行」，
         # 绝不据此自动点击——见 _describe_unmatched_rows 的说明）
         last_rows: Sequence[Row] = ()
@@ -771,6 +1121,15 @@ class TdxSignalConfirmer:
             if not window.visible:
                 self._force_show(window)
                 time.sleep(0.2)
+            # 刚被强制显示的窗口 CEF 仍在重绘（真机：该帧价格列整体缺失，
+            # 点击未生效）→ 等「行 + 价格列区间 + 发送按钮」连续两帧稳定再点。
+            if (not ready_waited
+                    and time.time() - self._force_shown_at <= _READY_GRACE):
+                ready_waited = True
+                self._force_shown_at = 0.0
+                self._wait_frame_ready(
+                    window, min(_READY_TIMEOUT,
+                                max(0.0, locate_end - time.time())))
             rows = self._read_rows(window)
             last_rows = rows
             if not rows:
@@ -778,14 +1137,52 @@ class TdxSignalConfirmer:
                 time.sleep(0.4)
                 continue
             stale = self._count_matching(rows, spec)
-            hit = _match_row(rows, spec, baseline=baseline)
+            hit = None
+            if _price_unreadable_rows(rows, spec, baseline) and \
+                    roi_tries < _PRICE_ROI_MAX_TRIES:
+                # 整行整窗 OCR 把价格读丢时，先按列锚点裁价格列 ROI 多帧投票
+                # （2026-11-18 真机：64.83 只剩「·83」）；ROI 明确读出价但
+                # 与本次委托对不上（约束不满足/价格不符）→ 视为冲突，不再
+                # 走「唯一命中」降级放行。再退回换档整窗重抓。
+                roi_tries += 1
+                hit, conflict = self._recover_hit_via_price_roi(
+                    window, rows, spec, baseline)
+                price_conflict = price_conflict or conflict
+            if hit is None:
+                hit = _match_row(rows, spec, baseline=baseline,
+                                 allow_price_missing=not price_conflict)
+            if hit is None and not alt_tried and \
+                    _count_price_unreadable_rows(rows, spec, baseline):
+                # 价格列常被 OCR 读丢（2026-11-18 真机：64.83 只剩「·83」）：
+                # 换一档放大倍率/阈值重抓一次再判（每次 confirm 只换一次）。
+                alt_tried = True
+                alt_rows = self._read_rows(window, scale=_OCR_SCALE_ALT,
+                                           threshold=_OCR_THRESHOLD_ALT)
+                if alt_rows:
+                    alt_hit = _match_row(
+                        alt_rows, spec, baseline=baseline,
+                        allow_price_missing=not price_conflict)
+                    if alt_hit is not None:
+                        rows, hit = alt_rows, alt_hit
+                        last_rows = alt_rows
+                        stale = self._count_matching(alt_rows, spec)
             if hit is None:
                 if self._scroll_down(window, rows):
                     detail = "待发送行不在可视区，已向下滚动列表"
                     continue
-                detail = ("可视区未见基线之后新出现的本次委托行"
-                          "（已排除基线 %d 行；代码/方向/数量/价格/时间均需一致，"
-                          "等待渲染）" % base_n)
+                missing_price = _count_price_unreadable_rows(rows, spec, baseline)
+                if price_conflict:
+                    detail = ("价格列 ROI 识别出的价格与本次委托不符"
+                              "（涨跌停区间/2% 偏离/±1 分不一致），判不可用，未点击")
+                elif missing_price:
+                    detail = (
+                        "OCR 未读出目标行价格，无法唯一确认本次委托行"
+                        "（同代码/方向/数量/时间窗候选 %d 条；价格列 ROI 多帧"
+                        "投票与换档重抓均未确认），未点击" % missing_price)
+                else:
+                    detail = ("可视区未见基线之后新出现的本次委托行"
+                              "（已排除基线 %d 行；代码/方向/数量/价格/时间均需一致，"
+                              "等待渲染）" % base_n)
                 time.sleep(0.35)
                 continue
             # 点击前最后一次核对坐标落在窗口内
@@ -798,11 +1195,19 @@ class TdxSignalConfirmer:
                 time.sleep(0.3)
                 continue
             if not method:
-                detail = "『发送』按钮位置被其它窗口遮挡，放弃点击（避免误点）"
+                detail = ("目标窗口无法置顶或『发送』按钮被其它窗口遮挡"
+                          "（置顶重试 %d 次仍失败），放弃点击（避免误点）"
+                          % _TOPMOST_ATTEMPTS)
                 break
             clicked = 1
             clicked_row = hit
             detail = "已点击『发送』，等待委托表出现该单"
+            if hit.price is None:
+                logger.warning(
+                    "tdx 交易信号：命中行价格列 OCR 缺失，按「代码+方向+数量+"
+                    "行时间」唯一命中点击（行时间 %s 数量 %s），点击后由委托表"
+                    "回查二次核对",
+                    _fmt_row_seconds(hit.seconds), hit.volume)
             if hit.code != spec.code6:
                 logger.warning(
                     "tdx 交易信号：命中行代码列不可读，按「时间+价格+数量」唯一"
@@ -821,8 +1226,22 @@ class TdxSignalConfirmer:
                     logger.exception("tdx 下单后置确认钩子异常")
             break
 
+        row_state: Optional[bool] = None
         if clicked and clicked_row is not None:
-            self._verify_clicked_row(window, clicked_row)
+            row_state = self._verify_clicked_row(window, clicked_row)
+            if row_state is False and clicked <= _CLICK_RETRY_MAX:
+                # 复核仍读作『发送』：可能点击未生效。重取一帧按同一行补点一次
+                # （上限 _CLICK_RETRY_MAX），再复核；仍 False 落回既有失败路径。
+                retried = self._reclick_pending_row(
+                    window, spec, clicked_row, baseline,
+                    allow_price_missing=not price_conflict)
+                if retried is not None:
+                    clicked += 1
+                    clicked_row = retried
+                    row_state = self._verify_clicked_row(window, retried)
+                    logger.info(
+                        "tdx 交易信号：点击后复核仍读作『发送』，已补点一次并复核"
+                        "（复核结果=%s）", row_state)
 
         # 未点击就失败时，客户端「交易信号」窗口可能残留本次委托的未发送行
         # （没点『发送』= 没报出去，但那一行仍可被人工误点）。此处**只记录不点击**：
@@ -839,6 +1258,14 @@ class TdxSignalConfirmer:
                 detail = ("%s；窗口内新增未发送行 %d 条"
                           "（需人工核对后手动『取消』）" % (detail, len(leftovers)))
 
+        # 点击结果校验（2026-11-18）：点完『发送』后复查该行是否消失/转为
+        # 「已发送」。复核仍为『发送』时已在上方补点一次（上限 1 次）；仍未确认
+        # 就按失败返回，由既有「已受理未认领」/deferred 路径兜底——绝不自动取消。
+        if clicked and row_state is True:
+            return ConfirmOutcome(
+                True, "已点击『发送』，该委托行已消失/已发送", clicked,
+                stale=stale)
+
         if clicked and is_submitted is not None:
             while time.time() < end:
                 try:
@@ -848,9 +1275,13 @@ class TdxSignalConfirmer:
                 except Exception as e:  # noqa: BLE001
                     logger.debug("tdx 确认后回查委托表异常：%s", e)
                 time.sleep(0.4)
-            detail = "已点击『发送』，但超时内委托表仍未出现该单"
+            if row_state is False:
+                detail = ("已点击『发送』，但该行仍为待发送状态，且超时内"
+                          "委托表未出现该单")
+            else:
+                detail = "已点击『发送』，但超时内委托表仍未出现该单（行状态无法核验）"
         elif is_submitted is None and clicked:
-            detail = "已点击『发送』（调用方未提供委托表回调）"
+            detail = "已点击『发送』（调用方未提供委托表回调，行状态未获确认）"
 
         self._dump(spec, detail, window, stale)
         return ConfirmOutcome(False, detail, clicked, stale=stale)
@@ -886,9 +1317,50 @@ class TdxSignalConfirmer:
                 _user32.ShowWindow(wt.HWND(window.hwnd), 4)   # SW_SHOWNOACTIVATE
             time.sleep(0.2)
             window.visible = bool(_user32.IsWindowVisible(wt.HWND(window.hwnd)))
+            self._force_shown_at = time.time()
             logger.info("tdx 交易信号窗口已隐藏，已强制显示 hwnd=%s", window.hwnd)
         except Exception:  # noqa: BLE001
             logger.exception("tdx 强制显示交易信号窗口失败")
+
+    def _wait_frame_ready(self, window: WindowRef,
+                          timeout: Optional[float] = None) -> bool:
+        """等「交易信号」画面就绪再点击（2026-11-18）。
+
+        判据：行非空 + 价格列区间可推（``_price_column_band`` 依赖行尾『发送』
+        锚点与价格碎片，等价于「价格列 + 发送按钮」都识别出来）+ 连续两帧行指纹
+        完全一致。窗口刚被强制显示时 CEF 仍在重绘，固定 sleep 后点击会点空
+        （真机：该帧价格列整体缺失、行尾仍是『发送』）。
+        超 ``timeout`` 返回 False 并记 WARNING，由调用方按现有路径继续（不改变
+        失败语义、不抛异常）。
+        """
+        limit = _READY_TIMEOUT if timeout is None else max(0.0, float(timeout))
+        end = time.time() + limit
+        prev_fp: Optional[tuple] = None
+        last_n = 0
+        last_band: Optional[Tuple[float, float]] = None
+        while True:
+            try:
+                rows = self._read_rows(window)
+            except Exception:  # noqa: BLE001
+                rows = []
+            last_n = len(rows)
+            fp = tuple(_row_fingerprint(r) for r in rows)
+            band = _price_column_band(rows) if rows else None
+            last_band = band
+            if rows and band is not None and prev_fp is not None and fp == prev_fp:
+                logger.info(
+                    "tdx 交易信号：画面就绪（%d 行，价格列 x=%.0f~%.0f，连续两帧一致）",
+                    len(rows), band[0], band[1])
+                return True
+            prev_fp = fp if rows else None
+            if time.time() >= end:
+                break
+            time.sleep(_READY_INTERVAL)
+        logger.warning(
+            "tdx 交易信号：等待画面就绪超时（%.1fs，行数=%d，价格列区间=%s），"
+            "按现有路径继续（可能点击未生效）",
+            limit, last_n, "可推" if last_band is not None else "不可推")
+        return False
 
     # ---- 截图 / OCR
 
@@ -947,9 +1419,13 @@ class TdxSignalConfirmer:
             self._last_img = img
         return img
 
-    def _ocr(self, img) -> List[tuple]:
+    def _ocr(self, img, scale: Optional[int] = None,
+             threshold: Optional[int] = None) -> List[tuple]:
+        """窗口截图 → 词表（窗口坐标）。scale/threshold 可换档重抓（见调用方）。"""
         if not self.enable_ocr or img is None:
             return []
+        scale = int(scale or _OCR_SCALE)
+        threshold = int(threshold or _OCR_THRESHOLD)
         try:
             from PIL import Image, ImageOps
         except ImportError:
@@ -963,11 +1439,11 @@ class TdxSignalConfirmer:
             hist_mean = sum(gray.resize((32, 32)).getdata()) / 1024.0
             if hist_mean < 128:          # 深色主题（通达信默认）→ 反色
                 rgb = ImageOps.invert(rgb)
-            big = rgb.resize((rgb.width * _OCR_SCALE, rgb.height * _OCR_SCALE),
+            big = rgb.resize((rgb.width * scale, rgb.height * scale),
                              Image.LANCZOS)
             bin_img = big.convert("L").point(
-                lambda p: 255 if p > _OCR_THRESHOLD else 0).convert("RGB")
-            return self._run_ocr(eng, bin_img)
+                lambda p: 255 if p > threshold else 0).convert("RGB")
+            return self._run_ocr(eng, bin_img, scale=scale)
         except Exception:  # noqa: BLE001
             logger.exception("tdx 交易信号窗口 OCR 失败")
             return []
@@ -993,7 +1469,7 @@ class TdxSignalConfirmer:
         self._ocr_engine = eng
         return eng
 
-    def _run_ocr(self, eng, img) -> List[tuple]:
+    def _run_ocr(self, eng, img, scale: int = _OCR_SCALE) -> List[tuple]:
         import asyncio
         import tempfile as _tf
 
@@ -1023,10 +1499,10 @@ class TdxSignalConfirmer:
                     b = w.bounding_rect
                     out.append((
                         w.text,
-                        float(b.x) / _OCR_SCALE,
-                        float(b.y) / _OCR_SCALE,
-                        float(b.width) / _OCR_SCALE,
-                        float(b.height) / _OCR_SCALE,
+                        float(b.x) / scale,
+                        float(b.y) / scale,
+                        float(b.width) / scale,
+                        float(b.height) / scale,
                     ))
             return out
         finally:
@@ -1035,11 +1511,146 @@ class TdxSignalConfirmer:
             except OSError:
                 pass
 
-    def _read_rows(self, window: WindowRef) -> List[Row]:
+    def _read_rows(self, window: WindowRef, scale: Optional[int] = None,
+                   threshold: Optional[int] = None) -> List[Row]:
         img = self._grab(window)
         if img is None:
             return []
-        return _build_rows(self._ocr(img))
+        return _build_rows(self._ocr(img, scale=scale, threshold=threshold))
+
+    def _ocr_price_roi(self, img, x0: float, y0: float,
+                       x1: float, y1: float) -> Optional[float]:
+        """裁价格列 ROI 单独 OCR：限定字符集 + 按块自适应阈值（Otsu）。
+
+        返回解析出的价格；裁剪越界/块内无内容/字符集不满足 → None（判不可用，
+        绝不用整行结果回填猜测）。
+        """
+        if not self.enable_ocr or img is None:
+            return None
+        try:
+            from PIL import Image, ImageOps, ImageStat
+        except ImportError:
+            return None
+        try:
+            w, h = img.size
+            box = (max(0, int(x0)), max(0, int(y0)),
+                   min(w, int(x1)), min(h, int(y1)))
+            if box[2] - box[0] < 3 or box[3] - box[1] < 3:
+                return None
+            block = img.crop(box).convert("RGB")
+            gray = block.convert("L")
+            lo, hi = gray.getextrema()
+            if hi - lo < 20:
+                return None
+            if ImageStat.Stat(gray).mean[0] < 128:
+                block = ImageOps.invert(block)   # 深色主题
+            big = block.resize((block.width * _PRICE_ROI_SCALE,
+                                block.height * _PRICE_ROI_SCALE), Image.LANCZOS)
+            gray_big = big.convert("L")
+            thr = _otsu_threshold(gray_big)
+            if thr is None:
+                thr = _OCR_THRESHOLD          # 回退到既有固定阈值
+            bin_img = gray_big.point(
+                lambda p: 255 if p > thr else 0).convert("RGB")
+            eng = self._ensure_ocr_engine()
+            if eng is None:
+                return None
+            words = self._run_ocr(eng, bin_img, scale=_PRICE_ROI_SCALE)
+            text = "".join(w[0] for w in sorted(words, key=lambda x: x[1]))
+            return _parse_price_block(text)
+        except Exception:  # noqa: BLE001
+            logger.exception("tdx 价格列 ROI OCR 失败")
+            return None
+
+    def _recover_hit_via_price_roi(self, window: WindowRef,
+                                   rows: Sequence[Row], spec: SignalSpec,
+                                   baseline: Optional[Sequence[tuple]]
+                                   ) -> Tuple[Optional[Row], bool]:
+        """价格列 ROI 多帧投票 → 回填唯一候选行价格 → 重新匹配。
+
+        返回 ``(命中行, 是否冲突)``：冲突=True 表示 ROI **确实读出了价**，但
+        该价不满足「涨跌停区间 / 与委托价偏离 ≤2% / 与委托价一致」，调用方
+        必须放弃本行的「价格缺失唯一命中」降级（冲突证据不放行）。读不出价
+        或推不出列区间 → ``(None, False)``，由整行路径继续兜底。
+        """
+        cands = _price_unreadable_rows(rows, spec, baseline)
+        probe: dict = {"candidates": len(cands), "band": None,
+                       "votes": [], "adopted": None, "accepted": False}
+        self._price_probe = probe
+        if len(cands) != 1:
+            logger.info("tdx 价格列 ROI 跳过：同代码/方向/数量/时间窗候选 %d 条（需唯一）",
+                        len(cands))
+            return None, False
+        band = _price_column_band(rows)
+        if band is None:
+            logger.info("tdx 价格列 ROI 跳过：当帧推不出价格列区间（回退整行识别）")
+            return None, False
+        target = cands[0]
+        probe["band"] = [round(band[0], 1), round(band[1], 1)]
+        y0 = min(c.y for c in target.cells) - _PRICE_ROI_MARGIN_Y
+        y1 = max(c.y + c.h for c in target.cells) + _PRICE_ROI_MARGIN_Y
+        votes: List[Optional[float]] = []
+        for i in range(_PRICE_VOTE_FRAMES):
+            votes.append(self._ocr_price_roi(self._grab(window),
+                                             band[0], y0, band[1], y1))
+            if i < _PRICE_VOTE_FRAMES - 1:
+                time.sleep(_PRICE_VOTE_INTERVAL)
+        probe["votes"] = votes
+        adopted = _majority_price(votes)
+        probe["adopted"] = adopted
+        logger.info(
+            "tdx 价格列 ROI 多帧投票：每帧价格=%s 采纳=%s（列区间 x=%.0f~%.0f）",
+            votes, adopted, band[0], band[1])
+        if adopted is None:
+            # 帧间出现 ≥2 个不同读值 = 证据冲突，不能当「价格读不出」放行
+            distinct = set(round(v, 2) for v in votes if v is not None)
+            return None, len(distinct) >= 2
+        if not _price_within_deviation(adopted, spec):
+            logger.warning(
+                "tdx 价格列 ROI：采纳价 %s 偏离委托价 %s 超 %.0f%%，判不可用",
+                adopted, spec.price, _PRICE_DEVIATION_MAX * 100)
+            return None, True
+        if not _price_within_daily_limits(adopted, spec):
+            logger.warning(
+                "tdx 价格列 ROI：采纳价 %s 不在当日涨跌停区间 [%s, %s]，判不可用",
+                adopted, spec.limit_down, spec.limit_up)
+            return None, True
+        target.price_override = adopted
+        matched = _match_row(rows, spec, baseline=baseline)
+        if matched is None:
+            logger.warning(
+                "tdx 价格列 ROI：采纳价 %s 与委托价 %s 不一致（±1 分），判冲突不放行",
+                adopted, spec.price)
+            return None, True
+        probe["accepted"] = True
+        return matched, False
+
+    def pending_row_state(self, spec: SignalSpec) -> str:
+        """该委托在「交易信号」窗口里是否仍停在待发送（2026-11-18）。
+
+        返回 ``"pending"``（唯一命中且行尾仍读作『发送』= 点击未生效/未报出）/
+        ``"absent"``（行已消失或已转『已发送』= 视为已报出）/ ``"unknown"``
+        （无窗口、OCR 空、多候选无法唯一判定、异常）。仅供引擎在 180s 到期前
+        复核，不点击、不取消任何行。
+        """
+        try:
+            with _dpi_ctx():
+                window = self._pick_window()
+                if window is None:
+                    return "unknown"
+                rows = self._read_rows(window)
+                if not rows:
+                    return "unknown"
+                state = _pending_unsent_row(rows, spec)
+                if state is True:
+                    return "pending"
+                if state is False:
+                    return "absent"
+                logger.info("tdx 待发送复核：候选行不唯一，按 unknown 处理（不重排）")
+                return "unknown"
+        except Exception:  # noqa: BLE001
+            logger.exception("tdx 待发送复核异常，按 unknown 处理")
+            return "unknown"
 
     def snapshot_rows(self) -> Tuple[tuple, ...]:
         """``order_stock`` **之前**拍「交易信号」窗口基线（旧行指纹集合）。
@@ -1065,36 +1676,79 @@ class TdxSignalConfirmer:
         return tuple(_row_fingerprint(r) for r in self._read_rows(window))
 
     def _verify_clicked_row(self, window: Optional[WindowRef],
-                            hit: Row) -> None:
-        """点击后校验该行行尾按钮是否变为「已发送」（OCR 可判定时）。
+                            hit: Row) -> Optional[bool]:
+        """点击后校验该行是否消失或转为「已发送」（OCR 可判定时）。
 
-        三类结果写日志区分判定路径：True=已发送；False=仍为『发送』（可疑，
-        最终仍以委托表认领为准）；None=判不了（行已消失/OCR 读不到），退回
-        委托表认领。
+        返回三态：True=已消失 / 行尾已变『已发送』；False=该行仍在且仍读作
+        『发送』（点击可能未生效）；None=判不了（无窗口/OCR 读不到），退回
+        委托表认领。``is_submitted``（委托表回查）仍是更强的确认口径，二者
+        任一确认为真即算报出。
         """
         if window is None:
             logger.info("tdx 确认：点击后无窗口句柄，退回委托表认领判定")
-            return
+            return None
         try:
             time.sleep(0.5)
             rows = self._read_rows(window)
         except Exception:  # noqa: BLE001
             logger.warning("tdx 确认：点击后 OCR 复核异常，退回委托表认领判定")
-            return
+            return None
         fp = _row_fingerprint(hit)
         same = [r for r in rows if _row_fingerprint(r) == fp]
         if not same:
-            logger.info("tdx 确认：OCR 判定路径=行已消失（可能已发送并移除），"
-                        "退回委托表认领")
-            return
+            logger.info("tdx 确认：OCR 判定路径=行已消失（已发送并移除）")
+            return True
         if any(r.sent for r in same):
             logger.info("tdx 确认：OCR 判定路径=行尾按钮已变『已发送』")
-        else:
-            # 预期降级：CEF 重绘后 OCR 常把按钮读回『发送』（2026-11-09 实测：
-            # 点击后已报柜台 status=50、资金已冻结，OCR 仍报『发送』）。
-            # 判定以委托表认领为准，这里只保留信息，不伪装成失败。
-            logger.debug("tdx 确认：OCR 复核未见『已发送』（行尾仍读作『发送』或未刷新）；"
-                         "不影响判定，以委托表认领为准")
+            return True
+        # 预期降级：CEF 重绘后 OCR 常把按钮读回『发送』（2026-11-09 实测：
+        # 点击后已报柜台 status=50、资金已冻结，OCR 仍报『发送』）。此时不
+        # 立即判失败——仍等委托表认领（is_submitted）；超时未认领才按失败返回。
+        logger.info("tdx 确认：OCR 复核未见『已发送』（行尾仍读作『发送』或未刷新），"
+                    "继续等委托表认领")
+        return False
+
+    def _reclick_pending_row(self, window: Optional[WindowRef], spec: SignalSpec,
+                             prev: Optional[Row],
+                             baseline: Optional[Sequence[tuple]] = None,
+                             allow_price_missing: bool = True) -> Optional[Row]:
+        """点击后复核仍为『发送』→ 重取一帧、按同一行补点一次（2026-11-18）。
+
+        返回补点成功命中的行；``None`` = 不补点（无窗口/重取失败/行已不可
+        唯一匹配/与上次命中不是同一行/点击通道拒绝）。**同一行校验**用
+        ``(code, volume, seconds)``，防止补点打到窗口里别的待发委托。
+        """
+        if window is None or prev is None:
+            return None
+        try:
+            rows = self._read_rows(window)
+        except Exception:  # noqa: BLE001
+            logger.warning("tdx 确认：补点前重取帧异常，放弃补点")
+            return None
+        hit = _match_row(rows, spec, baseline=baseline,
+                         allow_price_missing=allow_price_missing)
+        if hit is None or hit.send is None:
+            logger.warning("tdx 确认：补点前未能重新唯一命中同一行，放弃补点")
+            return None
+        if hit.sent:
+            # 该行已转『已发送』（首次点击其实生效了）→ 绝不再点
+            return None
+        if (hit.code, hit.volume, hit.seconds) != \
+                (prev.code, prev.volume, prev.seconds):
+            logger.warning(
+                "tdx 确认：补点候选与首次命中不是同一行（%s/%s/%s vs %s/%s/%s），"
+                "放弃补点", hit.code, hit.volume, hit.seconds,
+                prev.code, prev.volume, prev.seconds)
+            return None
+        sx = window.rect[0] + hit.send.cx
+        sy = window.rect[1] + hit.send.cy
+        method = self._click(window, sx, sy, hit)
+        if method in ("", "busy"):
+            logger.warning("tdx 确认：补点未发出（%s），不再重试", method or "遮挡/置顶失败")
+            return None
+        logger.info("tdx 交易信号：补点『发送』一次（%s，行时间 %s）",
+                    method, _fmt_row_seconds(hit.seconds))
+        return hit
 
     # ---- 滚动
 
@@ -1167,6 +1821,7 @@ class TdxSignalConfirmer:
         # 阻塞把整个 5s 确认预算吃光——锁忙就返回 "busy"，由调用方下一轮重试。
         if not UI_AUTO_LOCK.acquire(timeout=2.0):
             logger.warning("tdx 交易信号点击跳过：UI 互斥锁被占用（>2s），下轮重试")
+            self._restore_topmost()
             return "busy"
         try:
             _user32.SetCursorPos(int(sx), int(sy))
@@ -1179,32 +1834,64 @@ class TdxSignalConfirmer:
                 UI_AUTO_LOCK.release()
             except Exception:  # noqa: BLE001
                 pass
+            # 点击完成后立刻还原置顶（无论点击是否被客户端受理），
+            # 不让通达信长期悬浮在其它窗口之上。
+            self._restore_topmost()
         return "mouse"
 
     def _ensure_topmost(self, window: WindowRef, sx: float, sy: float) -> bool:
-        """确认点击点最上层就是我们自己的窗口（防点到遮挡窗口 / 误点其它客户端）。"""
+        """把目标窗口提到点击点最上层（防点到遮挡窗口 / 误点其它客户端）。
+
+        主路径 ``SetWindowPos(HWND_TOPMOST)``（后台进程无需前台权限），最小化
+        窗口先 ``SW_RESTORE``；每次置顶后用 ``WindowFromPoint`` 复核顶层是否为
+        目标窗口，不成立则重试（``_TOPMOST_ATTEMPTS`` 次，间隔 ~200ms）。窗口
+        原本已是置顶则不动它；置顶成功后记录 ``_topmost_raised``，由点击结束
+        时 ``_restore_topmost`` 还原为 ``HWND_NOTOPMOST``。复核仍不成立 →
+        fail-closed 返回 False（绝不按坐标偏移猜测点击）。
+        """
         try:
-            if _user32.IsIconic(wt.HWND(window.hwnd)):
-                _user32.ShowWindow(wt.HWND(window.hwnd), 9)
+            hwnd = wt.HWND(window.hwnd)
+            if _user32.IsIconic(hwnd):
+                _user32.ShowWindow(hwnd, 9)   # SW_RESTORE
                 time.sleep(0.2)
-            root = int(_user32.GetAncestor(
-                _user32.WindowFromPoint(wt.POINT(int(sx), int(sy))),
-                GA_ROOT) or 0)
-            if root == window.hwnd:
+            if _front_root_at(sx, sy) == window.hwnd:
                 return True
-            _user32.SetForegroundWindow(wt.HWND(window.hwnd))
-            time.sleep(0.25)
-            root = int(_user32.GetAncestor(
-                _user32.WindowFromPoint(wt.POINT(int(sx), int(sy))),
-                GA_ROOT) or 0)
-            if root == window.hwnd:
-                return True
-            logger.warning("tdx 交易信号窗口点 (%s,%s) 处被其它窗口遮挡（root=%s）",
-                           sx, sy, root)
+            already = _is_topmost(window.hwnd)
+            root = _front_root_at(sx, sy)
+            for attempt in range(_TOPMOST_ATTEMPTS):
+                if not already:
+                    _set_topmost(window.hwnd, True)
+                    if attempt == 0:
+                        self._topmost_raised = window.hwnd
+                else:
+                    # 已是置顶仍被压住（另一置顶窗口在上）：只能再请求前台
+                    try:
+                        _user32.SetForegroundWindow(hwnd)
+                    except Exception:  # noqa: BLE001
+                        pass
+                root = _front_root_at(sx, sy)
+                if root == window.hwnd:
+                    return True
+                if attempt < _TOPMOST_ATTEMPTS - 1:
+                    time.sleep(_TOPMOST_RETRY_DELAY)
+            logger.warning(
+                "tdx 交易信号窗口无法置顶/点 (%s,%s) 被其它窗口遮挡"
+                "（root=%s hwnd=%s，重试 %d 次）",
+                sx, sy, root, window.hwnd, _TOPMOST_ATTEMPTS)
+            self._restore_topmost()
             return False
         except Exception:  # noqa: BLE001
             logger.exception("tdx 点击前遮挡校验失败")
+            self._restore_topmost()
             return False
+
+    def _restore_topmost(self) -> None:
+        """还原点击前被本次调用置顶的窗口（原本就置顶的不动）。"""
+        hwnd = self._topmost_raised
+        self._topmost_raised = 0
+        if not hwnd:
+            return
+        _set_topmost(hwnd, False)
 
     def _button_at(self, hwnd: int, sx: float, sy: float) -> Optional[int]:
         """点位内若存在真实 Button 型子控件，返回其句柄（新版/其它主题可能提供）。"""
@@ -1258,6 +1945,7 @@ class TdxSignalConfirmer:
                    spec.sent_at),
                 "detail=%s" % detail,
                 "stale_matching_rows=%d" % stale,
+                "price_probe=%r" % (self._price_probe,),
                 "window=%r" % (window,),
                 "",
                 "== tdxw top-level windows ==",

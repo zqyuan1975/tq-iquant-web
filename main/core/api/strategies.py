@@ -51,6 +51,7 @@ VALID_STATUSES = {"active", "archived"}  # draft:500
 VALID_POSITION_SIZING = {"dynamic", "fixed"}  # W2 仓位模型：动态净资产/固定名义
 VALID_DAILY_LOSS_BASIS = {"equity", "initial"}  # 日内亏损分母：昨收净值（默认）/ 初始资金
 VALID_RISK_TIMINGS = {"next_day", "immediate"}  # 实盘风控/信号执行时点（批次1）
+VALID_MARKET_GATE_ENGINES = {"python", "tdx"}  # 市场门控：内置公式 / 客户端公式库
 
 
 class StrategyItem(BaseModel):
@@ -99,7 +100,14 @@ class StrategyItem(BaseModel):
 class PortfolioCreate(BaseModel):
     name: str
     stock_pool_id: int
-    benchmark_index: str = "000300.SH"
+    benchmark_index: str = "000985.CSI"
+    # 市场多空门控（2026-11-18）：基准指数空头状态禁止开仓/加仓，持仓不强平。
+    # None=请求未携带（编辑不动已有值 / 新建落默认 False）。
+    market_gate_enabled: bool | None = None
+    # 计算通道：python=内置公式（默认）/ tdx=客户端公式库按名求值。None=不动。
+    market_gate_engine: str | None = None
+    # tdx 通道公式名（空串或 None = 用内核默认 TQGATE）
+    market_gate_formula_name: str | None = None
     initial_capital: float = 500000
     max_drawdown: float = 0.2
     daily_loss_limit: float = 0.05
@@ -253,7 +261,12 @@ def _validate_portfolio_numerics(req) -> str | None:
     if tf is not None and not (0 <= tf <= 0.5):
         return f"transfer_fee_rate 须在 [0, 0.5]，收到 {tf}"
     if req.benchmark_index and not re.fullmatch(r"\d{6}\.[A-Za-z]{2,4}", req.benchmark_index):
-        return f"benchmark_index 格式须为 6 位代码.市场（如 000300.SH），收到 {req.benchmark_index!r}"
+        return f"benchmark_index 格式须为 6 位代码.市场（如 000985.CSI），收到 {req.benchmark_index!r}"
+    # 门控通道白名单：None=未填（不动）；空串/未知值一律拒绝，防止落库脏值
+    gate_engine = getattr(req, "market_gate_engine", None)
+    if gate_engine is not None and gate_engine not in VALID_MARKET_GATE_ENGINES:
+        return (f"market_gate_engine 必须为 {sorted(VALID_MARKET_GATE_ENGINES)}，"
+                f"收到 {gate_engine!r}")
     return None
 
 

@@ -106,6 +106,7 @@ class BacktestEngine:
         signal_cache: dict = None,
         benchmark_data: object = None,
         regime_tracker=None,
+        gate_tracker=None,
         daily_close_peak_enabled: bool = False,
         initial_pending_orders: Optional[List[OrderEvent]] = None,
         stock_names: Optional[dict] = None,
@@ -119,6 +120,9 @@ class BacktestEngine:
         成交价取 price_index 中该 bar 的 Open（open_prices 死参数已移除，#12）。
         regime_tracker：B5 可选因果市场状态跟踪器（CausalRegimeTracker，默认 None
         不启用）；逐 bar 喂当日基准收盘并把标签注入 portfolio.current_regime。
+        gate_tracker：市场多空门控跟踪器（MarketGateTracker，默认 None 不启用）；
+        注入 portfolio.current_market_gate，每日快照追加 gate_state/gate_strength
+        （None 时不写键）。
         daily_close_peak_enabled：可选保护（默认关）。开启后 peak/max_drawdown 只在
         当日最后一根 bar 更新；跨日 prev_close/daily_loss bookkeeping 仍每 bar 更新。
         纯 1d 行为不变。注意：关闭时**粗周期 bar（1d/1w/1mon）也不再抬峰**——它们
@@ -145,6 +149,8 @@ class BacktestEngine:
         portfolio.set_recorder(recorder)
         # B5：默认无市场状态（effective_* 全部回落原参数，行为不变）
         portfolio.current_regime = None
+        # 市场多空门控：默认不启用（None → _gate_blocks 恒 False，行为不变）
+        portfolio.current_market_gate = gate_tracker
 
         times = self._build_timeline(klines)
         price_index = self._build_price_index(klines)
@@ -577,6 +583,11 @@ class BacktestEngine:
                 # 缺失（基准停牌/非交易日/区间外）直接为 None（不做 carry-forward），
                 # Evaluator 喂基准序列时会过滤 None 值，全无则 benchmark_return 退化为 0。
                 snap["benchmark_value"] = benchmark_data.get(t.date()) if benchmark_data else None
+                # 市场多空门控：快照追加当日门控状态/强度（右移语义由 tracker 处理）；
+                # tracker=None 不写键——与「门控关闭不渲染」的前端契约一致。
+                if gate_tracker is not None:
+                    snap["gate_state"] = gate_tracker.state_for(t.date())
+                    snap["gate_strength"] = gate_tracker.strength_for(t.date())
 
                 # 4b. 策略层快照：共享现金按 capital_ratio 归一化分摊，保证可加性
                 #     Σ(策略总净值) == 组合总净值。供策略层独立净值曲线与评估。

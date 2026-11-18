@@ -1,11 +1,11 @@
 ﻿<script setup lang="ts">
-import { ref, computed, onMounted, onUnmounted } from 'vue'
+import { ref, computed, onMounted, onUnmounted, watch } from 'vue'
 import { formatEvent, nextEventId, EVENT_TYPE_COLOR, tradeTypeLabel, ORDER_STATUS_LABEL, gateLabel, LAYER_LABEL, ACTION_LABEL, channelStateLabel, channelBadgeState, RECOVERY_EVENT_TYPES, type LiveEvent } from '../utils/liveEvents'
 import {
   orderHistoryToRows, upsertOrderRow,
   tradeEventToRow, tradeHistoryToRows,
   upsertPositionRows, positionHistoryToRows, prependCapped,
-  decisionEventToRow, decisionHistoryToRows,
+  decisionEventToRow, decisionHistoryToRows, riskEventToRow, upsertDecisionRow,
   filterRowsByRange, summarizeDecisionRows, beijingNowHms, TIME_RANGE_OPTIONS,
   beijingDayKey, rangeStartTs, parseBeijingTime,
   positionRowKey,
@@ -369,6 +369,46 @@ const TAB_LABEL: Record<WbTab, string> = {
   positions: '持仓', orders: '委托', trades: '成交', decisions: '决策/拦截', signals: '预警信号',
 }
 
+// ---- 决策/拦截页签：自带刷新 + 切页签重拉 ----
+// 旧版只有挂载/切会话/reconnect/「刷新持仓」按钮会重拉历史，收盘后看当天移动止损与
+// 顺延事件常常是空表（页签没数据也没入口）——这里给决策页签独立刷新入口。
+const decisionsLoading = ref(false)
+/** 顺延待次日提交筛选开关（汇总条点击切换；只筛事件表，不动上方聚合统计）。 */
+const decOnlyDeferred = ref(false)
+/** 顺延待次日提交（gate=signal_bar_date / action=defer）的笔数（随筛选区间重算）。 */
+const deferredNextDayCount = computed(
+  () => filteredDecisions.value.filter(
+    (d) => d.gate === 'signal_bar_date' && d.action === 'defer').length,
+)
+/** 事件表实际渲染行：开了顺延筛选只留那一类（聚合表仍看全区间）。 */
+const decisionRowsView = computed(() => (decOnlyDeferred.value
+  ? filteredDecisions.value.filter((d) => d.gate === 'signal_bar_date' && d.action === 'defer')
+  : filteredDecisions.value))
+
+async function reloadDecisions() {
+  const id = activeSessionId
+  if (id === null) return
+  decisionsLoading.value = true
+  try {
+    const dec = await getLiveDecisions(id).catch(() => null)
+    if (activeSessionId !== id) return
+    decisions.value = dec ? decisionHistoryToRows(dec.events) : []
+  } finally {
+    decisionsLoading.value = false
+  }
+}
+
+/** 页签切换：切到决策/拦截时重拉一次历史（其它页签维持既有行为）。 */
+function setWbTab(tab: WbTab) {
+  if (tab === wbTab.value) return
+  wbTab.value = tab
+  decOnlyDeferred.value = false
+  if (tab === 'decisions') void reloadDecisions()
+}
+
+// 时间区间变更后顺延筛选可能已空 → 自动收起，避免「打开筛选像没数据」
+watch(decRange, () => { decOnlyDeferred.value = false })
+
 // 信号类型 / 预警推送状态中文映射
 const SIGNAL_TYPE_LABEL: Record<string, string> = {
   OPEN: '开仓', ADD: '加仓', REDUCE: '减仓', CLOSE: '清仓',
@@ -509,7 +549,11 @@ function applyToWorkbench(type: string, data: Record<string, unknown>, time: str
     workbenchEventsSinceLoad += 1
     trades.value = prependCapped(trades.value, tradeEventToRow(data, time))
   }
-  else if (type === 'decision') decisions.value = prependCapped(decisions.value, decisionEventToRow(data, time), 500)
+  else if (type === 'decision') decisions.value = upsertDecisionRow(decisions.value, decisionEventToRow(data, time))
+  // 后端以 type=risk 推送的持久化风控事件（现金差异/缺价/净值偏差/日线新鲜度/拆单队列丢失…）
+  // 与 decision 事件落同一张 live_decision_events（layer=risk），因此同样并入决策表；
+  // 去重签名与历史行同口径，SSE 重复推送与随后整页刷新都不会出双行。
+  else if (type === 'risk') decisions.value = upsertDecisionRow(decisions.value, riskEventToRow(data, time))
   else if (type === 'signal') scheduleSignalsRefresh()
 }
 
@@ -656,6 +700,7 @@ function watchSession(id: number) {
   decisions.value = []
   signals.value = []
   signalsTotal.value = 0
+  decOnlyDeferred.value = false
   loadHistory(id)
 }
 
@@ -1188,7 +1233,7 @@ onUnmounted(() => {
         <button
           v-for="(label, key) in TAB_LABEL" :key="key"
           class="btn btn-sm" :class="wbTab === key ? 'btn-primary' : ''"
-          @click="wbTab = key"
+          @click="setWbTab(key)"
         >{{ label }}</button>
         <button
           v-if="wbTab === 'positions'"
@@ -1197,6 +1242,14 @@ onUnmounted(() => {
           @click="loadHistory(activeSessionId!)"
           title="重新拉取全量持仓（原有持仓服务端缓存 60s）"
         >↻ 刷新持仓</button>
+        <button
+          v-if="wbTab === 'decisions'"
+          class="btn btn-sm" style="margin-left:8px"
+          data-test="decisions-refresh"
+          :disabled="decisionsLoading || activeSessionId === null"
+          @click="reloadDecisions()"
+          title="重新拉取决策/拦截历史（含 move-stop、顺延、持久化风控事件）"
+        >{{ decisionsLoading ? '刷新中…' : '↻ 刷新决策' }}</button>
       </div>
     </div>
 
@@ -1378,6 +1431,22 @@ onUnmounted(() => {
         </select>
         <span style="font-size:12px;color:var(--ink-faint)">按北京时间自然日 · 聚合与统计随筛选重算 · 共 {{ filteredDecisions.length }} 条事件</span>
       </div>
+      <!-- 顺延待次日提交汇总：gate=signal_bar_date / action=defer，N=0 不显示。
+           点击=把下方事件表筛到这一类（不隐藏入口，再点一次取消），非行高亮。 -->
+      <div
+        v-if="deferredNextDayCount > 0"
+        class="defer-banner"
+        :class="{ 'defer-banner--active': decOnlyDeferred }"
+        data-test="defer-summary"
+        @click="decOnlyDeferred = !decOnlyDeferred"
+        :title="decOnlyDeferred ? '点击取消筛选' : '点击只看顺延待次日提交的事件'"
+      >
+        顺延待次日提交（{{ deferredNextDayCount }} 笔）
+        <span class="defer-hint">
+          {{ decOnlyDeferred ? '已筛选 · 点击取消' : '点击只看这一类' }}
+          · 这些单在信号 bar 当日未报，等下一交易日开盘（盘前竞价或 09:31 首根 1m bar）再提交
+        </span>
+      </div>
       <!-- 聚合统计（按当前筛选区间重算，不再是全时段累计） -->
       <table v-if="decisionSummaryView.length > 0" style="margin-bottom:14px">
         <thead><tr>
@@ -1406,7 +1475,7 @@ onUnmounted(() => {
       <table>
         <thead><tr><th>时间（北京时间）</th><th>闸门</th><th>层</th><th>代码</th><th>策略</th><th>阈值</th><th>实际</th><th>请求/实发</th><th>原因</th></tr></thead>
         <tbody>
-          <tr v-for="d in filteredDecisions" :key="d.key">
+          <tr v-for="d in decisionRowsView" :key="d.key">
             <td style="color:var(--ink-soft)">{{ d.time || '—' }}</td>
             <td><span class="badge badge-purple">{{ gateLabel(d.gate) }}</span></td>
             <td style="color:var(--ink-soft);font-size:11px">{{ layerLabel(d.layer) }}</td>
@@ -1419,8 +1488,9 @@ onUnmounted(() => {
           </tr>
         </tbody>
       </table>
-      <div v-if="filteredDecisions.length === 0" class="empty-state">
-        <p v-if="decRange === 'today'">今日暂无决策事件。止损/止盈/熔断/资金不足/超仓/收盘拦单等事件会实时显示在这里。</p>
+      <div v-if="decisionRowsView.length === 0" class="empty-state">
+        <p v-if="decOnlyDeferred">当前时间范围内没有顺延待次日提交的事件。</p>
+        <p v-else-if="decRange === 'today'">今日暂无决策事件。止损/止盈/熔断/资金不足/超仓/收盘拦单等事件会实时显示在这里。</p>
         <p v-else>该时间范围暂无决策事件。止损/止盈/熔断/资金不足/超仓/收盘拦单等事件会实时显示在这里。</p>
       </div>
     </div>
@@ -1975,6 +2045,19 @@ onUnmounted(() => {
 .drift-fields { margin: 4px 0 6px; }
 .drift-fields ul { margin: 0; padding-left: 20px; line-height: 1.7; }
 .drift-hint { font-size: 12px; color: var(--ink-faint); }
+/* 顺延待次日提交汇总条（点击切换事件表筛选） */
+.defer-banner {
+  margin: 0 0 10px;
+  padding: 8px 12px;
+  border-left: 4px solid #d97706;
+  background: rgba(217, 119, 6, 0.08);
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  user-select: none;
+}
+.defer-banner--active { background: rgba(217, 119, 6, 0.18); }
+.defer-hint { font-size: 12px; font-weight: normal; color: var(--ink-faint); margin-left: 8px; }
 /* 外部现金流台账弹窗 */
 .cash-flow-risk {
   font-size: 12px;

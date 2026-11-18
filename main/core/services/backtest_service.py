@@ -14,6 +14,7 @@ P1 #9（审计）第一块：把回测路由的业务逻辑下沉到 service，�
 """
 
 import json
+import logging
 import math
 from datetime import datetime, date, timedelta, timezone
 from decimal import Decimal
@@ -40,6 +41,15 @@ from core.engine.crisis_alpha import (
 from core.engine.persistence_alpha import compute_persistence
 from core.engine.backtest_robustness import analyze_robustness
 from core.engine.regime import segment_regime, CausalRegimeTracker
+from core.engine.market_gate import (
+    GATE_FORMULA_NAME_DEFAULT,
+    GATE_FORMULA_VERSION,
+    GATE_WARMUP_DAYS,
+    MarketGateTracker,
+    MarketGateUnavailableError,
+    compute_gate_states,
+    parse_tdx_gate_outputs,
+)
 from core.services.acceptance import ACCEPTANCE_PROFILES, compute_acceptance
 from core.engine.regime_alpha import (
     QUADRANT_STYLE_INDICES,
@@ -62,6 +72,8 @@ from core.engine.tdx_formula import (
     evaluate_outputs,
     xref_names_of,
 )
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -427,6 +439,96 @@ def build_benchmark_data(
     ).get(index_code, {})
 
 
+def build_gate_ohlcv(code: str, start: date, end: date,
+                     period: str = "1d") -> pl.DataFrame:
+    """取门控基准指数的 OHLCV（默认前复权日线）供内置公式计算。
+
+    与 build_index_close_series 分开：门控公式需要 High/Low/Open/Volume
+    （角度线/形态/量能分都用得上），单收 close 不足以复现状态机。
+    取数失败或列缺失 → 返回空 DataFrame（由调用方统一报错）。
+    """
+    try:
+        raw = TQData().get_history_raw(
+            stocks=[code],
+            periods=[period],
+            start=start.strftime("%Y%m%d"),
+            end=end.strftime("%Y%m%d"),
+            dividend_type="front",
+            count=-1,
+        )
+    except Exception:
+        logger.exception("门控基准 %s 取数异常", code)
+        return pl.DataFrame()
+    frame = (raw or {}).get(period) or {}
+    close_df = frame.get("Close")
+    if close_df is None or getattr(close_df, "empty", True):
+        return pl.DataFrame()
+    cols = {}
+    for name in ("Open", "High", "Low", "Close", "Volume"):
+        col = frame.get(name)
+        if col is None or code not in getattr(col, "columns", []):
+            return pl.DataFrame()
+        cols[name] = [None if _is_nan(v) else float(v) for v in col[code].to_list()]
+    df = pl.DataFrame({"datetime": list(close_df.index), **cols})
+    return df.drop_nulls().sort("datetime")
+
+
+def build_gate_tracker(ps, start: date, end: date, enabled: bool | None = None):
+    """构建市场多空门控跟踪器（None=未启用）。
+
+    enabled=None 跟随组合 market_gate_enabled；显式 bool 为 run 级覆盖。
+    取数起点提前 GATE_WARMUP_DAYS 自然日（MA288 预热）。
+    取数/公式无结果一律 ValueError——门控开启却静默放行等于没开，
+    宁可让本轮回测失败并给出可操作提示（路由层转 HTTP 400）。
+    """
+    if enabled is None:
+        enabled = bool(getattr(ps, "market_gate_enabled", False))
+    if not enabled:
+        return None
+    code = getattr(ps, "benchmark_index", None) or DEFAULT_BENCHMARK_CODE
+    fetch_start = start - timedelta(days=GATE_WARMUP_DAYS)
+    engine = (getattr(ps, "market_gate_engine", None) or "python").lower()
+    if engine == "tdx":
+        fname = (getattr(ps, "market_gate_formula_name", None)
+                 or GATE_FORMULA_NAME_DEFAULT)
+        raw = TQFormula().compute(
+            fname, "", [code], period="1d", count=-1,
+            start_time=fetch_start.strftime("%Y%m%d"),
+            end_time=end.strftime("%Y%m%d"),
+        )
+        states, strengths = parse_tdx_gate_outputs(raw or {}, code)
+    else:
+        ohlcv = build_gate_ohlcv(code, fetch_start, end)
+        if ohlcv.is_empty():
+            raise MarketGateUnavailableError(
+                f"门控基准 {code} 无法取数（无 K 线）。请确认该指数在通达信中已下载，"
+                f"或在组合配置中改用其它基准指数。"
+            )
+        states, strengths = compute_gate_states(ohlcv)
+    if not states:
+        raise MarketGateUnavailableError(
+            f"门控基准 {code} 历史不足或公式无输出（区间 {fetch_start}~{end}），"
+            f"无法判定多空状态。请加长回测区间或补齐指数日线数据。"
+        )
+    tracker = MarketGateTracker()
+    tracker.feed_history(states, strengths)
+    return tracker
+
+
+def gate_summary(tracker, ps) -> dict | None:
+    """门控摘要（冻结入 params_snapshot，供跨记录口径核对）。"""
+    if tracker is None:
+        return None
+    span = tracker.span()
+    return {
+        "index": getattr(ps, "benchmark_index", None) or DEFAULT_BENCHMARK_CODE,
+        "engine": (getattr(ps, "market_gate_engine", None) or "python"),
+        "formula_version": GATE_FORMULA_VERSION,
+        "switches": tracker.switches(),
+        "span": [str(span[0]), str(span[1])] if span else None,
+    }
+
+
 def _crisis_benchmark_code(ps) -> str:
     return getattr(ps, "benchmark_index", None) or DEFAULT_BENCHMARK_CODE
 
@@ -573,7 +675,12 @@ def build_params_snapshot(ps, dividend_mode: str = "front",
                           daily_loss_basis: str = "equity",
                           data_start: str | None = None,
                           strategies: Optional[list] = None,
-                          stock_pool_codes: Optional[dict] = None) -> str:
+                          stock_pool_codes: Optional[dict] = None,
+                          market_gate_enabled: bool | None = None,
+                          gate_summary: dict | None = None) -> str:
+    # 门控开关未显式传入时跟随组合配置（指纹/快照共用同一口径）
+    if market_gate_enabled is None:
+        market_gate_enabled = bool(getattr(ps, "market_gate_enabled", False))
     payload = {
         field: _snapshot_value(getattr(ps, field, None))
         for field in PARAMS_SNAPSHOT_FIELDS
@@ -625,6 +732,15 @@ def build_params_snapshot(ps, dividend_mode: str = "front",
         payload["stock_pool_codes"] = {
             str(k): sorted(v) for k, v in stock_pool_codes.items()
         }
+    # 市场多空门控（2026-11-18）：开关 + 基准指数 + 摘要（含公式版本）。
+    # 只在启用时写 gate_index；关闭记录也写 market_gate_enabled=False（显式否定），
+    # 与"旧记录缺该键"（口径未知）区分。
+    payload["market_gate_enabled"] = bool(market_gate_enabled)
+    if market_gate_enabled:
+        payload["gate_index"] = getattr(ps, "benchmark_index", None)
+        payload["gate_formula_version"] = GATE_FORMULA_VERSION
+    if gate_summary:
+        payload["gate_summary"] = gate_summary
     return json.dumps(payload, ensure_ascii=False, sort_keys=True)
 
 
@@ -2445,6 +2561,9 @@ def _persist_result(
             daily_return=snap.get("daily_return"),
             cumulative_return=snap.get("cumulative_return"),
             benchmark_value=snap.get("benchmark_value"),
+            # 市场多空门控当日生效状态/强度（仅启用门控的 run 有值，其余 NULL）
+            gate_state=snap.get("gate_state"),
+            gate_strength=snap.get("gate_strength"),
             # 新回测才有 positions 键；空仓写 "[]"（有效负载），老引擎结果为 None
             positions_json=(
                 json.dumps(snap["positions"], default=str)
@@ -2572,6 +2691,8 @@ def _serialize_snapshot(s: BacktestDailySnapshot) -> dict:
         "daily_return": _f(s.daily_return),
         "cumulative_return": _f(s.cumulative_return),
         "benchmark_value": _f(s.benchmark_value),
+        "gate_state": s.gate_state,
+        "gate_strength": s.gate_strength,
     }
 
 
@@ -3532,6 +3653,19 @@ def run_backtest(db: Session, ps: PortfolioStrategy, req,
         else getattr(ps, "slippage_impact_coef", None)
     )
 
+    # 市场多空门控（2026-11-18）：run 级三态覆盖（None=跟随组合配置）。
+    # 语义只禁开仓/加仓，持仓不强平（CLOSE/REDUCE/风控卖出不受影响）。
+    # 在写 record 之前构建：取数/公式失败 → ValueError（路由层转 HTTP 400），
+    # 不产生一条"已创建但必然失败"的 running 记录。
+    _gate_req = getattr(req, "market_gate_enabled", None)
+    gate_enabled = (
+        bool(getattr(ps, "market_gate_enabled", False))
+        if _gate_req is None else bool(_gate_req)
+    )
+    gate_tracker = build_gate_tracker(
+        ps, req.start_date, req.end_date, enabled=gate_enabled)
+    gate_snapshot = gate_summary(gate_tracker, ps)
+
     # 写 record（running）
     rec = BacktestRecord(
         portfolio_strategy_id=ps.id,
@@ -3556,6 +3690,8 @@ def run_backtest(db: Session, ps: PortfolioStrategy, req,
             # 仅凭组合级字段无法复现/解释本记录。
             strategies=strategies,
             stock_pool_codes=pool_composition(ps, db),
+            market_gate_enabled=gate_enabled,
+            gate_summary=gate_snapshot,
         ),
         evaluation_profile=evaluation_profile,
         is_oos_gate_enabled=is_oos_gate_enabled,
@@ -3691,6 +3827,7 @@ def run_backtest(db: Session, ps: PortfolioStrategy, req,
             signal_cache=signal_cache,
             benchmark_data=benchmark_data,
             regime_tracker=regime_tracker,
+            gate_tracker=gate_tracker,
             daily_close_peak_enabled=daily_close_peak_enabled,
             stock_names=_pool_stock_names(ps, db),
             pending_order_max_days=int(

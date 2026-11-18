@@ -12,6 +12,7 @@ from core.api.response import err, ok
 from core.config import load_config
 from core.db import get_db
 from core.models import PortfolioStrategy
+from core.engine.market_gate import MarketGateUnavailableError
 from core.services.html_report import build_html_report
 
 router = APIRouter(prefix="/api/backtest", tags=["backtest"])
@@ -83,6 +84,9 @@ class BacktestRequest(BaseModel):
     # 日内亏损熔断分母口径 run 级覆盖（None=跟随组合配置）：
     # equity=上一交易日收盘净值；initial=初始资金（旧口径，阈值恒定）
     daily_loss_basis: str | None = None
+    # 市场多空门控 run 级三态覆盖（None=跟随组合市场门控配置）：
+    # True=强制开启，False=强制关闭；空头状态只禁开仓/加仓，持仓不强平
+    market_gate_enabled: bool | None = None
 
 
 class PoolCompareRequest(BaseModel):
@@ -395,6 +399,10 @@ def run_backtest(req: BacktestRequest, db: Session = Depends(get_db)):
         )
     try:
         return ok(_svc_run_backtest(db, ps, req))
+    except MarketGateUnavailableError as exc:
+        # 门控基准取数/公式无输出：属可操作的配置/数据问题，明确回 400
+        # （不落 record，service 层在写库前抛出）。其它异常保持 500 语义不变。
+        return err(400, str(exc))
     finally:
         _release_slot()
 

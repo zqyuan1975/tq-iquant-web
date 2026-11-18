@@ -528,6 +528,11 @@ class LiveEngine:
         trading_calendar: Optional[TradingCalendar] = None,
         regime_provider: Optional[Callable] = None,
         benchmark_codes: Optional[Dict[int, str]] = None,
+        # 市场多空门控（2026-11-18）：gate_provider(portfolio_id, end_date) →
+        # MarketGateTracker；gate_portfolio_ids 为启用门控的组合白名单。
+        # 两者缺省(None/空)=不启用，行为与接线前逐字一致。
+        gate_provider: Optional[Callable] = None,
+        gate_portfolio_ids: Optional[set] = None,
         execution_mode: str = "auto",
         signal_monitor=None,
         signal_scheduler=None,
@@ -756,6 +761,12 @@ class LiveEngine:
         self._regime_provider = regime_provider
         self._benchmark_codes: Dict[int, str] = benchmark_codes or {}
         self._regime_updated: Dict[int, date] = {}
+        # 市场多空门控（2026-11-18）：每组合每交易日首根非 baseline bar 重建
+        # tracker 并注入 portfolio.current_market_gate（右移一日语义在 tracker 内）。
+        # 只对白名单组合生效；provider 为 None 时完全不启用。
+        self._gate_provider = gate_provider
+        self._gate_portfolio_ids: set = set(gate_portfolio_ids or ())
+        self._gate_updated: Dict[int, date] = {}
         # R3：每组合每日首根 bar 已调 enter_day（跨日补算上一日 daily_loss，
         # 与回测对齐——暂停/恢复在日首生效），防混合周期多 bar/日重复调用。
         self._enter_day_updated: Dict[int, date] = {}
@@ -3536,6 +3547,59 @@ class LiveEngine:
                 total += p.account.cash + p._holdings_value()
         return total
 
+    def _row_price(self, code: str, row) -> Optional[Decimal]:
+        """真实持仓行现价：组合最近已知价 → 行内价格字段；都无 → None。
+
+        与 ``Portfolio._resolve_price`` 前两级同源（现价口径唯一来源）。**不用
+        成本冒充现价**——成本兜底只允许调用方在最后一级显式使用。
+        """
+        for port in self.ctx.portfolios:
+            px = (getattr(port, "_price_snapshot", None) or {}).get(code)
+            try:
+                if px is not None and float(px) > 0:
+                    return Decimal(str(px))
+            except (TypeError, ValueError):
+                continue
+        if isinstance(row, dict):
+            for key in ("price", "current_price", "last_price", "cur_price",
+                        "now", "Price"):
+                v = _finite_or_none(row.get(key))
+                if v is None:
+                    continue
+                try:
+                    if float(v) > 0:
+                        return Decimal(str(v))
+                except (TypeError, ValueError, OverflowError):
+                    continue
+        return None
+
+    def _row_market_value(self, code: str, row, volume: int,
+                          cost: Decimal) -> Decimal:
+        """真实持仓逐只市值 = 现价 × 数量（与顶层 ``market_value`` 同口径）。
+
+        优先级：行内市值（柜台权威）→ 现价×数量 → 成本×数量（价格兜底的最后
+        一级，仅当无任何价格来源）→ 0。**成本价只作价格兜底，绝不在有现价时
+        代表市值**（2026-11-18 修：通达信持仓明细无市值列 → 账户快照逐只市值
+        恒等于 数量×成本价，与顶层现价合计差 ~1.4 万）。
+        """
+        if isinstance(row, dict):
+            mv = _finite_or_none(row.get("market_value"))
+            try:
+                if mv is not None and float(mv) > 0:
+                    return Decimal(str(mv))
+            except (TypeError, ValueError, OverflowError):
+                pass
+        try:
+            vol = int(volume or 0)
+        except (TypeError, ValueError, OverflowError):
+            vol = 0
+        px = self._row_price(code, row)
+        if px is not None and px > 0 and vol > 0:
+            return (px * Decimal(vol)).quantize(Decimal("0.01"))
+        if cost and cost > 0 and vol > 0:
+            return cost * Decimal(vol)
+        return Decimal("0")
+
     def _out_of_pool_market_value(self, positions: list) -> Decimal:
         """真实持仓中不在任何组合股票池的市值合计（比对真实侧时剔除）。"""
         pools = self._pool_codes_by_portfolio or {}
@@ -3557,7 +3621,7 @@ class LiveEngine:
                 continue
             if vol <= 0:
                 continue
-            total += _position_market_value(r, vol, _position_cost(r, vol))
+            total += self._row_market_value(code, r, vol, _position_cost(r, vol))
         return total
 
     def _note_equity_deviation(self, real_total: Decimal, positions: list) -> None:
@@ -3743,11 +3807,11 @@ class LiveEngine:
                 default=None,
             )
             # QMT 会对停牌/异常持仓返回 inf/nan/DBL_MAX（实测 601989 市值 inf）：
-            # 直接落库会让会话详情 JSON 序列化 500，这里先归一为 None。
+            # 直接落库会让会话详情 JSON 序列化 500——市值由 ``_row_market_value``
+            # 统一归一（inf/nan → 视同缺失），这里只归一数量/成本/可用。
             volume = _finite_or_none(r.get("volume"))
             avail_qty = _finite_or_none(r.get("available"))
             cost = _finite_or_none(r.get("cost"))
-            mv = _finite_or_none(r.get("market_value"))
             # 峰值兜底（2026-11-07）：既无历史快照峰值、也无内存峰值（继承仓在
             # 行情轮询窗口外启动 / 该票无 bar → update_high(close) 从未执行）时，
             # 用柜台成本作起点。否则该列永远 NULL（tdx 会话 5 实证 1888 行全空）→
@@ -3760,21 +3824,7 @@ class LiveEngine:
             # 现价：优先组合最近已知价（与 total_value 估值同源），其次通道行内
             # 价格字段，最后回落成本。此前该列从未被赋值（全表 5701 行为 NULL），
             # 既无法区分「收盘后无现价」与「通道未提供价格」，也让快照不可读。
-            cur_px = None
-            for port in self.ctx.portfolios:
-                px = (getattr(port, "_price_snapshot", None) or {}).get(code)
-                if px is not None and px > 0:
-                    cur_px = px
-                    break
-            if cur_px is None:
-                for key in ("price", "current_price", "last_price", "now", "Price"):
-                    v = _finite_or_none(r.get(key))
-                    try:
-                        if v is not None and float(v) > 0:
-                            cur_px = Decimal(str(v))
-                            break
-                    except (TypeError, ValueError):
-                        continue
+            cur_px = self._row_price(code, r)
             if cur_px is None and cost is not None and cost > 0:
                 cur_px = Decimal(str(cost))
             snap.positions.append(LiveAccountPositionSnapshot(
@@ -3783,12 +3833,11 @@ class LiveEngine:
                 available_quantity=int(avail_qty) if avail_qty is not None else None,
                 cost_price=Decimal(str(cost)) if cost is not None else None,
                 current_price=cur_px,
-                # 市值缺失/为 0（通达信持仓明细无市值列）→ 复用 cost×volume 兜底，
-                # 否则快照显示 0 会让工作台持仓市值合计凭空少一大块。
-                # 传入已归一化的 mv（inf/nan 已被 _finite_or_none 转 None），
-                # 避免 inf 绕过上面的序列化保护。
-                market_value=_position_market_value(
-                    {"market_value": mv}, int(volume or 0),
+                # 逐只市值 = 现价 × 数量（与顶层 market_value 同口径），成本价只在
+                # 完全取不到现价时兜底。旧实现「市值缺失 → cost×volume」让每只
+                # 持仓市值恒等于数量×成本价，与顶层现价合计差 ~1.4 万（2026-11-18）。
+                market_value=self._row_market_value(
+                    code, r, int(volume or 0),
                     Decimal(str(cost)) if cost is not None else Decimal("0")) or None,
                 highest_price=effective_hp,
             ))
@@ -4085,7 +4134,9 @@ class LiveEngine:
             avail = _finite_or_none(r.get("available"))
             real[code] = (
                 max(0, vol), avail, cost,
-                _position_market_value(r, vol, cost),
+                # 市值口径 = 现价 × 数量（不是 数量×成本价）：新增/继承部分
+                # 按真实市值扣虚拟现金，用成本会在建仓瞬间制造假盈亏。
+                self._row_market_value(code, r, vol, cost),
             )
         if not real:
             return 0
@@ -4531,7 +4582,8 @@ class LiveEngine:
             except Exception:  # noqa: BLE001
                 cost = Decimal("0")
             try:
-                mv = _position_market_value(r, vol, cost)
+                # 逐只市值 = 现价 × 数量（成本只在完全无价时兜底）
+                mv = self._row_market_value(code, r, vol, cost)
             except Exception:  # noqa: BLE001
                 mv = Decimal("0")
             snapshot.append({
@@ -5497,6 +5549,31 @@ class LiveEngine:
                 portfolio.portfolio_id, code, exc_info=True,
             )
 
+    def _maybe_update_gate(self, portfolio: Portfolio, bar_date: date) -> None:
+        """市场多空门控：每日首根非 baseline bar 更新组合门控状态。
+
+        跳过条件：provider 未注入 / 组合不在启用白名单 / 当日已更新。
+        provider 异常或返回 None 时保留旧状态（fail-open：绝不因取数失败变成
+        "永不开仓"）。门控只拦 OPEN/ADD，持仓不强平。
+        """
+        if self._gate_provider is None:
+            return
+        pid = portfolio.portfolio_id
+        if pid not in self._gate_portfolio_ids:
+            return
+        if self._gate_updated.get(pid) == bar_date:
+            return
+        try:
+            tracker = self._gate_provider(pid, bar_date)
+            if tracker is not None:
+                portfolio.current_market_gate = tracker
+            self._gate_updated[pid] = bar_date
+        except Exception:
+            logger.warning(
+                "portfolio %s 市场门控更新失败，沿用旧状态（fail-open）",
+                pid, exc_info=True,
+            )
+
     def _tick_alert(self, now: Optional[datetime] = None) -> None:
         """alert 单轮：TQ 心跳 → 拉行情 → 调度信号；不碰委托/成交/持仓。"""
         was_online = self._bridge_online
@@ -5828,6 +5905,9 @@ class LiveEngine:
         # B5：每日首 bar 更新组合市场状态（未启用策略/provider 缺省 → 跳过，行为不变）
         if not baseline:
             self._maybe_update_regime(portfolio, bar.bar_time.date())
+            # 市场多空门控：必须在 deferred 放行（下一行）之前更新，
+            # 保证当日首根 bar 放行的 deferred 单读到当日门控状态。
+            self._maybe_update_gate(portfolio, bar.bar_time.date())
         # B-1 未来函数闸门放行：跨日后释放 deferred 的日线信号订单（bar_time 更新为
         # 当前 bar——决策时间戳语义），与 on_bar 新单合并重走同一提交链
         # （approve/收盘/日历/去重/在途门全复用，且放行单先行——对齐回测
@@ -8000,6 +8080,8 @@ class LiveEngine:
     def _requeue_rejected_order(
         self, db: Session, portfolio: Portfolio, order: OrderEvent,
         live_order: LiveOrder, reason: str,
+        gate: str = "bridge_rejected",
+        event_message: Optional[str] = None,
     ) -> bool:
         """P1-3：把可重排拒单写回 deferred 行并放回内存队列。
 
@@ -8054,22 +8136,23 @@ class LiveEngine:
             "(session %s)", order.trade_type.value, order.stock_code,
             count + 1, _DEFERRED_RETRY_MAX + 1, reason, self.session_id)
         self._rec_live(
-            "bridge_rejected", "requeue", portfolio, order,
-            message=("可重排拒单（%s）：回 deferred，次一交易日 due 窗口/下一根 bar 重试"
+            gate, "requeue", portfolio, order,
+            message=(event_message
+                     or "可重排拒单（%s）：回 deferred，次一交易日 due 窗口/下一根 bar 重试"
                      "（第 %d/%d 次尝试；上限 %d 次重排）"
                      % (reason, count + 1, _DEFERRED_RETRY_MAX + 1, _DEFERRED_RETRY_MAX)),
         )
         self._emit("risk", {
             "session_id": self.session_id,
             "engine": self._engine_key,
-            "gate": "bridge_rejected",
+            "gate": gate,
             "action": "requeue",
             "rule": "order_requeued",
             "code": order.stock_code,
             "side": order.trade_type.value,
             "attempt": count + 1,
             "max_attempts": _DEFERRED_RETRY_MAX + 1,
-            "message": "可重排拒单：%s（回 deferred 重试，不是终态）" % reason,
+            "message": event_message or "可重排拒单：%s（回 deferred 重试，不是终态）" % reason,
         })
         return True
 
@@ -8569,7 +8652,137 @@ class LiveEngine:
                                     deals: Optional[list]) -> None:
         self._order_machine.sync_terminal_order_status(db, pending, orders, deals)
 
+    def _recheck_unconfirmed_pending_rows(
+        self, db: Session, pending: Optional[list] = None
+    ) -> None:
+        """180s 到期前再核一次「已受理未认领」的待发送行（2026-11-18）。
+
+        TDX 通道点击未生效时，客户端的行仍停在『发送』，dispatcher 当时按
+        「已受理未认领」返回 None（不是拒单），订单以 submitted 留在在途集合，
+        180s 后被 expire 判 rejected 终态 —— 决策静默丢失。这里在 expire 之前
+        让通道复核该行（只读截图 + OCR，不点击、不取消）：
+        - 仍在待发送（``pending``）→ 判未报出，回 deferred 重排（与 P1-3 同源，
+          受 ``_DEFERRED_RETRY_MAX`` 与 error_message 标记约束，当日绝不重报）；
+        - 行已消失/已转『已发送』（``absent``）或无法判定（``unknown``）→ 保持
+          现行为（交 expire / 委托表回填），绝不把可能已报出的单再报一次。
+
+        只对有 ``pending_row_state`` 的通道生效（HTTP 桥/THS 无此属性 → 跳过）。
+        """
+        state_fn = getattr(
+            getattr(self, "_dispatcher", None), "pending_row_state", None)
+        if not callable(state_fn):
+            return
+        if pending is None:
+            # 与 OrderStateMachine.expire_stale_orders 同口径（DB 为记账真相；
+            # _pending_orders 只是内存在途子集，不能当全量）
+            try:
+                pending = (
+                    db.query(LiveOrder)
+                    .filter(
+                        LiveOrder.live_session_id == self.session_id,
+                        LiveOrder.status.in_(["submitted", "partial"]),
+                    )
+                    .all()
+                )
+            except Exception:  # noqa: BLE001
+                logger.exception("[unconfirmed-recheck] 查询在途单失败，跳过复核")
+                return
+        rows = list(pending)
+        if not rows:
+            return
+        now_utc = datetime.now(timezone.utc).replace(tzinfo=None)
+        ports = {p.portfolio_id: p for p in self.portfolios}
+        for lo in rows:
+            if getattr(lo, "order_ref", None):
+                continue
+            if str(getattr(lo, "status", "") or "").lower() not in (
+                    "submitted", "partial"):
+                continue
+            if not getattr(lo, "bridge_order_id", None):
+                continue
+            created_at = getattr(lo, "created_at", None)
+            if not isinstance(created_at, datetime):
+                continue
+            created_naive = (created_at.replace(tzinfo=None)
+                             if created_at.tzinfo else created_at)
+            if (now_utc - created_naive) < _ORDER_REF_MATCH_TIMEOUT:
+                continue
+            try:
+                state = state_fn(lo)
+            except Exception:  # noqa: BLE001
+                logger.exception(
+                    "[unconfirmed-recheck] 待发送复核异常，保持现行为 order_id=%s",
+                    lo.id)
+                continue
+            if state != "pending":
+                logger.info(
+                    "[unconfirmed-recheck] %s %s order_id=%s 复核=%s，"
+                    "保持 expire/回填现行为",
+                    getattr(lo, "trade_type", ""), lo.stock_code, lo.id, state)
+                continue
+            portfolio = ports.get(lo.portfolio_strategy_id)
+            if portfolio is None:
+                logger.warning(
+                    "[unconfirmed-recheck] 找不到组合 %s，跳过多单 %s（交 expire）",
+                    lo.portfolio_strategy_id, lo.id)
+                continue
+            try:
+                order = OrderEvent(
+                    strategy_id=lo.strategy_id,
+                    portfolio_id=lo.portfolio_strategy_id,
+                    stock_code=lo.stock_code,
+                    trade_type=TradeType(lo.trade_type.upper()),
+                    signal_type=(SignalType(lo.signal_type)
+                                 if lo.signal_type else SignalType.CLOSE),
+                    quantity=lo.quantity,
+                    price=lo.price,
+                    bar_time=lo.bar_time,
+                    signal_name=lo.signal_name or "",
+                    # 与 recover 同口径：defer 的定义即 signal_bar_date=bar_time 当日，
+                    # 放行只能发生在次一交易日的 due 窗口（当日绝不重报）
+                    signal_bar_date=lo.bar_time.date() if lo.bar_time else None,
+                )
+            except Exception:  # noqa: BLE001
+                logger.exception(
+                    "[unconfirmed-recheck] 重建订单事件失败，跳过多单 %s", lo.id)
+                continue
+            order._deferred_row_id = lo.id
+            order._deferred_retry_count = _retry_count_from_message(
+                getattr(lo, "error_message", None))
+            reason = ("order_unconfirmed: 180s 内『交易信号』行仍待发送"
+                      "（点击未生效，未报出）")
+            try:
+                requeued = self._requeue_rejected_order(
+                    db, portfolio, order, lo, reason,
+                    gate="order_unconfirmed",
+                    event_message=(
+                        "已点击『发送』但行仍待发送（点击未生效）：判为未报出，"
+                        "回 deferred 重试（不是终态；受 %d 次重排上限约束）"
+                        % _DEFERRED_RETRY_MAX))
+            except Exception:  # noqa: BLE001
+                logger.exception(
+                    "[unconfirmed-recheck] 重排失败，交 expire order_id=%s", lo.id)
+                continue
+            if requeued:
+                logger.warning(
+                    "[unconfirmed-recheck] %s %s x%s order_id=%s 180s 后行仍待发送 "
+                    "→ 回 deferred（第 %d 次重排）。该行仍在通达信「交易信号」窗口"
+                    "待发送，系统不会自动点/撤，请人工核对后手动『取消』"
+                    "（session %s）",
+                    lo.trade_type, lo.stock_code, lo.quantity, lo.id,
+                    getattr(order, "_deferred_retry_count", 0), self.session_id)
+            else:
+                logger.warning(
+                    "[unconfirmed-recheck] %s %s order_id=%s 行仍待发送但重排次数"
+                    "已用尽（%d），交 expire 落 rejected 终态；该行需人工『取消』"
+                    "（session %s）",
+                    lo.trade_type, lo.stock_code, lo.id,
+                    _DEFERRED_RETRY_MAX, self.session_id)
+
     def _expire_stale_orders(self, db: Session, pending: Optional[list] = None) -> None:
+        # 先复核「已受理未认领」的待发送行：仍在待发送 → 回 deferred（不是
+        # rejected 终态）；absent/unknown/无该能力通道 → 保持原有 expire 行为。
+        self._recheck_unconfirmed_pending_rows(db, pending)
         self._order_machine.expire_stale_orders(db, pending)
 
     def _cancel_unfilled_orders(self, db: Session) -> list:

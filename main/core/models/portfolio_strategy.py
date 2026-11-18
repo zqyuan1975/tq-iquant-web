@@ -11,6 +11,14 @@ class PortfolioStrategy(Base):
     name = Column(String(100), nullable=False)
     stock_pool_id = Column(Integer, ForeignKey("stock_pools.id", ondelete="RESTRICT"), nullable=False, index=True)
     benchmark_index = Column(String(20), default="000300.SH", server_default="000300.SH", nullable=False)
+    # 市场多空门控（2026-11-18）：基准指数空头状态禁止开仓/加仓，持仓不强平。
+    # 判定内核 core/engine/market_gate.py（内置 M 状态机，右移一日）。
+    # 空/未定状态一律放行；只拦 OPEN/ADD，CLOSE/REDUCE/止损止盈移动止损不受影响。
+    market_gate_enabled = Column(Boolean, default=False, server_default="0", nullable=False)
+    # 计算通道：python（默认，内置公式）/ tdx（客户端公式库按名求值）
+    market_gate_engine = Column(String(10), default="python", server_default="python", nullable=False)
+    # tdx 通道的公式名（空=用内核默认 TQGATE）
+    market_gate_formula_name = Column(String(50), nullable=True)
     initial_capital = Column(Numeric(15, 2), default=500000, server_default="500000", nullable=False)
     max_drawdown = Column(Numeric(5, 4), default=0.2000, server_default="0.2000", nullable=False)
     daily_loss_limit = Column(Numeric(5, 4), default=0.0500, server_default="0.0500", nullable=False)

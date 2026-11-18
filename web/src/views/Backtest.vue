@@ -20,6 +20,7 @@ import type {
 } from '../api'
 import { gateLabel, LAYER_LABEL, ACTION_LABEL } from '../utils/liveEvents'
 import { deriveBlockCode } from '../utils/blockCode'
+import { MARKET_GATE_OVERRIDES } from '../utils/marketGate'
 import PageHeader from '../components/PageHeader.vue'
 import { fmtMoney, fmtPrice, fmtQty, fmtPct, fmtSignedPct, fmtRatio } from '../utils/format'
 import { useTable } from '../composables/useTable'
@@ -111,7 +112,7 @@ const showBacktestGuide = ref(false)
 const submitting = ref(false)
 // 高级选项（评估口径 / IS-OOS 采纳门槛 / 费用预留 / 自适应滑点）默认折叠：发起回测默认走增强前的基础方式
 const showAdvanced = ref(false)
-const form = ref({ portfolio_strategy_id: 0, name: '', start_date: '', end_date: '', dividend_mode: 'front', evaluation_profile: 'absolute', is_oos_gate_enabled: false, oos_gate_min_ratio: 0.5, fee_reserve_enabled: false, bond_t0_enabled: false, bond_lot_enabled: false, adaptive_slippage_enabled: undefined as boolean | undefined, slippage_impact_coef: undefined as string | undefined, volume_limit_enabled: undefined as boolean | undefined, volume_limit_ratio: undefined as string | undefined, equity_cap: undefined as string | undefined, daily_close_peak_enabled: false, daily_loss_basis: '' as '' | 'equity' | 'initial' })
+const form = ref({ portfolio_strategy_id: 0, name: '', start_date: '', end_date: '', dividend_mode: 'front', evaluation_profile: 'absolute', is_oos_gate_enabled: false, oos_gate_min_ratio: 0.5, fee_reserve_enabled: false, bond_t0_enabled: false, bond_lot_enabled: false, adaptive_slippage_enabled: undefined as boolean | undefined, slippage_impact_coef: undefined as string | undefined, volume_limit_enabled: undefined as boolean | undefined, volume_limit_ratio: undefined as string | undefined, equity_cap: undefined as string | undefined, daily_close_peak_enabled: false, daily_loss_basis: '' as '' | 'equity' | 'initial', market_gate_enabled: '' as '' | 'true' | 'false' })
 const gateBanner = ref<BacktestGateResult | null>(null)
 
 // ===== 详情视图 =====
@@ -937,6 +938,7 @@ function openForm() {
     equity_cap: undefined,
     daily_close_peak_enabled: false,
     daily_loss_basis: '',
+    market_gate_enabled: '',
   }
   showForm.value = true
 }
@@ -983,6 +985,9 @@ async function submit() {
       daily_close_peak_enabled: form.value.daily_close_peak_enabled,
       ...(form.value.daily_loss_basis
         ? { daily_loss_basis: form.value.daily_loss_basis }
+        : {}),
+      ...(form.value.market_gate_enabled
+        ? { market_gate_enabled: form.value.market_gate_enabled === 'true' }
         : {}),
           ...(form.value.adaptive_slippage_enabled !== undefined
             ? {
@@ -3131,6 +3136,13 @@ watch(theme, () => {
                   <option value="">跟随组合</option>
                   <option value="equity">昨日收盘净值</option>
                   <option value="initial">初始资金（旧口径）</option>
+                </select>
+                <span class="field-suffix">run 级覆盖，不改组合配置</span>
+              </div>
+              <div class="field-row">
+                <span class="field-label">市场多空门控</span>
+                <select v-model="form.market_gate_enabled" class="field-select" data-field="market_gate_enabled">
+                  <option v-for="o in MARKET_GATE_OVERRIDES" :key="o.value" :value="o.value">{{ o.label }}</option>
                 </select>
                 <span class="field-suffix">run 级覆盖，不改组合配置</span>
               </div>

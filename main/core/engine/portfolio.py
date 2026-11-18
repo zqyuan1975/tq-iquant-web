@@ -153,6 +153,12 @@ class Portfolio:
         # B5 市场状态闸：当前市场状态标签，由引擎在 on_bar 前注入（None=无状态，
         # ctx.effective_* 全部回落原参数，行为与旧逻辑一致）
         self.current_regime: Optional[str] = None
+        # 市场多空门控（2026-11-18）：组合级基准指数状态查询器（MarketGateTracker），
+        # 由引擎在 on_bar 前注入（None=未启用门控，行为与旧逻辑逐字一致）。
+        # 语义：空头状态只禁止**开仓/加仓**（OPEN/ADD），持仓不强平——
+        # CLOSE/REDUCE/止损/止盈/移动止损一律不受影响。查询一律右移一日
+        # （昨日收盘状态管今日开仓），见 core/engine/market_gate.py。
+        self.current_market_gate = None
         # B4 择优轮动：收盘价历史（code → 最近 N 根有效 close）与去重时间戳
         self._price_history: Dict[str, List[Decimal]] = {}
         self._price_hist_last_t: Dict[str, datetime] = {}
@@ -270,6 +276,23 @@ class Portfolio:
                           "（需 ≥%d 个交易日），不开新仓"
                           % (sig.stock_code, last, elapsed, days - elapsed, days))
         return True
+
+    def _gate_blocks(self, trade_time) -> bool:
+        """市场多空门控闸：基准指数空头状态 → True（禁止开仓/加仓）。
+
+        ``current_market_gate`` 为 None（未启用/注入失败）时恒 False，行为与
+        接线前逐字一致。tracker 内部右移一日（取严格早于 trade_time 日期的最
+        近状态日），因此本方法只用事实上的「昨日状态」，绝不使用当日收盘信息。
+        """
+        tracker = self.current_market_gate
+        if tracker is None:
+            return False
+        try:
+            return bool(tracker.blocks(trade_time.date()))
+        except Exception:  # noqa: BLE001
+            # 门控查询异常一律放行（fail-open）：不能让基准状态问题变成"永不开仓"
+            logger.warning("市场门控查询异常，本次放行（fail-open）", exc_info=True)
+            return False
 
     def _book_guard(self):
         """账本锁上下文（P0-2）：实盘返回注入的 RLock，回测返回 nullcontext。
@@ -821,6 +844,13 @@ class Portfolio:
             # 轮动换入（_try_rotation）同受此闸约束——两者都是「开新仓」。
             if self._risk_cooldown_block(ctx, sig, bar):
                 return []
+            # 市场多空门控（2026-11-18）：基准指数空头状态禁止开新仓（持仓不强平）。
+            # 放在冷静期之后、max_holdings/槽位闸之前——与冷静期同属"开新仓"闸；
+            # 轮动换入（_try_rotation）同样受此闸约束。
+            if self._gate_blocks(bar.bar_time):
+                self._rec("market_gate", "signal_gate", "block", ctx, sig, bar,
+                          message="市场门控为空头，跳过开仓")
+                return []
             # 组合级 max_holdings 闸（回测/实盘共用 on_bar，一处接线两端生效）：
             # 组合当前去重股票数（跨策略按 stock_code 去重，主从同票合并计数）
             # ≥ max_holdings → 拒绝新开仓。ADD/减仓/清仓类不受影响；
@@ -911,6 +941,12 @@ class Portfolio:
                 self._rec("add_cost_unknown", "signal_gate", "block", ctx, sig, bar,
                           message="ADD 跳过：持仓成本未知（avg_cost=0），"
                                   "无法判断回撤且加仓会污染加权成本")
+                return []
+            # 市场多空门控（2026-11-18）：基准指数空头状态禁止加仓（持仓不强平）。
+            # 与 OPEN 同一闸；减仓/清仓/风控卖出不受影响。
+            if self._gate_blocks(bar.bar_time):
+                self._rec("market_gate", "signal_gate", "block", ctx, sig, bar,
+                          message="市场门控为空头，跳过加仓")
                 return []
             if ctx.add_position_threshold != Decimal("-1"):
                 drop = (pos.avg_cost - close) / pos.avg_cost

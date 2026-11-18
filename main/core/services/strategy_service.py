@@ -105,6 +105,10 @@ def serialize_portfolio(db: Session, p: PortfolioStrategy) -> dict:
             if p.cash_enhance_position_ratio_threshold is not None else None
         ),
         "equity_cap": (float(p.equity_cap) if p.equity_cap is not None else None),
+        # 市场多空门控（2026-11-18）：开关 + 通道 + 公式名（NULL 归一成空串给前端）
+        "market_gate_enabled": bool(p.market_gate_enabled) if p.market_gate_enabled is not None else False,
+        "market_gate_engine": p.market_gate_engine or "python",
+        "market_gate_formula_name": p.market_gate_formula_name or "",
         "status": p.status,
         "created_at": p.created_at,
         "updated_at": p.updated_at,
@@ -169,6 +173,14 @@ def _apply_portfolio_fields(p: PortfolioStrategy, req) -> None:
             req.cash_enhance_position_ratio_threshold)
     # W3 容量上限（可选，None=不设上限）
     p.equity_cap = getattr(req, "equity_cap", None)
+    # 市场多空门控（2026-11-18）：None=请求未携带 → 不动已有值（与相邻开关口径一致，
+    # 前端隐藏字段不 put 时不会把已有配置清掉）
+    if getattr(req, "market_gate_enabled", None) is not None:
+        p.market_gate_enabled = bool(req.market_gate_enabled)
+    if getattr(req, "market_gate_engine", None) is not None:
+        p.market_gate_engine = req.market_gate_engine
+    if getattr(req, "market_gate_formula_name", None) is not None:
+        p.market_gate_formula_name = req.market_gate_formula_name or None
 
 
 def _create_strategies_two_step(db: Session, pid: int, strategies: list) -> None:

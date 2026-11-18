@@ -365,6 +365,68 @@ def test_place_order_auto_confirms_and_returns_trade(fake, no_quote):
     assert "W777" in d._claimed_refs
 
 
+def _confirm_stub(order_holder):
+    """自动确认桩：记录 SignalSpec，点击后把委托塞进委托表（模拟柜台认领）。"""
+
+    class _Stub:
+        def __init__(self):
+            self.specs = []
+
+        def snapshot_rows(self):
+            return ()
+
+        def confirm(self, spec, is_submitted=None, deadline=None,
+                    on_clicked=None, baseline=None):
+            self.specs.append(spec)
+            order_holder.append(
+                _order(code="000001", flag=0, ref="W888", price=10.5, vol=1000))
+            ok = bool(is_submitted and is_submitted())
+            return SimpleNamespace(ok=ok, detail="已点击发送", clicks=1, stale=0)
+
+    return _Stub()
+
+
+def _pending_order():
+    return SimpleNamespace(
+        strategy_id=1, portfolio_id=2, stock_code="000001",
+        trade_type=TradeType.BUY, signal_type=SignalType.OPEN, signal_name="open_sig",
+        quantity=1000, price=Decimal("10.5"), bar_time=None,
+    )
+
+
+def test_confirm_spec_carries_daily_price_limits(fake, no_quote):
+    """确认时把本通道的当日涨跌停填进 SignalSpec（价格列 ROI 约束用）。"""
+    fake.orders = []
+    fake.msg = "已发送信号至客户端，待用户确认！"
+    confirmer = _confirm_stub(fake.orders)
+    d = TdxTqDispatcher(confirmer=confirmer)
+    monkeypatch_result = (10.0, 11.0, 9.0)
+    d.price_limit_bounds = lambda symbol: monkeypatch_result
+
+    trade = d.place_order(_pending_order())
+
+    assert trade is not None
+    spec = confirmer.specs[0]
+    assert spec.limit_up == 11.0
+    assert spec.limit_down == 9.0
+
+
+def test_confirm_proceeds_when_price_limits_unavailable(fake, no_quote):
+    """取不到涨跌停 → 留空（0）且确认流程照常继续（fail-open 不拒单）。"""
+    fake.orders = []
+    fake.msg = "已发送信号至客户端，待用户确认！"
+    confirmer = _confirm_stub(fake.orders)
+    d = TdxTqDispatcher(confirmer=confirmer)
+    d.price_limit_bounds = lambda symbol: None
+
+    trade = d.place_order(_pending_order())
+
+    assert trade is not None
+    spec = confirmer.specs[0]
+    assert spec.limit_up == 0.0
+    assert spec.limit_down == 0.0
+
+
 def test_place_order_skips_confirm_when_value_2(fake, no_quote):
     """Value=2（直接成功）不进入 UI 确认路径。"""
 
@@ -1269,3 +1331,56 @@ def test_query_deals_side_from_position_delta(fake, caplog):
     assert second["side"] == "buy"
     assert second["side_source"] == "position_delta"
     assert "position delta" in caplog.text
+
+
+# ------------------------------------------------ 2026-11-18 点击未生效收口
+
+
+class _StubConfirmer:
+    """假确认器：记录 pending_row_state 收到的 spec。"""
+
+    def __init__(self, state="pending"):
+        self.state = state
+        self.specs = []
+
+    def pending_row_state(self, spec):
+        self.specs.append(spec)
+        return self.state
+
+
+def _live_order(**kw):
+    base = dict(
+        stock_code="301600.SZ", trade_type=TradeType.SELL, quantity=220,
+        price=Decimal("64.01"),
+        created_at=datetime(2026, 11, 18, 3, 8, 42),  # UTC naive → 11:08:42 上海
+    )
+    base.update(kw)
+    return SimpleNamespace(**base)
+
+
+def test_last_unconfirmed_message_property():
+    """TDX 补齐 last_unconfirmed_message，引擎可把它写进 live_orders.error_message。"""
+    d = TdxTqDispatcher()
+    assert d.last_unconfirmed_message == ""
+    d._last_unconfirmed_message = "已受理未认领：已点击『发送』但行仍待发送"
+    assert d.last_unconfirmed_message == "已受理未认领：已点击『发送』但行仍待发送"
+
+
+def test_pending_row_state_builds_spec_from_live_order():
+    stub = _StubConfirmer("pending")
+    d = TdxTqDispatcher(auto_confirm_dialog=True, confirmer=stub)
+    assert d.pending_row_state(_live_order()) == "pending"
+    spec = stub.specs[0]
+    assert spec.code6 == "301600"
+    assert spec.direction == "sell"
+    assert spec.volume == 220
+    assert spec.sent_at == datetime(2026, 11, 18, 11, 8, 42)
+
+
+def test_pending_row_state_disabled_when_auto_confirm_off():
+    """自动确认关闭（纯人工盯盘）→ 通道不支持复核，返回 None 保持 expire。"""
+    stub = _StubConfirmer("pending")
+    d = TdxTqDispatcher(auto_confirm_dialog=False, confirmer=stub)
+    assert d.pending_row_state(_live_order()) is None
+    assert stub.specs == []
+

@@ -1232,3 +1232,32 @@ def test_klines_from_handoff_drops_halted_flat_volume0_bars():
         datetime(2026, 1, 5), datetime(2026, 1, 7)]
     assert df["Volume"].to_list() == [800, 1200]
 
+
+def test_scheduler_records_failure_event_once_per_day(db_session, monkeypatch):
+    """调度异常必须落 live_decision_events，且同日重试不刷屏。"""
+    sess, ps, link = _seed_live_link(db_session)
+    sess_id = sess.id
+    link.seam_date = date(2026, 1, 5)
+    db_session.commit()
+
+    def _boom(*args, **kwargs):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(ib, "run_incremental", _boom)
+    sched = ib.IncrementalBacktestScheduler(
+        cfg_provider=lambda: {"enabled": True, "daily_at": "15:10"},
+        session_factory=lambda: db_session,
+        now_fn=lambda: datetime(2026, 1, 6, 15, 30),
+    )
+    sched.maybe_run()
+    sched.maybe_run()
+
+    rows = [
+        e for e in db_session.query(ib.LiveDecisionEvent).all()
+        if e.gate == "incremental_backtest"
+    ]
+    assert len(rows) == 1
+    assert rows[0].action == "error"
+    assert rows[0].layer == "live_gate"
+    assert rows[0].live_session_id == sess_id
+    assert "boom" in (rows[0].message or "")

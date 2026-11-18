@@ -59,21 +59,21 @@ shared/ — tq_iquant_shared 包，被 main 和 live 共同引用
 
 > 测试路径注意：AGENTS.md 写的是 `tests/`，实际位于 `main/core/tests/`。
 
-## 实现状态（更新：2026-08-10）
+## 实现状态（更新：2026-11-18）
 
 **已实现（较完整）**：
-- 14 个 SQLAlchemy 模型（[main/core/models/](main/core/models/)）+ Alembic 迁移（init 14 表 + `circuit_breaker_count`/`formula_count`/数据完整性约束/回测增强/`live_sessions.engine` 等后续迁移；head = `c3f7a1b9d402`）
-- 7 个 API 路由模块已注册到 [main/core/main.py](main/core/main.py)：stock-pools/formulas/strategies/backtest/live/system/status 全部可用（回测、实盘 CRUD + start/stop + SSE 流）
-- QMT 通道 `HttpBridgeDispatcher`（[main/core/engine/http_bridge_dispatcher.py](main/core/engine/http_bridge_dispatcher.py)）+ 行情通道 `BarPoller`（[main/core/engine/bar_poller.py](main/core/engine/bar_poller.py)）+ 桥策略 `live/bridge/iquant_bridge.py`（真机验证过，订单匹配键 `m_strOrderRef` 等已定案）
-- 同花顺 UI 执行通道 `ThsUiDispatcher`（可选，`ths_ui.enabled`；UIA 切「资金股票/当日委托」+ 剪贴板取数，Windows 内置 OCR 自动过复制验证码；`query_quote/query_calendar` 复用 TQ；无备注列，Core 走 legacy 模糊匹配）。双模式 `execute_mode`：`file_builtin`（默认，文件交接层 `core/engine/live/ths_handoff.py`——signal/decision/risk 落 JSONL、place_order 入 `orders.jsonl` 秒回 None、内置执行线程按 `execute_interval_seconds` 消费指令、回执落 `results.jsonl`）/ `direct`（同步直呼原行为）
+- 31 个 SQLAlchemy 模型文件（33 张表，[main/core/models/](main/core/models/)）+ Alembic 迁移 58 个（init 14 表 + `circuit_breaker_count`/`formula_count`/数据完整性约束/回测增强/`live_sessions.engine`/级联删除/市场多空门控等后续迁移；head = `a4b5c6d7e8f9`）
+- 11 个 API 模块（10 个路由模块 + `response.py`）注册到 [main/core/main.py](main/core/main.py)：stock-pools/formulas/strategies/backtest/live/system/status/tdx/incremental/market-gate 全部可用（回测、实盘 CRUD + start/stop + SSE 流；市场门控状态卡）
+- QMT 通道 `HttpBridgeDispatcher`（[main/core/engine/http_bridge_dispatcher.py](main/core/engine/http_bridge_dispatcher.py)）+ 行情通道 `BarPoller`（[main/core/engine/bar_poller.py](main/core/engine/bar_poller.py)）+ 桥策略 `live/bridge/iquant_bridge.py`（真机验证过，订单匹配键 `m_strOrderRef` 等已定案）；掘金桥 `goldminer_bridge.py` 同构协议
+- 同花顺 UI 执行通道 `ThsUiDispatcher`（可选，`ths_ui.enabled`；UIA 切「资金股票/当日委托」+ 剪贴板取数，Windows 内置 OCR 自动过复制验证码；`query_quote/query_calendar` 复用 TQ；无备注列，Core 走 legacy 模糊匹配）。双模式 `execute_mode`：`file_builtin`（默认，文件交接层 `core/engine/live/file_handoff.py`——signal/decision/risk 落 JSONL、place_order 入 `orders.jsonl` 秒回 None、内置执行线程按 `execute_interval_seconds` 消费指令、回执落 `results.jsonl`）/ `direct`（同步直呼原行为）
 - 通达信 TQ 交易通道 `TdxTqDispatcher`（[main/core/engine/tdx_tq_dispatcher.py](main/core/engine/tdx_tq_dispatcher.py)）：`tq.stock_account` / `query_stock_asset` / `query_stock_positions` / `query_stock_orders` / `order_stock`，与回测取数共用同一条 TQ 连接；委托表无备注列且无时间列 → `supports_remark=False`，下单后回查 `Wtbh` 认领并在进程内记录提交时间供 legacy 模糊匹配；半自动「下单确认」模式显式拒单告警
-- 实盘引擎按会话可选：`live_sessions.engine`（iquant/tdx/ths，NULL=历史会话按全局默认解析：`tq_trade.default_engine` 优先（SystemConfig 可配，默认 tdx），未配置回退旧行为 `ths_ui.enabled` 判定；miniQMT 通道已移除，历史 qmt 会话经 `session_engine` 白名单回退到默认引擎），`/api/live/channel` 返回引擎清单与配置状态，`/api/live/sessions/{id}/start` 按会话引擎装配 dispatcher
+- 实盘引擎按会话可选：`live_sessions.engine`（iquant/goldminer/tdx/ths，NULL=历史会话按全局默认解析：`tq_trade.default_engine` 优先（SystemConfig 可配，默认 tdx），未配置回退旧行为 `ths_ui.enabled` 判定；miniQMT 通道已移除，历史 qmt 会话经 `session_engine` 白名单回退到默认引擎），`/api/live/channel` 返回引擎清单与配置状态，`/api/live/sessions/{id}/start` 按会话引擎装配 dispatcher
 - 引擎层全 TDD 实现：`BacktestEngine.run` 完整逐 bar 回测；`LiveEngine` 实盘主链路（订单状态机 + /deals 回填 + 三段式周期 1m 边界/1d 14:30/1w·1mon 通达信 + B5 SSE 五类事件流 + E5/E6 熔断 + D3 对账告警）已接线。`SignalEngine` 为未接线的冗余壳（信号走 `strategy_context` + `Portfolio.on_bar` 直接求值）
 - TQ 模块（[main/core/tq/](main/core/tq/)）data/formula/utils 已对接通达信真机可用；`tdx_path` 从 config.yaml 读取
-- 前端 6 个视图 + 路由 + API 客户端 + 布局（Backtest/Formulas/LiveSessions/Portfolios/StockPools/SystemConfig）
+- 前端 11 个视图 + 路由 + API 客户端 + 布局（Backtest/Formulas/LiveSessions/Portfolios/StockPools/SystemConfig/ForwardTest/...；市场门控状态卡在备选股池页）
 
 **当前缺口**（实时状态见 [docs/live-flow-checklist.md](docs/live-flow-checklist.md) 与 [docs/implementation-plan.md](docs/implementation-plan.md)）：
-- F9 印花税仍 0（`/deals` 印花税字段待真机验证）；D3 对账自动校准待真机跑顺放开
+- 实盘印花税：卖出侧按组合费率补算（`OrderMachine._stamp_duty_for`，默认 0.05%，与佣金补算同口径）；`/deals` 自带印花税字段仍不采信（待真机核对），不是「恒 0」。D3 对账自动校准待真机跑顺放开
 - 首页仪表盘前端页、监控/告警骨架、conftest `dependency_overrides` 字符串 key、`data_feed.py`（功能由 backtest.py 直接调 `TQData`/`TQFormula` 覆盖）
 
 **配置链（已修复）**：[main/core/db.py](main/core/db.py) 与 [main/alembic/env.py](main/alembic/env.py) 均从 [core.config.load_config()](main/core/config.py) 读 `database.sqlite_path`（默认 `data/dev.db`，相对 `main/` 解析为 `main/data/dev.db`），与 `config.yaml` 一致。db.py 逐连接开启 `PRAGMA foreign_keys=ON` 让 ondelete 生效。纯单用户本地工具，数据库就 SQLite 一条路，不切 PostgreSQL。
@@ -90,7 +90,7 @@ shared/ — tq_iquant_shared 包，被 main 和 live 共同引用
 - **熔断**：max_drawdown 触发次日恢复（累计 3 次转手动）；daily_loss_limit 当日暂停次日恢复。熔断期间不清仓，仅暂停新开仓
 - **主从策略**：从策略只能买入主策略当前持有的同一只股票；主策略清仓（含该股）后从策略不可新开仓但存量可自行卖出
 - **数据库迁移**：用 Alembic，禁止手动改表结构。
-- **并发**：回测同步内联执行 + 全局锁 `_BACKTEST_LOCK`，同一时刻最多 1 个（并发启动返回 HTTP 409）；实盘全局限 1 个 session（`_ENGINES` 非空即拒，B6），start/stop 经 `_START_LOCK` 串行化防双引擎。实盘主池（bar/approve/submit/收割）与 deals 池（5s 回填）为独立单 worker 线程池，跨池记账由引擎级 `_book_lock`（RLock）串行化（锁序 `_book_lock` → `get_tdx_lock`）。回测与实盘互不互斥，共享的通达信 TQ（C 扩展非线程安全）由 `core/tq/utils.py` 全局锁串行化；实盘 TQ 回调线程方案已废弃，实际为 HTTP 拉取轮询
+- **并发**：回测同步内联执行 + 全局锁 `_BACKTEST_LOCK`，同一时刻最多 1 个（并发启动返回 HTTP 409）；实盘最多 4 个会话（`MAX_ACTIVE_LIVE_SESSIONS=4`），并发约束为「同引擎类型同时仅 1 个（C1）+ 同资金账户键独占（C2）」，start/stop 经 `_START_LOCK` 串行化防双引擎。实盘主池（bar/approve/submit/收割）与 deals 池（5s 回填）为独立单 worker 线程池，跨池记账由引擎级 `_book_lock`（RLock）串行化（锁序 `_book_lock` → `get_tdx_lock`）。回测与实盘互不互斥，共享的通达信 TQ（C 扩展非线程安全）由 `core/tq/utils.py` 全局锁串行化；实盘 TQ 回调线程方案已废弃，实际为 HTTP 拉取轮询
 
 ## 开发范式
 

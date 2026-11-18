@@ -2,7 +2,7 @@
 
 ## 项目状态
 
-**已实现（脚手架 + 主链路已通）** — 31 个模型文件、52 个引擎源码文件、11 个 API 路由模块、11 个前端视图、57 个 Alembic 迁移均已落地；回测/实盘主链路已接线。完整实现状态见 [CLAUDE.md](CLAUDE.md)「实现状态」小节。本文档记录业务规则与设计依据，实现细节以代码与 CLAUDE.md 为准。
+**已实现（脚手架 + 主链路已通）** — 31 个模型文件（33 张表）、50 个引擎源码文件、11 个 API 模块（10 路由 + `response.py`）、11 个前端视图、58 个 Alembic 迁移（head `a4b5c6d7e8f9`）均已落地；回测/实盘主链路已接线。完整实现状态见 [CLAUDE.md](CLAUDE.md)「实现状态」小节。本文档记录业务规则与设计依据，实现细节以代码与 CLAUDE.md 为准。
 
 **单用户系统**：无用户鉴权，所有接口无需登录。
 
@@ -92,6 +92,7 @@ Web 前端 (Vue 3 + Vite + Pinia) ←HTTP/SSE→ Core (FastAPI)
 
 - **股票代码格式**：统一带后缀（如 `000001.SZ`），通达信规范
 - **复权方式**：回测支持三档复权模式（`dividend_mode`：`front` 前复权默认 / `back` 后复权 / `dual` 前复权信号+后复权记账，推荐）。前复权"加性压缩"会让长区间历史价逼近 0/转负（假收益），取数层已过滤 `Open/Close≤0` 与近零价（<0.01）伪影行
+- **实盘桥行情不复权（已知口径差异，显式标记，不按缺陷处理）**：`/quote` 返回柜台原始价（`kline_t` 直出，`http_bridge_dispatcher.py` 注释自述），而回测（含 `dual` 的信号腿）用前复权。影响仅限 **1d/1w/1mon** 这类跨除权日的周期公式（除权日前后同一公式可能给出不同信号）；1m/5m 等日内周期与风控（止损/止盈/移动止损只用当日价格序列）不受影响。桥侧不做复权（QMT/掘金均无稳定前复权序列），故不回改信号口径；已知差异只做标记：`backtest_records.params_snapshot.dividend_mode` 记录回测口径，实盘会话按原始价执行，不可用「回测信号条数」直接与实盘对齐核对。
 - **TQ 数据传递**：polars DataFrame 进程内传递，通过 tqcenter SDK 直连运行中通达信
 - **Core↔交易通道通信**：QMT 通道走 HTTP 桥（`127.0.0.1:8790`，账号 410038214257 / `STOCK`；QMT 是四条生产通道之一、平台按生产标准维护，但**该账户是 QMT 仿真账户、账户内为仿真资金**，不是真实资金；切真实资金须改桥文件 `ACCOUNT` / `ACCOUNT_TYPE`（必要时 `TICK_TAG` / `DRY_RUN`）并重跑实盘验证。`iquant_bridge_live.py` 的 `8791` + 信用账户 `CREDIT` 保留但**非生产、未启用**），掘金走 HTTP 桥（`127.0.0.1:7801`）；桥策略受理下单/查单/持仓/资金，QMT 桥另提供行情拉取（掘金行情由平台走通达信快照合成）。端点见 [live/bridge/README.md](live/bridge/README.md)
 - **信号优先级**：风控信号（止损/止盈/移动止损）> 公式信号（OPEN/ADD/REDUCE/CLOSE）
@@ -132,6 +133,7 @@ Web 前端 (Vue 3 + Vite + Pinia) ←HTTP/SSE→ Core (FastAPI)
 ## 实盘链 P1 收口（2026-11-16）
 
 - **日线轮次幂等**：`live_sessions.daily_bars_done_date` **只在整轮驱动成功后写**（旧实现驱动前就写，一次短暂掉线/崩溃就永久丢剩余组合的 1d/1w/1mon）。桥离线（`BridgeUnavailableError`）只跳过该组合、继续驱动其余组合并计「未完成」，其它异常同样跳过该组合；本轮有未完成则不标完成，由 60s tick 重试，已成功的 `(交易日, 周期, 组合)` 记在 `_daily_driven_keys` 不再重复驱动。
+- **增量调度异常可审计**：进程内 `IncrementalBacktestScheduler` 的日更/周校验异常除 `logger.exception` 外，同落 `live_decision_events`（`gate=incremental_backtest|incremental_validation`、`layer=live_gate`、`action=error`、`message` 取 `异常类型: 内容` 前 200 字），按 `(session, ps, gate, 交易日)` 去重，避免 60s 重试刷屏；写事件失败只告警，不掩盖原始异常、不阻断调度。
 - **拆单队列可观测**：`stop` 时未提交子单随队列丢弃（预期行为），逐队列落 `gate=split_children_lost / action=drop` 决策事件（含剩余笔数与股数，供人工判断是否补单）；`recover` 按 `live_bar_order_marks(seq>0)` + 在途子单反查剩余量并记 `action=notice` 告警，**不自动补单、不落库重放、不新增列**。
 - **risk 事件落库清单**：`valuation_missing_price` / `deferred_release fallback` / `deferred_dropped_stale` / `cash_diff` / `equity_deviation` / `daily_bar_freshness` 经 `_emit_risk_safe(persist=True)` **同落 `live_decision_events`（layer=risk）**，刷新页面仍可查；节流口径不变（每 code 每日一次 / 10 分钟 / 每会话一次 / 每交易日一条）。
 - **周期边界补偿**：`dispatch_period_bar` 返回 `dispatched | stale | empty | no_strategy`；`stale`（全部被新鲜度闸拦下）与 `empty`（有该周期策略但一只 code 都取不到可用 bar）**同等挂待补偿**（15 分钟或跨日放弃），`no_strategy`（实例无该周期策略）不进补偿。
@@ -139,6 +141,29 @@ Web 前端 (Vue 3 + Vite + Pinia) ←HTTP/SSE→ Core (FastAPI)
 - **记账锁（BUY 临界区）**：BUY 的「资金上限计算（读在途预留）+ 审批 + 拆单 + 落库 + 在途注册」在**同一个 `_book_lock` 临界区**内完成（旧实现 cap 在锁外算、注册在锁内，deals 池追价与新单并发时双份占用同一笔现金＝超买）；锁序恒为 `_book_lock → get_tdx_lock`。
 - **判重键**：桥可用持仓刷新按 **`bar_time`** 判重（`_available_bar_time`，不用 bar 对象身份——1m 节拍与周期边界可能是同一时刻的两个 `BarEvent`）；**缺价告警去重键 = `(portfolio_id, code)`**（旧键只用 code，多组合持同一缺价票时只有第一个组合报一次）；`trade_type` 读取统一走 `_is_buy()` 大小写归一（大写行漏计在途 BUY → 超开仓）。
 - **隐式契约**：`live_orders` **无 `signal_bar_date` 列**，deferred 的信号日靠 `bar_time.date()` 重建；`orig_quantity` / `baseline_version` **只写不读**（放行时按真实可用动态缩量；基准识别靠 deferred 行 + `bar_time` 口径，不靠这两列）。
+
+## 通达信「交易信号」确认收口（2026-11-18）
+
+针对「点击没生效却被记成已受理、180s 后静默吃 rejected 终态」的闭环缺口（真机 2026-11-18 11:08 实证：窗口刚从隐藏被强制显示约 1 秒即点击，该帧价格列整体缺失、点击未生效）：
+
+- **点之前等画面就绪**：`_force_show` 记 `_force_shown_at`（`snapshot_rows` 与 confirm 共用同一 confirmer 实例，跨调用有效）；confirm 循环在刚强制显示后的 `_READY_GRACE=10s` 内先 `_wait_frame_ready`——判据 = 行非空 + `_price_column_band` 可推（价格列区间 + 行尾『发送』锚点）+ **连续两帧行指纹一致**，上限 `_READY_TIMEOUT=4s`、间隔 `_READY_INTERVAL=0.3s`；超时只 WARNING 并继续现有路径（不改变失败语义）。
+- **点击后复核不通过补点一次**：`_verify_clicked_row` 返回 False（行尾仍读作『发送』）→ `_reclick_pending_row` 重取一帧、按 `(code, volume, seconds)` 校验**必须还是同一行**（防点到别的待发委托）后补点 **1 次**（`_CLICK_RETRY_MAX=1`）并再复核；仍 False 落回既有失败路径。返回 None 的语义不变（不补点）；行已转『已发送』(`row.sent`) 绝不补点。
+- **别把「点过」当「已报」**：`_expire_stale_orders` 在 `OrderStateMachine.expire_stale_orders` 之前调 `_recheck_unconfirmed_pending_rows`——仅对提供 `pending_row_state` 的通道（TDX）生效，条件 = `order_ref is None` + `status ∈ submitted/partial` + `bridge_order_id` 非空 + `created_at` 距今 ≥ `_ORDER_REF_MATCH_TIMEOUT`(180s)；复核 `pending`（行仍在『发送』）→ 重建 `OrderEvent` 调 `_requeue_rejected_order(gate=order_unconfirmed)` 回 deferred；`absent`（行已消失/已转『已发送』）与 `unknown`（无窗口/OCR 不可判/多候选）**保持现行为**交 expire。重排沿用 P1-3 同一套约束：`_DEFERRED_RETRY_MAX=2`、`error_message=deferred_retry:n=<k>` 跨重启读回、`signal_bar_date=bar_time.date()` 使放行必须跨到次一交易日（**当日绝不重报**）。残留未发送行**只告警、不自动点/撤**（日志提示人工核对后手动『取消』）。
+- **`last_unconfirmed_message`**：TDX dispatcher 补齐该属性（此前仅 `HttpBridgeDispatcher` 定义），unconfirmed 分支写入 `confirm()` 的具体 detail（如「已点击『发送』，但该行仍为待发送状态…」），引擎既有 `getattr(..., "last_unconfirmed_message", None)` 口径不变，`live_orders.error_message` 不再只有通用文案。
+
+## 市场多空门控（2026-11-18）
+
+组合级开关：**基准指数空头状态禁止开仓/加仓，持仓不强平**。回测/实盘同一套闸门（`Portfolio._gate_blocks`），语义只拦 `OPEN`/`ADD`，`CLOSE`/`REDUCE`/止损/止盈/移动止损一律不受影响。
+
+- **判别内核** `core/engine/market_gate.py`：`compute_gate_states(ohlcv)` 对通达信公式的 numpy/pandas 精确重实现（MA26/55/144/288 均线带、`jd` 角度线、`s1/s2/d/q` 多头触发、`s3/e/i` 空头触发、`M_IN` 优先、carry-forward、`jj` → 状态 2），输出 `states`（`-1` 空头 / `0` 未定 / `1` 多头 / `2` 多头强势）与 `strengths`（0–100）。`GATE_FORMULA_VERSION = "tqgate_py_v1"`，**改动公式必须同步改版本号**（冻结入 `params_snapshot`，用于跨记录口径核对；公式实现以参考版单测逐位对齐为验收基线，禁止"顺手优化" `_round_half_away` / `_if` NaN 语义 / `_count` 窗口）。
+- **右移一日**：`MarketGateTracker._last_state_before` 用 `bisect_left` 取**严格早于当日**的最近状态日 → 昨日收盘状态管今日开仓，绝不用当日收盘决定当日成交（`blocks(d) = state == -1`，`0` 未定**放行**）。
+- **配置**（`portfolio_strategies` 三列）：`market_gate_enabled`（默认 0）/ `market_gate_engine`（`python` 默认 / `tdx`）/ `market_gate_formula_name`（tdx 公式名，空=`TQGATE`）。迁移 `a4b5c6d7e8f9`（紧接 `e2f3a4b5c6d8`）另给 `backtest_daily_snapshots` 加 `gate_state`/`gate_strength`（NULL＝未启用门控）。
+- **取数**：`backtest_service.build_gate_ohlcv` 走 `TQData().get_history_raw(... dividend_type="front", count=-1)`，取 OHLCV 五列（公式需 High/Low/Open/Volume，单 close 不够）；`build_gate_tracker(ps, start, end, enabled=None)` 把起点前推 `GATE_WARMUP_DAYS=500` 自然日做 MA288 预热，`enabled=None` 跟随组合配置。取数/公式无输出抛 `MarketGateUnavailableError`（`ValueError` 子类）→ 回测路由映射 **HTTP 400**；**不静默放行**（门控开启却全 0 等于没开）。
+- **回测**：`BacktestEngine.run(gate_tracker=)` 注入 `portfolio.current_market_gate`，日快照追加 `gate_state`/`gate_strength`（`None` 不写键）；`POST /api/backtest/run` 的 `market_gate_enabled` 为 run 级三态覆盖（`null` 跟随组合 / `true` / `false`）。`params_snapshot` 写 `market_gate_enabled` / `gate_index` / `gate_formula_version` / `gate_summary`。
+- **增量续跑**：`run_incremental` 与校验侧（`run_validation`）**都必须**带 `build_gate_tracker`（同一口径），`schema_fingerprint` 含 `market_gate = GATE_FORMULA_VERSION` → 开关或公式版本变化判废旧接缝，防接缝前后半段口径不一致。
+- **实盘**：`live_service` 组装组合时收集**标量**配置 `gate_specs`（只收启用门控的组合，**不持有 ORM 实例**——避免 `build_engine` 之后 commit/expire 触发 DetachedInstanceError），传 `gate_provider` + `gate_portfolio_ids`；`LiveEngine._maybe_update_gate` 在**每组合每交易日首根非 baseline bar** 重建 tracker，调用点必须在 `_release_signal_bar_deferred` **之前**；provider 异常保留旧 tracker（fail-open，绝不因取数失败变成永不开仓）。**运行中改门控配置需停止再启动会话**（配置只在 `build_engine` 读一次）。
+- **状态卡**：`GET /api/market-gate/status`（`core/services/market_gate_service.py`）实时算、不落库；进程内 **5 分钟缓存**（`(code, period)` 键，`refresh=true` 绕过）以避免每次进备选股池页都冻结通达信客户端。返回 `direction(-1/0/1/2)`、`strength`、`as_of`、`since`、`duration_bars`、`transitions`（最近 N 次转折）。前端入口（2026-11-18）：「备选股池」页顶部状态卡（基准下拉默认 `000985.CSI`、刷新、方向/强度分/截至/持续与起始日/最近转折，**独立取数失败只影响卡片**）；组合编辑弹窗末组「市场多空门控」；「发起回测」弹窗三态下拉（`''`=跟随组合 / `'true'` / `'false'`，提交时非空才展开为布尔）。
+- **已知边界**：①门控只拦新信号，已排队的次日 deferred 单与盘前集合竞价单**不重判**（沿用信号日已决策，与参考版对齐）；②默认基准仅**新建组合**取 `000985.CSI`（中证全指），既有组合保留库值；③本地指数日线若有缺口（实证 `000985.CSI` 在 `2026-10-28~11-17` 缺失），状态靠 carry-forward 维持，卡片「数据截至」仍显示最新一根，**不报错也不拦截**。
 
 ## 模块复用
 

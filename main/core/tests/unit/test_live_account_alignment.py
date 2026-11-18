@@ -1045,6 +1045,81 @@ def test_capture_seeds_peak_and_price_from_cost_for_tdx_row():
     assert Decimal(str(row.current_price)) == Decimal("10.221")
 
 
+# ---- 逐只市值口径：现价 × 数量（不是 数量 × 成本价）----
+
+def test_snapshot_position_market_value_uses_price_not_cost():
+    """逐只市值 = 现价 × 数量；逐只合计与顶层 market_value 同口径。
+
+    2026-11-18 实证：通达信持仓明细无市值列（market_value=0）→ 旧实现回落
+    cost×volume，账户快照逐只市值恒等于数量×成本价，与顶层现价合计差 ~1.4 万。
+    """
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single()
+    # 最近已知价（行情轮询/前收种子同源）与柜台成本不同
+    port._price_snapshot["002745.SZ"] = Decimal("9.67")
+    port._price_snapshot["600888.SH"] = Decimal("7.5")
+    disp = _AcctDispatcher(
+        positions=[
+            {"symbol": "002745.SZ", "volume": 5300, "available": 5300,
+             "cost": 10.221, "market_value": 0},
+            {"symbol": "600888.SH", "volume": 900, "available": 900,
+             "cost": 10.99, "market_value": 0},
+        ],
+        # 顶层市值 = 现价合计（柜台资产口径）：9.67×5300 + 7.5×900
+        asset={"total_asset": "158001", "available": "100000",
+               "market_value": "58001"},
+    )
+    engine = _mk_engine(disp, factory, port, engine_key="tdx",
+                        account_snapshot_interval=5.0)
+    engine._tick_deals()
+
+    db = factory()
+    snap = (db.query(LiveAccountSnapshot)
+            .order_by(LiveAccountSnapshot.id.desc()).first())
+    rows = {p.stock_code: p for p in snap.positions}
+    db.close()
+    assert Decimal(str(rows["002745.SZ"].market_value)) == Decimal("51251.00")
+    assert Decimal(str(rows["600888.SH"].market_value)) == Decimal("6750.00")
+    # 旧实现（数量×成本价）合计为 64062.30 —— 必须与顶层现价合计一致
+    per_sum = sum(Decimal(str(p.market_value)) for p in rows.values())
+    assert per_sum == Decimal(str(snap.market_value)) == Decimal("58001")
+
+
+def test_out_of_pool_market_value_uses_price_not_cost():
+    """equity_check 真实侧剔除的池外市值同样走现价（成本只兜底）。"""
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single()
+    port._price_snapshot["002745.SZ"] = Decimal("9.0")
+    engine = _mk_engine(_AcctDispatcher(), factory, port, engine_key="tdx")
+    engine._pool_codes_by_portfolio = {1: {"600000.SH"}}
+    rows = [{"symbol": "002745.SZ", "volume": 1000, "available": 1000,
+             "cost": 10.0, "market_value": 0}]
+    assert engine._out_of_pool_market_value(rows) == Decimal("9000.00")
+
+
+def test_mirror_added_shares_deducted_at_market_value_not_cost():
+    """柜台真实量 > 虚拟量（外部手工增仓）：新增部分按现价扣虚拟现金。
+
+    旧实现市值恒等于数量×成本，新增 300 股会按成本扣现金、却按现价估值 →
+    建仓瞬间凭空产生 (现价−成本)×300 的假盈亏。
+    """
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single()
+    port._price_snapshot["002745.SZ"] = Decimal("9.67")
+    pos = Position("002745.SZ")
+    pos.buy(5000, Decimal("10.221"), datetime(2026, 11, 5, 10, 0))
+    port.strategies[0].positions["002745.SZ"] = pos
+    engine = _mk_engine(_AcctDispatcher(), factory, port, engine_key="tdx")
+    rows = [{"symbol": "002745.SZ", "volume": 5300, "available": 5300,
+             "cost": 10.221, "market_value": 0}]
+
+    with factory() as db:
+        engine._mirror_bridge_positions(db, rows, now_shanghai())
+
+    # 新增 300 股 × 现价 9.67 = 2901（旧口径会是 300×10.221 = 3066.3）
+    assert port.account.cash == Decimal("100000") - Decimal("2901")
+
+
 # ---- 实盘成交量约束（对齐回测 #2 volume_cap）----
 
 def _fetcher(snaps):

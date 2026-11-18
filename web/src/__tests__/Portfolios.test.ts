@@ -1200,3 +1200,78 @@ describe('Portfolios.vue — 单票上限 / 现金下限（仅实盘，默认不
     expect(arg.min_cash_reserve_pct).toBeCloseTo(0.1)
   })
 })
+
+// 回归：组合数量超过一屏时，最后几行（用户实测序号 11/12）的[编辑]仍能触发编辑动作。
+// 现象曾报「条目少时正常，排到 11、12 号后点[编辑]无反应」；此处用 12 个组合 + 每个组合
+// 展开 1 条子策略，覆盖「列表远超一屏」+「末尾行」两个条件，分别校验子策略行与组合行。
+describe('Portfolios.vue — 长列表（超过一屏）末尾行[编辑]仍可触发', () => {
+  function makePortfolios() {
+    return Array.from({ length: 12 }, (_, i) => ({
+      ...mockPortfolios[0],
+      id: i + 1,
+      name: `组合${i + 1}`,
+      strategies: [{ id: 100 + i, name: `子策略${i + 1}`, role: 'master' }],
+    }))
+  }
+  function makeStrategies(pid: number) {
+    return [{
+      ...mockStrategies[0],
+      id: 99 + pid,
+      name: `子策略${pid}`,
+    }]
+  }
+  function setup() {
+    const list = makePortfolios()
+    ;(getPortfolios as any).mockResolvedValue(list)
+    ;(getStrategies as any).mockImplementation((pid: number) => Promise.resolve(makeStrategies(pid)))
+    ;(getPortfolioDetail as any).mockImplementation(
+      (id: number) => Promise.resolve(list.find(p => p.id === id)),
+    )
+    return list
+  }
+
+  it('12 个组合全部展开后，最后一条子策略的[编辑]打开「编辑子策略」', async () => {
+    setup()
+    const w = mount(Portfolios)
+    await flushPromises()
+
+    const toggles = w.findAll('button.toggle-expand')
+    expect(toggles.length).toBe(12)
+    for (const t of toggles) await t.trigger('click')
+    await flushPromises()
+
+    const subRows = w.findAll('.strategy-sub-row')
+    expect(subRows.length).toBe(12)
+
+    const lastSubRow = subRows[subRows.length - 1]
+    expect(lastSubRow.text()).toContain('子策略12')
+    const lastEdit = lastSubRow.findAll('button').find(b => b.text() === '编辑')!
+    expect(lastEdit.exists()).toBe(true)
+    await lastEdit.trigger('click')
+    await flushPromises()
+
+    expect(w.text()).toContain('编辑子策略')
+    expect((w.find('input[data-field="name"]').element as HTMLInputElement).value).toBe('子策略12')
+  })
+
+  it('12 个组合时，最后一个组合行（#12）的[编辑]打开「编辑组合」', async () => {
+    setup()
+    const w = mount(Portfolios)
+    await flushPromises()
+
+    const mainRows = w.findAll('tbody tr').filter(
+      r => !r.classes('strategy-sub-row') && !r.classes('strategy-add-row'),
+    )
+    expect(mainRows.length).toBe(12)
+
+    const lastRow = mainRows[mainRows.length - 1]
+    expect(lastRow.text()).toContain('#12')
+    const lastEdit = lastRow.findAll('button').find(b => b.text() === '编辑')!
+    await lastEdit.trigger('click')
+    await flushPromises()
+
+    expect(getPortfolioDetail).toHaveBeenCalledWith(12)
+    expect(w.text()).toContain('编辑组合')
+    expect((w.find('input[data-field="name"]').element as HTMLInputElement).value).toBe('组合12')
+  })
+})

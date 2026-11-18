@@ -421,7 +421,73 @@ export function decisionEventToRow(ev: Ev, liveTime = ''): DecisionRow {
   }
 }
 
+/**
+ * 决策行去重签名：与后端 `live_decision_events` 落库字段同口径
+ * （gate / layer / action / 代码 / 策略 / message 前 200 字）。
+ *
+ * 后端把同一逻辑事件的两种投影都落库：`_rec_live` → layer=live_gate，
+ * `_emit_risk_safe(persist=True)` → layer=risk，所以 layer 必须进签名，
+ * 否则实时去重后与整页刷新拉到的历史行数对不上。message 截 200 字是因为
+ * 后端落库 `(ev.message or "")[:200]`，SSE payload 是全文。
+ */
+export function decisionRowSignature(
+  r: Pick<DecisionRow, 'gate' | 'layer' | 'action' | 'stock_code' | 'strategy_id' | 'message'>,
+): string {
+  return [
+    r.gate, r.layer, r.action, r.stock_code,
+    r.strategy_id == null ? '' : String(r.strategy_id),
+    (r.message || '').slice(0, 200),
+  ].join('|')
+}
+
+/**
+ * SSE risk 事件 → 决策行（后端持久化风控事件：现金差异 / 缺价 / 净值偏差 /
+ * 日线新鲜度 / 拆单队列丢失…）。字段映射对齐 `_persist_risk_decision`：
+ * gate 取 payload.gate 否则 rule，layer 恒 risk，action 缺省 notice，
+ * param_name 取 payload.param_name 否则 rule。
+ */
+export function riskEventToRow(ev: Ev, liveTime = ''): DecisionRow {
+  const t = parseBeijingTime(ev.bar_time as string | undefined)
+  const rule = (ev.rule as string) || ''
+  return {
+    key: nextEventId(),
+    time: liveTime || t.text,
+    ts: liveTime ? Date.now() : t.ts,
+    gate: (ev.gate as string) || rule,
+    layer: 'risk',
+    action: (ev.action as string) || 'notice',
+    stock_code: (ev.stock_code as string) || '',
+    strategy_id: (ev.strategy_id as number) ?? null,
+    param_name: (ev.param_name as string) ?? (rule || null),
+    param_value: (ev.param_value as number) ?? null,
+    actual_value: (ev.actual_value as number) ?? null,
+    requested_qty: (ev.requested_qty as number) ?? null,
+    final_qty: (ev.final_qty as number) ?? null,
+    message: (ev.message as string) || '',
+  }
+}
+
+/**
+ * 决策表 upsert：同一签名（见 `decisionRowSignature`）已存在则不新增，
+ * 只把既有行的时间推进（SSE 重复推送 / 与历史行撞车时不会出现双行）。
+ * 未命中则头部插入并封顶。
+ */
+export function upsertDecisionRow(rows: DecisionRow[], incoming: DecisionRow, cap = 500): DecisionRow[] {
+  const sig = decisionRowSignature(incoming)
+  const idx = rows.findIndex((r) => decisionRowSignature(r) === sig)
+  if (idx < 0) return prependCapped(rows, incoming, cap)
+  const prev = rows[idx]
+  // 时间只前进不后退（历史行 created_at 可能晚于 SSE 到达的本地时刻）
+  if (incoming.ts != null && (prev.ts == null || incoming.ts > prev.ts)) {
+    const next = [...rows]
+    next[idx] = { ...prev, time: incoming.time || prev.time, ts: incoming.ts }
+    return next
+  }
+  return rows
+}
+
 /** 决策历史 → 行（key=-id，稳定）；历史按 bar_time 升序返回，前端展示倒序（最新在上）。
+
  * 时间列用 created_at（事件落库时刻）——日线事件 bar_time 恒 00:00:00，无法区分
  * 何时触发（2026-11-03 止损 defer 57 次无法排重问题）；bar_time 兜底。 */
 export function decisionHistoryToRows(items: DecisionEventItem[]): DecisionRow[] {

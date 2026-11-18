@@ -9,6 +9,8 @@ import {
   multiAccountBannerText, keyboardConflictOpponents, parseStartConflict,
   baselineResetAllowed, shortAccountKey, formatMoney2, BASELINE_RESET_BLOCKED_REASON,
   paramsDriftLines, paramFieldLabel, formatParamValue,
+  riskEventToRow, upsertDecisionRow, decisionRowSignature, decisionHistoryToRows,
+  decisionEventToRow,
   type SessionOccupancy,
 } from '../utils/liveWorkbench'
 
@@ -521,6 +523,54 @@ describe('liveWorkbench', () => {
       expect(info.message).toContain('params_drift_block=true')
       // 不再露英文 key
       expect(info.message).not.toContain('max_drawdown')
+    })
+  })
+
+  describe('决策表 risk 事件（持久化风控事件并入）', () => {
+    it('riskEventToRow 对齐 _persist_risk_decision 落库口径', () => {
+      const row = riskEventToRow({
+        rule: 'deferred_dropped_stale', action: 'notice',
+        stock_code: '600000.SH', strategy_id: 3,
+        message: '顺延单跨日放弃', bar_time: '2026-11-17T09:31:00+08:00',
+      }, '09:31:05')
+      // gate 缺省取 rule；layer 恒 risk；action 缺省 notice；param_name=rule
+      expect(row.gate).toBe('deferred_dropped_stale')
+      expect(row.layer).toBe('risk')
+      expect(row.action).toBe('notice')
+      expect(row.param_name).toBe('deferred_dropped_stale')
+      expect(row.stock_code).toBe('600000.SH')
+      expect(row.time).toBe('09:31:05')
+    })
+
+    it('同一事件 SSE 重复推送 + 历史行同签名 → 只留一行', () => {
+      const payload = {
+        rule: 'cash_diff', gate: 'cash_diff', action: 'notice',
+        stock_code: '600000.SH', strategy_id: 1,
+        message: '柜台现金与虚拟现金差异 1200 元（不改账）',
+      }
+      let rows = upsertDecisionRow([], riskEventToRow(payload, '14:30:00'))
+      rows = upsertDecisionRow(rows, riskEventToRow(payload, '14:30:02'))
+      expect(rows).toHaveLength(1)
+
+      // 历史行（layer=risk / action=notice / message 前 200 字）与 SSE 行同签名
+      const history = decisionHistoryToRows([{
+        id: 42, gate: 'cash_diff', layer: 'risk', action: 'notice',
+        portfolio_id: 1, strategy_id: 1, stock_code: '600000.SH',
+        bar_time: null, created_at: '2026-11-17T14:30:00+08:00',
+        param_name: 'cash_diff', param_value: null, actual_value: null,
+        requested_qty: null, final_qty: null, message: payload.message,
+      }])
+      expect(decisionRowSignature(history[0])).toBe(decisionRowSignature(rows[0]))
+    })
+
+    it('签名含 layer：live_gate 与 risk 的同名事件各自成行（与历史落库一致）', () => {
+      const base = {
+        gate: 'deferred_release', action: 'fallback', stock_code: '600000.SH',
+        strategy_id: null, message: '取不到开盘价，退回实时价',
+      }
+      const a = riskEventToRow({ ...base, rule: 'deferred_release' }, '09:31:00')
+      const b = decisionEventToRow({ ...base, layer: 'live_gate' }, '09:31:00')
+      expect(upsertDecisionRow([b], a)).toHaveLength(2)
     })
   })
 })

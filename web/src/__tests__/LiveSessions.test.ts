@@ -608,6 +608,116 @@ describe('LiveSessions.vue 工作台(B4b)', () => {
     w.unmount()
   })
 
+  it('切到决策/拦截页签 → 重拉历史；页签自带刷新按钮', async () => {
+    ;(getLiveSessions as any).mockResolvedValue([runningSession])
+    ;(getLiveDecisions as any).mockResolvedValue({ summary: [], events: [] })
+    const w = mount(LiveSessions)
+    await flushPromises()
+    const callsAtMount = (getLiveDecisions as any).mock.calls.length
+
+    // 切页签（挂载时默认在「持仓」）→ 触发一次决策历史重拉
+    await w.findAll('button').find((b) => b.text().includes('决策/拦截'))!.trigger('click')
+    await flushPromises()
+    expect((getLiveDecisions as any).mock.calls.length).toBe(callsAtMount + 1)
+
+    // 页签自带刷新按钮（与「刷新持仓」独立），点击再拉一次
+    const refresh = w.find('[data-test="decisions-refresh"]')
+    expect(refresh.exists()).toBe(true)
+    expect(refresh.text()).toContain('刷新决策')
+    await refresh.trigger('click')
+    await flushPromises()
+    expect((getLiveDecisions as any).mock.calls.length).toBe(callsAtMount + 2)
+    w.unmount()
+  })
+
+  it('SSE risk 事件并入决策表，重复推送不出双行', async () => {
+    ;(getLiveSessions as any).mockResolvedValue([runningSession])
+    const NOW = Date.parse('2026-11-05T10:00:00+08:00')
+    const spy = vi.spyOn(Date, 'now').mockReturnValue(NOW)
+    const w = mount(LiveSessions)
+    await flushPromises()
+    await w.findAll('button').find((b) => b.text().includes('决策/拦截'))!.trigger('click')
+
+    const es = FakeEventSource.instances[0]
+    const payload = {
+      rule: 'cash_diff', gate: 'cash_diff', action: 'notice',
+      message: '柜台现金与虚拟现金差异 1200 元（不改账）',
+    }
+    es.emit('risk', payload)
+    es.emit('risk', payload)
+    await flushPromises()
+
+    // 进决策表（闸门中文 + 风控层），且同签名重复推送只留一行
+    expect(w.text()).toContain('现金差异')
+    expect(w.text()).toContain('风控事件')
+    // 只看逐事件表（实时事件日志里同一条也会出现，不能按整页文本计数）
+    const evTable = w.findAll('table').find((t) => t.text().includes('时间（北京时间）'))!
+    expect(evTable.text().split(payload.message).length - 1).toBe(1)
+    spy.mockRestore()
+    w.unmount()
+  })
+
+  it('顺延待次日提交汇总：有 gate=signal_bar_date/action=defer 才显示，点击筛表', async () => {
+    ;(getLiveSessions as any).mockResolvedValue([runningSession])
+    const NOW = Date.parse('2026-11-05T10:00:00+08:00')
+    const spy = vi.spyOn(Date, 'now').mockReturnValue(NOW)
+    const ev = (id: number, gate: string, action: string, code: string) => ({
+      id, gate, layer: 'live_gate', action, stock_code: code, strategy_id: 1,
+      created_at: '2026-11-05T09:35:00+08:00', bar_time: '2026-11-05T09:35:00+08:00',
+      param_name: null, param_value: null, actual_value: null,
+      requested_qty: null, final_qty: null, message: '',
+    })
+    ;(getLiveDecisions as any).mockResolvedValue({
+      summary: [],
+      events: [
+        ev(1, 'signal_bar_date', 'defer', '600000.SH'),
+        ev(2, 'signal_bar_date', 'defer', '600888.SH'),
+        ev(3, 'stop_loss', 'sell', '000009.SZ'),
+      ],
+    })
+    const w = mount(LiveSessions)
+    await flushPromises()
+    await w.findAll('button').find((b) => b.text().includes('决策/拦截'))!.trigger('click')
+
+    const banner = w.find('[data-test="defer-summary"]')
+    expect(banner.exists()).toBe(true)
+    expect(banner.text()).toContain('顺延待次日提交（2 笔）')
+    // 未筛选时三类事件都在
+    expect(w.text()).toContain('000009.SZ')
+
+    // 点击汇总条 → 事件表只留顺延单
+    await banner.trigger('click')
+    expect(w.text()).toContain('600888.SH')
+    expect(w.text()).not.toContain('000009.SZ')
+
+    // 再点取消筛选
+    await w.find('[data-test="defer-summary"]').trigger('click')
+    expect(w.text()).toContain('000009.SZ')
+    spy.mockRestore()
+    w.unmount()
+  })
+
+  it('无顺延单时汇总条不显示', async () => {
+    ;(getLiveSessions as any).mockResolvedValue([runningSession])
+    const NOW = Date.parse('2026-11-05T10:00:00+08:00')
+    const spy = vi.spyOn(Date, 'now').mockReturnValue(NOW)
+    ;(getLiveDecisions as any).mockResolvedValue({
+      summary: [],
+      events: [{
+        id: 1, gate: 'stop_loss', layer: 'risk', action: 'sell', stock_code: '600000.SH',
+        strategy_id: 1, created_at: '2026-11-05T09:35:00+08:00',
+        bar_time: '2026-11-05T09:35:00+08:00', param_name: 'stop_loss',
+        param_value: 5, actual_value: 4.9, requested_qty: 100, final_qty: 100, message: '',
+      }],
+    })
+    const w = mount(LiveSessions)
+    await flushPromises()
+    await w.findAll('button').find((b) => b.text().includes('决策/拦截'))!.trigger('click')
+    expect(w.find('[data-test="defer-summary"]').exists()).toBe(false)
+    spy.mockRestore()
+    w.unmount()
+  })
+
   it('委托表默认今日过滤；切到全部可见更早委托', async () => {
     ;(getLiveSessions as any).mockResolvedValue([runningSession])
     const NOW = Date.parse('2026-11-05T10:00:00+08:00')

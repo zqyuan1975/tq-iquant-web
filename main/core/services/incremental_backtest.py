@@ -50,6 +50,7 @@ from core.models import (
     LiveAccountSnapshot,
     LiveAccountPositionSnapshot,
     LiveCashFlow,
+    LiveDecisionEvent,
     LiveSession,
     LiveSessionPortfolio,
     LiveTrade,
@@ -63,10 +64,12 @@ from core.services.backtest_service import (
     _slice_klines_from,
     _strategy_periods,
     build_klines,
+    build_gate_tracker,
     build_params_snapshot,
     build_signal_cache,
 )
 from core.tq.data import no_trade_bar_mask
+from core.engine.market_gate import GATE_FORMULA_VERSION
 from tq_iquant_shared.constants import SignalType, TradeType
 
 logger = logging.getLogger(__name__)
@@ -436,6 +439,9 @@ def schema_parts(dividend_mode: str) -> dict:
         "t1": _T1_SCHEMA,
         "engine": _ENGINE_SCHEMA,
         "dividend_mode": dividend_mode,
+        # 市场多空门控公式口径（2026-11-18）：公式/参数任何调整都会改变拦单点，
+        # 接缝前后必须同口径，否则续跑结果与全量/实盘不可比。
+        "market_gate": GATE_FORMULA_VERSION,
     }
 
 
@@ -1558,6 +1564,11 @@ def _run_incremental_locked(db: Session, session_id: int,
     else:
         pending = restore_portfolio(portfolio, state)
 
+    # 市场多空门控（2026-11-18）：与全量回测同一口径——enabled=None 跟随组合
+    # 配置；取数失败抛 MarketGateUnavailableError（调度器逐条 try/except 兜底，
+    # 不会中断其余组合）。接缝前后同口径由 schema_fp 的 market_gate 版本保证。
+    gate_tracker = build_gate_tracker(ps, run_from, today)
+
     result = BacktestEngine().run(
         portfolio, klines=klines, signal_cache=signal_cache,
         initial_pending_orders=pending,
@@ -1568,7 +1579,8 @@ def _run_incremental_locked(db: Session, session_id: int,
         prev_close_by_day=build_prev_close_by_day(klines_all),
         # 在途单最大存活期（交易日；缺键=20，<=0 不限）：与全量回测同一配置项，
         # 防止停牌/连板单跨段无限顺延。
-        pending_order_max_days=int(cfg.get("pending_order_max_days", 20)))
+        pending_order_max_days=int(cfg.get("pending_order_max_days", 20)),
+        gate_tracker=gate_tracker)
 
     snaps = result.get("snapshots") or []
     if not snaps:
@@ -1751,11 +1763,14 @@ def run_validation(db: Session, session_id: int, ps_id: int,
             portfolio = assemble_portfolio(ps, strategies, db)
             if resolve_anchor(link, cfg):
                 apply_seam_anchor(portfolio, link.seam_cash, seam_positions)
+            # 校验侧与续跑侧必须同口径门控（否则「全量 vs 续跑」对比恒不一致）
+            gate_tracker = build_gate_tracker(ps, from_date, to_date)
             result = BacktestEngine().run(
                 portfolio, klines=klines, signal_cache=signal_cache,
                 stock_names=_pool_stock_names(ps, db),
                 prev_close_by_day=build_prev_close_by_day(klines_all),
-                pending_order_max_days=int(cfg.get("pending_order_max_days", 20)))
+                pending_order_max_days=int(cfg.get("pending_order_max_days", 20)),
+                gate_tracker=gate_tracker)
         except Exception as exc:  # noqa: BLE001 — 校验失败要留痕，不吞
             logger.exception("incremental validation failed")
             row = IncrementalBacktestValidation(
@@ -1954,6 +1969,32 @@ def _parse_hm(text: str, default: str) -> tuple:
         return int(h), int(m)
 
 
+def _record_scheduler_failure(db: Session, session_id: int, ps_id: int,
+                              gate: str, exc: BaseException) -> None:
+    """调度异常落 ``live_decision_events``（审计可见，失败只告警）。
+
+    调用前调用方必须已 ``rollback``。写入失败不得再抛，避免掩盖原始异常。
+    """
+    try:
+        db.add(LiveDecisionEvent(
+            live_session_id=session_id,
+            gate=gate,
+            layer="live_gate",
+            action="error",
+            param_name="portfolio_strategy_id",
+            actual_value=float(ps_id),
+            message=(f"{type(exc).__name__}: {exc}")[:200] or None,
+        ))
+        db.commit()
+    except Exception:  # noqa: BLE001 — 观测失败不得阻断调度
+        logger.warning("写入调度失败事件失败（gate=%s, ps=%s）", gate, ps_id,
+                       exc_info=True)
+        try:
+            db.rollback()
+        except Exception:  # noqa: BLE001
+            pass
+
+
 class IncrementalBacktestScheduler:
     """进程内每日续跑 + 每周双跑校验（daemon 线程，60s 轮询）。
 
@@ -1973,6 +2014,9 @@ class IncrementalBacktestScheduler:
         self._thread: Optional[threading.Thread] = None
         self._lock = threading.Lock()
         self._last_validation_date: Optional[date] = None
+        # 失败事件去重：同一 (会话, 组合, 闸门, 日期) 只落一行（调度 60s 一轮重试，
+        # 不节流会把 live_decision_events 刷屏）
+        self._notified_failures: set = set()
 
     def start(self) -> None:
         with self._lock:
@@ -2030,11 +2074,18 @@ class IncrementalBacktestScheduler:
                     run_incremental(
                         db, link.session_id, link.portfolio_strategy_id,
                         today=today, now=now)
-                except Exception:  # noqa: BLE001
+                except Exception as exc:  # noqa: BLE001
                     logger.exception(
                         "增量回测失败 (session %s, ps %s)",
                         link.session_id, link.portfolio_strategy_id)
                     db.rollback()
+                    key = (link.session_id, link.portfolio_strategy_id,
+                           "incremental_backtest", today)
+                    if key not in self._notified_failures:
+                        self._notified_failures.add(key)
+                        _record_scheduler_failure(
+                            db, link.session_id, link.portfolio_strategy_id,
+                            "incremental_backtest", exc)
 
             # 每周双跑校验
             try:
@@ -2050,10 +2101,18 @@ class IncrementalBacktestScheduler:
                         run_validation(
                             db, link.session_id, link.portfolio_strategy_id,
                             to_date=today, now=now)
-                    except Exception:  # noqa: BLE001
+                    except Exception as exc:  # noqa: BLE001
                         logger.exception(
                             "增量回测双跑校验失败 (session %s, ps %s)",
                             link.session_id, link.portfolio_strategy_id)
                         db.rollback()
+                        key = (link.session_id, link.portfolio_strategy_id,
+                               "incremental_validation", today)
+                        if key not in self._notified_failures:
+                            self._notified_failures.add(key)
+                            _record_scheduler_failure(
+                                db, link.session_id,
+                                link.portfolio_strategy_id,
+                                "incremental_validation", exc)
                 self._last_validation_date = today
         return {"ran_at": now.isoformat()}

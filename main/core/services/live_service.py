@@ -968,6 +968,10 @@ def build_engine(
     stock_codes: set = set()
     # B5 市场状态闸：组合 → 基准指数代码（供 LiveEngine 逐日算 regime）
     benchmark_codes: Dict[int, str] = {}
+    # 市场多空门控（2026-11-18）：组合 → **标量配置**（不持有 ORM 实例，避免
+    # build_engine 之后 commit/expire 触发 DetachedInstanceError）。
+    # 只收集启用了门控的组合；未启用的组合不进 provider，零额外 TQ 取数。
+    gate_specs: Dict[int, dict] = {}
     formula_ids: set = set()
     strategy_formula: Dict[int, int] = {}  # strategy_id -> formula_id
     # 预热/分发按 (code, period) 取该股票该周期所有公式的 formula_count 最大值（跨组合跨策略）。
@@ -1013,6 +1017,15 @@ def build_engine(
         portfolios.append(port)
         baseline_weights.append((port, weight))
         benchmark_codes[ps.id] = getattr(ps, "benchmark_index", None) or DEFAULT_BENCHMARK_CODE
+        if getattr(ps, "market_gate_enabled", False):
+            gate_specs[ps.id] = {
+                "portfolio_id": ps.id,
+                "market_gate_enabled": True,
+                "benchmark_index": (getattr(ps, "benchmark_index", None)
+                                    or DEFAULT_BENCHMARK_CODE),
+                "market_gate_engine": getattr(ps, "market_gate_engine", None) or "python",
+                "market_gate_formula_name": getattr(ps, "market_gate_formula_name", None),
+            }
         pool_codes = resolve_stock_codes(db, ps.id)
         stock_codes.update(pool_codes)
         pool_codes_by_portfolio[ps.id] = set(pool_codes)
@@ -1095,6 +1108,24 @@ def build_engine(
         return build_index_close_series(
             [code], end_date - timedelta(days=620), end_date,
         ).get(code, {})
+
+    def _gate_provider(portfolio_id: int, end_date):
+        """市场多空门控：按组合标量配置现算 tracker（每组合每交易日一次）。
+
+        只捕获标量字典（不持有 ORM 实例）——build_engine 之后的 commit/expire
+        不会让闭包失效。返回 None 表示该组合未启用门控（引擎据此不注入）。
+        取数失败抛 MarketGateUnavailableError，由 LiveEngine._maybe_update_gate
+        捕获并保留旧状态（fail-open，不做「全禁开仓」）。
+        """
+        spec = gate_specs.get(portfolio_id)
+        if not spec:
+            return None
+        from types import SimpleNamespace
+        from core.services.backtest_service import build_gate_tracker
+        # build_gate_tracker 内部再前推 GATE_WARMUP_DAYS(500) 自然日，
+        # 这里传 end_date-365 天 → 实际回看约 865 天（≈600 根日线），MA288 余量充足。
+        return build_gate_tracker(
+            SimpleNamespace(**spec), end_date - timedelta(days=365), end_date)
 
     # 股票池为空时给一个占位，避免空列表；首期实盘一般有成分股
     poll_codes = sorted(stock_codes) or ["000001.SZ"]
@@ -1185,6 +1216,8 @@ def build_engine(
         trading_calendar=trading_calendar,
         regime_provider=_regime_provider,
         benchmark_codes=benchmark_codes,
+        gate_provider=_gate_provider if gate_specs else None,
+        gate_portfolio_ids=set(gate_specs),
         execution_mode=execution_mode,
         signal_file_path=signal_file_path,
         advance_close_enabled=bool(advance_close_enabled),
@@ -3109,6 +3142,17 @@ def engine_external_positions(engine: LiveEngine) -> List[dict]:
             market_value = float(r.get("market_value") or 0)
         except (TypeError, ValueError):
             avg_cost, market_value = 0.0, 0.0
+        if market_value <= 0:
+            # 通达信持仓明细无市值列（market_value=0）→ 按最近已知价重算，
+            # 成本价只进「成本价」列、不冒充市值（2026-11-18 口径统一）。
+            for port in getattr(engine, "portfolios", None) or []:
+                px = (getattr(port, "_price_snapshot", None) or {}).get(code)
+                try:
+                    if px is not None and float(px) > 0:
+                        market_value = round(float(px) * quantity, 2)
+                        break
+                except (TypeError, ValueError):
+                    continue
         out.append({
             "portfolio_id": None,
             "strategy_id": None,

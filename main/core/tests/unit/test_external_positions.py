@@ -207,6 +207,22 @@ def test_external_positions_without_pool_info_never_marks_out_of_pool():
     assert rows[0]["out_of_pool"] is False
 
 
+def test_external_position_market_value_uses_price_when_row_mv_missing():
+    """通达信持仓行无市值列（market_value=0）→ 外部持仓按最近已知价重算市值。
+
+    成本价 12.0 只进「成本价」列，不冒充市值（2026-11-18 口径统一）。
+    """
+    disp = _FakeDispatcher([
+        {"symbol": "000001", "volume": 1000, "available": 1000,
+         "cost": 12.0, "market_value": 0},
+    ])
+    eng = _virtual_engine(disp)
+    eng.portfolios[0]._price_snapshot = {"000001.SZ": Decimal("9.5")}
+    rows = live_service.engine_external_positions(eng)
+    assert rows[0]["avg_cost"] == 12.0
+    assert rows[0]["market_value"] == 9500.0
+
+
 def test_positions_merge_external_snapshot_for_bridge_channels():
     """桥通道（无 get_positions）→ /positions 合并引擎外部持仓快照。
 

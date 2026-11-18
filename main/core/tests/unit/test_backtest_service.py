@@ -1936,6 +1936,8 @@ _SNAPSHOT_KEYS = {
     # 2026-11-16 P1：口径版本 + 策略级参数 + 池成分冻结（纯 JSON，不加表列）
     "no_trade_bar_policy", "stamp_duty_segments", "fee_threshold_basis",
     "strategies", "stock_pool_codes",
+    # 市场多空门控（2026-11-18）：未启用时只冻结开关位
+    "market_gate_enabled",
 }
 
 _NO_TRADES_RESULT = {

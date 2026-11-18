@@ -8,6 +8,8 @@ import {
   type PortfolioItem, type StockPoolItem, type FormulaItem,
 } from '../api'
 import PageHeader from '../components/PageHeader.vue'
+import { BENCHMARKS, DEFAULT_BENCHMARK } from '../utils/benchmarks'
+import { MARKET_GATE_ENGINES } from '../utils/marketGate'
 
 // ===== 数据 =====
 const portfolios = ref<PortfolioItem[]>([])
@@ -38,16 +40,8 @@ const strategyForm = ref<Record<string, any>>(emptyStrategyForm())
 // 14:50 定信号 + 14:52 bar 开盘价报单）；1w/1mon 走通达信注入（仅周期末）。
 // 60m 两端都不认。
 const PERIODS = ['1m', '5m', '15m', '30m', '1h', '1d', '1w', '1mon']
-// 基准指数可选集（TQ 指数日线可取，与回测页基准 guard 同集合；默认沪深300）
-const BENCHMARK_OPTIONS = [
-  { code: '000300.SH', name: '沪深300' },
-  { code: '000905.SH', name: '中证500' },
-  { code: '000852.SH', name: '中证1000' },
-  { code: '000688.SH', name: '科创50' },
-  { code: '399006.SZ', name: '创业板指' },
-  { code: '000001.SH', name: '上证指数' },
-  { code: '399001.SZ', name: '深证成指' },
-]
+// 基准指数可选集（TQ 指数日线可取，与回测页基准 guard 同集合；默认中证全指）
+const BENCHMARK_OPTIONS = BENCHMARKS
 const ROLES = [
   { value: 'independent', label: '独立' },
   { value: 'master', label: '主策略' },
@@ -120,13 +114,13 @@ interface FieldMeta {
   placeholder?: string
   options?: string
   hint?: string
-  showIf?: string | { key: string; equals: unknown }
+  showIf?: string | { key: string; equals: unknown } | ((form: Record<string, any>) => boolean)
 }
-const PORTFOLIO_GROUPS: { title: string; fields: FieldMeta[] }[] = [
+const PORTFOLIO_GROUPS: { title: string; hint?: string; fields: FieldMeta[] }[] = [
   { title: '基本信息', fields: [
     { key: 'name', label: '名称', span: 2, type: 'text', placeholder: '例如：稳健组合' },
     { key: 'stock_pool_id', label: '股票池', span: 1, type: 'select', options: 'pools' },
-    { key: 'benchmark_index', label: '基准指数', span: 1, type: 'select', options: 'benchmarks', hint: '用于回测超额与 crisis alpha 对比；TQ 指数日线可取，默认沪深300' },
+    { key: 'benchmark_index', label: '基准指数', span: 1, type: 'select', options: 'benchmarks', hint: '用于回测超额与 crisis alpha 对比，同时作为市场多空门控判别基准；默认中证全指（000985.CSI）' },
     { key: 'initial_capital', label: '初始资金（元）', span: 2, type: 'number' },
   ]},
   { title: '风控参数', fields: [
@@ -162,6 +156,11 @@ const PORTFOLIO_GROUPS: { title: string; fields: FieldMeta[] }[] = [
     { key: 'cash_enhance_enabled', label: '现金管理增强（预留）', span: 2, type: 'switch', hint: '命中阈值仅记录决策事件，暂不自动下单' },
     { key: 'cash_enhance_equity_threshold', label: '净资产阈值（元）', span: 1, type: 'number', showIf: { key: 'cash_enhance_enabled', equals: true } },
     { key: 'cash_enhance_position_ratio_threshold', label: '仓位占比阈值', span: 1, type: 'percent', placeholder: '30', showIf: { key: 'cash_enhance_enabled', equals: true } },
+  ]},
+  { title: '市场多空门控', hint: '基准指数空头时禁止开仓/加仓，持仓不强平；回测/实盘同口径（同一判别内核）。配置在实盘会话启动时读取一次，运行中修改需停止再启动。', fields: [
+    { key: 'market_gate_enabled', label: '启用门控', span: 2, type: 'switch', hint: '空头状态拦截 OPEN/ADD；CLOSE/REDUCE/止损/止盈/移动止损不受影响；未定状态放行' },
+    { key: 'market_gate_engine', label: '判别引擎', span: 2, type: 'select', options: 'gateEngines', showIf: (f: Record<string, any>) => !!f.market_gate_enabled, hint: 'python=内置公式（回测/实盘均可用）；tdx=通达信客户端公式库（按公式名取状态列）' },
+    { key: 'market_gate_formula_name', label: '通达信公式名', span: 2, type: 'text', placeholder: '留空=TQGATE', showIf: (f: Record<string, any>) => !!f.market_gate_enabled && f.market_gate_engine === 'tdx', hint: '仅判别引擎=通达信时生效，留空使用默认公式名 TQGATE' },
   ]},
 ]
 
@@ -238,7 +237,7 @@ function emptyStrategyForm(): Record<string, any> {
 
 function emptyPortfolioForm(): Record<string, any> {
   return {
-    name: '', stock_pool_id: 0, benchmark_index: '000300.SH',
+    name: '', stock_pool_id: 0, benchmark_index: DEFAULT_BENCHMARK,
     initial_capital: 500000, max_drawdown: 0.2, daily_loss_limit: 0.05,
     max_holdings: 10,
     min_commission: 5, buy_commission_rate: 0.00025, sell_commission_rate: 0.00025,
@@ -253,6 +252,8 @@ function emptyPortfolioForm(): Record<string, any> {
     // 单票上限 / 现金下限：默认不限制（null → 输入框留空，提交 null，后端 NULL=不设限）。
     // 绝不能预填非 0 值——会立刻改变次日实际报单结果。
     max_single_position_pct: null, min_cash_reserve_pct: null,
+    // 市场多空门控默认关（回测/实盘同口径）
+    market_gate_enabled: false, market_gate_engine: 'python', market_gate_formula_name: '',
     strategies: [],
   }
 }
@@ -515,7 +516,7 @@ async function openEditPortfolio(p: PortfolioItem) {
   }
   portfolioForm.value = {
     name: detail.name, stock_pool_id: detail.stock_pool_id,
-    benchmark_index: detail.benchmark_index || '000300.SH',
+    benchmark_index: detail.benchmark_index || DEFAULT_BENCHMARK,
     initial_capital: detail.initial_capital, max_drawdown: detail.max_drawdown,
     daily_loss_limit: detail.daily_loss_limit, max_holdings: detail.max_holdings,
     min_commission: detail.min_commission ?? 5,
@@ -539,6 +540,9 @@ async function openEditPortfolio(p: PortfolioItem) {
     equity_cap: detail.equity_cap ?? null,
     max_single_position_pct: detail.max_single_position_pct ?? null,
     min_cash_reserve_pct: detail.min_cash_reserve_pct ?? null,
+    market_gate_enabled: detail.market_gate_enabled ?? false,
+    market_gate_engine: detail.market_gate_engine || 'python',
+    market_gate_formula_name: detail.market_gate_formula_name || '',
     strategies: [],
   }
   // 比例字段转百分比显示
@@ -679,9 +683,13 @@ async function removeStrategy(pid: number, s: StrategyDetail) {
   loadPortfolios()  // 刷新列表徽章
 }
 
-// 表单字段是否显示（showIf 条件：字符串=按 role 匹配，对象=按布尔/等值匹配）
-function fieldVisible(fld: { showIf?: string | { key: string; equals: unknown } }, form: Record<string, any>): boolean {
+// 表单字段是否显示（showIf 条件：函数=自定义，字符串=按 role 匹配，对象=按布尔/等值匹配）
+function fieldVisible(
+  fld: { showIf?: string | { key: string; equals: unknown } | ((form: Record<string, any>) => boolean) },
+  form: Record<string, any>,
+): boolean {
   if (!fld.showIf) return true
+  if (typeof fld.showIf === 'function') return !!fld.showIf(form)
   if (typeof fld.showIf === 'string') return form.role === fld.showIf
   return form[fld.showIf.key] === fld.showIf.equals
 }
@@ -703,6 +711,7 @@ function optionsOf(src: string | undefined, pid?: number) {
   if (src === 'positionSizings') return POSITION_SIZINGS.map(s => ({ value: s.value, label: s.label }))
   if (src === 'dailyLossBases') return DAILY_LOSS_BASES.map(s => ({ value: s.value, label: s.label }))
   if (src === 'riskTimings') return RISK_TIMINGS.map(t => ({ value: t.value, label: t.label }))
+  if (src === 'gateEngines') return MARKET_GATE_ENGINES.map(e => ({ value: e.value, label: e.label }))
   if (src === 'signalFrequencies') return [
     { value: null, label: '跟随周期（period）' },
     ...SIGNAL_FREQUENCIES.map(f => ({ value: f, label: f })),
@@ -802,7 +811,7 @@ onMounted(loadPortfolios)
 
         <div class="modal-body">
           <div v-for="g in PORTFOLIO_GROUPS" :key="g.title">
-            <label class="group-label">{{ g.title }}</label>
+            <label class="group-label">{{ g.title }}<span v-if="g.hint" class="group-hint">{{ g.hint }}</span></label>
             <div class="field-grid">
               <div
                 v-for="fld in g.fields" :key="fld.key"
@@ -823,7 +832,7 @@ onMounted(loadPortfolios)
                   :placeholder="fld.placeholder"
                   @input="clearPortfolioFieldError(fld.key)"
                 />
-                <select v-else :data-field="fld.key" v-model="portfolioForm[fld.key]">
+                <select v-else class="field-select" :data-field="fld.key" v-model="portfolioForm[fld.key]">
                   <option v-for="o in optionsOf(fld.options)" :key="o.value ?? 'null'" :value="o.value">{{ o.label }}</option>
                 </select>
                 <span v-if="fld.type === 'percent'" class="field-suffix">%</span>
@@ -960,7 +969,7 @@ onMounted(loadPortfolios)
                   v-model="strategyForm[fld.key]"
                   :placeholder="fld.placeholder"
                 />
-                <select v-else :data-field="fld.key" v-model="strategyForm[fld.key]">
+                <select v-else class="field-select" :data-field="fld.key" v-model="strategyForm[fld.key]">
                   <option v-for="o in optionsOf(fld.options, strategyPortfolioId!)" :key="o.value ?? 'null'" :value="o.value">{{ o.label }}</option>
                 </select>
                 <span v-if="fld.type === 'percent'" class="field-suffix">%</span>

@@ -204,6 +204,10 @@ class TdxTqDispatcher(OrderDispatcher):
         #: place_order 返回 None。引擎据此把订单**保持 submitted**（不判拒单），
         #: 由后续 /deals 轮询认领或 180s 超时收口——避免真实在途单脱离跟踪。
         self.last_unconfirmed_order_id: Optional[str] = None
+        #: 与 last_unconfirmed_order_id 配套的可读原因（2026-11-18）：引擎把它写进
+        #: live_orders.error_message，工作台直接看到「已点击但行仍待发送」等真实
+        #: 原因，而不是通用文案。非本通道语义时为空串。
+        self._last_unconfirmed_message: str = ""
         #: 认领异常回调（引擎注入 → 转 risk 事件）：PRICE_MY 下同码同向同量候选
         #: 的 WtPrice 与审批价不符时调用，让「静默等 180s expire」在工作台可见。
         self.on_claim_anomaly = on_claim_anomaly
@@ -221,6 +225,11 @@ class TdxTqDispatcher(OrderDispatcher):
     @property
     def last_error(self) -> str:
         return self._last_error
+
+    @property
+    def last_unconfirmed_message(self) -> str:
+        """最近一次「已受理未认领」的具体原因（引擎写进 live_orders.error_message）。"""
+        return self._last_unconfirmed_message
 
     @staticmethod
     def order_id(order: OrderEvent) -> str:
@@ -1369,9 +1378,9 @@ class TdxTqDispatcher(OrderDispatcher):
             # 返回 None + 标记 last_unconfirmed_order_id：引擎保持 submitted，
             # 后续 poll_deals 继续 legacy 模糊认领，最坏 180s expire 收口。
             self.last_unconfirmed_order_id = self.order_id(order)
-            self._last_error = (
-                "已受理未认领：委托列表暂未见该单（%s）"
-                % (confirm_detail or msg or res))
+            self._last_unconfirmed_message = (
+                "已受理未认领：%s" % (confirm_detail or msg or res))[:500]
+            self._last_error = self._last_unconfirmed_message
             logger.warning(
                 "tdx order accepted but unclaimed: %s %s x%s @%s (%s)",
                 direction, symbol, vol, price, confirm_detail or msg or res,
@@ -1428,6 +1437,44 @@ class TdxTqDispatcher(OrderDispatcher):
             self._confirmer = TdxSignalConfirmer(timeout=self._confirm_timeout)
         return self._confirmer
 
+    def pending_row_state(self, live_order) -> Optional[str]:
+        """180s 到期前复核：本单在「交易信号」窗口里是否仍停在『待发送』。
+
+        返回 ``"pending"``（点击未生效/未报出）/ ``"absent"``（行已消失或已转
+        『已发送』，视为已报出）/ ``"unknown"``（无窗口/OCR 不可判）。
+        ``None`` = 本通道不支持（自动确认关闭或 LiveOrder 字段不全），调用方
+        直接跳过、保持既有 expire 行为。只读截图 + OCR，不点击、不取消。
+        """
+        if not self._auto_confirm_dialog:
+            return None
+        try:
+            code6 = re.sub(
+                r"\D", "", str(getattr(live_order, "stock_code", "") or ""))[:6]
+            if len(code6) != 6:
+                return None
+            trade_type = str(getattr(live_order, "trade_type", "") or "").lower()
+            direction = "buy" if "buy" in trade_type else "sell"
+            volume = int(getattr(live_order, "quantity", 0) or 0)
+            if volume <= 0:
+                return None
+            created_at = getattr(live_order, "created_at", None)
+            # DB created_at 为 UTC naive（SQLite CURRENT_TIMESTAMP），行时间按
+            # 上海时间显示 → +8h 对齐再看秒数。
+            sent_at = (created_at + timedelta(hours=8)
+                       if isinstance(created_at, datetime) else None)
+            from .live.tdx_signal_confirm import SignalSpec
+            spec = SignalSpec(
+                code6=code6,
+                direction=direction,
+                volume=volume,
+                price=float(getattr(live_order, "price", 0) or 0),
+                sent_at=sent_at,
+            )
+            return self._get_confirmer().pending_row_state(spec)
+        except Exception:  # noqa: BLE001
+            logger.exception("tdx pending_row_state 异常，按不支持（None）处理")
+            return None
+
     def _confirm_pending_order(self, symbol: str, direction: str, price: float,
                                vol: int, code6: str, sent_at, dialog_before,
                                msg: str, baseline=()):
@@ -1440,8 +1487,22 @@ class TdxTqDispatcher(OrderDispatcher):
         """
         from .live.tdx_signal_confirm import SignalSpec
 
+        # 当日涨跌停（确认器「价格列 ROI 识别价」约束用）：复用本通道既有的
+        # price_limit_bounds（最近一根已完成日线收盘 + 板块/ST/新股幅度推算，
+        # 不新增取数路径），只在确认这条路径上取一次。取不到 → 0（确认器按
+        # 「未知」跳过该条约束，fail-open，不因缺涨跌停价拒单）。
+        limit_up = limit_down = 0.0
+        try:
+            bounds = self.price_limit_bounds(symbol)
+        except Exception as e:  # noqa: BLE001
+            logger.debug("tdx 自动确认：涨跌停取价异常，按未知处理：%s", e)
+            bounds = None
+        if bounds:
+            _prev, limit_up, limit_down = bounds
         spec = SignalSpec(code6=code6, direction=direction, volume=int(vol),
-                          price=float(price), sent_at=sent_at)
+                          price=float(price), sent_at=sent_at,
+                          limit_up=float(limit_up),
+                          limit_down=float(limit_down))
         state = {"ref": ""}
 
         def _submitted() -> bool:

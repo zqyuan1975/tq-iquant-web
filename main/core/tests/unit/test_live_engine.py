@@ -4457,7 +4457,11 @@ def test_bars_to_formula_df_accepts_stime_only():
 
 # ---- E8 离线→在线转场 ----
 def test_loop_offline_to_online_resets_baseline():
-    """E8：桥离线→在线转场 → _loop 调 reset_baseline（重建基线，不补 bar）。"""
+    """E8：快照通道离线→在线转场 → _loop 调 reset_baseline（重建基线，不补 bar）。
+
+    P2-6 起，声明 supports_historical_quote 的桥（QMT/掘金）走缺口补派而非重建基线；
+    本用例覆盖「不能回补」的快照通道，故显式关闭该能力。
+    """
     import asyncio
 
     factory, _ = _db_factory()
@@ -4486,6 +4490,7 @@ def test_loop_offline_to_online_resets_baseline():
 
     rec = FlakyPing()
     disp, _ = _make_dispatcher(rec)
+    disp.supports_historical_quote = False  # 快照通道：不补派，只能重建基线
     from core.engine.bar_poller import BarPoller
     poller = BarPoller(disp, [stock], period="1m", count=10)
     reset_calls = []
@@ -7126,7 +7131,10 @@ def test_executor_single_worker():
 
 
 def test_loop_offline_to_online_still_resets_baseline_after_thread_offload():
-    """#3 回归：tick 走线程池后 E8 离线→在线转场仍调 reset_baseline。"""
+    """#3 回归：tick 走线程池后，快照通道离线→在线转场仍调 reset_baseline。
+
+    同上：可回补的桥走 P2-6 缺口补派，本用例只覆盖快照通道的基线重建路径。
+    """
     import asyncio
 
     factory, _ = _db_factory()
@@ -7152,6 +7160,7 @@ def test_loop_offline_to_online_still_resets_baseline_after_thread_offload():
 
     rec = FlakyPing()
     disp, _ = _make_dispatcher(rec)
+    disp.supports_historical_quote = False  # 快照通道：不补派，只能重建基线
     from core.engine.bar_poller import BarPoller
     poller = BarPoller(disp, [stock], period="1m", count=10)
     reset_calls = []
@@ -14130,3 +14139,91 @@ def test_minute_order_price_bias_uses_tick():
     assert _submit("1m", False)[0] == Decimal("10.00")
     # 日线周期：路径不变
     assert _submit("1d", True)[0] == Decimal("10.00")
+
+
+# ===========================================================================
+# 已受理未认领的待发送行复核（2026-11-18）
+# ===========================================================================
+
+
+def _unconfirmed_live_order(**kw):
+    from types import SimpleNamespace
+    base = dict(
+        id=11, order_ref=None, status="submitted", bridge_order_id="bm-1",
+        created_at=(datetime.now(timezone.utc).replace(tzinfo=None)
+                    - timedelta(seconds=200)),
+        strategy_id=5, portfolio_strategy_id=3, stock_code="301600.SZ",
+        trade_type="SELL", signal_type="CLOSE", quantity=220,
+        price=Decimal("64.01"), bar_time=datetime(2026, 11, 18, 11, 8, 42),
+        signal_name="stop_loss", error_message=None,
+    )
+    base.update(kw)
+    return SimpleNamespace(**base)
+
+
+def _recheck_engine(state="pending", orders=None):
+    """轻量引擎桩：只装配 _recheck_unconfirmed_pending_rows 所需属性。"""
+    from types import SimpleNamespace
+    eng = object.__new__(LiveEngine)
+    eng.ctx = SimpleNamespace(session_id=0, portfolios=[], dispatcher=None)
+    eng._book_lock = threading.RLock()
+    eng.session_id = 7
+    eng._engine_key = "tdx"
+    portfolio = SimpleNamespace(portfolio_id=3)
+    eng.portfolios = [portfolio]
+    if state is None:
+        eng._dispatcher = SimpleNamespace()
+    else:
+        eng._dispatcher = SimpleNamespace(pending_row_state=lambda _lo: state)
+    calls = []
+    eng._requeue_rejected_order = (
+        lambda db, p, order, lo, reason, **kw:
+        calls.append((p, order, lo, reason, kw)) or True)
+    return eng, portfolio, calls
+
+
+def test_recheck_unconfirmed_requeues_when_row_still_pending():
+    """180s 后行仍待发送 → 判未报出，重建订单并回 deferred（不是终态）。"""
+    eng, portfolio, calls = _recheck_engine("pending")
+    from types import SimpleNamespace
+    lo = _unconfirmed_live_order()
+    eng._recheck_unconfirmed_pending_rows(SimpleNamespace(commit=lambda: None), [lo])
+    assert len(calls) == 1
+    p, order, seen_lo, reason, kw = calls[0]
+    assert p is portfolio and seen_lo is lo
+    assert kw["gate"] == "order_unconfirmed"
+    assert order.stock_code == "301600.SZ"
+    assert order.trade_type == TradeType.SELL
+    assert order.quantity == 220
+    assert order.signal_bar_date == date(2026, 11, 18)  # 当日不重报，次日放行
+    assert order._deferred_row_id == 11
+    assert "点击未生效" in reason
+
+
+def test_recheck_unconfirmed_keeps_expire_when_row_absent_or_unknown():
+    """行已消失/不可判/通道无该能力 → 保持既有 expire 行为，绝不重排。"""
+    for state in ("absent", "unknown", None):
+        eng, _portfolio, calls = _recheck_engine(state)
+        eng._recheck_unconfirmed_pending_rows(
+            None, [_unconfirmed_live_order()])
+        assert calls == [], state
+
+
+def test_recheck_unconfirmed_skips_unknown_portfolio_and_young_orders():
+    """找不到组合 / 未到 180s → 不重排（交现行为）。"""
+    from types import SimpleNamespace
+
+    eng, _portfolio, calls = _recheck_engine("pending")
+    eng.portfolios = []
+    eng._recheck_unconfirmed_pending_rows(
+        SimpleNamespace(commit=lambda: None), [_unconfirmed_live_order()])
+    assert calls == []
+
+    eng2, _p2, calls2 = _recheck_engine("pending")
+    eng2._recheck_unconfirmed_pending_rows(
+        SimpleNamespace(commit=lambda: None),
+        [_unconfirmed_live_order(
+            created_at=datetime.now(timezone.utc).replace(tzinfo=None)
+            - timedelta(seconds=30))])
+    assert calls2 == []
+

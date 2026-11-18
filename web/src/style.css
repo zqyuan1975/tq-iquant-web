@@ -177,6 +177,18 @@ tbody tr:last-child td{border-bottom:none}
 .field-row{display:flex;align-items:center;gap:8px;margin-bottom:8px}
 .field-label{flex:0 0 130px;min-width:130px;font-size:12px;color:var(--ink-soft);text-align:right;line-height:1.35}
 .field-row input,.field-row select{flex:1;margin-bottom:0;padding:7px 10px;border:1px solid var(--border);border-radius:var(--radius)}
+/* 下拉框美化：仅作用于字段行下拉与显式 .field-select（不动全局 select）。
+   原生箭头替换为内联 SVG，右侧留出箭头区；颜色沿用主题变量。 */
+.field-row select,.field-select{
+  appearance:none;-webkit-appearance:none;-moz-appearance:none;
+  padding-right:30px;
+  background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 12 8'%3E%3Cpath d='M1 1l5 5 5-5' fill='none' stroke='%238a8a8a' stroke-width='1.6' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+  background-repeat:no-repeat;background-position:right 10px center;background-size:10px 7px;
+  cursor:pointer;transition:border-color .15s,box-shadow .15s,background-color .15s;
+}
+.field-row select:hover,.field-select:hover{border-color:var(--line-strong)}
+.field-row select:focus,.field-select:focus{outline:none;border-color:var(--accent);box-shadow:0 0 0 2px var(--accent-light)}
+.field-row select:disabled,.field-select:disabled{opacity:.55;cursor:not-allowed;background-color:var(--hover-bg)}
 .field-suffix{flex:0 0 auto;font-size:13px;color:var(--ink-soft)}
 /* 开关行：勾选框 + 说明并排（双列网格下半格也紧凑） */
 .field-row .switch-row{display:inline-flex;align-items:center;gap:6px;flex:1;min-width:0;margin:0;font-size:12px}
