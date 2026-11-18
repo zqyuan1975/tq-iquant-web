@@ -440,6 +440,39 @@ def delete_pending_change(session_id: int, change_id: int,
     return ok(result)
 
 
+@router.get("/emergency")
+def get_emergency(db: Session = Depends(get_db)):
+    """M2：全局应急开关状态（缺失 = 关闭）。"""
+    return ok(svc.get_emergency(db))
+
+
+@router.post("/emergency/pause-all")
+def pause_all(data: Optional[dict] = None, db: Session = Depends(get_db)):
+    """M2：一键暂停全部（停新开仓；SELL/风控/回填照常）。"""
+    payload = data or {}
+    return ok(svc.set_global_halt(
+        db, True, payload.get("reason"), payload.get("operator"), _ENGINES))
+
+
+@router.post("/emergency/resume-all")
+def resume_all(data: Optional[dict] = None, db: Session = Depends(get_db)):
+    """M2：解除全局暂停（恢复新开仓）。"""
+    payload = data or {}
+    return ok(svc.set_global_halt(
+        db, False, payload.get("reason"), payload.get("operator"), _ENGINES))
+
+
+@router.post("/emergency/liquidate-all")
+def liquidate_all(data: Optional[dict] = None, db: Session = Depends(get_db)):
+    """M2 高危：一键全平，需 body `confirm="LIQUIDATE"`；走既有提交闸门链。"""
+    payload = data or {}
+    ok_flag, result = svc.liquidate_all(
+        db, payload.get("confirm"), payload.get("reason"), _ENGINES)
+    if not ok_flag:
+        return err(result[0], result[1])
+    return ok(result)
+
+
 @router.get("/sessions/{session_id}/params-drift")
 def session_params_drift(session_id: int, db: Session = Depends(get_db)):
     """H2 参数漂移（A7）：绑定回测记录时返回当前参数与 params_snapshot 的差异。

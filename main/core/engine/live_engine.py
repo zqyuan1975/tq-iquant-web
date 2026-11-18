@@ -920,6 +920,10 @@ class LiveEngine:
         # 账户级聚合风控（D1/D2，2026-11-18）：默认关闭；关闭时 on_bar 首行返回。
         self._account_risk = AccountRiskService(
             self.ctx, self._emit, account_risk_config)
+        # 全局应急开关（M2，2026-11-18）：每 30s 从 live_global_switches 刷新一次；
+        # 表/行缺失按关闭处理，关闭时订单列表零变化。
+        self._global_halt = False
+        self._global_switch_checked_at = 0.0
         # 日终/收盘时点编排协作者（0010 步骤 5）：14:30 日终估值（转 breaker）、
         # 15:05 日线级别轮次（1d/1w/1mon 完整 bar；转 market_data，经 on_bar 驱动）、
         # 15:05 收盘清扫（转 orders 回填/终态同步/兜底 cancel）。持有幂等日期标记。
@@ -5786,24 +5790,120 @@ class LiveEngine:
 
     def _apply_account_halt(self, portfolio: Portfolio,
                             orders: List[OrderEvent]) -> List[OrderEvent]:
-        """账户级熔断/日亏暂停：剥掉本批 BUY（含 deferred 放行），SELL 保留。"""
-        if not orders or not self._account_risk.halted:
+        """账户级熔断/日亏暂停 + 全局应急开关：剥掉本批 BUY，SELL 保留。"""
+        if not orders:
+            return orders
+        rules = []
+        if self._global_halt:
+            rules.append(("global_emergency", "全局应急开关"))
+        if self._account_risk.halted:
+            rule = ("max_drawdown" if self._account_risk.breaker_active
+                    else "daily_loss")
+            rules.append(("account_risk_halt", "账户级 %s" % rule))
+        if not rules:
             return orders
         stripped = [o for o in orders if o.trade_type == TradeType.BUY]
         if not stripped:
             return orders
-        rule = ("max_drawdown" if self._account_risk.breaker_active
-                else "daily_loss")
-        for order in stripped:
-            self._rec_live(
-                "account_risk_halt", "strip", portfolio, order,
-                message="账户级 %s 暂停新开仓：剥掉 BUY %s（%s）" % (
-                    rule, order.stock_code, order.signal_name),
-            )
+        for gate, label in rules:
+            for order in stripped:
+                self._rec_live(
+                    gate, "strip", portfolio, order,
+                    message="%s 暂停新开仓：剥掉 BUY %s（%s）" % (
+                        label, order.stock_code, order.signal_name),
+                )
         logger.warning(
-            "account risk halt: session %s portfolio %s 剥离 %d 个 BUY（%s）",
-            self.session_id, portfolio.portfolio_id, len(stripped), rule)
+            "session %s portfolio %s 剥离 %d 个 BUY（%s）",
+            self.session_id, portfolio.portfolio_id, len(stripped),
+            "、".join(label for _, label in rules))
         return [o for o in orders if o.trade_type != TradeType.BUY]
+
+    def _refresh_global_switch(self, force: bool = False) -> None:
+        """M2：读取全局应急开关（30s 节流；失败保持旧值，不阻断交易）。"""
+        now = time.monotonic()
+        if not force and now - self._global_switch_checked_at < 30:
+            return
+        self._global_switch_checked_at = now
+        db = self._db_session_factory()
+        if db is None:
+            return
+        try:
+            from core.models import LiveGlobalSwitch
+            row = db.query(LiveGlobalSwitch).filter(
+                LiveGlobalSwitch.id == 1).first()
+            self._global_halt = bool(row and row.halt_new_positions)
+        except Exception:  # noqa: BLE001 — 开关读取失败保持旧值
+            logger.warning("global switch refresh failed (session %s)",
+                           self.session_id, exc_info=True)
+        finally:
+            db.close()
+
+    def set_global_halt(self, halted: bool) -> None:
+        """M2：API 写入后即时同步内存态（无需等下一轮刷新）。"""
+        self._global_halt = bool(halted)
+        self._global_switch_checked_at = time.monotonic()
+
+    def emergency_liquidate_all(self, reason: Optional[str] = None) -> dict:
+        """M2 一键全平：逐组合逐持仓生成 SELL CLOSE，走既有提交闸门链。
+
+        不绕过熔断/时点/T+1/在途门；任一单失败只记日志不中断其它组合。
+        """
+        db = self._db_session_factory()
+        if db is None:
+            return {"submitted": 0, "skipped": 0, "error": "db unavailable"}
+        submitted = 0
+        skipped = 0
+        try:
+            now = self.ctx.clock()
+            for portfolio in list(self.ctx.portfolios or []):
+                price_snapshot = getattr(portfolio, "_price_snapshot", {}) or {}
+                for strat in list(getattr(portfolio, "strategies", None) or []):
+                    strategy_id = getattr(strat, "strategy_id", None)
+                    positions = getattr(strat, "positions", None) or {}
+                    for code, pos in list(positions.items()):
+                        qty = int(getattr(pos, "quantity", 0) or 0)
+                        if qty <= 0 or strategy_id is None:
+                            continue
+                        price = price_snapshot.get(code)
+                        if price is None:
+                            price = getattr(pos, "avg_cost", None)
+                        if price is None:
+                            skipped += 1
+                            continue
+                        order = OrderEvent(
+                            strategy_id=strategy_id,
+                            portfolio_id=portfolio.portfolio_id,
+                            stock_code=code, trade_type=TradeType.SELL,
+                            signal_type=SignalType.CLOSE, quantity=qty,
+                            price=Decimal(str(price)), bar_time=now,
+                            signal_name="emergency_liquidate", period="1d",
+                        )
+                        try:
+                            self._submit_one_order(
+                                db, portfolio, order, "1d", emit_signal=False)
+                            submitted += 1
+                        except Exception:  # noqa: BLE001 — 单票失败不中断全平
+                            db.rollback()
+                            skipped += 1
+                            logger.exception(
+                                "组合 %s 应急全平提交失败（%s）",
+                                portfolio.portfolio_id, code)
+                        try:
+                            db.add(LiveDecisionEvent(
+                                live_session_id=self.session_id,
+                                gate="global_emergency", layer="global",
+                                action="liquidate", bar_time=now,
+                                param_name="liquidate_all",
+                                message=("应急全平 %s %s x%s：%s" % (
+                                    portfolio.portfolio_id, code, qty,
+                                    reason or ""))[:200],
+                            ))
+                            db.commit()
+                        except Exception:  # noqa: BLE001
+                            db.rollback()
+            return {"submitted": submitted, "skipped": skipped}
+        finally:
+            db.close()
 
     # ---------------- bar 驱动 ----------------
     def _on_bar(self, bar: BarEvent) -> None:
@@ -6417,6 +6517,8 @@ class LiveEngine:
         # P1：记录分钟级 bar 的交易日（引擎级，多组合共享同一 bar 只推进一次），
         # 供 _release_signal_bar_deferred 判断「due 当日是否收到过行情」。
         self._note_minute_bar_date(bar)
+        # M2（2026-11-18）：全局应急开关 30s 节流刷新；关闭时订单列表零变化。
+        self._refresh_global_switch()
         # 公司行为（J1/J2，默认关）：specs 为空时立即返回。必须在镜面刷新与信号
         # 评估之前——停牌闸（suspended_codes）与分红入账要先于本根 bar 生效。
         self._maybe_apply_corporate_actions(bar.bar_time)

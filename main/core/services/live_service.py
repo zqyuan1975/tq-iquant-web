@@ -42,6 +42,7 @@ from core.models import (
     LiveOutOfPoolDecision, LiveCorporateAction,
     LivePortfolioDaily,
     LiveSessionPendingChange,
+    LiveGlobalSwitch,
     IncrementalBacktestCheckpoint, BacktestRecord,
 )
 from core.engine.portfolio_builder import assemble_portfolio
@@ -4011,6 +4012,66 @@ def apply_pending_changes(db: Session, session_id: int) -> int:
         logger.info("pending changes applied before start (session %s): %d",
                     session_id, applied)
     return applied
+
+
+# ---------------------------------------------------------------------------
+# M2 全局应急开关（2026-11-18）
+# ---------------------------------------------------------------------------
+def get_emergency(db: Session) -> dict:
+    """全局应急开关状态（表/行缺失 = 关闭）。"""
+    row = db.query(LiveGlobalSwitch).filter(LiveGlobalSwitch.id == 1).first()
+    if row is None:
+        return {"halt_new_positions": False, "reason": None, "operator": None,
+                "updated_at": None}
+    return {
+        "halt_new_positions": bool(row.halt_new_positions),
+        "reason": row.reason,
+        "operator": row.operator,
+        "updated_at": _iso_utc(row.updated_at),
+    }
+
+
+def set_global_halt(db: Session, halted: bool, reason: Optional[str],
+                    operator: Optional[str],
+                    engines: Dict[int, LiveEngine]) -> dict:
+    """写入全局开关并即时同步所有运行中引擎（无需等 30s 刷新）。"""
+    row = db.query(LiveGlobalSwitch).filter(LiveGlobalSwitch.id == 1).first()
+    if row is None:
+        row = LiveGlobalSwitch(id=1)
+        db.add(row)
+    row.halt_new_positions = bool(halted)
+    row.reason = reason
+    row.operator = operator
+    row.updated_at = datetime.now()
+    db.commit()
+    for engine in (engines or {}).values():
+        setter = getattr(engine, "set_global_halt", None)
+        if setter is not None:
+            try:
+                setter(bool(halted))
+            except Exception:  # noqa: BLE001
+                logger.warning("sync global halt to engine failed", exc_info=True)
+    return get_emergency(db)
+
+
+def liquidate_all(db: Session, confirm: Optional[str], reason: Optional[str],
+                  engines: Dict[int, LiveEngine]):
+    """M2 一键全平：需显式 confirm=LIQUIDATE；仅运行中会话。"""
+    if str(confirm or "") != "LIQUIDATE":
+        return False, (400, "高危操作：需 confirm=LIQUIDATE 显式确认")
+    results = []
+    for session_id, engine in list((engines or {}).items()):
+        fn = getattr(engine, "emergency_liquidate_all", None)
+        if fn is None:
+            continue
+        try:
+            detail = fn(reason=reason)
+        except Exception as exc:  # noqa: BLE001 — 单会话失败不影响其它会话
+            logger.exception("emergency liquidate failed (session %s)",
+                             session_id)
+            detail = {"error": str(exc)}
+        results.append(dict(detail, session_id=session_id))
+    return True, {"results": results, "reason": reason}
 
 
 def bridge_status(session_id: int, status: str, engine: Optional[LiveEngine]) -> dict:
