@@ -1374,6 +1374,10 @@ def list_sessions(db: Session, engines: Optional[Dict[int, LiveEngine]] = None) 
             # 错周期 bar 风控（三态原始值：None=跟随全局，true/false=会话覆盖）
             "intraday_mismatched_risk_enabled":
                 s.intraday_mismatched_risk_enabled,
+            # A1 资金池：列表回显，编辑弹窗据此预填
+            "capital_pool_mode": getattr(s, "capital_pool_mode", None) or "off",
+            "capital_pool_rebalance_enabled": bool(
+                getattr(s, "capital_pool_rebalance_enabled", False)),
             "status": s.status,
             # 引擎是否真的在本进程注册表中运行（工作台据此区分「状态陈旧」与
             # 真正运行中：status=running 但 engine_running=false = 后端重启后
@@ -1658,6 +1662,186 @@ def get_session(db: Session, session_id: int, engine: Optional[LiveEngine] = Non
     # 序列化兜底：任何路径混进来的 inf/-inf/nan 在这里归一为 None，
     # 保证 GET /api/live/sessions/{id} 不会因一个脏字段整接口 500。
     return _json_safe(data)
+
+
+# ---------------------------------------------------------------------------
+# B1 + A4：会话配置编辑（未运行全量可改；运行中入待生效队列，下次启动生效）
+# ---------------------------------------------------------------------------
+#: PUT /sessions/{id} 允许编辑的字段（白名单，未知字段忽略）。
+SESSION_EDIT_FIELDS = (
+    "name", "engine", "execution_mode", "signal_file_path",
+    "advance_close_enabled", "advance_close_time",
+    "intraday_mismatched_risk_enabled", "capital_pool_mode",
+    "capital_pool_rebalance_enabled", "portfolio_ids",
+)
+#: 运行中只能「下次启动生效」的字段（name 为纯展示字段，立即生效）。
+SESSION_NEXT_START_FIELDS = frozenset(SESSION_EDIT_FIELDS) - {"name"}
+
+
+def _sync_session_portfolios(db: Session, session_id: int, pids: List[int]) -> None:
+    """A4：把会话的组合关联同步为目标集合（保留会话与历史成交，只增删关联行）。"""
+    wanted = set(pids)
+    rows = (
+        db.query(LiveSessionPortfolio)
+        .filter(LiveSessionPortfolio.session_id == session_id)
+        .all()
+    )
+    existing = {row.portfolio_strategy_id: row for row in rows}
+    for pid in sorted(wanted - set(existing)):
+        db.add(LiveSessionPortfolio(
+            session_id=session_id, portfolio_strategy_id=pid))
+    for pid, row in existing.items():
+        if pid not in wanted:
+            db.delete(row)
+
+
+def _apply_session_field(db: Session, session: LiveSession, field: str, value) -> None:
+    """写入单个会话字段（portfolio_ids 同步关联表）；调用方保证 field 已白名单。"""
+    if field == "portfolio_ids":
+        _sync_session_portfolios(db, session.id, [int(p) for p in value])
+        return
+    setattr(session, field, value)
+
+
+def _normalize_session_patch(db: Session, data: dict):
+    """校验并归一 PUT body；返回 (patch, (status, message) | None)。"""
+    patch: dict = {}
+    if "name" in data:
+        name = str(data.get("name") or "").strip()
+        if not name:
+            return None, (400, "会话名称不能为空")
+        patch["name"] = name
+    if "engine" in data:
+        engine = str(data.get("engine") or "").strip()
+        if engine not in ENGINES_META:
+            return None, (400, "engine 非法，仅支持 %s" % " / ".join(ENGINES_META))
+        patch["engine"] = engine
+    if "execution_mode" in data:
+        execution_mode = str(data.get("execution_mode") or "").strip()
+        if execution_mode not in ("alert", "auto", "manual"):
+            return None, (400, "execution_mode 非法，仅支持 alert / auto / manual")
+        patch["execution_mode"] = execution_mode
+    if "signal_file_path" in data:
+        raw = data.get("signal_file_path")
+        patch["signal_file_path"] = (
+            str(raw).strip() or None if raw is not None else None)
+    if "advance_close_enabled" in data:
+        patch["advance_close_enabled"] = bool(data.get("advance_close_enabled"))
+    if "advance_close_time" in data:
+        raw = str(data.get("advance_close_time") or "14:51").strip()
+        try:
+            hh, mm = raw.split(":")
+            minutes = int(hh) * 60 + int(mm)
+        except (TypeError, ValueError):
+            return None, (400, "advance_close_time 须为 HH:MM 格式")
+        if not (14 * 60 + 51 <= minutes <= 14 * 60 + 59):
+            return None, (400, "advance_close_time 仅支持 14:51–14:59")
+        patch["advance_close_time"] = raw
+    if "intraday_mismatched_risk_enabled" in data:
+        raw = data.get("intraday_mismatched_risk_enabled")
+        if raw is None:
+            patch["intraday_mismatched_risk_enabled"] = None
+        elif isinstance(raw, bool):
+            patch["intraday_mismatched_risk_enabled"] = raw
+        elif isinstance(raw, int) and raw in (0, 1):
+            patch["intraday_mismatched_risk_enabled"] = bool(raw)
+        else:
+            return None, (
+                400, "intraday_mismatched_risk_enabled 仅支持 null / true / false")
+    if "capital_pool_mode" in data:
+        mode = str(data.get("capital_pool_mode") or "off").strip()
+        if mode not in ("off", "equal", "risk_budget", "priority"):
+            return None, (400, "capital_pool_mode 非法，仅支持 off/equal/risk_budget/priority")
+        patch["capital_pool_mode"] = mode
+    if "capital_pool_rebalance_enabled" in data:
+        patch["capital_pool_rebalance_enabled"] = bool(
+            data.get("capital_pool_rebalance_enabled"))
+    if "portfolio_ids" in data:
+        pids = data.get("portfolio_ids")
+        if not isinstance(pids, list):
+            return None, (400, "portfolio_ids 必须为数组")
+        try:
+            pids = [int(p) for p in pids]
+        except (TypeError, ValueError):
+            return None, (400, "portfolio_ids 只能包含整数组合 id")
+        if len(set(pids)) != len(pids):
+            return None, (400, "portfolio_ids 存在重复项")
+        if pids:
+            existing = {
+                row.id for row in
+                db.query(PortfolioStrategy.id)
+                .filter(PortfolioStrategy.id.in_(pids)).all()
+            }
+            missing = [str(p) for p in pids if p not in existing]
+            if missing:
+                return None, (400, "组合不存在：%s" % "、".join(missing))
+        patch["portfolio_ids"] = pids
+    if not patch:
+        return None, (400, "没有可更新的字段（支持：%s）"
+                      % " / ".join(SESSION_EDIT_FIELDS))
+    return patch, None
+
+
+def _enqueue_session_pending(db: Session, session: LiveSession,
+                             field: str, value) -> LiveSessionPendingChange:
+    """运行中会话的字段变更入待生效队列（同会话同字段只保留一条 pending）。"""
+    row = (
+        db.query(LiveSessionPendingChange)
+        .filter(LiveSessionPendingChange.live_session_id == session.id,
+                LiveSessionPendingChange.portfolio_strategy_id.is_(None),
+                LiveSessionPendingChange.field == field,
+                LiveSessionPendingChange.status == "pending")
+        .first()
+    )
+    if row is None:
+        row = LiveSessionPendingChange(
+            live_session_id=session.id, portfolio_strategy_id=None,
+            strategy_id=None, field=field)
+        db.add(row)
+    old_value = getattr(session, field, None)
+    row.old_value = json.dumps(old_value, ensure_ascii=False, default=str)
+    row.new_value = json.dumps(value, ensure_ascii=False)
+    row.note = "会话配置编辑（下次启动生效）"
+    row.status = "pending"
+    row.applied_at = None
+    return row
+
+
+def update_session(db: Session, session_id: int, data: dict,
+                   engines: Dict[int, LiveEngine]):
+    """B1 + A4：编辑会话配置。
+
+    - 未运行：全部字段立即写库（组合增删同步关联表，保留会话与历史成交）；
+    - 运行中：`name` 立即生效，其余字段入 D3 待生效队列，下次启动前应用。
+    返回 (ok, data_or_(status, message))。
+    """
+    session = db.query(LiveSession).filter(LiveSession.id == session_id).first()
+    if session is None:
+        return False, (404, "资源不存在")
+    patch, error = _normalize_session_patch(db, data)
+    if error:
+        return False, error
+    running = (session_id in engines
+               or session.status in ("running", "stopping"))
+    applied: List[str] = []
+    pending: List[str] = []
+    for field, value in patch.items():
+        if running and field in SESSION_NEXT_START_FIELDS:
+            _enqueue_session_pending(db, session, field, value)
+            pending.append(field)
+        else:
+            _apply_session_field(db, session, field, value)
+            applied.append(field)
+    db.commit()
+    result = get_session(db, session_id, engines.get(session_id))
+    return True, {
+        "session": result,
+        "applied": applied,
+        "pending": pending,
+        "effective_at": "next_start" if pending else "now",
+        "message": ("会话运行中：%s 已加入待生效队列，下次启动生效"
+                    % "、".join(pending)) if pending else "已立即生效",
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -3913,6 +4097,7 @@ def list_pending_changes(db: Session, session_id: int):
     )
     return [{
         "id": row.id,
+        "scope": "session" if row.portfolio_strategy_id is None else "portfolio",
         "portfolio_strategy_id": row.portfolio_strategy_id,
         "strategy_id": row.strategy_id,
         "field": row.field,
@@ -4019,7 +4204,13 @@ def discard_pending_change(db: Session, session_id: int, change_id: int,
 
 
 def apply_pending_changes(db: Session, session_id: int) -> int:
-    """启动建引擎前应用本会话全部 pending 变更；返回应用条数。"""
+    """启动建引擎前应用本会话全部 pending 变更；返回应用条数。
+
+    两类行共用同一张队列表：
+    - ``portfolio_strategy_id IS NULL``：B1/A4 会话配置变更（engine/execution_mode/
+      portfolio_ids/资金池等），值为 JSON；先应用，保证随后建的引擎读到新配置；
+    - 非空：D3 风控参数变更（Decimal 比例），沿用原逻辑。
+    """
     rows = (
         db.query(LiveSessionPendingChange)
         .filter(LiveSessionPendingChange.live_session_id == session_id,
@@ -4028,7 +4219,36 @@ def apply_pending_changes(db: Session, session_id: int) -> int:
         .all()
     )
     applied = 0
-    for row in rows:
+    session_rows = [r for r in rows if r.portfolio_strategy_id is None]
+    param_rows = [r for r in rows if r.portfolio_strategy_id is not None]
+    session = db.query(LiveSession).filter(LiveSession.id == session_id).first()
+    for row in session_rows:
+        if session is None or row.field not in SESSION_NEXT_START_FIELDS:
+            row.status = "discarded"
+            logger.warning(
+                "session pending change discarded (session %s id=%s field=%s)",
+                session_id, row.id, row.field)
+            continue
+        try:
+            value = json.loads(row.new_value)
+        except (TypeError, ValueError):
+            row.status = "discarded"
+            logger.warning(
+                "session pending change invalid value (session %s id=%s field=%s)",
+                session_id, row.id, row.field)
+            continue
+        try:
+            _apply_session_field(db, session, row.field, value)
+        except Exception:  # noqa: BLE001 — 单条失败不阻断启动
+            row.status = "discarded"
+            logger.warning(
+                "session pending change apply failed (session %s id=%s field=%s)",
+                session_id, row.id, row.field, exc_info=True)
+            continue
+        row.status = "applied"
+        row.applied_at = datetime.now()
+        applied += 1
+    for row in param_rows:
         target, error = _pending_target(
             db, session_id, row.portfolio_strategy_id,
             row.strategy_id, row.field)

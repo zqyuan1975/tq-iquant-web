@@ -217,6 +217,19 @@ def get_session(session_id: int, db: Session = Depends(get_db)):
     return ok(data)
 
 
+@router.put("/sessions/{session_id}")
+def update_session(session_id: int, data: dict, db: Session = Depends(get_db)):
+    """B1 + A4：编辑会话配置。
+
+    未运行：全部字段立即生效（组合增删同步关联表，不重建会话）；
+    运行中：name 立即生效，其余字段入待生效队列，下次启动前应用。
+    """
+    ok_flag, result = svc.update_session(db, session_id, data, _ENGINES)
+    if not ok_flag:
+        return err(result[0], result[1])
+    return ok(result)
+
+
 @router.get("/sessions/{session_id}/signals")
 def session_signals(
     session_id: int,

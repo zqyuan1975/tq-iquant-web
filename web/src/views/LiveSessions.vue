@@ -18,7 +18,7 @@ import {
 import {
   getLiveOrders, getLiveTrades, getLivePositions, getLiveDecisions, getLiveSignals, getPortfolios,
   ackLiveDecision, ackAllLiveDecisions,
-  getLiveSessions, getLiveSession, createLiveSession, startLiveSession, stopLiveSession, deleteLiveSession,
+  getLiveSessions, getLiveSession, createLiveSession, updateLiveSession, startLiveSession, stopLiveSession, deleteLiveSession,
   recoverLiveBreaker, getLiveChannel, testLiveChannel, sendUserBlock, getFormulas, getWatchdogStatus,
   getLiveAccountPreview, resetLiveBaseline,
   getLiveParamsDrift, getLiveCashFlows, createLiveCashFlow,
@@ -1017,6 +1017,61 @@ async function deleteSession(s: LiveSessionItem) {
   }
 }
 
+// ---- B1 + A4 编辑会话配置（运行中除名称外下次启动生效）----
+const editModal = ref<LiveSessionItem | null>(null)
+const editSaving = ref(false)
+const editError = ref('')
+const editResult = ref<{ effective_at: string; message: string } | null>(null)
+const editForm = ref({
+  name: '',
+  engine: 'tdx' as LiveEngineKey,
+  execution_mode: 'alert' as LiveExecutionMode,
+  signal_file_path: '',
+  capital_pool_mode: 'off' as 'off' | 'equal' | 'risk_budget' | 'priority',
+  capital_pool_rebalance_enabled: false,
+  portfolio_ids: [] as number[],
+})
+function openEdit(s: LiveSessionItem) {
+  editModal.value = s
+  editError.value = ''
+  editResult.value = null
+  editForm.value = {
+    name: s.name,
+    engine: (s.engine || defaultEngineKey()) as LiveEngineKey,
+    execution_mode: (s.execution_mode || 'auto') as LiveExecutionMode,
+    signal_file_path: s.signal_file_path || '',
+    capital_pool_mode: (s.capital_pool_mode || 'off') as 'off' | 'equal' | 'risk_budget' | 'priority',
+    capital_pool_rebalance_enabled: !!s.capital_pool_rebalance_enabled,
+    portfolio_ids: [...(s.portfolio_ids || [])],
+  }
+}
+async function submitEdit() {
+  if (!editModal.value) return
+  editSaving.value = true
+  editError.value = ''
+  editResult.value = null
+  try {
+    const res = await updateLiveSession(editModal.value.id, {
+      name: editForm.value.name,
+      engine: editForm.value.engine,
+      execution_mode: editForm.value.execution_mode,
+      signal_file_path: editForm.value.signal_file_path,
+      capital_pool_mode: editForm.value.capital_pool_mode,
+      capital_pool_rebalance_enabled: editForm.value.capital_pool_rebalance_enabled,
+      portfolio_ids: editForm.value.portfolio_ids,
+    })
+    editResult.value = { effective_at: res.effective_at, message: res.message }
+    load()
+    if (res.effective_at === 'now') {
+      editModal.value = null
+    }
+  } catch (e: any) {
+    editError.value = e?.response?.data?.message || e?.message || '保存失败'
+  } finally {
+    editSaving.value = false
+  }
+}
+
 async function loadChannel(engine?: LiveEngineKey) {
   try {
     channel.value = await getLiveChannel(engine)
@@ -1239,6 +1294,11 @@ onUnmounted(() => {
               class="btn btn-sm" data-test="cash-flow-open"
               title="登记入金/出金/分红等外部现金流（不记台账会扭曲净值、收益率、回撤、日亏）"
             >存取款/分红</button>
+            <button
+              v-if="s.status !== 'stopping'"
+              @click="openEdit(s)" class="btn btn-sm" data-test="session-edit-open"
+              title="编辑会话配置；运行中除名称外，其余修改下次启动生效"
+            >编辑</button>
             <button v-if="s.status === 'stopped'" @click="deleteSession(s)" class="btn btn-sm">删除</button>
             <!-- 结构化 409：按 data.rule 指名占用者（C1 引擎占用 / C2 账户占用 / C3 键鼠硬拦 / 参数漂移阻断） -->
             <div v-if="startErrors[s.id]" class="start-error" data-test="start-error">{{ startErrors[s.id] }}</div>
@@ -1746,6 +1806,64 @@ onUnmounted(() => {
       <div class="modal-actions">
         <button @click="create" class="btn btn-primary">确认</button>
         <button @click="showCreate = false" class="btn">取消</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- B1 + A4 编辑会话：未运行立即生效；运行中除名称外入待生效队列 -->
+  <div v-if="editModal" class="modal-overlay modal-lg" data-test="session-edit-modal" @click.self="editModal = null">
+    <div class="modal-content">
+      <h3>编辑会话 #{{ editModal.id }}「{{ editModal.name }}」</h3>
+      <div class="modal-body">
+        <p v-if="editModal.status !== 'stopped'" class="baseline-preview warn" data-test="session-edit-running-hint">
+          会话运行中：名称立即生效；引擎 / 执行模式 / 资金池 / 外部信号 / 组合增删将在下次启动前应用，
+          不影响当前正在跑的策略与持仓。
+        </p>
+        <label>名称</label>
+        <input v-model="editForm.name" data-field="edit-name" />
+        <label>交易引擎</label>
+        <select v-model="editForm.engine" data-field="edit-engine">
+          <option v-for="e in channel?.engines || []" :key="e.key" :value="e.key" :disabled="engineOptionDisabled(e)">
+            {{ engineOptionText(e) }}
+          </option>
+        </select>
+        <label>执行模式</label>
+        <select v-model="editForm.execution_mode" data-field="edit-execution-mode">
+          <option value="alert">预警（半自动，不下单）</option>
+          <option value="auto">自动（按交易引擎下单）</option>
+        </select>
+        <label>资金池模式</label>
+        <select v-model="editForm.capital_pool_mode" data-field="edit-capital-pool">
+          <option value="off">关闭（分账不分池）</option>
+          <option value="equal">等权池（各组合均分现金）</option>
+          <option value="risk_budget">风险预算（按 1/最大回撤分配）</option>
+          <option value="priority">优先级池（按组合下单优先级分配）</option>
+        </select>
+        <label v-if="editForm.capital_pool_mode !== 'off'" style="display:flex;align-items:center;gap:8px">
+          <input v-model="editForm.capital_pool_rebalance_enabled" type="checkbox" style="width:auto" />
+          每交易日首 bar 再平衡（只挪虚拟现金，不强制卖出）
+        </label>
+        <label>外部信号文件路径（可选）</label>
+        <input v-model="editForm.signal_file_path" placeholder="留空 = 走 TQ 公式计算信号" data-field="edit-signal-path" />
+        <label>组合策略（可多选，运行中下次启动生效）</label>
+        <div class="portfolio-check-list">
+          <label v-for="p in portfolios" :key="p.id" class="portfolio-check">
+            <input v-model="editForm.portfolio_ids" type="checkbox" :value="p.id" data-edit-portfolio-check />
+            {{ p.name }}<span style="color:var(--ink-faint)">（#{{ p.id }}）</span>
+            <span v-if="portfolioFormulas(p.id)" class="formula-tag">{{ portfolioFormulas(p.id) }}</span>
+          </label>
+        </div>
+        <p v-if="editError" class="form-error" data-test="session-edit-error">{{ editError }}</p>
+        <p v-if="editResult" class="baseline-preview" data-test="session-edit-result">
+          {{ editResult.message }}
+          <span v-if="editResult.effective_at === 'next_start'">（下次启动自动应用并留痕）</span>
+        </p>
+      </div>
+      <div class="modal-actions">
+        <button class="btn btn-primary" :disabled="editSaving" data-test="session-edit-save" @click="submitEdit">
+          {{ editSaving ? '保存中…' : '保存' }}
+        </button>
+        <button class="btn" @click="editModal = null">关闭</button>
       </div>
     </div>
   </div>

@@ -1799,6 +1799,14 @@ export interface LiveSessionItem {
   advance_close_done_date?: string | null  // 提前收盘价轮次已执行日期（幂等标记）
   // 错周期风控三态（原始值）：null=跟随全局 / true=强制开启 / false=强制关闭
   intraday_mismatched_risk_enabled?: boolean | null
+  // A1 资金池（列表/详情回显）
+  capital_pool_mode?: 'off' | 'equal' | 'risk_budget' | 'priority'
+  capital_pool_rebalance_enabled?: boolean
+  // 外部信号文件注入：null/空 = 走 TQ 公式计算
+  signal_file_path?: string | null
+  // B2 主备通道（后续批次使用；旧数据缺省）
+  backup_engine?: LiveEngineKey | null
+  failover_enabled?: boolean
 }
 
 // I-7（audit）：对账差异摘要（LiveEngine._reconcile_positions 产出）
@@ -1932,6 +1940,18 @@ export async function createLiveSession(req: LiveSessionCreate) {
     status: string
     warnings?: string[]   // A1 软校验：目标引擎已被其它 running/stopping 会话占用（不阻断）
   }>>('/live/sessions', req)
+  return res.data.data
+}
+
+/** B1 + A4：编辑会话配置。运行中除 name 外进入待生效队列，下次启动生效。 */
+export async function updateLiveSession(id: number, req: Record<string, unknown>) {
+  const res = await api.put<ApiResponse<{
+    session: LiveSessionItem
+    applied: string[]
+    pending: string[]
+    effective_at: 'now' | 'next_start'
+    message: string
+  }>>(`/live/sessions/${id}`, req)
   return res.data.data
 }
 
