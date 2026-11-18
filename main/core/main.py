@@ -43,6 +43,13 @@ async def lifespan(app: FastAPI):
     # 打包版端口动态（8888~8898），自愈父进程与第二次双击都靠它找到本实例。
     runtime.mark_serving(runtime.resolve_bound_port())
     init_db()
+    # L5：启动版本校验（默认关闭）。只读比对 alembic_version 与代码 head，
+    # 不执行任何迁移；开关关闭时无日志、零副作用。
+    try:
+        from core.services import upgrade_service
+        upgrade_service.startup_check()
+    except Exception:  # noqa: BLE001 — 版本校验失败不得阻断启动
+        logger.warning("启动版本校验异常（已忽略）", exc_info=True)
     # 打包版启用自动退出：浏览器标签页全部关闭后自动退出进程，避免残留占用端口。
     # 自愈子进程（--serve）必须常驻，不做「关标签页即退出」，否则父进程会反复重启。
     if _is_frozen() and not runtime.auto_shutdown_suppressed():

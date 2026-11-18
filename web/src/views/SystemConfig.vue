@@ -3,7 +3,9 @@ import { ref, computed, onMounted } from 'vue'
 import {
   getSystemConfigs, updateSystemConfigs, testLiveChannel,
   getBackupStatus, createBackup, listBackupRecords, verifyBackup, restoreBackup,
+  getUpgradeCheck, upgradeBackup,
   type SystemConfig, type BackupStatus, type BackupRecord, type BackupVerifyResult,
+  type UpgradeCheckResult,
 } from '../api'
 import { fmtBytes } from '../utils/format'
 import PageHeader from '../components/PageHeader.vue'
@@ -70,6 +72,7 @@ const GROUPS = [
   { key: 'preopen', label: '盘前集合竞价' },
   { key: 'misc', label: '回测与数据' },
   { key: 'backup', label: '数据备份' },
+  { key: 'upgrade', label: '升级与回滚' },
 ] as const
 type GroupKey = (typeof GROUPS)[number]['key']
 const activeGroup = ref<GroupKey>('base')
@@ -136,6 +139,7 @@ onMounted(async () => {
   }
   await loadBackupStatus()
   await loadBackupRecords()
+  await loadUpgradeCheck()
 })
 
 // ---- 数据备份（内嵌：VACUUM INTO 一致性副本 + WAL 收敛）----
@@ -151,6 +155,42 @@ async function loadBackupStatus() {
     backupStatus.value = await getBackupStatus()
   } catch (e) {
     backupErr.value = '读取备份状态失败: ' + (e instanceof Error ? e.message : String(e))
+  }
+}
+
+// ---- 升级与回滚（批次22 L5，只读检查 + 升级前强制备份）----
+const upgrade = ref<UpgradeCheckResult | null>(null)
+const upgradeBusy = ref(false)
+const upgradeMsg = ref('')
+const upgradeErr = ref('')
+
+async function loadUpgradeCheck() {
+  try {
+    upgrade.value = await getUpgradeCheck()
+  } catch (e) {
+    upgradeErr.value = '读取升级检查失败: ' + (e instanceof Error ? e.message : String(e))
+  }
+}
+
+function upgradeRevision(revs: string[] | null | undefined): string {
+  return revs && revs.length ? revs.join(', ') : '—'
+}
+
+async function prepareUpgradeBackup() {
+  if (!window.confirm('执行升级前备份？将生成一份手动备份，不会修改当前库。')) return
+  upgradeBusy.value = true
+  upgradeMsg.value = ''
+  upgradeErr.value = ''
+  try {
+    const res = await upgradeBackup(true)
+    upgradeMsg.value = `升级前备份完成${res.record?.filename ? '：' + res.record.filename : ''}`
+    await loadUpgradeCheck()
+    await loadBackupStatus()
+    await loadBackupRecords()
+  } catch (e) {
+    upgradeErr.value = '升级前备份失败: ' + (e instanceof Error ? e.message : String(e))
+  } finally {
+    upgradeBusy.value = false
   }
 }
 
@@ -654,6 +694,100 @@ function testTdx() { return testChannel('tdx_tq') }
             </div>
           </section>
 
+          <section v-show="activeGroup === 'upgrade'">
+            <h3 class="cfg-h">升级前检查（只读）</h3>
+            <p class="cfg-desc">
+              对比数据库 <code>alembic_version</code> 与代码迁移 head，并检查最近备份是否新鲜。
+              <b>本页不会执行任何迁移</b>；升级仍按台账人工执行 <code>alembic upgrade head</code>。
+              自动启动校验与「升级前备份」需在 config.yaml 设置 <code>upgrade.enabled: true</code>。
+            </p>
+            <div v-if="upgradeErr" style="color:var(--red);font-size:13px;margin-bottom:8px">
+              {{ upgradeErr }}
+            </div>
+            <div class="backup-status">
+              <div class="backup-row">
+                <span class="backup-label">能力开关</span>
+                <span>{{ upgrade?.enabled ? '已开启' : '未开启（upgrade.enabled=false）' }}</span>
+              </div>
+              <div class="backup-row">
+                <span class="backup-label">当前版本</span>
+                <span>{{ upgradeRevision(upgrade?.migrations.current) }}</span>
+              </div>
+              <div class="backup-row">
+                <span class="backup-label">代码 head</span>
+                <span>{{ upgradeRevision(upgrade?.migrations.heads) }}</span>
+              </div>
+              <div class="backup-row">
+                <span class="backup-label">版本状态</span>
+                <span>
+                  <template v-if="upgrade?.migrations.available === false">
+                    读取失败：{{ upgrade?.migrations.error || '未知原因' }}
+                  </template>
+                  <template v-else-if="upgrade?.migrations.at_head">已在 head</template>
+                  <template v-else>
+                    待执行 {{ upgrade?.migrations.pending_count ?? 0 }} 条迁移
+                  </template>
+                  <span v-if="upgrade?.migrations.single_head === false" style="color:var(--red)">
+                    （检测到多个 head，请先合并迁移）
+                  </span>
+                </span>
+              </div>
+              <div class="backup-row">
+                <span class="backup-label">最近成功备份</span>
+                <span>
+                  {{ backupLine(upgrade?.backup.latest) }}
+                  <template v-if="upgrade?.backup.age_hours != null">
+                    （{{ upgrade?.backup.age_hours }} 小时前）
+                  </template>
+                  <span v-if="upgrade?.backup.required" style="color:var(--red)"> · 需先备份</span>
+                </span>
+              </div>
+              <div class="backup-row">
+                <span class="backup-label">磁盘</span>
+                <span>
+                  剩余 {{ upgrade?.disk.free_mb ?? '—' }} MB / 保护阈值
+                  {{ upgrade?.disk.min_free_mb ?? '—' }} MB
+                  <span v-if="upgrade && !upgrade.disk.ok" style="color:var(--red)"> · 不足</span>
+                </span>
+              </div>
+            </div>
+            <div v-if="upgrade?.migrations.pending.length" class="backup-status">
+              <div class="backup-row">
+                <span class="backup-label">待执行迁移</span>
+                <span>
+                  {{ upgrade.migrations.pending
+                    .slice(0, 10)
+                    .map((p) => `${p.revision}${p.doc ? ' ' + p.doc : ''}`)
+                    .join('；') }}
+                </span>
+              </div>
+            </div>
+            <div class="cfg-test">
+              <button class="btn btn-sm" @click="loadUpgradeCheck" :disabled="upgradeBusy">
+                刷新检查
+              </button>
+              <button
+                class="btn btn-sm" @click="prepareUpgradeBackup"
+                :disabled="upgradeBusy || upgrade?.enabled !== true"
+              >
+                {{ upgradeBusy ? '备份中…' : '执行升级前备份' }}
+              </button>
+              <span v-if="upgrade?.enabled !== true" class="cfg-hint">
+                未启用（config.yaml upgrade.enabled=false）
+              </span>
+              <span v-if="upgradeMsg" style="color:var(--green);font-size:13px">{{ upgradeMsg }}</span>
+            </div>
+
+            <h3 class="cfg-h">升级步骤</h3>
+            <ol class="upgrade-list">
+              <li v-for="(s, i) in upgrade?.steps || []" :key="i">{{ s }}</li>
+            </ol>
+            <h3 class="cfg-h">回滚与恢复</h3>
+            <ul class="upgrade-list">
+              <li v-for="(s, i) in upgrade?.rollback || []" :key="i">{{ s }}</li>
+            </ul>
+          </section>
+
           <div class="cfg-foot">
             <button @click="save" class="btn btn-primary">保存</button>
             <span v-if="saved" style="color:var(--green);font-size:13px">已保存</span>
@@ -693,6 +827,13 @@ function testTdx() { return testChannel('tdx_tq') }
   box-shadow: inset 2px 0 0 var(--accent);
 }
 .cfg-pane { flex: 1; min-width: 0; }
+.upgrade-list {
+  margin: 0 0 8px;
+  padding-left: 20px;
+  color: var(--ink-soft);
+  font-size: 13px;
+  line-height: 1.9;
+}
 .cfg-h { margin: 18px 0 4px; font-size: 14px; }
 .cfg-h:first-child { margin-top: 0; }
 .cfg-desc { margin: 0 0 12px; font-size: 12px; color: var(--ink-soft); }

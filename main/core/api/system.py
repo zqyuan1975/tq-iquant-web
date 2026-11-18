@@ -2,7 +2,7 @@ from fastapi import APIRouter
 
 from core.api.response import err, ok
 from core.services.system_service import get_config, update_config
-from core.services import auto_shutdown, backup_service, health_service
+from core.services import auto_shutdown, backup_service, health_service, upgrade_service
 
 router = APIRouter(prefix="/api/system", tags=["system"])
 
@@ -25,6 +25,24 @@ def get_config_route():
 def update_config_route(data: dict):
     update_config(data)
     return ok()
+
+
+@router.get("/upgrade-check")
+def upgrade_check_route():
+    """L5 升级前只读清单：当前/目标 revision、待执行迁移、备份新鲜度、回滚提示。
+
+    纯只读（不执行 upgrade）；开关关闭时只把 ``enabled=false`` 带回，不做额外副作用。
+    """
+    return ok(upgrade_service.preflight())
+
+
+@router.post("/upgrade/backup")
+def upgrade_backup_route(data: dict):
+    """L5 升级前强制备份：需 ``upgrade.enabled=true`` + ``confirm=true``。"""
+    result = upgrade_service.prepare_backup(confirm=bool(data.get("confirm")))
+    if not result.get("ok"):
+        return err(400, result.get("message") or "升级前备份未执行", result)
+    return ok(result)
 
 
 @router.get("/backup")

@@ -2887,6 +2887,56 @@ export async function restoreBackup(payload: { record_id?: number; path?: string
 }
 
 // ---------------------------------------------------------------------------
+// 升级 / 回滚路径（批次22 L5）
+// ---------------------------------------------------------------------------
+
+export interface UpgradeMigrationPending {
+  revision: string
+  doc: string | null
+  down_revision: string | string[] | null
+}
+
+export interface UpgradeCheckResult {
+  enabled: boolean
+  checked_at: string
+  migrations: {
+    available: boolean
+    error: string | null
+    current: string[]
+    heads: string[]
+    pending: UpgradeMigrationPending[]
+    pending_count: number
+    single_head: boolean | null
+    at_head: boolean | null
+  }
+  backup: {
+    latest: BackupRecord | null
+    age_hours: number | null
+    max_age_hours: number
+    fresh: boolean
+    required: boolean
+    dir: string
+  }
+  disk: { free_mb: number; min_free_mb: number; ok: boolean }
+  steps: string[]
+  rollback: string[]
+}
+
+/** L5 升级前只读检查：版本差异 / 备份新鲜度 / 回滚提示（不执行迁移）。 */
+export async function getUpgradeCheck() {
+  const res = await api.get<ApiResponse<UpgradeCheckResult>>('/system/upgrade-check')
+  return res.data.data
+}
+
+/** L5 升级前强制备份：需后端 upgrade.enabled=true 且显式 confirm=true。 */
+export async function upgradeBackup(confirm: boolean) {
+  const res = await api.post<ApiResponse<{
+    ok: boolean; status: string; message?: string | null; record: BackupRecord
+  }>>('/system/upgrade/backup', { confirm })
+  return res.data.data
+}
+
+// ---------------------------------------------------------------------------
 // 接缝续跑式增量回测（GET /incremental/summary、POST /incremental/validate）
 // ---------------------------------------------------------------------------
 
