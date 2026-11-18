@@ -117,6 +117,22 @@ def parse_gate_indices(raw) -> list:
     return out
 
 
+def gate_enabled_for(ps, strategies=None, requested=None) -> bool:
+    """组合门控启用判定（E3）：run 级三态覆盖 > 组合开关 > 任一策略 force-on。
+
+    requested 为 None 表示跟随组合配置；显式 bool 为 run 级覆盖。
+    策略级 market_gate_mode="on" 允许在组合总开关关闭时单独启用门控。
+    """
+    if requested is not None:
+        return bool(requested)
+    if bool(getattr(ps, "market_gate_enabled", False)):
+        return True
+    return any(
+        (getattr(s, "market_gate_mode", None) or "inherit") == "on"
+        for s in (strategies or [])
+    )
+
+
 class CompositeGateTracker:
     """E3：多指数投票门控（接口与 MarketGateTracker 对齐）。
 

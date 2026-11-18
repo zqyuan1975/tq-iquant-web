@@ -94,6 +94,12 @@ def assemble_portfolio(
     # 风控冷静期（默认 1=风控卖出当日不再买回、次日恢复；0=关闭）：回测/实盘共用
     _cooldown = getattr(ps, "risk_cooldown_days", None)
     port.risk_cooldown_days = 1 if _cooldown is None else max(0, int(_cooldown))
+    # E3 空头减仓档（默认 0=关闭；>0 时空头连续段内每只持仓减一次）：回测/实盘共用
+    try:
+        port.gate_bear_reduce_ratio = Decimal(
+            str(getattr(ps, "market_gate_bear_reduce_ratio", 0) or 0))
+    except (TypeError, ValueError):
+        port.gate_bear_reduce_ratio = Decimal("0")
     # #2 成交量/流动性约束（可选，默认关；仅回测成交步生效）
     port.volume_limit_enabled = bool(getattr(ps, "volume_limit_enabled", False))
     _vol_ratio = getattr(ps, "volume_limit_ratio", None)
@@ -154,6 +160,8 @@ def assemble_portfolio(
                 else None
             ),
             trend_max_positions=getattr(strat, "trend_max_positions", None),
+            # E3 策略级门控覆盖（默认 inherit=跟随组合）
+            market_gate_mode=getattr(strat, "market_gate_mode", None) or "inherit",
             # #3 策略级敞口上限（可选，默认关；回测/实盘成交步生效）
             exposure_cap_enabled=bool(getattr(strat, "exposure_cap_enabled", False)),
             # 单笔最大买入金额（元，可选 None=不限；回测/实盘双端 cap_quantity 生效）

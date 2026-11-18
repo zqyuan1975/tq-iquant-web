@@ -896,6 +896,8 @@ export interface StrategyItem {
   regime_filter_enabled: boolean
   trend_trailing_stop_ratio: number | null
   trend_max_positions: number | null
+  // E3 策略级门控覆盖（inherit=跟随组合（默认）/off=不受门控/on=强制启用）
+  market_gate_mode: string
   exposure_cap_enabled: boolean
 }
 
@@ -986,6 +988,8 @@ export interface StrategyDetail {
   regime_filter_enabled: boolean
   trend_trailing_stop_ratio: number | null
   trend_max_positions: number | null
+  // E3 策略级门控覆盖（inherit=跟随组合（默认）/off=不受门控/on=强制启用）
+  market_gate_mode: string
   exposure_cap_enabled: boolean
   max_order_amount?: number | null  // 单笔最大买入金额（元），null=不限
   requote_enabled: boolean
@@ -1031,6 +1035,8 @@ export interface StrategyRequest {
   regime_filter_enabled?: boolean
   trend_trailing_stop_ratio?: number | null
   trend_max_positions?: number | null
+  // E3 策略级门控覆盖（inherit/off/on；null=请求未携带）
+  market_gate_mode?: string | null
   exposure_cap_enabled?: boolean
   max_order_amount?: number | null  // 单笔最大买入金额（元），null=不限
   requote_enabled?: boolean

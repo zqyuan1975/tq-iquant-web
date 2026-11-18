@@ -53,6 +53,8 @@ def serialize_strategy(s: Strategy) -> dict:
         "regime_filter_enabled": bool(s.regime_filter_enabled) if s.regime_filter_enabled is not None else False,
         "trend_trailing_stop_ratio": float(s.trend_trailing_stop_ratio) if s.trend_trailing_stop_ratio is not None else None,
         "trend_max_positions": s.trend_max_positions,
+        # E3 策略级门控覆盖（默认 inherit=跟随组合）
+        "market_gate_mode": getattr(s, "market_gate_mode", None) or "inherit",
         # #3 策略级敞口上限（默认关）
         "exposure_cap_enabled": bool(s.exposure_cap_enabled) if s.exposure_cap_enabled is not None else False,
         # 策略级单笔最大买入金额（元，None=不限）
@@ -314,6 +316,7 @@ def _create_strategies_two_step(db: Session, pid: int, strategies: list) -> None
             regime_filter_enabled=getattr(s, "regime_filter_enabled", False),
             trend_trailing_stop_ratio=getattr(s, "trend_trailing_stop_ratio", None),
             trend_max_positions=getattr(s, "trend_max_positions", None),
+            market_gate_mode=getattr(s, "market_gate_mode", "inherit") or "inherit",
             exposure_cap_enabled=getattr(s, "exposure_cap_enabled", False),
             max_order_amount=getattr(s, "max_order_amount", None),
             requote_enabled=getattr(s, "requote_enabled", False),
@@ -454,6 +457,13 @@ def _apply_strategy_fields(s: Strategy, req, is_update: bool = False) -> None:
     _apply_opt("regime_filter_enabled", False)
     _apply_opt("trend_trailing_stop_ratio", None)
     _apply_opt("trend_max_positions", None)
+    # E3 策略级门控覆盖（inherit/off/on；缺省字段回落 inherit，旧请求行为不变）
+    _mode = getattr(req, "market_gate_mode", None)
+    if _mode is not None:
+        _mode = str(_mode).strip().lower()
+        if _mode not in ("inherit", "off", "on"):
+            raise ValueError("market_gate_mode 需为 inherit/off/on")
+    s.market_gate_mode = _mode or "inherit"
     # #3 策略级敞口上限（默认关；缺省字段回落 False，保持旧请求行为不变）
     s.exposure_cap_enabled = getattr(req, "exposure_cap_enabled", False)
     # 单笔最大买入金额（None=不限；缺省字段回落 None，保持旧请求行为不变）

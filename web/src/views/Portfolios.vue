@@ -9,7 +9,7 @@ import {
 } from '../api'
 import PageHeader from '../components/PageHeader.vue'
 import { BENCHMARKS, DEFAULT_BENCHMARK } from '../utils/benchmarks'
-import { MARKET_GATE_ENGINES, MARKET_GATE_VOTE_MODES } from '../utils/marketGate'
+import { MARKET_GATE_ENGINES, MARKET_GATE_MODES, MARKET_GATE_VOTE_MODES } from '../utils/marketGate'
 
 // ===== 数据 =====
 const portfolios = ref<PortfolioItem[]>([])
@@ -205,6 +205,7 @@ const STRATEGY_GROUPS: { title: string; hint?: string; fields: FieldMeta[] }[] =
     { key: 'rotation_hysteresis', label: '轮动滞后', span: 1, type: 'percent', placeholder: '5', showIf: { key: 'rotation_enabled', equals: true } },
     { key: 'trend_trailing_stop_ratio', label: '趋势移动止损', span: 1, type: 'percent', placeholder: '3', showIf: { key: 'regime_filter_enabled', equals: true } },
     { key: 'trend_max_positions', label: '趋势最大持仓', span: 1, type: 'number', placeholder: '5', showIf: { key: 'regime_filter_enabled', equals: true } },
+    { key: 'market_gate_mode', label: '门控覆盖', span: 1, type: 'select', options: 'gateModes', hint: 'inherit=跟随组合（默认）/ off=本策略不受门控 / on=组合未开也强制' },
     { key: 'exposure_cap_enabled', label: '策略级敞口上限', span: 2, type: 'switch', hint: '总持仓市值 ≤ capital_ratio × 初始资金' },
   ]},
   { title: '实盘预警调度（信号推送时机）', hint: '实盘预警（alert 半自动）按此调度推送；每日收盘后发信号请设 15:05，次日开盘操作。注意：本组只管「什么时候推送信号」，不决定信号算出来后什么时候下单（下单时点见下方「执行控制」的风控执行时点）。', fields: [
@@ -241,6 +242,7 @@ function emptyStrategyForm(): Record<string, any> {
     add_position_ratio: 0.1, reduce_position_ratio: 0.3,
     rotation_enabled: false, rotation_momentum_bars: 20, rotation_hysteresis: 0.05,
     regime_filter_enabled: false, trend_trailing_stop_ratio: null, trend_max_positions: null,
+    market_gate_mode: 'inherit',
     exposure_cap_enabled: false,
     max_order_amount: null,
     requote_enabled: false, requote_max_attempts: 2,
@@ -670,6 +672,7 @@ function openEditStrategy(pid: number, s: StrategyDetail) {
     rotation_enabled: s.rotation_enabled, rotation_momentum_bars: s.rotation_momentum_bars,
     rotation_hysteresis: s.rotation_hysteresis, regime_filter_enabled: s.regime_filter_enabled,
     trend_trailing_stop_ratio: s.trend_trailing_stop_ratio, trend_max_positions: s.trend_max_positions,
+    market_gate_mode: s.market_gate_mode || 'inherit',
     exposure_cap_enabled: s.exposure_cap_enabled,
     max_order_amount: s.max_order_amount ?? null,
     requote_enabled: s.requote_enabled ?? false,
@@ -771,6 +774,7 @@ function optionsOf(src: string | undefined, pid?: number) {
   ]
   if (src === 'gateEngines') return MARKET_GATE_ENGINES.map(e => ({ value: e.value, label: e.label }))
   if (src === 'gateVoteModes') return MARKET_GATE_VOTE_MODES.map(e => ({ value: e.value, label: e.label }))
+  if (src === 'gateModes') return MARKET_GATE_MODES.map(e => ({ value: e.value, label: e.label }))
   if (src === 'signalFrequencies') return [
     { value: null, label: '跟随周期（period）' },
     ...SIGNAL_FREQUENCIES.map(f => ({ value: f, label: f })),

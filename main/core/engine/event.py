@@ -41,6 +41,9 @@ class SignalEvent:
     signal_name: str
     signal_type: SignalType
     bar_time: datetime
+    # E3 空头减仓档：本单专用减仓比例（None=沿用策略 reduce_position_ratio）。
+    # 仅 Portfolio 内部生成的 gate_bear_reduce 信号会填，公式/风控信号保持 None。
+    reduce_ratio: Optional[Decimal] = None
 
 
 @dataclass

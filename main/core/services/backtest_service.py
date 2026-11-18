@@ -59,6 +59,7 @@ from core.engine.market_gate import (
     MarketGateTracker,
     MarketGateUnavailableError,
     compute_gate_states,
+    gate_enabled_for,
     parse_gate_indices,
     parse_tdx_gate_outputs,
 )
@@ -3813,10 +3814,7 @@ def run_backtest(db: Session, ps: PortfolioStrategy, req,
     # 在写 record 之前构建：取数/公式失败 → ValueError（路由层转 HTTP 400），
     # 不产生一条"已创建但必然失败"的 running 记录。
     _gate_req = getattr(req, "market_gate_enabled", None)
-    gate_enabled = (
-        bool(getattr(ps, "market_gate_enabled", False))
-        if _gate_req is None else bool(_gate_req)
-    )
+    gate_enabled = gate_enabled_for(ps, strategies, _gate_req)
     gate_tracker = build_gate_tracker(
         ps, req.start_date, req.end_date, enabled=gate_enabled)
     gate_snapshot = gate_summary(gate_tracker, ps)
@@ -4312,11 +4310,9 @@ def run_multi_backtest(db: Session, portfolios: list, req) -> dict:
         _basis = daily_loss_basis if daily_loss_basis in ("equity", "initial") else (
             getattr(ps, "daily_loss_basis", None) or "equity")
         portfolio.risk_manager.daily_loss_on_equity_enabled = (_basis != "initial")
-        # 市场多空门控：run 级三态覆盖（None=跟随组合）
+        # 市场多空门控：run 级三态覆盖（None=跟随组合；策略 on 可单独启用）
         _gate_req = getattr(req, "market_gate_enabled", None)
-        gate_enabled = (
-            bool(getattr(ps, "market_gate_enabled", False))
-            if _gate_req is None else bool(_gate_req))
+        gate_enabled = gate_enabled_for(ps, strategies, _gate_req)
         tracker = build_gate_tracker(
             ps, start_date, end_date, enabled=gate_enabled)
         gate_trackers[ps.id] = tracker

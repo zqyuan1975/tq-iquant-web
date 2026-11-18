@@ -92,6 +92,19 @@ def test_single_index_defaults_match_plain_tracker():
         assert (composite.state_for(d) == 1) == (plain.state_for(d) in (1, 2))
 
 
+def test_gate_enabled_for_strategy_force_on():
+    from core.engine.market_gate import gate_enabled_for
+
+    ps = SimpleNamespace(market_gate_enabled=False)
+    assert gate_enabled_for(ps) is False
+    assert gate_enabled_for(ps, [SimpleNamespace(market_gate_mode="inherit")]) is False
+    assert gate_enabled_for(ps, [SimpleNamespace(market_gate_mode="on")]) is True
+    assert gate_enabled_for(ps, [SimpleNamespace(market_gate_mode="on")],
+                            requested=False) is False
+    assert gate_enabled_for(SimpleNamespace(market_gate_enabled=True),
+                            [SimpleNamespace(market_gate_mode="off")]) is True
+
+
 def test_build_gate_tracker_dispatches_composite(monkeypatch):
     from core.services import backtest_service as bt
 

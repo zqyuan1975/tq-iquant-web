@@ -22,6 +22,13 @@ export const MARKET_GATE_ENGINES = [
   { value: 'tdx', label: '通达信公式库（tdx）' },
 ]
 
+// E3 策略级门控覆盖模式（与后端 market_gate_mode 同集合）
+export const MARKET_GATE_MODES = [
+  { value: 'inherit', label: '跟随组合（inherit，默认）' },
+  { value: 'off', label: '本策略不门控（off）' },
+  { value: 'on', label: '强制启用（on）' },
+]
+
 // E3 多指数投票模式（与后端 market_gate_vote_mode 同集合）
 export const MARKET_GATE_VOTE_MODES = [
   { value: 'any', label: '任一空头即拦（any，默认）' },

@@ -35,6 +35,9 @@ class StrategyContext:
         regime_filter_enabled: bool = False,
         trend_trailing_stop_ratio: Optional[Decimal] = None,
         trend_max_positions: Optional[int] = None,
+        # E3 策略级门控覆盖（默认 inherit=跟随组合）：off=本策略不受门控 /
+        # on=组合未开总开关时也强制对本策略生效
+        market_gate_mode: str = "inherit",
         # #3 策略级敞口上限（默认关）：BUY 审批加卡策略总持仓市值
         # ≤ capital_ratio × 组合初始资金（回测/实盘成交步传入生效）
         exposure_cap_enabled: bool = False,
@@ -93,6 +96,8 @@ class StrategyContext:
         self.regime_filter_enabled = regime_filter_enabled
         self.trend_trailing_stop_ratio = trend_trailing_stop_ratio
         self.trend_max_positions = trend_max_positions
+        # E3 策略级门控覆盖（inherit/off/on）
+        self.market_gate_mode = market_gate_mode or "inherit"
         # #3 策略级敞口上限开关（默认关，关闭时审批行为与原逻辑一致）
         self.exposure_cap_enabled = exposure_cap_enabled
         # 单笔最大买入金额（None=不限，关闭时审批行为与原逻辑一致）

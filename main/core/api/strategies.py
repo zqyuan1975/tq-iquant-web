@@ -80,6 +80,8 @@ class StrategyItem(BaseModel):
     regime_filter_enabled: bool = False
     trend_trailing_stop_ratio: float | None = None
     trend_max_positions: int | None = None
+    # E3 策略级门控覆盖（inherit=跟随组合（默认）/off=本策略不受门控/on=组合未开也强制）
+    market_gate_mode: str | None = None
     # #3 策略级敞口上限（默认关）：回测 BUY 审批卡策略总持仓市值 ≤ capital_ratio × 初始资金
     exposure_cap_enabled: bool = False
     # 策略级单笔最大买入金额（元，None=不限）：BUY 审批金额超此值缩量到整手股数
@@ -551,6 +553,8 @@ class StrategyCreate(BaseModel):
     regime_filter_enabled: bool = False
     trend_trailing_stop_ratio: float | None = None
     trend_max_positions: int | None = None
+    # E3 策略级门控覆盖（inherit=跟随组合（默认）/off=本策略不受门控/on=组合未开也强制）
+    market_gate_mode: str | None = None
     # #3 策略级敞口上限（默认关）：回测 BUY 审批卡策略总持仓市值 ≤ capital_ratio × 初始资金
     exposure_cap_enabled: bool = False
     # 策略级单笔最大买入金额（元，None=不限）：BUY 审批金额超此值缩量到整手股数

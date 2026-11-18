@@ -132,3 +132,62 @@ def test_gate_none_unchanged():
     bar = _bar(date(2025, 6, 17))
     orders = p._signal_to_order(ctx, _sig(SignalType.OPEN), bar)
     assert len(orders) == 1
+
+
+# ---------------- E3：策略级覆盖 + 空头减仓档 ----------------
+
+def test_strategy_off_bypasses_gate():
+    """策略 market_gate_mode=off → 组合空头也放行本策略 OPEN。"""
+    p, ctx = _mk_portfolio(gate=_tracker({date(2025, 6, 16): -1}))
+    ctx.market_gate_mode = "off"
+    bar = _bar(date(2025, 6, 17))
+    orders = p._signal_to_order(ctx, _sig(SignalType.OPEN), bar)
+    assert len(orders) == 1
+
+
+def test_bear_reduce_signal_once_per_episode():
+    """空头减仓档：每段每只持仓一条 REDUCE，转多后重置可再触发。"""
+    p, ctx = _held_ctx(*_mk_portfolio(gate=_tracker({date(2025, 6, 16): -1})))
+    p.gate_bear_reduce_ratio = Decimal("0.5")
+    bar = _bar(date(2025, 6, 17))
+    first = p._gate_bear_reduce_signals(ctx, bar)
+    assert len(first) == 1
+    assert first[0].signal_type == SignalType.REDUCE
+    assert first[0].reduce_ratio == Decimal("0.5")
+    # 同段内第二次（同/次日）不重复减
+    assert p._gate_bear_reduce_signals(ctx, bar) == []
+
+    # 转多头（状态日 17 日，18 日查询生效）→ 清空 episode
+    p.current_market_gate = _tracker({date(2025, 6, 16): -1, date(2025, 6, 17): 1})
+    assert p._gate_bear_reduce_signals(ctx, _bar(date(2025, 6, 18))) == []
+    # 再回空头 → 重新允许减一次
+    p.current_market_gate = _tracker({date(2025, 6, 16): -1, date(2025, 6, 17): 1,
+                                      date(2025, 6, 18): -1})
+    again = p._gate_bear_reduce_signals(ctx, _bar(date(2025, 6, 19)))
+    assert len(again) == 1
+
+
+def test_bear_reduce_disabled_when_ratio_zero_or_strategy_off():
+    p, ctx = _held_ctx(*_mk_portfolio(gate=_tracker({date(2025, 6, 16): -1})))
+    bar = _bar(date(2025, 6, 17))
+    assert p._gate_bear_reduce_signals(ctx, bar) == []  # 默认比例 0
+
+    p.gate_bear_reduce_ratio = Decimal("0.5")
+    ctx.market_gate_mode = "off"
+    assert p._gate_bear_reduce_signals(ctx, bar) == []
+
+
+def test_reduce_order_uses_signal_ratio():
+    """带 reduce_ratio 的 REDUCE 信号按该比例出单，不读策略默认比例。"""
+    p, ctx = _held_ctx(*_mk_portfolio(gate=_tracker({date(2025, 6, 16): -1})))
+    ctx.reduce_position_ratio = Decimal("0.3")
+    bar = _bar(date(2025, 6, 17))
+    sig = SignalEvent(strategy_id=1, stock_code=CODE, signal_name="gate_bear_reduce",
+                      signal_type=SignalType.REDUCE,
+                      bar_time=datetime(2025, 6, 17, 15, 0),
+                      reduce_ratio=Decimal("0.5"))
+    orders = p._signal_to_order(ctx, sig, bar)
+    assert len(orders) == 1
+    assert orders[0].trade_type == TradeType.SELL
+    assert orders[0].quantity == 500
+

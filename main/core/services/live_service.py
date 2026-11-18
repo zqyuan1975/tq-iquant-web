@@ -67,6 +67,7 @@ from core.engine.position import Position
 from core.engine.format import dec_money
 from core.engine.decision import summarize_decisions
 from core.engine.crisis_alpha import DEFAULT_BENCHMARK_CODE
+from core.engine.market_gate import gate_enabled_for
 from core.engine.event import TradeEvent
 from core.tq.formula import TQFormula
 from core.tq.alert import TQAlert
@@ -1104,7 +1105,7 @@ def build_engine(
         portfolios.append(port)
         baseline_weights.append((port, weight))
         benchmark_codes[ps.id] = getattr(ps, "benchmark_index", None) or DEFAULT_BENCHMARK_CODE
-        if getattr(ps, "market_gate_enabled", False):
+        if gate_enabled_for(ps, strategies):
             gate_specs[ps.id] = {
                 "portfolio_id": ps.id,
                 "market_gate_enabled": True,

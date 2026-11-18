@@ -159,6 +159,11 @@ class Portfolio:
         # CLOSE/REDUCE/止损/止盈/移动止损一律不受影响。查询一律右移一日
         # （昨日收盘状态管今日开仓），见 core/engine/market_gate.py。
         self.current_market_gate = None
+        # E3 空头减仓档（组合级，默认 0=关闭）：空头连续段内每只持仓减仓一次。
+        # 0 时零开销、行为与接线前逐字一致。
+        self.gate_bear_reduce_ratio: Decimal = Decimal("0")
+        # {(strategy_id, code)}：本空头连续段内已减过仓的持仓，转多/未定时清空。
+        self._gate_bear_episode: set = set()
         # 公司行为（2026-11-18，J1/J2）：手工事件时间线，None = 未启用（默认）。
         # 由 backtest_service / live_service 在组合开关打开时注入；注入后
         # BacktestEngine / LiveEngine 每交易日调一次 corporate_actions.apply_day。
@@ -296,13 +301,16 @@ class Portfolio:
                           % (sig.stock_code, last, elapsed, days - elapsed, days))
         return True
 
-    def _gate_blocks(self, trade_time) -> bool:
+    def _gate_blocks(self, trade_time, ctx=None) -> bool:
         """市场多空门控闸：基准指数空头状态 → True（禁止开仓/加仓）。
 
         ``current_market_gate`` 为 None（未启用/注入失败）时恒 False，行为与
         接线前逐字一致。tracker 内部右移一日（取严格早于 trade_time 日期的最
         近状态日），因此本方法只用事实上的「昨日状态」，绝不使用当日收盘信息。
+        E3 策略级覆盖：ctx.market_gate_mode == "off" → 本策略不受门控。
         """
+        if ctx is not None and getattr(ctx, "market_gate_mode", "inherit") == "off":
+            return False
         tracker = self.current_market_gate
         if tracker is None:
             return False
@@ -312,6 +320,52 @@ class Portfolio:
             # 门控查询异常一律放行（fail-open）：不能让基准状态问题变成"永不开仓"
             logger.warning("市场门控查询异常，本次放行（fail-open）", exc_info=True)
             return False
+
+    def _gate_bear_reduce_signals(self, ctx: StrategyContext, bar: BarEvent) -> List[SignalEvent]:
+        """E3 空头减仓档：空头连续段内每只持仓减仓一次（默认 0=关闭）。
+
+        与开仓闸同源（tracker 右移一日）；策略级 market_gate_mode="off" 跳过。
+        只产生 REDUCE 信号，实际数量/整手/T+1/卖出范围仍走既有卖出路径。
+        """
+        tracker = self.current_market_gate
+        ratio = self.gate_bear_reduce_ratio
+        if tracker is None or ratio is None or ratio <= 0:
+            return []
+        if getattr(ctx, "market_gate_mode", "inherit") == "off":
+            return []
+        try:
+            blocked = bool(tracker.blocks(bar.bar_time.date()))
+        except Exception:  # noqa: BLE001
+            logger.warning("市场门控减仓查询异常，本 bar 跳过减仓（fail-open）",
+                           exc_info=True)
+            return []
+        if not blocked:
+            # 空头段结束：下次再进空头重新计一次
+            self._gate_bear_episode.clear()
+            return []
+        out: List[SignalEvent] = []
+        for stock_code, pos in self._iter_positions(ctx):
+            if pos.quantity <= 0 or stock_code not in bar.stocks:
+                continue
+            key = (ctx.strategy_id, stock_code)
+            if key in self._gate_bear_episode:
+                continue
+            self._gate_bear_episode.add(key)
+            sig = SignalEvent(
+                strategy_id=ctx.strategy_id,
+                stock_code=stock_code,
+                signal_name="gate_bear_reduce",
+                signal_type=SignalType.REDUCE,
+                bar_time=bar.bar_time,
+                reduce_ratio=ratio,
+            )
+            out.append(sig)
+            self._rec("market_gate_bear_reduce", "signal_gate", "reduce",
+                      ctx, sig, bar,
+                      param_name="market_gate_bear_reduce_ratio",
+                      param_value=float(ratio),
+                      message="市场门控空头：本段首次按 %s 减仓" % fmt_pct(ratio))
+        return out
 
     def _book_guard(self):
         """账本锁上下文（P0-2）：实盘返回注入的 RLock，回测返回 nullcontext。
@@ -624,8 +678,12 @@ class Portfolio:
         # 风控检查：对每只持仓股票检查止损/止盈/移动止损
         risk_signals = self._check_risks(ctx, bar, skip_codes=skip_risk_codes)
 
+        # E3 空头减仓档（默认关）：每空头连续段内每只持仓只减一次
+        bear_signals = (
+            self._gate_bear_reduce_signals(ctx, bar) if include_signals else []
+        )
         # 合并并按优先级排序：风控优先，公式按 CLOSE>REDUCE>ADD>OPEN
-        all_signals = risk_signals + signals
+        all_signals = risk_signals + signals + bear_signals
         all_signals.sort(key=lambda s: _signal_priority(s.signal_type))
 
         orders: List[OrderEvent] = []
@@ -914,22 +972,27 @@ class Portfolio:
             if pos is None or pos.quantity == 0:
                 return []
             lot = self._lot(sig.stock_code)
+            # E3：信号级 reduce_ratio（空头减仓档）优先，否则用策略默认减仓比例
+            reduce_ratio = (
+                sig.reduce_ratio if getattr(sig, "reduce_ratio", None) is not None
+                else ctx.reduce_position_ratio
+            )
             # 卖出范围口径：先按意图量收窄（platform_only 夹到平台仓），再按整手向下取整
             intent = self._scope_sell_quantity(
-                ctx, sig, bar, pos, int(pos.quantity * ctx.reduce_position_ratio))
+                ctx, sig, bar, pos, int(pos.quantity * reduce_ratio))
             quantity = intent // lot * lot
             if quantity < lot:
                 logger.debug(
                     "REDUCE 拦截:计算量 %d <%d（%s 持仓 %d × reduce_ratio %s）",
-                    quantity, lot, sig.stock_code, pos.quantity, ctx.reduce_position_ratio,
+                    quantity, lot, sig.stock_code, pos.quantity, reduce_ratio,
                 )
                 self._rec("reduce_qty_too_small", "signal_gate", "block", ctx, sig, bar,
                           param_name="reduce_position_ratio",
-                          param_value=float(ctx.reduce_position_ratio),
+                          param_value=float(reduce_ratio),
                           actual_value=float(quantity),
                           requested_qty=pos.quantity,
                           message="REDUCE 减仓比例 %s × 持仓 %d 向下取整后 %d 股 <%d"
-                                  % (fmt_pct(ctx.reduce_position_ratio), pos.quantity,
+                                  % (fmt_pct(reduce_ratio), pos.quantity,
                                      quantity, lot))
                 return []
             trade_type = TradeType.SELL
@@ -950,7 +1013,7 @@ class Portfolio:
             # 市场多空门控（2026-11-18）：基准指数空头状态禁止开新仓（持仓不强平）。
             # 放在冷静期之后、max_holdings/槽位闸之前——与冷静期同属"开新仓"闸；
             # 轮动换入（_try_rotation）同样受此闸约束。
-            if self._gate_blocks(bar.bar_time):
+            if self._gate_blocks(bar.bar_time, ctx):
                 self._rec("market_gate", "signal_gate", "block", ctx, sig, bar,
                           message="市场门控为空头，跳过开仓")
                 return []
@@ -1047,7 +1110,7 @@ class Portfolio:
                 return []
             # 市场多空门控（2026-11-18）：基准指数空头状态禁止加仓（持仓不强平）。
             # 与 OPEN 同一闸；减仓/清仓/风控卖出不受影响。
-            if self._gate_blocks(bar.bar_time):
+            if self._gate_blocks(bar.bar_time, ctx):
                 self._rec("market_gate", "signal_gate", "block", ctx, sig, bar,
                           message="市场门控为空头，跳过加仓")
                 return []
