@@ -11,7 +11,7 @@
 """
 import logging
 import time
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from typing import Dict, Optional, Tuple
 
 from core.engine.crisis_alpha import CRISIS_BENCHMARKS
@@ -20,12 +20,16 @@ from core.engine.market_gate import (
     MarketGateUnavailableError,
     compute_gate_states,
 )
+from core.engine.market_rules import trading_days_between
 from core.services.backtest_service import build_gate_ohlcv
 
 logger = logging.getLogger(__name__)
 
 # 门控默认基准（与组合层新建默认一致）：中证全指
 DEFAULT_GATE_INDEX = "000985.CSI"
+
+# E4：状态数据落后超过 N 个交易日 → 标记陈旧（前端标黄，提示可能不准）。
+GATE_STALE_TRADING_DAYS = 3
 
 # 缓存 TTL：5 分钟。刷新按钮走 ``force=True`` 绕过缓存（用户显式要求最新）。
 _CACHE_TTL_SECONDS = 300
@@ -46,6 +50,32 @@ def _transitions(days: list, states: dict, limit: int) -> list:
             out.append({"date": d.isoformat(), "state": cur})
         prev = cur
     return list(reversed(out[-limit:])) if limit > 0 else []
+
+
+def _last_trading_day_on_or_before(day: date) -> date:
+    """往前找最近的交易日（周末 + 内置休市表；表未收录年份按仅周末）。"""
+    from core.engine.live.calendar import BUILTIN_CLOSURES
+
+    d = day
+    for _ in range(3700):
+        if d.weekday() < 5 and d not in BUILTIN_CLOSURES.get(
+                d.year, frozenset()):
+            return d
+        d -= timedelta(days=1)
+    return d
+
+
+def expected_latest_trading_day(now: Optional[datetime] = None) -> date:
+    """应有完整日线落定的最近交易日。
+
+    15:00 前今天尚未收盘，预期最新完整日线为「今天之前」的最后一个交易日；
+    15:00 后（含）今天的日线应已可算，若非交易日则前移。
+    """
+    now = now or datetime.now()
+    today = now.date()
+    anchor = (today if (now.hour, now.minute) >= (15, 0)
+              else today - timedelta(days=1))
+    return _last_trading_day_on_or_before(anchor)
 
 
 def _compute(code: str, period: str, count: int, history: int) -> dict:
@@ -76,6 +106,11 @@ def _compute(code: str, period: str, count: int, history: int) -> dict:
         idx -= 1
     since = days[idx]
     duration = len(days) - idx
+    # E4：数据新鲜度 —— 与「应已落定的最近交易日」比对，超过 N 个交易日标黄。
+    latest = expected_latest_trading_day()
+    stale_days = trading_days_between(as_of, latest)
+    if latest <= as_of:
+        stale_days = 0
     return {
         "code": code,
         "benchmark_name": _BENCHMARK_NAMES.get(code, code),
@@ -88,6 +123,9 @@ def _compute(code: str, period: str, count: int, history: int) -> dict:
         "duration_bars": int(duration),
         "transitions": _transitions(days, states, history),
         "bars": len(days),
+        "latest_trading_day": latest.isoformat(),
+        "stale_days": int(stale_days),
+        "stale": bool(stale_days >= GATE_STALE_TRADING_DAYS),
     }
 
 

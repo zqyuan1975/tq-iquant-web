@@ -65,6 +65,46 @@ def test_payload_shape_and_transitions(monkeypatch):
         date.fromisoformat(item["date"])
 
 
+def test_expected_latest_trading_day_respects_close_time():
+    # 2026-11-18 是周三；15:00 前预期为前一交易日，15:00 后为当日
+    assert svc.expected_latest_trading_day(
+        datetime(2026, 11, 18, 10, 0)) == date(2026, 11, 17)
+    assert svc.expected_latest_trading_day(
+        datetime(2026, 11, 18, 15, 30)) == date(2026, 11, 18)
+
+
+def test_expected_latest_trading_day_skips_weekend_and_holiday():
+    # 周六 → 上周五
+    assert svc.expected_latest_trading_day(
+        datetime(2026, 11, 21, 10, 0)) == date(2026, 11, 20)
+    # 国庆（10/1 休市）→ 9/30
+    assert svc.expected_latest_trading_day(
+        datetime(2026, 10, 1, 10, 0)) == date(2026, 9, 30)
+
+
+def test_stale_flag_and_days(monkeypatch):
+    df = _ohlcv()
+    monkeypatch.setattr(svc, "build_gate_ohlcv", lambda *a, **k: df)
+    data = svc.fetch_gate_status()
+    as_of = date.fromisoformat(data["as_of"])
+
+    svc.clear_cache()
+    monkeypatch.setattr(
+        svc, "expected_latest_trading_day", lambda now=None: as_of)
+    fresh = svc.fetch_gate_status()
+    assert fresh["stale"] is False
+    assert fresh["stale_days"] == 0
+    assert fresh["latest_trading_day"] == as_of.isoformat()
+
+    svc.clear_cache()
+    monkeypatch.setattr(
+        svc, "expected_latest_trading_day",
+        lambda now=None: as_of + timedelta(days=10))
+    old = svc.fetch_gate_status()
+    assert old["stale"] is True
+    assert old["stale_days"] >= svc.GATE_STALE_TRADING_DAYS
+
+
 def test_empty_ohlcv_raises(monkeypatch):
     monkeypatch.setattr(svc, "build_gate_ohlcv", lambda *a, **k: pl.DataFrame())
     with pytest.raises(MarketGateUnavailableError):

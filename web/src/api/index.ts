@@ -639,6 +639,10 @@ export interface MarketGateStatusItem {
   duration_bars: number      // 持续交易日数（含起始日与 as_of）
   transitions: MarketGateTransition[]  // 最近 N 次转折（新→旧）
   bars: number               // 参与计算的 K 线根数
+  // E4 数据新鲜度：预期最新交易日 / 落后交易日数 / 是否超阈值（标黄提示）
+  latest_trading_day?: string
+  stale_days?: number
+  stale?: boolean
   cached: boolean
 }
 
