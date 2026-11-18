@@ -252,6 +252,10 @@ export interface DecisionEventItem {
   final_qty: number | null
   message: string | null
   created_at?: string | null
+  // M4 确认/关闭：open 未处理 / acked 已确认（日终清零等同 acked）
+  ack_status?: 'open' | 'acked' | null
+  ack_note?: string | null
+  ack_at?: string | null
 }
 
 // 决策闸门聚合统计（summarize_decisions，按 gate+param_name 分组）
@@ -272,6 +276,8 @@ export interface DecisionSummaryItem {
 // 决策事件查询响应（实盘 /decisions；回测详情内嵌同构字段）
 export interface DecisionData {
   summary: DecisionSummaryItem[]
+  // M4：未处理/已确认计数（后端全量口径，不随 ack_status 过滤变化）
+  ack_summary?: { open: number; acked: number }
   events: DecisionEventItem[]
 }
 
@@ -1684,8 +1690,31 @@ export async function getLivePositions(sessionId: number) {
 }
 
 // 决策闸门事件（调参可观测性）：聚合统计 + 逐事件，对齐 live.session_decisions
-export async function getLiveDecisions(sessionId: number) {
-  const res = await api.get<ApiResponse<DecisionData>>(`/live/sessions/${sessionId}/decisions`)
+export async function getLiveDecisions(sessionId: number, ackStatus?: 'open' | 'acked') {
+  const res = await api.get<ApiResponse<DecisionData>>(
+    `/live/sessions/${sessionId}/decisions`,
+    { params: ackStatus ? { ack_status: ackStatus } : undefined },
+  )
+  return res.data.data
+}
+
+/** M4：确认/关闭单条决策事件（幂等，可附处理备注）。 */
+export async function ackLiveDecision(sessionId: number, eventId: number, note?: string) {
+  const res = await api.post<ApiResponse<DecisionEventItem>>(
+    `/live/sessions/${sessionId}/decisions/${eventId}/ack`,
+    note ? { note } : {},
+  )
+  return res.data.data
+}
+
+/** M4：批量确认未处理事件；day_end=true 时备注默认「日终清零」。 */
+export async function ackAllLiveDecisions(
+  sessionId: number, opts?: { note?: string; day_end?: boolean },
+) {
+  const res = await api.post<ApiResponse<{ acked: number; ack_status: string; note: string | null }>>(
+    `/live/sessions/${sessionId}/decisions/ack-all`,
+    opts || {},
+  )
   return res.data.data
 }
 

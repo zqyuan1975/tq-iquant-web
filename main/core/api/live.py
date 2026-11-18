@@ -977,16 +977,45 @@ def session_manual_actions(session_id: int, limit: int = 200,
 
 
 @router.get("/sessions/{session_id}/decisions")
-def session_decisions(session_id: int, db: Session = Depends(get_db)):
+def session_decisions(session_id: int, ack_status: Optional[str] = None,
+                      db: Session = Depends(get_db)):
     """决策闸门事件（调参可观测性）：聚合统计 summary + 原始事件 events。
 
     覆盖信号→成交全链路拦截点（止损/止盈/熔断/资金不足/超仓/收盘/去重/桥拒单…），
-    与回测详情的 decision_summary/decisions 同口径。
+    与回测详情的 decision_summary/decisions 同口径。M4：ack_status=open/acked
+    可过滤未处理/已确认事件，ack_summary 返回两类计数。
     """
-    data = svc.session_decisions(db, session_id)
+    if ack_status not in (None, "", "open", "acked"):
+        return err(400, "ack_status 仅支持 open / acked")
+    data = svc.session_decisions(db, session_id, ack_status or None)
     if data is None:
         return err(404, "资源不存在")
     return ok(data)
+
+
+@router.post("/sessions/{session_id}/decisions/{event_id}/ack")
+def ack_decision(session_id: int, event_id: int,
+                 data: Optional[dict] = None,
+                 db: Session = Depends(get_db)):
+    """M4：确认/关闭单条决策事件，可带处理备注。"""
+    note = (data or {}).get("note")
+    result = svc.ack_decision(db, session_id, event_id, note=note)
+    if result is None:
+        return err(404, "会话或决策事件不存在")
+    return ok(result)
+
+
+@router.post("/sessions/{session_id}/decisions/ack-all")
+def ack_all_decisions(session_id: int, data: Optional[dict] = None,
+                      db: Session = Depends(get_db)):
+    """M4：批量确认未处理事件；day_end=true 时备注默认「日终清零」。"""
+    data = data or {}
+    result = svc.ack_all_decisions(
+        db, session_id, note=data.get("note"),
+        day_end=bool(data.get("day_end")))
+    if result is None:
+        return err(404, "资源不存在")
+    return ok(result)
 
 
 @router.delete("/sessions/{session_id}")

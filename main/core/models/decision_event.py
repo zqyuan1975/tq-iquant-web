@@ -58,8 +58,14 @@ class LiveDecisionEvent(_DecisionEventColumns, Base):
     live_session_id = Column(
         Integer, ForeignKey("live_sessions.id", ondelete="CASCADE"), nullable=False
     )
+    # M4 事件确认/关闭：open（未处理）/ acked（已确认或备注关闭）
+    ack_status = Column(String(16), nullable=False, default="open",
+                        server_default="open")
+    ack_note = Column(String(200), nullable=True)
+    ack_at = Column(DateTime, nullable=True)
 
     __table_args__ = (
         Index("ix_live_decisions_sess_gate", "live_session_id", "gate"),
         Index("ix_live_decisions_sess_bar", "live_session_id", "bar_time"),
+        Index("ix_live_decisions_sess_ack", "live_session_id", "ack_status"),
     )

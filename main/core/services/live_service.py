@@ -4577,6 +4577,10 @@ def serialize_decision(d: LiveDecisionEvent) -> dict:
         "final_qty": d.final_qty,
         "message": d.message,
         "created_at": _iso_utc(d.created_at),
+        # M4 确认/关闭状态：open 未处理 / acked 已确认（含日终清零）
+        "ack_status": getattr(d, "ack_status", None) or "open",
+        "ack_note": getattr(d, "ack_note", None),
+        "ack_at": _iso_utc(getattr(d, "ack_at", None)),
     }
 
 
@@ -4586,11 +4590,13 @@ def serialize_decision(d: LiveDecisionEvent) -> dict:
 _MIN_DECISION_BAR_TIME = datetime(2000, 1, 1)
 
 
-def session_decisions(db: Session, session_id: int) -> Optional[dict]:
+def session_decisions(db: Session, session_id: int,
+                      ack_status: Optional[str] = None) -> Optional[dict]:
     """决策闸门事件：聚合统计 + 原始事件。session 不存在返回 None。
 
     summary 复用 summarize_decisions（与回测详情同口径），按 (gate, param_name)
     分组计数；events 按 bar_time 正序返回（下钻看逐次触发）。
+    ``ack_status`` 可选 open/acked 过滤（M4 事件关闭），ack_summary 始终按全量计。
 
     读取侧年份下限：历史脏行 ``bar_time = 1970-08-23 20:05:06``（旧
     ``parse_bar_time`` 把 ``20261106`` 当 epoch 秒，2026-11-06 一次性写入会话 4
@@ -4612,10 +4618,73 @@ def session_decisions(db: Session, session_id: int) -> Optional[dict]:
         .order_by(LiveDecisionEvent.bar_time, LiveDecisionEvent.id)
         .all()
     )
+    ack_summary = {"open": 0, "acked": 0}
+    for d in rows:
+        status = getattr(d, "ack_status", None) or "open"
+        if status == "acked":
+            ack_summary["acked"] += 1
+        else:
+            ack_summary["open"] += 1
+    if ack_status:
+        rows = [d for d in rows
+                if (getattr(d, "ack_status", None) or "open") == ack_status]
     return {
         "summary": summarize_decisions(rows),
+        "ack_summary": ack_summary,
         "events": [serialize_decision(d) for d in rows],
     }
+
+
+def ack_decision(db: Session, session_id: int, event_id: int,
+                 note: Optional[str] = None) -> Optional[dict]:
+    """M4：确认/关闭单条决策事件；session 或事件不存在返回 None。
+
+    重复确认为幂等覆盖（更新备注与时间），便于补记处理说明。
+    """
+    if not db.query(LiveSession.id).filter(LiveSession.id == session_id).first():
+        return None
+    event = (
+        db.query(LiveDecisionEvent)
+        .filter(LiveDecisionEvent.live_session_id == session_id,
+                LiveDecisionEvent.id == event_id)
+        .first()
+    )
+    if event is None:
+        return None
+    event.ack_status = "acked"
+    event.ack_note = (str(note).strip()[:200] if note not in (None, "") else None)
+    event.ack_at = datetime.now()
+    db.commit()
+    return serialize_decision(event)
+
+
+def ack_all_decisions(db: Session, session_id: int,
+                      note: Optional[str] = None,
+                      day_end: bool = False) -> Optional[dict]:
+    """M4：批量确认当前所有 open 事件；session 不存在返回 None。
+
+    ``day_end=true`` 时备注默认写「日终清零」，用于日终把当天的拦截事件一次性
+    归档，避免天天堆积；已 acked 的事件不重复处理。
+    """
+    if not db.query(LiveSession.id).filter(LiveSession.id == session_id).first():
+        return None
+    rows = (
+        db.query(LiveDecisionEvent)
+        .filter(LiveDecisionEvent.live_session_id == session_id,
+                or_(LiveDecisionEvent.ack_status == "open",
+                    LiveDecisionEvent.ack_status.is_(None)))
+        .all()
+    )
+    resolved_note = str(note).strip()[:200] if note not in (None, "") else None
+    if resolved_note is None and day_end:
+        resolved_note = "日终清零"
+    now = datetime.now()
+    for event in rows:
+        event.ack_status = "acked"
+        event.ack_note = resolved_note
+        event.ack_at = now
+    db.commit()
+    return {"acked": len(rows), "ack_status": "acked", "note": resolved_note}
 
 
 def serialize_signal(s: LiveSignal) -> dict:

@@ -17,6 +17,7 @@ import {
 } from '../utils/liveWorkbench'
 import {
   getLiveOrders, getLiveTrades, getLivePositions, getLiveDecisions, getLiveSignals, getPortfolios,
+  ackLiveDecision, ackAllLiveDecisions,
   getLiveSessions, getLiveSession, createLiveSession, startLiveSession, stopLiveSession, deleteLiveSession,
   recoverLiveBreaker, getLiveChannel, testLiveChannel, sendUserBlock, getFormulas, getWatchdogStatus,
   getLiveAccountPreview, resetLiveBaseline,
@@ -373,6 +374,10 @@ const TAB_LABEL: Record<WbTab, string> = {
 // 旧版只有挂载/切会话/reconnect/「刷新持仓」按钮会重拉历史，收盘后看当天移动止损与
 // 顺延事件常常是空表（页签没数据也没入口）——这里给决策页签独立刷新入口。
 const decisionsLoading = ref(false)
+/** M4：未处理/已确认计数（后端全量口径）。 */
+const decisionAckSummary = ref<{ open: number; acked: number }>({ open: 0, acked: 0 })
+/** 正在确认的事件 id（按钮防重）。 */
+const ackingEventId = ref<number | null>(null)
 /** 顺延待次日提交筛选开关（汇总条点击切换；只筛事件表，不动上方聚合统计）。 */
 const decOnlyDeferred = ref(false)
 /** 顺延待次日提交（gate=signal_bar_date / action=defer）的笔数（随筛选区间重算）。 */
@@ -393,6 +398,38 @@ async function reloadDecisions() {
     const dec = await getLiveDecisions(id).catch(() => null)
     if (activeSessionId !== id) return
     decisions.value = dec ? decisionHistoryToRows(dec.events) : []
+    decisionAckSummary.value = dec?.ack_summary || { open: 0, acked: 0 }
+  } finally {
+    decisionsLoading.value = false
+  }
+}
+
+/** M4：确认单条事件（附带「人工确认」备注，刷新计数与状态）。 */
+async function ackDecisionRow(d: DecisionRow) {
+  const sid = activeSessionId
+  if (sid === null || !d.id || ackingEventId.value === d.id) return
+  ackingEventId.value = d.id
+  try {
+    await ackLiveDecision(sid, d.id, '人工确认')
+    await reloadDecisions()
+  } catch {
+    /* 失败保持原状，用户可重试 */
+  } finally {
+    ackingEventId.value = null
+  }
+}
+
+/** M4：日终清零——把所有未处理事件批量标记为已确认。 */
+async function ackAllDayEnd() {
+  const sid = activeSessionId
+  if (sid === null) return
+  if (!window.confirm('将当前所有未处理的决策/拦截事件标记为已确认（日终清零）？')) return
+  decisionsLoading.value = true
+  try {
+    await ackAllLiveDecisions(sid, { day_end: true })
+    await reloadDecisions()
+  } catch {
+    /* 失败保持原状，用户可重试 */
   } finally {
     decisionsLoading.value = false
   }
@@ -591,6 +628,7 @@ async function loadHistory(id: number) {
     trades.value = tradeHistoryToRows(trd)
     // 决策历史：逐事件（旧库/迁移未应用时端点 404 → 兜底空）；聚合统计前端按筛选区重算
     decisions.value = dec ? decisionHistoryToRows(dec.events) : []
+    decisionAckSummary.value = dec?.ack_summary || { open: 0, acked: 0 }
     // 预警信号：alert 模式主产物；auto 模式下也可能有信号落库
     signals.value = sig?.items ?? []
     signalsTotal.value = sig?.total ?? 0
@@ -1438,6 +1476,17 @@ onUnmounted(() => {
           <option v-for="opt in TIME_RANGE_OPTIONS" :key="opt.value" :value="opt.value">{{ opt.label }}</option>
         </select>
         <span style="font-size:12px;color:var(--ink-faint)">按北京时间自然日 · 聚合与统计随筛选重算 · 共 {{ filteredDecisions.length }} 条事件</span>
+        <span style="margin-left:auto;font-size:12px;color:var(--ink-soft)">
+          未处理 {{ decisionAckSummary.open }} 条 · 已确认 {{ decisionAckSummary.acked }} 条
+        </span>
+        <button
+          class="btn ghost"
+          data-test="decisions-ack-all"
+          style="font-size:12px;padding:2px 10px"
+          :disabled="decisionsLoading || decisionAckSummary.open === 0"
+          title="把所有未处理的决策/拦截事件标记为已确认（日终清零）"
+          @click="ackAllDayEnd"
+        >全部确认（日终清零）</button>
       </div>
       <!-- 顺延待次日提交汇总：gate=signal_bar_date / action=defer，N=0 不显示。
            点击=把下方事件表筛到这一类（不隐藏入口，再点一次取消），非行高亮。 -->
@@ -1481,7 +1530,7 @@ onUnmounted(() => {
 
       <!-- 逐事件流 -->
       <table>
-        <thead><tr><th>时间（北京时间）</th><th>闸门</th><th>层</th><th>代码</th><th>策略</th><th>阈值</th><th>实际</th><th>请求/实发</th><th>原因</th></tr></thead>
+        <thead><tr><th>时间（北京时间）</th><th>闸门</th><th>层</th><th>代码</th><th>策略</th><th>阈值</th><th>实际</th><th>请求/实发</th><th>原因</th><th>确认</th></tr></thead>
         <tbody>
           <tr v-for="d in decisionRowsView" :key="d.key">
             <td style="color:var(--ink-soft)">{{ d.time || '—' }}</td>
@@ -1493,6 +1542,17 @@ onUnmounted(() => {
             <td>{{ fmtGateVal(d.actual_value) }}</td>
             <td style="text-align:right">{{ qtyPair(d.requested_qty, d.final_qty) }}</td>
             <td style="color:var(--ink-soft);white-space:normal;min-width:160px" :title="d.message">{{ d.message || '—' }}</td>
+            <td style="white-space:nowrap">
+              <span v-if="d.ack_status === 'acked'" class="badge badge-gray" :title="d.ack_note || '已确认'">已确认</span>
+              <button
+                v-else-if="d.id"
+                class="btn ghost"
+                style="font-size:11px;padding:1px 8px"
+                :disabled="ackingEventId === d.id"
+                @click="ackDecisionRow(d)"
+              >确认</button>
+              <span v-else style="color:var(--ink-soft)">—</span>
+            </td>
           </tr>
         </tbody>
       </table>

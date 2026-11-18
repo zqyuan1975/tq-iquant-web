@@ -63,6 +63,7 @@ export interface PositionRow {
 /** 决策闸门事件行（调参可观测性）。 */
 export interface DecisionRow {
   key: number
+  id?: number | null
   time: string
   ts?: number | null
   gate: string
@@ -76,6 +77,9 @@ export interface DecisionRow {
   requested_qty: number | null
   final_qty: number | null
   message: string
+  // M4 确认/关闭状态
+  ack_status?: 'open' | 'acked' | null
+  ack_note?: string | null
 }
 
 type Ev = Record<string, unknown>
@@ -505,6 +509,7 @@ export function decisionHistoryToRows(items: DecisionEventItem[]): DecisionRow[]
     const bt = parseBeijingTime(i.bar_time || undefined)
     return {
       key: -(i.id ?? 0),
+      id: i.id ?? null,
       time: ct.text || bt.text,
       ts: ct.ts ?? bt.ts,
       gate: i.gate,
@@ -518,6 +523,8 @@ export function decisionHistoryToRows(items: DecisionEventItem[]): DecisionRow[]
       requested_qty: i.requested_qty ?? null,
       final_qty: i.final_qty ?? null,
       message: i.message || '',
+      ack_status: i.ack_status ?? 'open',
+      ack_note: i.ack_note ?? null,
     }
   }).reverse()
 }
