@@ -615,6 +615,9 @@ class LiveEngine:
         # 两者缺省(None/空)=不启用，行为与接线前逐字一致。
         gate_provider: Optional[Callable] = None,
         gate_portfolio_ids: Optional[set] = None,
+        # E1（默认关）：顺延次日单 / 盘前集合竞价单在提交前用执行日前一收盘
+        # 的门控状态重判一次，空头则拦下并落决策事件。
+        gate_recheck_on_execute: bool = False,
         # 公司行为（2026-11-18，J1/J2）：corporate_action_specs 为启用组合的标量
         # 配置（不持有 ORM 实例）；corporate_timeline_provider(portfolio_id) 现读
         # 事件表返回 CorporateActionTimeline。两者缺省(None/空)=不启用，行为不变。
@@ -889,6 +892,7 @@ class LiveEngine:
         self._gate_provider = gate_provider
         self._gate_portfolio_ids: set = set(gate_portfolio_ids or ())
         self._gate_updated: Dict[int, date] = {}
+        self._gate_recheck_on_execute = bool(gate_recheck_on_execute)
         # 公司行为（J1/J2，默认关）：组合标量配置 + 时间线提供者 + 每组合每日一次
         # 的应用水位；specs 为空时 _maybe_apply_corporate_actions 第一行即返回。
         self._corporate_action_specs: Dict[int, dict] = dict(corporate_action_specs or {})
@@ -2574,6 +2578,13 @@ class LiveEngine:
                 candidates,
                 key=lambda o: 0 if o.trade_type == TradeType.SELL else 1)
             for order in orders:
+                # E1（默认关）：盘前集合竞价提交前重判门控，空头直接取消
+                recheck_reason = self._gate_recheck_blocked(
+                    portfolio, order, now)
+                if recheck_reason:
+                    self._gate_recheck_cancel(
+                        portfolio, order, now, recheck_reason)
+                    continue
                 order._pre_open_bar_time = order.bar_time  # 原信号 bar 时间（回队恢复）
                 order.bar_time = now  # 决策时间戳语义：本次盘前报单时点
                 price = self._pre_open_price(order)
@@ -6457,6 +6468,76 @@ class LiveEngine:
             logger.exception("组合 %s 退市/停牌强平提交失败（%s）",
                              portfolio.portfolio_id, act.code)
 
+    def _gate_recheck_blocked(self, portfolio: Portfolio, order: OrderEvent,
+                              when: datetime) -> Optional[str]:
+        """E1：执行前重判门控（默认关）。
+
+        仅在该会话开启 ``gate_recheck_on_execute`` 时生效；只拦 BUY（门控只
+        作用于 OPEN/ADD，卖出/风控不受影响）。返回拦截原因文本，None=放行。
+        判定异常一律放行（fail-open，绝不因门控观测问题卡单）。
+        """
+        if not self._gate_recheck_on_execute:
+            return None
+        if order.trade_type != TradeType.BUY:
+            return None
+        tracker = getattr(portfolio, "current_market_gate", None)
+        if tracker is None:
+            return None
+        try:
+            blocked = bool(tracker.blocks(when.date()))
+        except Exception:  # noqa: BLE001
+            logger.warning(
+                "执行前门控重判异常，本次放行（fail-open）", exc_info=True)
+            return None
+        if not blocked:
+            return None
+        try:
+            state = int(tracker.state_for(when.date()))
+            strength = int(tracker.strength_for(when.date()))
+        except Exception:  # noqa: BLE001
+            state, strength = -1, 0
+        return ("执行前重判门控：执行日 %s 基准为空头（state=%s，强度 %s），"
+                "拦下信号日已决策的顺延单" % (when.date().isoformat(),
+                                              state, strength))
+
+    def _gate_recheck_cancel(self, portfolio: Portfolio, order: OrderEvent,
+                             when: datetime, reason: str) -> None:
+        """E1：重判拦下 → 决策事件 + risk 事件 +（若有行）DB 行置 canceled。"""
+        self._rec_live("market_gate_recheck", "block", portfolio, order,
+                       message=reason, bar_time=when)
+        self._emit_risk_safe({
+            "session_id": self.session_id,
+            "rule": "gate_recheck_blocked",
+            "portfolio_id": portfolio.portfolio_id,
+            "strategy_id": order.strategy_id,
+            "stock_code": order.stock_code,
+            "trade_type": order.trade_type.value,
+            "quantity": int(order.quantity),
+            "price": float(order.price) if order.price is not None else None,
+            "signal_bar_date": str(order.signal_bar_date),
+            "exec_date": when.date().isoformat(),
+            "message": reason,
+        })
+        row_id = getattr(order, "_deferred_row_id", None)
+        if not row_id or self._db_session_factory is None:
+            return
+        db = self._db_session_factory()
+        try:
+            row = db.query(LiveOrder).filter(LiveOrder.id == row_id).first()
+            if row is not None:
+                marker = "gate_recheck:%s" % reason
+                row.status = "canceled"
+                row.error_message = (
+                    ((row.error_message + "; ") if row.error_message else "")
+                    + marker)
+                db.commit()
+        except Exception:  # noqa: BLE001 — 观测/落库失败不影响交易主链路
+            db.rollback()
+            logger.warning("重判门控拦单落库失败（session %s）",
+                           self.session_id, exc_info=True)
+        finally:
+            db.close()
+
     def _maybe_update_gate(self, portfolio: Portfolio, bar_date: date) -> None:
         """市场多空门控：每日首根非 baseline bar 更新组合门控状态。
 
@@ -9720,6 +9801,14 @@ class LiveEngine:
                 else:
                     self._expire_deferred_order(order, portfolio, bar_date, due)
                     continue
+            # E1（默认关）：执行前用「执行日之前最近收盘」的门控再判一次，
+            # 空头则取消本单（不拿信号日决策硬执行）。
+            recheck_reason = self._gate_recheck_blocked(
+                portfolio, order, bar.bar_time)
+            if recheck_reason:
+                self._gate_recheck_cancel(
+                    portfolio, order, bar.bar_time, recheck_reason)
+                continue
             order.bar_time = bar.bar_time
             # 价格刷新（P4）：默认用**当日首根 1m bar 开盘价**做限价（对齐回测
             # 「次日开盘成交」，可复现）；取不到首根 open 才退回实时 close 并记
@@ -10161,7 +10250,7 @@ class LiveEngine:
 
     def _rec_live(
         self, gate: str, action: str, portfolio: Portfolio, order: OrderEvent,
-        message: Optional[str] = None,
+        message: Optional[str] = None, bar_time: Optional[datetime] = None,
     ) -> None:
         """记录一条实盘专属闸门事件（收盘/日历/去重/在途/桥拒单）。"""
         self._recorder.record(
@@ -10169,7 +10258,7 @@ class LiveEngine:
             portfolio_id=portfolio.portfolio_id,
             strategy_id=order.strategy_id,
             stock_code=order.stock_code,
-            bar_time=order.bar_time,
+            bar_time=bar_time or order.bar_time,
             message=message,
         )
 

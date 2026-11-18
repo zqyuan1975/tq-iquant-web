@@ -1347,6 +1347,9 @@ def build_engine(
         benchmark_codes=benchmark_codes,
         gate_provider=_gate_provider if gate_specs else None,
         gate_portfolio_ids=set(gate_specs),
+        # E1（默认关）：顺延次日单/盘前竞价单提交前重判门控
+        gate_recheck_on_execute=bool(
+            getattr(session_row, "gate_recheck_on_execute", False)),
         corporate_action_specs=ca_specs or None,
         corporate_timeline_provider=(
             _corporate_timeline_provider if ca_specs else None),
@@ -1456,6 +1459,9 @@ def list_sessions(db: Session, engines: Optional[Dict[int, LiveEngine]] = None) 
             # 错周期 bar 风控（三态原始值：None=跟随全局，true/false=会话覆盖）
             "intraday_mismatched_risk_enabled":
                 s.intraday_mismatched_risk_enabled,
+            # E1：执行前重判门控（默认关）
+            "gate_recheck_on_execute": bool(
+                getattr(s, "gate_recheck_on_execute", False)),
             # A1 资金池：列表回显，编辑弹窗据此预填
             "capital_pool_mode": getattr(s, "capital_pool_mode", None) or "off",
             "capital_pool_rebalance_enabled": bool(
@@ -1629,6 +1635,8 @@ def create_session(db: Session, data: dict, mode: str) -> dict:
         # 错周期 bar 风控（三态）：NULL=跟随全局默认，0/1=会话覆盖
         intraday_mismatched_risk_enabled=normalize_mismatched_risk(
             data.get("intraday_mismatched_risk_enabled")),
+        # E1：执行前重判门控（默认关）
+        gate_recheck_on_execute=bool(data.get("gate_recheck_on_execute")),
         backtest_record_id=backtest_record_id,
     )
     db.add(session)
@@ -1645,6 +1653,8 @@ def create_session(db: Session, data: dict, mode: str) -> dict:
             "backtest_record_id": backtest_record_id,
             "capital_pool_mode": pool_mode,
             "capital_pool_rebalance_enabled": pool_rebalance,
+            "gate_recheck_on_execute": bool(
+                session.gate_recheck_on_execute),
             "warnings": _engine_occupancy_warnings(db, session)}
 
 
@@ -1703,6 +1713,9 @@ def get_session(db: Session, session_id: int, engine: Optional[LiveEngine] = Non
         # 错周期 bar 风控（三态原始值：None=跟随全局，true/false=会话覆盖）
         "intraday_mismatched_risk_enabled":
             session.intraday_mismatched_risk_enabled,
+        # E1：执行前重判门控（默认关）
+        "gate_recheck_on_execute": bool(
+            getattr(session, "gate_recheck_on_execute", False)),
         "status": session.status,
         "started_at": session.started_at,
         "stopped_at": session.stopped_at,
@@ -1773,6 +1786,7 @@ SESSION_EDIT_FIELDS = (
     "advance_close_enabled", "advance_close_time",
     "intraday_mismatched_risk_enabled", "capital_pool_mode",
     "capital_pool_rebalance_enabled", "portfolio_ids",
+    "gate_recheck_on_execute",
 )
 #: 运行中只能「下次启动生效」的字段（name 为纯展示字段，立即生效）。
 SESSION_NEXT_START_FIELDS = frozenset(SESSION_EDIT_FIELDS) - {"name"}
@@ -1871,6 +1885,9 @@ def _normalize_session_patch(db: Session, data: dict,
     if "capital_pool_rebalance_enabled" in data:
         patch["capital_pool_rebalance_enabled"] = bool(
             data.get("capital_pool_rebalance_enabled"))
+    if "gate_recheck_on_execute" in data:
+        patch["gate_recheck_on_execute"] = bool(
+            data.get("gate_recheck_on_execute"))
     if "portfolio_ids" in data:
         pids = data.get("portfolio_ids")
         if not isinstance(pids, list):

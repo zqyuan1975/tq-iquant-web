@@ -1834,6 +1834,8 @@ export interface LiveSessionItem {
   failover_enabled?: boolean
   // H2 待补发拆单剩余笔数（>0 显示「补发拆单剩余」入口）
   split_remainder_count?: number
+  // E1 执行前重判门控（默认关）：顺延次日单/盘前竞价单提交前再判一次
+  gate_recheck_on_execute?: boolean
 }
 
 // H2 拆单剩余量（停会话时未提交的子单快照）
@@ -1889,6 +1891,8 @@ export interface LiveSessionCreate {
   // 错周期风控三态：null=跟随全局（tq_trade.intraday_mismatched_risk_enabled，默认 False=对齐回测）/
   // true=强制开启（任意 bar 都跑风控，旧行为）/ false=强制关闭
   intraday_mismatched_risk_enabled?: boolean | null
+  // E1 执行前重判门控（默认关）
+  gate_recheck_on_execute?: boolean
 }
 
 /** 真实总资产预览（GET /live/account-preview）：只读；通道未就绪时后端 503。 */

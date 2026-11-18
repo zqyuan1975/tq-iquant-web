@@ -82,6 +82,8 @@ const form = ref({
   // False=对齐回测：错周期 bar 只更新价格快照，不评估止损/止盈/移动止损）/
   // true=强制开启（任意 bar 都跑风控）/ false=强制关闭
   intraday_mismatched_risk_enabled: null as boolean | null,
+  // E1：执行前重判门控（默认关）——顺延次日单/盘前竞价单提交前再判一次
+  gate_recheck_on_execute: false as boolean,
 })
 
 /** live_capital 归一化：空串/未填 → null（以真实总资产为基准），否则转数值透传。 */
@@ -797,7 +799,7 @@ function openCreate() {
   const engine = (!occ[preferred]
     ? preferred
     : (engines.find((e) => e.configured && !occ[e.key])?.key as LiveEngineKey | undefined)) || preferred
-  form.value = { name: '', mode: 'simulation', engine, execution_mode: 'alert', portfolio_ids: [], live_capital: null, signal_file_path: '', advance_close_enabled: false, advance_close_time: '14:51', intraday_mismatched_risk_enabled: null }
+  form.value = { name: '', mode: 'simulation', engine, execution_mode: 'alert', portfolio_ids: [], live_capital: null, signal_file_path: '', advance_close_enabled: false, advance_close_time: '14:51', intraday_mismatched_risk_enabled: null, gate_recheck_on_execute: false }
   createError.value = ''
   showCreate.value = true
   loadAccountPreview(engine)
@@ -830,7 +832,7 @@ async function create() {
     // A1 软校验：目标引擎已被其它会话占用等提示（不阻断创建，但必须让用户看见）
     createWarnings.value = Array.isArray(res?.warnings) ? res.warnings : []
     showCreate.value = false
-    form.value = { name: '', mode: 'simulation', engine: defaultEngineKey(), execution_mode: 'alert', capital_pool_mode: 'off', capital_pool_rebalance_enabled: false, portfolio_ids: [], live_capital: null, signal_file_path: '', advance_close_enabled: false, advance_close_time: '14:51', intraday_mismatched_risk_enabled: null }
+    form.value = { name: '', mode: 'simulation', engine: defaultEngineKey(), execution_mode: 'alert', capital_pool_mode: 'off', capital_pool_rebalance_enabled: false, portfolio_ids: [], live_capital: null, signal_file_path: '', advance_close_enabled: false, advance_close_time: '14:51', intraday_mismatched_risk_enabled: null, gate_recheck_on_execute: false }
     load()
   } catch (e: any) {
     // 后端参数校验失败（名称空/资金≤0 等）返回 code!==0 → 拦截器 reject，
@@ -1120,6 +1122,7 @@ const editForm = ref({
   signal_file_path: '',
   capital_pool_mode: 'off' as 'off' | 'equal' | 'risk_budget' | 'priority',
   capital_pool_rebalance_enabled: false,
+  gate_recheck_on_execute: false,
   portfolio_ids: [] as number[],
 })
 const editHealth = ref<LiveSessionChannelHealth | null>(null)
@@ -1145,6 +1148,7 @@ function openEdit(s: LiveSessionItem) {
     signal_file_path: s.signal_file_path || '',
     capital_pool_mode: (s.capital_pool_mode || 'off') as 'off' | 'equal' | 'risk_budget' | 'priority',
     capital_pool_rebalance_enabled: !!s.capital_pool_rebalance_enabled,
+    gate_recheck_on_execute: !!s.gate_recheck_on_execute,
     portfolio_ids: [...(s.portfolio_ids || [])],
   }
   loadEditHealth(s.id)
@@ -1179,6 +1183,7 @@ async function submitEdit() {
       signal_file_path: editForm.value.signal_file_path,
       capital_pool_mode: editForm.value.capital_pool_mode,
       capital_pool_rebalance_enabled: editForm.value.capital_pool_rebalance_enabled,
+      gate_recheck_on_execute: editForm.value.gate_recheck_on_execute,
       portfolio_ids: editForm.value.portfolio_ids,
     })
     editResult.value = { effective_at: res.effective_at, message: res.message }
@@ -1948,6 +1953,13 @@ onUnmounted(() => {
       <p style="font-size:12px;color:var(--ink-faint);margin:2px 0 12px">
         关闭时（全局默认）止损/止盈/移动止损只在策略<strong>自身周期</strong>的边界 bar 上评估：1m/5m 等错周期 bar 只更新价格快照，周线/月线同样只在自身边界评估——与回测口径一致。开启则任何 bar 到达都按收盘价评估持仓风险（旧行为，盘中反应更早但回测无法复现）。历史会话（未设置）恒跟随全局。
       </p>
+      <label style="display:flex;align-items:center;gap:8px">
+        <input v-model="form.gate_recheck_on_execute" type="checkbox" style="width:auto" data-field="gate_recheck_on_execute" />
+        执行前重判门控（顺延次日单 / 盘前竞价单提交前再判一次）
+      </label>
+      <p style="font-size:12px;color:var(--ink-faint);margin:2px 0 12px">
+        默认关闭：信号日门控通过即按原决策执行。开启后，顺延次日单与盘前集合竞价单在真正提交前用「执行日前一收盘」的门控状态再判一次；若为空头则直接取消并落决策事件（gate=market_gate_recheck），不拿旧决策硬执行。仅对启用市场门控的组合生效。
+      </p>
       <label>组合策略（可多选）</label>
       <div class="portfolio-check-list">
         <label v-for="p in portfolios" :key="p.id" class="portfolio-check">
@@ -2105,6 +2117,10 @@ onUnmounted(() => {
         </label>
         <label>外部信号文件路径（可选）</label>
         <input v-model="editForm.signal_file_path" placeholder="留空 = 走 TQ 公式计算信号" data-field="edit-signal-path" />
+        <label style="display:flex;align-items:center;gap:8px">
+          <input v-model="editForm.gate_recheck_on_execute" type="checkbox" style="width:auto" data-field="edit-gate-recheck" />
+          执行前重判门控（顺延次日单 / 盘前竞价单提交前再判一次，默认关）
+        </label>
         <label>组合策略（可多选，运行中下次启动生效）</label>
         <div class="portfolio-check-list">
           <label v-for="p in portfolios" :key="p.id" class="portfolio-check">

@@ -69,6 +69,12 @@ class LiveSession(Base):
     #   0/1  = 本会话显式覆盖（关闭时错周期 bar 一律只更新价格快照、不跑风控）
     # 历史会话为 NULL → 立即跟随新默认（对齐回测：风控只在自身周期 bar 上评估）。
     intraday_mismatched_risk_enabled = Column(Boolean, nullable=True)
+    # ---- E1 执行前重判门控（2026-11-18，默认关闭）----
+    # 开启后：顺延次日单 / 盘前集合竞价单在真正提交前，用「执行日之前最近收盘」
+    # 的门控状态再判一次；空头则拦下（保持 deferred 并落决策事件）。
+    # 默认关 = 完全沿用「信号日决策即执行」的旧行为。
+    gate_recheck_on_execute = Column(
+        Boolean, nullable=False, server_default="0", default=False)
     # ---- 账户级风控（D1/D2，2026-11-18，默认关闭）----
     # 会话（账户）级聚合熔断：Σ 各组合 risk_equity() 的口径，与组合级独立生效。
     # enabled=0 时引擎完全不读取/不写入本组字段，行为与接线前一致。
