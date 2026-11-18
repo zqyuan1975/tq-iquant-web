@@ -1792,6 +1792,49 @@ export async function getLiveOrders(sessionId: number, status?: string) {
   return res.data.data
 }
 
+/** G1：待放行的顺延委托（DB 权威 + 运行中内存可达性标记）。 */
+export interface LiveDeferredOrderItem {
+  id: number
+  portfolio_strategy_id: number | null
+  strategy_id: number | null
+  stock_code: string
+  trade_type: string
+  price: number | null
+  quantity: number
+  signal_type?: string | null
+  signal_name?: string | null
+  period?: string | null
+  bar_time?: string | null
+  signal_bar_date?: string | null
+  status: string
+  retry_count: number
+  error_message?: string | null
+  in_memory: boolean
+}
+
+export async function getLiveDeferredOrders(sessionId: number) {
+  const res = await api.get<ApiResponse<{ running: boolean; items: LiveDeferredOrderItem[] }>>(
+    `/live/sessions/${sessionId}/deferred-orders`)
+  return res.data.data
+}
+
+/** G1：人工放行（仅 auto，需 confirm）。 */
+export async function releaseLiveDeferredOrder(sessionId: number, orderId: number) {
+  const res = await api.post<ApiResponse<{ status: string; order_id: number; live_order_id?: number | null }>>(
+    `/live/sessions/${sessionId}/deferred-orders/${orderId}/release`, { confirm: true })
+  return res.data.data
+}
+
+/** G1：人工放弃（终态 canceled，需 confirm，可选原因）。 */
+export async function abandonLiveDeferredOrder(
+  sessionId: number, orderId: number, reason?: string,
+) {
+  const res = await api.post<ApiResponse<{ status: string; order_id: number; reason: string }>>(
+    `/live/sessions/${sessionId}/deferred-orders/${orderId}/abandon`,
+    { confirm: true, ...(reason ? { reason } : {}) })
+  return res.data.data
+}
+
 /** 成交历史。可选 start_date/end_date（YYYY-MM-DD，北京自然日闭区间）服务端预筛；
  *  不传=全量（与旧行为一致，向后兼容）。 */
 export async function getLiveTrades(

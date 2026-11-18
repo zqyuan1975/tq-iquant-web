@@ -826,6 +826,55 @@ def reject_session_approval(session_id: int, approval_id: int,
         return err(404 if "不存在" in str(exc) else 409, str(exc))
 
 
+# ---- G1：待放行顺延委托（工作台人工放行/放弃，全部写审计）----
+
+@router.get("/sessions/{session_id}/deferred-orders")
+def session_deferred_orders(session_id: int, db: Session = Depends(get_db)):
+    """待放行的顺延委托。运行中走引擎（含 in_memory 标记），停止态回退 DB。"""
+    eng = _ENGINES.get(session_id)
+    if eng is not None:
+        return ok({"running": True, "items": eng.list_deferred_orders()})
+    rows = svc.session_deferred_orders(db, session_id)
+    if rows is None:
+        return err(404, "资源不存在")
+    return ok({"running": False, "items": rows})
+
+
+@router.post("/sessions/{session_id}/deferred-orders/{order_id}/release")
+def release_session_deferred_order(
+        session_id: int, order_id: int, data: Optional[dict] = None):
+    """人工放行一条顺延委托：仅 auto，须 confirm=true，重走完整闸门链。"""
+    eng, error = _running_engine(session_id)
+    if error is not None:
+        return error
+    if not (data or {}).get("confirm"):
+        return err(400, "需显式 confirm=true 确认放行")
+    try:
+        return ok(eng.release_deferred_order(order_id))
+    except LookupError as exc:
+        return err(404, str(exc))
+    except ValueError as exc:
+        return err(409, str(exc))
+
+
+@router.post("/sessions/{session_id}/deferred-orders/{order_id}/abandon")
+def abandon_session_deferred_order(
+        session_id: int, order_id: int, data: Optional[dict] = None):
+    """人工放弃一条顺延委托：终态 canceled，须 confirm=true，写审计。"""
+    eng, error = _running_engine(session_id)
+    if error is not None:
+        return error
+    if not (data or {}).get("confirm"):
+        return err(400, "需显式 confirm=true 确认放弃")
+    try:
+        return ok(eng.abandon_deferred_order(
+            order_id, (data or {}).get("reason")))
+    except LookupError as exc:
+        return err(404, str(exc))
+    except ValueError as exc:
+        return err(409, str(exc))
+
+
 def _manual_error(exc: Exception):
     """ManualActionError → envelope；其它异常交给全局 500。"""
     status = getattr(exc, "http_status", 400)

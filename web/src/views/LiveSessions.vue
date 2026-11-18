@@ -23,6 +23,8 @@ import {
   getLiveDataHealth,
   getLiveChannelGuard, reconnectLiveChannel,
   getLiveSplitRemainders, reorderLiveSplitRemainders,
+  getLiveDeferredOrders, releaseLiveDeferredOrder, abandonLiveDeferredOrder,
+  type LiveDeferredOrderItem,
   getLiveGateSnapshots,
   type LiveSplitRemainderItem,
   type LiveGateSnapshotItem,
@@ -311,6 +313,10 @@ const positions = ref<PositionRow[]>([])
 const poolPositions = computed(() => positions.value.filter((p) => p.out_of_pool !== true))
 const outOfPoolPositions = computed(() => positions.value.filter((p) => p.out_of_pool === true))
 const orders = ref<OrderRow[]>([])
+// G1：待放行的顺延委托（运行中人工放行/放弃；DB 权威 + 内存可达性）
+const deferredOrders = ref<LiveDeferredOrderItem[]>([])
+const deferredRunning = ref(false)
+const deferredBusy = ref<number | null>(null)
 const trades = ref<TradeRow[]>([])
 const decisions = ref<DecisionRow[]>([])
 // 时间区间筛选（默认今日；聚合统计随筛选区间重算，不再显示全时段累计）
@@ -686,6 +692,8 @@ async function loadHistory(id: number) {
     // 预警信号：alert 模式主产物；auto 模式下也可能有信号落库
     signals.value = sig?.items ?? []
     signalsTotal.value = sig?.total ?? 0
+    // G1：待放行顺延委托（独立端点；失败静默，不阻塞主工作台）
+    loadDeferredOrders(id)
     // 账户全貌快照 + 交易日历来源/退化状态（同一详情请求，采集于 deals 节拍）——失败静默（辅助卡）
     try {
       getLiveSession(id).then(d => {
@@ -712,6 +720,66 @@ async function loadHistory(id: number) {
     }
   } catch {
     // 会话已删除等 → 保持现状
+  }
+}
+
+/** G1：待放行顺延委托列表；停止态返回 in_memory=false 的只读视图。 */
+async function loadDeferredOrders(id: number | null = activeSessionId) {
+  if (id === null) {
+    deferredOrders.value = []
+    deferredRunning.value = false
+    return
+  }
+  try {
+    const data = await getLiveDeferredOrders(id)
+    if (activeSessionId !== id) return
+    deferredOrders.value = data.items || []
+    deferredRunning.value = !!data.running
+  } catch {
+    deferredOrders.value = []
+    deferredRunning.value = false
+  }
+}
+
+async function onReleaseDeferred(o: LiveDeferredOrderItem) {
+  if (activeSessionId === null) return
+  const label = `${o.stock_code} ${tradeTypeLabel(o.trade_type)} ${o.quantity} 股`
+  if (!window.confirm(
+    `放行顺延委托：${label}？\n将按当前价重走完整闸门链（资金/槽位/门控），被拦下会自动回队。`,
+  )) return
+  deferredBusy.value = o.id
+  try {
+    const r = await releaseLiveDeferredOrder(activeSessionId, o.id)
+    if (r.status === 'blocked') {
+      alert('已尝试提交但被闸门拦下，已回队等待自动重试（详见决策/拦截）。')
+    }
+    await loadDeferredOrders()
+    await loadHistory(activeSessionId)
+  } catch (e: any) {
+    alert(e?.response?.data?.message || e?.message || '放行失败')
+  } finally {
+    deferredBusy.value = null
+  }
+}
+
+async function onAbandonDeferred(o: LiveDeferredOrderItem) {
+  if (activeSessionId === null) return
+  const reason = window.prompt(
+    `放弃顺延委托 ${o.stock_code} ${o.quantity} 股，请填写原因（写入审计）：`, '')
+  if (reason === null) return
+  if (!reason.trim()) {
+    alert('必须填写放弃原因')
+    return
+  }
+  deferredBusy.value = o.id
+  try {
+    await abandonLiveDeferredOrder(activeSessionId, o.id, reason.trim())
+    await loadDeferredOrders()
+    await loadHistory(activeSessionId)
+  } catch (e: any) {
+    alert(e?.response?.data?.message || e?.message || '放弃失败')
+  } finally {
+    deferredBusy.value = null
   }
 }
 
@@ -1725,6 +1793,51 @@ onUnmounted(() => {
 
     <!-- 委托 -->
     <div v-if="wbTab === 'orders'" class="table-wrap">
+      <!-- G1：待放行的顺延委托（人工放行/放弃，全部写审计） -->
+      <div style="border:1px solid var(--line);border-radius:6px;padding:10px;margin-bottom:14px" data-test="deferred-panel">
+        <div style="display:flex;align-items:center;gap:8px;margin:0 0 6px;flex-wrap:wrap">
+          <strong style="font-size:13px">待放行委托</strong>
+          <span class="badge" :class="deferredOrders.length ? 'badge-orange' : 'badge-gray'">{{ deferredOrders.length }} 笔</span>
+          <span style="font-size:12px;color:var(--ink-faint)">
+            信号日未成交、等下一交易日放行的委托；{{ deferredRunning ? '运行中可人工放行/放弃' : '会话未运行，仅可查看' }}
+          </span>
+          <button class="btn btn-sm" type="button" style="margin-left:auto" @click="loadDeferredOrders()">刷新</button>
+        </div>
+        <table v-if="deferredOrders.length">
+          <thead><tr><th>信号日</th><th>代码</th><th>方向</th><th>数量</th><th>限价</th><th>重试</th><th>队列</th><th>说明</th><th>操作</th></tr></thead>
+          <tbody>
+            <tr v-for="o in deferredOrders" :key="o.id">
+              <td>{{ o.signal_bar_date || '—' }}</td>
+              <td>{{ o.stock_code }}</td>
+              <td>{{ tradeTypeLabel(o.trade_type) }}</td>
+              <td>{{ o.quantity }}</td>
+              <td>{{ o.price ?? '-' }}</td>
+              <td>{{ o.retry_count }}</td>
+              <td>
+                <span class="badge" :class="o.in_memory ? 'badge-green' : 'badge-gray'">
+                  {{ o.in_memory ? '可达' : '不在队列' }}
+                </span>
+              </td>
+              <td style="max-width:280px;white-space:normal;color:var(--ink-soft)">{{ o.error_message || '—' }}</td>
+              <td style="white-space:nowrap">
+                <button
+                  class="btn btn-sm" type="button"
+                  :disabled="!deferredRunning || !o.in_memory || deferredBusy === o.id"
+                  @click="onReleaseDeferred(o)"
+                >放行</button>
+                <button
+                  class="btn btn-sm" type="button" style="margin-left:6px"
+                  :disabled="!deferredRunning || deferredBusy === o.id"
+                  @click="onAbandonDeferred(o)"
+                >放弃</button>
+              </td>
+            </tr>
+          </tbody>
+        </table>
+        <div v-else class="empty-state" style="padding:6px 0">
+          <p style="margin:0">当前没有待放行的顺延委托</p>
+        </div>
+      </div>
       <div style="display:flex;align-items:center;gap:8px;margin:0 0 8px">
         <span style="font-size:12px;color:var(--ink-soft)">时间范围</span>
         <select v-model="orderRange" style="font-size:12px;padding:2px 6px" aria-label="委托时间范围">

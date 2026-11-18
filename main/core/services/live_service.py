@@ -5560,6 +5560,58 @@ def session_orders(db: Session, session_id: int, status: Optional[str] = None) -
     return items
 
 
+# G1：deferred 重排次数标记（与引擎 `_RETRY_MARKER` 同格式，只读解析）
+_RETRY_MARKER_TEXT = "deferred_retry:n="
+
+
+def session_deferred_orders(db: Session, session_id: int) -> Optional[List[dict]]:
+    """G1：待放行的顺延委托（会话停止时也可查；in_memory 恒 False）。
+
+    会话运行中优先走引擎 `list_deferred_orders()`（能标记内存队列可达性）；
+    本函数只做 DB 权威视图，供停止态/引擎缺失时回退。
+    """
+    session = db.query(LiveSession).filter(LiveSession.id == session_id).first()
+    if not session:
+        return None
+    rows = (
+        db.query(LiveOrder)
+        .filter(LiveOrder.live_session_id == session_id,
+                LiveOrder.status == "deferred")
+        .order_by(LiveOrder.bar_time, LiveOrder.id)
+        .all()
+    )
+    items = []
+    for row in rows:
+        msg = row.error_message or ""
+        retry = 0
+        if _RETRY_MARKER_TEXT in msg:
+            try:
+                retry = int(msg.split(_RETRY_MARKER_TEXT, 1)[1].split(";", 1)[0])
+            except (ValueError, IndexError):
+                retry = 0
+        items.append({
+            "id": row.id,
+            "portfolio_strategy_id": row.portfolio_strategy_id,
+            "strategy_id": row.strategy_id,
+            "stock_code": row.stock_code,
+            "trade_type": (row.trade_type or "").upper(),
+            "price": None if row.price is None else float(row.price),
+            "quantity": row.quantity,
+            "signal_type": row.signal_type,
+            "signal_name": row.signal_name,
+            "period": None,
+            "bar_time": None if row.bar_time is None else row.bar_time.isoformat(),
+            "signal_bar_date": (
+                None if row.bar_time is None
+                else row.bar_time.date().isoformat()),
+            "status": row.status,
+            "retry_count": retry,
+            "error_message": row.error_message,
+            "in_memory": False,
+        })
+    return items
+
+
 def session_trades(
     db: Session, session_id: int,
     start_date: Optional[date] = None, end_date: Optional[date] = None,

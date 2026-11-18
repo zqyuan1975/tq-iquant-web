@@ -7428,6 +7428,186 @@ class LiveEngine:
         finally:
             db.close()
 
+    # ---- G1：待放行顺延委托的人工放行 / 放弃（2026-11-18）----
+
+    @staticmethod
+    def _deferred_retry_count(row) -> int:
+        """从 error_message 的 deferred_retry:n= 标记读本次重试次数。"""
+        msg = row.error_message or ""
+        if _RETRY_MARKER in msg:
+            try:
+                return int(msg.split(_RETRY_MARKER, 1)[1].split(";", 1)[0])
+            except (ValueError, IndexError):
+                return 0
+        return 0
+
+    def serialize_deferred_order(self, row, in_memory: bool = False) -> dict:
+        return {
+            "id": row.id,
+            "portfolio_strategy_id": row.portfolio_strategy_id,
+            "strategy_id": row.strategy_id,
+            "stock_code": row.stock_code,
+            "trade_type": (row.trade_type or "").upper(),
+            "price": None if row.price is None else float(row.price),
+            "quantity": row.quantity,
+            "signal_type": row.signal_type,
+            "signal_name": row.signal_name,
+            "period": None,
+            "bar_time": None if row.bar_time is None else row.bar_time.isoformat(),
+            "signal_bar_date": (
+                None if row.bar_time is None
+                else row.bar_time.date().isoformat()),
+            "status": row.status,
+            "retry_count": self._deferred_retry_count(row),
+            "error_message": row.error_message,
+            "in_memory": bool(in_memory),
+        }
+
+    def list_deferred_orders(self) -> list:
+        """G1：本会话待放行的顺延委托（DB 权威 + 内存队列可达性标记）。"""
+        db = self._db_session_factory()
+        try:
+            rows = (
+                db.query(LiveOrder)
+                .filter(LiveOrder.live_session_id == self.session_id,
+                        LiveOrder.status == "deferred")
+                .order_by(LiveOrder.bar_time, LiveOrder.id)
+                .all()
+            )
+            memory_ids = {
+                getattr(o, "_deferred_row_id", None)
+                for o in self._signal_bar_deferred
+            }
+            return [self.serialize_deferred_order(
+                r, in_memory=r.id in memory_ids) for r in rows]
+        finally:
+            db.close()
+
+    def release_deferred_order(self, order_id: int) -> dict:
+        """G1：人工放行一条顺延委托（仅 auto；重走完整闸门链）。
+
+        语义与自动放行一致：摘内存队列 → bar_time 改为当下 → 按当日首根 1m
+        open 重定限价 → `_submit_one_order`。成功时旧 deferred 行被同一事务
+        删除并写入 submitted 行；被闸门拦下或异常时回队并保留 deferred 行，
+        绝不产生双份委托。全过程写 gate=deferred_manual 审计事件。
+        """
+        if self.execution_mode != "auto":
+            raise ValueError("仅全自动（auto）会话支持人工放行顺延委托")
+        db = self._db_session_factory()
+        try:
+            row = db.get(LiveOrder, order_id)
+            if row is None or row.live_session_id != self.session_id:
+                raise LookupError("顺延委托不存在")
+            if row.status != "deferred":
+                raise ValueError("顺延委托状态为 %s，不可放行" % row.status)
+            target = None
+            for order in self._signal_bar_deferred:
+                if getattr(order, "_deferred_row_id", None) == row.id:
+                    target = order
+                    break
+            if target is None:
+                raise ValueError(
+                    "该顺延单不在内存队列（可能已过期或重启后未恢复），"
+                    "请等待自动放行或放弃")
+            portfolio = self._approval_portfolio(row.portfolio_strategy_id)
+            if portfolio is None:
+                raise ValueError("组合不在本会话运行实例中，请停止后重新启动会话")
+            now = self.ctx.clock()
+            with self._book_lock:
+                self._signal_bar_deferred = [
+                    o for o in self._signal_bar_deferred if o is not target]
+            target.bar_time = now
+            self._refresh_release_price(target)
+            row_id = getattr(target, "_deferred_row_id", None)
+            try:
+                self._submit_one_order(
+                    db, portfolio, target, "1m", emit_signal=False)
+            except Exception:
+                with self._book_lock:
+                    if all(o is not target for o in self._signal_bar_deferred):
+                        self._signal_bar_deferred.append(target)
+                self._rec_live(
+                    "deferred_manual", "release_error", portfolio, target,
+                    message="人工放行提交异常，已回队等待自动重试")
+                self._drain_decisions(db, portfolio)
+                db.commit()
+                raise
+            submitted = (row_id is not None
+                         and getattr(target, "_deferred_row_id", None) is None)
+            if not submitted:
+                with self._book_lock:
+                    if all(o is not target for o in self._signal_bar_deferred):
+                        self._signal_bar_deferred.append(target)
+                self._rec_live(
+                    "deferred_manual", "release_blocked", portfolio, target,
+                    message="人工放行被闸门拦下，已回队")
+                self._drain_decisions(db, portfolio)
+                db.commit()
+                return {"status": "blocked", "order_id": order_id}
+            self._rec_live(
+                "deferred_manual", "release", portfolio, target,
+                message="人工放行顺延委托（重走完整闸门链）")
+            self._drain_decisions(db, portfolio)
+            db.commit()
+            return {
+                "status": "released",
+                "order_id": order_id,
+                "live_order_id": getattr(target, "_live_order_id", None),
+            }
+        finally:
+            db.close()
+
+    def abandon_deferred_order(self, order_id: int,
+                               reason: Optional[str] = None) -> dict:
+        """G1：人工放弃一条顺延委托（终态 canceled，写审计，不物理删除）。"""
+        db = self._db_session_factory()
+        try:
+            row = db.get(LiveOrder, order_id)
+            if row is None or row.live_session_id != self.session_id:
+                raise LookupError("顺延委托不存在")
+            if row.status != "deferred":
+                raise ValueError("顺延委托状态为 %s，不可放弃" % row.status)
+            target = None
+            for order in self._signal_bar_deferred:
+                if getattr(order, "_deferred_row_id", None) == row.id:
+                    target = order
+                    break
+            if target is not None:
+                with self._book_lock:
+                    self._signal_bar_deferred = [
+                        o for o in self._signal_bar_deferred if o is not target]
+                target._deferred_row_id = None
+            detail = (reason or "未填写原因").strip()[:200]
+            row.status = "canceled"
+            row.error_message = ("人工放弃：%s" % detail)[:500]
+            db.commit()
+            portfolio = None
+            for p in self.portfolios:
+                if p.portfolio_id == row.portfolio_strategy_id:
+                    portfolio = p
+                    break
+            if target is not None and portfolio is not None:
+                self._rec_live(
+                    "deferred_manual", "abandon", portfolio, target,
+                    message="人工放弃顺延委托：%s" % detail,
+                    bar_time=self.ctx.clock())
+                self._drain_decisions(db, portfolio)
+                db.commit()
+            else:
+                self._recorder.record(
+                    gate="deferred_manual", layer="live_gate", action="abandon",
+                    portfolio_id=row.portfolio_strategy_id,
+                    strategy_id=row.strategy_id,
+                    stock_code=row.stock_code, bar_time=self.ctx.clock(),
+                    message="人工放弃顺延委托：%s" % detail,
+                )
+            logger.info("[deferred] abandoned id=%s reason=%s (session %s)",
+                        order_id, detail, self.session_id)
+            return {"status": "abandoned", "order_id": order_id,
+                    "reason": detail}
+        finally:
+            db.close()
+
     def _expire_approvals(self, db: Session) -> int:
         """超时审批单转 expired（主循环调用；整批一条日志，不刷屏）。"""
         now = self.ctx.clock()
