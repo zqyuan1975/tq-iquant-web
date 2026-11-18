@@ -3242,6 +3242,181 @@ def list_records(db: Session) -> list:
     return [_serialize_record(r) for r in recs]
 
 
+# ---------------------------------------------------------------------------
+# K2 多记录横向对比：曲线叠加 + 指标表 + 参数 diff + 成交 diff
+# 只读既有 trades/snapshots/evaluations，不新增落库字段。
+# ---------------------------------------------------------------------------
+_COMPARE_METRICS = [
+    ("total_return", "总收益"), ("annual_return", "年化收益"),
+    ("max_drawdown", "最大回撤"), ("volatility", "年化波动率"),
+    ("sharpe_ratio", "夏普比率"), ("calmar_ratio", "卡玛比率"),
+    ("win_rate", "胜率"), ("profit_factor", "盈亏比"),
+    ("total_trades", "成交笔数"), ("benchmark_return", "基准收益"),
+    ("excess_annual_return", "年化超额"), ("annual_turnover", "年化换手（双边）"),
+    ("total_cost_ratio", "交易成本/日均净值"),
+]
+
+_COMPARE_MAX_RECORDS = 10
+_COMPARE_MAX_STOCK_ROWS = 50
+
+
+def _compare_scalar_params(raw: Optional[str]) -> dict:
+    """params_snapshot → 标量键值（dict/list 值跳过，避免把大块快照塞进对比表）。"""
+    try:
+        params = json.loads(raw) if raw else {}
+    except (TypeError, ValueError):
+        return {}
+    if not isinstance(params, dict):
+        return {}
+    return {
+        k: v for k, v in params.items()
+        if v is None or isinstance(v, (str, int, float, bool))
+    }
+
+
+def _compare_trade_summary(trades: list) -> dict:
+    """单记录成交概览：笔数 + 买卖金额 + 每股净买入额（成交 diff 的行值）。"""
+    stocks: Dict[str, float] = {}
+    buy_amount = 0.0
+    sell_amount = 0.0
+    buy_count = 0
+    sell_count = 0
+    for t in trades:
+        amt = float(t.amount or 0)
+        code = t.stock_code
+        if t.trade_type == "BUY":
+            buy_count += 1
+            buy_amount += amt
+            stocks[code] = stocks.get(code, 0.0) + amt
+        else:
+            sell_count += 1
+            sell_amount += amt
+            stocks[code] = stocks.get(code, 0.0) - amt
+    return {
+        "trades_count": len(trades),
+        "buy_count": buy_count,
+        "sell_count": sell_count,
+        "buy_amount": round(buy_amount, 2),
+        "sell_amount": round(sell_amount, 2),
+        "stocks": {k: round(v, 2) for k, v in stocks.items()},
+    }
+
+
+def compare_records(
+    db: Session, record_ids: List[int],
+) -> Tuple[Optional[dict], Optional[str]]:
+    """K2：N 条回测记录横向对比。
+
+    返回 (payload, error)。error 非空时由路由层转 400/404。
+    曲线做首日归一（index_value = total_value / 首日净值），不同初始资金的记录
+    可直接叠加；指标/参数/成交 diff 仅做同源只读汇总，不改变任何落库数据。
+    """
+    ids = list(dict.fromkeys(int(i) for i in (record_ids or [])))
+    if len(ids) < 2:
+        return None, "请至少选择 2 条回测记录进行对比"
+    if len(ids) > _COMPARE_MAX_RECORDS:
+        return None, f"一次最多对比 {_COMPARE_MAX_RECORDS} 条记录"
+    recs = {
+        r.id: r for r in db.query(BacktestRecord).filter(BacktestRecord.id.in_(ids)).all()
+    }
+    missing = [i for i in ids if i not in recs]
+    if missing:
+        return None, "回测记录不存在：" + ", ".join(f"#{i}" for i in missing)
+
+    items: list = []
+    warnings: list = []
+    for rid in ids:
+        rec = recs[rid]
+        if rec.status != "completed":
+            warnings.append(f"记录 #{rid} 状态为 {rec.status}，曲线与指标可能为空")
+        snaps = (
+            db.query(BacktestDailySnapshot)
+            .filter_by(backtest_record_id=rid, target_type="portfolio")
+            .order_by(BacktestDailySnapshot.snap_date)
+            .all()
+        )
+        trades = (
+            db.query(BacktestTrade)
+            .filter_by(backtest_record_id=rid)
+            .order_by(BacktestTrade.bar_time)
+            .all()
+        )
+        ev = (
+            db.query(BacktestEvaluation)
+            .filter_by(backtest_record_id=rid, target_type="portfolio")
+            .first()
+        )
+        ev_dict = _serialize_evaluation(ev) if ev is not None else {}
+        base = next(
+            (float(s.total_value) for s in snaps
+             if s.total_value is not None and float(s.total_value) > 0),
+            None,
+        )
+        curve = []
+        for s in snaps:
+            tv = _f(s.total_value)
+            curve.append({
+                "date": s.snap_date.isoformat() if s.snap_date else None,
+                "total_value": tv,
+                "cumulative_return": _f(s.cumulative_return),
+                "index_value": (tv / base) if (tv is not None and base) else None,
+            })
+        items.append({
+            "record": _serialize_record(rec),
+            "metrics": {k: ev_dict.get(k) for k, _ in _COMPARE_METRICS},
+            "curve": curve,
+            "params": _compare_scalar_params(rec.params_snapshot),
+            "trade_summary": _compare_trade_summary(trades),
+        })
+
+    # 指标表（列顺序 = 请求顺序）
+    metric_rows = []
+    for key, label in _COMPARE_METRICS:
+        values = [it["metrics"].get(key) for it in items]
+        present = [v for v in values if v is not None]
+        metric_rows.append({
+            "key": key, "label": label, "values": values,
+            "differs": len({round(v, 6) for v in present}) > 1 if present else False,
+        })
+
+    # 参数 diff：并集键，标量值，值不齐/不等均标 differs
+    param_keys = sorted({k for it in items for k in it["params"]})
+    param_rows = []
+    for k in param_keys:
+        values = [it["params"].get(k) for it in items]
+        param_rows.append({
+            "key": k, "values": values,
+            "differs": len({json.dumps(v, ensure_ascii=False, sort_keys=True)
+                             for v in values}) > 1,
+        })
+
+    # 成交 diff：每股净买入额（买 +、卖 −），按绝对值降序取前 N 只
+    all_codes = sorted({
+        code for it in items for code in it["trade_summary"]["stocks"]
+    })
+    stock_rows = []
+    for code in all_codes:
+        values = [it["trade_summary"]["stocks"].get(code, 0.0) for it in items]
+        if not any(abs(v) > 0 for v in values):
+            continue
+        stock_rows.append({"stock_code": code, "values": values,
+                           "differs": len({round(v, 2) for v in values}) > 1})
+    stock_rows.sort(key=lambda r: max(abs(v) for v in r["values"]), reverse=True)
+
+    return {
+        "records": items,
+        "metric_rows": metric_rows,
+        "param_rows": param_rows,
+        "stock_rows": stock_rows[:_COMPARE_MAX_STOCK_ROWS],
+        "stock_rows_truncated": len(stock_rows) > _COMPARE_MAX_STOCK_ROWS,
+        "trade_totals": [
+            {k: v for k, v in it["trade_summary"].items() if k != "stocks"}
+            for it in items
+        ],
+        "warnings": warnings,
+    }, None
+
+
 def _refresh_oos_from_latest_wf(db: Session, record: dict) -> None:
     """详情读取时用最新一次「已完成」的 walk-forward 覆盖冻结的样本外引用。
 

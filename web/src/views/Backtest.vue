@@ -6,10 +6,12 @@ import {
   deleteBacktestRecord, recomputeCrisisAlpha, recomputeMarketRegime,
   cancelBacktestRecord,
   recomputeRobustness, recomputePersistenceAnalysis, getStockPools, compareBacktestPools,
+  compareBacktestRecords,
   sendUserBlock,
 } from '../api'
 import type {
   BacktestRecordItem, BacktestDetailItem, PortfolioItem,
+  BacktestCompareResult,
   BacktestEvaluationItem, DecisionSummaryItem, DecisionEventItem,
   CrisisAlphaData, CrisisAlphaBenchmarkResolution,
   MarketRegimeData, MarketRegimeStateRow,
@@ -918,6 +920,95 @@ async function load() {
   } finally {
     loading.value = false
   }
+}
+
+// ---- K2 多记录横向对比 ----
+const recordCompareSelected = ref<number[]>([])
+const showRecordCompare = ref(false)
+const recordCompareLoading = ref(false)
+const recordCompareError = ref('')
+const recordCompareData = ref<BacktestCompareResult | null>(null)
+const recordCompareChartEl = ref<HTMLElement | null>(null)
+let recordCompareChart: echarts.ECharts | null = null
+const RECORD_COMPARE_PCT_KEYS = new Set([
+  'total_return', 'annual_return', 'max_drawdown', 'volatility', 'win_rate',
+  'benchmark_return', 'excess_annual_return', 'total_cost_ratio',
+])
+
+function recordCompareMetricText(key: string, v: number | null): string {
+  if (v === null || v === undefined) return '—'
+  if (RECORD_COMPARE_PCT_KEYS.has(key)) return fmtPct(v)
+  if (key === 'annual_turnover') return `${v.toFixed(2)}×`
+  if (key === 'total_trades') return String(Math.round(v))
+  return v.toFixed(2)
+}
+
+function recordCompareParamText(v: string | number | boolean | null): string {
+  if (v === null || v === undefined) return '—'
+  if (typeof v === 'boolean') return v ? '开' : '关'
+  return String(v)
+}
+
+function recordCompareStockText(v: number): string {
+  return fmtMoney(v)
+}
+
+function renderRecordCompareChart() {
+  if (!recordCompareChartEl.value || !recordCompareData.value) return
+  if (recordCompareChart) { recordCompareChart.dispose(); recordCompareChart = null }
+  recordCompareChart = echarts.init(recordCompareChartEl.value)
+  recordCompareChart.setOption({
+    color: [cssVar('--blue'), cssVar('--red'), cssVar('--green'), '#f0a429',
+            '#7c3aed', '#0891b2', '#be185d', '#4d7c0f', '#a16207', '#6b7280'],
+    tooltip: { trigger: 'axis' },
+    legend: { type: 'scroll', top: 0, textStyle: { color: cssVar('--ink-soft'), fontSize: 11 } },
+    grid: { left: 56, right: 20, top: 44, bottom: 36 },
+    xAxis: {
+      type: 'time',
+      axisLabel: { color: cssVar('--ink-faint'), fontSize: 11 },
+      axisLine: { lineStyle: { color: cssVar('--line') } },
+    },
+    yAxis: {
+      type: 'value', scale: true,
+      name: '归一净值',
+      nameTextStyle: { color: cssVar('--ink-faint'), fontSize: 11 },
+      axisLabel: { color: cssVar('--ink-faint'), fontSize: 11,
+                   formatter: (v: number) => v.toFixed(2) },
+      splitLine: { lineStyle: { color: cssVar('--line') } },
+    },
+    series: recordCompareData.value.records.map(it => ({
+      name: `#${it.record.id} ${it.record.name}`,
+      type: 'line',
+      showSymbol: false,
+      lineWidth: 1.5,
+      data: it.curve.filter(p => p.date && p.index_value !== null)
+        .map(p => [p.date as string, p.index_value as number]),
+    })),
+  })
+}
+
+async function openRecordCompare() {
+  if (recordCompareSelected.value.length < 2) return
+  recordCompareError.value = ''
+  recordCompareData.value = null
+  showRecordCompare.value = true
+  recordCompareLoading.value = true
+  try {
+    recordCompareData.value = await compareBacktestRecords([...recordCompareSelected.value])
+    await nextTick()
+    renderRecordCompareChart()
+  } catch (e) {
+    recordCompareError.value = '对比失败：' + errMsg(e)
+  } finally {
+    recordCompareLoading.value = false
+  }
+}
+
+function closeRecordCompare() {
+  showRecordCompare.value = false
+  recordCompareData.value = null
+  recordCompareError.value = ''
+  if (recordCompareChart) { recordCompareChart.dispose(); recordCompareChart = null }
 }
 
 function openForm() {
@@ -3016,6 +3107,7 @@ watch(theme, () => {
     nextTick(() => {
       initCharts()
       if (!mrCollapsed.value) initMrCharts()
+      if (showRecordCompare.value && recordCompareData.value) renderRecordCompareChart()
     })
   }, 60)
 })
@@ -3025,6 +3117,10 @@ watch(theme, () => {
   <!-- ============ 列表视图 ============ -->
   <div v-if="!currentRecord">
     <PageHeader title="回测管理">
+      <button class="btn btn-sm" :disabled="recordCompareSelected.length < 2" @click="openRecordCompare"
+              title="勾选 2~10 条已完成记录，对比净值曲线 / 指标 / 参数 / 成交差异">
+        对比所选{{ recordCompareSelected.length ? ` (${recordCompareSelected.length})` : '' }}
+      </button>
       <button @click="openForm" class="btn btn-primary">+ 发起回测</button>
     </PageHeader>
 
@@ -3040,9 +3136,13 @@ watch(theme, () => {
     <div v-if="loading" class="card" style="padding:12px"><p>加载中…</p></div>
     <div v-else class="card table-wrap">
       <table>
-        <thead><tr><th>ID</th><th>名称</th><th>组合</th><th>起止</th><th>状态</th><th>门状态</th><th>操作</th></tr></thead>
+        <thead><tr><th style="width:30px"></th><th>ID</th><th>名称</th><th>组合</th><th>起止</th><th>状态</th><th>门状态</th><th>操作</th></tr></thead>
         <tbody>
           <tr v-for="r in records" :key="r.id">
+            <td>
+              <input type="checkbox" :value="r.id" v-model="recordCompareSelected"
+                     :disabled="r.status !== 'completed'" title="勾选参与横向对比" />
+            </td>
             <td style="color:var(--ink-faint)">#{{ r.id }}</td>
             <td>{{ r.name }}</td>
             <td>{{ poolName(r.portfolio_strategy_id) }}</td>
@@ -3064,6 +3164,117 @@ watch(theme, () => {
         </tbody>
       </table>
       <div v-if="records.length === 0" class="empty-state"><p>暂无回测记录，点右上[+发起回测]</p></div>
+    </div>
+
+    <!-- K2 多记录横向对比 Modal -->
+    <div v-if="showRecordCompare" class="modal-overlay modal-lg" @click.self="closeRecordCompare">
+      <div class="modal-content">
+        <div style="display:flex;align-items:center;justify-content:space-between;gap:8px">
+          <h3 style="margin:0">多记录横向对比</h3>
+          <button class="btn btn-sm" @click="closeRecordCompare">关闭</button>
+        </div>
+        <div class="modal-body">
+          <div v-if="recordCompareLoading"><p>加载中…</p></div>
+          <div v-else-if="recordCompareError" style="color:var(--red)">{{ recordCompareError }}</div>
+          <template v-else-if="recordCompareData">
+            <div v-if="recordCompareData.warnings.length" class="form-hint"
+                 style="color:var(--red);margin-bottom:8px">
+              <div v-for="(w, i) in recordCompareData.warnings" :key="i">{{ w }}</div>
+            </div>
+
+            <h4 style="margin:4px 0 8px">归一净值曲线（首日=1）</h4>
+            <div ref="recordCompareChartEl" style="width:100%;height:320px"></div>
+
+            <h4 style="margin:16px 0 8px">指标对比</h4>
+            <div class="table-container">
+              <table>
+                <thead>
+                  <tr>
+                    <th>指标</th>
+                    <th v-for="it in recordCompareData.records" :key="it.record.id">
+                      #{{ it.record.id }} {{ it.record.name }}
+                    </th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr v-for="row in recordCompareData.metric_rows" :key="row.key">
+                    <td>{{ row.label }}</td>
+                    <td v-for="(v, i) in row.values" :key="i">
+                      {{ recordCompareMetricText(String(row.key), v as number | null) }}
+                    </td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+
+            <h4 style="margin:16px 0 8px">参数 diff（<span style="color:var(--red)">红点</span>=不一致）</h4>
+            <div class="table-container" style="max-height:280px;overflow:auto">
+              <table>
+                <thead>
+                  <tr>
+                    <th>参数</th>
+                    <th v-for="it in recordCompareData.records" :key="it.record.id">#{{ it.record.id }}</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr v-for="row in recordCompareData.param_rows" :key="row.key">
+                    <td>
+                      <span v-if="row.differs" style="color:var(--red)">●</span>
+                      {{ row.key }}
+                    </td>
+                    <td v-for="(v, i) in row.values" :key="i">{{ recordCompareParamText(v) }}</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+
+            <h4 style="margin:16px 0 8px">成交对比（每股净买入额：买 + / 卖 −）</h4>
+            <div class="table-container">
+              <table>
+                <thead>
+                  <tr>
+                    <th>记录</th><th>成交笔数</th><th>买入笔数</th><th>卖出笔数</th>
+                    <th>买入金额</th><th>卖出金额</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr v-for="(t, i) in recordCompareData.trade_totals" :key="i">
+                    <td>#{{ recordCompareData.records[i].record.id }} {{ recordCompareData.records[i].record.name }}</td>
+                    <td>{{ t.trades_count }}</td>
+                    <td>{{ t.buy_count }}</td>
+                    <td>{{ t.sell_count }}</td>
+                    <td>{{ fmtMoney(t.buy_amount) }}</td>
+                    <td>{{ fmtMoney(t.sell_amount) }}</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+            <div v-if="recordCompareData.stock_rows.length" class="table-container"
+                 style="margin-top:8px;max-height:320px;overflow:auto">
+              <table>
+                <thead>
+                  <tr>
+                    <th>股票</th>
+                    <th v-for="it in recordCompareData.records" :key="it.record.id">#{{ it.record.id }}</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr v-for="row in recordCompareData.stock_rows" :key="row.stock_code">
+                    <td>{{ row.stock_code }}</td>
+                    <td v-for="(v, i) in row.values" :key="i">{{ recordCompareStockText(Number(v)) }}</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+            <p v-if="recordCompareData.stock_rows_truncated" class="note">
+              仅显示净买入额绝对值最大的 50 只股票。
+            </p>
+          </template>
+        </div>
+        <div class="modal-actions">
+          <button class="btn" @click="closeRecordCompare">关闭</button>
+        </div>
+      </div>
     </div>
 
     <!-- 发起回测 Modal -->

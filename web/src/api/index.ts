@@ -142,6 +142,50 @@ export interface BacktestRecordItem {
   data_quality: DataQuality | null
 }
 
+// K2 多记录横向对比（对齐 backtest_service.compare_records）
+export interface BacktestCompareCurvePoint {
+  date: string | null
+  total_value: number | null
+  cumulative_return: number | null
+  index_value: number | null  // 首日归一净值（各记录可叠加）
+}
+
+export interface BacktestCompareItem {
+  record: BacktestRecordItem
+  metrics: Record<string, number | null>
+  curve: BacktestCompareCurvePoint[]
+  params: Record<string, string | number | boolean | null>
+  trade_summary: {
+    trades_count: number
+    buy_count: number
+    sell_count: number
+    buy_amount: number
+    sell_amount: number
+    stocks: Record<string, number>
+  }
+}
+
+export interface BacktestCompareRow {
+  key?: string
+  label?: string
+  stock_code?: string
+  values: (number | string | null)[]
+  differs: boolean
+}
+
+export interface BacktestCompareResult {
+  records: BacktestCompareItem[]
+  metric_rows: BacktestCompareRow[]
+  param_rows: BacktestCompareRow[]
+  stock_rows: BacktestCompareRow[]
+  stock_rows_truncated: boolean
+  trade_totals: Array<{
+    trades_count: number; buy_count: number; sell_count: number
+    buy_amount: number; sell_amount: number
+  }>
+  warnings: string[]
+}
+
 // F1 回测数据质量（对齐 backtest_service.summarize_data_quality）
 export interface DataQualityPeriod {
   union_bars: number
@@ -1725,6 +1769,12 @@ export interface PoolCompareItem {
 export async function compareBacktestPools(req: PoolCompareRequest) {
   const res = await api.post<ApiResponse<{ comparisons: PoolCompareItem[] }>>(
     '/backtest/robustness/compare', req)
+  return res.data.data
+}
+
+export async function compareBacktestRecords(record_ids: number[]) {
+  const res = await api.post<ApiResponse<BacktestCompareResult>>(
+    '/backtest/records/compare', { record_ids })
   return res.data.data
 }
 

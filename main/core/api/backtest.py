@@ -126,6 +126,11 @@ class PoolCompareRequest(BaseModel):
     dividend_mode: str = "dual"
 
 
+class CompareRecordsRequest(BaseModel):
+    """K2 多记录横向对比：2~10 条已完成记录，只读汇总。"""
+    record_ids: List[int]
+
+
 class WalkForwardRequest(BaseModel):
     """C8 walk-forward 滚动验证：滚动 train_years 年训练 + test_years 年验证逐段前移，
     每窗子回测过 IS/OOS 门槛（C7 同一判定），全窗 passed 才 overall_pass。"""
@@ -174,6 +179,7 @@ from core.services.backtest_service import (  # noqa: E402
     _slice_klines_from,
     _MINUTE_PERIODS,
     list_records as _svc_list_records,
+    compare_records as _svc_compare_records,
     get_record_detail as _svc_get_record_detail,
     delete_record as _svc_delete_record,
     run_backtest as _svc_run_backtest,
@@ -211,6 +217,19 @@ from core.tq.formula import TQFormula  # noqa: E402  re-export（同上）
 @router.get("/records")
 def list_records(db: Session = Depends(get_db)):
     return ok(_svc_list_records(db))
+
+
+@router.post("/records/compare")
+def compare_records(req: CompareRecordsRequest, db: Session = Depends(get_db)):
+    """K2 多记录横向对比（只读）：曲线叠加 + 指标表 + 参数 diff + 成交 diff。
+
+    用 POST 避免与 ``GET /records/{record_id}`` 的路径参数歧义；
+    记录不存在 → 404，条数越界/不足 → 400。
+    """
+    payload, msg = _svc_compare_records(db, req.record_ids)
+    if payload is None:
+        return err(404 if msg and "不存在" in msg else 400, msg)
+    return ok(payload)
 
 
 @router.get("/records/{record_id}")

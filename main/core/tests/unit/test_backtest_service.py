@@ -3229,3 +3229,95 @@ def test_upsert_persistence_failed_keeps_last_payload(db_session):
     assert json.loads(row2.payload_json)["verdict"]["level"] == "stable"
     assert row2.computed_at > old
 
+
+# ---------------------------------------------------------------------------
+# K2 多记录横向对比
+# ---------------------------------------------------------------------------
+def _seed_compare_record(db, ps, name, values, trades, params, total_return):
+    rec = BacktestRecord(
+        portfolio_strategy_id=ps.id, name=name,
+        start_date=date(2026, 7, 29), end_date=date(2026, 7, 31),
+        status="completed", params_snapshot=json.dumps(params),
+    )
+    db.add(rec)
+    db.flush()
+    base = float(values[0])
+    for i, v in enumerate(values):
+        db.add(BacktestDailySnapshot(
+            backtest_record_id=rec.id, target_type="portfolio", target_id=ps.id,
+            snap_date=date(2026, 7, 29) + timedelta(days=i),
+            total_value=Decimal(str(v)), cash=Decimal(str(v)),
+            market_value=Decimal("0"),
+            cumulative_return=Decimal(str(v / base - 1)),
+        ))
+    for code, ttype, price, qty in trades:
+        db.add(BacktestTrade(
+            backtest_record_id=rec.id, strategy_id=1, signal_name="s",
+            signal_type="OPEN", stock_code=code, trade_type=ttype,
+            price=Decimal(str(price)), quantity=qty,
+            amount=Decimal(str(price)) * qty,
+            commission=Decimal("5"), stamp_duty=Decimal("0"),
+            transfer_fee=Decimal("0"), bar_time=datetime(2026, 7, 30, 10),
+        ))
+    db.add(BacktestEvaluation(
+        backtest_record_id=rec.id, target_type="portfolio", target_id=ps.id,
+        total_return=Decimal(str(total_return)), max_drawdown=Decimal("-0.05"),
+        total_trades=len(trades), annual_turnover=Decimal("2.0"),
+    ))
+    db.commit()
+    return rec
+
+
+def test_compare_records_curves_metrics_and_diffs(db_session):
+    """K2：曲线首日归一可叠加；指标表/参数 diff/成交 diff 同源只读汇总。"""
+    ps, _ = _seed(db_session)
+    a = _seed_compare_record(
+        db_session, ps, "A", [100000, 110000, 120000],
+        [("000001.SZ", "BUY", 10, 1000)],
+        {"dividend_mode": "front", "slippage": 0}, 0.2,
+    )
+    b = _seed_compare_record(
+        db_session, ps, "B", [50000, 49000, 52000],
+        [("000001.SZ", "SELL", 10, 1000)],
+        {"dividend_mode": "back", "slippage": 0.001}, 0.04,
+    )
+
+    payload, err = svc.compare_records(db_session, [a.id, b.id])
+
+    assert err is None
+    assert [it["record"]["id"] for it in payload["records"]] == [a.id, b.id]
+    # 首日归一到 1.0：初始资金不同的记录可直接叠加
+    assert payload["records"][0]["curve"][0]["index_value"] == pytest.approx(1.0)
+    assert payload["records"][0]["curve"][2]["index_value"] == pytest.approx(1.2)
+    assert payload["records"][1]["curve"][0]["index_value"] == pytest.approx(1.0)
+
+    ret_row = next(r for r in payload["metric_rows"] if r["key"] == "total_return")
+    assert ret_row["values"] == [pytest.approx(0.2), pytest.approx(0.04)]
+    assert ret_row["differs"] is True
+
+    div_row = next(r for r in payload["param_rows"] if r["key"] == "dividend_mode")
+    assert div_row["values"] == ["front", "back"]
+    assert div_row["differs"] is True
+
+    stock_row = next(
+        r for r in payload["stock_rows"] if r["stock_code"] == "000001.SZ")
+    assert stock_row["values"] == [pytest.approx(10000.0), pytest.approx(-10000.0)]
+    assert payload["trade_totals"][0]["buy_count"] == 1
+    assert payload["trade_totals"][1]["sell_count"] == 1
+
+
+def test_compare_records_validates_ids(db_session):
+    """K2：少于 2 条 / 记录不存在 都在 service 层给出明确错误（路由转 400/404）。"""
+    ps, _ = _seed(db_session)
+    a = _seed_compare_record(
+        db_session, ps, "A", [100000, 101000], [], {}, 0.01)
+
+    payload, err = svc.compare_records(db_session, [a.id])
+    assert payload is None and "至少" in err
+
+    payload, err = svc.compare_records(db_session, [a.id, a.id])
+    assert payload is None and "至少" in err
+
+    payload, err = svc.compare_records(db_session, [a.id, a.id + 999])
+    assert payload is None and "不存在" in err
+
