@@ -2931,8 +2931,11 @@ onUnmounted(() => {
           <label class="group-label">四、实盘执行配置（策略表单「实盘执行」分组）</label>
           <div class="guide-block">
             <p class="guide-step"><b>撤单后追价重下 requote</b>：超时未成交 → 自动撤单 → 追 1 tick 重下
-              （最多 requote_max_attempts 次）；默认关。依赖通道撤单能力（通达信/同花顺），桥通道不生效。</p>
-            <p class="guide-step"><b>大额拆单（仅 TDX）</b>：单笔 ≥ split_order_threshold → 拆 N 子单，成交驱动续发；默认关。</p>
+              （最多 requote_max_attempts 次）；默认关。requote_price_mode=tick（默认）/adaptive（按盘口追价，
+              受 requote_max_slippage_ticks 限制，无行情回退 tick）。依赖通道撤单能力（通达信/同花顺），桥通道不生效。</p>
+            <p class="guide-step"><b>大额拆单（仅 TDX）</b>：单笔 ≥ split_order_threshold → 拆 N 子单，成交驱动续发；默认关。
+              split_order_count/min_qty/interval_seconds/volume_pct 默认 NULL、interval_jitter 默认 false
+              （NULL/false＝按阈值与成交量推导的旧口径）。</p>
             <p class="guide-step"><b>风控执行时点 risk_timing</b>：next_day（默认，与回测一致——日线信号
               次日开盘执行）/ immediate（当日确认当日执行，仅盘中周期有效；15:05 收盘落定轮次与
               提前收盘价之外的日线单仍按本设置）。仅实盘生效，回测忽略（回测固定 T+1）；
@@ -2966,13 +2969,58 @@ onUnmounted(() => {
               不下单——半自动（此时所选引擎只用于记录，不参与取数）。</p>
             <p class="guide-step"><b>自动（auto）</b>：全套自动下单——按所选引擎执行；同花顺 file_builtin 下
               指令/回执落在 {ths_ui.work_dir}/{session_id}/（signals/risk/orders/results + cursor.json）。</p>
+            <p class="guide-step"><b>人工审批（manual）</b>：信号先入审批队列，人工确认后才下单；支持人工补单/改账，
+              受 tq_trade.approval_exempt_sells（默认 true，卖出豁免）、manual_order_max_amount（默认 0 不限）、
+              manual_action_min_interval_ms（默认 1000）约束。非 manual 会话的审批端点返回 409。</p>
+            <p class="guide-step"><b>影子（shadow）</b>：只按真实行情记账、生成决策与持仓，<b>不触发任何真实委托</b>，
+              用于验证策略与执行偏差；必须显式选择，能力矩阵不会自动开启。</p>
             <p class="guide-note">· THS 自动模式已真机验证（下单→成交→撤单全链路）；首次实盘建议小单先行；
               运行期间勿触碰键鼠。</p>
           </div>
         </div>
 
         <div class="form-group">
-          <label class="group-label">七、风险提示</label>
+          <label class="group-label">七、本轮新增能力与开关（2026-11-18，默认全部关闭）</label>
+          <div class="guide-block">
+            <p class="guide-step"><b>告警外发（notify）</b>：总开关 notify.enabled 默认 false；飞书
+              notify.channel=feishu + webhook_url/secret，企微 notify.wecom.webhook_url，邮件
+              notify.email.smtp_host/smtp_port(465)/username/password/from/to[]/use_ssl(true)（密码可用
+              TQ_NOTIFY_EMAIL_PASSWORD），本地提示音 notify.sound.enabled(false)/path。公共项 min_level=warn、
+              silence_seconds=300、timeout_seconds 夹 1~5 秒。仅 config.yaml 可配，改后<b>即时生效</b>；
+              关闭＝不建线程、不发请求，与接入前逐字一致。</p>
+            <p class="guide-step"><b>日志轮转 / 升级校验 / 业务心跳 / 备份恢复</b>：logging.daily_rotate 默认
+              false、backup_count=14（<b>改后需重启后端</b>，关闭＝单文件追加）；upgrade.enabled 默认 false、
+              require_backup=true、max_backup_age_hours=24（preflight 即时，启动校验需重启；关闭＝不校验版本）；
+              health.business_probe_enabled 默认 false、business_stall_seconds=180、business_grace_seconds=120
+              （即时读取，关闭＝/health 不带 business 字段）；backup.restore_enabled 默认 false
+              （即时读取，关闭＝恢复接口/前端入口不可用，只能手工替换库）。</p>
+            <p class="guide-step"><b>行情降级 / 盘后交叉校验 / 回测 K 线缓存</b>：live.quote_fallback.enabled
+              默认 false、chain=[tq,iquant,goldminer]（<b>需重启会话</b>，关闭＝只用主行情源）；
+              live.cross_check.enabled 默认 false、sample_size=5、max_dev_pct=1.0（次日生效，关闭＝不校验）；
+              backtest.kline_cache.enabled 默认 false、dir=data/kline_cache、today_ttl_seconds=300
+              （每次回测即时读取，关闭＝每次直连数据源）。</p>
+            <p class="guide-step"><b>会话级默认（重启会话生效）</b>：execution_mode 新建默认 alert（历史会话
+              auto），shadow 仅影子记账不下单，manual 才启用审批队列；gate_recheck_on_execute=0（关闭＝按信号日
+              决策执行）；account_risk_enabled=0、account_max_drawdown/account_daily_loss_limit=NULL（回退
+              tq_trade 全局 0.15/0.05）；failover_enabled=0、backup_engine=NULL（关闭＝只走主通道）；
+              capital_pool_mode=off、capital_pool_rebalance_enabled=0（关闭＝分账不分池、不日再平衡）；
+              pre_open_auction_enabled/end_time/price_bias_pct=NULL（NULL＝跟随全局 true/09:20/2.0）。</p>
+            <p class="guide-step"><b>组合/策略级（重启会话生效）</b>：portfolio priority=0（0＝默认顺序）；
+              market_gate_indices=NULL、vote_mode=any、strength_threshold=0、bear_reduce_ratio=0（默认＝单指数
+              任一空头即拦、无强度门槛、不减仓）；breaker_action=halt（只停开仓）；requote_price_mode=tick
+              （adaptive 才按盘口追价）；split_order_count/min_qty/interval_seconds/volume_pct=NULL、
+              interval_jitter=false（NULL/false＝按阈值推导或旧口径）。</p>
+            <p class="guide-step"><b>回测档位</b>：dividend_mode 默认 front，exact＝不复权 + 显式公司行为（仅作
+              对账基准）；execution_profile 默认 legacy，realistic 才启用涨跌停/成交量/自适应滑点/日终抬峰。
+              二者按每次回测显式选择，无需重启。</p>
+            <p class="guide-note">· <b>通道能力矩阵</b>：GET /api/live/channel 的 engines[].capabilities /
+              capability_limits 为静态声明（下单/撤单/行情/限价/备注认领/拆单/盘前限价），前端据此置灰不支持的
+              配置；无需配置，也不改变既有行为。影子模式必须显式选择，不会因能力矩阵自动开启。</p>
+          </div>
+        </div>
+
+        <div class="form-group">
+          <label class="group-label">八、风险提示</label>
           <div class="guide-block">
             <p class="guide-note">· 同一资金账号禁止挂两个会话。</p>
             <p class="guide-note">· 同花顺真实账户操作请先小单验证。</p>

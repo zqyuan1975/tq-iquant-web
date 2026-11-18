@@ -45,7 +45,7 @@ def read_version() -> str:
     text = VERSION_FILE.read_text(encoding="utf-8-sig")
     match = re.search(r'#define\s+AppVersion\s+"([^"]+)"', text)
     if not match:
-        sys.exit(f"无法从 {VERSION_FILE} 解析 AppVersion（期望格式：#define AppVersion \"1.0.1\"）")
+        sys.exit(f"无法从 {VERSION_FILE} 解析 AppVersion（期望格式：#define AppVersion \"1.0.6\"）")
     return match.group(1)
 
 
@@ -304,7 +304,7 @@ def write_build_info(dist_dir: Path, mode: str):
     """分发目录内留一份构建档案：装到目标机后可直接看版本/来源，便于核对与回滚。
 
     --web-only 复用已有二进制：app_version / build_time / git 来源必须保留原值
-    （否则 1.0.4 的 exe 会配上一份写着 1.0.5 的档案），只追加 frontend_patch_time，
+    （否则旧版 exe 会配上一份写着当前版本号的档案），只追加 frontend_patch_time，
     并刷新 frontend_dist_mtime 指向本次前端产物。
     """
     index = WEB_DIST / "index.html"

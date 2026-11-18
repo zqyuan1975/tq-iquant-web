@@ -3728,7 +3728,8 @@ watch(theme, () => {
             <label class="group-label">一、基本参数</label>
             <div class="guide-block">
               <p class="guide-step"><b>复权模式</b>：front=前复权（默认，历史价被压缩）；back=后复权；
-                <b>dual=前复权信号+后复权记账（推荐）</b>，信号与真实价成交口径一致。</p>
+                <b>dual=前复权信号+后复权记账（推荐）</b>，信号与真实价成交口径一致；
+                exact=不复权 + 显式公司行为（送转/分红/停牌/退市），仅作对账基准，成本与旧回测不可直接比较。</p>
               <p class="guide-step"><b>成本口径</b>：回测按模型计费（佣金含最低 5 元 / 卖出印花税 /
                 买卖双向过户费），实盘成本取柜台真实成交成本（含费、含送转摊薄，可能为负或未知），
                 <b>两者不可逐日对比</b>；2026-11-11 前发起的历史回测需在新过户费口径下重跑才严格可比。</p>
@@ -3746,6 +3747,9 @@ watch(theme, () => {
                 冲击系数留空=用组合默认。</p>
               <p class="guide-step"><b>成交量约束/容量上限（run 级覆盖）</b>：发起回测弹窗的成交量/容量选项可
                 临时覆盖组合配置做 A/B 对比，不改组合。</p>
+              <p class="guide-step"><b>K 线缓存（backtest.kline_cache）</b>：enabled 默认 false，
+                dir=data/kline_cache，today_ttl_seconds=300；关闭＝每次回测直连数据源，开启后复用历史 parquet，
+                当日数据超过 TTL 会刷新。</p>
               <p class="guide-step"><b>风控规则</b>：信号优先级 风控（止损/止盈/移动止损）&gt; 公式信号；
                 移动止损跟踪持仓最高价回撤≥阈值触发，是核心出场机制（实测贡献约 70% 利润）。</p>
             </div>

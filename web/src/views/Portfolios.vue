@@ -996,6 +996,24 @@ onMounted(loadPortfolios)
               <p class="guide-note">· 动态仓位下建议先用「回归验证」（walk-forward）做样本外检验，再决定是否实盘。</p>
             </div>
           </div>
+          <div class="form-group">
+            <label class="group-label">五、本轮新增组合级开关（2026-11-18，默认关闭）</label>
+            <div class="guide-block">
+              <p class="guide-step"><b>下单优先级 priority</b>：默认 0。同一 bar 多组合并发时数值越大越先分配资金并下单；
+                0＝按默认顺序。改后<b>需重启实盘会话</b>。</p>
+              <p class="guide-step"><b>门控多指数投票</b>：market_gate_indices 默认空（只用基准指数）；vote_mode=any
+                （任一空头即拦，旧语义）/ majority / all；strength_threshold=0（不设空头强度门槛）；
+                bear_reduce_ratio=0（空头只拦开仓、不减仓）。改后<b>需重启实盘会话</b>。</p>
+              <p class="guide-step"><b>熔断动作 breaker_action</b>：默认 halt（只停开仓，不减仓、不通知）；
+                notify=仅通知、half=减半仓、liquidate=清仓，均为显式选择，改后<b>需重启实盘会话</b>。</p>
+              <p class="guide-step"><b>公司行为 / 时点股票池</b>：corporate_actions_enabled、
+                dividend_reinvest_enabled、suspension_dispose_days、delist_force_close_enabled、pool_pit_enabled
+                均默认 0；关闭＝不应用公司行为、不处置长期停牌/退市（退市只记 notice）、按静态股票池判定。
+                改后<b>需重启实盘会话</b>（回测按次生效）。</p>
+              <p class="guide-note">· 资金池模式（capital_pool_mode=off、capital_pool_rebalance_enabled=0）
+                属于会话级开关，见实盘页「配置指南」；组合级不重复配置。</p>
+            </div>
+          </div>
         </div>
         <div class="modal-actions">
           <button @click="showGuide = false" class="btn btn-primary">知道了</button>
