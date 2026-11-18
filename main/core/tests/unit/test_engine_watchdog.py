@@ -457,3 +457,73 @@ def test_process_tag_contains_pid():
     tag = process_tag()
     assert tag.startswith("pid=")
     assert "port=" in tag
+
+
+# ---------------- 错配自愈（仅在注入 unregister_fn 的生产路径启用） ----------------
+
+def test_owner_mismatch_self_heal_stops_and_unregisters():
+    engines = {}
+    eng = _running_engine()
+    eng._stop_requested = False
+    engines[1] = eng
+    unregistered = []
+
+    def unregister(sid):
+        unregistered.append(sid)
+        engines.pop(sid, None)
+
+    wd = _watchdog(engines, session_status_fn=lambda sid: "stopped",
+                   unregister_fn=unregister)
+    wd.scan()
+
+    assert eng._running is False          # 循环下一拍退出
+    assert eng._stop_requested is True    # 拒单闸同步关闭
+    assert unregistered == [1]
+    assert 1 not in engines
+    assert len(_risk(eng, "engine_owner_mismatch")) == 1
+
+    wd.scan()  # 已移出注册表：不重复告警、不残留错配态
+    assert len(_risk(eng, "engine_owner_mismatch")) == 1
+    assert wd.status()["owner_mismatch"] == []
+
+
+def test_owner_mismatch_no_self_heal_without_unregister():
+    """默认（未注入 unregister_fn）只告警，不动引擎——保持既有语义/单测安全。"""
+    eng = _running_engine()
+    wd = _watchdog({1: eng}, session_status_fn=lambda sid: "stopped")
+    wd.scan()
+    assert eng._running is True
+    assert len(_risk(eng, "engine_owner_mismatch")) == 1
+
+
+def test_owner_mismatch_self_heal_unregister_failure_is_tolerated():
+    eng = _running_engine()
+
+    def boom(sid):
+        raise RuntimeError("registry busy")
+
+    wd = _watchdog({1: eng}, session_status_fn=lambda sid: "stopped",
+                   unregister_fn=boom)
+    wd.scan()  # 不抛异常；标志已置，告警仍留痕
+    assert eng._running is False
+    assert len(_risk(eng, "engine_owner_mismatch")) == 1
+
+
+def test_owner_mismatch_stale_snapshot_after_registry_pop_is_ignored():
+    """stop_session 先 pop 注册表再 commit：扫描快照取到旧引擎不应判错配。"""
+    eng = _running_engine()
+    calls = {"n": 0}
+    live = {1: eng}
+
+    def provider():
+        calls["n"] += 1
+        return dict(live) if calls["n"] == 1 else {}
+
+    wd = EngineWatchdog(
+        provider, now_fn=lambda: NOW, mono_fn=lambda: 0.0,
+        snapshot_fn=lambda sid: None, session_status_fn=lambda sid: "stopping",
+        in_session_fn=lambda dt: True, client_online_fn=lambda ch: True,
+        timeout_seconds=10 ** 9, grace_seconds=120)
+    wd.scan()
+    assert _risk(eng, "engine_owner_mismatch") == []
+    assert eng._running is True

@@ -26,6 +26,7 @@
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -227,6 +228,7 @@ class EngineWatchdog:
         mono_fn: Callable[[], float] = time.monotonic,
         snapshot_fn: Callable[[int], Optional[datetime]] = latest_snapshot_at,
         session_status_fn: Callable[[int], Optional[str]] = live_session_status,
+        unregister_fn: Optional[Callable[[int], None]] = None,
         in_session_fn: Callable[[datetime], bool] = default_in_session,
         client_online_fn: Callable[[str], bool] = client_window_present,
         persist_fn: Optional[Callable[..., None]] = None,
@@ -251,6 +253,8 @@ class EngineWatchdog:
         self._snapshot = snapshot_fn
         # 会话 DB 状态探针（错配自检用；单测可注入，避免读真实库）
         self._session_status = session_status_fn
+        # 错配自愈：把本进程的孤儿引擎移出注册表（生产注入 ENGINES.pop）
+        self._unregister = unregister_fn
         self._in_session = in_session_fn
         # 客户端窗口/进程探针（tdx/ths）：毫秒级 ctypes，不初始化 TQ
         self._client_online = client_online_fn
@@ -341,7 +345,8 @@ class EngineWatchdog:
         now = self._now()
         self._scan_stats = {"sessions": 0, "rules_checked": 0, "alarms": 0}
         sessions = dict(self._sessions_provider() or {})
-        for session_id, engine in sessions.items():
+        # 用 list() 快照迭代：错配自愈会在扫描过程中把引擎移出注册表
+        for session_id, engine in list(sessions.items()):
             try:
                 self._scan_one(now, session_id, engine)
             except Exception:  # noqa: BLE001 — 单会话异常不影响其它会话
@@ -373,7 +378,9 @@ class EngineWatchdog:
         channel = self._channel(engine)
         # 进程/会话状态错配（DB 已 stopped/stopping 但本进程引擎仍在跑）：
         # 不受交易时段限制——盘后照样会继续写快照，必须能报出来。
-        self._check_owner_mismatch(session_id, engine, channel)
+        # 自愈已收敛该引擎时本轮不再跑探针（避免对正在停的会话发通道告警）。
+        if self._check_owner_mismatch(session_id, engine, channel):
+            return
         # 引擎层卡死：仅交易时段判定（无 bar/无快照在盘外是正常）
         if self._in_session(now):
             self._scan_stats["rules_checked"] += 1
@@ -394,29 +401,38 @@ class EngineWatchdog:
 
     # ------------------------------------------------------------ 进程错配自检
     def _check_owner_mismatch(self, session_id: int, engine: object,
-                              channel: str) -> None:
+                              channel: str) -> bool:
         """DB 已 stopped/stopping，但本进程引擎仍在跑 → 进程/状态错配。
 
         正常 stop 一定由持有引擎的进程处理：路由同步置 ``_running=False``，
         因此本检查只在异常分支命中（预热宽限已在 ``_scan_one`` 扣掉）。命中
-        即 ERROR + SSE risk + 落 ``engine_owner_mismatch`` 决策事件，供事后
-        把「哪个进程在写、哪个进程收到 stop」对上号。不在此处停机——停机兜底
-        由自愈逻辑单独处理。
+        即 ERROR + SSE risk + 落 ``engine_owner_mismatch`` 决策事件，再由
+        ``_heal_owner_mismatch`` 收敛（本进程自愈）。
+
+        返回 True 表示引擎已被自愈移出注册表，调用方应跳过本轮其它探针。
         """
+        # 过期快照保护：``stop_session`` 先 pop 注册表再 commit，正常 stop 的
+        # 瞬间可能被扫到「快照里有引擎、DB 已 stopping」。此时注册表里已无该
+        # 引擎（或已换成重启后的新引擎），不是错配，直接跳过。
+        try:
+            if self._sessions_provider().get(session_id) is not engine:
+                return False
+        except Exception:  # noqa: BLE001 — 注册表不可读时不构成错配判据
+            return False
         try:
             status = self._session_status(session_id)
         except Exception:  # noqa: BLE001 — DB 抖动不应当成错配
             logger.warning(
                 "engine watchdog: 读取会话状态失败 (session %s)", session_id,
                 exc_info=True)
-            return
+            return False
         if status is None:
             # 会话行不存在（删除/尚未落库）：不做错配判定
             self._owner_mismatch.pop(session_id, None)
-            return
+            return False
         if status not in _NOT_RUNNING_STATUSES:
             self._recover_owner_mismatch(session_id, engine, channel, status)
-            return
+            return False
         mono = self._mono()
         state = self._owner_mismatch.get(session_id)
         if state is None:
@@ -425,7 +441,7 @@ class EngineWatchdog:
             self._owner_mismatch[session_id] = state
         state["db_status"] = status
         if state["alerted"] and mono - state["last_log_mono"] < self._repeat:
-            return
+            return False
         first = not state["alerted"]
         state["alerted"] = True
         state["last_log_mono"] = mono
@@ -449,6 +465,50 @@ class EngineWatchdog:
             self._persist_owner_event(
                 session_id, channel, "engine_owner_mismatch", "trigger",
                 seconds, "db_status=%s" % status, message)
+            # 自愈默认关闭：只有生产注入 unregister_fn（真实的 ENGINES 注册表）
+            # 才收敛停机；未注入（单测/只读诊断）保持「只告警不动引擎」。
+            if self._unregister is not None:
+                self._heal_owner_mismatch(session_id, engine, status)
+                return True
+        return False
+
+    def _heal_owner_mismatch(self, session_id: int, engine: object,
+                             status: str) -> None:
+        """把「DB 已停、本进程仍在跑」的孤儿引擎收敛停机并移出注册表。
+
+        只会在异常分支触发（status ∈ stopped/stopping 且引擎已过预热宽限）：
+        正常 stop 已由路由同步置 ``_running=False``，不会走到这里；会话重启
+        会重新构建并注册新引擎，不受影响。先同步置标志（循环在下一拍退出），
+        再尽力调度 ``engine.stop()`` 做清理，最后移出注册表，避免本进程继续
+        占用该会话、也避免 watchdog 反复告警。
+        """
+        errors = []
+        try:
+            if hasattr(engine, "_running"):
+                engine._running = False
+            if hasattr(engine, "_stop_requested"):
+                engine._stop_requested = True
+        except Exception as exc:  # noqa: BLE001 — 自愈尽力而为，需留痕
+            errors.append("flags:%s" % exc)
+        loop = getattr(engine, "_loop_ref", None)
+        try:
+            if loop is not None and loop.is_running():
+                asyncio.run_coroutine_threadsafe(engine.stop(), loop)
+        except Exception as exc:  # noqa: BLE001
+            errors.append("stop:%s" % exc)
+        if self._unregister is not None:
+            try:
+                self._unregister(session_id)
+            except Exception as exc:  # noqa: BLE001
+                errors.append("unregister:%s" % exc)
+        if errors:
+            logger.error(
+                "错配自愈部分失败：会话 %s（DB=%s，%s，%s）",
+                session_id, status, process_tag(), "; ".join(errors))
+        else:
+            logger.error(
+                "错配自愈：会话 %s（DB=%s）已置 _running=False、调度 engine.stop() "
+                "并移出本进程注册表（%s）", session_id, status, process_tag())
 
     def _recover_owner_mismatch(self, session_id: int, engine: object,
                                 channel: str, status: str) -> None:

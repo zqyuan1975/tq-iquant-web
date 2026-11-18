@@ -97,8 +97,12 @@ async def lifespan(app: FastAPI):
     try:
         # 通道类故障单次判定即落 live_decision_events（gate=channel_offline/
         # channel_recovered），几分钟闪断也能在库里查到（2026-11-13）。
+        # unregister_fn：DB 已 stopped/stopping 而本进程引擎仍在跑（另一进程
+        # 收到 stop 的错配，2026-11-18 实证）时，自愈把孤儿引擎移出注册表。
+        # 仅异常分支触发；正常 stop 由路由同步置 _running=False，不会走到这里。
         watchdog = EngineWatchdog(
-            lambda: ENGINES, persist_fn=record_channel_decision)
+            lambda: ENGINES, persist_fn=record_channel_decision,
+            unregister_fn=lambda sid: ENGINES.pop(sid, None))
         watchdog.start()
         logger.info("实盘引擎存活监控已启动（进程内，30s 扫描）")
     except Exception:  # noqa: BLE001 — 监控启动失败不得阻断主服务
