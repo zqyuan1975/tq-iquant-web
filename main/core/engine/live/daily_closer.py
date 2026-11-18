@@ -94,6 +94,7 @@ class DailyCloser:
         snapshot_synth=None,
         on_daily_snapshot: Optional[Callable[[date], None]] = None,
         on_daily_gap_report: Optional[Callable[[date], None]] = None,
+        on_daily_cross_check: Optional[Callable[[date], None]] = None,
     ) -> None:
         self._ctx = ctx
         self._market_data = market_data
@@ -121,6 +122,8 @@ class DailyCloser:
         self._on_daily_snapshot = on_daily_snapshot
         # F3（2026-11-18）：收盘清扫完成后输出当日缺失分钟段清单（只观测）。None=不启用。
         self._on_daily_gap_report = on_daily_gap_report
+        # F4（2026-11-18）：收盘清扫后抽样交叉校验收盘价（只观测）。None=不启用。
+        self._on_daily_cross_check = on_daily_cross_check
         self._clock = ctx.clock
         # R4：幂等日期标记移入 __init__（原在 _calendar property 的 return 之后，死代码）。
         # E5/E6：14:30 日终已算过的日期标记（每日一次，避免每轮重复调 update_daily）
@@ -901,6 +904,7 @@ class DailyCloser:
                     self._ctx.session_id, today,
                 )
                 self._report_daily_gap(today)
+                self._report_daily_cross_check(today)
                 return
             logger.info(
                 "close sweep start (session %s, %s): %d pending order(s)",
@@ -1026,6 +1030,7 @@ class DailyCloser:
             self.last_close_sweep_date = today
             logger.info("close sweep done (session %s, %s)", self._ctx.session_id, today)
             self._report_daily_gap(today)
+            self._report_daily_cross_check(today)
         except Exception:  # noqa: BLE001
             db.rollback()
             logger.exception("close sweep error (session %s)", self._ctx.session_id)
@@ -1042,6 +1047,19 @@ class DailyCloser:
         except Exception:  # noqa: BLE001 — 缺失清单失败不影响日终
             logger.warning(
                 "daily gap report failed (session %s, %s)",
+                self._ctx.session_id, today, exc_info=True,
+            )
+
+    def _report_daily_cross_check(self, today: date) -> None:
+        """F4：收盘清扫完成后回调引擎做抽样交叉校验（只观测，失败只告警）。"""
+        cb = self._on_daily_cross_check
+        if not callable(cb):
+            return
+        try:
+            cb(today)
+        except Exception:  # noqa: BLE001 — 交叉校验失败不影响日终
+            logger.warning(
+                "daily cross check failed (session %s, %s)",
                 self._ctx.session_id, today, exc_info=True,
             )
 

@@ -90,6 +90,9 @@ from .live.timing import (
 )
 from .live.event_bus import EventBus
 from .live.gap_report import compress_missing_segments
+from .live.cross_check import (
+    compare_closes, format_report, pick_sample, positive_price,
+)
 # 外部信号注入源（通达信条件预警文件 → 公式名匹配策略 → 注入 signal_cache）
 from .live.external_signal_source import (
     ExternalSignalFileSource,
@@ -1034,6 +1037,8 @@ class LiveEngine:
             on_daily_snapshot=self._write_daily_portfolio_snapshots,
             # F3（2026-11-18）：15:05 收盘清扫后输出当日缺失分钟段清单（只观测）
             on_daily_gap_report=self._report_daily_gap,
+            # F4（2026-11-18）：15:05 收盘清扫后抽样交叉校验收盘价（只观测）
+            on_daily_cross_check=self._report_daily_cross_check,
         )
 
         # 已分发过周期边界的 1m stime 集合——同根 bar 二次触发时挡掉重复周期分发。
@@ -1051,6 +1056,8 @@ class LiveEngine:
         # F3：当日「仍缺」的分钟时间点（缺口补派后仍缺 + 周期边界超窗放弃），
         # 日终压缩为缺失分钟段清单（gate=bar_gap_daily）供人工判断影响。
         self._day_missing_minutes: Dict[date, Set[datetime]] = {}
+        # F4：抽样交叉校验当日已执行标记（每日收盘清扫后一次）
+        self._cross_check_done_date: Optional[date] = None
 
         self._running = False
         # I-5：stop 请求标记（stop() 首行置 True、start() 重置 False）。提交链入口
@@ -10720,6 +10727,150 @@ class LiveEngine:
         if len(self._day_missing_minutes) > 5:
             for d in sorted(self._day_missing_minutes)[:-5]:
                 self._day_missing_minutes.pop(d, None)
+
+    # ---------------- F4：收盘后抽样交叉校验（只观测）----------------
+    def _report_daily_cross_check(self, today: date) -> None:
+        """抽样比较通达信日线与实盘行情路径的当日收盘价（默认关闭）。
+
+        默认关闭（``live.cross_check.enabled=false``）：首行返回，不取数、不发事件。
+        只观测：偏差超阈值记 ``gate=data_cross_check`` 的 risk 事件（落库 + 通知），
+        不写账本、不产生订单、不影响任何交易判定。每交易日一次。
+        """
+        try:
+            cfg = (load_config() or {}).get("live") or {}
+        except Exception:  # noqa: BLE001
+            return
+        section = cfg.get("cross_check") or {}
+        if not isinstance(section, dict) or not bool(section.get("enabled", False)):
+            return
+        if self._cross_check_done_date == today:
+            return
+        try:
+            size = int(section.get("sample_size", 5) or 0)
+        except (TypeError, ValueError):
+            size = 5
+        try:
+            max_dev = float(section.get("max_dev_pct", 1.0))
+        except (TypeError, ValueError):
+            max_dev = 1.0
+        codes = pick_sample(getattr(self._bar_poller, "stock_codes", []), size)
+        if not codes:
+            return
+        primary = self._tq_daily_closes(codes, today)
+        secondary, secondary_name = self._live_daily_closes(codes, today)
+        self._cross_check_done_date = today
+        if not primary or not secondary:
+            logger.info(
+                "daily cross check skipped：两路取数不完整（tq=%d, live=%d, "
+                "session %s, %s）",
+                len(primary), len(secondary), self.session_id, today,
+            )
+            return
+        report = compare_closes(primary, secondary, max_dev)
+        text = format_report(
+            report, primary_name="tq_1d", secondary_name=secondary_name)
+        if not report["deviations"]:
+            logger.info("[data-cross-check] %s (session %s)", text, self.session_id)
+            return
+        payload = {
+            "session_id": self.session_id,
+            "engine": self._engine_key,
+            "gate": "data_cross_check",
+            "action": "deviation",
+            "rule": "close_price_mismatch",
+            "trade_date": today.isoformat(),
+            "primary": "tq_1d",
+            "secondary": secondary_name,
+            "checked": int(report["checked"]),
+            "deviation_count": len(report["deviations"]),
+            "max_dev_pct": report["max_dev_pct"],
+            "deviations": report["deviations"][:20],
+            "message": text,
+        }
+        logger.warning("[data-cross-check] %s (session %s)", text, self.session_id)
+        self._emit_risk_safe(payload, persist=True)
+        try:
+            notify("warn", "行情交叉校验偏差", text,
+                   gate="data_cross_check", trade_date=today)
+        except Exception:  # noqa: BLE001 — 通知失败不影响日终
+            logger.debug("cross check notify failed", exc_info=True)
+
+    @staticmethod
+    def _tq_daily_closes(codes: List[str], today: date) -> Dict[str, float]:
+        """通达信 1d 当日收盘价（只取索引最后一行且日期必须是今天）。"""
+        try:
+            from core.tq.data import TQData
+            raw = TQData().get_history_raw(
+                stocks=list(codes), periods=["1d"],
+                start=today.strftime("%Y%m%d"), end=today.strftime("%Y%m%d"),
+                dividend_type="front", count=-1,
+            )
+        except Exception:  # noqa: BLE001 — 取数失败只是本日不校验
+            logger.warning("daily cross check: TQ 日线取数失败", exc_info=True)
+            return {}
+        close_df = ((raw or {}).get("1d") or {}).get("Close")
+        if close_df is None or len(getattr(close_df, "index", [])) == 0:
+            return {}
+        last = close_df.index[-1]
+        last_date = last.date() if hasattr(last, "date") else last
+        if last_date != today:
+            return {}
+        out: Dict[str, float] = {}
+        columns = getattr(close_df, "columns", [])
+        for code in codes:
+            if code not in columns:
+                continue
+            px = positive_price(close_df.loc[last, code])
+            if px is not None:
+                out[code] = px
+        return out
+
+    def _live_daily_closes(
+        self, codes: List[str], today: date,
+    ):
+        """实盘行情路径的当日收盘价：快照合成最后一根 1m，或桥 1d bar。"""
+        synth = self._snapshot_synth
+        if synth is not None:
+            try:
+                completed = synth.completed_bars(list(codes), count=30) or {}
+            except Exception:  # noqa: BLE001
+                logger.warning(
+                    "daily cross check: 快照合成取数失败", exc_info=True)
+                completed = {}
+            out: Dict[str, float] = {}
+            for code, rows in completed.items():
+                for row in reversed(rows or []):
+                    st = parse_bar_time(row)
+                    if st is None:
+                        continue
+                    if st.date() == today:
+                        px = positive_price(row.get("close"))
+                        if px is not None:
+                            out[code] = px
+                        break
+            return out, "snapshot_1m_close"
+        out = {}
+        for code in codes:
+            try:
+                rows = self._ctx.dispatcher.query_quote(
+                    code, period="1d", count=2)
+            except BridgeUnavailableError:
+                # 收盘后观测失败不置离线（不影响交易链路），本日该 code 不比较
+                continue
+            except Exception:  # noqa: BLE001
+                logger.debug(
+                    "daily cross check: 桥 1d 取数失败 %s", code, exc_info=True)
+                continue
+            for row in reversed(rows or []):
+                st = parse_bar_time(row)
+                if st is None:
+                    continue
+                if st.date() == today:
+                    px = positive_price(row.get("close"))
+                    if px is not None:
+                        out[code] = px
+                    break
+        return out, "bridge_1d"
 
     def _report_daily_gap(self, today: date) -> None:
         """日终输出当日缺失分钟段清单（gate=bar_gap_daily，落库 + 通知）。
