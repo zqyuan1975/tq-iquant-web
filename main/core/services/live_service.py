@@ -41,6 +41,7 @@ from core.models import (
     LiveManualAction, LiveReconciliationDiff, LiveReconciliationReport,
     LiveOutOfPoolDecision, LiveCorporateAction,
     LivePortfolioDaily,
+    LiveGateSnapshot,
     LivePositionPeak,
     LiveSessionPendingChange,
     LiveGlobalSwitch,
@@ -1347,6 +1348,8 @@ def build_engine(
         benchmark_codes=benchmark_codes,
         gate_provider=_gate_provider if gate_specs else None,
         gate_portfolio_ids=set(gate_specs),
+        # E2：每日门控快照（带基准指数/引擎元信息）
+        gate_specs=gate_specs,
         # E1（默认关）：顺延次日单/盘前竞价单提交前重判门控
         gate_recheck_on_execute=bool(
             getattr(session_row, "gate_recheck_on_execute", False)),
@@ -4611,6 +4614,37 @@ def list_split_remainders(db: Session, session_id: int):
             "period": parts[4] if len(parts) > 4 else "",
             "signal_name": signal_name,
             "created_at": _iso_utc(row.created_at),
+        })
+    return items
+
+
+def list_gate_snapshots(db: Session, session_id: int, days: int = 30):
+    """E2：每日门控快照（按日倒序）。会话不存在返回 None。"""
+    exists = db.query(LiveSession.id).filter(LiveSession.id == session_id).first()
+    if exists is None:
+        return None
+    days = max(1, min(int(days or 30), 365))
+    cutoff = date.today() - timedelta(days=days)
+    rows = (
+        db.query(LiveGateSnapshot)
+        .filter(LiveGateSnapshot.live_session_id == session_id,
+                LiveGateSnapshot.snap_date >= cutoff)
+        .order_by(LiveGateSnapshot.snap_date.desc(),
+                  LiveGateSnapshot.portfolio_strategy_id.asc())
+        .all()
+    )
+    items = []
+    for row in rows:
+        items.append({
+            "id": row.id,
+            "snap_date": (row.snap_date.isoformat()
+                          if row.snap_date is not None else None),
+            "portfolio_id": row.portfolio_strategy_id,
+            "benchmark_index": row.benchmark_index,
+            "gate_engine": row.gate_engine,
+            "direction": row.direction,
+            "strength": row.strength,
+            "as_of": row.as_of.isoformat() if row.as_of is not None else None,
         })
     return items
 

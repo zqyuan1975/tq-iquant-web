@@ -505,6 +505,16 @@ def portfolio_daily(session_id: int, days: int = 30,
     return ok(rows)
 
 
+@router.get("/sessions/{session_id}/gate-snapshots")
+def gate_snapshots(session_id: int, days: int = 30,
+                   db: Session = Depends(get_db)):
+    """E2：每日市场门控快照（每组合每日一条；按日倒序）。"""
+    rows = svc.list_gate_snapshots(db, session_id, days)
+    if rows is None:
+        return err(404, "资源不存在")
+    return ok(rows)
+
+
 @router.get("/sessions/{session_id}/pending-changes")
 def list_pending_changes(session_id: int, db: Session = Depends(get_db)):
     """D3：风控参数待生效队列（运行中变更在此排队，下次启动生效）。"""

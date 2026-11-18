@@ -1858,6 +1858,18 @@ export interface LiveSplitRemainderList {
   count: number
 }
 
+// E2 每日市场门控快照（每组合每日一条；direction 1/0/-1）
+export interface LiveGateSnapshotItem {
+  id: number
+  snap_date: string | null
+  portfolio_id: number
+  benchmark_index: string | null
+  gate_engine: string | null
+  direction: number | null
+  strength: number | null
+  as_of: string | null
+}
+
 // I-7（audit）：对账差异摘要（LiveEngine._reconcile_positions 产出）
 export interface ReconcileMismatch {
   code: string
@@ -2011,6 +2023,13 @@ export async function updateLiveSession(id: number, req: Record<string, unknown>
 export async function getLiveSplitRemainders(id: number) {
   const res = await api.get<ApiResponse<LiveSplitRemainderList>>(
     `/live/sessions/${id}/split-remainders`)
+  return res.data.data
+}
+
+/** E2：每日市场门控快照（按日倒序）。 */
+export async function getLiveGateSnapshots(id: number, days = 30) {
+  const res = await api.get<ApiResponse<LiveGateSnapshotItem[]>>(
+    `/live/sessions/${id}/gate-snapshots`, { params: { days } })
   return res.data.data
 }
 

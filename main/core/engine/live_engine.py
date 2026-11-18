@@ -615,6 +615,9 @@ class LiveEngine:
         # 两者缺省(None/空)=不启用，行为与接线前逐字一致。
         gate_provider: Optional[Callable] = None,
         gate_portfolio_ids: Optional[set] = None,
+        # E2：门控组合规格 {pid: {benchmark_index, market_gate_engine}}，
+        # 用于每日门控快照落库；缺省不落快照。
+        gate_specs: Optional[Dict[int, dict]] = None,
         # E1（默认关）：顺延次日单 / 盘前集合竞价单在提交前用执行日前一收盘
         # 的门控状态重判一次，空头则拦下并落决策事件。
         gate_recheck_on_execute: bool = False,
@@ -891,6 +894,7 @@ class LiveEngine:
         # 只对白名单组合生效；provider 为 None 时完全不启用。
         self._gate_provider = gate_provider
         self._gate_portfolio_ids: set = set(gate_portfolio_ids or ())
+        self._gate_specs: Dict[int, dict] = dict(gate_specs or {})
         self._gate_updated: Dict[int, date] = {}
         self._gate_recheck_on_execute = bool(gate_recheck_on_execute)
         # 公司行为（J1/J2，默认关）：组合标量配置 + 时间线提供者 + 每组合每日一次
@@ -6557,11 +6561,54 @@ class LiveEngine:
             if tracker is not None:
                 portfolio.current_market_gate = tracker
             self._gate_updated[pid] = bar_date
+            self._persist_gate_snapshot(
+                pid, bar_date, tracker or portfolio.current_market_gate)
         except Exception:
             logger.warning(
                 "portfolio %s 市场门控更新失败，沿用旧状态（fail-open）",
                 pid, exc_info=True,
             )
+
+    def _persist_gate_snapshot(self, pid: int, bar_date: date,
+                               tracker) -> None:
+        """E2：每日每组合落一条门控快照（同键覆盖），失败只告警。
+
+        快照只记录当日生效方向/强度/基准与状态数据截至日，不参与交易判定。
+        """
+        if tracker is None or self._db_session_factory is None:
+            return
+        try:
+            from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+            from core.models.live_gate_snapshot import LiveGateSnapshot
+
+            state = int(tracker.state_for(bar_date))
+            strength = int(tracker.strength_for(bar_date))
+            span = tracker.span()
+            as_of = span[1] if span else None
+            spec = self._gate_specs.get(pid) or {}
+            benchmark = spec.get("benchmark_index")
+            engine_name = spec.get("market_gate_engine") or "python"
+            db = self._db_session_factory()
+            try:
+                stmt = sqlite_insert(LiveGateSnapshot).values(
+                    live_session_id=self.session_id,
+                    portfolio_strategy_id=pid, snap_date=bar_date,
+                    benchmark_index=benchmark, gate_engine=engine_name,
+                    direction=state, strength=strength, as_of=as_of)
+                stmt = stmt.on_conflict_do_update(
+                    index_elements=["live_session_id",
+                                    "portfolio_strategy_id", "snap_date"],
+                    set_={"benchmark_index": benchmark,
+                          "gate_engine": engine_name,
+                          "direction": state, "strength": strength,
+                          "as_of": as_of})
+                db.execute(stmt)
+                db.commit()
+            finally:
+                db.close()
+        except Exception:  # noqa: BLE001 — 观测落库失败不影响交易主链路
+            logger.warning("门控快照落库失败（session %s, portfolio %s）",
+                           self.session_id, pid, exc_info=True)
 
     def _tick_alert(self, now: Optional[datetime] = None) -> None:
         """alert 单轮：TQ 心跳 → 拉行情 → 调度信号；不碰委托/成交/持仓。"""

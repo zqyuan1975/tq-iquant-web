@@ -22,7 +22,9 @@ import {
   getLiveSessionChannelHealth, failoverLiveSession,
   getLiveChannelGuard, reconnectLiveChannel,
   getLiveSplitRemainders, reorderLiveSplitRemainders,
+  getLiveGateSnapshots,
   type LiveSplitRemainderItem,
+  type LiveGateSnapshotItem,
   type LiveSessionChannelHealth, type LiveChannelGuard,
   recoverLiveBreaker, getLiveChannel, testLiveChannel, sendUserBlock, getFormulas, getWatchdogStatus,
   getLiveAccountPreview, resetLiveBaseline,
@@ -380,10 +382,11 @@ function snapshotHint(engine: string | null | undefined): string {
   }
   return '后台每 60s 采集一次，无需打开下单窗口'
 }
-type WbTab = 'positions' | 'orders' | 'trades' | 'decisions' | 'signals'
+type WbTab = 'positions' | 'orders' | 'trades' | 'decisions' | 'signals' | 'gate'
 const wbTab = ref<WbTab>('positions')
 const TAB_LABEL: Record<WbTab, string> = {
-  positions: '持仓', orders: '委托', trades: '成交', decisions: '决策/拦截', signals: '预警信号',
+  positions: '持仓', orders: '委托', trades: '成交', decisions: '决策/拦截',
+  signals: '预警信号', gate: '门控快照',
 }
 
 // ---- 决策/拦截页签：自带刷新 + 切页签重拉 ----
@@ -457,6 +460,36 @@ function setWbTab(tab: WbTab) {
   wbTab.value = tab
   decOnlyDeferred.value = false
   if (tab === 'decisions') void reloadDecisions()
+  if (tab === 'gate') void reloadGateSnapshots()
+}
+
+// ---- E2：每日市场门控快照（每组合每日一条，工作台回看门控判定依据）----
+const gateSnapshots = ref<LiveGateSnapshotItem[]>([])
+const gateSnapshotsLoading = ref(false)
+
+async function reloadGateSnapshots() {
+  const id = activeSessionId
+  if (id === null) return
+  gateSnapshotsLoading.value = true
+  try {
+    const rows = await getLiveGateSnapshots(id, 30).catch(() => [])
+    if (activeSessionId !== id) return
+    gateSnapshots.value = rows
+  } finally {
+    gateSnapshotsLoading.value = false
+  }
+}
+
+function gateSnapshotLabel(d: number | null): string {
+  if (d === 1) return '多头'
+  if (d === -1) return '空头'
+  if (d === 0) return '中性'
+  return '—'
+}
+function gateSnapshotBadge(d: number | null): string {
+  if (d === 1) return 'badge-green'
+  if (d === -1) return 'badge-red'
+  return 'badge-gray'
 }
 
 // 时间区间变更后顺延筛选可能已空 → 自动收起，避免「打开筛选像没数据」
@@ -1769,6 +1802,39 @@ onUnmounted(() => {
         <p v-if="decOnlyDeferred">当前时间范围内没有顺延待次日提交的事件。</p>
         <p v-else-if="decRange === 'today'">今日暂无决策事件。止损/止盈/熔断/资金不足/超仓/收盘拦单等事件会实时显示在这里。</p>
         <p v-else>该时间范围暂无决策事件。止损/止盈/熔断/资金不足/超仓/收盘拦单等事件会实时显示在这里。</p>
+      </div>
+    </div>
+
+    <!-- E2 门控快照：每组合每交易日一条，回看当日生效方向/强度与数据截至日 -->
+    <div v-if="wbTab === 'gate'" class="table-wrap">
+      <div style="display:flex;justify-content:flex-end;align-items:center;margin:0 0 6px">
+        <button class="btn btn-sm" :disabled="gateSnapshotsLoading"
+                data-test="reload-gate-snapshots" @click="reloadGateSnapshots()">
+          {{ gateSnapshotsLoading ? '刷新中…' : '↻ 刷新快照' }}
+        </button>
+      </div>
+      <p style="font-size:12px;color:var(--ink-faint);margin:0 0 6px">
+        仅启用市场门控的组合在每个交易日首根 bar 落一条；方向为「当日生效」的右移一日收盘状态（1 多头 / 0 中性 / -1 空头）。
+      </p>
+      <table v-if="gateSnapshots.length > 0">
+        <thead><tr>
+          <th>日期</th><th>组合</th><th>基准</th><th>方向</th><th>强度</th>
+          <th>数据截至</th><th>引擎</th>
+        </tr></thead>
+        <tbody>
+          <tr v-for="g in gateSnapshots" :key="g.id" :data-test="`gate-snapshot-${g.id}`">
+            <td>{{ g.snap_date || '—' }}</td>
+            <td>{{ portfolioName(g.portfolio_id) }}</td>
+            <td>{{ g.benchmark_index || '—' }}</td>
+            <td><span class="badge" :class="gateSnapshotBadge(g.direction)">{{ gateSnapshotLabel(g.direction) }}</span></td>
+            <td>{{ g.strength ?? '—' }}</td>
+            <td>{{ g.as_of || '—' }}</td>
+            <td>{{ g.gate_engine || '—' }}</td>
+          </tr>
+        </tbody>
+      </table>
+      <div v-else class="empty-state">
+        <p>暂无门控快照：仅启用市场门控的组合会在每个交易日首根 bar 落一条记录（最近 30 天）。</p>
       </div>
     </div>
 
