@@ -3629,11 +3629,15 @@ def recover_breaker(
     session_id: int,
     portfolio_id: int,
     engines: Dict[int, LiveEngine],
+    reason: Optional[str] = None,
+    confirm: bool = False,
 ) -> Tuple[bool, Optional[str]]:
     """手动恢复某组合熔断（3 次转手动恢复后的人工恢复入口）。
 
     引擎运行中：engine.recover_breaker 负责内存态 + DB 双写；
     引擎未运行：只改 DB（下次 start → recover 读回 count=0 不补挂，组合正常）。
+    D5（2026-11-18）：恢复原因写入 live_decision_events；已转手动恢复
+    （count>=3 或 risk_state.manual_recovery）时必须显式 confirm=true。
     返回 (ok, error_message)。
     """
     session = db.query(LiveSession).filter(LiveSession.id == session_id).first()
@@ -3644,6 +3648,14 @@ def recover_breaker(
     ).first()
     if link is None:
         return False, "该组合不在此 session 中"
+    manual_recovery = int(link.circuit_breaker_count or 0) >= 3
+    if not manual_recovery and link.risk_state:
+        try:
+            manual_recovery = bool(json.loads(link.risk_state).get("manual_recovery"))
+        except (TypeError, ValueError):
+            manual_recovery = False
+    if manual_recovery and not confirm:
+        return False, "该组合已转手动恢复，需二次确认（confirm=true）"
     engine = engines.get(session_id)
     if engine is not None:
         # 运行中：引擎方法负责内存 + DB 双写
@@ -3666,7 +3678,15 @@ def recover_breaker(
                 logger.warning(
                     "recover_breaker: risk_state 解析失败，峰值保持原值 (session %s, "
                     "portfolio %s)", session_id, portfolio_id)
-        db.commit()
+    # D5：恢复留痕（原因/时间/组合），本地单用户也保留审计链
+    db.add(LiveDecisionEvent(
+        live_session_id=session_id, gate="breaker_recover",
+        layer="portfolio_risk", action="recover", bar_time=datetime.now(),
+        portfolio_id=portfolio_id, param_name="recover",
+        message=("手动恢复熔断 portfolio=%s reason=%s" % (
+            portfolio_id, reason or ""))[:200],
+    ))
+    db.commit()
     return True, None
 
 

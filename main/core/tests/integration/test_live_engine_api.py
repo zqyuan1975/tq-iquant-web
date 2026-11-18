@@ -19,6 +19,7 @@ from core.db import get_db
 from core.models import (
     Base, StockPool, StockPoolStock, Formula, FormulaSignal,
     PortfolioStrategy, Strategy, LiveOrder, LiveTrade, LiveSessionPortfolio,
+    LiveDecisionEvent,
 )
 from core.engine.position import Position
 import core.api.live as live_api
@@ -1165,13 +1166,15 @@ def test_recover_breaker_resets_running_session(client, mock_bridge):
     rm.circuit_breaker_active = True
     engine._breaker_count_written[ps_id] = 3
 
-    resp = c.post("/api/live/sessions/%d/portfolios/%d/recover" % (sid, ps_id))
+    resp = c.post("/api/live/sessions/%d/portfolios/%d/recover" % (sid, ps_id),
+                  json={"confirm": True, "reason": "人工确认恢复"})
 
     assert resp.status_code == 200
     body = resp.json()
     assert body["code"] == 0
     assert body["data"]["status"] == "active"
     assert body["data"]["circuit_breaker_count"] == 0
+    assert body["data"]["reason"] == "人工确认恢复"
     # 内存态
     assert rm.manual_recovery is False
     assert rm.circuit_breaker_active is False
@@ -1186,6 +1189,12 @@ def test_recover_breaker_resets_running_session(client, mock_bridge):
         ).first()
         assert link.status == "active"
         assert link.circuit_breaker_count == 0
+        # D5 审计：恢复原因写入决策事件
+        evt = db.query(LiveDecisionEvent).filter_by(
+            live_session_id=sid, gate="breaker_recover").first()
+        assert evt is not None
+        assert "人工确认恢复" in (evt.message or "")
+        assert "portfolio=%d" % ps_id in (evt.message or "")
     finally:
         db.close()
 
@@ -1203,7 +1212,8 @@ def test_recover_breaker_stopped_session_only_db(client, mock_bridge):
     assert sid not in live_api._ENGINES  # 未 start
     _set_breaker(Session, sid, ps_id, count=3)
 
-    resp = c.post("/api/live/sessions/%d/portfolios/%d/recover" % (sid, ps_id))
+    resp = c.post("/api/live/sessions/%d/portfolios/%d/recover" % (sid, ps_id),
+                  json={"confirm": True, "reason": "收盘后人工复核"})
 
     assert resp.status_code == 200
     assert resp.json()["code"] == 0
@@ -1216,6 +1226,37 @@ def test_recover_breaker_stopped_session_only_db(client, mock_bridge):
         ).first()
         assert link.status == "active"
         assert link.circuit_breaker_count == 0
+        evt = db.query(LiveDecisionEvent).filter_by(
+            live_session_id=sid, gate="breaker_recover").first()
+        assert evt is not None and "收盘后人工复核" in (evt.message or "")
+    finally:
+        db.close()
+
+
+def test_recover_breaker_manual_recovery_requires_confirm(client, mock_bridge):
+    """D5：count>=3 已转手动恢复时，未带 confirm 的恢复被拒（400），状态不变。"""
+    c, Session = client
+    db = Session()
+    ps_id = _seed(db)
+    db.close()
+
+    sid = _create_session(c, portfolio_ids=(ps_id,))
+    _set_breaker(Session, sid, ps_id, count=3)
+
+    resp = c.post("/api/live/sessions/%d/portfolios/%d/recover" % (sid, ps_id))
+    assert resp.status_code == 200
+    assert resp.json()["code"] == 400
+    assert "二次确认" in resp.json()["message"]
+
+    db = Session()
+    try:
+        link = db.query(LiveSessionPortfolio).filter_by(
+            session_id=sid, portfolio_strategy_id=ps_id
+        ).first()
+        assert link.status == "circuit_broken"
+        assert link.circuit_breaker_count == 3
+        assert db.query(LiveDecisionEvent).filter_by(
+            live_session_id=sid, gate="breaker_recover").first() is None
     finally:
         db.close()
 

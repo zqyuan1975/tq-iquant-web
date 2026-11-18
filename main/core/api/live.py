@@ -329,11 +329,21 @@ async def stop_session(session_id: int, db: Session = Depends(get_db)):
 
 
 @router.post("/sessions/{session_id}/portfolios/{portfolio_id}/recover")
-def recover_breaker(session_id: int, portfolio_id: int, db: Session = Depends(get_db)):
-    ok_flag, message = svc.recover_breaker(db, session_id, portfolio_id, _ENGINES)
+def recover_breaker(session_id: int, portfolio_id: int,
+                    data: Optional[dict] = None,
+                    db: Session = Depends(get_db)):
+    """D5：手动恢复熔断；body 可带 reason，已转手动恢复需 confirm=true。"""
+    payload = data or {}
+    ok_flag, message = svc.recover_breaker(
+        db, session_id, portfolio_id, _ENGINES,
+        reason=payload.get("reason"),
+        confirm=bool(payload.get("confirm")),
+    )
     if not ok_flag:
-        return err(404, message)
-    return ok({"portfolio_id": portfolio_id, "status": "active", "circuit_breaker_count": 0})
+        code = 400 if message and "二次确认" in message else 404
+        return err(code, message)
+    return ok({"portfolio_id": portfolio_id, "status": "active",
+               "circuit_breaker_count": 0, "reason": payload.get("reason")})
 
 
 @router.get("/account-preview")
