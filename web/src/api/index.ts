@@ -2165,6 +2165,9 @@ export interface LiveChannelEngine {
   label: string
   configured: boolean
   detail: string
+  // B4 能力矩阵（下单/撤单/行情/限价/备注认领/拆单/盘前限价）
+  capabilities?: Record<string, boolean>
+  capability_limits?: string[]
 }
 
 export interface LiveChannelInfo {
@@ -2179,6 +2182,9 @@ export interface LiveChannelInfo {
   configured?: boolean
   detail?: string
   engines: LiveChannelEngine[]
+  // B4 当前引擎能力矩阵与中文标签
+  capabilities?: Record<string, boolean>
+  capability_labels?: Record<string, string>
   ths_ui: ThsUiConfig
   bridge: { simulation: string; live: string }
   tq_trade?: { available: boolean; account: string; account_type: string; price_mode: string; client_path: string }

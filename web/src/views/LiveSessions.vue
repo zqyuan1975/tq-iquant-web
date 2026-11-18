@@ -209,6 +209,12 @@ function onEngineChange() {
   createError.value = ''
   loadAccountPreview(form.value.engine)
 }
+// B4 能力矩阵：随选中引擎展示支持/不支持项，避免配置了通道做不到的选项
+const selectedEngineCaps = computed<Record<string, boolean>>(() =>
+  channel.value?.engines?.find((e) => e.key === form.value.engine)?.capabilities || {})
+function capabilityLabel(key: string): string {
+  return channel.value?.capability_labels?.[key] || key
+}
 // 引擎中文名（列表与弹窗共用；后端 engines 清单里有 label 时优先）
 const ENGINE_LABEL: Record<string, string> = {
   goldminer: '掘金量化', iquant: 'QMT 通道', tdx: '通达信', ths: '同花顺',
@@ -1793,6 +1799,14 @@ onUnmounted(() => {
           {{ engineOptionText(e) }}
         </option>
       </select>
+      <!-- B4 通道能力矩阵：拆单仅通达信支持，备注认领仅 QMT/掘金桥支持 -->
+      <div v-if="Object.keys(selectedEngineCaps).length" class="capability-row" data-test="channel-capabilities">
+        <span
+          v-for="(ok, key) in selectedEngineCaps" :key="key"
+          class="capability-chip" :class="{ off: !ok }"
+          :title="ok ? '支持' : '该通道不支持'"
+        >{{ ok ? '✓' : '✗' }} {{ capabilityLabel(String(key)) }}</span>
+      </div>
       <label>资金池模式（可选增强，默认关闭）</label>
       <select v-model="form.capital_pool_mode" data-field="create-capital-pool">
         <option value="off">关闭（分账不分池）</option>
@@ -2356,6 +2370,13 @@ onUnmounted(() => {
 }
 .guard-check-list li.ok { color: var(--ink-soft); }
 .guard-check-list li span { color: var(--ink-faint); text-align: right; }
+/* B4 通道能力矩阵 */
+.capability-row { display: flex; flex-wrap: wrap; gap: 6px; margin: 4px 0 10px; }
+.capability-chip {
+  font-size: 11px; padding: 2px 8px; border-radius: 10px;
+  border: 1px solid var(--line, #2a2f3a); color: var(--ink-soft);
+}
+.capability-chip.off { color: var(--ink-faint); opacity: .65; text-decoration: line-through; }
 .form-error { font-size: 12px; color: var(--red); margin: -6px 0 12px; }
 /* start 409 行内红字：指名占用者，不笼统报「启动失败」 */
 .start-error {

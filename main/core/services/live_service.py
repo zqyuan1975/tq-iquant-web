@@ -420,6 +420,40 @@ def bridge_probe_message(channel: str, reason: Optional[str], base_url: str) -> 
     return "%s不可达（%s）：请检查桥策略是否运行及端口配置" % (label, base_url)
 
 
+#: B4：通道能力矩阵（前端据此置灰不支持的配置，后端在启动时软提示）。
+#: 口径来自各 dispatcher 实现：备注精确认领仅 HTTP 桥（iquant/goldminer）支持；
+#: 拆单仅通达信 TQ 通道支持；其余能力四通道一致。
+CHANNEL_CAPABILITIES: Dict[str, Dict[str, bool]] = {
+    "tdx": {
+        "place_order": True, "cancel_order": True, "quotes": True,
+        "limit_price": True, "remark_claim": False, "split_order": True,
+        "premarket_limit": True,
+    },
+    "ths": {
+        "place_order": True, "cancel_order": True, "quotes": True,
+        "limit_price": True, "remark_claim": False, "split_order": False,
+        "premarket_limit": True,
+    },
+    "iquant": {
+        "place_order": True, "cancel_order": True, "quotes": True,
+        "limit_price": True, "remark_claim": True, "split_order": False,
+        "premarket_limit": True,
+    },
+    "goldminer": {
+        "place_order": True, "cancel_order": True, "quotes": True,
+        "limit_price": True, "remark_claim": True, "split_order": False,
+        "premarket_limit": True,
+    },
+}
+
+#: 能力中文名（顺序即前端展示顺序）。
+CHANNEL_CAPABILITY_LABELS = {
+    "place_order": "下单", "cancel_order": "撤单", "quotes": "行情",
+    "limit_price": "限价", "remark_claim": "备注认领",
+    "split_order": "拆单", "premarket_limit": "盘前限价",
+}
+
+
 def engine_status(engine: Optional[str]) -> dict:
     """引擎清单 + 已配置情况（前端下拉与通道条共用）。"""
     ths = ths_ui_config()
@@ -444,15 +478,22 @@ def engine_status(engine: Optional[str]) -> dict:
             detail = "仿真 %s / 实盘 %s" % (q["simulation"], q["live"])
         else:
             continue
+        caps = dict(CHANNEL_CAPABILITIES.get(key, {}))
         items.append({
             "key": key, "channel": channel, "label": label,
             "configured": configured, "detail": detail,
+            "capabilities": caps,
+            "capability_limits": [CHANNEL_CAPABILITY_LABELS[k]
+                                  for k, ok in caps.items() if not ok],
         })
     current = engine or default_engine()
     # 未知引擎（如历史 qmt）回退 tdx 展示，避免前端 active 为 None
     channel, label = ENGINES_META.get(current, ENGINES_META["tdx"])
+    caps_key = current if current in CHANNEL_CAPABILITIES else "tdx"
     return {
         "engine": current, "active": channel, "label": label, "engines": items,
+        "capabilities": dict(CHANNEL_CAPABILITIES.get(caps_key, {})),
+        "capability_labels": dict(CHANNEL_CAPABILITY_LABELS),
         "ths_ui": ths, "tq_trade": tq, "bridge": bridge_config(),
     }
 
