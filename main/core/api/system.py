@@ -112,14 +112,23 @@ def _resolve_backup_file(data: dict):
     return path
 
 
-@router.api_route("/heartbeat", methods=["GET", "POST"])
-def heartbeat_route():
+@router.get("/heartbeat")
+def heartbeat_get_route():
     """前端标签页存活心跳（打包版自动退出用；页面打开时每 5s 发送一次）。
 
     前端经 navigator.sendBeacon 发送（固定为 POST），GET 保留供直接调用/测试。
+    与 POST 拆成两个函数共用同一实现：同一函数挂两个方法会让 FastAPI 生成
+    重复 operationId（heartbeat_route_..._post），启动时打 Duplicate Operation ID
+    告警并污染自动生成 SDK。
     """
     auto_shutdown.heartbeat()
     return ok()
+
+
+@router.post("/heartbeat")
+def heartbeat_post_route():
+    """前端标签页存活心跳（POST，sendBeacon 固定方法）。"""
+    return heartbeat_get_route()
 
 
 @router.post("/closing")

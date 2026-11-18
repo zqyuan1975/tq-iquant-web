@@ -57,3 +57,25 @@ async def test_auto_shutdown_endpoints_return_ok():
             resp = await client.request(method, url)
             assert resp.status_code == 200, (method, url)
             assert resp.json()["code"] == 0, (method, url)
+
+
+def test_openapi_operation_ids_are_unique():
+    """同一函数挂多个方法会生成重复 operationId（2026-11-19 修复 heartbeat）。
+
+    FastAPI 用「函数名 + 路径 + 方法」生成 operationId；``api_route`` 双方法会让
+    GET/POST 共用同一个 id，启动时打 Duplicate Operation ID 告警并污染自动生成
+    SDK。拆成两个函数后全量 operationId 必须唯一。
+    """
+    schema = app.openapi()
+    ids = [
+        op.get("operationId")
+        for item in schema["paths"].values()
+        for method, op in item.items()
+        if method in ("get", "post", "put", "patch", "delete")
+    ]
+    assert all(ids)
+    duplicated = sorted({i for i in ids if ids.count(i) > 1})
+    assert duplicated == []
+
+    heartbeat = schema["paths"]["/api/system/heartbeat"]
+    assert heartbeat["get"]["operationId"] != heartbeat["post"]["operationId"]
