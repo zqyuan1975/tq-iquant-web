@@ -561,6 +561,43 @@ export interface BacktestDetailItem {
   robustness: BacktestRobustnessItem | null  // 稳健性检验（年度/3年滚动/集中度/样本内外）
   persistence: PersistenceAnalysis | null  // 持续性检验（阿尔法衰减 vs 风格钟摆）
   acceptance: AcceptanceResult              // B6 考核口径验收（absolute/relative）
+  cost_capacity: BacktestCostCapacity | null  // K5 成本与容量（详情现算，不落库）
+}
+
+// K5 成本与容量（对齐 backtest_service.build_cost_capacity）
+export interface BacktestCostCapacity {
+  explicit: {
+    total_cost: number | null
+    commission: number | null
+    stamp_duty: number | null
+    transfer_fee: number | null
+    turnover: number | null
+    cost_bps: number | null
+    avg_equity: number | null
+    cost_to_avg_equity: number | null
+    net_profit: number | null
+    gross_profit: number | null
+    cost_drag_ratio: number | null
+  }
+  slippage: {
+    configured_bps: number | null
+    realized_deviation_bps: number | null
+    excess_bps: number | null
+    excess_cost_amount: number | null
+    matched_trades: number
+    trades_count: number
+    matched_amount: number | null
+  }
+  capacity: {
+    trades_count: number
+    max_trade_amount: number | null
+    max_trade_pct_equity: number | null
+    avg_trade_pct_equity: number | null
+    large_trade_threshold_pct: number
+    large_trade_count: number
+    large_trade_amount_ratio: number | null
+    pressure_level: string
+  }
 }
 
 // B6 考核口径验收（对齐 acceptance.compute_acceptance）

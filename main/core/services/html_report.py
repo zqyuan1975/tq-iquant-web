@@ -285,6 +285,85 @@ def _section(title: str, body: str) -> str:
     return f'<section><h2>{esc(title)}</h2>{body}</section>'
 
 
+def _cost_capacity_section(detail: dict) -> str:
+    """二、成本与容量：显性成本拖累 / 滑点实现偏差 / 容量与冲击成本。
+
+    数据来自详情序列化时的 cost_capacity 块（按 trades + snapshots 现算，
+    不新增落库列），因此历史记录同样可直接出报告。
+    """
+    title = "二、成本与容量"
+    cc = detail.get("cost_capacity")
+    if not cc:
+        return _section(title, _empty("本次回测无成交与快照，无法计算成本与容量"))
+    ex = cc.get("explicit") or {}
+    sl = cc.get("slippage") or {}
+    cap = cc.get("capacity") or {}
+
+    cards = [
+        _kpi("交易成本合计", money(ex.get("total_cost")), sub="佣金+印花税+过户费"),
+        _kpi("成本拖累占比", pct(ex.get("cost_drag_ratio")),
+             sub="成本 / 毛利（毛利=净收益+成本）"),
+        _kpi("成本 / 成交额", f"{num(ex.get('cost_bps'))} bps", sub="双边换手口径"),
+        _kpi("滑点实现偏差", f"{num(sl.get('realized_deviation_bps'))} bps",
+             sub=f"配置 {num(sl.get('configured_bps'))} bps"),
+        _kpi("容量压力", esc(cap.get("pressure_level") or "—"),
+             sub=f"最大单笔占净值 {pct(cap.get('max_trade_pct_equity'))}"),
+    ]
+
+    cost_tbl = _table(
+        ["项目", "金额 / 数值"],
+        [
+            ["佣金", money(ex.get("commission"))],
+            ["印花税", money(ex.get("stamp_duty"))],
+            ["过户费", money(ex.get("transfer_fee"))],
+            ["合计", money(ex.get("total_cost"))],
+            ["成交额（双边）", money(ex.get("turnover"))],
+            ["日均净值", money(ex.get("avg_equity"))],
+            ["成本 / 日均净值", pct(ex.get("cost_to_avg_equity"))],
+        ],
+    )
+    slip_tbl = _table(
+        ["项目", "数值"],
+        [
+            ["配置固定滑点", f"{num(sl.get('configured_bps'))} bps"],
+            ["实测实现偏差（买高/卖低为正）", f"{num(sl.get('realized_deviation_bps'))} bps"],
+            ["固定滑点无法解释的部分", f"{num(sl.get('excess_bps'))} bps"],
+            ["对应金额", money(sl.get("excess_cost_amount"))],
+            ["可匹配成交 / 总成交",
+             f"{sl.get('matched_trades') or 0} / {sl.get('trades_count') or 0} 笔"],
+        ],
+    )
+    cap_tbl = _table(
+        ["项目", "数值"],
+        [
+            ["成交笔数", str(cap.get("trades_count") or 0)],
+            ["最大单笔成交额", money(cap.get("max_trade_amount"))],
+            ["最大单笔 / 当日净值", pct(cap.get("max_trade_pct_equity"))],
+            ["平均单笔 / 当日净值", pct(cap.get("avg_trade_pct_equity"))],
+            [f"大额成交笔数（≥{pct(cap.get('large_trade_threshold_pct'))} 净值）",
+             str(cap.get("large_trade_count") or 0)],
+            ["大额成交额占比", pct(cap.get("large_trade_amount_ratio"))],
+            ["容量压力等级", esc(cap.get("pressure_level") or "—")],
+        ],
+    )
+    note = (
+        '<div class="meta"><div class="gen">'
+        "口径说明：回测未落库行情，滑点实现偏差以「成交价 vs 同日持仓隐含收盘价"
+        "（市值/数量，缺失时取最近快照）」估算，买高/卖低记为正；它与配置固定滑点的"
+        "差额近似市场冲击与择时代价。容量按单笔成交额占当日净值比例衡量，"
+        f"≥{pct(cap.get('large_trade_threshold_pct'))} 记为大额。"
+        "</div></div>"
+    )
+    body = (
+        '<div class="kpi-grid">' + "".join(cards) + "</div>"
+        + "<h3>显性成本</h3>" + cost_tbl
+        + "<h3>滑点实现偏差</h3>" + slip_tbl
+        + "<h3>容量与冲击成本</h3>" + cap_tbl
+        + note
+    )
+    return _section(title, body)
+
+
 def _overview(detail: dict) -> str:
     rec = detail.get("record") or {}
     ev = detail.get("evaluations") or {}
@@ -1794,6 +1873,7 @@ def build_html_report(detail: dict) -> str:
     body = (
         _overview(detail)
         + nav_html
+        + _cost_capacity_section(detail)
         + _crisis_section(detail, charts)
         + _market_regime_section(detail, charts)
         + _robustness_section(detail)

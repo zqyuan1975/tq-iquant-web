@@ -3452,6 +3452,191 @@ def _refresh_oos_from_latest_wf(db: Session, record: dict) -> None:
     }
 
 
+# ---------------------------------------------------------------------------
+# K5 成本与容量（详情序列化时按 trades + snapshots 现算，不新增 DB 列）
+# ---------------------------------------------------------------------------
+_COST_CAPACITY_LARGE_PCT = 0.02   # 单笔成交额 ≥ 当日净值 2% 视为大额（容量压力）
+_COST_CAPACITY_HIGH_PCT = 0.05    # 单笔最大 ≥ 5% 净值 → 容量压力「高」
+
+
+def _implied_close_prices(snaps: list) -> Dict[str, list]:
+    """从每日快照 positions_json 反推收盘价：market_value / quantity。
+
+    回测未落库行情，这是唯一可复现的「当日价格」来源；用于估算成交价相对
+    收盘价的实现偏差（含滑点/择时/冲击，口径见下方注释）。
+    """
+    out: Dict[str, list] = {}
+    for s in snaps:
+        if not s.positions_json or s.snap_date is None:
+            continue
+        try:
+            rows = json.loads(s.positions_json)
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(rows, list):
+            continue
+        for p in rows:
+            if not isinstance(p, dict):
+                continue
+            try:
+                qty = float(p.get("quantity") or 0)
+                mv = float(p.get("market_value") or 0)
+            except (TypeError, ValueError):
+                continue
+            code = p.get("stock_code")
+            if code and qty > 0 and mv > 0:
+                out.setdefault(code, []).append((s.snap_date, mv / qty))
+    return out
+
+
+def build_cost_capacity(
+    snaps: list, trades: list, params: Optional[dict] = None,
+) -> Optional[dict]:
+    """K5 成本与容量分析：显性成本拖累 / 滑点实现偏差 / 容量与冲击。
+
+    - 显性成本：佣金 + 印花税 + 过户费（成本拖累占比 = 成本 / 毛利，
+      毛利 = 净收益 + 成本；毛利 ≤ 0 时占比无意义，返回 None）
+    - 滑点实现偏差：成交价 vs 同日（缺失时取最近快照）持仓隐含收盘价，
+      买高/卖低记为正（不利）；再与 params 中的固定滑点比较，得到
+      「固定滑点无法解释的部分」，作为市场冲击/择时代价的近似
+    - 容量：单笔成交额占当日净值比例的分位数/大额占比，给出压力等级
+
+    无 trades 且无 snapshots 时返回 None（前端/报告整块隐藏）。
+    """
+    if not snaps and not trades:
+        return None
+    params = params or {}
+    eq_by_date = {}
+    for s in snaps:
+        v = _f(s.total_value)
+        if v is not None and s.snap_date is not None:
+            eq_by_date[s.snap_date] = v
+    eq_dates = sorted(eq_by_date)
+    eq_values = [eq_by_date[d] for d in eq_dates]
+    avg_equity = (sum(eq_values) / len(eq_values)) if eq_values else None
+
+    commission = stamp_duty = transfer_fee = turnover = 0.0
+    for t in trades:
+        commission += float(t.commission or 0)
+        stamp_duty += float(t.stamp_duty or 0)
+        transfer_fee += float(t.transfer_fee or 0)
+        turnover += abs(float(t.amount or 0))
+    total_cost = commission + stamp_duty + transfer_fee
+
+    net_profit = (
+        eq_values[-1] - eq_values[0] if len(eq_values) >= 2 else None)
+    gross_profit = (
+        net_profit + total_cost if net_profit is not None else None)
+    cost_drag_ratio = (
+        total_cost / gross_profit
+        if gross_profit is not None and gross_profit > 0 else None)
+
+    # ---- 滑点实现偏差 ----
+    implied = _implied_close_prices(snaps)
+    deviation_amount = 0.0      # 正 = 对己不利
+    matched_amount = 0.0
+    matched = 0
+    for t in trades:
+        series = implied.get(t.stock_code) or []
+        price = float(t.price or 0)
+        amt = abs(float(t.amount or 0))
+        if not series or price <= 0 or amt <= 0:
+            continue
+        trade_date = t.bar_time.date() if t.bar_time else None
+        ref_date, ref_price = (
+            min(series, key=lambda x: abs((x[0] - trade_date).days))
+            if trade_date else series[-1])
+        if ref_price <= 0:
+            continue
+        dev = (price - ref_price) / ref_price
+        sign = 1.0 if t.trade_type == "BUY" else -1.0
+        deviation_amount += sign * dev * amt
+        matched_amount += amt
+        matched += 1
+    realized_bps = (
+        deviation_amount / matched_amount * 10000 if matched_amount else None)
+    try:
+        configured_slippage = float(params["slippage"])
+    except (KeyError, TypeError, ValueError):
+        configured_slippage = None
+    configured_bps = (
+        configured_slippage * 10000 if configured_slippage is not None else None)
+    excess_bps = (
+        realized_bps - configured_bps
+        if realized_bps is not None and configured_bps is not None else None)
+    excess_cost_amount = (
+        deviation_amount - (configured_bps / 10000) * matched_amount
+        if excess_bps is not None else None)
+
+    # ---- 容量 ----
+    max_amount = 0.0
+    max_pct = None
+    pct_sum = 0.0
+    pct_n = 0
+    large_amount = 0.0
+    large_count = 0
+    for t in trades:
+        amt = abs(float(t.amount or 0))
+        max_amount = max(max_amount, amt)
+        trade_date = t.bar_time.date() if t.bar_time else None
+        equity = eq_by_date.get(trade_date) if trade_date else None
+        if equity is None:
+            equity = avg_equity
+        if not equity or equity <= 0:
+            continue
+        pct = amt / equity
+        pct_sum += pct
+        pct_n += 1
+        max_pct = pct if max_pct is None else max(max_pct, pct)
+        if pct >= _COST_CAPACITY_LARGE_PCT:
+            large_count += 1
+            large_amount += amt
+    pressure_level = (
+        "高" if (max_pct or 0) >= _COST_CAPACITY_HIGH_PCT
+        else "中" if (max_pct or 0) >= _COST_CAPACITY_LARGE_PCT
+        else "低")
+
+    def _r(x, n=2):
+        return None if x is None else round(x, n)
+
+    return {
+        "explicit": {
+            "total_cost": _r(total_cost),
+            "commission": _r(commission),
+            "stamp_duty": _r(stamp_duty),
+            "transfer_fee": _r(transfer_fee),
+            "turnover": _r(turnover),
+            "cost_bps": _r(total_cost / turnover * 10000 if turnover else None),
+            "avg_equity": _r(avg_equity),
+            "cost_to_avg_equity": _r(
+                total_cost / avg_equity if avg_equity else None, 6),
+            "net_profit": _r(net_profit),
+            "gross_profit": _r(gross_profit),
+            "cost_drag_ratio": _r(cost_drag_ratio, 4),
+        },
+        "slippage": {
+            "configured_bps": _r(configured_bps),
+            "realized_deviation_bps": _r(realized_bps),
+            "excess_bps": _r(excess_bps),
+            "excess_cost_amount": _r(excess_cost_amount),
+            "matched_trades": matched,
+            "trades_count": len(trades),
+            "matched_amount": _r(matched_amount),
+        },
+        "capacity": {
+            "trades_count": len(trades),
+            "max_trade_amount": _r(max_amount),
+            "max_trade_pct_equity": _r(max_pct, 4),
+            "avg_trade_pct_equity": _r(pct_sum / pct_n if pct_n else None, 4),
+            "large_trade_threshold_pct": _COST_CAPACITY_LARGE_PCT,
+            "large_trade_count": large_count,
+            "large_trade_amount_ratio": _r(
+                large_amount / turnover if turnover else None, 4),
+            "pressure_level": pressure_level,
+        },
+    }
+
+
 def get_record_detail(
     db: Session, record_id: int, profile_override: Optional[str] = None,
 ) -> Optional[dict]:
@@ -3623,6 +3808,9 @@ def get_record_detail(
         "robustness": robustness,
         "persistence": persistence,
         "acceptance": acceptance,
+        # K5 成本与容量：按 trades+snapshots 现算，不改落库结构
+        "cost_capacity": build_cost_capacity(
+            snaps, trades, _compare_scalar_params(rec.params_snapshot)),
     }
 
 

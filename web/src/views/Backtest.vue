@@ -1011,6 +1011,21 @@ function closeRecordCompare() {
   if (recordCompareChart) { recordCompareChart.dispose(); recordCompareChart = null }
 }
 
+// ---- K5 成本与容量（详情接口现算块）----
+const costCapacity = computed(() => detail.value?.cost_capacity ?? null)
+const costCapacityCards = computed(() => {
+  const cc = costCapacity.value
+  if (!cc) return []
+  const bps = (v: number | null) => (v === null ? '—' : `${v.toFixed(2)} bps`)
+  return [
+    { label: '交易成本合计', value: fmtMoney(cc.explicit.total_cost), sub: '佣金+印花税+过户费' },
+    { label: '成本拖累占比', value: pct(cc.explicit.cost_drag_ratio), sub: '成本 / 毛利（毛利=净收益+成本）' },
+    { label: '成本 / 成交额', value: bps(cc.explicit.cost_bps), sub: '双边换手口径' },
+    { label: '滑点实现偏差', value: bps(cc.slippage.realized_deviation_bps), sub: `配置 ${bps(cc.slippage.configured_bps)}` },
+    { label: '容量压力', value: cc.capacity.pressure_level || '—', sub: `最大单笔占净值 ${fmtPct(cc.capacity.max_trade_pct_equity)}` },
+  ]
+})
+
 function openForm() {
   const today = new Date()
   const fmt = (d: Date) => {
@@ -4878,6 +4893,68 @@ watch(theme, () => {
         </div>
       </template>
       </template>
+    </div>
+
+    <!-- K5 成本与容量（详情接口现算：显性成本 / 滑点实现偏差 / 容量与冲击） -->
+    <div class="ca-section" v-if="costCapacity">
+      <div class="section-title ca-header"><span>成本与容量</span></div>
+      <div class="kpi-grid" style="margin-bottom:10px">
+        <div class="kpi" v-for="c in costCapacityCards" :key="c.label">
+          <div class="kpi-label">{{ c.label }}</div>
+          <div class="kpi-value">{{ c.value }}</div>
+          <div class="kpi-sub">{{ c.sub }}</div>
+        </div>
+      </div>
+      <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:12px">
+        <div class="card" style="padding:10px">
+          <div class="section-title" style="font-size:13px">显性成本拆解</div>
+          <table>
+            <tbody>
+              <tr><td>佣金</td><td class="num">{{ fmtMoney(costCapacity.explicit.commission) }}</td></tr>
+              <tr><td>印花税</td><td class="num">{{ fmtMoney(costCapacity.explicit.stamp_duty) }}</td></tr>
+              <tr><td>过户费</td><td class="num">{{ fmtMoney(costCapacity.explicit.transfer_fee) }}</td></tr>
+              <tr><td>合计</td><td class="num">{{ fmtMoney(costCapacity.explicit.total_cost) }}</td></tr>
+              <tr><td>成交额（双边）</td><td class="num">{{ fmtMoney(costCapacity.explicit.turnover) }}</td></tr>
+              <tr><td>日均净值</td><td class="num">{{ fmtMoney(costCapacity.explicit.avg_equity) }}</td></tr>
+              <tr><td>成本 / 日均净值</td><td class="num">{{ pct(costCapacity.explicit.cost_to_avg_equity) }}</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="card" style="padding:10px">
+          <div class="section-title" style="font-size:13px">滑点实现偏差</div>
+          <table>
+            <tbody>
+              <tr><td>配置固定滑点</td><td class="num">{{ costCapacity.slippage.configured_bps?.toFixed(2) ?? '—' }} bps</td></tr>
+              <tr><td>实测实现偏差（买高/卖低为正）</td><td class="num">{{ costCapacity.slippage.realized_deviation_bps?.toFixed(2) ?? '—' }} bps</td></tr>
+              <tr><td>固定滑点无法解释的部分</td><td class="num">{{ costCapacity.slippage.excess_bps?.toFixed(2) ?? '—' }} bps</td></tr>
+              <tr><td>对应金额</td><td class="num">{{ fmtMoney(costCapacity.slippage.excess_cost_amount) }}</td></tr>
+              <tr><td>可匹配成交 / 总成交</td>
+                <td class="num">{{ costCapacity.slippage.matched_trades }} / {{ costCapacity.slippage.trades_count }} 笔</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="card" style="padding:10px">
+          <div class="section-title" style="font-size:13px">容量与冲击成本</div>
+          <table>
+            <tbody>
+              <tr><td>成交笔数</td><td class="num">{{ costCapacity.capacity.trades_count }}</td></tr>
+              <tr><td>最大单笔成交额</td><td class="num">{{ fmtMoney(costCapacity.capacity.max_trade_amount) }}</td></tr>
+              <tr><td>最大单笔 / 当日净值</td><td class="num">{{ fmtPct(costCapacity.capacity.max_trade_pct_equity) }}</td></tr>
+              <tr><td>平均单笔 / 当日净值</td><td class="num">{{ fmtPct(costCapacity.capacity.avg_trade_pct_equity) }}</td></tr>
+              <tr><td>大额成交笔数（≥{{ fmtPct(costCapacity.capacity.large_trade_threshold_pct) }} 净值）</td>
+                <td class="num">{{ costCapacity.capacity.large_trade_count }}</td>
+              </tr>
+              <tr><td>大额成交额占比</td><td class="num">{{ fmtPct(costCapacity.capacity.large_trade_amount_ratio) }}</td></tr>
+              <tr><td>容量压力等级</td><td class="num">{{ costCapacity.capacity.pressure_level || '—' }}</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+      <p class="ca-note">
+        口径：回测未落库行情，滑点实现偏差以「成交价 vs 同日持仓隐含收盘价（市值/数量，
+        缺失时取最近快照）」估算，买高/卖低记为正；与配置固定滑点的差额近似冲击/择时代价。
+      </p>
     </div>
 
     <!-- 持续性检验（阿尔法衰减 vs 风格钟摆） -->

@@ -558,3 +558,44 @@ def test_box_chart_drops_sparse_year_without_axis_misalignment():
     boxes = option["series"][0]["data"]
     assert cats == ["2022", "2024"]
     assert len(boxes) == len(cats) == 2
+
+
+def test_cost_capacity_section_renders_numbers():
+    """K5：成本与容量章节随详情 cost_capacity 块渲染（历史记录同样可用）。"""
+    detail = _detail()
+    detail["trades"] = []
+    detail["cost_capacity"] = {
+        "explicit": {
+            "total_cost": 1234.5, "commission": 1000.0, "stamp_duty": 200.0,
+            "transfer_fee": 34.5, "turnover": 2_000_000.0, "cost_bps": 6.17,
+            "avg_equity": 1_000_000.0, "cost_to_avg_equity": 0.001234,
+            "net_profit": 50_000.0, "gross_profit": 51_234.5,
+            "cost_drag_ratio": 0.0241,
+        },
+        "slippage": {
+            "configured_bps": 10.0, "realized_deviation_bps": 12.5,
+            "excess_bps": 2.5, "excess_cost_amount": 500.0,
+            "matched_trades": 40, "trades_count": 50, "matched_amount": 2_000_000.0,
+        },
+        "capacity": {
+            "trades_count": 50, "max_trade_amount": 120_000.0,
+            "max_trade_pct_equity": 0.12, "avg_trade_pct_equity": 0.02,
+            "large_trade_threshold_pct": 0.02, "large_trade_count": 12,
+            "large_trade_amount_ratio": 0.45, "pressure_level": "高",
+        },
+    }
+    html = build_html_report(detail)
+    assert "成本与容量" in html
+    assert "1,234.50" in html
+    assert "12.50 bps" in html
+    assert "12 / 50" not in html  # 匹配笔数是 40/50
+    assert "40 / 50" in html
+    assert "容量压力等级" in html
+
+
+def test_cost_capacity_section_empty_when_absent():
+    """K5：无 cost_capacity（无成交/快照）时给出空态而不是报错。"""
+    detail = _detail()
+    assert "cost_capacity" not in detail
+    html = build_html_report(detail)
+    assert "无法计算成本与容量" in html

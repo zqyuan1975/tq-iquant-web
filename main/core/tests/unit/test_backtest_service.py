@@ -3321,3 +3321,75 @@ def test_compare_records_validates_ids(db_session):
     payload, err = svc.compare_records(db_session, [a.id, a.id + 999])
     assert payload is None and "不存在" in err
 
+
+# ---------------------------------------------------------------------------
+# K5 成本与容量
+# ---------------------------------------------------------------------------
+def _cc_snap(day, value, positions=None):
+    return SimpleNamespace(
+        snap_date=day, total_value=Decimal(str(value)),
+        positions_json=json.dumps(positions) if positions is not None else None,
+    )
+
+
+def _cc_trade(ttype, price, qty, *, cost=5.0, day=date(2026, 7, 29)):
+    return SimpleNamespace(
+        stock_code="000001.SZ", trade_type=ttype, price=Decimal(str(price)),
+        quantity=qty, amount=Decimal(str(price)) * qty,
+        commission=Decimal(str(cost)), stamp_duty=Decimal("0"),
+        transfer_fee=Decimal("0"), bar_time=datetime.combine(day, datetime.min.time()),
+    )
+
+
+def test_cost_capacity_explicit_cost_drag_and_capacity():
+    """K5：显性成本、成本拖累占比、容量压力按 trades+snapshots 现算。"""
+    snaps = [
+        _cc_snap(date(2026, 7, 29), 100000,
+                 [{"stock_code": "000001.SZ", "quantity": 1000, "market_value": "10000"}]),
+        _cc_snap(date(2026, 7, 30), 110000),
+    ]
+    trades = [_cc_trade("BUY", 10.1, 1000, cost=5.0)]
+
+    out = svc.build_cost_capacity(snaps, trades, {"slippage": 0.001})
+
+    ex = out["explicit"]
+    assert ex["total_cost"] == pytest.approx(5.0)
+    assert ex["turnover"] == pytest.approx(10100.0)
+    assert ex["cost_bps"] == pytest.approx(round(5.0 / 10100 * 10000, 2))
+    # 净收益 10000 + 成本 5 → 毛利 10005
+    assert ex["gross_profit"] == pytest.approx(10005.0)
+    assert ex["cost_drag_ratio"] == pytest.approx(5.0 / 10005, rel=1e-3)
+
+    sl = out["slippage"]
+    # 成交价 10.1 vs 同日隐含收盘 10.0 → 买高 1% = 100bps；配置 10bps
+    assert sl["realized_deviation_bps"] == pytest.approx(100.0)
+    assert sl["configured_bps"] == pytest.approx(10.0)
+    assert sl["excess_bps"] == pytest.approx(90.0)
+    assert sl["excess_cost_amount"] == pytest.approx(90.9)
+    assert sl["matched_trades"] == 1
+
+    cap = out["capacity"]
+    assert cap["max_trade_amount"] == pytest.approx(10100.0)
+    assert cap["max_trade_pct_equity"] == pytest.approx(0.101)
+    assert cap["large_trade_count"] == 1
+    assert cap["large_trade_amount_ratio"] == pytest.approx(1.0)
+    assert cap["pressure_level"] == "高"
+
+
+def test_cost_capacity_without_slippage_param_and_empty():
+    """K5：params 缺滑点时不臆造超额；无 trades/snapshots 返回 None。"""
+    snaps = [
+        _cc_snap(date(2026, 7, 29), 100000),
+        _cc_snap(date(2026, 7, 30), 100000),
+    ]
+    out = svc.build_cost_capacity(snaps, [_cc_trade("SELL", 10.0, 1000)], {})
+    assert out["slippage"]["configured_bps"] is None
+    assert out["slippage"]["excess_bps"] is None
+    # 无持仓快照 → 无法反推收盘价，无匹配成交
+    assert out["slippage"]["matched_trades"] == 0
+    assert out["slippage"]["realized_deviation_bps"] is None
+    # 卖出方向不影响容量口径
+    assert out["capacity"]["max_trade_pct_equity"] == pytest.approx(0.1)
+
+    assert svc.build_cost_capacity([], [], {}) is None
+
