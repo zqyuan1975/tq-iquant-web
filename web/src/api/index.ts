@@ -2610,6 +2610,8 @@ export interface IncrementalSummary {
   seam_date: string | null
   seam_cash: string | null
   checkpoint: IncrementalCheckpointInfo | null
+  // K3：最近一次接缝判废（null=从未判废）
+  last_invalidation: { at: string | null; message: string } | null
   days: IncrementalDayRow[]
   latest_validation: IncrementalValidationInfo | null
   config: {
@@ -2647,6 +2649,23 @@ export async function runIncrementalValidation(
     portfolio_strategy_id: portfolioStrategyId,
     from_date: fromDate ?? null,
     to_date: toDate ?? null,
+  })
+  return res.data.data
+}
+
+// K3：一键重建接缝（丢弃 checkpoint 后从接缝日全量重建）
+export async function rebuildIncremental(
+  sessionId: number, portfolioStrategyId: number,
+) {
+  const res = await api.post<ApiResponse<{
+    status: string
+    as_of_date?: string | null
+    days?: number
+    reason?: string
+    checkpoint_invalidated?: { categories: string[]; from_as_of: string | null } | null
+  }>>('/incremental/rebuild', {
+    session_id: sessionId,
+    portfolio_strategy_id: portfolioStrategyId,
   })
   return res.data.data
 }

@@ -1453,18 +1453,24 @@ def _inc_trades_by_day(trades: List, dates: List[date]) -> Dict[date, List[str]]
 
 def run_incremental(db: Session, session_id: int, portfolio_strategy_id: int,
                     today: Optional[date] = None,
-                    now: Optional[datetime] = None) -> dict:
-    """续跑一个组合策略到 ``today``（默认上海今天）。"""
+                    now: Optional[datetime] = None,
+                    force_rebuild: bool = False) -> dict:
+    """续跑一个组合策略到 ``today``（默认上海今天）。
+
+    force_rebuild（K3，默认 False）：无视 checkpoint 有效性，强制丢弃旧 checkpoint
+    并从接缝日重建（用户在工作台点「立即重建接缝」时使用，仍复用同一把锁）。
+    """
     now = now or datetime.now(_TZ)
     today = today or now.date()
     cfg = _cfg()
     with _INCR_LOCK:
         return _run_incremental_locked(db, session_id, portfolio_strategy_id,
-                                       today, cfg)
+                                       today, cfg, force_rebuild=force_rebuild)
 
 
 def _run_incremental_locked(db: Session, session_id: int,
-                            ps_id: int, today: date, cfg: dict) -> dict:
+                            ps_id: int, today: date, cfg: dict,
+                            force_rebuild: bool = False) -> dict:
     if not cfg.get("enabled", True):
         return {"status": "disabled", "reason": "增量回测已关闭（enabled=false）"}
     link = (
@@ -1517,17 +1523,32 @@ def _run_incremental_locked(db: Session, session_id: int,
             state = json.loads(ckpt.state_json)
         except (TypeError, ValueError):
             state = None
-        if not checkpoint_valid(
+        if force_rebuild or not checkpoint_valid(
                 ckpt.params_hash, (state or {}).get("schema_fp", ""),
                 ckpt.schema_version, want_params_hash, want_schema_fp):
-            reasons = _invalidation_reasons(
-                state, (state or {}).get("schema_fp", ""), ckpt.schema_version,
-                want_schema_fp, fp["parts"], schema_parts(dividend_mode))
+            if force_rebuild:
+                reasons = ["用户手动重建接缝"]
+            else:
+                reasons = _invalidation_reasons(
+                    state, (state or {}).get("schema_fp", ""), ckpt.schema_version,
+                    want_schema_fp, fp["parts"], schema_parts(dividend_mode))
             invalidated = {"categories": reasons, "from_as_of": _dt(ckpt.as_of_date)}
             logger.warning(
-                "[incremental] 参数/口径指纹变化 → checkpoint 作废并从接缝日重建 "
+                "[incremental] %s → checkpoint 作废并从接缝日重建 "
                 "(session %s, ps %s, 旧 as_of=%s)：%s",
+                "用户手动重建接缝" if force_rebuild else "参数/口径指纹变化",
                 session_id, ps_id, ckpt.as_of_date, "；".join(reasons))
+            # K3：判废即落决策事件（工作台红标 + 事后追溯，随重建事务一并提交；
+            # 重建失败回滚时事件同步回滚，避免「未真正作废」的假告警）。
+            db.add(LiveDecisionEvent(
+                live_session_id=session_id,
+                gate="incremental_checkpoint",
+                layer="live_gate",
+                action="invalidated",
+                param_name="portfolio_strategy_id",
+                actual_value=float(ps_id),
+                message=("；".join(reasons))[:200],
+            ))
             # 作废 checkpoint 与随后的重建放在**同一事务**（flush 不 commit）：
             # 旧实现先 delete+commit，若本轮重建在取数/引擎处失败（提前 return），
             # 库里只剩空 checkpoint——旧 as_of/days/validations 不清、摘要继续按
@@ -2021,6 +2042,19 @@ def summary(db: Session, session_id: int, ps_id: int) -> dict:
         .limit(400)
         .all()
     )
+    # K3：最近一次接缝判废（工作台红标 + 一键重建入口）
+    last_inv = (
+        db.query(LiveDecisionEvent)
+        .filter_by(
+            live_session_id=session_id,
+            gate="incremental_checkpoint",
+            action="invalidated",
+            param_name="portfolio_strategy_id",
+            actual_value=float(ps_id),
+        )
+        .order_by(LiveDecisionEvent.id.desc())
+        .first()
+    )
 
     return {
         "supported": supported,
@@ -2028,6 +2062,10 @@ def summary(db: Session, session_id: int, ps_id: int) -> dict:
         "seam_date": link.seam_date.isoformat() if link and link.seam_date else None,
         "seam_cash": str(link.seam_cash) if link and link.seam_cash is not None else None,
         "checkpoint": None if ckpt is None else _checkpoint_summary(ckpt),
+        "last_invalidation": None if last_inv is None else {
+            "at": _dt(last_inv.created_at) or _dt(last_inv.bar_time),
+            "message": last_inv.message or "",
+        },
         "days": [{
             "trade_date": r.trade_date.isoformat(),
             "inc_total_value": str(r.inc_total_value) if r.inc_total_value is not None else None,

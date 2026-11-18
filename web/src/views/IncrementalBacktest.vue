@@ -2,12 +2,14 @@
 import { computed, onMounted, ref } from 'vue'
 import {
   getIncrementalSummary, getLiveSessions, getPortfolios, runIncrementalValidation,
+  rebuildIncremental,
   type IncrementalSummary, type LiveSessionItem, type PortfolioItem,
 } from '../api'
 import PageHeader from '../components/PageHeader.vue'
 
 const loading = ref(false)
 const validating = ref(false)
+const rebuilding = ref(false)
 const errorMsg = ref('')
 const sessions = ref<LiveSessionItem[]>([])
 const portfolios = ref<PortfolioItem[]>([])
@@ -82,6 +84,22 @@ async function onValidate() {
   }
 }
 
+// K3：一键重建接缝（丢弃 checkpoint，从接缝日全量重建）
+async function onRebuild() {
+  if (!sessionId.value || !portfolioId.value) return
+  if (!confirm('确定重建接缝？将丢弃当前 checkpoint 并从接缝日全量重算（耗时较长）。')) return
+  rebuilding.value = true
+  errorMsg.value = ''
+  try {
+    await rebuildIncremental(sessionId.value, portfolioId.value)
+    await loadSummary()
+  } catch (e: any) {
+    errorMsg.value = e?.message || '重建接缝失败'
+  } finally {
+    rebuilding.value = false
+  }
+}
+
 async function onSessionChange() {
   portfolioId.value = availablePortfolioIds.value[0] ?? null
   summary.value = null
@@ -140,6 +158,18 @@ onMounted(async () => {
 
     <div v-if="summary && !summary.supported" class="card" style="padding:12px; color:#b45309">
       {{ summary.reason || '该组合策略暂不支持续跑' }}
+    </div>
+
+    <div v-if="summary?.last_invalidation" class="card" data-test="invalidation-banner"
+         style="padding:12px; margin-bottom:12px; border-left:4px solid #e5484d; color:#b42318">
+      <strong>接缝判废：</strong>
+      <span>{{ summary.last_invalidation.message || '参数/口径变化，checkpoint 已作废' }}</span>
+      <span v-if="summary.last_invalidation.at" class="muted" style="margin-left:8px">
+        {{ summary.last_invalidation.at }}
+      </span>
+      <button class="btn" style="margin-left:12px" :disabled="rebuilding" @click="onRebuild">
+        {{ rebuilding ? '重建中…' : '立即重建接缝' }}
+      </button>
     </div>
 
     <div v-if="summary?.latest_validation" class="card" style="padding:12px; margin-bottom:12px">

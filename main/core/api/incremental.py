@@ -26,6 +26,11 @@ class ValidateRequest(BaseModel):
     to_date: Optional[date] = None
 
 
+class RebuildRequest(BaseModel):
+    session_id: int
+    portfolio_strategy_id: int
+
+
 @router.get("/summary")
 def get_summary(
     session_id: int,
@@ -36,6 +41,20 @@ def get_summary(
         return ok(svc.summary(db, session_id, portfolio_strategy_id))
     except Exception as exc:  # noqa: BLE001 — 统一 envelope，前端可读
         return err(500, "读取增量回测汇总失败：%s" % exc)
+
+
+@router.post("/rebuild")
+def post_rebuild(body: RebuildRequest, db: Session = Depends(get_db)):
+    """K3：一键重建接缝（丢弃 checkpoint 后从接缝日全量重建）。"""
+    try:
+        result = svc.run_incremental(
+            db, body.session_id, body.portfolio_strategy_id,
+            force_rebuild=True)
+    except Exception as exc:  # noqa: BLE001
+        return err(500, "重建接缝失败：%s" % exc)
+    if result.get("status") == "error":
+        return err(422, result.get("reason") or "重建接缝失败", result)
+    return ok(result)
 
 
 @router.post("/validate")
