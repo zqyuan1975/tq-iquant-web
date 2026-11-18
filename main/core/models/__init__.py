@@ -37,6 +37,7 @@ from .data_backup import DataBackupRecord
 from .corporate_action import CorporateAction, LiveCorporateAction
 from .live_approval_queue import LiveApprovalQueue
 from .live_manual_action import LiveManualAction
+from .live_reconciliation_diff import LiveReconciliationDiff
 
 __all__ = [
     "Base",
@@ -79,4 +80,5 @@ __all__ = [
     "LiveCorporateAction",
     "LiveApprovalQueue",
     "LiveManualAction",
+    "LiveReconciliationDiff",
 ]

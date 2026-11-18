@@ -2,7 +2,7 @@
 
 ## 项目状态
 
-**已实现（脚手架 + 主链路已通）** — 31 个模型文件（33 张表）、50 个引擎源码文件、11 个 API 模块（10 路由 + `response.py`）、11 个前端视图、58 个 Alembic 迁移（head `a4b5c6d7e8f9`）均已落地；回测/实盘主链路已接线。完整实现状态见 [CLAUDE.md](CLAUDE.md)「实现状态」小节。本文档记录业务规则与设计依据，实现细节以代码与 CLAUDE.md 为准。
+**已实现（脚手架 + 主链路已通）** — 31 个模型文件（33 张表）、50 个引擎源码文件、11 个 API 模块（10 路由 + `response.py`）、11 个前端视图、64 个 Alembic 迁移（head `f4b5c6d7e8f9`）均已落地；回测/实盘主链路已接线。完整实现状态见 [CLAUDE.md](CLAUDE.md)「实现状态」小节。本文档记录业务规则与设计依据，实现细节以代码与 CLAUDE.md 为准。
 
 **单用户系统**：无用户鉴权，所有接口无需登录。
 
@@ -197,6 +197,13 @@ Web 前端 (Vue 3 + Vite + Pinia) ←HTTP/SSE→ Core (FastAPI)
   - `submit_manual_order` 仅 `manual` 会话开放；`_manual_order=True` → 不入审批队列、不参与 `bought_today` 信号级排重、**不让价**（人工定价原样报出），但仍走全部闸门与拆单/落库链；归因策略 = 请求 `strategy_id` 或组合内第一个策略。
   - `force_close_position` 按虚拟持仓全额 SELL CLOSE，**不绕过 `live_sell_scope`**（`platform_only` 下纯外部仓 409 + `blocked` 审计）。
   - 现金改账复用 `record_cash_flow`（运行中即时生效）；**持仓改账仅停止的会话**：写一条合成 `live_trades`（`live_order_id=NULL`、费用 0），重启 `recover` 重放即生效——虚拟持仓/现金的唯一权威来源就是 `live_trades` 重放，新增账本会造成双口径。
+
+## 对账差异台账与现金流红冲（2026-11-18）
+
+- **C1 差异台账（默认关闭）**：`live_reconciliation_diffs`（迁移 `f4b5c6d7e8f9`）记录 `position` / `cash` / `equity` 三类差异，状态 `pending → accepted | resolved | ignored`。开关 `tq_trade.reconciliation_ledger_enabled`（**默认 false**，关闭时 `_note_reconciliation_diff` 第一行返回，既有告警链逐字不变）。插入点全部**旁路在既有告警发射之后**：`_note_cash_diff` / `_note_equity_deviation` / `_note_manual_intervention`（后者 `detail` 带 `price=` 供改账取价）。同一 `(session, diff_type, stock_code)` 的 pending 行复用更新，不逐次追加。API：`GET /api/live/sessions/{id}/diffs?status=`、`POST .../diffs/{did}/resolve`（`action=accept|resolve|ignore` + `resolution` + 可选 `price`）。**运行中改该项需停止再启动会话**。
+- **I2 以柜台为准**：`position` + accept 按「柜台量 − 期望量」写合成成交改虚拟持仓（运行中 `engine.accept_counter_truth` 同步内存，停止时 `adjust_position_virtual` 重启重放生效）；`cash`/`equity` + accept **只确认口径不改账**（现金差仍按既有「只告警不改账」规则）。已处理行不能再次处理；改账价格优先请求 `price`，其次 `detail` 的 `price=` 提示。
+- **C2 现金流红冲**：`live_cash_flows` 加 `reversal_of_id` / `reversed_by_id`（自引用 FK SET NULL）/ `voided`。**禁止物理删除**——红冲 = 反向补一笔（金额取反、`reversal_of_id=原行`）+ 原行 `voided=1`；Σamount 自动归零，净值口径无需额外处理。同一笔只能冲一次、红冲行不能再红冲。API：`POST .../cash-flows/{fid}/reverse`。
+- **C3 现金流日期边界**：`flow_date` 晚于今天 → 拒绝；早于会话起账日（`live_sessions.created_at.date()`）→ 拒绝，除非显式 `allow_backfill=true`（会改写历史净值口径，必须操作者确认）。`POST /cash-flows` 透传 `allow_backfill`。
 
 ## 模块复用
 

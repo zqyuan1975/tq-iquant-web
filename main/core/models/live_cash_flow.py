@@ -1,5 +1,5 @@
 from sqlalchemy import (
-    Column, Date, DateTime, ForeignKey, Index, Integer, Numeric, String,
+    Boolean, Column, Date, DateTime, ForeignKey, Index, Integer, Numeric, String,
 )
 from sqlalchemy.sql import func
 
@@ -32,6 +32,13 @@ class LiveCashFlow(Base):
     amount = Column(Numeric(15, 2), nullable=False)
     flow_date = Column(Date, nullable=False)
     note = Column(String(200), nullable=True)
+    # C2（2026-11-18）红冲：台账只允许「反向补一笔」，禁止物理删除/改数。
+    # reversal_of_id = 被冲销的原行；reversed_by_id = 由哪一行冲销（原行登记后即
+    # 不可再次冲销）；voided 仅作展示/查询标记（净流入按 amount 求和，冲销行
+    # amount 与类型方向相反，口径天然正确）。
+    reversal_of_id = Column(Integer, nullable=True)
+    reversed_by_id = Column(Integer, nullable=True)
+    voided = Column(Boolean, nullable=False, server_default="0", default=False)
     created_at = Column(DateTime, server_default=func.now())
 
     __table_args__ = (

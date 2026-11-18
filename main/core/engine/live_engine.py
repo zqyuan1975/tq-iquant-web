@@ -3609,6 +3609,10 @@ class LiveEngine:
             trade_date=now_shanghai().date(),
             fields={"会话": self.session_id},
         )
+        # C1（2026-11-18）：差异台账（默认关闭）。现金差按既有规则只留痕不改账。
+        self._note_reconciliation_diff(
+            "cash", expected=expected, actual=real_cash,
+            detail="virtual=%s;diff=%s" % (virtual, diff))
 
     # ---------------- 真实总资产 vs 虚拟净值（⑥） ----------------
     def virtual_equity(self) -> Decimal:
@@ -3761,6 +3765,10 @@ class LiveEngine:
             trade_date=now_shanghai().date(),
             fields={"会话": self.session_id},
         )
+        # C1（2026-11-18）：差异台账（默认关闭）。净值差只确认口径，不改账。
+        self._note_reconciliation_diff(
+            "equity", expected=expected, actual=real_total,
+            detail="virtual=%s;deviation_pct=%s" % (virtual, pct))
 
     # ---------------- 外部现金流（③） ----------------
     def apply_cash_flow(self, portfolio_id: int, amount: Decimal) -> bool:
@@ -4107,7 +4115,7 @@ class LiveEngine:
     def _note_manual_intervention(
         self, db: Session, code: str, virtual_qty: int, real_qty: int,
         direction: str, reason: str, action: str = "notice",
-        source: str = "bridge_mirror",
+        source: str = "bridge_mirror", portfolio_id: Optional[int] = None,
     ) -> None:
         """人工干预打标：柜台持仓出现「平台台账 + 在途单」解释不了的增减量。
 
@@ -4183,6 +4191,22 @@ class LiveEngine:
             logger.exception(
                 "record manual intervention decision failed (session %s, code %s)",
                 self.session_id, code)
+        # C1（2026-11-18）：差异台账（默认关闭）。带价格提示，供「以柜台为准」
+        # 改账时取价（台账只存差异本身，不存价格列）。失败只告警。
+        price_hint = None
+        if portfolio_id is not None:
+            try:
+                port = self._approval_portfolio(int(portfolio_id))
+                if port is not None:
+                    price_hint = port._resolve_price(code)
+            except Exception:  # noqa: BLE001
+                price_hint = None
+        detail = "direction=%s;reason=%s;action=%s" % (direction, reason, action)
+        if price_hint is not None:
+            detail += ";price=%s" % price_hint
+        self._note_reconciliation_diff(
+            "position", portfolio_id=portfolio_id, stock_code=code,
+            expected=int(virtual_qty), actual=int(real_qty), detail=detail)
 
     def _mirror_bridge_positions(self, db: Session, positions: list, now) -> int:
         """以桥 /positions 镜面覆盖虚拟账本的数量/可卖/成本（覆盖不累加）。
@@ -4258,6 +4282,7 @@ class LiveEngine:
                                 else "counter_lt_ledger"),
                         action="notice",
                         source="bridge_mirror",
+                        portfolio_id=holders[0][0].portfolio_id,
                     )
                 weights = [pos.quantity for _, _, pos in holders]
                 qty_alloc = (_allocate_proportional(weights, vol)
@@ -4391,7 +4416,8 @@ class LiveEngine:
                         self._note_manual_intervention(
                             db, code, pos.quantity, 0, direction="decrease",
                             reason="counter_position_gone_unverified",
-                            action="notice", source="counter_gone")
+                            action="notice", source="counter_gone",
+                            portfolio_id=port.portfolio_id)
                         logger.warning(
                             "counter position row missing but account read "
                             "untrusted → notice only: %s (virtual=%d, session %s)",
@@ -4415,7 +4441,7 @@ class LiveEngine:
                     self._note_manual_intervention(
                         db, code, qty, 0, direction="decrease",
                         reason="counter_position_gone", action="apply",
-                        source="counter_gone")
+                        source="counter_gone", portfolio_id=port.portfolio_id)
                     self._emit("position", {
                         "portfolio_id": port.portfolio_id,
                         "strategy_id": ctx.strategy_id,
@@ -6860,6 +6886,132 @@ class LiveEngine:
             "quantity": qty,
             "price": str(px),
             "strategy_id": ctx.strategy_id,
+        }
+
+    # ------------------------------------------- C1/I2 差异台账 + 接受柜台口径
+    def _diff_ledger_enabled(self) -> bool:
+        """C1 差异台账开关（`tq_trade.reconciliation_ledger_enabled`，默认关闭）。"""
+        try:
+            cfg = load_config()
+            tq = cfg.get("tq_trade", {}) if isinstance(cfg, dict) else {}
+            return bool(tq.get("reconciliation_ledger_enabled", False)) \
+                if isinstance(tq, dict) else False
+        except Exception:  # noqa: BLE001 — 配置坏了不影响主链
+            return False
+
+    def _note_reconciliation_diff(
+        self, diff_type: str, *, portfolio_id: Optional[int] = None,
+        stock_code: Optional[str] = None, expected=None, actual=None,
+        detail: Optional[str] = None,
+    ) -> None:
+        """把差异写进 `live_reconciliation_diffs`（默认关闭；失败只告警）。
+
+        插入点在既有告警之后：告警口径不变，台账只是让差异「可闭环」而不是
+        每天一条 SSE 之后没人管。
+        """
+        if not self._diff_ledger_enabled():
+            return
+        if self._db_session_factory is None:
+            return
+        try:
+            from ..services.live_service import record_reconciliation_diff
+            db = self._db_session_factory()
+            if db is None:
+                return
+            try:
+                record_reconciliation_diff(
+                    db, self.session_id, diff_type,
+                    portfolio_id=portfolio_id, stock_code=stock_code,
+                    expected=expected, actual=actual, detail=detail)
+            finally:
+                db.close()
+        except Exception:  # noqa: BLE001
+            logger.warning("差异台账写入失败 type=%s (session %s)",
+                           diff_type, self.session_id, exc_info=True)
+
+    def accept_counter_truth(
+        self, portfolio_id: int, stock_code: str, actual_qty: int,
+        price=None, note: Optional[str] = None,
+    ) -> Optional[dict]:
+        """C1/I2「以柜台为准」：把虚拟持仓改到柜台量并同步内存 + 现金。
+
+        落库走合成 `live_trades`（重启 recover 重放一致），内存按**同一笔成交**
+        走 ``Position.apply_trade`` / ``Account.apply_trade`` / ``note_trade``，
+        与回填路径完全同口径（不复用「直接赋值」的捷径，避免 avg_cost 漂移）。
+        """
+        portfolio = self._approval_portfolio(portfolio_id)
+        if portfolio is None:
+            return {"status": "error", "message": "组合不在本会话运行实例中"}
+        code = str(stock_code or "").strip().upper()
+        if not code:
+            return {"status": "error", "message": "stock_code 不能为空"}
+        try:
+            actual = int(actual_qty)
+        except (TypeError, ValueError):
+            return {"status": "error", "message": "actual_qty 非法"}
+        try:
+            ctx = self._manual_ctx(portfolio)
+        except ManualActionError as exc:
+            return {"status": "error", "message": str(exc)}
+        pos = (getattr(ctx, "positions", None) or {}).get(code)
+        virtual = int(getattr(pos, "quantity", 0) or 0) if pos is not None else 0
+        delta = actual - virtual
+        if delta == 0:
+            return {"status": "noop", "virtual": virtual, "actual": actual}
+        px = self._manual_price(portfolio, code, price, TradeType.SELL)
+        from ..services.live_service import adjust_position_virtual
+        db = self._db_session_factory()
+        if db is None:
+            return {"status": "error", "message": "无数据库会话，无法落账"}
+        try:
+            data, error = adjust_position_virtual(
+                db, self.session_id, portfolio_id, ctx.strategy_id, code,
+                delta, px, note=(note or "接受柜台为准"))
+        finally:
+            db.close()
+        if error is not None:
+            return {"status": "error", "message": error}
+        # 内存同步（与 recover 重放同一顺序：持仓 → 现金 → 冷静期/峰值记录）
+        trade = TradeEvent(
+            strategy_id=ctx.strategy_id,
+            portfolio_id=portfolio_id,
+            stock_code=code,
+            trade_type=(TradeType.BUY if delta > 0 else TradeType.SELL),
+            price=px,
+            quantity=abs(delta),
+            amount=px * Decimal(abs(delta)),
+            commission=Decimal("0"),
+            stamp_duty=Decimal("0"),
+            trade_time=self.ctx.clock(),
+            signal_type=None,
+        )
+        if pos is None:
+            pos = Position(code)
+            ctx.positions[code] = pos
+        applied = pos.apply_trade(trade)
+        if applied < abs(delta):
+            logger.warning(
+                "accept_counter_truth: 持仓改账按可应用量入账 %s < %s (%s)",
+                applied, abs(delta), code)
+        if applied > 0:
+            portfolio.account.apply_trade(trade.scaled_to(applied))
+            portfolio.note_trade(trade.scaled_to(applied))
+        self._record_manual_action(
+            action_type="position_adjust", portfolio_id=portfolio_id,
+            stock_code=code,
+            trade_type=("BUY" if delta > 0 else "SELL"),
+            quantity=abs(delta), price=px, result="applied",
+            cash_delta=str(-(px * Decimal(abs(delta))) if delta > 0
+                       else px * Decimal(abs(delta))),
+            reason=(note or "接受柜台为准（差异台账）"))
+        return {
+            "status": "applied",
+            "stock_code": code,
+            "virtual_before": virtual,
+            "actual": actual,
+            "delta": delta,
+            "price": str(px),
+            "trade_id": (data or {}).get("trade_id"),
         }
 
     def _should_defer_order(
@@ -11045,7 +11197,7 @@ class LiveEngine:
                         self._note_manual_intervention(
                             db, code, qty, 0, direction="decrease",
                             reason="close_reconcile_counter_zero", action="apply",
-                            source="close_reconcile")
+                            source="close_reconcile", portfolio_id=port.portfolio_id)
                         cleared.append(code)
             db.commit()
         except Exception:  # noqa: BLE001 — 修正失败不阻断收盘流程，只留日志

@@ -38,7 +38,7 @@ from core.models import (
     LiveSession, LiveSessionPortfolio, PortfolioStrategy, Strategy,
     StockPoolStock, StockPoolMembership, Formula, FormulaSignal, LiveOrder, LiveTrade, LiveDecisionEvent,
     LiveSignal, LiveAccountSnapshot, LiveCashFlow, LiveBaselineReset,
-    LiveManualAction,
+    LiveManualAction, LiveReconciliationDiff,
     IncrementalBacktestCheckpoint, BacktestRecord,
 )
 from core.engine.portfolio_builder import assemble_portfolio
@@ -1670,6 +1670,7 @@ def record_cash_flow(
     flow_date=None,
     note: Optional[str] = None,
     engine: Optional[LiveEngine] = None,
+    allow_backfill: bool = False,
 ) -> Tuple[Optional[dict], Optional[str]]:
     """登记一笔外部现金流并计入虚拟账本（③）。
 
@@ -1703,9 +1704,21 @@ def record_cash_flow(
         except ValueError:
             return None, "flow_date 须为 YYYY-MM-DD"
 
-    session = db.query(LiveSession.id).filter(LiveSession.id == session_id).first()
+    session = db.query(LiveSession).filter(LiveSession.id == session_id).first()
     if session is None:
         return None, "资源不存在"
+    # C3（2026-11-18）日期边界：未来日期会把外部净流入提前计进今天的净值口径；
+    # 早于会话起账日的流水会改写已发生的历史净值（当日/区间收益全部变）——
+    # 两者都只在显式 allow_backfill / 合法日期下才允许。
+    today = now_shanghai().date()
+    if flow_day > today:
+        return None, "flow_date 不能晚于今天（%s）" % today.isoformat()
+    started = getattr(session, "created_at", None)
+    started_day = started.date() if started is not None else None
+    if started_day is not None and flow_day < started_day and not allow_backfill:
+        return None, ("flow_date 早于会话起账日 %s；补记历史流水需显式传 "
+                      "allow_backfill=true（会改写历史净值口径）"
+                      % started_day.isoformat())
     link = (
         db.query(LiveSessionPortfolio)
         .filter_by(session_id=session_id, portfolio_strategy_id=portfolio_id)
@@ -1753,6 +1766,294 @@ def record_cash_flow(
         "net_inflow": str(net),
         "engine_applied": applied,
     }, None
+
+
+#: C1 差异台账状态常量（模型层定义，service/API/引擎共用一份）
+DIFF_STATUS_PENDING = "pending"
+DIFF_STATUS_ACCEPTED = "accepted"
+DIFF_STATUS_RESOLVED = "resolved"
+DIFF_STATUS_IGNORED = "ignored"
+
+
+def reverse_cash_flow(
+    db: Session, session_id: int, flow_id: int,
+    note: Optional[str] = None, engine: Optional[LiveEngine] = None,
+) -> Tuple[Optional[dict], Optional[str]]:
+    """C2（2026-11-18）红冲：反向补一笔冲销原流水，禁止物理删除/改数。
+
+    - 冲销行 `flow_type` 与原行一致、`amount` 取反 → Σamount 口径自动归零，
+      净值（总市值 − 累计净流入）无需额外处理；
+    - 原行 `reversed_by_id` + `voided=1`（展示划线），同一笔只能冲销一次；
+    - 红冲行本身不可再被冲销（防套娃）；
+    - 运行中引擎立即应用该反向金额，停止时下次启动重放。
+    """
+    row = db.query(LiveCashFlow).filter_by(
+        id=flow_id, live_session_id=session_id).first()
+    if row is None:
+        return None, "资源不存在"
+    if row.reversed_by_id is not None:
+        return None, "该流水已被红冲，不能重复冲销"
+    if row.reversal_of_id is not None:
+        return None, "红冲行不能再被红冲（如需恢复请重新登记一笔流水）"
+    if row.flow_date and row.flow_date > now_shanghai().date():
+        return None, "原流水日期在未来，拒绝红冲"
+    amount = -Decimal(str(row.amount))
+    reversal = LiveCashFlow(
+        live_session_id=row.live_session_id,
+        portfolio_strategy_id=row.portfolio_strategy_id,
+        flow_type=row.flow_type,
+        amount=amount,
+        flow_date=now_shanghai().date(),
+        note=(note or ("红冲 #%s" % row.id))[:200],
+        reversal_of_id=row.id,
+    )
+    try:
+        db.add(reversal)
+        db.flush()
+        row.reversed_by_id = reversal.id
+        row.voided = True
+        db.commit()
+        db.refresh(reversal)
+    except Exception:  # noqa: BLE001 — 多为未执行迁移（缺列）
+        db.rollback()
+        logger.exception("reverse_cash_flow: 红冲失败 (session %s, flow %s)",
+                         session_id, flow_id)
+        return None, "现金流红冲不可用：请先执行数据库迁移（alembic upgrade head）"
+    applied = False
+    if engine is not None:
+        try:
+            applied = engine.apply_cash_flow(
+                row.portfolio_strategy_id, amount)
+        except Exception:  # noqa: BLE001 — 已落库，内存失败由重启重放兜底
+            logger.exception("reverse_cash_flow: engine apply 失败 (session %s)",
+                             session_id)
+    net = cash_flow_net_inflow(db, session_id).get(
+        row.portfolio_strategy_id, Decimal("0"))
+    logger.info(
+        "cash flow reverse: session %s 组合 %s 冲销 #%s %s（累计净流入 %s）",
+        session_id, row.portfolio_strategy_id, row.id, amount, net)
+    return {
+        "id": reversal.id,
+        "session_id": session_id,
+        "portfolio_id": row.portfolio_strategy_id,
+        "flow_type": reversal.flow_type,
+        "amount": str(reversal.amount),
+        "flow_date": reversal.flow_date.isoformat(),
+        "note": reversal.note,
+        "reversal_of_id": row.id,
+        "net_inflow": str(net),
+        "engine_applied": applied,
+    }, None
+
+
+def record_reconciliation_diff(
+    db: Session, session_id: int, diff_type: str, *,
+    portfolio_id: Optional[int] = None, stock_code: Optional[str] = None,
+    expected=None, actual=None, detail: Optional[str] = None,
+) -> Optional[dict]:
+    """C1 差异台账写入（默认关闭，由 `tq_trade.reconciliation_ledger_enabled` 控制）。
+
+    同一 `(session, diff_type, stock_code)` 的 pending 行复用（更新 actual/delta/
+    detail），不为每次账户刷新新起一行——差异未处理期间值会来回变，逐次追加会
+    把台账刷成噪声。写库失败只告警（差异告警本身已经发出，台账是补强不是主链）。
+    """
+    try:
+        q = db.query(LiveReconciliationDiff).filter(
+            LiveReconciliationDiff.live_session_id == session_id,
+            LiveReconciliationDiff.diff_type == diff_type,
+            LiveReconciliationDiff.status == DIFF_STATUS_PENDING,
+        )
+        if stock_code:
+            q = q.filter(LiveReconciliationDiff.stock_code == str(stock_code).upper())
+        else:
+            q = q.filter(LiveReconciliationDiff.stock_code.is_(None))
+        row = q.order_by(LiveReconciliationDiff.id.desc()).first()
+        delta = None
+        try:
+            if expected is not None and actual is not None:
+                delta = Decimal(str(actual)) - Decimal(str(expected))
+        except (ArithmeticError, TypeError, ValueError):
+            delta = None
+        if row is None:
+            row = LiveReconciliationDiff(
+                live_session_id=session_id,
+                portfolio_strategy_id=portfolio_id,
+                diff_type=diff_type,
+                stock_code=(str(stock_code).upper() if stock_code else None),
+                expected=expected, actual=actual, delta=delta,
+                status=DIFF_STATUS_PENDING, detail=(detail or None),
+            )
+            db.add(row)
+        else:
+            row.actual = actual
+            row.delta = delta
+            row.detail = (detail or row.detail)
+            if portfolio_id is not None:
+                row.portfolio_strategy_id = portfolio_id
+        db.commit()
+        db.refresh(row)
+        return serialize_reconciliation_diff(row)
+    except Exception:  # noqa: BLE001 — 多为未执行迁移（无表）
+        db.rollback()
+        logger.warning("record_reconciliation_diff 写入失败 (session %s, %s)",
+                       session_id, diff_type, exc_info=True)
+        return None
+
+
+def serialize_reconciliation_diff(row) -> dict:
+    def _s(v):
+        return None if v is None else str(v)
+    return {
+        "id": row.id,
+        "diff_type": row.diff_type,
+        "portfolio_id": row.portfolio_strategy_id,
+        "stock_code": row.stock_code,
+        "expected": _s(row.expected),
+        "actual": _s(row.actual),
+        "delta": _s(row.delta),
+        "status": row.status,
+        "resolution": row.resolution,
+        "detail": row.detail,
+        "created_at": (row.created_at.strftime("%Y-%m-%d %H:%M:%S")
+                       if row.created_at else None),
+        "updated_at": (row.updated_at.strftime("%Y-%m-%d %H:%M:%S")
+                       if row.updated_at else None),
+    }
+
+
+def list_reconciliation_diffs(
+    db: Session, session_id: int, status: Optional[str] = None,
+    limit: int = 200,
+) -> Optional[dict]:
+    """C1 差异台账列表（按 id 倒序）。session 不存在返回 None。"""
+    session = db.query(LiveSession.id).filter(LiveSession.id == session_id).first()
+    if session is None:
+        return None
+    try:
+        q = db.query(LiveReconciliationDiff).filter(
+            LiveReconciliationDiff.live_session_id == session_id)
+        if status:
+            q = q.filter(LiveReconciliationDiff.status == status)
+        rows = (q.order_by(LiveReconciliationDiff.id.desc())
+                .limit(max(1, min(int(limit), 1000))).all())
+    except Exception:  # noqa: BLE001 — 未执行迁移 → 空列表
+        db.rollback()
+        rows = []
+    counts: Dict[str, int] = {}
+    for r in rows:
+        counts[r.status] = counts.get(r.status, 0) + 1
+    return {
+        "diffs": [serialize_reconciliation_diff(r) for r in rows],
+        "status_counts": counts,
+    }
+
+
+def resolve_reconciliation_diff(
+    db: Session, session_id: int, diff_id: int, action: str,
+    resolution: Optional[str] = None, engine=None, price=None,
+) -> Tuple[Optional[dict], Optional[str]]:
+    """C1/I2 差异处理：accept（以柜台为准）/ resolve（以平台为准）/ ignore。
+
+    - `position` + accept：写合成成交把虚拟持仓改到柜台量（运行中由引擎同步
+      内存，停止时重启重放生效），现金按差额×价格联动；
+    - `cash` / `equity` + accept：只确认口径（既有规则明确「现金差只告警不改账」，
+      这里不能借差异闭环偷偷改虚拟现金）。
+    """
+    if action not in ("accept", "resolve", "ignore"):
+        return None, "action 仅支持 accept / resolve / ignore"
+    row = db.query(LiveReconciliationDiff).filter_by(
+        id=diff_id, live_session_id=session_id).first()
+    if row is None:
+        return None, "资源不存在"
+    if row.status != DIFF_STATUS_PENDING:
+        return None, "该差异已处理（status=%s）" % row.status
+    note = (str(resolution)[:200] if resolution else None)
+    if action == "ignore":
+        row.status = DIFF_STATUS_IGNORED
+        row.resolution = note or "人工忽略"
+        db.commit()
+        db.refresh(row)
+        return serialize_reconciliation_diff(row), None
+    if action == "resolve":
+        row.status = DIFF_STATUS_RESOLVED
+        row.resolution = note or "以平台台账为准"
+        db.commit()
+        db.refresh(row)
+        return serialize_reconciliation_diff(row), None
+    # accept
+    if row.diff_type == "position":
+        if row.stock_code is None or row.actual is None:
+            return None, "该差异缺少代码/柜台数量，无法自动改账"
+        try:
+            actual_qty = int(Decimal(str(row.actual)))
+            expected_qty = int(Decimal(str(row.expected or 0)))
+        except (ArithmeticError, TypeError, ValueError):
+            return None, "差异数量非法"
+        delta = actual_qty - expected_qty
+        if delta:
+            px = _diff_price_hint(row, price)
+            if px is None:
+                return None, ("无法确定改账价格（该票已无持仓/无行情），"
+                              "请改用人工持仓改账接口显式指定 price")
+            if engine is not None:
+                applied = engine.accept_counter_truth(
+                    row.portfolio_strategy_id, row.stock_code, actual_qty,
+                    price=px, note=note)
+                if applied is None or applied.get("status") == "error":
+                    return None, (applied or {}).get("message", "改账失败")
+            else:
+                strategy_id = _first_strategy_id(db, row.portfolio_strategy_id)
+                if strategy_id is None:
+                    return None, "组合内没有可用策略，无法归因改账成交"
+                data, error = adjust_position_virtual(
+                    db, session_id, row.portfolio_strategy_id, strategy_id,
+                    row.stock_code, delta, px,
+                    note=note or "接受柜台为准（差异台账）")
+                if error is not None:
+                    return None, error
+        row.status = DIFF_STATUS_ACCEPTED
+        row.resolution = note or "以柜台为准，虚拟账已按差额改账"
+    else:
+        row.status = DIFF_STATUS_ACCEPTED
+        row.resolution = note or "已确认柜台口径（现金/净值差按既有规则只留痕不改账）"
+    db.commit()
+    db.refresh(row)
+    return serialize_reconciliation_diff(row), None
+
+
+def _diff_price_hint(row, price=None) -> Optional[Decimal]:
+    """差异改账价格：请求显式 price 优先，其次从 detail 的 `price=` 标记解析。
+
+    台账只存差异本身（股数/金额），价格属于「处理时」信息；调用方（API）优先
+    传当前价/成本，缺省时退化为写入差异时随 detail 带上的价格提示。
+    """
+    if price is not None:
+        try:
+            value = Decimal(str(price))
+        except (ArithmeticError, TypeError, ValueError):
+            return None
+        return value if value > 0 else None
+    detail = row.detail or ""
+    for marker in ("price=", "px="):
+        idx = detail.find(marker)
+        if idx >= 0:
+            raw = detail[idx + len(marker):].split(",")[0].split(";")[0].strip()
+            try:
+                value = Decimal(raw)
+            except (ArithmeticError, ValueError):
+                continue
+            if value > 0:
+                return value
+    return None
+
+
+def _first_strategy_id(db: Session, portfolio_id: Optional[int]) -> Optional[int]:
+    if portfolio_id is None:
+        return None
+    row = (db.query(Strategy.id)
+           .filter(Strategy.portfolio_id == portfolio_id)
+           .order_by(Strategy.id).first())
+    return None if row is None else int(row[0])
 
 
 def record_manual_action(
@@ -1853,7 +2154,7 @@ def adjust_position_virtual(
         return None, "price 非法"
     if not px.is_finite() or px <= 0:
         return None, "price 必须为正数"
-    session = db.query(LiveSession.id).filter(LiveSession.id == session_id).first()
+    session = db.query(LiveSession).filter(LiveSession.id == session_id).first()
     if session is None:
         return None, "资源不存在"
     link = (
@@ -1948,6 +2249,9 @@ def list_cash_flows(
                 "amount": str(r.amount),
                 "flow_date": r.flow_date.isoformat() if r.flow_date else None,
                 "note": r.note,
+                "reversal_of_id": r.reversal_of_id,
+                "reversed_by_id": r.reversed_by_id,
+                "voided": bool(r.voided),
                 "created_at": (
                     r.created_at.strftime("%Y-%m-%d %H:%M:%S")
                     if r.created_at else None),

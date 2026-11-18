@@ -520,6 +520,7 @@ def create_cash_flow(session_id: int, data: dict, db: Session = Depends(get_db))
         flow_date=data.get("flow_date"),
         note=data.get("note"),
         engine=_ENGINES.get(session_id),
+        allow_backfill=bool(data.get("allow_backfill")),
     )
     if error == "资源不存在":
         return err(404, error)
@@ -688,6 +689,50 @@ def manual_position_adjust(session_id: int, data: dict,
         data.get("stock_code"), data.get("quantity_delta"),
         data.get("price"), note=data.get("note"),
     )
+    if error == "资源不存在":
+        return err(404, error)
+    if error is not None:
+        return err(400, error)
+    return ok(row)
+
+
+@router.post("/sessions/{session_id}/cash-flows/{flow_id}/reverse")
+def reverse_session_cash_flow(session_id: int, flow_id: int,
+                              data: Optional[dict] = None,
+                              db: Session = Depends(get_db)):
+    """C2 现金流红冲（禁止物理删除）：反向补一笔并作废旧行，全程可审计。"""
+    row, error = svc.reverse_cash_flow(
+        db, session_id, flow_id, note=(data or {}).get("note"),
+        engine=_ENGINES.get(session_id))
+    if error == "资源不存在":
+        return err(404, error)
+    if error is not None:
+        return err(400, error)
+    return ok(row)
+
+
+@router.get("/sessions/{session_id}/diffs")
+def session_reconciliation_diffs(session_id: int, status: Optional[str] = None,
+                                 limit: int = 200,
+                                 db: Session = Depends(get_db)):
+    """C1 差异台账（持仓/现金/净值），按 id 倒序 + 状态计数。"""
+    data = svc.list_reconciliation_diffs(db, session_id, status=status, limit=limit)
+    if data is None:
+        return err(404, "资源不存在")
+    return ok(data)
+
+
+@router.post("/sessions/{session_id}/diffs/{diff_id}/resolve")
+def resolve_session_diff(session_id: int, diff_id: int, data: dict,
+                         db: Session = Depends(get_db)):
+    """C1/I2 差异处理：accept（以柜台为准，持仓差改账）/ resolve / ignore。
+
+    body: action / resolution(可选备注) / price(可选，accept 持仓差时显式定价)。
+    """
+    row, error = svc.resolve_reconciliation_diff(
+        db, session_id, diff_id, str(data.get("action") or "").strip(),
+        resolution=data.get("resolution"), engine=_ENGINES.get(session_id),
+        price=data.get("price"))
     if error == "资源不存在":
         return err(404, error)
     if error is not None:
