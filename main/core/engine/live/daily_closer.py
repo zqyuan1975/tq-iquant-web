@@ -92,6 +92,7 @@ class DailyCloser:
         advance_close_enabled: bool = False,
         advance_close_time: str = "14:51",
         snapshot_synth=None,
+        on_daily_snapshot: Optional[Callable[[date], None]] = None,
     ) -> None:
         self._ctx = ctx
         self._market_data = market_data
@@ -115,6 +116,8 @@ class DailyCloser:
         if self._advance_time < _ADVANCE_EXEC_START:
             self._advance_time = _ADVANCE_EXEC_START
         self._advance_synth = snapshot_synth
+        # A3（2026-11-18）：14:30 日终估值后写组合资金日序列；None=不启用。
+        self._on_daily_snapshot = on_daily_snapshot
         self._clock = ctx.clock
         # R4：幂等日期标记移入 __init__（原在 _calendar property 的 return 之后，死代码）。
         # E5/E6：14:30 日终已算过的日期标记（每日一次，避免每轮重复调 update_daily）
@@ -214,6 +217,14 @@ class DailyCloser:
             "daily close done (session %s, %s): %d portfolio(s) valuated",
             self._ctx.session_id, today, len(self._ctx.portfolios),
         )
+        # A3：日终组合资金日序列（14:30 每交易日一次；失败只告警）
+        if self._on_daily_snapshot is not None:
+            try:
+                self._on_daily_snapshot(today)
+            except Exception:  # noqa: BLE001 — 观测快照失败不影响日终估值
+                logger.warning(
+                    "daily portfolio snapshot failed (session %s, %s)",
+                    self._ctx.session_id, today, exc_info=True)
 
     # ---------------- 15:05 日线级别轮次（1d/1w/1mon，收盘落定后）----------------
     def _note_daily_freshness_skip(self, today, *, stale: int, total: int) -> None:

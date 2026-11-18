@@ -40,6 +40,7 @@ from core.models import (
     LiveSignal, LiveAccountSnapshot, LiveCashFlow, LiveBaselineReset,
     LiveManualAction, LiveReconciliationDiff, LiveReconciliationReport,
     LiveOutOfPoolDecision, LiveCorporateAction,
+    LivePortfolioDaily,
     IncrementalBacktestCheckpoint, BacktestRecord,
 )
 from core.engine.portfolio_builder import assemble_portfolio
@@ -1278,6 +1279,19 @@ def build_engine(
         corporate_action_specs=ca_specs or None,
         corporate_timeline_provider=(
             _corporate_timeline_provider if ca_specs else None),
+        # D1/D2（2026-11-18）：账户级聚合风控配置（默认关闭）。
+        # 阈值优先级：会话列显式值 > config.tq_trade.account_max_drawdown /
+        # account_daily_loss_limit > 引擎默认 15% / 5%。
+        account_risk_config={
+            "enabled": bool(getattr(session_row, "account_risk_enabled", False)),
+            "max_drawdown": (
+                getattr(session_row, "account_max_drawdown", None)
+                or _tq_cfg.get("account_max_drawdown")),
+            "daily_loss_limit": (
+                getattr(session_row, "account_daily_loss_limit", None)
+                or _tq_cfg.get("account_daily_loss_limit")),
+            "state": getattr(session_row, "account_risk_state", None),
+        },
         execution_mode=execution_mode,
         signal_file_path=signal_file_path,
         advance_close_enabled=bool(advance_close_enabled),
@@ -3644,6 +3658,153 @@ def recover_breaker(
                     "portfolio %s)", session_id, portfolio_id)
         db.commit()
     return True, None
+
+
+def account_risk_status(session_id: int,
+                        engine: Optional[LiveEngine]) -> Optional[dict]:
+    """D1/D2 账户级风控状态；引擎存在时带内存实时态。"""
+    service = getattr(engine, "_account_risk", None) if engine is not None else None
+    if service is None:
+        return None
+    return {
+        "enabled": bool(service.enabled),
+        "max_drawdown": (float(service.max_drawdown)
+                         if service.max_drawdown is not None else None),
+        "daily_loss_limit": (float(service.daily_loss_limit)
+                             if service.daily_loss_limit is not None else None),
+        "halted": bool(service.halted),
+        "breaker_active": bool(service.breaker_active),
+        "daily_pause_active": bool(service.daily_pause_active),
+        "triggers": int(service.triggers or 0),
+        "manual_recovery": bool(service.manual_recovery),
+        "peak_value": (float(service.peak_value)
+                       if service.peak_value is not None else None),
+        "prev_close_value": (float(service.prev_close_value)
+                             if service.prev_close_value is not None else None),
+        "last_date": (service.last_date.isoformat()
+                      if service.last_date is not None else None),
+        "breaker_trigger_date": (
+            service.breaker_trigger_date.isoformat()
+            if service.breaker_trigger_date is not None else None),
+    }
+
+
+def update_account_risk(
+    db: Session,
+    session_id: int,
+    payload: dict,
+    engines: Dict[int, LiveEngine],
+) -> Tuple[bool, object]:
+    """配置账户级风控（D1/D2）。返回 (ok, error_or_data)。"""
+    session = db.query(LiveSession).filter(LiveSession.id == session_id).first()
+    if session is None:
+        return False, (404, "资源不存在")
+
+    def _ratio(name: str):
+        raw = payload.get(name)
+        if raw is None or raw == "":
+            return None, None
+        try:
+            value = Decimal(str(raw))
+        except Exception:  # noqa: BLE001
+            return None, (400, "%s 非法" % name)
+        if not (Decimal("0") < value <= Decimal("1")):
+            return None, (400, "%s 需在 (0, 1] 区间" % name)
+        return value, None
+
+    max_dd, error = _ratio("max_drawdown")
+    if error:
+        return False, error
+    daily_loss, error = _ratio("daily_loss_limit")
+    if error:
+        return False, error
+    enabled = payload.get("enabled")
+    if enabled is not None:
+        session.account_risk_enabled = bool(enabled)
+    if max_dd is not None:
+        session.account_max_drawdown = max_dd
+    if daily_loss is not None:
+        session.account_daily_loss_limit = daily_loss
+    db.commit()
+    engine = engines.get(session_id)
+    if engine is not None:
+        account_risk = getattr(engine, "_account_risk", None)
+        if account_risk is not None:
+            account_risk.apply_config(
+                enabled=None if enabled is None else bool(enabled),
+                max_drawdown=max_dd, daily_loss_limit=daily_loss)
+            account_risk.persist_state()
+    return True, account_risk_status(session_id, engine) or {
+        "enabled": bool(session.account_risk_enabled),
+        "max_drawdown": (float(session.account_max_drawdown)
+                         if session.account_max_drawdown is not None else None),
+        "daily_loss_limit": (float(session.account_daily_loss_limit)
+                             if session.account_daily_loss_limit is not None
+                             else None),
+    }
+
+
+def recover_account_risk(
+    db: Session,
+    session_id: int,
+    reason: Optional[str],
+    engines: Dict[int, LiveEngine],
+) -> Tuple[bool, object]:
+    """人工恢复账户级熔断（D1）；未运行会话只清状态列。"""
+    session = db.query(LiveSession).filter(LiveSession.id == session_id).first()
+    if session is None:
+        return False, (404, "资源不存在")
+    engine = engines.get(session_id)
+    account_risk = getattr(engine, "_account_risk", None) if engine else None
+    if account_risk is not None:
+        account_risk.recover(reason=reason)
+    else:
+        session.account_risk_state = None
+        db.commit()
+    return True, {"status": "recovered", "reason": reason}
+
+
+def list_portfolio_daily(db: Session, session_id: int, days: int = 30):
+    """A3：组合资金日序列（按日倒序；附账户合计行）。会话不存在返回 None。"""
+    exists = db.query(LiveSession.id).filter(LiveSession.id == session_id).first()
+    if exists is None:
+        return None
+    days = max(1, min(int(days or 30), 365))
+    cutoff = date.today() - timedelta(days=days)
+    rows = (
+        db.query(LivePortfolioDaily)
+        .filter(LivePortfolioDaily.live_session_id == session_id,
+                LivePortfolioDaily.trade_date >= cutoff)
+        .order_by(LivePortfolioDaily.trade_date.desc(),
+                  LivePortfolioDaily.portfolio_strategy_id.asc())
+        .all()
+    )
+    items = []
+    for row in rows:
+        items.append({
+            "trade_date": row.trade_date.isoformat(),
+            "portfolio_strategy_id": row.portfolio_strategy_id,
+            "cash": float(row.cash) if row.cash is not None else None,
+            "market_value": (float(row.market_value)
+                             if row.market_value is not None else None),
+            "total_value": (float(row.total_value)
+                            if row.total_value is not None else None),
+            "risk_value": (float(row.risk_value)
+                           if row.risk_value is not None else None),
+            "weight": float(row.weight) if row.weight is not None else None,
+            "position_count": row.position_count,
+            "detail": _loads_or_none(row.detail),
+        })
+    return items
+
+
+def _loads_or_none(raw):
+    if not raw:
+        return None
+    try:
+        return json.loads(raw)
+    except (TypeError, ValueError):
+        return None
 
 
 def bridge_status(session_id: int, status: str, engine: Optional[LiveEngine]) -> dict:

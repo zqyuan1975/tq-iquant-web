@@ -354,6 +354,61 @@ def account_preview(engine: Optional[str] = None, mode: Optional[str] = None,
     return ok(data)
 
 
+@router.get("/sessions/{session_id}/account-risk")
+def get_account_risk(session_id: int, db: Session = Depends(get_db)):
+    """D1/D2：账户级聚合风控状态（未运行会话返回库内配置 + halted=false）。"""
+    session = db.query(LiveSession).filter(LiveSession.id == session_id).first()
+    if session is None:
+        return err(404, "资源不存在")
+    data = svc.account_risk_status(session_id, _ENGINES.get(session_id))
+    if data is None:
+        data = {
+            "enabled": bool(session.account_risk_enabled),
+            "max_drawdown": (float(session.account_max_drawdown)
+                             if session.account_max_drawdown is not None else None),
+            "daily_loss_limit": (float(session.account_daily_loss_limit)
+                                 if session.account_daily_loss_limit is not None
+                                 else None),
+            "halted": False,
+            "running": False,
+        }
+    else:
+        data["running"] = True
+    return ok(data)
+
+
+@router.put("/sessions/{session_id}/account-risk")
+def put_account_risk(session_id: int, data: Optional[dict] = None,
+                     db: Session = Depends(get_db)):
+    """D1/D2：配置账户级开关与阈值（运行中即时生效于后续 bar 判定）。"""
+    ok_flag, result = svc.update_account_risk(
+        db, session_id, data or {}, _ENGINES)
+    if not ok_flag:
+        return err(result[0], result[1])
+    return ok(result)
+
+
+@router.post("/sessions/{session_id}/account-risk/recover")
+def recover_account_risk(session_id: int, data: Optional[dict] = None,
+                         db: Session = Depends(get_db)):
+    """D1：人工恢复账户级熔断（记原因；运行中同步内存态）。"""
+    ok_flag, result = svc.recover_account_risk(
+        db, session_id, (data or {}).get("reason"), _ENGINES)
+    if not ok_flag:
+        return err(result[0], result[1])
+    return ok(result)
+
+
+@router.get("/sessions/{session_id}/portfolio-daily")
+def portfolio_daily(session_id: int, days: int = 30,
+                    db: Session = Depends(get_db)):
+    """A3：组合资金日序列（日终 14:30 落库；按日倒序）。"""
+    rows = svc.list_portfolio_daily(db, session_id, days)
+    if rows is None:
+        return err(404, "资源不存在")
+    return ok(rows)
+
+
 @router.get("/sessions/{session_id}/params-drift")
 def session_params_drift(session_id: int, db: Session = Depends(get_db)):
     """H2 参数漂移（A7）：绑定回测记录时返回当前参数与 params_snapshot 的差异。

@@ -1,4 +1,4 @@
-from sqlalchemy import Boolean, Column, Integer, String, DateTime, Numeric
+from sqlalchemy import Boolean, Column, Integer, String, DateTime, Numeric, Text
 from sqlalchemy.sql import func
 
 from .base import Base
@@ -69,6 +69,16 @@ class LiveSession(Base):
     #   0/1  = 本会话显式覆盖（关闭时错周期 bar 一律只更新价格快照、不跑风控）
     # 历史会话为 NULL → 立即跟随新默认（对齐回测：风控只在自身周期 bar 上评估）。
     intraday_mismatched_risk_enabled = Column(Boolean, nullable=True)
+    # ---- 账户级风控（D1/D2，2026-11-18，默认关闭）----
+    # 会话（账户）级聚合熔断：Σ 各组合 risk_equity() 的口径，与组合级独立生效。
+    # enabled=0 时引擎完全不读取/不写入本组字段，行为与接线前一致。
+    account_risk_enabled = Column(
+        Boolean, nullable=False, server_default="0", default=False)
+    # 账户级阈值；NULL = 回退 config.tq_trade.account_max_drawdown / 日亏阈值。
+    account_max_drawdown = Column(Numeric(9, 6), nullable=True)
+    account_daily_loss_limit = Column(Numeric(9, 6), nullable=True)
+    # 账户级内存态 JSON（峰值/昨收/暂停态/已预警级别），跨重启读回。
+    account_risk_state = Column(Text, nullable=True)
     status = Column(String(10), nullable=False)
     created_at = Column(DateTime, server_default=func.now())
     updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())

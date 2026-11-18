@@ -40,6 +40,9 @@ from .live_manual_action import LiveManualAction
 from .live_reconciliation_diff import LiveReconciliationDiff
 from .live_reconciliation_report import LiveReconciliationReport
 from .live_out_of_pool_decision import LiveOutOfPoolDecision
+from .live_portfolio_daily import LivePortfolioDaily
+from .live_pending_change import LiveSessionPendingChange
+from .live_global_switch import LiveGlobalSwitch
 
 __all__ = [
     "Base",
@@ -85,4 +88,7 @@ __all__ = [
     "LiveReconciliationDiff",
     "LiveReconciliationReport",
     "LiveOutOfPoolDecision",
+    "LivePortfolioDaily",
+    "LiveSessionPendingChange",
+    "LiveGlobalSwitch",
 ]

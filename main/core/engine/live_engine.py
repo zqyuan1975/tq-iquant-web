@@ -113,6 +113,7 @@ from .live.order_machine import (
     _MANUAL_REVIEW_MARKER,
 )
 from .live.breaker import BreakerService
+from .live.account_risk import AccountRiskService
 from .live.daily_closer import DailyCloser
 from .market_rules import session_allows_bar, tick_size
 from .decision import DecisionRecorder
@@ -125,6 +126,7 @@ from core.models import (
     LiveSession, LiveSessionPortfolio, LiveSignal, LiveTrade,
     LiveCorporateAction,
     LiveApprovalQueue, LiveManualAction, LiveOutOfPoolDecision,
+    LivePortfolioDaily,
 )
 from core.tq.formula import TQFormula
 from core.tq.utils import TDXLockTimeout
@@ -566,6 +568,9 @@ class LiveEngine:
         # 事件表返回 CorporateActionTimeline。两者缺省(None/空)=不启用，行为不变。
         corporate_action_specs: Optional[Dict[int, dict]] = None,
         corporate_timeline_provider: Optional[Callable] = None,
+        # 账户级聚合风控（D1/D2，2026-11-18）：enabled/max_drawdown/
+        # daily_loss_limit/state（live_sessions 列）。缺省/关闭 = 零行为变化。
+        account_risk_config: Optional[dict] = None,
         execution_mode: str = "auto",
         signal_monitor=None,
         signal_scheduler=None,
@@ -912,6 +917,9 @@ class LiveEngine:
         # 计数持久化、3 次转手动、手动恢复、重启读回归 BreakerService。持有 _breaker_count_written。
         # 事件发射经 self._emit 回调注入（不反向 import LiveEngine）。引擎保留同名薄委托。
         self._breaker = BreakerService(self.ctx, self._emit)
+        # 账户级聚合风控（D1/D2，2026-11-18）：默认关闭；关闭时 on_bar 首行返回。
+        self._account_risk = AccountRiskService(
+            self.ctx, self._emit, account_risk_config)
         # 日终/收盘时点编排协作者（0010 步骤 5）：14:30 日终估值（转 breaker）、
         # 15:05 日线级别轮次（1d/1w/1mon 完整 bar；转 market_data，经 on_bar 驱动）、
         # 15:05 收盘清扫（转 orders 回填/终态同步/兜底 cancel）。持有幂等日期标记。
@@ -934,6 +942,8 @@ class LiveEngine:
                 self._advance_close_enabled_cfg and self.execution_mode == "auto"),
             advance_close_time=self._advance_close_time_cfg,
             snapshot_synth=self._snapshot_synth,
+            # A3（2026-11-18）：14:30 日终写组合资金日序列
+            on_daily_snapshot=self._write_daily_portfolio_snapshots,
         )
 
         # 已分发过周期边界的 1m stime 集合——同根 bar 二次触发时挡掉重复周期分发。
@@ -5695,6 +5705,106 @@ class LiveEngine:
             if db is not None:
                 db.close()
 
+    # ---------------- A3 组合资金日序列 ----------------
+    def _write_daily_portfolio_snapshots(self, today: date) -> None:
+        """14:30 日终写每组合一行资金快照（A3，upsert，失败只告警）。
+
+        `risk_value` 与熔断/回撤同口径（扣累计外部净流入）；`total_value` 是
+        实际资产（cash + 持仓市值），仓位分配口径。`weight` 按账户总市值占比。
+        """
+        db = self._db_session_factory()
+        if db is None:
+            return
+        try:
+            payloads = []
+            account_total = Decimal("0")
+            for port in (self.ctx.portfolios or []):
+                with self._book_lock:
+                    cash = Decimal(str(port.account.cash or 0))
+                    market_value = port._holdings_value()
+                    risk_value = port.risk_equity()
+                    detail = []
+                    price_snapshot = getattr(port, "_price_snapshot", {}) or {}
+                    for strat in (getattr(port, "strategies", None) or []):
+                        for code, pos in (getattr(strat, "positions", None) or {}).items():
+                            qty = int(getattr(pos, "quantity", 0) or 0)
+                            if qty <= 0:
+                                continue
+                            price = price_snapshot.get(code)
+                            if price is None:
+                                price = getattr(pos, "avg_cost", None)
+                            mv = (Decimal(str(price)) * qty
+                                  if price is not None else None)
+                            detail.append({
+                                "stock_code": code,
+                                "quantity": qty,
+                                "market_value": (str(mv) if mv is not None
+                                                 else None),
+                            })
+                total = cash + market_value
+                account_total += total
+                payloads.append({
+                    "live_session_id": self.session_id,
+                    "portfolio_strategy_id": port.portfolio_id,
+                    "trade_date": today,
+                    "cash": cash,
+                    "market_value": market_value,
+                    "total_value": total,
+                    "risk_value": risk_value,
+                    "position_count": len(detail),
+                    "detail": json.dumps(detail, ensure_ascii=False),
+                })
+            for payload in payloads:
+                weight = None
+                if account_total > 0:
+                    weight = (payload["total_value"] / account_total
+                              ).quantize(Decimal("0.000001"))
+                values = dict(payload, weight=weight)
+                stmt = sqlite_insert(LivePortfolioDaily).values(**values)
+                stmt = stmt.on_conflict_do_update(
+                    index_elements=["live_session_id",
+                                    "portfolio_strategy_id", "trade_date"],
+                    set_={
+                        "cash": values["cash"],
+                        "market_value": values["market_value"],
+                        "total_value": values["total_value"],
+                        "risk_value": values["risk_value"],
+                        "weight": values["weight"],
+                        "position_count": values["position_count"],
+                        "detail": values["detail"],
+                    },
+                )
+                db.execute(stmt)
+            db.commit()
+        except Exception:  # noqa: BLE001 — 观测快照失败不影响日终估值
+            db.rollback()
+            logger.warning(
+                "daily portfolio snapshot write failed (session %s, %s)",
+                self.session_id, today, exc_info=True)
+        finally:
+            db.close()
+
+    def _apply_account_halt(self, portfolio: Portfolio,
+                            orders: List[OrderEvent]) -> List[OrderEvent]:
+        """账户级熔断/日亏暂停：剥掉本批 BUY（含 deferred 放行），SELL 保留。"""
+        if not orders or not self._account_risk.halted:
+            return orders
+        stripped = [o for o in orders if o.trade_type == TradeType.BUY]
+        if not stripped:
+            return orders
+        rule = ("max_drawdown" if self._account_risk.breaker_active
+                else "daily_loss")
+        for order in stripped:
+            self._rec_live(
+                "account_risk_halt", "strip", portfolio, order,
+                message="账户级 %s 暂停新开仓：剥掉 BUY %s（%s）" % (
+                    rule, order.stock_code, order.signal_name),
+            )
+        logger.warning(
+            "account risk halt: session %s portfolio %s 剥离 %d 个 BUY（%s）",
+            self.session_id, portfolio.portfolio_id, len(stripped), rule)
+        return [o for o in orders if o.trade_type != TradeType.BUY]
+
     # ---------------- bar 驱动 ----------------
     def _on_bar(self, bar: BarEvent) -> None:
         """BarPoller 回调（1m 节拍）：① 驱动 1m 策略；② 按 bar stime 边界分发长周期。
@@ -6380,6 +6490,9 @@ class LiveEngine:
                 portfolio, total_value, bar.bar_time.date(),
                 allow_peak_update=_allow_peak_update(portfolio, bar),
             )
+            # D1/D2（2026-11-18）：账户级聚合更新（同一 bar_time 只算一次）。
+            # 关闭时首行返回；触发后本组合本批 BUY 在下方统一剥离。
+            self._account_risk.on_bar(bar.bar_time)
         # F5：每 bar 刷一次桥可用持仓（同 bar_time 去重），SELL 减仓上限用
         # m_nCanUseVolume（T+1 可用），供 cap_quantity 取数。
         # P1#4（2026-11-16）：判重键从 **bar 对象身份** 改为 bar_time。1m 节拍的
@@ -6484,6 +6597,10 @@ class LiveEngine:
             orders = self._dedupe_inflight_sells(portfolio, orders)
         if orders:
             orders.sort(key=lambda o: 0 if o.trade_type.value == "SELL" else 1)
+            # D1：账户级熔断/日亏暂停 → 剥 BUY（SELL 保留），在资金分配之前，
+            # 避免被剥单仍占用本批可用现金。
+            orders = self._apply_account_halt(portfolio, orders)
+        if orders:
             # 同批（同 bar/同组合）买单资金分配：先按目标金额比例分配并预留可用
             # 现金，再逐笔提交——避免 FIFO 先到先得让最后一笔在柜台因资金不足被拒。
             # deferred 单不参与（其可用资金以放行 bar 为准），单笔批次不分配。
