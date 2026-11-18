@@ -1,11 +1,13 @@
 ﻿from .base import Base
 from .stock_pool import StockPool
 from .stock_pool_stock import StockPoolStock
+from .stock_pool_membership import StockPoolMembership
 from .formula import Formula
 from .formula_signal import FormulaSignal
 from .portfolio_strategy import PortfolioStrategy
 from .strategy import Strategy
 from .backtest_record import BacktestRecord
+from .backtest_run_group import BacktestRunGroup
 from .backtest_trade import BacktestTrade
 from .backtest_daily_snapshot import BacktestDailySnapshot
 from .backtest_evaluation import BacktestEvaluation
@@ -38,11 +40,13 @@ __all__ = [
     "Base",
     "StockPool",
     "StockPoolStock",
+    "StockPoolMembership",
     "Formula",
     "FormulaSignal",
     "PortfolioStrategy",
     "Strategy",
     "BacktestRecord",
+    "BacktestRunGroup",
     "BacktestTrade",
     "BacktestDailySnapshot",
     "BacktestEvaluation",

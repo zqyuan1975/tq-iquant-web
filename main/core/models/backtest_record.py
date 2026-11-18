@@ -38,5 +38,8 @@ class BacktestRecord(Base):
     # P2b 参数微扰子回测关联：非空表示该记录是某次 param-perturb run 的扰动/基准
     # 子回测（列表接口默认过滤，仅 run 详情内可见）；空 = 普通回测（历史行为）。
     param_perturb_run_id = Column(Integer, ForeignKey("param_perturb_runs.id", ondelete="SET NULL"), nullable=True, index=True)
+    # N1 多组合回测（2026-11-18）：非空表示该记录是某次多组合 run 的成员记录
+    # （成员各自是完整记录，详情/分析可直接复用；聚合曲线存 run group）。
+    run_group_id = Column(Integer, ForeignKey("backtest_run_groups.id", ondelete="SET NULL"), nullable=True, index=True)
     created_at = Column(DateTime, server_default=func.now())
     completed_at = Column(DateTime, nullable=True)

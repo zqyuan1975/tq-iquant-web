@@ -11,6 +11,10 @@ from core.services.stock_pool_service import (
     list_tdx_stocks as _svc_list_tdx_stocks,
     sync_pool as _svc_sync_pool,
     delete_pool as _svc_delete_pool,
+    list_memberships as _svc_list_memberships,
+    create_membership as _svc_create_membership,
+    update_membership as _svc_update_membership,
+    delete_membership as _svc_delete_membership,
 )
 from core.tq.utils import TDXConnectionError
 
@@ -19,6 +23,21 @@ router = APIRouter(prefix="/api/stock-pools", tags=["stock_pools"])
 
 class SyncReq(BaseModel):
     code: str
+
+
+class MembershipReq(BaseModel):
+    stock_code: str
+    effective_from: str
+    effective_to: str | None = None
+    source: str | None = None
+    note: str | None = None
+
+
+class MembershipUpdateReq(BaseModel):
+    stock_code: str | None = None
+    effective_from: str | None = None
+    effective_to: str | None = None
+    note: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -90,3 +109,47 @@ def delete_pool(pool_id: int, db: Session = Depends(get_db)):
         db.rollback()
         return err(409, "该股票池被组合策略引用，无法删除")
     return ok()
+
+
+# ---------------------------------------------------------------------------
+# 时点成分区间（J7）：手工作业入口，组合 pool_pit_enabled 开启后回测按此判定
+# ---------------------------------------------------------------------------
+@router.get("/{pool_id}/memberships")
+def list_memberships(pool_id: int, as_of: str | None = None,
+                     db: Session = Depends(get_db)):
+    try:
+        return ok(_svc_list_memberships(db, pool_id, as_of=as_of))
+    except ValueError as exc:
+        return err(400, str(exc))
+
+
+@router.post("/{pool_id}/memberships")
+def create_membership(pool_id: int, req: MembershipReq,
+                      db: Session = Depends(get_db)):
+    try:
+        return ok(_svc_create_membership(db, pool_id, req.model_dump()))
+    except LookupError:
+        return err(404, "股票池不存在")
+    except ValueError as exc:
+        return err(400, str(exc))
+
+
+@router.put("/memberships/{membership_id}")
+def update_membership(membership_id: int, req: MembershipUpdateReq,
+                      db: Session = Depends(get_db)):
+    payload = {k: v for k, v in req.model_dump().items() if v is not None}
+    try:
+        data = _svc_update_membership(db, membership_id, payload)
+    except ValueError as exc:
+        return err(400, str(exc))
+    if data is None:
+        return err(404, "成分记录不存在")
+    return ok(data)
+
+
+@router.delete("/memberships/{membership_id}")
+def delete_membership(membership_id: int, db: Session = Depends(get_db)):
+    if not _svc_delete_membership(db, membership_id):
+        return err(404, "成分记录不存在")
+    return ok()
+

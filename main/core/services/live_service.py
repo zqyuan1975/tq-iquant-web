@@ -36,7 +36,7 @@ from core.config import load_config
 from core.db import SessionLocal
 from core.models import (
     LiveSession, LiveSessionPortfolio, PortfolioStrategy, Strategy,
-    StockPoolStock, Formula, FormulaSignal, LiveOrder, LiveTrade, LiveDecisionEvent,
+    StockPoolStock, StockPoolMembership, Formula, FormulaSignal, LiveOrder, LiveTrade, LiveDecisionEvent,
     LiveSignal, LiveAccountSnapshot, LiveCashFlow, LiveBaselineReset,
     IncrementalBacktestCheckpoint, BacktestRecord,
 )
@@ -1049,7 +1049,25 @@ def build_engine(
                 "delist_force_close_enabled": bool(
                     getattr(ps, "delist_force_close_enabled", False)),
             }
+        # 时点股票池（J7，默认关）：注入时间线与「历史成分并集」——
+        # 当日不在池的票不开仓/加仓，但已持仓的卖出/风控不受影响；行情轮询
+        # 也必须覆盖历史成分，否则日后重新入池时没有可用的价格序列。
+        _pit_enabled = bool(getattr(ps, "pool_pit_enabled", False))
+        if _pit_enabled:
+            try:
+                from core.services.backtest_service import build_pool_timeline
+                _pit_timeline = build_pool_timeline(db, ps)
+                if len(_pit_timeline):
+                    port.pool_timeline = _pit_timeline
+                    port.pool_pit_enabled = True
+            except Exception:  # noqa: BLE001 — 取数失败只告警，不影响启动
+                logger.exception("组合 %s 时点股票池加载失败，按当前池运行", ps.id)
         pool_codes = resolve_stock_codes(db, ps.id)
+        if _pit_enabled:
+            pool_codes = sorted(set(pool_codes) | set(
+                row[0] for row in db.query(StockPoolMembership.stock_code)
+                .filter(StockPoolMembership.pool_id == ps.stock_pool_id)
+                .distinct().all()))
         stock_codes.update(pool_codes)
         pool_codes_by_portfolio[ps.id] = set(pool_codes)
         for strat in strategies:

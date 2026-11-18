@@ -74,6 +74,12 @@ from core.engine.market_gate import GATE_FORMULA_VERSION
 from core.engine.corporate_actions import (
     CORPORATE_ACTION_VERSION, build_timeline_from_rows,
 )
+from core.engine.pool_timeline import (
+    POOL_TIMELINE_VERSION, build_pool_timeline,
+)
+from core.engine.execution_profile import (
+    EXECUTION_PROFILE_VERSION, expand_profile, fingerprint,
+)
 from core.services.notify_service import notify
 from tq_iquant_shared.constants import SignalType, TradeType
 
@@ -449,6 +455,9 @@ def schema_parts(dividend_mode: str) -> dict:
         "market_gate": GATE_FORMULA_VERSION,
         # 公司行为内核口径（2026-11-18，J1/J2）：判定语义变更同样作废旧接缝。
         "corporate_actions": CORPORATE_ACTION_VERSION,
+        # 时点股票池（2026-11-18，J7）与执行档位（N1）口径版本。
+        "pool_timeline": POOL_TIMELINE_VERSION,
+        "execution": EXECUTION_PROFILE_VERSION,
     }
 
 
@@ -485,6 +494,8 @@ _FP_PART_LABELS = {
     "formula": "公式正文/引擎/跨周期口径/信号线",
     "pool": "股票池成分代码",
     "corporate_actions": "公司行为事件集合/处置档位",
+    "pool_timeline": "时点股票池成分区间",
+    "execution": "回测执行档位（成交假设）",
     "baseline": "资金基准（baseline_version / baseline_value）",
 }
 
@@ -497,6 +508,8 @@ _SCHEMA_PART_LABELS = {
     "engine": "引擎版本 _ENGINE_SCHEMA",
     "dividend_mode": "复权模式",
     "corporate_actions": "公司行为内核口径",
+    "pool_timeline": "时点股票池内核口径",
+    "execution": "执行档位版本",
 }
 
 
@@ -614,6 +627,24 @@ def _corporate_actions_fp(ps, db: Optional[Session]) -> str:
     }, sort_keys=True, ensure_ascii=False)
 
 
+def _pool_timeline_fp(ps, db: Optional[Session]) -> str:
+    """时点股票池指纹（2026-11-18，J7）：关闭=固定串；开启=内核版本 + 区间 digest。"""
+    if not getattr(ps, "pool_pit_enabled", False):
+        return "disabled"
+    digest = None
+    if db is not None:
+        digest = build_pool_timeline(db, ps).digest()
+    return json.dumps({
+        "version": POOL_TIMELINE_VERSION,
+        "digest": digest,
+    }, sort_keys=True, ensure_ascii=False)
+
+
+def _execution_fp(ps=None) -> str:
+    """执行档位指纹（2026-11-18，N1）：增量调度固定 legacy，逐开关入指纹。"""
+    return fingerprint(expand_profile(None))
+
+
 def baseline_fingerprint(session_row) -> dict:
     """资金基准指纹（2026-11-16 基准对齐）：baseline_version + baseline_value。
 
@@ -654,6 +685,12 @@ def params_fingerprint(ps, dividend_mode: str,
         # 公司行为事件集合（2026-11-18）：开关/事件内容/处置档位任一变化，
         # 接缝前后半段口径就会不一致（历史分红/送转/退市强平无法复现）。
         "corporate_actions": _corporate_actions_fp(ps, db),
+        # 时点股票池（2026-11-18，J7）：开关或成分区间变动 → 旧接缝判废
+        # （历史某日「在不在池」不同，信号集合就不同）。
+        "pool_timeline": _pool_timeline_fp(ps, db),
+        # 执行档位（2026-11-18，N1）：legacy 固定串；realistic 或显式覆盖时按
+        # 展开后的逐开关入指纹（成交假设变化必须新旧不混比）。
+        "execution": _execution_fp(ps),
         "baseline": json.dumps(baseline or {}, sort_keys=True, ensure_ascii=False),
     }
     payload = json.dumps(sections, sort_keys=True, ensure_ascii=False)
@@ -1602,6 +1639,13 @@ def _run_incremental_locked(db: Session, session_id: int,
                 getattr(ps, "suspension_dispose_days", 0) or 0)
             portfolio.delist_force_close_enabled = bool(
                 getattr(ps, "delist_force_close_enabled", False))
+    # 时点股票池（J7，默认关）：与全量回测同一张成员表与同一判定内核，
+    # 接缝前后同口径由 schema_fp 的 pool_timeline 版本 + params 分项保证。
+    if getattr(ps, "pool_pit_enabled", False):
+        _pit_timeline = build_pool_timeline(db, ps, today)
+        if len(_pit_timeline):
+            portfolio.pool_timeline = _pit_timeline
+            portfolio.pool_pit_enabled = True
     if state is None:
         if resolve_anchor(link, cfg):
             apply_seam_anchor(portfolio, link.seam_cash, seam_positions)
@@ -1818,6 +1862,12 @@ def run_validation(db: Session, session_id: int, ps_id: int,
                         getattr(ps, "suspension_dispose_days", 0) or 0)
                     portfolio.delist_force_close_enabled = bool(
                         getattr(ps, "delist_force_close_enabled", False))
+            # 时点股票池（J7）：校验侧与续跑侧同口径
+            if getattr(ps, "pool_pit_enabled", False):
+                _pit_timeline = build_pool_timeline(db, ps, to_date)
+                if len(_pit_timeline):
+                    portfolio.pool_timeline = _pit_timeline
+                    portfolio.pool_pit_enabled = True
             if resolve_anchor(link, cfg):
                 apply_seam_anchor(portfolio, link.seam_cash, seam_positions)
             # 校验侧与续跑侧必须同口径门控（否则「全量 vs 续跑」对比恒不一致）

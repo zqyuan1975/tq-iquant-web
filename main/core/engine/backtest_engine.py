@@ -1,11 +1,14 @@
 from typing import Dict, List, Optional
 from datetime import datetime, date
 from decimal import Decimal, ROUND_HALF_UP
+from dataclasses import replace
 import logging
 
 from .portfolio import Portfolio
 from .position import Position, is_convertible_bond, lot_size_for
 from .execution_engine import ExecutionEngine, SimulatedDispatcher, SimulatedT1Checker
+from .cash_allocator import MIN_FILL_RATIO, allocate_batch_buys
+from .format import fmt_money
 from .evaluator import Evaluator
 from .event import BarEvent, OrderEvent, TradeEvent
 from .decision import DecisionRecorder
@@ -120,6 +123,7 @@ class BacktestEngine:
         stock_names: Optional[dict] = None,
         prev_close_by_day: Optional[Dict[tuple, Decimal]] = None,
         pending_order_max_days: int = PENDING_ORDER_MAX_DAYS,
+        run_options: Optional[dict] = None,
     ) -> dict:
         """逐 bar 回测主链路。
 
@@ -148,7 +152,13 @@ class BacktestEngine:
         ``PENDING_ORDER_MAX_DAYS``=20，<=0 不限）。超期单在本 bar 记
         ``gate=pending_order_expired`` 决策事件后作废（不再回队），防停牌/连板
         无限顺延后在几个月后按恢复日开盘价「补做」早已过期的决策。依据见常量注释。
+        run_options：执行档位展开后的开关（N1，2026-11-18，默认 None=旧行为）：
+        ``first_bar_no_fill``（每交易日首根 bar 不生成 BUY）/
+        ``partial_fill_enabled``（成交量上限缩量后残量回队续成交）。
         """
+        run_options = run_options or {}
+        _first_bar_no_fill = bool(run_options.get("first_bar_no_fill", False))
+        _partial_fill = bool(run_options.get("partial_fill_enabled", False))
         klines = klines or {}
         signal_cache = signal_cache if signal_cache is not None else {}
 
@@ -261,6 +271,9 @@ class BacktestEngine:
                     t.date(), portfolio.account.initial_capital
                 )
                 last_enter_date = t.date()
+                is_first_bar_of_day = True
+            else:
+                is_first_bar_of_day = False
 
             # 0b. 公司行为（J1/J2，默认未启用 —— timeline=None 时整段跳过）。
             #     必须在成交步之前：当日待成交的顺延单若碰上送转，股数要先调整，
@@ -464,6 +477,10 @@ class BacktestEngine:
                     # 成交股数上限（TDX Volume 单位=手，×100 转股数，向下取整手）。
                     # 订单量 ≤ 上限 → 照常；> 上限且上限 ≥ 一手 → 缩量成交（每次记）；
                     # 上限不足一手 → 延后至量足 bar（每订单仅首次记 1 条）。
+                    # 4b. 执行档位 partial_fill（N1，默认关）：成交量上限缩量后
+                    # 残量回队续成交（仅 BUY；卖出残量由既有风控残量/下一次信号处理，
+                    # 避免一次卖出被拆成两笔重复计入卖出信号统计）。
+                    partial_residual = 0
                     if portfolio.volume_limit_enabled:
                         bar_volume = price_index.get((t, period), {}).get(
                             order.stock_code, {}).get("volume")
@@ -502,6 +519,8 @@ class BacktestEngine:
                                     if (not is_buy
                                             and order.signal_type in _RISK_SELL_TYPES):
                                         risk_sell_original = order.quantity
+                                    if _partial_fill and is_buy:
+                                        partial_residual = order.quantity - final_qty
                                     order.quantity = final_qty
                                 else:
                                     if id(order) not in volume_defer_recorded:
@@ -572,6 +591,20 @@ class BacktestEngine:
                                         "于后续 bar 分批成交（不重复触发风控）"
                                         % (int(risk_sell_original) - remaining, remaining),
                             )
+                    # 4b. 买入 partial_fill 残量回队（默认关）：成交量上限缩量成交后，
+                    # 未成交部分作为新在途单挂回，下一根 bar 继续按 open 成交。
+                    if (_partial_fill and trade is not None and partial_residual > 0):
+                        deferred.append(replace(order, quantity=partial_residual))
+                        recorder.record(
+                            gate="partial_fill", layer="execution", action="carry",
+                            portfolio_id=order.portfolio_id or 0,
+                            strategy_id=order.strategy_id,
+                            stock_code=order.stock_code,
+                            bar_time=t,
+                            requested_qty=partial_residual,
+                            message="成交量约束部分成交，剩余 %d 股回队于后续 bar 续买"
+                                    "（execution_profile=realistic）" % partial_residual,
+                        )
 
             # 2. 构造 BarEvent（从预建索引 O(1) 查表；含当前周期标注）
             bar = self._build_bar(price_index, t, period)
@@ -599,6 +632,26 @@ class BacktestEngine:
                     bar, signal_cache=signal_cache, period=period,
                     inflight_risk_sells=inflight_risk_sells,
                 )
+                # 执行档位（N1，默认关）：每交易日首根 bar 不生成 BUY（卖出/风控照常）。
+                # 关闭时逐字维持旧行为——不进行任何过滤。
+                if _first_bar_no_fill and is_first_bar_of_day and new_orders:
+                    _kept_orders = []
+                    for _o in new_orders:
+                        if _o.trade_type == TradeType.BUY:
+                            recorder.record(
+                                gate="first_bar_no_fill", layer="execution",
+                                action="skip",
+                                portfolio_id=_o.portfolio_id or 0,
+                                strategy_id=_o.strategy_id,
+                                stock_code=_o.stock_code,
+                                bar_time=t,
+                                requested_qty=_o.quantity,
+                                message="执行档位：当日首根 bar 不买入，订单丢弃"
+                                        "（execution_profile=realistic）",
+                            )
+                        else:
+                            _kept_orders.append(_o)
+                    new_orders = _kept_orders
                 # 在途单寿命起点：新单在其信号 bar 当日登记（后续若首根就成交，
                 # 该字段不参与任何计算；只有真正被延后的单才会累计交易日）。
                 for _o in new_orders:
@@ -737,6 +790,507 @@ class BacktestEngine:
             "risk_sell_trigger_count": risk_trigger_count,
             "risk_sell_fill_attempts": risk_fill_attempts,
         }
+
+    def run_multi(
+        self,
+        portfolios: List[Portfolio],
+        klines: dict,
+        signal_cache: dict = None,
+        benchmark_data: Optional[dict] = None,
+        stock_names: Optional[dict] = None,
+        regime_trackers: Optional[Dict[int, object]] = None,
+        gate_trackers: Optional[Dict[int, object]] = None,
+        pending_order_max_days: int = PENDING_ORDER_MAX_DAYS,
+        run_options: Optional[dict] = None,
+    ) -> Dict[int, dict]:
+        """多组合共享现金回测（N1，2026-11-18）。
+
+        与 ``run`` 的关系：单组合路径完全不走这里（``run`` 未改动默认行为）。
+        本方法复用同一套辅助方法（涨跌停档位、成交量上限、日终快照、公司行为、
+        T+1、熔断），差异只有「资金」一层：
+
+          * 每个组合仍有自己的 ``Account``（回测是纯现金账）；
+          * 每个 bar 上，各组合 ``on_bar`` 期间临时把 ``account.cash`` 置为
+            **共享可用额**（Σ cash − Σ 在途 BUY 金额），使仓位按共享池而非各自
+            账本切分审批；
+          * 收集到的新买单一律交给 ``cash_allocator.allocate_batch_buys`` 统一
+            逐笔审批（80% 门槛、按组合/信号顺序、不做等比缩量），拒绝单记
+            ``insufficient_cash``；
+          * 成交时若本组合现金不足，从其他组合账户转移差额（Σ 现金不变），
+            保证共享账户语义与账本一致性。
+
+        返回 ``{portfolio_id: run() 同构结果}``（不含聚合，聚合由服务层拼）。
+        """
+        run_options = run_options or {}
+        _first_bar_no_fill = bool(run_options.get("first_bar_no_fill", False))
+        _partial_fill = bool(run_options.get("partial_fill_enabled", False))
+        if not portfolios:
+            return {}
+        klines = klines or {}
+        signal_cache = signal_cache if signal_cache is not None else {}
+        recorder = DecisionRecorder()
+        for portfolio in portfolios:
+            portfolio.set_recorder(recorder)
+            portfolio.current_regime = None
+
+        times = self._build_timeline(klines)
+        price_index = self._build_price_index(klines)
+        prev_close_by_day = build_prev_close_by_day(klines)
+        first_bar_date: Dict[str, date] = {}
+        for _code, _periods in klines.items():
+            _dates = [
+                _dt.date()
+                for _df in (_periods or {}).values() if _df is not None
+                for _dt in _df["datetime"].to_list() if _dt is not None
+            ]
+            if _dates:
+                first_bar_date[_code] = min(_dates)
+        run_first_date = min(first_bar_date.values()) if first_bar_date else None
+        _truncation_warned: set = set()
+        new_listing_recorded: set = set()
+        no_price_recorded: set = set()
+        price_limit_recorded: set = set()
+        volume_defer_recorded: set = set()
+        _rule_cache: Dict[tuple, object] = {}
+
+        states = []
+        for portfolio in portfolios:
+            gate = (gate_trackers or {}).get(portfolio.portfolio_id)
+            portfolio.current_market_gate = gate
+            states.append({
+                "portfolio": portfolio,
+                "trades": [],
+                "snapshots": [],
+                "strategy_snapshots": {
+                    ctx.strategy_id: [] for ctx in portfolio.strategies},
+                "pending": [],
+                "pending_snap": None,
+                "pending_strategy_snaps": [],
+                "last_snap_date": None,
+                "last_enter_date": None,
+                "last_action_date": None,
+                "last_regime_date": None,
+                "ca_reinvest": [],
+            })
+
+        def _own_available(portfolio: Portfolio, pending,
+                           exclude_ids: Optional[set] = None) -> Decimal:
+            """单组合可用虚拟现金 = account.cash − 本组合在途 BUY 金额。
+
+            各组合虚拟现金独立（不互相划转，见 0010 §5.1「不做组合间调仓/资金
+            划转」）：共享的只是「同一时刻的可用现金池约束」与同一套审批内核。
+            ``exclude_ids``：本 bar 刚产生、尚未审批的新单（它们已进 pending，
+            不排除会被自己重复预留一次 → 可用额虚低 → 误判资金不足）。
+            """
+            reserved = Decimal("0")
+            for o in pending:
+                if exclude_ids and id(o) in exclude_ids:
+                    continue
+                if o.trade_type == TradeType.BUY and o.price:
+                    reserved += o.price * Decimal(int(o.quantity or 0))
+            return max(portfolio.account.cash - reserved, Decimal("0"))
+
+        day_end_steps = set()
+        _cur_date = _cur_t = None
+        _group_first = None
+        for _idx, (_t, _p) in enumerate(times):
+            if _t.date() != _cur_date:
+                if _group_first is not None:
+                    day_end_steps.add(_group_first)
+                _cur_date, _cur_t, _group_first = _t.date(), _t, _idx
+            elif _t != _cur_t:
+                _cur_t, _group_first = _t, _idx
+        if _group_first is not None:
+            day_end_steps.add(_group_first)
+
+        for i, (t, period) in enumerate(times):
+            for s in states:
+                portfolio = s["portfolio"]
+                tracker = (regime_trackers or {}).get(portfolio.portfolio_id)
+                if tracker is not None:
+                    last_regime = s["last_regime_date"]
+                    if last_regime is not None and t.date() != last_regime:
+                        prev_bench = (benchmark_data.get(last_regime)
+                                      if benchmark_data else None)
+                        if prev_bench is not None:
+                            tracker.update(last_regime, float(prev_bench))
+                    portfolio.current_regime = tracker.label
+                    if last_regime is None or t.date() != last_regime:
+                        s["last_regime_date"] = t.date()
+                if s["last_enter_date"] != t.date():
+                    portfolio.risk_manager.enter_day(
+                        t.date(), portfolio.account.initial_capital)
+                    s["last_enter_date"] = t.date()
+                    s["is_first_bar"] = True
+                else:
+                    s["is_first_bar"] = False
+                if (portfolio.corporate_timeline is not None
+                        and s["last_action_date"] != t.date()):
+                    _ca_actions = apply_corporate_day(
+                        portfolio, portfolio.corporate_timeline, t.date(),
+                        recorder, mode="backtest",
+                        reinvest_enabled=portfolio.dividend_reinvest_enabled,
+                        price_resolver=lambda code: self._ca_reference_price(
+                            code, t, period, price_index, prev_close_by_day),
+                        dispose_days=portfolio.suspension_dispose_days,
+                        delist_force_close=portfolio.delist_force_close_enabled,
+                        last_action_date=s["last_action_date"],
+                    )
+                    s["last_action_date"] = t.date()
+                    s["ca_reinvest"].extend(
+                        a for a in _ca_actions if a.kind == KIND_REINVEST)
+                    self._apply_corporate_actions(
+                        portfolio, _ca_actions, t, s["trades"], recorder)
+
+            # 1. 成交上一 bar 的在途单（共享价格表；每个组合各自 pending）
+            deferred_by_state = []
+            bar_open_prices = self._bar_open_prices(price_index, t, period)
+            bar_volumes = {
+                code: ohlcv.get("volume")
+                for code, ohlcv in price_index.get((t, period), {}).items()
+            }
+            for s in states:
+                deferred: List[OrderEvent] = []
+                portfolio = s["portfolio"]
+                deferred_by_state.append(deferred)
+                if not s["pending"]:
+                    continue
+                bar_price_limits: Dict[str, tuple] = {}
+                if portfolio.price_limit_check_enabled:
+                    for _pending in s["pending"]:
+                        _code = _pending.stock_code
+                        if _code in bar_price_limits or _code not in bar_open_prices:
+                            continue
+                        _pc = prev_close_by_day.get((_code, t.date()))
+                        if _pc is None or _pc < Decimal("1"):
+                            continue
+                        _rule = _rule_cache.get((_code, t.date()))
+                        if _rule is None:
+                            _rule = self._limit_rule_for(
+                                _code, t, stock_names, first_bar_date,
+                                run_first_date, _truncation_warned)
+                            _rule_cache[(_code, t.date())] = _rule
+                        if _rule.ratio is None:
+                            continue
+                        bar_price_limits[_code] = (
+                            (_pc * (1 - _rule.ratio)).quantize(
+                                Decimal("0.01"), rounding=ROUND_HALF_UP),
+                            (_pc * (1 + _rule.ratio)).quantize(
+                                Decimal("0.01"), rounding=ROUND_HALF_UP),
+                        )
+                dispatcher = SimulatedDispatcher(
+                    bar_open_prices,
+                    bar_volumes=(
+                        bar_volumes if portfolio.adaptive_slippage_enabled else None),
+                    slippage_impact_coef=(
+                        portfolio.slippage_impact_coef
+                        if portfolio.adaptive_slippage_enabled else None),
+                    price_limits=bar_price_limits or None,
+                    **portfolio.cost_params,
+                )
+                engine = ExecutionEngine(
+                    dispatcher, SimulatedT1Checker(), recorder=recorder,
+                    lot_size_of=lambda code: lot_size_for(
+                        code, portfolio.bond_lot_enabled),
+                )
+                for order in s["pending"]:
+                    if (pending_order_max_days and pending_order_max_days > 0
+                            and order.pending_since is not None
+                            and trading_days_between(
+                                order.pending_since, t.date())
+                            >= pending_order_max_days):
+                        recorder.record(
+                            gate="pending_order_expired", layer="execution",
+                            action="cancel",
+                            portfolio_id=order.portfolio_id or 0,
+                            strategy_id=order.strategy_id,
+                            stock_code=order.stock_code, bar_time=t,
+                            message="在途单超过最大存活期（%d 个交易日）：作废，"
+                                    "不再顺延" % pending_order_max_days)
+                        continue
+                    risk_sell_original = None
+                    if order.period is not None and order.period != period:
+                        deferred.append(order)
+                        continue
+                    if (order.signal_bar_date is not None
+                            and t.date() <= order.signal_bar_date):
+                        deferred.append(order)
+                        continue
+                    if not bar_open_prices.get(order.stock_code):
+                        if id(order) not in no_price_recorded:
+                            no_price_recorded.add(id(order))
+                            recorder.record(
+                                gate="no_market_data", layer="execution",
+                                action="defer",
+                                portfolio_id=order.portfolio_id or 0,
+                                strategy_id=order.strategy_id,
+                                stock_code=order.stock_code, bar_time=t,
+                                message="停牌/无行情：本 bar 无开盘价，订单延后至"
+                                        "下一有价 bar 重试")
+                        deferred.append(order)
+                        continue
+                    if portfolio.price_limit_check_enabled:
+                        prev_close = prev_close_by_day.get(
+                            (order.stock_code, t.date()))
+                        if prev_close is not None and prev_close >= Decimal("1"):
+                            open_px = bar_open_prices[order.stock_code]
+                            _rule_key = (order.stock_code, t.date())
+                            rule = _rule_cache.get(_rule_key)
+                            if rule is None:
+                                rule = self._limit_rule_for(
+                                    order.stock_code, t, stock_names,
+                                    first_bar_date, run_first_date,
+                                    _truncation_warned)
+                                _rule_cache[_rule_key] = rule
+                            ratio = rule.ratio
+                            if ratio is not None:
+                                limit_up = (prev_close * (1 + ratio)).quantize(
+                                    Decimal("0.01"), rounding=ROUND_HALF_UP)
+                                limit_down = (prev_close * (1 - ratio)).quantize(
+                                    Decimal("0.01"), rounding=ROUND_HALF_UP)
+                                is_buy = order.trade_type == TradeType.BUY
+                                if ((is_buy and open_px >= limit_up)
+                                        or (not is_buy and open_px <= limit_down)):
+                                    if id(order) not in price_limit_recorded:
+                                        price_limit_recorded.add(id(order))
+                                        recorder.record(
+                                            gate="price_limit", layer="execution",
+                                            action="defer",
+                                            portfolio_id=order.portfolio_id or 0,
+                                            strategy_id=order.strategy_id,
+                                            stock_code=order.stock_code,
+                                            bar_time=t,
+                                            message="涨跌停约束：开盘价 %s 触及限制"
+                                                    "（%s），订单延后至下一 bar"
+                                                    % (open_px, rule.source))
+                                    deferred.append(order)
+                                    continue
+                    partial_residual = 0
+                    if portfolio.volume_limit_enabled:
+                        bar_volume = bar_volumes.get(order.stock_code)
+                        if bar_volume is not None:
+                            cap_shares = int(
+                                portfolio.volume_limit_ratio
+                                * Decimal(int(bar_volume)))
+                            if order.quantity > cap_shares:
+                                vol_lot = lot_size_for(
+                                    order.stock_code, portfolio.bond_lot_enabled)
+                                is_buy = order.trade_type == TradeType.BUY
+                                final_qty = ((cap_shares // vol_lot) * vol_lot
+                                             if is_buy else cap_shares)
+                                if final_qty >= vol_lot or (
+                                        not is_buy and final_qty > 0):
+                                    if (not is_buy
+                                            and order.signal_type in _RISK_SELL_TYPES):
+                                        risk_sell_original = order.quantity
+                                    if _partial_fill and is_buy:
+                                        partial_residual = (
+                                            order.quantity - final_qty)
+                                    order.quantity = final_qty
+                                else:
+                                    if id(order) not in volume_defer_recorded:
+                                        volume_defer_recorded.add(id(order))
+                                        recorder.record(
+                                            gate="volume_cap_defer",
+                                            layer="execution", action="defer",
+                                            portfolio_id=order.portfolio_id or 0,
+                                            strategy_id=order.strategy_id,
+                                            stock_code=order.stock_code,
+                                            bar_time=t,
+                                            message="成交量约束：本 bar 上限不足一手，"
+                                                    "订单延后至量足 bar")
+                                    deferred.append(order)
+                                    continue
+                    order.bar_time = t
+                    ctx = portfolio.find_strategy(order.strategy_id)
+                    if ctx is None:
+                        continue
+                    pos = ctx.positions.get(order.stock_code)
+                    if pos is None and order.trade_type.value == "BUY":
+                        pos = Position(
+                            order.stock_code,
+                            same_day_sellable=(
+                                portfolio.bond_t0_enabled
+                                and is_convertible_bond(order.stock_code)),
+                            lot_size=lot_size_for(
+                                order.stock_code, portfolio.bond_lot_enabled),
+                        )
+                        ctx.positions[order.stock_code] = pos
+                    # 各组合虚拟现金独立：不从其他组合划转（0010 §5.1 明确不做）
+                    trade = engine.execute(
+                        order, portfolio.account, pos,
+                        **self._exposure_kwargs(portfolio, ctx))
+                    if trade is not None:
+                        s["trades"].append(trade)
+                        portfolio.note_trade(trade)
+                    if risk_sell_original is not None and trade is not None:
+                        remaining = (int(risk_sell_original)
+                                     - int(getattr(trade, "quantity", 0) or 0))
+                        if remaining > 0:
+                            order.quantity = remaining
+                            deferred.append(order)
+                    if (_partial_fill and trade is not None
+                            and partial_residual > 0):
+                        deferred.append(replace(order, quantity=partial_residual))
+
+            bar = self._build_bar(price_index, t, period)
+
+            # 3. on_bar：各组合用「共享可用额」审批，随后统一逐笔分配
+            for idx, s in enumerate(states):
+                portfolio = s["portfolio"]
+                if not session_allows_bar(
+                        portfolio.trading_session, t.time(), period):
+                    # 与 run 的 else 分支一致：时段外只保留未成交单，不重复计数已成交单
+                    s["pending"] = deferred_by_state[idx]
+                    continue
+                deferred = deferred_by_state[idx]
+                inflight_risk_sells: Dict[int, set] = {}
+                for _order in deferred:
+                    if (_order.trade_type == TradeType.SELL
+                            and _order.signal_type in _RISK_SELL_TYPES):
+                        inflight_risk_sells.setdefault(
+                            _order.strategy_id, set()).add(_order.stock_code)
+                # 各组合用**自己的**虚拟现金做仓位/审批（不临时借用共享池，
+                # 避免按整池规模放大每家的目标仓位）
+                new_orders = portfolio.on_bar(
+                    bar, signal_cache=signal_cache, period=period,
+                    inflight_risk_sells=inflight_risk_sells)
+                if _first_bar_no_fill and s["is_first_bar"] and new_orders:
+                    new_orders = [o for o in new_orders
+                                  if o.trade_type != TradeType.BUY]
+                for _o in new_orders:
+                    if _o.pending_since is None:
+                        _o.pending_since = t.date()
+                for _o in deferred:
+                    _o.pending_since = _o.pending_since or t.date()
+                s["pending"] = deferred + list(new_orders)
+                s["new_orders"] = list(new_orders)
+
+            # 3b. 逐组合资金审批（同一内核 cash_allocator）：按状态顺序（= 用户
+            #     给出的组合顺序）串行处理，每个组合用「自己的可用虚拟现金」。
+            #     组级共享约束：Σ 审批通过的买入金额 ≤ Σ 各组合可用现金（各组合均
+            #     不超自身可用，故恒成立；是「同一时刻可用现金池」的形式化保证）。
+            lot_of = lambda code: lot_size_for(
+                code, any(s["portfolio"].bond_lot_enabled for s in states))
+            for idx, s in enumerate(states):
+                portfolio = s["portfolio"]
+                own_new = [
+                    o for o in s.get("new_orders", [])
+                    if o.trade_type == TradeType.BUY
+                    and o.price is not None and o.price > 0
+                    and int(o.quantity or 0) > 0]
+                if not own_new:
+                    continue
+                avail = _own_available(
+                    portfolio, s["pending"], {id(o) for o in own_new})
+                decisions = allocate_batch_buys(
+                    own_new, avail, lot_of=lot_of,
+                    sort_key=lambda o: (o.bar_time or datetime.min,),
+                )
+                rejected = {
+                    id(d.order): d for d in decisions if not d.accepted}
+                kept = []
+                for o in s.get("new_orders", []):
+                    d = rejected.get(id(o))
+                    if d is None:
+                        kept.append(o)
+                        continue
+                    recorder.record(
+                        gate="insufficient_cash", layer="execution",
+                        action="skip",
+                        portfolio_id=portfolio.portfolio_id,
+                        strategy_id=o.strategy_id,
+                        stock_code=o.stock_code, bar_time=t,
+                        param_name="available_cash",
+                        param_value=float(d.target_share or 0),
+                        actual_value=float(d.available_before or 0),
+                        requested_qty=d.original_qty,
+                        final_qty=0,
+                        message="可用资金不足：目标 %s，实际可买 %s，低于目标"
+                                " %d%% 门槛，本笔不下单"
+                                % (fmt_money(d.target_share),
+                                   fmt_money(d.available_before),
+                                   int(MIN_FILL_RATIO * 100)))
+                s["pending"] = deferred_by_state[idx] + kept
+            for s in states:
+                s.pop("new_orders", None)
+
+            # 4. 日终快照 / 再投资 / 熔断（逐组合）
+            for s in states:
+                portfolio = s["portfolio"]
+                total_value = portfolio.total_value(bar)
+                is_day_end = i in day_end_steps
+                if is_day_end and s["ca_reinvest"]:
+                    self._execute_ca_reinvest(
+                        portfolio, s["ca_reinvest"], bar, t, s["trades"],
+                        recorder)
+                    s["ca_reinvest"] = []
+                snap = None
+                day_strategy_snaps = []
+                if is_day_end:
+                    snap = portfolio.snapshot(t.date(), total_value, bar)
+                    snap["benchmark_value"] = (
+                        benchmark_data.get(t.date()) if benchmark_data else None)
+                    gate = (gate_trackers or {}).get(portfolio.portfolio_id)
+                    if gate is not None:
+                        snap["gate_state"] = gate.state_for(t.date())
+                        snap["gate_strength"] = gate.strength_for(t.date())
+                    day_strategy_snaps = self._strategy_snapshots(
+                        portfolio, bar, t.date())
+                    for s_snap in day_strategy_snaps:
+                        s_snap["benchmark_value"] = snap["benchmark_value"]
+                portfolio.maybe_cash_enhancement(bar, total_value)
+                if (s["last_snap_date"] is not None
+                        and t.date() != s["last_snap_date"]):
+                    s["snapshots"].append(s["pending_snap"])
+                    for s_snap in s["pending_strategy_snaps"]:
+                        s["strategy_snapshots"][s_snap["target_id"]].append(s_snap)
+                s["last_snap_date"] = t.date()
+                if is_day_end:
+                    s["pending_snap"] = snap
+                    s["pending_strategy_snaps"] = day_strategy_snaps
+                allow_peak_update = (
+                    is_day_end if period in _COARSE_PERIODS else True)
+                if run_options.get("daily_close_peak_enabled"):
+                    allow_peak_update = is_day_end
+                portfolio.risk_manager.update_peak(
+                    total_value, t.date(), allow_peak_update=allow_peak_update)
+
+        results: Dict[int, dict] = {}
+        for s in states:
+            portfolio = s["portfolio"]
+            if s["pending_snap"] is not None:
+                s["snapshots"].append(s["pending_snap"])
+                for s_snap in s["pending_strategy_snaps"]:
+                    s["strategy_snapshots"][s_snap["target_id"]].append(s_snap)
+            portfolio.risk_manager.finalize_last_day(
+                portfolio.account.initial_capital)
+            # 与 run 同口径的评估：组合层 + 策略层（策略快照 < 2 根跳过）
+            bench_series = (
+                [{"value": x["benchmark_value"]} for x in s["snapshots"]
+                 if x.get("benchmark_value") is not None] or None)
+            evaluations = Evaluator().evaluate(
+                s["snapshots"], benchmark_data=bench_series, trades=s["trades"])
+            strategy_evaluations: Dict[int, dict] = {}
+            for ctx in portfolio.strategies:
+                s_snaps = s["strategy_snapshots"].get(ctx.strategy_id, [])
+                if len(s_snaps) < 2:
+                    continue
+                strategy_evaluations[ctx.strategy_id] = Evaluator().evaluate(
+                    s_snaps, benchmark_data=bench_series,
+                    trades=[t for t in s["trades"]
+                            if t.strategy_id == ctx.strategy_id])
+            results[portfolio.portfolio_id] = {
+                "trades": s["trades"],
+                "snapshots": s["snapshots"],
+                "strategy_snapshots": s["strategy_snapshots"],
+                "evaluations": evaluations,
+                "strategy_evaluations": strategy_evaluations,
+                "pending_orders": s["pending"],
+                "pending_order_count": len(s["pending"]),
+            }
+        results["_decisions"] = [ev.to_dict() for ev in recorder.drain()]
+        return results
 
     def _exposure_kwargs(self, portfolio: Portfolio, ctx) -> dict:
         """#3 策略级敞口上限（可选，默认关）：开启时给出 execute 的两个 strategy_* 参数。

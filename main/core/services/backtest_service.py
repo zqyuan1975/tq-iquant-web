@@ -26,7 +26,7 @@ from sqlalchemy.orm import Session
 
 from core.config import load_config
 from core.models import (
-    StockPool, StockPoolStock, Strategy, Formula, FormulaSignal, PortfolioStrategy,
+    StockPool, StockPoolStock, StockPoolMembership, Strategy, Formula, FormulaSignal, PortfolioStrategy,
     BacktestRecord, BacktestTrade, BacktestDailySnapshot, BacktestEvaluation,
     BacktestDecisionEvent, BacktestCrisisAlpha, BacktestMarketRegimeAnalysis,
     BacktestRobustnessAnalysis, BacktestPersistenceAnalysis, WalkForwardRun,
@@ -35,6 +35,13 @@ from core.models import (
 from core.engine.backtest_engine import BacktestEngine
 from core.engine.corporate_actions import (
     CORPORATE_ACTION_VERSION, build_timeline_from_rows,
+)
+from core.engine.pool_timeline import (
+    POOL_TIMELINE_VERSION, build_pool_timeline as build_pool_timeline_from_rows,
+)
+from core.engine.execution_profile import (
+    DEFAULT_VOLUME_LIMIT_RATIO, PROFILE_REALISTIC, expand_profile,
+    snapshot_payload,
 )
 from core.engine.execution_engine import STAMP_DUTY_SEGMENTS_VERSION
 from core.engine.evaluator import Evaluator
@@ -330,7 +337,8 @@ def _slice_klines_from(klines: dict, start: date) -> dict:
 
 
 def build_klines(ps, start: date, end: date, db: Session = None,
-                 dividend_mode: str = "front") -> dict:
+                 dividend_mode: str = "front",
+                 pool_codes: Optional[list] = None) -> dict:
     """从 TQ 取历史 K 线：{stock_code: {period: pl.DataFrame}}（含公式预热段）。
 
     股票来自 ps.stock_pool_id 对应的 stock_pool_stocks；周期取所有策略的 period 去重。
@@ -343,7 +351,7 @@ def build_klines(ps, start: date, end: date, db: Session = None,
     切回主区间（预热 bar 只喂 build_signal_cache，不进引擎时间轴）。
     dividend_mode：复权模式（"front" 前复权 / "back" 后复权），K线取数透传给 TQ。
     """
-    stocks = _pool_stocks(ps, db)
+    stocks = pool_codes if pool_codes is not None else _pool_stocks(ps, db)
     if not stocks:
         return {}
     periods = _strategy_periods(ps, db)
@@ -704,7 +712,9 @@ def build_params_snapshot(ps, dividend_mode: str = "front",
                           stock_pool_codes: Optional[dict] = None,
                           market_gate_enabled: bool | None = None,
                           gate_summary: dict | None = None,
-                          corporate_actions: dict | None = None) -> str:
+                          corporate_actions: dict | None = None,
+                          pool_timeline: dict | None = None,
+                          execution: dict | None = None) -> str:
     # 门控开关未显式传入时跟随组合配置（指纹/快照共用同一口径）
     if market_gate_enabled is None:
         market_gate_enabled = bool(getattr(ps, "market_gate_enabled", False))
@@ -778,6 +788,23 @@ def build_params_snapshot(ps, dividend_mode: str = "front",
         "delist_force_close_enabled": False,
         "event_count": 0,
         "events_digest": None,
+    }
+    # 时点股票池（J7，2026-11-18）：显式否定值兜底；digest 随成员区间变动。
+    payload["pool_timeline"] = pool_timeline or {
+        "version": POOL_TIMELINE_VERSION,
+        "enabled": False,
+        "digest": None,
+        "interval_count": 0,
+    }
+    # 执行档位（N1，2026-11-18）：legacy = 显式维持旧成交口径（不是"缺键"）。
+    payload["execution"] = execution or {
+        "profile": "legacy",
+        "partial_fill_enabled": False,
+        "first_bar_no_fill": False,
+        "price_limit_check_enabled": True,
+        "volume_limit_enabled": False,
+        "adaptive_slippage_enabled": False,
+        "daily_close_peak_enabled": False,
     }
     return json.dumps(payload, ensure_ascii=False, sort_keys=True)
 
@@ -2419,10 +2446,12 @@ def _pool_stock_set(db: Session, pool_id: int) -> set:
     }
 
 
-def _pool_stocks(ps, db: Session) -> list:
+def _pool_stocks(ps, db: Session, include_historical: bool = False) -> list:
     """回测所需全部股票：组合级池 ∪ 各策略级独立池（去重保序）。
 
     策略 stock_pool_id 为空的继承组合级（已在组合级中），非空才并入并集。
+    ``include_historical=True``（J7 时点池开启）时再并入成员表出现过的全部代码
+    ——历史成分必须能取到行情，否则「当时在池、现在已剔除」的票无法产生信号。
     db 为 None 时返回空。
     """
     if db is None:
@@ -2442,7 +2471,37 @@ def _pool_stocks(ps, db: Session) -> list:
     for r in rows:
         if r.stock_code not in seen:
             seen.append(r.stock_code)
+    if include_historical:
+        hist = db.query(StockPoolMembership.stock_code).filter(
+            StockPoolMembership.pool_id.in_(pool_ids)
+        ).distinct().order_by(StockPoolMembership.stock_code).all()
+        for (code,) in hist:
+            if code and code not in seen:
+                seen.append(code)
     return seen
+
+
+def build_pool_timeline(db: Session, ps, end: Optional[date] = None):
+    """读取时点成分区间 → ``PoolTimeline``（开关关闭时调用方不调用本函数）。
+
+    只取组合级池 ∪ 策略级独立池的成员；``end`` 非空时剔除起点晚于回测终点的
+    区间（未来成分不影响历史，纯剪枝）。
+    """
+    pool_ids = {ps.stock_pool_id}
+    for s in _portfolio_strategies(ps, db):
+        if s.stock_pool_id is not None:
+            pool_ids.add(s.stock_pool_id)
+    pool_ids.discard(None)
+    if not pool_ids:
+        return build_pool_timeline_from_rows([])
+    query = db.query(StockPoolMembership).filter(
+        StockPoolMembership.pool_id.in_(pool_ids))
+    if end is not None:
+        query = query.filter(StockPoolMembership.effective_from <= end)
+    rows = query.order_by(
+        StockPoolMembership.stock_code,
+        StockPoolMembership.effective_from).all()
+    return build_pool_timeline_from_rows(rows)
 
 
 def pool_composition(ps, db: Session) -> Dict[str, List[str]]:
@@ -3234,6 +3293,10 @@ def recover_stale_running_batch_runs(db: Session) -> int:
     stale: list = []
     stale += db.query(WalkForwardRun).filter_by(status="running").all()
     stale += db.query(ParamPerturbRun).filter_by(status="running").all()
+    # N1 多组合回测批：同样会残留 running（子记录已被上面回收，批自身也要收）
+    from core.models import BacktestRunGroup
+
+    stale += db.query(BacktestRunGroup).filter_by(status="running").all()
     if not stale:
         return 0
     msg = "应用启动时检测到中断状态（进程崩溃/重启），已自动标记为失败"
@@ -3725,6 +3788,33 @@ def run_backtest(db: Session, ps: PortfolioStrategy, req,
             ca_timeline.digest() if ca_timeline is not None and len(ca_timeline) else None),
     }
 
+    # 时点股票池（J7，默认关）：关闭时 timeline=None、选股范围仍是当前成分，
+    # 引擎侧 portfolio.pool_timeline 不注入 → 闸门第一行返回，行为逐字不变。
+    pit_enabled = bool(getattr(ps, "pool_pit_enabled", False))
+    pit_timeline = build_pool_timeline(db, ps, req.end_date) if pit_enabled else None
+    pit_snapshot = {
+        "version": POOL_TIMELINE_VERSION,
+        "enabled": pit_enabled,
+        "digest": (pit_timeline.digest() if pit_enabled and len(pit_timeline) else None),
+        "interval_count": len(pit_timeline) if pit_timeline is not None else 0,
+    }
+
+    # 执行档位（N1，默认 legacy = 旧成交口径）：展开为逐开关并写入快照/指纹。
+    _exec_overrides = {
+        "partial_fill_enabled": getattr(req, "partial_fill_enabled", None),
+        "first_bar_no_fill": getattr(req, "first_bar_no_fill", None),
+    }
+    exec_flags = expand_profile(
+        getattr(req, "execution_profile", None), _exec_overrides)
+    exec_snapshot = snapshot_payload(exec_flags)
+    _exec_realistic = exec_flags["profile"] == PROFILE_REALISTIC
+    if _exec_realistic:
+        # 快照与引擎必须同口径：realistic 的开关在写 record 之前就展开到位
+        eff_adaptive = True
+        volume_limit_enabled = True
+        volume_limit_ratio = DEFAULT_VOLUME_LIMIT_RATIO
+        daily_close_peak_enabled = True
+
     # 写 record（running）
     rec = BacktestRecord(
         portfolio_strategy_id=ps.id,
@@ -3752,6 +3842,8 @@ def run_backtest(db: Session, ps: PortfolioStrategy, req,
             market_gate_enabled=gate_enabled,
             gate_summary=gate_snapshot,
             corporate_actions=ca_snapshot,
+            pool_timeline=pit_snapshot,
+            execution=exec_snapshot,
         ),
         evaluation_profile=evaluation_profile,
         is_oos_gate_enabled=is_oos_gate_enabled,
@@ -3777,6 +3869,18 @@ def run_backtest(db: Session, ps: PortfolioStrategy, req,
             portfolio.dividend_reinvest_enabled = ca_snapshot["dividend_reinvest_enabled"]
             portfolio.suspension_dispose_days = ca_snapshot["suspension_dispose_days"]
             portfolio.delist_force_close_enabled = ca_snapshot["delist_force_close_enabled"]
+        # 时点股票池（J7，默认关）：timeline 仅在有区间时注入；未注入时
+        # Portfolio.pool_timeline=None → _signal_to_order 闸门整段跳过。
+        if pit_timeline is not None and len(pit_timeline):
+            portfolio.pool_timeline = pit_timeline
+            portfolio.pool_pit_enabled = True
+        # 执行档位 realistic：把「现实约束」一次性打开（legacy 不改任何既有开关）。
+        if _exec_realistic:
+            portfolio.price_limit_check_enabled = True
+            portfolio.volume_limit_enabled = True
+            portfolio.volume_limit_ratio = DEFAULT_VOLUME_LIMIT_RATIO
+            portfolio.adaptive_slippage_enabled = True
+            daily_close_peak_enabled = True
         # run 级覆盖装配：费用预留 + 可转债开关 + 自适应滑点 + 成交量约束 + 容量上限（不改组合表，仅本轮内存生效）
         portfolio.fee_reserve_enabled = fee_reserve_enabled
         portfolio.bond_t0_enabled = bond_t0_enabled
@@ -3795,8 +3899,14 @@ def run_backtest(db: Session, ps: PortfolioStrategy, req,
             portfolio.equity_cap = Decimal(str(equity_cap))
         t1 = datetime.now()
         # klines 含公式预热段（早于 start，保证首根 bar 公式有效值）
+        # 时点池关闭（默认）时不传 pool_codes：取数口径与改动前逐字一致
+        _kl_kwargs = {}
+        if pit_enabled:
+            _kl_kwargs["pool_codes"] = _pool_stocks(
+                ps, db, include_historical=True)
         klines_full = build_klines(
             ps, req.start_date, req.end_date, db, dividend_mode=accounting_mode,
+            **_kl_kwargs,
         )
         t2 = datetime.now()
         # 数据量摘要：各周期多少根 bar、多少只股票，帮助判断瓶颈
@@ -3899,6 +4009,7 @@ def run_backtest(db: Session, ps: PortfolioStrategy, req,
             stock_names=_pool_stock_names(ps, db),
             pending_order_max_days=int(
                 _bt_cfg.get("pending_order_max_days", 20)),
+            run_options=exec_flags,
         )
         t7 = datetime.now()
         _log_timing(f"[回测#{record_id}] 引擎逐bar回测: {(t7-t6).total_seconds():.1f}s")
@@ -4013,3 +4124,361 @@ def run_backtest(db: Session, ps: PortfolioStrategy, req,
         "warnings": warnings,
         "gate": gate,
     }
+
+
+# ---------------------------------------------------------------------------
+# N1 多组合共享现金回测（2026-11-18）
+# ---------------------------------------------------------------------------
+def _sum_final_value(snaps: list) -> Decimal:
+    """单组合日快照序列 → 末个交易日的总市值（无快照返回 0）。"""
+    dedup = _dedup_daily_by_date(snaps or [])
+    if not dedup:
+        return Decimal("0")
+    return Decimal(str(dedup[-1].get("total_value") or 0))
+
+
+def aggregate_run_group(per_portfolio: dict, initial_total: Decimal) -> dict:
+    """多组合结果 → 聚合 JSON（曲线 = 各组合同日总市值求和；缺口日按前值携带）。
+
+    ``per_portfolio``: ``{portfolio_id: run_multi 单组合结果}``。
+    聚合口径与单组合日快照同义：市值之和（不是资金之和），所以曲线可比
+    「若把这些组合放在同一个账户里跑」的净值形状。仅作展示/对照，不落
+    backtest_daily_snapshots（逐组合记录里已有原始快照）。
+    """
+    by_date: Dict[date, Decimal] = {}
+    for res in per_portfolio.values():
+        for snap in _dedup_daily_by_date(res.get("snapshots") or []):
+            d = snap["snap_date"]
+            by_date[d] = by_date.get(d, Decimal("0")) + Decimal(
+                str(snap.get("total_value") or 0))
+    dates = sorted(by_date)
+    series: List[dict] = []
+    last = Decimal("0")
+    for d in dates:
+        last = by_date.get(d, last)
+        series.append({"date": d.isoformat(), "total_value": str(last)})
+    first_value = series[0]["total_value"] if series else "0"
+    final = Decimal(series[-1]["total_value"]) if series else Decimal("0")
+    try:
+        total_return = (
+            float(final / Decimal(first_value) - 1) if Decimal(first_value) else None
+        )
+    except (ArithmeticError, ValueError):
+        total_return = None
+    return {
+        "portfolio_count": len(per_portfolio),
+        "initial_capital": str(initial_total),
+        "final_value": str(final),
+        "total_return": total_return,
+        "series": series,
+        "portfolios": [
+            {
+                "portfolio_strategy_id": pid,
+                "final_value": str(_sum_final_value(res.get("snapshots") or [])),
+                "trades_count": len(res.get("trades") or []),
+                "snapshots_count": len(
+                    _dedup_daily_by_date(res.get("snapshots") or [])),
+            }
+            for pid, res in per_portfolio.items()
+        ],
+    }
+
+
+def run_multi_backtest(db: Session, portfolios: list, req) -> dict:
+    """多组合组合回测（N1，2026-11-18）：共享现金池 + 统一逐笔资金审批。
+
+    与 ``run_backtest`` 的关系：单组合路径**完全不走这里**（``run`` 与
+    ``run_backtest`` 未改默认行为）。差异只有「资金」一层：
+    ``BacktestEngine.run_multi`` 在同一时间轴上驱动多个 Portfolio，各组合保留
+    自己的 ``Account``，但审批用「共享可用额」（Σ cash − Σ 在途 BUY 金额），
+    新买单统一过 ``cash_allocator.allocate_batch_buys``（80% 门槛、不做等比
+    缩量），成交时跨组合转账保持 Σ 现金守恒。
+
+    落库：一个 ``backtest_run_group`` + 每组合一条 ``backtest_records``
+    （``run_group_id`` 关联），聚合曲线写 ``aggregate_json``。
+    """
+    from core.models import BacktestRunGroup
+
+    start_date, end_date = req.start_date, req.end_date
+    dividend_mode = getattr(req, "dividend_mode", "front") or "front"
+    if dividend_mode not in DIVIDEND_MODES:
+        dividend_mode = "front"
+    accounting_mode, signal_mode = (
+        ("back", "front") if dividend_mode == "dual" else (dividend_mode, dividend_mode))
+    evaluation_profile = getattr(req, "evaluation_profile", "absolute") or "absolute"
+    if evaluation_profile not in ACCEPTANCE_PROFILES:
+        evaluation_profile = "absolute"
+    daily_loss_basis = getattr(req, "daily_loss_basis", None)
+    _exec_overrides = {
+        "partial_fill_enabled": getattr(req, "partial_fill_enabled", None),
+        "first_bar_no_fill": getattr(req, "first_bar_no_fill", None),
+    }
+    exec_flags = expand_profile(
+        getattr(req, "execution_profile", None), _exec_overrides)
+    exec_snapshot = snapshot_payload(exec_flags)
+    _exec_realistic = exec_flags["profile"] == PROFILE_REALISTIC
+
+    # 每个组合的策略列表 / 装配 / 口径组件（全在写库前完成：取数或门控失败
+    # 抛 ValueError → 路由 400，不产生一条必然失败的 running 记录）
+    entries = []
+    gate_trackers: Dict[int, object] = {}
+    ca_timeline = None
+    for ps in portfolios:
+        strategies = (
+            db.query(Strategy).filter_by(portfolio_id=ps.id)
+            .order_by(Strategy.id).all()
+        )
+        portfolio = _assemble_portfolio(ps, strategies, db)
+        ca_enabled = bool(getattr(ps, "corporate_actions_enabled", False))
+        if ca_enabled and ca_timeline is None:
+            # 事件表是全局的（按 code/ex_date 索引），一个组合启用即构建一次，
+            # 各组合只作用于自己持仓的代码，共享同一 timeline 安全。
+            ca_timeline = build_corporate_timeline(db, start_date, end_date)
+        if ca_timeline is not None and len(ca_timeline):
+            portfolio.corporate_timeline = ca_timeline
+            portfolio.corporate_actions_enabled = True
+            portfolio.dividend_reinvest_enabled = bool(
+                getattr(ps, "dividend_reinvest_enabled", False))
+            portfolio.suspension_dispose_days = int(
+                getattr(ps, "suspension_dispose_days", 0) or 0)
+            portfolio.delist_force_close_enabled = bool(
+                getattr(ps, "delist_force_close_enabled", False))
+        pit_enabled = bool(getattr(ps, "pool_pit_enabled", False))
+        pit_timeline = build_pool_timeline(db, ps, end_date) if pit_enabled else None
+        if pit_timeline is not None and len(pit_timeline):
+            portfolio.pool_timeline = pit_timeline
+            portfolio.pool_pit_enabled = True
+        # 执行档位 realistic：与单组合路径同一套开关展开
+        if _exec_realistic:
+            portfolio.price_limit_check_enabled = True
+            portfolio.volume_limit_enabled = True
+            portfolio.volume_limit_ratio = DEFAULT_VOLUME_LIMIT_RATIO
+            portfolio.adaptive_slippage_enabled = True
+        _basis = daily_loss_basis if daily_loss_basis in ("equity", "initial") else (
+            getattr(ps, "daily_loss_basis", None) or "equity")
+        portfolio.risk_manager.daily_loss_on_equity_enabled = (_basis != "initial")
+        # 市场多空门控：run 级三态覆盖（None=跟随组合）
+        _gate_req = getattr(req, "market_gate_enabled", None)
+        gate_enabled = (
+            bool(getattr(ps, "market_gate_enabled", False))
+            if _gate_req is None else bool(_gate_req))
+        tracker = build_gate_tracker(
+            ps, start_date, end_date, enabled=gate_enabled)
+        gate_trackers[ps.id] = tracker
+        entries.append({
+            "ps": ps, "strategies": strategies, "portfolio": portfolio,
+            "gate_enabled": gate_enabled, "gate_summary": gate_summary(tracker, ps),
+            "pit_enabled": pit_enabled,
+            "pit_snapshot": {
+                "version": POOL_TIMELINE_VERSION,
+                "enabled": pit_enabled,
+                "digest": (pit_timeline.digest()
+                           if pit_timeline is not None and len(pit_timeline) else None),
+                "interval_count": len(pit_timeline) if pit_timeline is not None else 0,
+            },
+        })
+
+    klines_by_ps: Dict[int, dict] = {}
+    signal_by_ps: Dict[int, dict] = {}
+    names: Dict[str, str] = {}
+    for e in entries:
+        ps = e["ps"]
+        full = build_klines(
+            ps, start_date, end_date, db, dividend_mode=accounting_mode,
+            pool_codes=_pool_stocks(ps, db, include_historical=e["pit_enabled"]),
+        )
+        klines_by_ps[ps.id] = full
+        signal_by_ps[ps.id] = build_signal_cache(
+            ps, full, db, start=start_date, dividend_mode=signal_mode)
+        names.update(_pool_stock_names(ps, db))
+
+    # 共享时间轴：各组合行情按 code 合并（同一 code 复权口径相同，先到先得）
+    merged: dict = {}
+    for full in klines_by_ps.values():
+        for code, periods in (full or {}).items():
+            merged.setdefault(code, periods)
+    klines_full = _slice_klines_from(merged, start_date)
+    if not klines_full:
+        raise ValueError(
+            f"未取到任何行情数据：区间 {start_date}~{end_date}，"
+            f"组合 {'、'.join(str(e['ps'].id) for e in entries)}")
+    signal_cache: dict = {}
+    for cache in signal_by_ps.values():
+        signal_cache.update(cache or {})
+
+    benchmark_data = build_benchmark_data(
+        entries[0]["ps"], start_date, end_date, db, dividend_mode=accounting_mode)
+
+    initial_total = sum(
+        (Decimal(str(e["ps"].initial_capital or 0)) for e in entries), Decimal("0"))
+    group = BacktestRunGroup(
+        name=getattr(req, "name", "") or "多组合回测",
+        status="running",
+        params_snapshot=json.dumps({
+            "start_date": start_date.isoformat(),
+            "end_date": end_date.isoformat(),
+            "dividend_mode": dividend_mode,
+            "execution": exec_snapshot,
+            "portfolios": [e["ps"].id for e in entries],
+            "initial_capital": str(initial_total),
+        }, ensure_ascii=False, sort_keys=True),
+    )
+    db.add(group)
+    db.commit()
+    db.refresh(group)
+    group_id = group.id
+
+    records: Dict[int, int] = {}
+    try:
+        for e in entries:
+            ps = e["ps"]
+            rec = BacktestRecord(
+                portfolio_strategy_id=ps.id,
+                run_group_id=group_id,
+                name=f"{group.name} / {ps.name}",
+                start_date=start_date,
+                end_date=end_date,
+                status="running",
+                params_snapshot=build_params_snapshot(
+                    ps, dividend_mode=dividend_mode,
+                    daily_loss_basis=(daily_loss_basis if daily_loss_basis in
+                                      ("equity", "initial") else
+                                      (getattr(ps, "daily_loss_basis", None) or "equity")),
+                    data_start=start_date,
+                    strategies=e["strategies"],
+                    stock_pool_codes=pool_composition(ps, db),
+                    market_gate_enabled=e["gate_enabled"],
+                    gate_summary=e["gate_summary"],
+                    corporate_actions={
+                        "version": CORPORATE_ACTION_VERSION,
+                        "enabled": bool(getattr(ps, "corporate_actions_enabled", False)),
+                        "dividend_reinvest_enabled": bool(
+                            getattr(ps, "dividend_reinvest_enabled", False)),
+                        "suspension_dispose_days": int(
+                            getattr(ps, "suspension_dispose_days", 0) or 0),
+                        "delist_force_close_enabled": bool(
+                            getattr(ps, "delist_force_close_enabled", False)),
+                        "event_count": len(ca_timeline) if ca_timeline is not None else 0,
+                        "events_digest": (
+                            ca_timeline.digest()
+                            if ca_timeline is not None and len(ca_timeline) else None),
+                    },
+                    pool_timeline=e["pit_snapshot"],
+                    execution=exec_snapshot,
+                ),
+                evaluation_profile=evaluation_profile,
+            )
+            db.add(rec)
+            db.commit()
+            db.refresh(rec)
+            records[ps.id] = rec.id
+
+        _bt_cfg = (load_config() or {}).get("backtest") or {}
+        results = BacktestEngine().run_multi(
+            [e["portfolio"] for e in entries],
+            klines=klines_full,
+            signal_cache=signal_cache,
+            benchmark_data=benchmark_data,
+            stock_names=names,
+            gate_trackers=gate_trackers,
+            pending_order_max_days=int(_bt_cfg.get("pending_order_max_days", 20)),
+            run_options=exec_flags,
+        )
+        decisions = results.pop("_decisions", []) if isinstance(results, dict) else []
+        per_portfolio: Dict[int, dict] = {}
+        for e in entries:
+            ps = e["ps"]
+            res = results.get(ps.id) or {
+                "trades": [], "snapshots": [], "strategy_snapshots": {},
+                "evaluations": {}, "strategy_evaluations": {},
+                "pending_orders": [], "pending_order_count": 0,
+            }
+            # 决策事件按 portfolio_id 归属（引擎只用全局 recorder 收集一次）
+            res["decisions"] = [
+                d for d in decisions
+                if d.get("portfolio_id") in (None, ps.id)
+            ]
+            per_portfolio[ps.id] = res
+            _persist_result(db, records[ps.id], ps.id, res, e["strategies"])
+            rec = db.get(BacktestRecord, records[ps.id])
+            if rec is not None:
+                rec.status = "completed"
+                if res.get("pending_order_count"):
+                    rec.warnings_json = json.dumps(
+                        [f"回测结束时仍有 {res['pending_order_count']} 笔信号未成交"],
+                        ensure_ascii=False)
+                rec.completed_at = datetime.now(timezone.utc).replace(tzinfo=None)
+            db.commit()
+
+        aggregate = aggregate_run_group(per_portfolio, initial_total)
+        group.status = "completed"
+        group.aggregate_json = json.dumps(aggregate, ensure_ascii=False, default=str)
+        group.finished_at = datetime.now(timezone.utc).replace(tzinfo=None)
+        db.commit()
+        return {
+            "run_group_id": group_id,
+            "records": [
+                {
+                    "portfolio_strategy_id": pid,
+                    "record_id": rid,
+                    "trades_count": len(per_portfolio[pid].get("trades") or []),
+                    "snapshots_count": len(
+                        _dedup_daily_by_date(per_portfolio[pid].get("snapshots") or [])),
+                }
+                for pid, rid in records.items()
+            ],
+            "aggregate": aggregate,
+        }
+    except Exception as exc:
+        db.rollback()
+        g = db.get(BacktestRunGroup, group_id)
+        if g is not None:
+            g.status = "failed"
+            g.error_message = str(exc) or repr(exc)
+        for rid in records.values():
+            rec = db.get(BacktestRecord, rid)
+            if rec is not None and rec.status == "running":
+                rec.status = "failed"
+                rec.error_message = str(exc) or repr(exc)
+        db.commit()
+        raise
+
+
+def _serialize_run_group(g) -> dict:
+    return {
+        "id": g.id,
+        "name": g.name,
+        "status": g.status,
+        "error_message": g.error_message,
+        "params_snapshot": json.loads(g.params_snapshot) if g.params_snapshot else None,
+        "started_at": g.started_at,
+        "finished_at": g.finished_at,
+    }
+
+
+def list_run_groups(db: Session) -> list:
+    """多组合回测批（run group）列表，按 id 倒序。"""
+    from core.models import BacktestRunGroup
+
+    rows = db.query(BacktestRunGroup).order_by(BacktestRunGroup.id.desc()).all()
+    return [_serialize_run_group(g) for g in rows]
+
+
+def get_run_group(db: Session, group_id: int) -> Optional[dict]:
+    """批详情：组信息 + 子记录列表 + 聚合曲线。None=不存在。"""
+    from core.models import BacktestRunGroup
+
+    g = db.get(BacktestRunGroup, group_id)
+    if g is None:
+        return None
+    payload = _serialize_run_group(g)
+    payload["aggregate"] = (
+        json.loads(g.aggregate_json) if g.aggregate_json else None)
+    rows = (
+        db.query(BacktestRecord)
+        .filter(BacktestRecord.run_group_id == group_id)
+        .order_by(BacktestRecord.id)
+        .all()
+    )
+    payload["records"] = [_serialize_record(r) for r in rows]
+    return payload

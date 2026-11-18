@@ -172,6 +172,12 @@ class Portfolio:
         self.suspended_codes: frozenset = frozenset()
         # 长期停牌处置的幂等键集合（(code, suspend_ex_date)），防每日重复发强平。
         self._ca_disposed: set = set()
+        # 时点股票池（J7，2026-11-18）：None = 未启用（默认）。
+        # 注入后只拦 OPEN/ADD；该交易日无任何成员记录时 fail-open 放行（回落
+        # 当前池），每组合每日记一条 pool_pit_uncovered 事件。
+        self.pool_timeline = None
+        self.pool_pit_enabled: bool = False
+        self._pool_pit_noted_days: set = set()
         # B4 择优轮动：收盘价历史（code → 最近 N 根有效 close）与去重时间戳
         self._price_history: Dict[str, List[Decimal]] = {}
         self._price_hist_last_t: Dict[str, datetime] = {}
@@ -803,6 +809,26 @@ class Portfolio:
             self._rec("corporate_suspend", "signal_gate", "block", ctx, sig, bar,
                       message="停牌期间禁止开仓/加仓（corporate_actions.suspend）")
             return []
+        # 时点股票池闸（J7，默认 pool_timeline=None → 整段跳过）：
+        # 只拦 OPEN/ADD；该交易日无任何成员记录时 fail-open 放行（回落当前池），
+        # 每组合每日只记一条 pool_pit_uncovered，避免历史未录段把回测变零交易。
+        if (self.pool_timeline is not None
+                and sig.signal_type in (SignalType.OPEN, SignalType.ADD)):
+            bar_day = getattr(bar, "bar_time", None)
+            bar_day = bar_day.date() if bar_day is not None else None
+            if bar_day is not None:
+                if not self.pool_timeline.covered(bar_day):
+                    if bar_day not in self._pool_pit_noted_days:
+                        self._pool_pit_noted_days.add(bar_day)
+                        self._rec("pool_pit_uncovered", "signal_gate", "notice",
+                                  ctx, sig, bar,
+                                  message="该交易日无时点成分记录，按当前池放行（fail-open）")
+                elif not self.pool_timeline.contains(sig.stock_code, bar_day):
+                    self._rec("pool_pit_out_of_pool", "signal_gate", "block",
+                              ctx, sig, bar,
+                              message="该交易日不在股票池时点成分内，禁止开仓/加仓"
+                                      "（pool_pit_enabled）")
+                    return []
         # 策略资金 = capital_ratio × 组合当前总净值（dynamic）或初始资金（fixed）
         strategy_fund = self._strategy_fund(ctx)
 

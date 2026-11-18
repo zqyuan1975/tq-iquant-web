@@ -114,6 +114,9 @@ class PortfolioCreate(BaseModel):
     dividend_reinvest_enabled: bool | None = None
     suspension_dispose_days: int | None = None
     delist_force_close_enabled: bool | None = None
+    # 时点股票池（2026-11-18，J7）：按 stock_pool_memberships 生效区间判定成分，
+    # 只拦开仓/加仓。None=请求未携带（编辑不动已有值 / 新建落默认 False）。
+    pool_pit_enabled: bool | None = None
     initial_capital: float = 500000
     max_drawdown: float = 0.2
     daily_loss_limit: float = 0.05

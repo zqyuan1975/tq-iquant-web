@@ -123,6 +123,8 @@ def serialize_portfolio(db: Session, p: PortfolioStrategy) -> dict:
         "dividend_reinvest_enabled": bool(p.dividend_reinvest_enabled),
         "suspension_dispose_days": int(p.suspension_dispose_days or 0),
         "delist_force_close_enabled": bool(p.delist_force_close_enabled),
+        # 时点股票池（2026-11-18，J7）：按生效区间判定成分，只拦开仓/加仓
+        "pool_pit_enabled": bool(p.pool_pit_enabled),
         "status": p.status,
         "created_at": p.created_at,
         "updated_at": p.updated_at,
@@ -218,6 +220,9 @@ def _apply_portfolio_fields(p: PortfolioStrategy, req) -> None:
         p.suspension_dispose_days = max(0, int(req.suspension_dispose_days))
     if getattr(req, "delist_force_close_enabled", None) is not None:
         p.delist_force_close_enabled = bool(req.delist_force_close_enabled)
+    # 时点股票池（2026-11-18，J7）：None=请求未携带 → 不动已有值；显式 False 合法
+    if getattr(req, "pool_pit_enabled", None) is not None:
+        p.pool_pit_enabled = bool(req.pool_pit_enabled)
 
 
 def _create_strategies_two_step(db: Session, pid: int, strategies: list) -> None:

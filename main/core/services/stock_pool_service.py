@@ -10,13 +10,31 @@
 
 路由层仅剩 HTTP 入口 + 资源校验(404) + 异常翻译 + ok/err 包装。
 """
+from datetime import date
+
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 from sqlalchemy.sql import func
 
-from core.models import StockPool, StockPoolStock
+from core.models import StockPool, StockPoolMembership, StockPoolStock
 from core.tq.data import TQData
 from core.tq.utils import TDXConnectionError
+
+
+def _today() -> date:
+    """同步日/默认生效日（单测可 monkeypatch 本模块的 ``_today``）。"""
+    return date.today()
+
+
+def _norm_day(value):
+    if value is None:
+        return None
+    if isinstance(value, date):
+        return value
+    try:
+        return date.fromisoformat(str(value)[:10])
+    except (TypeError, ValueError):
+        raise ValueError("日期格式应为 YYYY-MM-DD")
 
 
 def serialize_pool(db: Session, p: StockPool) -> dict:
@@ -117,18 +135,189 @@ def sync_pool(db: Session, code: str) -> dict:
 
     # 全量替换成分股
     db.query(StockPoolStock).filter(StockPoolStock.pool_id == p.id).delete()
+    codes = []
     for s in tdx_stocks:
         stock_code = s.get("stock_code")
         if stock_code:
+            codes.append(stock_code)
             db.add(StockPoolStock(
                 pool_id=p.id,
                 stock_code=stock_code,
                 stock_name=s.get("stock_name"),
             ))
+    # 时点成分（J7）：同步只做「新增→开区间、消失→关区间」，历史已关闭记录不重开。
+    # 组合未开 pool_pit_enabled 时本表不参与选股，写它只为以后开启时点池时有据可查。
+    sync_memberships(db, p.id, codes, source="sync", day=_today())
     p.synced_at = func.now()
     db.commit()
     db.refresh(p)
     return serialize_pool(db, p)
+
+
+# ---------------------------------------------------------------------------
+# 时点股票池成员（J7，2026-11-18）
+# ---------------------------------------------------------------------------
+def serialize_membership(m: StockPoolMembership) -> dict:
+    return {
+        "id": m.id,
+        "pool_id": m.pool_id,
+        "stock_code": m.stock_code,
+        "effective_from": m.effective_from,
+        "effective_to": m.effective_to,
+        "source": m.source,
+        "note": m.note,
+        "is_current": m.effective_to is None,
+    }
+
+
+def list_memberships(db: Session, pool_id: int, as_of: date = None) -> list[dict]:
+    """池成员区间列表。``as_of`` 非空时只返回该日有效的成员。"""
+    if as_of is not None:
+        day = _norm_day(as_of)
+        rows = (
+            db.query(StockPoolMembership)
+            .filter(
+                StockPoolMembership.pool_id == pool_id,
+                StockPoolMembership.effective_from <= day,
+                (StockPoolMembership.effective_to.is_(None))
+                | (StockPoolMembership.effective_to >= day),
+            )
+            .order_by(StockPoolMembership.stock_code,
+                      StockPoolMembership.effective_from)
+            .all()
+        )
+        return [serialize_membership(m) for m in rows]
+    rows = (
+        db.query(StockPoolMembership)
+        .filter(StockPoolMembership.pool_id == pool_id)
+        .order_by(StockPoolMembership.stock_code,
+                  StockPoolMembership.effective_from)
+        .all()
+    )
+    return [serialize_membership(m) for m in rows]
+
+
+def _overlap_query(db: Session, pool_id: int, code: str, start: date,
+                   end, exclude_id: int = None):
+    """既有区间 [ef, et] 与新区间 [start, end] 是否重叠（et=None 视为开区间）。"""
+    q = db.query(StockPoolMembership).filter(
+        StockPoolMembership.pool_id == pool_id,
+        StockPoolMembership.stock_code == code,
+    )
+    if end is not None:
+        q = q.filter(StockPoolMembership.effective_from <= end)
+    q = q.filter(
+        (StockPoolMembership.effective_to.is_(None))
+        | (StockPoolMembership.effective_to >= start)
+    )
+    if exclude_id is not None:
+        q = q.filter(StockPoolMembership.id != exclude_id)
+    return q.first()
+
+
+def sync_memberships(db: Session, pool_id: int, codes, source: str = "sync",
+                     day: date = None) -> dict:
+    """按成分 diff 写生效区间（不 commit，由调用方提交）。
+
+    新增 → ``effective_from=day`` / ``effective_to=NULL``；消失 → 给现役记录填
+    ``effective_to=day``（含当日，fail-safe：同步日不因口径变化误拦）。
+    已在池内且现役的记录保持原 ``effective_from``，不重开、不改写。
+    """
+    day = _norm_day(day) or _today()
+    wanted = {str(c).strip() for c in (codes or []) if str(c or "").strip()}
+    open_rows = (
+        db.query(StockPoolMembership)
+        .filter(
+            StockPoolMembership.pool_id == pool_id,
+            StockPoolMembership.effective_to.is_(None),
+        )
+        .all()
+    )
+    open_by_code = {m.stock_code: m for m in open_rows}
+    added = closed = 0
+    for code in sorted(wanted - set(open_by_code)):
+        db.add(StockPoolMembership(
+            pool_id=pool_id, stock_code=code, effective_from=day,
+            effective_to=None, source=source))
+        added += 1
+    for code, row in open_by_code.items():
+        if code not in wanted:
+            row.effective_to = day
+            closed += 1
+    db.flush()
+    return {"added": added, "closed": closed, "current": len(wanted)}
+
+
+def create_membership(db: Session, pool_id: int, payload: dict) -> dict:
+    """手工新增区间。校验：code 非空、from 必填、to>=from、同代码区间不重叠。"""
+    pool = db.query(StockPool).filter(StockPool.id == pool_id).first()
+    if pool is None:
+        raise LookupError("股票池不存在")
+    code = str(payload.get("stock_code") or "").strip()
+    if not code:
+        raise ValueError("stock_code 不能为空")
+    start = _norm_day(payload.get("effective_from"))
+    if start is None:
+        raise ValueError("effective_from 不能为空")
+    end = _norm_day(payload.get("effective_to"))
+    if end is not None and end < start:
+        raise ValueError("effective_to 不能早于 effective_from")
+    if _overlap_query(db, pool_id, code, start, end) is not None:
+        raise ValueError("该股票在此区间与既有生效记录重叠")
+    row = StockPoolMembership(
+        pool_id=pool_id, stock_code=code, effective_from=start,
+        effective_to=end, source=str(payload.get("source") or "manual"),
+        note=payload.get("note"))
+    db.add(row)
+    db.commit()
+    db.refresh(row)
+    return serialize_membership(row)
+
+
+def update_membership(db: Session, membership_id: int, payload: dict):
+    """改区间（None 不动）。重叠校验排除自身；不存在返回 None。"""
+    row = (
+        db.query(StockPoolMembership)
+        .filter(StockPoolMembership.id == membership_id)
+        .first()
+    )
+    if row is None:
+        return None
+    code = str(payload.get("stock_code") or row.stock_code).strip()
+    start = (_norm_day(payload["effective_from"])
+             if "effective_from" in payload else row.effective_from)
+    end = (_norm_day(payload["effective_to"])
+           if "effective_to" in payload else row.effective_to)
+    if not code:
+        raise ValueError("stock_code 不能为空")
+    if start is None:
+        raise ValueError("effective_from 不能为空")
+    if end is not None and end < start:
+        raise ValueError("effective_to 不能早于 effective_from")
+    if _overlap_query(db, row.pool_id, code, start, end,
+                      exclude_id=row.id) is not None:
+        raise ValueError("该股票在此区间与既有生效记录重叠")
+    row.stock_code = code
+    row.effective_from = start
+    row.effective_to = end
+    if "note" in payload:
+        row.note = payload.get("note")
+    db.commit()
+    db.refresh(row)
+    return serialize_membership(row)
+
+
+def delete_membership(db: Session, membership_id: int) -> bool:
+    row = (
+        db.query(StockPoolMembership)
+        .filter(StockPoolMembership.id == membership_id)
+        .first()
+    )
+    if row is None:
+        return False
+    db.delete(row)
+    db.commit()
+    return True
 
 
 def delete_pool(db: Session, pool_id: int) -> bool:

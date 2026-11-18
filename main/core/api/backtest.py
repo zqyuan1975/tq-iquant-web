@@ -87,6 +87,33 @@ class BacktestRequest(BaseModel):
     # 市场多空门控 run 级三态覆盖（None=跟随组合市场门控配置）：
     # True=强制开启，False=强制关闭；空头状态只禁开仓/加仓，持仓不强平
     market_gate_enabled: bool | None = None
+    # 执行档位（N1，2026-11-18）：None/legacy=旧成交口径（默认，行为逐字不变）；
+    # realistic=一次性打开「涨跌停校验 + 成交量约束(10%) + 自适应滑点 + 日终抬峰」
+    execution_profile: str | None = None
+    # 执行档位逐开关覆盖（None=跟随档位）：成交量不足时买单单部分成交，残量顺延；
+    # first_bar_no_fill=当日首根 bar 不接受买单（模拟「日线信号次日开盘才可能成交」）
+    partial_fill_enabled: bool | None = None
+    first_bar_no_fill: bool | None = None
+
+
+class MultiBacktestRequest(BaseModel):
+    """N1 多组合共享现金回测（2026-11-18）：≥2 个组合共用同一资金池。
+
+    与单组合回测的区别只在资金审批：共享可用额（Σcash − Σ在途BUY）统一逐笔
+    过 ``cash_allocator``。逐组合仍落独立 ``backtest_records``，另有一个
+    ``backtest_run_groups`` 批记录承载聚合曲线。
+    """
+    portfolio_strategy_ids: List[int]
+    name: str = "多组合回测"
+    start_date: date
+    end_date: date
+    dividend_mode: str = "front"
+    evaluation_profile: str = "absolute"
+    daily_loss_basis: str | None = None
+    market_gate_enabled: bool | None = None
+    execution_profile: str | None = None
+    partial_fill_enabled: bool | None = None
+    first_bar_no_fill: bool | None = None
 
 
 class PoolCompareRequest(BaseModel):
@@ -157,6 +184,9 @@ from core.services.backtest_service import (  # noqa: E402
     recompute_validation as _svc_recompute_validation,
     recompute_persistence as _svc_recompute_persistence,
     run_pool_comparison as _svc_run_pool_comparison,
+    run_multi_backtest as _svc_run_multi_backtest,
+    list_run_groups as _svc_list_run_groups,
+    get_run_group as _svc_get_run_group,
 )
 from core.services.walk_forward_service import (  # noqa: E402
     run_walk_forward as _svc_run_walk_forward,
@@ -370,6 +400,10 @@ def _validate_backtest_request(req: BacktestRequest) -> Optional[str]:
     if req.daily_loss_basis is not None and req.daily_loss_basis not in ("equity", "initial"):
         return (f"daily_loss_basis 仅支持 equity/initial（None=跟随组合），"
                 f"收到 {req.daily_loss_basis!r}")
+    # 执行档位：None=legacy（旧成交口径）；显式值仅限 legacy/realistic
+    if req.execution_profile not in (None, "", "legacy", "realistic"):
+        return (f"execution_profile 仅支持 legacy/realistic（None=legacy），"
+                f"收到 {req.execution_profile!r}")
     return None
 
 
@@ -405,6 +439,98 @@ def run_backtest(req: BacktestRequest, db: Session = Depends(get_db)):
         return err(400, str(exc))
     finally:
         _release_slot()
+
+
+# ---------------------------------------------------------------------------
+# N1 多组合共享现金回测（2026-11-18）
+# ---------------------------------------------------------------------------
+def _validate_multi_request(req: MultiBacktestRequest) -> Optional[str]:
+    """多组合回测请求校验：≥2 个不重复组合 + 日期/口径与单组合同一套规则。"""
+    if len(req.portfolio_strategy_ids) < 2:
+        return "多组合回测至少需要 2 个组合策略"
+    if len(set(req.portfolio_strategy_ids)) != len(req.portfolio_strategy_ids):
+        return "portfolio_strategy_ids 不可重复"
+    if req.start_date >= req.end_date:
+        return f"开始日期必须早于结束日期，收到 {req.start_date} ~ {req.end_date}"
+    today = date.today()
+    if req.start_date > today:
+        return f"开始日期不可在未来，收到 {req.start_date}（今天 {today}）"
+    if req.end_date > today:
+        return f"结束日期不可在未来，收到 {req.end_date}（今天 {today}）"
+    if req.dividend_mode not in ("front", "back", "dual"):
+        return f"复权模式仅支持 front/back/dual，收到 {req.dividend_mode!r}"
+    if req.evaluation_profile not in ("absolute", "relative"):
+        return f"评估口径仅支持 absolute/relative，收到 {req.evaluation_profile!r}"
+    if req.daily_loss_basis not in (None, "equity", "initial"):
+        return (f"daily_loss_basis 仅支持 equity/initial（None=跟随组合），"
+                f"收到 {req.daily_loss_basis!r}")
+    if req.execution_profile not in (None, "", "legacy", "realistic"):
+        return (f"execution_profile 仅支持 legacy/realistic（None=legacy），"
+                f"收到 {req.execution_profile!r}")
+    return None
+
+
+@router.post("/run-multi")
+def run_multi_backtest(req: MultiBacktestRequest, db: Session = Depends(get_db)):
+    """多组合共享现金回测（N1）：≥2 个组合共用同一资金池，同步内联执行。
+
+    与 ``POST /api/backtest`` 共用同一个并发槽（同一时刻最多 N 个回测在跑），
+    超限同样返回真实 HTTP 409。
+    """
+    err_msg = _validate_multi_request(req)
+    if err_msg:
+        return err(400, err_msg)
+    portfolios = (
+        db.query(PortfolioStrategy)
+        .filter(PortfolioStrategy.id.in_(req.portfolio_strategy_ids))
+        .all()
+    )
+    found = {p.id for p in portfolios}
+    missing = [pid for pid in req.portfolio_strategy_ids if pid not in found]
+    if missing:
+        return err(404, f"组合策略不存在：{missing}")
+    # 保持请求顺序（资金优先级 = 用户看到的顺序）
+    order = {pid: i for i, pid in enumerate(req.portfolio_strategy_ids)}
+    portfolios.sort(key=lambda p: order.get(p.id, 0))
+
+    if not _try_acquire_slot():
+        raise HTTPException(
+            status_code=409,
+            detail="回测正在进行中，请等待当前回测完成后再启动（已达并发上限）",
+        )
+    try:
+        return ok(_svc_run_multi_backtest(db, portfolios, req))
+    except MarketGateUnavailableError as exc:
+        return err(400, str(exc))
+    except ValueError as exc:
+        # 取不到行情等可操作的数据问题（不落 running 记录）
+        return err(400, str(exc))
+    finally:
+        _release_slot()
+
+
+@router.get("/run-groups")
+def list_run_groups(db: Session = Depends(get_db)):
+    """多组合回测批列表（id 倒序；含 status 与参数快照）。"""
+    return ok(_svc_list_run_groups(db))
+
+
+@router.get("/run-groups/{group_id}")
+def get_run_group(group_id: int, db: Session = Depends(get_db)):
+    """批详情：组信息 + 子记录 + 聚合曲线。"""
+    payload = _svc_get_run_group(db, group_id)
+    if payload is None:
+        return err(404, "多组合回测批不存在")
+    return ok(payload)
+
+
+@router.get("/run-groups/{group_id}/aggregate")
+def get_run_group_aggregate(group_id: int, db: Session = Depends(get_db)):
+    """仅聚合曲线（前端画多组合合计净值用）。"""
+    payload = _svc_get_run_group(db, group_id)
+    if payload is None:
+        return err(404, "多组合回测批不存在")
+    return ok(payload.get("aggregate") or {})
 
 
 # ---------------------------------------------------------------------------

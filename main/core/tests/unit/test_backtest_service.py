@@ -1940,6 +1940,8 @@ _SNAPSHOT_KEYS = {
     "market_gate_enabled",
     # 公司行为（2026-11-18，J1/J2）：未启用时写显式否定值（区分关闭与旧记录缺键）
     "corporate_actions",
+    # 时点股票池（J7）+ 执行档位（N1，2026-11-18）：未启用/legacy 时同样写块
+    "pool_timeline", "execution",
 }
 
 _NO_TRADES_RESULT = {

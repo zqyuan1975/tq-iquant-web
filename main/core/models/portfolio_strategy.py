@@ -83,6 +83,10 @@ class PortfolioStrategy(Base):
     suspension_dispose_days = Column(Integer, default=0, server_default="0", nullable=False)
     # 退市强制了结（默认关；与总开关 AND）：按最后可交易价生成 SELL。
     delist_force_close_enabled = Column(Boolean, default=False, server_default="0", nullable=False)
+    # 时点股票池（J7，2026-11-18）：开启后回测/实盘按 stock_pool_memberships 的
+    # 生效区间判定当日成分，只拦 OPEN/ADD；关闭（默认）不读成员表，选股范围仍是
+    # stock_pool_stocks 当前成分，行为与改动前逐字一致。
+    pool_pit_enabled = Column(Boolean, default=False, server_default="0", nullable=False)
     status = Column(String(10), default="active", server_default="active", nullable=False)
     created_at = Column(DateTime, server_default=func.now())
     updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())

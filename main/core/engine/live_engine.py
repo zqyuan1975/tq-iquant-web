@@ -35,6 +35,10 @@ from .portfolio import Portfolio
 from .position import Position
 from .format import dec_money, dec_price, fmt_money, fmt_pct, fmt_price
 from .execution_engine import ExecutionEngine, LiveT1Checker
+from .cash_allocator import (
+    REASON_INSUFFICIENT_CASH,
+    allocate_batch_buys,
+)
 from .corporate_actions import (
     apply_day as apply_corporate_day,
     CorporateActionTimeline,
@@ -6544,74 +6548,52 @@ class LiveEngine:
         if not candidates:
             return orders
         avail = self._buy_available_cash(portfolio)
-        # 信号产生顺序（bar_time + 拆单 seq；稳定排序，同键保留原列表序）
-        candidates = sorted(
-            candidates,
-            key=lambda o: (o.bar_time or datetime.min, self._bar_mark_seq(o)),
+        # 组合级护栏（仅实盘接线）：分母 = 组合总资产（现金 + 持仓市值）。
+        # 阈值 None/0 = 不设限 → caps 直接返回原 qty（行为与接线前一致）。
+        equity = self._allocation_equity(portfolio)
+        # 资金审批内核与回测多组合共享（N1，2026-11-18）：顺序（bar_time + 拆单
+        # seq，稳定排序）、80% 门槛、不做等比缩量、caps 回调顺序全部由
+        # ``cash_allocator`` 唯一实现，本方法只负责事件记录与过滤。
+        decisions = allocate_batch_buys(
+            candidates, avail,
+            lot_of=lambda code: self._engine._lot(code),
+            target_share_of=lambda o: self._order_target_share(portfolio, o),
+            caps=lambda o, qty, avail_now, pending: self._apply_allocation_caps(
+                portfolio, o, qty, avail_now, equity,
+                self._engine._lot(o.stock_code), pending),
+            sort_key=lambda o: (o.bar_time or datetime.min,
+                                self._bar_mark_seq(o)),
         )
         skipped = set()
-        # 组合级护栏（仅实盘接线）：分母 = 组合总资产（现金 + 持仓市值）。
-        # 阈值 None/0 = 不设限 → 下面两个 helper 直接返回原 qty（行为与接线前一致）。
-        equity = self._allocation_equity(portfolio)
-        batch_code_value: Dict[str, Decimal] = {}
-        for o in candidates:
-            original = int(o.quantity)
-            need = o.price * Decimal(original)
-            target_share = self._order_target_share(portfolio, o)
-            if target_share is None or target_share <= 0:
-                # 取不到参照（无 ctx / 资金）→ 用本单目标金额当参照，保持可运行
-                target_share = need
-            lot = self._engine._lot(o.stock_code)
-            if avail >= need:
-                # 资金足够本单目标量：满额提交（本单目标量小于目标份额时也不拦，
-                # 那不是「资金不足缩量」）
-                qty = original
-            else:
-                affordable = avail
-                min_accept = (target_share * _MIN_FILL_RATIO).quantize(
-                    Decimal("0.01"))
-                if affordable < min_accept:
-                    skipped.add(id(o))
-                    pct = ((affordable / target_share) * Decimal("100")).quantize(
-                        Decimal("0.01")) if target_share > 0 else Decimal("0")
-                    self._recorder.record(
-                        gate="insufficient_cash", layer="live_gate",
-                        action="skip",
-                        portfolio_id=portfolio.portfolio_id,
-                        strategy_id=o.strategy_id,
-                        stock_code=o.stock_code,
-                        bar_time=o.bar_time,
-                        param_name="single_open_ratio",
-                        param_value=float(target_share),
-                        actual_value=float(affordable),
-                        requested_qty=original,
-                        final_qty=0,
-                        message=("资金不足跳过：目标份额 %s（%d 股 @%s），实际可买 %s"
-                                 "（%s%%，低于目标 %d%% 门槛），本笔不下单"
-                                 % (fmt_money(target_share), original,
-                                    fmt_price(o.price), fmt_money(affordable), pct,
-                                    int(_MIN_FILL_RATIO * 100))),
-                    )
-                    continue
-                # 剩余现金 ≥80% 目标份额：按可买额取整手，≥80% 不算残仓
-                qty = min(int(affordable / o.price / lot) * lot, original)
-                if qty < lot:
-                    skipped.add(id(o))
-                    continue
-            # 组合级护栏：单票集中度上限 → 现金留存下限（仅实盘接线，默认不约束）。
-            # 在 insufficient_cash 之后、落 qty 之前执行；截断后不足 1 手 → 跳过。
-            qty = self._apply_allocation_caps(
-                portfolio, o, qty, avail, equity, lot,
-                batch_code_value.get(o.stock_code, Decimal("0")),
-            )
-            if qty < lot:
-                skipped.add(id(o))
+        for decision in decisions:
+            if decision.accepted:
                 continue
-            o.quantity = qty
-            avail -= o.price * Decimal(qty)
-            batch_code_value[o.stock_code] = (
-                batch_code_value.get(o.stock_code, Decimal("0"))
-                + o.price * Decimal(qty))
+            skipped.add(id(decision.order))
+            if decision.reason != REASON_INSUFFICIENT_CASH:
+                continue
+            o = decision.order
+            target_share = decision.target_share
+            affordable = decision.available_before
+            pct = ((affordable / target_share) * Decimal("100")).quantize(
+                Decimal("0.01")) if target_share > 0 else Decimal("0")
+            self._recorder.record(
+                gate="insufficient_cash", layer="live_gate",
+                action="skip",
+                portfolio_id=portfolio.portfolio_id,
+                strategy_id=o.strategy_id,
+                stock_code=o.stock_code,
+                bar_time=o.bar_time,
+                param_name="single_open_ratio",
+                param_value=float(target_share),
+                actual_value=float(affordable),
+                requested_qty=decision.original_qty,
+                final_qty=0,
+                message=("资金不足跳过：目标份额 %s（%d 股 @%s），实际可买 %s"
+                         "（%s%%，低于目标 %d%% 门槛），本笔不下单"
+                         % (fmt_money(target_share), decision.original_qty,
+                            fmt_price(o.price), fmt_money(affordable), pct,
+                            int(_MIN_FILL_RATIO * 100))),
+            )
         return [o for o in orders if id(o) not in skipped]
 
     @staticmethod

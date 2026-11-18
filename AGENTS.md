@@ -178,6 +178,16 @@ Web 前端 (Vue 3 + Vite + Pinia) ←HTTP/SSE→ Core (FastAPI)
 - **状态卡**：`GET /api/market-gate/status`（`core/services/market_gate_service.py`）实时算、不落库；进程内 **5 分钟缓存**（`(code, period)` 键，`refresh=true` 绕过）以避免每次进备选股池页都冻结通达信客户端。返回 `direction(-1/0/1/2)`、`strength`、`as_of`、`since`、`duration_bars`、`transitions`（最近 N 次转折）。前端入口（2026-11-18）：「备选股池」页顶部状态卡（基准下拉默认 `000985.CSI`、刷新、方向/强度分/截至/持续与起始日/最近转折，**独立取数失败只影响卡片**）；组合编辑弹窗末组「市场多空门控」；「发起回测」弹窗三态下拉（`''`=跟随组合 / `'true'` / `'false'`，提交时非空才展开为布尔）。
 - **已知边界**：①门控只拦新信号，已排队的次日 deferred 单与盘前集合竞价单**不重判**（沿用信号日已决策，与参考版对齐）；②默认基准仅**新建组合**取 `000985.CSI`（中证全指），既有组合保留库值；③本地指数日线若有缺口（实证 `000985.CSI` 在 `2026-10-28~11-17` 缺失），状态靠 carry-forward 维持，卡片「数据截至」仍显示最新一根，**不报错也不拦截**。
 
+## 时点股票池与多组合回测（2026-11-18）
+
+**J7 时点股票池**：`stock_pool_memberships`（`pool_id`/`stock_code`/`effective_from`/`effective_to`，**两端含当日**，`effective_to=NULL` 仍有效）+ `portfolio_strategies.pool_pit_enabled`（默认 **0**）。判定内核 `core/engine/pool_timeline.py`（`PoolTimeline.contains/covered/codes_on/digest`，`POOL_TIMELINE_VERSION="manual_memberships_v1"`）；插入点 `Portfolio._signal_to_order` 停牌闸之后，**只拦 `OPEN`/`ADD`**（`CLOSE`/`REDUCE`/风控卖出不受限）。关闭时 `pool_timeline is None` → 闸门第一行即返回，取数也不传 `pool_codes`（与改动前逐字一致）。**该交易日无任何区间覆盖 → fail-open 放行**并记 `pool_pit_uncovered`（每交易日一条），绝不因历史未录变成零交易；出池票记 `pool_pit_out_of_pool/block`。成分同步按**用户操作当日**写区间（新增开区间、消失 `effective_to=当日`），**不回溯改历史区间**。API：`GET|POST /api/stock-pools/{id}/memberships`、`PUT|DELETE /api/stock-pools/memberships/{id}`。迁移 `f1e2d3c4b5a6`（紧接 `f0e1d2c3b4a6`，回填既有 `stock_pool_stocks` 为 1970 起开区间）。口径冻结 + 增量指纹分项 `pool_timeline`。
+
+**N1 唯一资金审批内核**：`core/engine/cash_allocator.py` 的 `allocate_batch_buys`（目标份额 + **80% 门槛** + **不做等比缩量** + `caps` 回调 + 同代码累计）是实盘 `LiveEngine._allocate_batch_buys` 与回测（`run` / `run_multi`）的**同一份判定**，禁止在任一端另写一套资金规则。改门槛/缩量语义必须两端同时回归。
+
+**N1 多组合回测**：`BacktestEngine.run_multi` 单时间轴驱动多个 `Portfolio`；服务 `run_multi_backtest` 落一个 `backtest_run_groups` + 每组合一条 `backtest_records`（`run_group_id`），聚合曲线（各组同日总市值求和）写 `aggregate_json`。**资金口径 = 各组合虚拟现金独立、互不划转**（0010 §5.1），每笔买单可用额 = 本组合 `cash − 在途 BUY`，按请求组合顺序串行审批（组级不变量：Σ 通过金额 ≤ Σ 可用现金）。**不要实现跨组合转账**——会让出资组合虚拟净值凭空下跌（假回撤可能误触熔断）。API：`POST /api/backtest/run-multi`（≥2 组合、共用单组合并发槽、超限 409）、`GET /api/backtest/run-groups[/{id}[/aggregate]]`。迁移 `f2e3d4c5b6a7`（紧接 `f1e2d3c4b5a6`）。
+
+**N1 执行档位**：`core/engine/execution_profile.py`（`EXECUTION_PROFILE_VERSION="execution_profile_v1"`）；`legacy`（默认，旧成交口径）/ `realistic`（涨跌停校验 + 成交量约束 10% + 自适应滑点 + 日终抬峰），逐开关 `partial_fill_enabled` / `first_bar_no_fill` 可覆盖（**默认 false**）。`partial_fill` **只作用于 BUY**（卖出残量仍走既有顺延/超时撤单）。档位写 `params_snapshot.execution` 并进增量指纹 `execution` 分项（切档位判废旧接缝，不自动重建）。缺省值必须与改动前逐字一致——回归基线是「不传任何新参数时结果与旧版相同」。
+
 ## 模块复用
 
 引擎层核心逻辑（风控、信号优先级排序、资金审批、持仓更新）回测/实盘共用，集中在 `portfolio.py`/`risk_manager.py`/`strategy_context.py`。实盘独有逻辑（对账告警、熔断次日恢复、SSE 事件流、周期边界 1m/1d 14:30/1w·1mon 处理）在 `live_engine.py`。差异通过策略模式隔离下单与 T+1 检查：
