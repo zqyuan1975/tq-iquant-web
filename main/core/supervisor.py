@@ -380,18 +380,42 @@ class Supervisor:
             self._sleep(0.25)
         return False
 
+    @staticmethod
+    def _business_ok(payload) -> bool:
+        """L6：``health.business_probe_enabled=true`` 时业务心跳也纳入探活判据。
+
+        开关关闭（默认）→ 完全不看 ``business`` 字段，判活行为与旧版逐字一致；
+        开关开启但载荷缺少该字段（旧子进程/降级）→ 不误判，仍按 HTTP 探活结果。
+        """
+        try:
+            from core.config import load_config
+
+            raw = (load_config() or {}).get("health")
+            raw = raw if isinstance(raw, dict) else {}
+            if not bool(raw.get("business_probe_enabled", False)):
+                return True
+        except Exception:  # noqa: BLE001 — 配置读取失败不得误杀子进程
+            return True
+        if not isinstance(payload, dict):
+            return True
+        business = payload.get("business")
+        if not isinstance(business, dict):
+            return True
+        return business.get("ok") is not False
+
     def _health_default(self, child) -> bool:
         """按 ``server.json`` 的实际端口探活（端口动态，绝不硬编码）。"""
-        if self._port and runtime.is_our_health(
-                runtime.http_health(self._port, timeout=self._health_timeout)):
-            return True
+        if self._port:
+            payload = runtime.http_health(self._port, timeout=self._health_timeout)
+            if runtime.is_our_health(payload):
+                return self._business_ok(payload)
         info = runtime.read_server_info() or {}
         port = info.get("port")
         if info.get("app") != runtime.APP_MARKER or not port:
             return False
         self._port = int(port)
-        return runtime.is_our_health(
-            runtime.http_health(self._port, timeout=self._health_timeout))
+        payload = runtime.http_health(self._port, timeout=self._health_timeout)
+        return runtime.is_our_health(payload) and self._business_ok(payload)
 
     def _monitor(self, child) -> str:
         """返回 ``exited`` / ``unresponsive`` / ``stop``。"""

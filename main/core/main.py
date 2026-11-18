@@ -177,8 +177,19 @@ async def health():
 
     自愈父进程（``--supervise``）与桌面壳都靠它判断后端是否真的在服务；
     端口动态，以 ``data/runtime/server.json`` 记录的端口为准。
+
+    L6：``health.business_probe_enabled=true`` 时附加 ``business`` 业务心跳
+    （最近 bar / 轮次推进 / watchdog 扫描）；默认关闭时响应体与旧行为逐字一致。
     """
-    return runtime.health_payload()
+    payload = runtime.health_payload()
+    try:
+        from core.services import business_health
+
+        if business_health.probe_enabled():
+            payload["business"] = business_health.snapshot()
+    except Exception:  # noqa: BLE001 — 业务探针失败不得让 /health 500
+        logger.warning("业务级心跳采集失败（已忽略）", exc_info=True)
+    return payload
 
 
 @app.get("/debug-path")
