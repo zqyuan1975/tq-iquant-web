@@ -78,6 +78,7 @@ from core.engine.portfolio_builder import (
     assemble_portfolio as _assemble_portfolio,
 )
 from core.tq.data import TQData, no_trade_bar_mask
+from core.tq.kline_cache import KlineCache
 from core.tq.formula import TQFormula
 from core.engine.tdx_formula import (
     FormulaEvalError,
@@ -523,11 +524,27 @@ def build_klines(ps, start: date, end: date, db: Session = None,
             fetch_start = start - timedelta(days=span)
     start_str = fetch_start.strftime("%Y%m%d")
     end_str = end.strftime("%Y%m%d")
-    tq = TQData()
-    raw_by_period = tq.get_history_raw(
-        stocks=stocks, periods=periods,
-        start=start_str, end=end_str, dividend_type=dividend_mode, count=-1,
-    )
+    cache = KlineCache.from_config()
+    raw_by_period: Optional[dict] = None
+    if cache is not None:
+        cached: Dict[str, dict] = {}
+        for period in periods:
+            raw = cache.load_period(
+                stocks, period, start_str, end_str, dividend_mode)
+            if raw is None:
+                cached = None  # type: ignore[assignment]
+                break
+            cached[period] = raw
+        raw_by_period = cached
+    if raw_by_period is None:
+        raw_by_period = TQData().get_history_raw(
+            stocks=stocks, periods=periods,
+            start=start_str, end=end_str, dividend_type=dividend_mode, count=-1,
+        )
+        if cache is not None:
+            for period, raw in raw_by_period.items():
+                cache.store_period(
+                    raw, stocks, period, start_str, end_str, dividend_mode)
     return _convert_market_data_multi(
         raw_by_period, stocks, stats=stats, window=(start, end))
 

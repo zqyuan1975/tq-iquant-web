@@ -243,6 +243,23 @@ def _defaults() -> dict:
                 "resume_time": "09:15",
                 "pause_time": "15:05",
             },
+            # J5（2026-11-18）：行情取数降级链（默认关闭）。开启后 1m 轮询按 chain
+            # 顺序尝试行情源，前一个源异常/返回空即切下一个，返回 bar 带 source 标记。
+            # 取值：tq（通达信 K 线）/ iquant（QMT 桥）/ goldminer（掘金桥）。
+            # 默认值刻意关闭，行为与接入前逐字一致；快照合成源（tdx/ths/alert）
+            # 不参与降级（本地采样不存在"源不可用"语义）。
+            "quote_fallback": {
+                "enabled": False,
+                "chain": ["tq", "iquant", "goldminer"],
+            },
+            # F4（2026-11-18）：收盘后抽样交叉校验（默认关闭）。15:05 收盘清扫后
+            # 抽样若干代码，比较两路日线收盘价，偏差超 max_dev_pct 记 risk 事件
+            # （gate=data_cross_check）。只观测，不影响交易判定。
+            "cross_check": {
+                "enabled": False,
+                "sample_size": 5,
+                "max_dev_pct": 1.0,
+            },
         },
         "tq_trade": {
             "account": "",
@@ -324,6 +341,16 @@ def _defaults() -> dict:
                 "direction_match_ratio": 0.9,
                 # 最大回撤偏差（百分点）：回撤是路径极值，对单日噪声更敏感
                 "max_drawdown_dev_pct": 1.0,
+            },
+        },
+        # J6（2026-11-18）：回测 K 线本地 parquet 缓存（默认关闭）。按
+        # (code, period, 复权, 区间) 缓存原始行情；闭区间长期有效，含当日按
+        # today_ttl_seconds 按 mtime 失效。开启后回测结果与不开缓存一致。
+        "backtest": {
+            "kline_cache": {
+                "enabled": False,
+                "dir": "data/kline_cache",
+                "today_ttl_seconds": 300,
             },
         },
     }
