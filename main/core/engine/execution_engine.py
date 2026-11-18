@@ -650,3 +650,72 @@ class ExecutionEngine:
             price=None,
             bar_time=None,
         )
+
+class ShadowDispatcher(OrderDispatcher):
+    """B5 影子模式：真实行情/心跳走内层 dispatcher，成交按订单价本地模拟。
+
+    - 不向真实柜台发任何委托/撤单：place_order 本地撮合，cancel_order 直接成功，
+      query_positions 恒空（避免把真实持仓混入影子账本）；
+    - 行情/心跳/窗口探测全部委托给内层真实 dispatcher，保证信号与实盘同源；
+    - 成本沿用 SimulatedDispatcher 同口径费率（影子只用于演练，不与真实费率对账）。
+    """
+
+    supports_remark = True
+
+    def __init__(self, inner=None):
+        super().__init__()
+        self._inner = inner
+        self.last_cancel_result = None
+
+    def __getattr__(self, name):
+        inner = self.__dict__.get("_inner")
+        if inner is not None:
+            return getattr(inner, name)
+        raise AttributeError(name)
+
+    def heartbeat(self) -> bool:
+        if self._inner is None:
+            return True
+        return bool(self._inner.heartbeat())
+
+    def query_positions(self) -> list:
+        return []
+
+    def cancel_order(self, order_ref: str, stock_code: str = "") -> bool:
+        self.last_cancel_result = True
+        return True
+
+    def order_id(self, order: OrderEvent) -> str:
+        return "shadow-%s-%s-%s" % (
+            order.stock_code, order.trade_type.value, order.quantity)
+
+    def place_order(self, order: OrderEvent,
+                    price_type: Optional[str] = None) -> Optional[TradeEvent]:
+        """本地撮合：按订单价成交，不触碰内层真实通道。"""
+        price = getattr(order, "price", None)
+        if not price or price <= 0:
+            return None
+        fill_price = Decimal(str(price))
+        amount = fill_price * order.quantity
+        is_sell = order.trade_type.value == "SELL"
+        commission = max(Decimal("5"), amount * Decimal("0.00025"))
+        stamp_duty = (
+            amount * stamp_duty_rate_on(order.bar_time, Decimal("0.0005"))
+            if is_sell else Decimal("0")
+        )
+        transfer_fee = amount * Decimal("0.00001")
+        return TradeEvent(
+            strategy_id=order.strategy_id,
+            portfolio_id=order.portfolio_id,
+            stock_code=order.stock_code,
+            trade_type=order.trade_type,
+            price=fill_price,
+            quantity=order.quantity,
+            amount=amount,
+            commission=commission,
+            stamp_duty=stamp_duty,
+            transfer_fee=transfer_fee,
+            trade_time=order.bar_time,
+            signal_type=order.signal_type,
+            signal_name=order.signal_name,
+        )

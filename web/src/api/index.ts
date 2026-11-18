@@ -1823,7 +1823,8 @@ export interface ReconcileMismatch {
 export type LiveEngineKey = 'iquant' | 'tdx' | 'ths' | 'goldminer'
 
 // 执行模式：alert(半自动预警,仅 TQ 行情+send_warn,不下单) / auto(全自动,走所选引擎下单)
-export type LiveExecutionMode = 'alert' | 'auto'
+// / manual(人工审批) / shadow(影子：真实行情+心跳,委托本地模拟成交,不触真实柜台)
+export type LiveExecutionMode = 'alert' | 'auto' | 'manual' | 'shadow'
 
 export interface LiveSessionCreate {
   name: string

@@ -120,8 +120,8 @@ def create_session(data: dict, db: Session = Depends(get_db)):
     data["name"] = name
     data["engine"] = engine
     execution_mode = str(data.get("execution_mode") or "alert")
-    if execution_mode not in ("alert", "auto", "manual"):
-        return err(400, "execution_mode 非法，仅支持 alert(信号) / auto(全自动) / manual(人工审批)")
+    if execution_mode not in ("alert", "auto", "manual", "shadow"):
+        return err(400, "execution_mode 非法，仅支持 alert(信号) / auto(全自动) / manual(人工审批) / shadow(影子)")
     data["execution_mode"] = execution_mode
     # A1 资金池模式（默认 off=分账不分池）：off/equal/risk_budget/priority；
     # 开启后首 bar 按权重分配各组合虚拟现金，再平衡开关按交易日重复执行。

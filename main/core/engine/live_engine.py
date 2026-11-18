@@ -964,9 +964,10 @@ class LiveEngine:
             set_bridge_offline=lambda: self._mark_bridge_offline(now_shanghai()),
             # 外部信号文件模式：日终 1w/1mon 通达信补注入同样停用（信号只来自文件）。
             external_signals_only=self._signal_source is not None,
-            # 14:50 提前收盘价：仅 auto 模式生效（预警模式不下单，无意义）。
+            # 14:50 提前收盘价：仅 auto/shadow 模式生效（预警模式不下单，无意义）。
             advance_close_enabled=(
-                self._advance_close_enabled_cfg and self.execution_mode == "auto"),
+                self._advance_close_enabled_cfg
+                and self.execution_mode in ("auto", "shadow")),
             advance_close_time=self._advance_close_time_cfg,
             snapshot_synth=self._snapshot_synth,
             # A3（2026-11-18）：14:30 日终写组合资金日序列

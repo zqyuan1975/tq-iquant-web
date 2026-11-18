@@ -224,8 +224,8 @@ function engineLabel(key?: string): string {
   return channel.value?.engines?.find((e) => e.key === key)?.label || ENGINE_LABEL[key] || key
 }
 
-// 执行模式中文名（alert=预警/auto=自动）；老数据缺省视作 auto
-const EXECUTION_MODE_LABEL: Record<string, string> = { alert: '预警', auto: '自动' }
+// 执行模式中文名（alert=预警/auto=自动/manual=审批/shadow=影子）；老数据缺省视作 auto
+const EXECUTION_MODE_LABEL: Record<string, string> = { alert: '预警', auto: '自动', manual: '审批', shadow: '影子' }
 function executionModeLabel(m?: string): string {
   return EXECUTION_MODE_LABEL[m || 'auto'] || m || '自动'
 }
@@ -1792,6 +1792,8 @@ onUnmounted(() => {
       <select v-model="form.execution_mode">
         <option value="alert">预警（半自动，仅 TQ 行情 + send_warn 推送，不下单）</option>
         <option value="auto">自动（按交易引擎下单）</option>
+        <option value="manual">人工审批（信号入队，人工确认后下单）</option>
+        <option value="shadow">影子（真实行情 + 本地模拟成交，不发真实委托）</option>
       </select>
       <label>交易引擎（决定信号计算的数据源）</label>
       <select v-model="form.engine" data-field="create-engine" @change="onEngineChange">
@@ -1960,6 +1962,8 @@ onUnmounted(() => {
         <select v-model="editForm.execution_mode" data-field="edit-execution-mode">
           <option value="alert">预警（半自动，不下单）</option>
           <option value="auto">自动（按交易引擎下单）</option>
+          <option value="manual">人工审批（信号入队，人工确认后下单）</option>
+          <option value="shadow">影子（真实行情 + 本地模拟成交）</option>
         </select>
         <label>备用通道（主备切换，可选）</label>
         <select v-model="editForm.backup_engine" data-field="edit-backup-engine">

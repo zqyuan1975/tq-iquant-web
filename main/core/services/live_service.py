@@ -70,6 +70,7 @@ from core.engine.event import TradeEvent
 from core.tq.formula import TQFormula
 from core.tq.alert import TQAlert
 from core.engine.live.alert_dispatcher import AlertDataDispatcher
+from core.engine.execution_engine import ShadowDispatcher
 from core.engine.live.market_data import MarketDataService
 from core.engine.live.timing import now_shanghai
 from core.services.signal_schedule import (
@@ -910,8 +911,8 @@ def preflight_signal_config(db: Session, session_id: int, execution_mode: str):
     auto（P0 兼容）: 只查 TQ engine + 频率规则，不做 TQ 试算/告警探测，
     避免历史自动会话因客户端未就绪而无法启动。
     """
-    if execution_mode not in ("alert", "auto", "manual"):
-        return (400, "execution_mode 必须为 alert/auto/manual")
+    if execution_mode not in ("alert", "auto", "manual", "shadow"):
+        return (400, "execution_mode 必须为 alert/auto/manual/shadow")
     for pid, st in _session_strategies(db, session_id):
         if st.formula_id is None:
             if execution_mode == "alert":
@@ -930,7 +931,7 @@ def preflight_signal_config(db: Session, session_id: int, execution_mode: str):
         if msg:
             return (503, msg)
         freq = effective_signal_frequency(st.period, st.signal_frequency)
-        if execution_mode == "auto" and freq != st.period:
+        if execution_mode in ("auto", "shadow") and freq != st.period:
             return (503, "全自动 P0 仅支持 signal_frequency == period；"
                          "请改用 alert 或等待 P2（策略 %s）" % st.name)
     if execution_mode == "alert":
@@ -976,6 +977,10 @@ def build_engine(
     """
     if execution_mode == "alert":
         dispatcher = AlertDataDispatcher()
+    elif execution_mode == "shadow":
+        # B5 影子模式：包裹真实通道取行情/心跳，委托本地模拟成交（不触真实柜台）
+        dispatcher = ShadowDispatcher(
+            make_dispatcher(engine or default_engine(), mode, session_id))
     elif dispatcher_cls is None:
         dispatcher = make_dispatcher(engine or default_engine(), mode, session_id)
     elif dispatcher_cls is ThsUiDispatcher:
@@ -1784,8 +1789,8 @@ def _normalize_session_patch(db: Session, data: dict,
         patch["failover_enabled"] = bool(data.get("failover_enabled"))
     if "execution_mode" in data:
         execution_mode = str(data.get("execution_mode") or "").strip()
-        if execution_mode not in ("alert", "auto", "manual"):
-            return None, (400, "execution_mode 非法，仅支持 alert / auto / manual")
+        if execution_mode not in ("alert", "auto", "manual", "shadow"):
+            return None, (400, "execution_mode 非法，仅支持 alert / auto / manual / shadow")
         patch["execution_mode"] = execution_mode
     if "signal_file_path" in data:
         raw = data.get("signal_file_path")
@@ -3173,6 +3178,9 @@ def _occupied_sessions(
     for row in rows:
         if row.id == exclude_id:
             continue
+        # B5 影子模式不占用真实通道/账户/键鼠，也不计入并行会话上限
+        if (getattr(row, "execution_mode", None) or "auto") == "shadow":
+            continue
         if row.id not in engines and _is_stale_stopping(row):
             row.status = "stopped"
             row.stopped_at = row.stopped_at or datetime.now()
@@ -3189,6 +3197,8 @@ def _occupied_sessions(
             continue
         row = db.query(LiveSession).filter(LiveSession.id == sid).first()
         if row is not None:
+            if (getattr(row, "execution_mode", None) or "auto") == "shadow":
+                continue
             occupied[sid] = row
     return occupied
 
@@ -3565,6 +3575,9 @@ def start_session(
     if session_id in engines:
         # 幂等：已在跑，直接返回（无 engine 新建，路由据此返回 ok running）
         return None, session, None
+    # B5：执行模式需在资源冲突检查前确定——影子模式只读行情、不占真实通道/账户/键鼠
+    execution_mode = getattr(session, "execution_mode", None) or "auto"
+    is_shadow = execution_mode == "shadow"
     # D3（2026-11-18）：建引擎前应用本会话待生效风控参数变更。
     # 无 pending 时行为与改动前逐字一致；应用失败不阻断启动（只告警）。
     try:
@@ -3612,7 +3625,7 @@ def start_session(
             )
     # B6 资源互斥（M1 多会话并行）：THS 通道键鼠独占，其余通道（tdx/iquant）
     # 可并行；组合重叠允许（复制交易语义，各会话独立虚拟账本）。
-    conflict = _check_channel_conflict(db, session, engines)
+    conflict = None if is_shadow else _check_channel_conflict(db, session, engines)
     if conflict is not None:
         return None, session, conflict
 
@@ -3636,7 +3649,6 @@ def start_session(
             "股票池为空：请先在组合策略中配置股票，或检查股票池同步",
         )
 
-    execution_mode = getattr(session, "execution_mode", None) or "auto"
     try:
         engine = build_engine(
             session_id, db, mode,
@@ -3707,18 +3719,22 @@ def start_session(
     # → C2 账户键」顺序校验（C1 已在上方完成）。取不到账号时降级 engine:<key>。
     own_key, own_source = resolve_account_key(
         session_engine(session), engine.dispatcher)
-    account_conflict = _check_account_conflict(db, session, engines, own_key)
+    account_conflict = (
+        None if is_shadow
+        else _check_account_conflict(db, session, engines, own_key))
     if account_conflict is not None:
         return None, session, account_conflict
     # C3 键鼠类互斥（tdx/ths）：默认软拦——未带 ack 返回 409 要求确认，带
     # ack_keyboard_risk 放行并留痕；config 可升级为硬拦（409，ack 也拒）。
-    keyboard_conflict = _check_keyboard_conflict(
-        db, session, engines, ack_keyboard_risk)
+    keyboard_conflict = (
+        None if is_shadow
+        else _check_keyboard_conflict(db, session, engines, ack_keyboard_risk))
     if keyboard_conflict is not None:
         return None, session, keyboard_conflict
     # 账户键落库（路由 commit 时随 status=running 一并持久化），供后续会话判定。
-    session.account_key = own_key
-    session.account_key_source = own_source
+    # B5 影子模式不绑定真实账户，避免占住账户键。
+    session.account_key = None if is_shadow else own_key
+    session.account_key_source = None if is_shadow else own_source
     # C4 多账户并行提醒（不阻断）：随启动结果回传给前端做横幅。
     try:
         setattr(engine, "start_warnings",
