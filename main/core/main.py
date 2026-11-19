@@ -18,6 +18,7 @@ from core.api.tdx import router as tdx_router
 from core.api.incremental import router as incremental_router
 from core.api.market_gate import router as market_gate_router
 from core.api.capital import router as capital_router
+from core.api.pairing import router as pairing_router
 from core.logging_config import setup_logging
 from core.services.backtest_service import (
     recover_stale_running_backtests, recover_stale_running_batch_runs,
@@ -182,6 +183,7 @@ app.include_router(incremental_router)
 app.include_router(market_gate_router)
 app.include_router(corporate_actions_router)
 app.include_router(capital_router)
+app.include_router(pairing_router)
 
 
 @app.exception_handler(Exception)
