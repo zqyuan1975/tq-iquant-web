@@ -960,3 +960,97 @@ def test_mirror_bridge_clears_stale_cost_when_unknown():
     pos.avg_cost = Decimal("36.43")
     pos.mirror_bridge(20, 20, Decimal("0"), date(2026, 11, 10))
     assert pos.avg_cost == 0
+
+
+# ---------------- 通道探活超时：与桥真实响应量级匹配 ----------------
+
+def test_probe_timeout_matches_channel_response_scale():
+    """窗口类 0.5s；HTTP 桥 5s（掘金 /ping 实测 3.02s，旧 1s 会误判离线）。"""
+    assert svc._probe_timeout_for("tdx") == 0.5
+    assert svc._probe_timeout_for("ths") == 0.5
+    assert svc._probe_timeout_for("goldminer") == 5.0
+    assert svc._probe_timeout_for("iquant") == 5.0
+
+
+def test_probe_bridge_allows_three_second_ping(monkeypatch):
+    """活线程慢应答在超时值以内 → 判在线（不因桥慢被误判离线）。"""
+    class _SlowBridge:
+        def heartbeat(self):
+            time.sleep(0.4)   # 真桥 3s 量级，测试里等比缩小
+            return True
+
+    online, stale, note = svc._probe_online_quick("goldminer", _SlowBridge())
+    assert online is True and stale is False and note == "ok"
+
+
+def test_probe_budget_exhausted_reuses_last_known(monkeypatch):
+    """探活预算耗尽：沿用上次已知值并给「沿用上次结果」标注，不发探针。"""
+    svc._PROBE_CACHE["goldminer"] = (
+        time.monotonic() - svc._PROBE_TTL_SECONDS - 1, True)
+
+    class _Never:
+        def heartbeat(self):
+            raise AssertionError("预算耗尽时不应再发探针")
+
+    online, stale, note = svc._probe_online_quick(
+        "goldminer", _Never(), deadline=time.monotonic() - 0.01)
+    assert online is True and stale is True
+    assert note == "budget"
+    assert "沿用上次结果" in svc._PROBE_NOTE_TEXT[note]
+
+
+def test_probe_budget_exhausted_without_baseline_marks_offline(monkeypatch):
+    """无历史结果且预算耗尽：暂判离线，但标注为「无上次结果」而非故障。"""
+    class _Never:
+        def heartbeat(self):
+            raise AssertionError("预算耗尽时不应再发探针")
+
+    online, stale, note = svc._probe_online_quick(
+        "iquant", _Never(), deadline=time.monotonic() - 0.01)
+    assert online is False and stale is True
+    assert note == "budget_no_baseline"
+
+
+def test_bridge_online_without_engine_reports_available(monkeypatch):
+    """桥可见但会话未启动：显示可用 + 「无运行引擎」，不是通道故障。"""
+    monkeypatch.setattr(svc, "load_config", lambda: _cfg(False))
+
+    class _Bridge:
+        def __init__(self, **kw):
+            pass
+
+        def heartbeat(self):
+            return True
+
+    monkeypatch.setattr(svc, "HttpBridgeDispatcher", _Bridge)
+    data = svc.channel_status(engine_key="goldminer", engines={})
+    assert data["online"] is True
+    assert data["engine_running"] is False
+    assert "无运行引擎" in data["detail"]
+
+
+# ---------------- TQ 账号文案：空配置 ≠ 功能不可用 ----------------
+
+def test_tdx_detail_empty_account_is_client_state_not_missing_config(monkeypatch):
+    """account 留空不是「未配置」：客户端不在时应说「未检测到登录账号」。"""
+    monkeypatch.setattr(svc, "load_config", lambda: _cfg(False, tq_trade={}))
+    monkeypatch.setattr(svc, "_window_present", lambda key: False)
+    data = svc.channel_status(engine_key="tdx", engines={})
+    assert "未配置" not in data["detail"]
+    assert "未检测到客户端登录账号" in data["detail"]
+
+
+def test_tdx_detail_reads_connected_client_account(monkeypatch):
+    """引擎已连上客户端 → 显示「客户端当前登录账号」（TQ 用客户端当前账号）。"""
+    monkeypatch.setattr(svc, "load_config", lambda: _cfg(False, tq_trade={}))
+    engine = SimpleNamespace(
+        dispatcher=SimpleNamespace(_connected=True, _account_id=3))
+    data = svc.channel_status(engine=engine, engine_key="tdx", engines={})
+    assert data["detail"] == "客户端当前登录账号"
+
+
+def test_tdx_detail_prefers_explicit_configured_account(monkeypatch):
+    monkeypatch.setattr(
+        svc, "load_config", lambda: _cfg(False, tq_trade={"account": "A1"}))
+    data = svc.channel_status(engine_key="tdx", engines={})
+    assert data["detail"] == "TQ 资金账号 A1"

@@ -200,3 +200,66 @@ def test_check_data_health_no_slow_quote_below_threshold():
     health = h.check_data_health(disp, ["600000.SH"], ["1d"],
                                  now=_NOW_OFF, calendar=_CAL, session_id=7)
     assert health["slow_quote_count"] == 0
+
+
+class _TimeoutDisp:
+    """支持 per-call timeout 的桥替身：slow_codes 里的标的一律超时。"""
+
+    def __init__(self, slow_codes=(), bars_by_code=None):
+        self.slow_codes = set(slow_codes)
+        self.bars_by_code = bars_by_code or {}
+        self.calls = []
+
+    def query_quote(self, code, period="1d", count=1, timeout=None):
+        self.calls.append((code, period, timeout))
+        if code in self.slow_codes:
+            raise TimeoutError("timed out")
+        return self.bars_by_code.get(code, [])
+
+
+def test_check_data_health_hard_timeout_marks_unverified_not_missing():
+    """单只硬超时：放弃该只、计入未校验，**不**误报为数据缺失。"""
+    codes = ["600000.SH", "000001.SZ", "600519.SH"]
+    disp = _TimeoutDisp(
+        slow_codes={"000001.SZ"},
+        bars_by_code={c: _bars(date(2026, 11, 18)) for c in codes})
+    health = h.check_data_health(disp, codes, ["1d"], now=_NOW_OFF,
+                                 calendar=_CAL, time_budget_seconds=2.0)
+    assert health["timeout_count"] == 1
+    assert health["timeout_codes"] == ["000001.SZ"]
+    assert health["checked_codes"] == 2          # 超时那只未校验
+    assert "000001.SZ" not in health["missing_codes"]   # 不当成缺失
+    assert health["periods"]["1d"]["timeout"] == 1
+    assert health["periods"]["1d"]["error"] == 0        # 也不当成通道错误
+    assert health["healthy"] is False
+    assert "未校验" in h.health_summary_text(health)
+    # 单只硬超时必须严格低于整体预算（2s 预算 → ≤ 1.2s）
+    assert all(t is not None and t < 2.0 for _c, _p, t in disp.calls)
+
+
+def test_check_data_health_hard_timeout_defaults_below_no_budget():
+    """不带预算时仍走默认单只硬超时（2s），保证在飞调用可被放弃。"""
+    disp = _TimeoutDisp(bars_by_code={"A": _bars(date(2026, 11, 18))})
+    h.check_data_health(disp, ["A"], ["1d"], now=_NOW_OFF, calendar=_CAL)
+    assert disp.calls[0][2] == h._QUOTE_HARD_TIMEOUT_SECONDS
+
+
+def test_check_data_health_dispatch_without_timeout_support_still_works():
+    """tdx/ths 等同步实现不接受 per-call timeout：退化为原调用，不抛 TypeError。"""
+    disp = _Disp({"A": _bars(date(2026, 11, 18))})
+    health = h.check_data_health(disp, ["A"], ["1d"], now=_NOW_OFF,
+                                 calendar=_CAL, time_budget_seconds=2.0)
+    assert health["periods"]["1d"]["ok"] == 1
+    assert health["timeout_count"] == 0
+
+
+def test_is_timeout_error_detects_wrapped_bridge_error():
+    """桥把 httpx 超时包成 BridgeUnavailableError（cause 保留）也要识别。"""
+
+    class _BridgeUnavailable(RuntimeError):
+        pass
+
+    err = _BridgeUnavailable("bridge request failed: ")
+    err.__cause__ = TimeoutError()
+    assert h._is_timeout_error(err) is True
+    assert h._is_timeout_error(RuntimeError("bridge offline")) is False

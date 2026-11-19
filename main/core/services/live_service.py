@@ -755,7 +755,10 @@ def engine_status(engine: Optional[str]) -> dict:
         elif key == "goldminer":
             g = goldminer_config()
             configured = g["available"]
-            detail = "%s（token%s）" % (g["base_url"], "已配" if g["token_set"] else "未配")
+            # token/账号在桥脚本（goldminer_bridge.py）内配置并注入 gm SDK；
+            # 平台侧 config.goldminer.token 不参与连通性判断，留空不影响可用性，
+            # 只是「平台没有单独记录」。这里不能写成「未配」制造不可用错觉。
+            detail = "%s（token/账号在桥脚本内配置）" % g["base_url"]
         elif key == "iquant":
             q = iquant_config()
             configured = q["available"]
@@ -782,13 +785,30 @@ def engine_status(engine: Optional[str]) -> dict:
     }
 
 
-#: 通道探活 TTL：同一通道 30s 内复用上次结果，页面请求不重复打桥
+#: 通道探活结果 TTL：30s。理由：桥 /ping 实测 0.6–3.0s（掘金桥内全局锁串行排队），
+#: 而同一页面会在数秒内重复请求同一通道（通道条 + 健康总览 + 守护清单）。
+#: 30s 与引擎主循环心跳（60s）同量级但更短：既能挡住连点/多入口的重复打桥，
+#: 又不会让刚启动的客户端等到下一分钟才转绿。
 _PROBE_TTL_SECONDS = 30.0
-#: 单次探活硬超时：心跳最多等 1s，超时沿用上次已知值（绝不阻塞页面请求）
-_PROBE_TIMEOUT_SECONDS = 1.0
+#: 探活硬超时**按通道类型区分**（2026-11-19 修正）：
+#: - 窗口枚举（tdx/ths）是纯 ctypes 调用，毫秒级，0.5s 足够；
+#: - HTTP 桥（goldminer/iquant）的 /ping 实测掘金 3.02s（桥内全局锁 + GIL 排队），
+#:   旧值统一 1s 会把 3s 的正常应答误判成「离线」。这里给 5s，与桥读超时同量级。
+_PROBE_TIMEOUT_WINDOW_SECONDS = 0.5
+_PROBE_TIMEOUT_BRIDGE_SECONDS = 5.0
 #: {通道键: (单调时钟时点, 是否在线)}
 _PROBE_CACHE: Dict[str, Tuple[float, bool]] = {}
 _PROBE_CACHE_LOCK = threading.Lock()
+
+#: 探活结论代码 → 给用户看的说明（超预算时必须如实标注「沿用上次结果」）。
+_PROBE_NOTE_TEXT = {
+    "ok": "",
+    "cache": "",
+    "timeout": "探活超时，沿用上次结果",
+    "timeout_no_baseline": "探活超时，无上次结果（暂判离线）",
+    "budget": "本轮探活预算已耗尽，沿用上次结果",
+    "budget_no_baseline": "本轮探活预算已耗尽，无上次结果（暂判离线）",
+}
 
 
 def _known_engine_online(engine) -> Optional[bool]:
@@ -872,17 +892,42 @@ def _probe_dispatcher_for(engine_key: Optional[str]):
     return None
 
 
-def _probe_online_quick(engine_key: str, dispatcher) -> Tuple[Optional[bool], bool]:
-    """兜底探活：30s TTL 缓存 + 1s 硬超时，返回 (online, stale)。
+def _probe_timeout_for(engine_key: Optional[str]) -> float:
+    """该通道单次探活的硬超时：窗口类 0.5s / HTTP 桥 5s（见常量注释）。"""
+    if engine_key in ("goldminer", "iquant"):
+        return _PROBE_TIMEOUT_BRIDGE_SECONDS
+    return _PROBE_TIMEOUT_WINDOW_SECONDS
+
+
+def _probe_online_quick(engine_key: str, dispatcher,
+                        deadline: Optional[float] = None
+                        ) -> Tuple[Optional[bool], bool, str]:
+    """兜底探活：30s TTL 缓存 + 按通道匹配的硬超时，返回 (online, stale, note)。
 
     仅用于没有 ``bridge_online`` 的引擎替身/旧实现；真实 LiveEngine 走引擎状态，
-    不会进入这里。心跳跑在守护线程里并 ``join(1s)``：超时/异常时沿用上一次已知
-    值（无缓存则判离线）并置 ``stale=True``，保证调用方最坏 1s 返回。
+    不会进入这里。心跳跑在守护线程里并 ``join(timeout)``，超时/预算耗尽时**沿用
+    上次已知值**（无缓存才判离线）并置 ``stale=True``，绝不阻塞调用方。
+
+    ``deadline`` 是本轮探活的时间预算（单调时钟时点）：剩余时间不足时按剩余
+    时间截断；已耗尽则直接返回上次结果，不再发探针。
+
+    ``note`` ∈ ok / cache / timeout / timeout_no_baseline / budget /
+    budget_no_baseline，供上层如实标注「探活超时，沿用上次结果」。
     """
+    now = time.monotonic()
     with _PROBE_CACHE_LOCK:
         cached = _PROBE_CACHE.get(engine_key)
-    if cached is not None and time.monotonic() - cached[0] < _PROBE_TTL_SECONDS:
-        return cached[1], False
+    if cached is not None and now - cached[0] < _PROBE_TTL_SECONDS:
+        return cached[1], False, "cache"
+
+    has_baseline = cached is not None
+    timeout = _probe_timeout_for(engine_key)
+    if deadline is not None:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return (cached[1] if has_baseline else False), True, (
+                "budget" if has_baseline else "budget_no_baseline")
+        timeout = min(timeout, remaining)
 
     box: List[bool] = []
 
@@ -894,18 +939,48 @@ def _probe_online_quick(engine_key: str, dispatcher) -> Tuple[Optional[bool], bo
 
     t = threading.Thread(target=_run, name="channel-probe", daemon=True)
     t.start()
-    t.join(_PROBE_TIMEOUT_SECONDS)
+    t.join(timeout)
     if t.is_alive():
-        return (cached[1] if cached is not None else False), True
+        return (cached[1] if has_baseline else False), True, (
+            "timeout" if has_baseline else "timeout_no_baseline")
     online = box[0] if box else False
     with _PROBE_CACHE_LOCK:
         _PROBE_CACHE[engine_key] = (time.monotonic(), online)
-    return online, False
+    return online, False, "ok"
+
+
+def _tdx_account_detail(engine) -> str:
+    """tdx 卡片次要信息：配置账号优先，否则如实描述客户端当前登录状态。
+
+    TQ 下单用的是客户端**当前登录**的资金账号，``config.tq_trade.account`` 留空
+    并不阻断下单（2026-11-19 实测：account 为空仍有 7 笔委托、3 笔成交）。
+    因此空值只能表示「未显式指定账号」，不能写成「未配置」——后者会让用户
+    误以为功能不可用。只有窗口都看不到时，才是「未检测到客户端登录账号」。
+    """
+    account = tq_trade_config()["account"]
+    if account:
+        return "TQ 资金账号 %s" % account
+    dispatcher = getattr(engine, "dispatcher", None) if engine is not None else None
+    try:
+        connected = (dispatcher is not None
+                     and bool(getattr(dispatcher, "_connected", False))
+                     and int(getattr(dispatcher, "_account_id", -1) or -1) >= 0)
+    except (TypeError, ValueError):
+        connected = False
+    if connected:
+        return "客户端当前登录账号"
+    try:
+        present = _window_present("tdx")
+    except Exception:  # noqa: BLE001 - 窗口探测失败只影响文案
+        present = False
+    return ("客户端当前登录账号（客户端已启动）" if present
+            else "未检测到客户端登录账号")
 
 
 def channel_status(engine: Optional[LiveEngine] = None,
                    engine_key: Optional[str] = None,
-                   engines: Optional[Dict[int, LiveEngine]] = None) -> dict:
+                   engines: Optional[Dict[int, LiveEngine]] = None,
+                   probe_deadline: Optional[float] = None) -> dict:
     """当前生效的下单通道 + 在线状态（实盘页顶部通道条 / 状态总览通道卡）。
 
     在线语义（2026-11-04 修正，2026-11-05 探活脱钩）：
@@ -935,6 +1010,7 @@ def channel_status(engine: Optional[LiveEngine] = None,
     source = "none"
     checked_at = None
     stale = False
+    probe_note = ""
     if running is not None:
         known = _known_engine_online(running)
         if known is not None:
@@ -942,19 +1018,21 @@ def channel_status(engine: Optional[LiveEngine] = None,
             source = "engine"
             checked_at, stale = _engine_state_freshness(running)
         else:
-            # 兜底探活（仅无引擎状态的替身/旧实现）：TTL 缓存 + 1s 硬超时。
-            online, stale = _probe_online_quick(engine_key or "", running.dispatcher)
+            # 兜底探活（仅无引擎状态的替身/旧实现）：TTL 缓存 + 按通道匹配硬超时。
+            online, stale, probe_note = _probe_online_quick(
+                engine_key or "", running.dispatcher, probe_deadline)
             source = "probe"
     elif engine_key is not None:
         # 无运行引擎也必须真实探测——「在线/离线」不能靠会话是否启动推断，更不能
         # 默认亮绿。tdx/ths 看客户端窗口是否在，goldminer/iquant 探对应 HTTP 桥；
-        # 探不到（依赖缺失/异常）一律判离线。复用 30s TTL + 1s 硬超时，不新起轮询。
+        # 探不到（依赖缺失/异常）一律判离线。复用 30s TTL + 按通道硬超时。
         try:
             probe = _probe_dispatcher_for(engine_key)
         except Exception:  # noqa: BLE001 - 配置读取失败只影响在线展示
             probe = None
         if probe is not None:
-            online, stale = _probe_online_quick(engine_key, probe)
+            online, stale, probe_note = _probe_online_quick(
+                engine_key, probe, probe_deadline)
         else:
             online, stale = False, False
         source = "probe"
@@ -963,6 +1041,9 @@ def channel_status(engine: Optional[LiveEngine] = None,
     data["online_source"] = source
     data["checked_at"] = checked_at
     data["stale"] = stale
+    # 探活预算/超时降级：如实标注「探活超时，沿用上次结果」，接口本身照常返回。
+    data["probe_note"] = _PROBE_NOTE_TEXT.get(probe_note, "")
+    data["probe_degraded"] = probe_note not in ("", "ok", "cache")
 
     # 四通道卡片统一口径：configured + 一行次要信息（端口/账号/窗口）
     key = engine_key or data.get("engine")
@@ -971,14 +1052,19 @@ def channel_status(engine: Optional[LiveEngine] = None,
     data["configured"] = bool(meta.get("configured")) if meta else False
     detail = ""
     if key == "tdx":
-        detail = "TQ 资金账号 %s" % (tq_trade_config()["account"] or "未配置")
+        detail = _tdx_account_detail(running)
     elif key == "ths":
         detail = ths_ui_config()["window_title"] or "同花顺下单窗口"
     elif key == "goldminer":
         detail = goldminer_config()["base_url"]
+        if running is None and online:
+            # 桥能看到就说明通道可用；没有引擎只是「会话没启动」，不是通道故障。
+            detail += "（桥在线，无运行引擎）"
     elif key == "iquant":
         # 只报生产的 8790 仿真桥；8791 信用腿非生产、未启用，不进状态卡
         detail = "HTTP 桥 %s" % iquant_config()["simulation"]
+        if running is None and online:
+            detail += "（桥在线，无运行引擎）"
     data["detail"] = detail
     return data
 
@@ -2647,10 +2733,12 @@ def update_session(db: Session, session_id: int, data: dict,
 # ---------------------------------------------------------------------------
 
 def _channel_health_one(engine_key: Optional[str],
-                        engines: Optional[Dict[int, LiveEngine]]) -> Optional[dict]:
+                        engines: Optional[Dict[int, LiveEngine]],
+                        probe_deadline: Optional[float] = None) -> Optional[dict]:
     if not engine_key:
         return None
-    data = channel_status(engine_key=engine_key, engines=engines)
+    data = channel_status(engine_key=engine_key, engines=engines,
+                          probe_deadline=probe_deadline)
     return {
         "engine": engine_key,
         "label": data.get("label") or ENGINES_META.get(engine_key, (None, engine_key))[1],
@@ -2661,16 +2749,22 @@ def _channel_health_one(engine_key: Optional[str],
         "detail": data.get("detail") or "",
         "stale": bool(data.get("stale")),
         "checked_at": data.get("checked_at"),
+        # 探活预算/超时降级（"探活超时，沿用上次结果"），空串=本次探活正常。
+        "probe_note": data.get("probe_note") or "",
+        "probe_degraded": bool(data.get("probe_degraded")),
     }
 
 
 def session_channel_health(db: Session, session_id: int,
-                           engines: Optional[Dict[int, LiveEngine]] = None):
+                           engines: Optional[Dict[int, LiveEngine]] = None,
+                           probe_deadline: Optional[float] = None):
     """B2：主/备通道健康探活（只读，不新建轮询）。
 
     - 主通道：会话生效引擎；运行中优先读引擎内存在线态，未运行真实探活；
     - 备用通道：未配置返回 None；配置后同样真实探活（tdx/ths 看窗口，
-      iquant/goldminer 探 HTTP 桥）。
+      iquant/goldminer 探 HTTP 桥）；
+    - ``probe_deadline``：本轮探活的时间预算（单调时钟时点），超时沿用上次
+      已知状态并标注 ``probe_note``，不阻塞调用方。
     """
     session = db.query(LiveSession).filter(LiveSession.id == session_id).first()
     if session is None:
@@ -2679,8 +2773,8 @@ def session_channel_health(db: Session, session_id: int,
     backup = getattr(session, "backup_engine", None)
     return {
         "session_id": session_id,
-        "primary": _channel_health_one(primary, engines),
-        "backup": _channel_health_one(backup, engines),
+        "primary": _channel_health_one(primary, engines, probe_deadline),
+        "backup": _channel_health_one(backup, engines, probe_deadline),
         "failover_enabled": bool(getattr(session, "failover_enabled", False)),
         "advice": ("主通道离线时可一键切换备用通道；运行中切换于下次启动生效"
                    if backup else "未配置备用通道（编辑会话可设置）"),
@@ -2692,7 +2786,8 @@ def session_data_health(db: Session, session_id: int,
                         auto_fill: bool = True,
                         now: Optional[datetime] = None,
                         max_codes: Optional[int] = None,
-                        time_budget_seconds: Optional[float] = None):
+                        time_budget_seconds: Optional[float] = None,
+                        quote_timeout_seconds: Optional[float] = None):
     """F2：会话数据体检 + 非盘中自动补齐（只读，不改交易语义）。
 
     - 运行中：用引擎 dispatcher/日历（与实盘同一通道口径）；
@@ -2742,7 +2837,8 @@ def session_data_health(db: Session, session_id: int,
         _HEALTH_INFLIGHT[sid] = started
     try:
         payload = _collect_session_data_health(
-            db, sid, engines, auto_fill, now, max_codes, time_budget_seconds)
+            db, sid, engines, auto_fill, now, max_codes, time_budget_seconds,
+            quote_timeout_seconds)
     finally:
         with _HEALTH_DEDUP_LOCK:
             _HEALTH_INFLIGHT.pop(sid, None)
@@ -2758,7 +2854,8 @@ def _collect_session_data_health(db: Session, session_id: int,
                                  auto_fill: bool,
                                  now: Optional[datetime],
                                  max_codes: int,
-                                 time_budget_seconds: float):
+                                 time_budget_seconds: float,
+                                 quote_timeout_seconds: Optional[float] = None):
     """``session_data_health`` 的实际取数体（预算/去重由外层负责）。"""
     session = db.query(LiveSession).filter(LiveSession.id == session_id).first()
     if session is None:
@@ -2798,6 +2895,7 @@ def _collect_session_data_health(db: Session, session_id: int,
         dispatcher, sorted(pool_codes), periods,
         auto_fill=auto_fill, now=now, calendar=calendar,
         max_codes=max_codes, time_budget_seconds=time_budget_seconds,
+        quote_timeout_seconds=quote_timeout_seconds,
         session_id=session_id)
     health = result["health"]
     return {
@@ -2808,6 +2906,8 @@ def _collect_session_data_health(db: Session, session_id: int,
         "periods_checked": periods,
         "codes_total": len(pool_codes),
         "codes_checked": health.get("checked_codes"),
+        "timeout_count": health.get("timeout_count"),
+        "timeout_codes": health.get("timeout_codes") or [],
         "truncated": bool(health.get("truncated")),
         "budget": {"max_codes": max_codes,
                    "time_budget_seconds": time_budget_seconds},
@@ -2882,29 +2982,36 @@ _MANUAL_CHANNEL_HINT = {
 }
 
 
-def _force_channel_probe(engine_key: str) -> Tuple[Optional[bool], bool]:
+def _force_channel_probe(engine_key: str) -> Tuple[Optional[bool], bool, str]:
     """清掉 30s 探活缓存后强制探一次（B3「一键重新探活」）。"""
     with _PROBE_CACHE_LOCK:
         _PROBE_CACHE.pop(engine_key, None)
     dispatcher = _probe_dispatcher_for(engine_key)
     if dispatcher is None:
-        return None, False
+        return None, False, ""
     return _probe_online_quick(engine_key, dispatcher)
 
 
 def session_channel_guard(db: Session, session_id: int,
-                          engines: Optional[Dict[int, LiveEngine]] = None):
+                          engines: Optional[Dict[int, LiveEngine]] = None,
+                          probe_deadline: Optional[float] = None,
+                          health: Optional[dict] = None):
     """B3：前置通道检查清单（只读）。
 
     只提示、不自动拉起终端、不自动重启会话；每项给 ``ok`` 与人工处置建议。
+
+    ``health`` 可由调用方（健康总览）传入**同一轮已算好的** channel-health，
+    避免同一请求内对同一会话重复真实探活；未传才自行计算。
     """
     session = db.query(LiveSession).filter(LiveSession.id == session_id).first()
     if session is None:
         return None
     engines = engines or ENGINES
-    health = session_channel_health(db, session_id, engines)
+    if health is None:
+        health = session_channel_health(db, session_id, engines, probe_deadline)
     primary = health["primary"] or {}
     backup = health["backup"]
+    probe_note = primary.get("probe_note") or ""
     running_status = session.status in ("running", "stopping")
     engine_key = primary.get("engine") or session_engine(session)
     registered = session_id in engines
@@ -2922,8 +3029,9 @@ def session_channel_guard(db: Session, session_id: int,
          "detail": primary.get("detail") or engine_key},
         {"key": "client_online", "ok": bool(primary.get("online")),
          "label": "客户端/桥在线",
-         "detail": ("在线" if primary.get("online") else
-                    (primary.get("detail") or "离线"))},
+         "detail": (("在线" if primary.get("online") else
+                     (primary.get("detail") or "离线"))
+                    + ("（%s）" % probe_note if probe_note else ""))},
         {"key": "engine_registered", "ok": (not running_status) or registered,
          "label": "运行态引擎已注册",
          "detail": ("未运行（不需要）" if not running_status else
@@ -2971,7 +3079,7 @@ def reconnect_session_channel(db: Session, session_id: int,
     if session is None:
         return False, (404, "资源不存在")
     engine_key = session_engine(session)
-    online, stale = _force_channel_probe(engine_key)
+    online, stale, probe_note = _force_channel_probe(engine_key)
     hint = "" if online else _MANUAL_CHANNEL_HINT.get(
         engine_key, "确认交易终端已启动并登录")
     return True, {
@@ -2979,6 +3087,7 @@ def reconnect_session_channel(db: Session, session_id: int,
         "engine": engine_key,
         "online": online,
         "stale": stale,
+        "probe_note": _PROBE_NOTE_TEXT.get(probe_note, ""),
         "message": ("通道在线" if online else "通道仍离线"),
         "manual_action": hint,
     }
@@ -4704,7 +4813,7 @@ def start_session(
             return None, session, (
                 503,
                 "通达信交易未就绪：请先启动并登录通达信交易客户端（%s）"
-                % (detail or "未获取到资金账号"),
+                % (detail or "未检测到客户端登录账号"),
             )
         channel = getattr(engine.dispatcher, "channel", "")
         base_url = getattr(engine.dispatcher, "_base_url", "") or "未知"

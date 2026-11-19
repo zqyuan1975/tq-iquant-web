@@ -46,7 +46,8 @@ def test_channel_health_reports_primary_and_backup(monkeypatch):
     db = _db()
     sid = _session(db, engine="tdx", backup="iquant")
 
-    def fake_status(engine: str = None, engine_key: str = None, engines=None):
+    def fake_status(engine: str = None, engine_key: str = None, engines=None,
+                    probe_deadline=None):
         online = engine_key == "iquant"
         return {
             "label": {"tdx": "通达信", "iquant": "QMT"}.get(engine_key, engine_key),

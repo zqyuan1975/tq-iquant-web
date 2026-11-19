@@ -42,12 +42,12 @@ def patched(monkeypatch):
         lambda sid, status, engine: {"online": True, "status": status})
     monkeypatch.setattr(
         hs.live_service, "session_channel_health",
-        lambda db, sid, engines: {
+        lambda db, sid, engines, probe_deadline=None: {
             "primary": {"configured": True, "online": True, "engine": "tdx"},
             "backup": None})
     monkeypatch.setattr(
         hs.live_service, "session_channel_guard",
-        lambda db, sid, engines: {"checks": [
+        lambda db, sid, engines, probe_deadline=None, health=None: {"checks": [
             {"key": "client_online", "ok": True, "label": "客户端/桥在线"}]})
     monkeypatch.setattr(
         hs.live_service, "session_data_health",
@@ -301,3 +301,59 @@ def test_in_progress_data_health_marks_incomplete(session_factory, patched):
     assert item["data"]["incomplete"] is True
     assert "已有数据体检在执行" in item["data"]["reason"]
     assert res["partial"] is True
+
+
+def test_overview_probes_channel_once_and_guard_reuses_result(
+        session_factory, patched):
+    """同一轮总览内同一会话只探一次：guard 复用 channel-health 的结果。"""
+    db = session_factory()
+    _session(db, engine="goldminer")
+    db.close()
+    calls = {"health": 0, "deadlines": [], "guard": []}
+
+    def _health(db, sid, engines, probe_deadline=None):
+        calls["health"] += 1
+        calls["deadlines"].append(probe_deadline)
+        return {
+            "primary": {"configured": True, "online": True,
+                        "engine": "goldminer"},
+            "backup": None,
+        }
+
+    def _guard(db, sid, engines, probe_deadline=None, health=None):
+        calls["guard"].append(health)
+        return {"checks": [{"key": "client_online", "ok": True,
+                            "label": "客户端/桥在线"}]}
+
+    patched.setattr(hs.live_service, "session_channel_health", _health)
+    patched.setattr(hs.live_service, "session_channel_guard", _guard)
+
+    hs.overview(session_factory=session_factory, now=NOW)
+
+    assert calls["health"] == 1                       # 只真实探活一次
+    assert calls["guard"][0] is not None               # guard 拿到同一结果
+    assert calls["guard"][0]["primary"]["engine"] == "goldminer"
+    assert calls["deadlines"][0] is not None           # 探活有独立时间预算
+
+
+def test_overview_surfaces_probe_degradation(session_factory, patched):
+    """探活超时沿用上次结果时，总览如实标注（不能静默当成离线/正常）。"""
+    db = session_factory()
+    _session(db, engine="goldminer")
+    db.close()
+
+    def _health(db, sid, engines, probe_deadline=None):
+        return {
+            "primary": {"configured": True, "online": True,
+                        "engine": "goldminer", "probe_degraded": True,
+                        "probe_note": "探活超时，沿用上次结果"},
+            "backup": None,
+        }
+
+    patched.setattr(hs.live_service, "session_channel_health", _health)
+
+    res = hs.overview(session_factory=session_factory, now=NOW)
+    item = res["sessions"][0]
+    assert item["channel"]["probe_degraded"] is True
+    assert item["channel"]["probe_note"] == "探活超时，沿用上次结果"
+    assert any("探活超时，沿用上次结果" in p["text"] for p in res["problems"])

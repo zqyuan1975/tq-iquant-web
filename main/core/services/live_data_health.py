@@ -16,6 +16,7 @@
 """
 from __future__ import annotations
 
+import inspect
 import logging
 import time as _time
 from datetime import date, datetime, time, timedelta
@@ -44,6 +45,18 @@ _MAX_CODES = 50
 _SLOW_QUOTE_SECONDS = 5.0
 # slow_quotes 最多保留条数（避免响应体膨胀）。
 _MAX_SLOW_QUOTES = 20
+# 单只取价硬超时（秒）：预算只在「每只之前」检查，在飞的那次拦不住，实测掘金桥
+# 出现过单只 12.67s 把 2s 预算拖穿。这里给 httpx 请求本身加硬超时，超时即放弃
+# 该只并计入未校验（``timeout_codes``），保证单会话体检不超过约 2×预算。
+# 取值理由：默认 2s ≈ 一次正常桥应答 + 一次排队余量（QMT /quote 实测 0.31s，
+# 掘金正常 5.9s）；带预算调用时再压到预算的 60%（2s 预算 → 1.2s），保证单只
+# 超时**严格低于**整体预算，不会一只就吃满预算。桥慢（掘金 5.9s）时该只会被
+# 误杀为「未校验/超时」而不是「数据缺失」——如实标注，不误报缺失、不阻断接口。
+_QUOTE_HARD_TIMEOUT_SECONDS = 2.0
+# 单只超时占整体预算的上限比例：留出余量给下一只/收尾，避免一只吃满预算。
+_QUOTE_TIMEOUT_BUDGET_RATIO = 0.6
+# 是否支持 per-call timeout 的能力缓存（按 dispatcher 类型）。
+_TIMEOUT_SUPPORT: Dict[type, bool] = {}
 
 
 def _fallback_is_trading_day(d: date) -> bool:
@@ -116,9 +129,52 @@ def classify_bar_freshness(period: str, bars, expected_date: date) -> dict:
     return {"status": status, "last_bar": last.isoformat()}
 
 
+def _supports_call_timeout(dispatcher) -> bool:
+    """dispatcher.query_quote 是否接受 per-call ``timeout``（按类型缓存）。
+
+    只有 HTTP 桥实现支持；tdx/ths 的同步实现与测试替身不支持，退化为不带超时
+    （这两类都是本地调用，不经过可能挂几十秒的网络）。
+    """
+    cls = type(dispatcher)
+    hit = _TIMEOUT_SUPPORT.get(cls)
+    if hit is None:
+        try:
+            sig = inspect.signature(dispatcher.query_quote)
+            hit = ("timeout" in sig.parameters
+                   or any(p.kind == p.VAR_KEYWORD for p in sig.parameters.values()))
+        except (TypeError, ValueError):
+            hit = False
+        _TIMEOUT_SUPPORT[cls] = hit
+    return hit
+
+
+def _query_quote(dispatcher, code: str, period: str, timeout: float,
+                 count: int = _CHECK_COUNT):
+    """带硬超时的单只取价（不支持 per-call timeout 的实现原样调用）。"""
+    if _supports_call_timeout(dispatcher):
+        return dispatcher.query_quote(code, period=period,
+                                      count=count, timeout=timeout)
+    return dispatcher.query_quote(code, period=period, count=count)
+
+
+def _is_timeout_error(exc: BaseException) -> bool:
+    """判断是否为取价超时（桥侧把 httpx 超时包成 BridgeUnavailableError）。"""
+    cause = getattr(exc, "__cause__", None)
+    for err in (exc, cause):
+        if err is None:
+            continue
+        if "timeout" in type(err).__name__.lower():
+            return True
+        text = str(err).lower()
+        if "timed out" in text or "timeout" in text:
+            return True
+    return False
+
+
 def check_data_health(dispatcher, codes, periods, *, now: datetime = None,
                       calendar=None, max_codes: Optional[int] = None,
                       time_budget_seconds: Optional[float] = None,
+                      quote_timeout_seconds: Optional[float] = None,
                       session_id: Optional[int] = None) -> dict:
     """逐 code × period 读取最新 bar 并汇总健康度（只读）。
 
@@ -129,14 +185,26 @@ def check_data_health(dispatcher, codes, periods, *, now: datetime = None,
     ``session_id`` 只用于慢调用留痕：单只取价超过 ``_SLOW_QUOTE_SECONDS`` 时写
     WARNING（会话/标的/周期/耗时），并在结果 ``slow_quotes`` 里保留最近若干条。
 
+    ``quote_timeout_seconds`` 是**单只取价硬超时**（默认 2s）：时间预算只在每只
+    之前检查，在飞的那次调用拦不住；给桥请求本身加超时后，超时的标的记为
+    ``timeout_codes`` / 未校验，单会话最坏耗时约为 2×预算。
+
     返回结构（可直接 JSON 序列化）：
     {version, checked_at, intraday, expected_dates, healthy, unavailable,
      truncated, requested_codes, checked_codes,
+     timeout_count, timeout_codes, slow_quotes, slow_quote_count,
      periods: {p: {total, ok, stale, empty, error, stale_codes, empty_codes,
                    error_codes, stale_count, empty_count, error_count}},
      missing_codes: [...], missing_count}
     """
     now = now or now_shanghai()
+    quote_timeout = (float(quote_timeout_seconds)
+                     if quote_timeout_seconds is not None
+                     else _QUOTE_HARD_TIMEOUT_SECONDS)
+    if time_budget_seconds is not None and time_budget_seconds > 0:
+        # 单只超时必须**严格低于**整体预算，否则「在飞的那只」仍会把调用方拖穿。
+        quote_timeout = min(quote_timeout, max(
+            0.2, float(time_budget_seconds) * _QUOTE_TIMEOUT_BUDGET_RATIO))
     requested_codes = [str(c) for c in (codes or []) if str(c)]
     codes = requested_codes
     periods = [str(p) for p in (periods or []) if str(p)]
@@ -156,8 +224,11 @@ def check_data_health(dispatcher, codes, periods, *, now: datetime = None,
     total_errors = 0
     budget_exhausted = False
     slow_quotes: List[dict] = []
+    timeout_codes: List[str] = []
+    timeout_count = 0
     for period in periods:
         stats = {"total": 0, "ok": 0, "stale": 0, "empty": 0, "error": 0,
+                 "timeout": 0,
                  "stale_codes": [], "empty_codes": [], "error_codes": []}
         for code in codes:
             if not code:
@@ -167,16 +238,32 @@ def check_data_health(dispatcher, codes, periods, *, now: datetime = None,
                 break
             stats["total"] += 1
             total_checks += 1
-            checked_codes.add(code)
+            call_timeout = quote_timeout
+            if deadline is not None:
+                call_timeout = min(quote_timeout,
+                                   max(0.05, deadline - _time.monotonic()))
             quote_started = _time.monotonic()
             try:
-                bars = dispatcher.query_quote(code, period=period, count=_CHECK_COUNT)
+                bars = _query_quote(dispatcher, code, period, call_timeout)
             except Exception as exc:  # noqa: BLE001 — 桥离线/通道异常都不阻断体检
-                stats["error"] += 1
-                total_errors += 1
-                if len(stats["error_codes"]) < _MAX_CODES:
-                    stats["error_codes"].append(code)
-                logger.debug("数据体检取数失败 code=%s period=%s: %s", code, period, exc)
+                if _is_timeout_error(exc):
+                    # 硬超时：放弃该只并计入未校验，**不**计入 error/missing，
+                    # 避免把「来不及验」误报成「数据缺失」（补齐也没有意义）。
+                    stats["timeout"] += 1
+                    timeout_count += 1
+                    if len(timeout_codes) < _MAX_CODES:
+                        timeout_codes.append(code)
+                    logger.warning(
+                        "数据体检单只取价超时：会话 %s 标的 %s 周期 %s 硬超时 %.2fs，"
+                        "本次放弃该只并计入未校验（不判为数据缺失）",
+                        session_id, code, period, call_timeout)
+                else:
+                    stats["error"] += 1
+                    total_errors += 1
+                    if len(stats["error_codes"]) < _MAX_CODES:
+                        stats["error_codes"].append(code)
+                    logger.debug("数据体检取数失败 code=%s period=%s: %s",
+                                 code, period, exc)
                 continue
             finally:
                 elapsed = _time.monotonic() - quote_started
@@ -190,6 +277,7 @@ def check_data_health(dispatcher, codes, periods, *, now: datetime = None,
                             "code": code, "period": period,
                             "elapsed_seconds": round(elapsed, 2),
                         })
+            checked_codes.add(code)
             verdict = classify_bar_freshness(period, bars, expected[period])
             stats[verdict["status"]] += 1
             if verdict["status"] != "ok" and len(stats["%s_codes" % verdict["status"]]) < _MAX_CODES:
@@ -197,6 +285,7 @@ def check_data_health(dispatcher, codes, periods, *, now: datetime = None,
         stats["stale_count"] = stats["stale"]
         stats["empty_count"] = stats["empty"]
         stats["error_count"] = stats["error"]
+        stats["timeout_count"] = stats["timeout"]
         per_period[period] = stats
         for key in ("stale_codes", "empty_codes", "error_codes"):
             for code in stats[key]:
@@ -207,6 +296,7 @@ def check_data_health(dispatcher, codes, periods, *, now: datetime = None,
     truncated = truncated or budget_exhausted
     healthy = (not truncated) and all(
         stats["stale"] == 0 and stats["empty"] == 0 and stats["error"] == 0
+        and stats["timeout"] == 0
         for stats in per_period.values()
     )
     return {
@@ -219,6 +309,8 @@ def check_data_health(dispatcher, codes, periods, *, now: datetime = None,
         "truncated": truncated,
         "requested_codes": len(requested_codes),
         "checked_codes": len(checked_codes),
+        "timeout_count": timeout_count,
+        "timeout_codes": timeout_codes,
         "slow_quotes": slow_quotes,
         "slow_quote_count": len(slow_quotes),
         "periods": per_period,
@@ -231,6 +323,7 @@ def auto_fill_missing(dispatcher, health: dict, codes, periods, *,
                       now: datetime = None, calendar=None,
                       max_pairs: Optional[int] = None,
                       time_budget_seconds: Optional[float] = None,
+                      quote_timeout_seconds: Optional[float] = None,
                       session_id: Optional[int] = None) -> dict:
     """非盘中自动补齐：对缺失 (code, period) 用更大 count 重读一次。
 
@@ -264,13 +357,21 @@ def auto_fill_missing(dispatcher, health: dict, codes, periods, *,
         deadline = _time.monotonic() + float(time_budget_seconds)
     warmed = 0
     failed = 0
+    call_timeout = (float(quote_timeout_seconds)
+                    if quote_timeout_seconds is not None
+                    else _QUOTE_HARD_TIMEOUT_SECONDS)
     for code, period in pairs:
         if deadline is not None and _time.monotonic() >= deadline:
             truncated = True
             break
+        this_timeout = call_timeout
+        if deadline is not None:
+            this_timeout = min(call_timeout,
+                               max(0.05, deadline - _time.monotonic()))
         quote_started = _time.monotonic()
         try:
-            bars = dispatcher.query_quote(code, period=period, count=_WARM_COUNT)
+            bars = _query_quote(dispatcher, code, period, this_timeout,
+                                count=_WARM_COUNT)
             if bars:
                 warmed += 1
             else:
@@ -289,6 +390,7 @@ def auto_fill_missing(dispatcher, health: dict, codes, periods, *,
                 "requested": requested_pairs, "warmed": warmed, "failed": failed,
                 "truncated": True}
     after = check_data_health(dispatcher, codes, periods, now=now, calendar=calendar,
+                              quote_timeout_seconds=quote_timeout_seconds,
                               session_id=session_id)
     return {"triggered": True, "reason": "off_hours", "requested": requested_pairs,
             "warmed": warmed, "failed": failed, "after": after}
@@ -298,17 +400,20 @@ def run_health_check(dispatcher, codes, periods, *, auto_fill: bool = True,
                      now: datetime = None, calendar=None,
                      max_codes: Optional[int] = None,
                      time_budget_seconds: Optional[float] = None,
+                     quote_timeout_seconds: Optional[float] = None,
                      session_id: Optional[int] = None) -> dict:
     """体检 + 可选非盘中补齐；返回 {health, auto_fill}（health 为补齐后结果）。
 
     启动链路与健康总览都应传 ``max_codes`` / ``time_budget_seconds``，保证体检
     不会把调用方卡在同步取数上；超预算时跳过补齐，直接返回部分结果。
+    ``quote_timeout_seconds`` 透传给单只取价硬超时（不传则用默认 2s）。
     ``session_id`` 仅用于慢调用留痕。
     """
     now = now or now_shanghai()
     health = check_data_health(dispatcher, codes, periods, now=now, calendar=calendar,
                                max_codes=max_codes,
                                time_budget_seconds=time_budget_seconds,
+                               quote_timeout_seconds=quote_timeout_seconds,
                                session_id=session_id)
     result = {"health": health, "auto_fill": None}
     if health.get("truncated"):
@@ -320,6 +425,7 @@ def run_health_check(dispatcher, codes, periods, *, auto_fill: bool = True,
                                  now=now, calendar=calendar,
                                  max_pairs=max_codes,
                                  time_budget_seconds=time_budget_seconds,
+                                 quote_timeout_seconds=quote_timeout_seconds,
                                  session_id=session_id)
         after = fill.pop("after", None)
         result["auto_fill"] = fill
@@ -341,10 +447,16 @@ def health_summary_text(health: dict) -> str:
         bad = int(stats.get("stale", 0)) + int(stats.get("empty", 0))
         if bad:
             parts.append("%s 缺失/陈旧 %d 只" % (period, bad))
+    timeout_count = int(health.get("timeout_count", 0) or 0)
     if not parts:
+        if timeout_count:
+            return "数据体检部分未校验：%d 只取价超时（不影响启动）" % timeout_count
         return "数据体检通过"
     shown = "、".join((health.get("missing_codes") or [])[:10])
-    return "数据体检异常：%s（%s%s）；请确认通达信已下载对应周期数据" % (
+    text = "数据体检异常：%s（%s%s）；请确认通达信已下载对应周期数据" % (
         "，".join(parts), shown,
         " 等" if int(health.get("missing_count", 0)) > 10 else "",
     )
+    if timeout_count:
+        text += "；另有 %d 只取价超时未校验" % timeout_count
+    return text

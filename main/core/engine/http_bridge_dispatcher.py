@@ -1140,12 +1140,17 @@ class HttpBridgeDispatcher(OrderDispatcher):
         """
         return self._get_json("/calendar")
 
-    def query_quote(self, code: str, period: str = "1m", count: int = 10) -> list:
+    def query_quote(self, code: str, period: str = "1m", count: int = 10,
+                    timeout: Optional[float] = None) -> list:
         """拉 1m/5m/1d bar（0009 切片3 行情通道）。
 
         桥 GET /quote?code=&period=&count= 返回
         {"ok": True, "data": {code: [bar, ...]}}，每 bar 含 stime/open/high/low/close/volume。
         返回该 code 的 bar dict 列表（空数据 → 空列表）。
+
+        ``timeout``：单次请求的硬超时（秒，httpx per-request 覆盖），仅供数据体检
+        这类「宁可放弃该只也不拖死调用方」的路径使用；None 沿用构造时的读超时
+        （桥全局锁排队可能需要 15–30s，正常取数不能设太小）。
 
         复权口径（P2-9）：桥侧一律返回**不复权**原始价——掘金桥
         ``/quote`` 用 ``adjust=0``；QMT 桥 ``dividend_type="follow"`` 经
@@ -1156,7 +1161,9 @@ class HttpBridgeDispatcher(OrderDispatcher):
         """
         path = "/quote?code=%s&period=%s&count=%s" % (code, period, count)
         try:
-            r = self._do_request("GET", path)
+            # 体检路径传 timeout 时按单次请求覆盖 httpx 读超时（见 docstring）。
+            kwargs = {"timeout": timeout} if timeout else {}
+            r = self._do_request("GET", path, **kwargs)
         except Exception as e:
             raise BridgeUnavailableError("bridge request failed: %s" % e) from e
         if r.status_code != 200:

@@ -48,6 +48,10 @@ _OVERVIEW_TOTAL_BUDGET_SECONDS = 12.0
 # 「未校验完整」也不允许扫全池。
 _OVERVIEW_DATA_HEALTH_MAX_CODES = 30
 _OVERVIEW_DATA_HEALTH_BUDGET_SECONDS = 2.0
+# 单会话通道探活预算：与 HTTP 桥 /ping 的真实量级对齐（掘金实测 3.02s，
+# 桥读超时 5s）。超过即沿用上次已知状态并标注「探活超时，沿用上次结果」，
+# 不再阻塞总览；窗口类探针本身是毫秒级，不会用到这个上限。
+_OVERVIEW_PROBE_BUDGET_SECONDS = 5.0
 # 降级原因（前端/日志可直接展示）。
 REASON_OVERVIEW_BUDGET = "健康总览整体时间预算已耗尽，未做数据体检"
 REASON_DATA_TRUNCATED = "体检超出预算，仅校验部分标的"
@@ -72,10 +76,15 @@ def _channel_ok(primary: Optional[dict]) -> bool:
 
 
 def _session_item(db, session: LiveSession, now: datetime,
-                  data_budget: Optional[float] = None) -> dict:
+                  data_budget: Optional[float] = None,
+                  probe_deadline: Optional[float] = None) -> dict:
     """单会话聚合；``data_budget`` 是本会话体检可用的秒数（None=默认预算）。
 
     体检预算耗尽时不再调用取数，直接标注「未完成 + 原因」，保证总览整体时长可控。
+
+    ``probe_deadline`` 是本会话通道探活的时间预算（单调时钟时点）。同一轮总览里
+    channel-health 只算**一次**，guard 直接复用该结果（``health=``），避免同会话
+    两次真实探活（此前 s2/s3 各多花 3.5s / 5.5s）。
     """
     sid = int(session.id)
     engine = live_service.ENGINES.get(sid)
@@ -85,13 +94,14 @@ def _session_item(db, session: LiveSession, now: datetime,
                    {"online": None, "status": "unknown"})
     health = _safe("channel_health(%s)" % sid,
                    lambda: live_service.session_channel_health(
-                       db, sid, live_service.ENGINES))
+                       db, sid, live_service.ENGINES, probe_deadline))
     primary = (health or {}).get("primary")
     backup = (health or {}).get("backup")
 
     guard = _safe("channel_guard(%s)" % sid,
                   lambda: live_service.session_channel_guard(
-                      db, sid, live_service.ENGINES))
+                      db, sid, live_service.ENGINES,
+                      probe_deadline=probe_deadline, health=health))
     checks = (guard or {}).get("checks") or []
     failed = [c.get("label") for c in checks if not c.get("ok")]
 
@@ -169,7 +179,13 @@ def _session_item(db, session: LiveSession, now: datetime,
         "backup_engine": getattr(session, "backup_engine", None),
         "registered": engine is not None,
         "bridge": bridge,
-        "channel": {"primary": primary, "backup": backup},
+        "channel": {
+            "primary": primary, "backup": backup,
+            # 探活降级（超时/预算耗尽沿用上次结果）——与「通道离线」区分开：
+            # 前者是本次没探成，后者是探到了确实不在。
+            "probe_degraded": bool((primary or {}).get("probe_degraded")),
+            "probe_note": (primary or {}).get("probe_note") or "",
+        },
         "channel_ok": _channel_ok(primary),
         "channel_guard": {
             "available": guard is not None,
@@ -246,16 +262,20 @@ def overview(session_factory=None, now: Optional[datetime] = None) -> dict:
     core = _safe("status", get_status, {})
     core_data = (core or {}).get("data", {}).get("core", {}) if core else {}
 
-    # 整体预算：逐会话聚合（通道探测各 1s 封顶，体检按剩余预算分配），
-    # 预算耗尽后剩余会话不再体检，只标明「未完成 + 原因」。
+    # 整体预算：逐会话聚合（通道探活按 5s/会话独立预算，体检按剩余预算分配），
+    # 预算耗尽后剩余会话不再体检/探活，只标明「未完成 + 原因」。
     deadline = _monotonic() + _OVERVIEW_TOTAL_BUDGET_SECONDS
     db = factory()
     try:
         sessions = db.query(LiveSession).order_by(LiveSession.id).all()
         items = []
         for s in sessions:
-            items.append(_session_item(db, s, now,
-                                       data_budget=deadline - _monotonic()))
+            remaining = deadline - _monotonic()
+            probe_budget = max(0.0, min(_OVERVIEW_PROBE_BUDGET_SECONDS, remaining))
+            items.append(_session_item(
+                db, s, now,
+                data_budget=deadline - _monotonic(),
+                probe_deadline=_monotonic() + probe_budget))
     finally:
         db.close()
 
@@ -297,6 +317,11 @@ def overview(session_factory=None, now: Optional[datetime] = None) -> dict:
             _add(LEVEL_WARN, "会话「%s」通道检查未通过：%s" % (
                 item["name"], "、".join(str(x) for x in
                                        item["channel_guard"]["failed"][:4])))
+        chan = item.get("channel") or {}
+        if chan.get("probe_degraded") and chan.get("probe_note"):
+            # 探活没探成 ≠ 通道离线：如实标注，避免被误读为故障。
+            _add(LEVEL_WARN, "会话「%s」通道探活降级：%s"
+                 % (item["name"], chan.get("probe_note")))
         data = item["data"]
         if data.get("unavailable"):
             _add(LEVEL_WARN, "会话「%s」数据体检不可用：%s"

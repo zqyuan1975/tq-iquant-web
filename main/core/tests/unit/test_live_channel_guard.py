@@ -30,7 +30,8 @@ def _session(db, engine="tdx", backup=None, status="stopped"):
 
 
 def _fake_status(online_map):
-    def fake(engine: str = None, engine_key: str = None, engines=None):
+    def fake(engine: str = None, engine_key: str = None, engines=None,
+             probe_deadline=None):
         return {
             "label": engine_key,
             "online": online_map.get(engine_key, False),
@@ -100,7 +101,7 @@ def test_reconnect_online(monkeypatch):
     db = _db()
     sid = _session(db, engine="tdx")
     monkeypatch.setattr(live_service, "_force_channel_probe",
-                        lambda key: (True, False))
+                        lambda key: (True, False, "ok"))
     ok, data = live_service.reconnect_session_channel(db, sid, {})
     assert ok is True
     assert data["online"] is True and data["manual_action"] == ""
@@ -110,7 +111,7 @@ def test_reconnect_offline_returns_manual_hint(monkeypatch):
     db = _db()
     sid = _session(db, engine="ths")
     monkeypatch.setattr(live_service, "_force_channel_probe",
-                        lambda key: (False, False))
+                        lambda key: (False, False, "ok"))
     ok, data = live_service.reconnect_session_channel(db, sid, {})
     assert ok is True
     assert data["online"] is False
