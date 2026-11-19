@@ -71,7 +71,8 @@ def _drop(start=Decimal("1000000"), days=DAYS, at=400, pct="0.10"):
 
 
 def _make_side(db, *, name, code, values, phase, hold_days, turnover,
-               max_drawdown=Decimal("0.20"), buy_amount=Decimal("60000")):
+               max_drawdown=Decimal("0.20"), buy_amount=Decimal("60000"),
+               gate_states=None, market_gate=False):
     pool = StockPool(code="POOL_%s" % name, name=name)
     db.add(pool)
     db.flush()
@@ -95,7 +96,8 @@ def _make_side(db, *, name, code, values, phase, hold_days, turnover,
     db.flush()
     rec.params_snapshot = build_params_snapshot(
         ps, strategies=[strategy],
-        stock_pool_codes={str(pool.id): [code]})
+        stock_pool_codes={str(pool.id): [code]},
+        market_gate_enabled=market_gate)
     rec.validation_json = json.dumps({"capacity": []})
     rec.data_quality_json = json.dumps(
         {"summary": {"coverage_ratio": 0.995}, "missing_stocks": []})
@@ -122,7 +124,8 @@ def _make_side(db, *, name, code, values, phase, hold_days, turnover,
             target_id=ps.id, snap_date=DAY0 + timedelta(days=i),
             total_value=value, cash=Decimal("200000"),
             market_value=value - Decimal("200000"),
-            gate_state=(1 if i < 200 else (-1 if i < 300 else 0)),
+            gate_state=(gate_states[i] if gate_states is not None else
+                        (1 if i < 200 else (-1 if i < 300 else 0))),
             positions_json=positions)
         for i, value in enumerate(values)
     ])
@@ -172,18 +175,26 @@ def _pair(db, *, lender_values=None, borrower_values=None,
           lender_code="600000.SH", borrower_code="600001.SH",
           lender_hold=10, borrower_hold=20,
           lender_turnover=10, borrower_turnover=20,
-          lender_dd=Decimal("0.20"), borrower_dd=Decimal("0.20")):
+          lender_dd=Decimal("0.20"), borrower_dd=Decimal("0.20"),
+          lender_gate=None, borrower_gate=None, market_gate=False):
     lender, lender_rec, _ = _make_side(
         db, name="出借方", code=lender_code,
         values=lender_values or _alternating(phase=0), phase=0,
         hold_days=lender_hold, turnover=lender_turnover,
-        max_drawdown=lender_dd)
+        max_drawdown=lender_dd, gate_states=lender_gate,
+        market_gate=market_gate)
     borrower, borrower_rec, _ = _make_side(
         db, name="借款方", code=borrower_code,
         values=borrower_values or _alternating(phase=1), phase=1,
         hold_days=borrower_hold, turnover=borrower_turnover,
-        max_drawdown=borrower_dd)
+        max_drawdown=borrower_dd, gate_states=borrower_gate,
+        market_gate=market_gate)
     return lender, borrower
+
+
+def _gate_states(closed):
+    """DAYS 长度门控序列：下标在 ``closed`` 内的日期为关闭（-1），其余多头。"""
+    return [-1 if i in closed else 1 for i in range(DAYS)]
 
 
 def _check(result, code):
@@ -218,7 +229,11 @@ def test_capacity_pending_blocks_go_until_c_layer():
     assert _check(result, "H4")["state"] == STATE_PENDING
     assert _check(result, "H4")["detail"]["pending_code"] == PENDING_C
     assert _check(result, "H6")["detail"]["pending_code"] == PENDING_C
-    assert any(s["pending_code"] == PENDING_D for s in result["soft"])
+    gate = _feature(result, "gate_off_overlap")
+    # 默认夹具未启用门控：关闭重合不适用，不参与判定，也不再标 PENDING_D
+    assert gate["state"] == STATE_PASS
+    assert gate["detail"]["applicable"] is False
+    assert gate["pending_code"] is None
 
 
 def test_h1_borrower_ineligible_is_no_go():
@@ -365,3 +380,54 @@ def test_same_portfolio_is_rejected():
         evaluate_pairing(db, lender.id, lender.id)
     with pytest.raises(LookupError):
         evaluate_pairing(db, lender.id, 9999)
+
+
+# ---------------- D1 门控关闭重合 ----------------
+
+def test_gate_off_overlap_pass_when_closed_days_disjoint():
+    db = _db()
+    lender, borrower = _pair(
+        db, market_gate=True,
+        lender_gate=_gate_states(set(range(0, 70))),
+        borrower_gate=_gate_states(set(range(100, 170))))
+    result = evaluate_pairing(db, lender.id, borrower.id,
+                              capacity=_capacity_ok())
+    gate = _feature(result, "gate_off_overlap")
+    assert gate["state"] == STATE_PASS
+    assert gate["value"] == pytest.approx(0.0)
+    assert gate["detail"]["applicable"] is True
+    assert gate["detail"]["both_closed"] == 0
+    assert result["metrics"]["gate_off_overlap"] == pytest.approx(0.0)
+    assert result["gate"]["lender"]["coverage"]["closed"] == 70
+
+
+def test_gate_off_overlap_fail_when_closed_days_identical():
+    db = _db()
+    closed = set(range(50, 120))
+    lender, borrower = _pair(
+        db, market_gate=True,
+        lender_gate=_gate_states(closed),
+        borrower_gate=_gate_states(closed))
+    result = evaluate_pairing(db, lender.id, borrower.id,
+                              capacity=_capacity_ok())
+    gate = _feature(result, "gate_off_overlap")
+    assert gate["value"] == pytest.approx(1.0)
+    assert gate["state"] == STATE_FAIL
+    assert result["status"] == STATUS_WATCH
+    assert "gate_off_overlap" in result["triggers"]
+
+
+def test_gate_off_overlap_pending_for_unknown_gate_caliber():
+    """旧记录未冻结门控开关 → 口径未知，仍标 PENDING_D，不猜结论。"""
+    db = _db()
+    lender, borrower = _pair(db, market_gate=True)
+    for ps in (lender, borrower):
+        rec = db.query(BacktestRecord).filter_by(
+            portfolio_strategy_id=ps.id).first()
+        rec.params_snapshot = json.dumps({"strategies": []})
+    db.commit()
+    result = evaluate_pairing(db, lender.id, borrower.id,
+                              capacity=_capacity_ok())
+    gate = _feature(result, "gate_off_overlap")
+    assert gate["state"] == STATE_PENDING
+    assert gate["pending_code"] == PENDING_D

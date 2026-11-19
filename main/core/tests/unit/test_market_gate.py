@@ -7,7 +7,9 @@ import pytest
 
 from core.engine.market_gate import (
     MarketGateTracker,
+    build_gate_timeline,
     compute_gate_states,
+    gate_off_overlap,
     parse_tdx_gate_outputs,
 )
 
@@ -138,3 +140,71 @@ def test_parse_tdx_missing_line_raises():
     raw = {"ErrorId": "0", "000985.CSI": {"多头强度": {"date": [], "value": []}}}
     with pytest.raises(ValueError):
         parse_tdx_gate_outputs(raw, "000985.CSI")
+
+
+# ---------------- D1 门控时间轴与关闭重合 ----------------
+
+D0 = date(2025, 1, 2)
+
+
+def _days(n):
+    return [D0 + timedelta(days=i) for i in range(n)]
+
+
+def _seq(spec, n=10):
+    """spec: {index: state}；未列出的日期记 0（未定）。"""
+    return {d: spec.get(i, 0) for i, d in enumerate(_days(n))}
+
+
+def test_build_gate_timeline_from_pairs_and_mapping():
+    days = _days(5)
+    tl = build_gate_timeline([(days[0], -1), (days[1], 1), (days[2], None)])
+    assert tl.days == (days[0], days[1])
+    assert tl.closed_on(days[0]) and not tl.closed_on(days[1])
+    assert tl.state_on(date(2024, 12, 31)) == 0          # 轴外日期按未定
+    tl_map = build_gate_timeline({days[0]: -1, days[1]: 2})
+    assert tl_map.days == (days[0], days[1])
+    assert build_gate_timeline([]) is None
+    assert build_gate_timeline([(days[0], None)]) is None
+
+
+def test_gate_timeline_runs_and_coverage():
+    tl = build_gate_timeline(_seq({1: -1, 2: -1, 4: -1, 5: 1}, n=6))
+    days = _days(6)
+    assert tl.runs() == [(days[1], days[2]), (days[4], days[4])]
+    assert tl.coverage() == {"days": 6, "closed": 3, "open": 1, "neutral": 2}
+    summary = tl.to_dict()
+    assert summary["first_day"] == days[0].isoformat()
+    assert [r["days"] for r in summary["closed_runs"]] == [2, 1]
+
+
+def test_gate_timeline_has_no_lookahead():
+    """某日判定只依赖当天记录：删掉后续日期不影响已有日期的状态。"""
+    full = build_gate_timeline(_seq({2: -1, 5: 1}, n=8))
+    prefix = build_gate_timeline(_seq({2: -1}, n=3))
+    for day in prefix.days:
+        assert full.state_on(day) == prefix.state_on(day)
+        assert full.closed_on(day) == prefix.closed_on(day)
+    # 关闭区间的结束日不能被未来的恢复日提前影响到
+    assert full.runs() == [(_days(8)[2], _days(8)[2])]
+
+
+def test_gate_off_overlap_jaccard_on_common_days():
+    lender = build_gate_timeline(_seq({0: -1, 1: -1, 2: 1}, n=5))
+    borrower = build_gate_timeline(_seq({1: -1, 3: -1}, n=5))
+    metric = gate_off_overlap(lender, borrower)
+    assert metric["both_closed"] == 1          # 仅第 1 日同日关闭
+    assert metric["either_closed"] == 3        # 0/1/3
+    assert metric["overlap"] == pytest.approx(1 / 3)
+    assert metric["common_days"] == 5
+
+    same = gate_off_overlap(lender, lender)
+    assert same["overlap"] == pytest.approx(1.0)
+
+
+def test_gate_off_overlap_zero_and_disjoint_days():
+    lender = build_gate_timeline(_seq({0: 1, 1: 2}, n=3))
+    borrower = build_gate_timeline(_seq({0: 0, 1: 0, 2: 0}, n=3))
+    assert gate_off_overlap(lender, borrower)["overlap"] == 0.0
+    other = build_gate_timeline({date(2024, 5, 1): -1})
+    assert gate_off_overlap(lender, other) is None   # 无共同交易日

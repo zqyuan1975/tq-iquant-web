@@ -16,6 +16,8 @@ from __future__ import annotations
 import bisect
 import json
 import logging
+from collections.abc import Mapping
+from dataclasses import dataclass
 from datetime import date, datetime
 from itertools import pairwise
 from typing import TYPE_CHECKING, Optional
@@ -84,6 +86,125 @@ class MarketGateTracker:
         if not self._sorted_days:
             return None
         return (self._sorted_days[0], self._sorted_days[-1])
+
+
+# ---------------- D1 门控时间轴（回测快照 → 只读轴） ----------------
+
+GATE_CLOSED_STATE = -1
+GATE_OPEN_STATES = frozenset({1, 2})
+
+
+@dataclass(frozen=True)
+class GateTimeline:
+    """逐日门控状态轴（只读）。
+
+    ``states`` 取回测快照里记录的**当日生效值**（引擎已按「昨日收盘状态管今日
+    开仓」右移），这里不再平移、也不参考任何后续日期：某天的判定只依赖当天
+    记录，因此天然无前视。``days`` 为升序交易日元组。
+    """
+
+    days: tuple
+    states: dict
+
+    def state_on(self, day: date) -> int:
+        return int(self.states.get(day, 0) or 0)
+
+    def closed_on(self, day: date) -> bool:
+        return self.state_on(day) == GATE_CLOSED_STATE
+
+    @property
+    def closed_days(self) -> frozenset:
+        return frozenset(d for d in self.days if self.closed_on(d))
+
+    def runs(self) -> list:
+        """连续关闭区间 ``[(start, end), ...]``（按相邻记录日，不插自然日）。"""
+        out: list = []
+        start = prev = None
+        for day in self.days:
+            if self.closed_on(day):
+                if start is None:
+                    start = day
+                prev = day
+            elif start is not None:
+                out.append((start, prev))
+                start = prev = None
+        if start is not None:
+            out.append((start, prev))
+        return out
+
+    def coverage(self) -> dict:
+        closed = sum(1 for d in self.days if self.closed_on(d))
+        opened = sum(1 for d in self.days
+                     if self.state_on(d) in GATE_OPEN_STATES)
+        return {"days": len(self.days), "closed": closed,
+                "open": opened, "neutral": len(self.days) - closed - opened}
+
+    def to_dict(self) -> dict:
+        """紧凑摘要（不逐日展开，避免接口膨胀）。"""
+        return {
+            "days": len(self.days),
+            "first_day": self.days[0].isoformat() if self.days else None,
+            "last_day": self.days[-1].isoformat() if self.days else None,
+            "coverage": self.coverage(),
+            "closed_runs": [
+                {"start": s.isoformat(), "end": e.isoformat(),
+                 "days": sum(1 for d in self.days
+                             if s <= d <= e and self.closed_on(d))}
+                for s, e in self.runs()
+            ],
+        }
+
+
+def build_gate_timeline(rows) -> Optional[GateTimeline]:
+    """构造只读门控时间轴。
+
+    ``rows`` 支持 ``{date: state}`` 映射或 ``(date, state)`` 序列（例如日快照的
+    ``(snap_date, gate_state)``）；日期或状态为 ``None`` 的记录跳过，同一日期
+    重复出现以最后一条为准。无有效记录 → ``None``。
+    """
+    items = rows.items() if isinstance(rows, Mapping) else rows
+    states: dict = {}
+    for day, state in items:
+        if day is None or state is None:
+            continue
+        if not isinstance(day, date):
+            parsed = _parse_gate_date(day)
+            if parsed is None:
+                continue
+            day = parsed
+        states[day] = int(state)
+    if not states:
+        return None
+    return GateTimeline(days=tuple(sorted(states)), states=states)
+
+
+def gate_off_overlap(lender: GateTimeline,
+                     borrower: GateTimeline) -> Optional[dict]:
+    """双方门控关闭日的 Jaccard（仅共同交易日，0020 §3.3）。
+
+    = 双方同日关闭数 / 任一方关闭日数；双方在共同区间内都没有关闭日 → 0.0。
+    只看两边已记录的当日生效状态，不回看、不补未来状态。
+    """
+    common = sorted(set(lender.days) & set(borrower.days))
+    if not common:
+        return None
+    both = either = lender_closed = borrower_closed = 0
+    for day in common:
+        lc, bc = lender.closed_on(day), borrower.closed_on(day)
+        lender_closed += 1 if lc else 0
+        borrower_closed += 1 if bc else 0
+        if lc and bc:
+            both += 1
+        if lc or bc:
+            either += 1
+    return {
+        "overlap": (both / either) if either else 0.0,
+        "common_days": len(common),
+        "both_closed": both,
+        "either_closed": either,
+        "lender_closed": lender_closed,
+        "borrower_closed": borrower_closed,
+    }
 
 
 # ---------------- E3 多指数投票（组合级维度扩展） ----------------

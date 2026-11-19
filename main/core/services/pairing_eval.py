@@ -34,6 +34,7 @@ from core.models import (
     PortfolioStrategy,
     WalkForwardRun,
 )
+from core.engine.market_gate import build_gate_timeline, gate_off_overlap
 from core.services.pairing_eligibility import (
     STATUS_ELIGIBLE,
     STATUS_WATCH as ELIG_WATCH,
@@ -42,7 +43,7 @@ from core.services.pairing_eligibility import (
 
 logger = logging.getLogger(__name__)
 
-PAIRING_EVAL_VERSION = "pairing-eval-b5"
+PAIRING_EVAL_VERSION = "pairing-eval-d1"
 
 STATUS_GO = "GO"
 STATUS_WATCH = "WATCH"
@@ -72,6 +73,7 @@ HOLDING_RATIO_PASS, HOLDING_RATIO_WARN = 2.0, 1.2
 TURNOVER_PASS, TURNOVER_FAIL = 45.0, 60.0
 SIGNAL_OVERLAP_PASS, SIGNAL_OVERLAP_FAIL = 0.30, 0.60
 CASH_COMPLEMENT_PASS, CASH_COMPLEMENT_FAIL = 0.30, 0.10
+GATE_OVERLAP_PASS, GATE_OVERLAP_FAIL = 0.50, 0.70   # 0020 §3.3 门控关闭重合
 
 DRAWDOWN_DEPTH = 0.03          # 回撤重叠：跌超 3% 才算「处于回撤」
 DEFAULT_DD_LIMIT = 0.20        # 组合风控上限缺失时的保守默认
@@ -160,6 +162,19 @@ def _oos_window(db: Session, portfolio_strategy_id: int):
         if start and end:
             return start, end
     return None
+
+
+def _gate_flag(record: Optional[BacktestRecord]) -> Optional[bool]:
+    """该回测口径下组合是否受门控（``None`` = 旧记录未冻结开关，口径未知）。"""
+    if record is None:
+        return None
+    params = _load_json(record.params_snapshot)
+    if "market_gate_enabled" not in params:
+        return None
+    if params.get("market_gate_enabled"):
+        return True
+    return any((row or {}).get("market_gate_mode") == "on"
+               for row in params.get("strategies") or [])
 
 
 def _side_snapshots(db: Session, record_id: int, window=None) -> list:
@@ -741,10 +756,44 @@ def evaluate_pairing(db: Session, lender_portfolio_strategy_id: int,
         "容量占用重叠 %.4f" % cap_overlap if cap_overlap is not None
         else "容量占用重叠由 C 层容量模型提供，当前未接线",
         pending_code=None if cap_overlap is not None else PENDING_C))
+    # 门控关闭重合（D1）：由日快照 gate_state（已右移的当日生效值）构轴，
+    # 只在双方都受门控时才参与判定；一方未受门控 → 关闭期天然互补。
+    lender_gate = build_gate_timeline(
+        (snap.snap_date, snap.gate_state) for snap in lender_snaps)
+    borrower_gate = build_gate_timeline(
+        (snap.snap_date, snap.gate_state) for snap in borrower_snaps)
+    lender_gated, borrower_gated = _gate_flag(lender_rec), _gate_flag(borrower_rec)
+    gate_metric = (gate_off_overlap(lender_gate, borrower_gate)
+                   if lender_gate is not None and borrower_gate is not None
+                   else None)
+    gate_detail = {
+        "lender_gated": lender_gated,
+        "borrower_gated": borrower_gated,
+        "lender": lender_gate.to_dict() if lender_gate is not None else None,
+        "borrower": borrower_gate.to_dict() if borrower_gate is not None else None,
+    }
+    if gate_metric is not None:
+        gate_detail.update(gate_metric)
+    if lender_gated is False or borrower_gated is False:
+        gate_value, gate_state, gate_pending = None, STATE_PASS, None
+        gate_message = "一方未启用门控，关闭期不影响其开仓（关闭重合不适用）"
+        gate_detail["applicable"] = False
+    elif lender_gated is None or borrower_gated is None or gate_metric is None:
+        gate_value, gate_state, gate_pending = None, STATE_PENDING, PENDING_D
+        gate_message = ("回测记录未冻结门控开关或日快照缺少 gate_state，"
+                        "无法生成门控时间轴")
+        gate_detail["applicable"] = None
+    else:
+        gate_value = gate_metric["overlap"]
+        gate_state = _grade(gate_value, GATE_OVERLAP_PASS, GATE_OVERLAP_FAIL)
+        gate_pending = None
+        gate_message = ("门控关闭重合 %.4f（同日关闭 %d / 任一方关闭 %d）"
+                        % (gate_value, gate_metric["both_closed"],
+                           gate_metric["either_closed"]))
+        gate_detail["applicable"] = True
     soft.append(_soft(
-        "gate_off_overlap", STATE_PENDING, None,
-        "策略级门控关闭重合由 D 层门控时间轴提供，当前未接线",
-        pending_code=PENDING_D))
+        "gate_off_overlap", gate_state, gate_value, gate_message,
+        pending_code=gate_pending, detail=gate_detail))
 
     lender_signals = _open_signal_pairs(db, lender_rec.id) if lender_rec else set()
     borrower_signals = _open_signal_pairs(db, borrower_rec.id) if borrower_rec else set()
@@ -845,5 +894,7 @@ def evaluate_pairing(db: Session, lender_portfolio_strategy_id: int,
             "weighted_code_overlap": overlap,
             "cash_timing_overlap": cash_overlap,
             "return_corr": corr,
+            "gate_off_overlap": gate_value,
         },
+        "gate": gate_detail,
     }
