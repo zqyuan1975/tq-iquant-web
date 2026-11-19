@@ -138,7 +138,7 @@ class PortfolioCreate(BaseModel):
     breaker_action: str | None = None
     # A2（2026-11-18）：跨组合下单优先级，数值越大越先处理（None=不改/默认 0）
     priority: int | None = None
-    initial_capital: float = 500000
+    initial_capital: float = 2000000
     max_drawdown: float = 0.2
     daily_loss_limit: float = 0.05
     max_holdings: int = 10
@@ -148,7 +148,7 @@ class PortfolioCreate(BaseModel):
     stamp_duty_rate: float = 0.0005
     # 过户费（双向，默认 A 股现行 0.001%/边）；None=请求未填 → 落默认，显式 0 原样落库
     transfer_fee_rate: float | None = 0.00001
-    slippage: float = 0
+    slippage: float = 0.002
     # 风控冷静期（默认 1）：止损/止盈/移动止损成交后 N 个交易日内禁止新开仓
     # （当日算第 1 天）；0=关闭。None=请求未携带 → 新建落默认 1 / 编辑不动已有值。
     risk_cooldown_days: int | None = None

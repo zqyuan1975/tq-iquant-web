@@ -261,11 +261,11 @@ function emptyStrategyForm(): Record<string, any> {
 function emptyPortfolioForm(): Record<string, any> {
   return {
     name: '', stock_pool_id: 0, benchmark_index: DEFAULT_BENCHMARK,
-    initial_capital: 500000, max_drawdown: 0.2, daily_loss_limit: 0.05,
+    initial_capital: 2000000, max_drawdown: 0.2, daily_loss_limit: 0.05,
     max_holdings: 10,
     priority: 0,
     min_commission: 5, buy_commission_rate: 0.00025, sell_commission_rate: 0.00025,
-    stamp_duty_rate: 0.0005, transfer_fee_rate: 0.00001, slippage: 0,
+    stamp_duty_rate: 0.0005, transfer_fee_rate: 0.00001, slippage: 0.002,
     risk_cooldown_days: 1,
     trading_session: 'full', status: 'active',
     price_limit_check_enabled: true, volume_limit_enabled: false, volume_limit_ratio: 0.1,

@@ -32,7 +32,7 @@ class PortfolioStrategy(Base):
     # 空头减仓档：0=关闭；>0 时空头连续段内每只持仓按该比例减仓一次
     market_gate_bear_reduce_ratio = Column(Numeric(5, 4), default=0, server_default="0",
                                            nullable=False)
-    initial_capital = Column(Numeric(15, 2), default=500000, server_default="500000", nullable=False)
+    initial_capital = Column(Numeric(15, 2), default=2000000, server_default="2000000", nullable=False)
     max_drawdown = Column(Numeric(5, 4), default=0.2000, server_default="0.2000", nullable=False)
     daily_loss_limit = Column(Numeric(5, 4), default=0.0500, server_default="0.0500", nullable=False)
     # 日内亏损熔断分母口径：
@@ -56,7 +56,7 @@ class PortfolioStrategy(Base):
     # 过户费（双向，2026-11-11）：A 股现行按成交额 0.001% 双边收取，默认 0.000010。
     # 回测买卖两侧都计入（买入摊入成本、卖出从盈亏扣），与实盘柜台成本同口径。
     transfer_fee_rate = Column(Numeric(8, 6), default=0.000010, server_default="0.000010", nullable=False)
-    slippage = Column(Numeric(8, 6), default=0, server_default="0", nullable=False)
+    slippage = Column(Numeric(8, 6), default=0.002, server_default="0.002000", nullable=False)
     # 风控冷静期（2026-11-12）：止损/止盈/移动止损**成交后**，同一 (策略, 代码)
     # 在接下来 N 个交易日内禁止新开仓（当日算第 1 天，N=1=当日不再买回、次日恢复）；
     # 0=关闭（等价改动前行为）。公式 CLOSE/REDUCE 不触发。回测/实盘共用引擎实现。

@@ -186,7 +186,9 @@ describe('Portfolios.vue — 组合列表（树状）', () => {
     expect(arg.transfer_fee_rate).toBeCloseTo(0.00001, 8)
     // 金额不转
     expect(arg.min_commission).toBe(5)
-    expect(arg.initial_capital).toBe(500000)
+    expect(arg.initial_capital).toBe(2000000)
+    // 新建默认滑点 0.2%（落库为比例 0.002）
+    expect(arg.slippage).toBeCloseTo(0.002, 6)
     // select 字段保持字符串/原值，不被 Number() 转成 NaN
     expect(arg.trading_session).toBe('full')
     expect(arg.stock_pool_id).toBe(1)
