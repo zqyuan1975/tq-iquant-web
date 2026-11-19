@@ -776,6 +776,14 @@ class LiveEngine:
         # 账户读取不可信导致的「快照跳过」日志节流：连续跳过只在首次打 WARNING，
         # 之后降为 DEBUG，成功采集一轮后重置（详见 _capture_account_snapshot）。
         self._acct_snapshot_skip_logged = False
+        # 静默空读留痕（2026-11-19）：持仓空表/资产空 dict/缺字段但未抛异常时
+        # 记一条带形状与判据的 WARNING；相同形状只留首条，恢复正常后重置。
+        self._acct_read_seq = 0
+        self._acct_empty_read_state = None
+        # 空读窗口：进入不可信读时记起始单调时刻；恢复后的首个成功快照补一次
+        # live_portfolio_daily 缺失行（同一窗口只补一次，失败只告警）。
+        self._acct_untrusted_since = None
+        self._acct_gap_backfilled = False
         # 快照写入日志节流：每进程首条 INFO（带 pid/port），其余降 DEBUG——
         # 用于从日志区分「哪个进程在写快照」（2026-11-18 进程错配排查）。
         self._acct_snapshot_write_logged = False
@@ -4111,6 +4119,7 @@ class LiveEngine:
         cost/market_value），asset 有则附（TDX get_asset / THS get_account；
         QMT 桥缺资产端点 → 空 dict，现金对齐自动降级虚拟口径）。
         读取失败返回 None（本轮跳过）。"""
+        self._acct_read_seq += 1
         d = self._dispatcher
         pos_fn = getattr(d, "get_positions", None)
         if not callable(pos_fn):
@@ -4148,7 +4157,52 @@ class LiveEngine:
                 logger.warning(
                     "account snapshot asset read failed (session %s)",
                     self.session_id, exc_info=True)
+        self._note_account_read_shape(asset, positions)
         return asset, positions
+
+    def _note_account_read_shape(self, asset: dict, positions: list) -> None:
+        """静默空读留痕（纯观测：不改变 ``_account_read_trustworthy`` 判定，也不
+        改变「不可信读 → 跳过快照」的行为）。
+
+        触发面：持仓返回空表、资产返回空 dict 或缺字段，且均未抛异常（异常分支
+        已有独立 WARNING）。判据写进日志，便于区分「没登录/切页」与「真空仓」：
+        前者是「空持仓 + total_asset/market_value/available 缺字段」，后者应能
+        读到 total_asset，且 market_value≈0 或 total_asset≈available。
+        相同形状连续出现只留首条 WARNING，其余 DEBUG；恢复到「有持仓 + 资产三
+        字段齐全」后重置，下次异常重新告警。
+        """
+        required = ("total_asset", "market_value", "available")
+        try:
+            missing = [k for k in required if asset.get(k) is None]
+            keys = sorted(asset.keys())
+        except AttributeError:  # 防御：asset 非 dict（正常路径已归一为 dict）
+            missing, keys = list(required), []
+        shape = (len(positions), tuple(keys), tuple(missing))
+        if positions and not missing:
+            self._acct_empty_read_state = None
+            return
+        if not positions and missing:
+            verdict = ("持仓空表 + 资产字段缺失 → 疑似通道未就绪/未登录或切页"
+                       "（按不可信读处理）；真空仓应可读 total_asset，且 "
+                       "market_value≈0 或 total_asset≈available")
+        elif not positions:
+            verdict = "持仓空表但资产可读 → 倾向真空仓（仍需对账确认）"
+        else:
+            verdict = "持仓可读但资产字段缺失 → 现金对齐降级为虚拟口径"
+        if shape == self._acct_empty_read_state:
+            logger.debug(
+                "account read shape repeated (session %s, %s, read#%d): "
+                "positions=%d row(s), asset_keys=%s, missing=%s；%s",
+                self.session_id, process_tag(), self._acct_read_seq,
+                len(positions), keys, missing or "—", verdict)
+            return
+        self._acct_empty_read_state = shape
+        logger.warning(
+            "account read shape anomaly (session %s, %s, read#%d): "
+            "positions=%d row(s), asset_keys=%s, missing=%s → %s；"
+            "后续相同形状降为 DEBUG",
+            self.session_id, process_tag(), self._acct_read_seq,
+            len(positions), keys, missing or "—", verdict)
 
     def _account_read_trustworthy(self, asset: dict, positions: list) -> bool:
         """本轮账户读取是否可信（只用于「柜台清仓」这类不可逆判定）。
@@ -4456,6 +4510,9 @@ class LiveEngine:
             # 仍有虚拟仓的代码发一条 notice（每日去重），绝不进 apply 清仓分支。
             # 日志节流：终端关闭/未就绪时该状态会持续数小时，5s 节拍全量 WARNING
             # 会淹没日志；连续跳过仅首条 WARNING，其余 DEBUG，成功采集后重置。
+            if self._acct_untrusted_since is None:
+                # 空读窗口起点（单调时钟）：恢复后的首个成功快照据此补一次日序列。
+                self._acct_untrusted_since = time.monotonic()
             skip_msg = (
                 "account snapshot skipped: positions empty but account asset "
                 "unavailable/inconsistent (session %s; total_asset=%r "
@@ -4477,6 +4534,15 @@ class LiveEngine:
                 logger.exception(
                     "detect counter cleared holdings failed (session %s)",
                     self.session_id)
+            # 该分支不写快照、原本直接 return，notice 的决策事件随会话关闭被丢弃
+            # （2026-11-19 09:52:18 实证）。这里显式提交，保证「只提示」也能落库。
+            try:
+                db.commit()
+            except Exception:  # noqa: BLE001 — 审计落库失败不阻断采集主链路
+                db.rollback()
+                logger.warning(
+                    "commit untrusted-read notice failed (session %s)",
+                    self.session_id, exc_info=True)
             return
         # 本轮采集成功（写快照）：重置跳过日志节流状态。
         self._acct_snapshot_skip_logged = False
@@ -4704,6 +4770,43 @@ class LiveEngine:
             logger.info(
                 "alignment import %d external position(s) (session %s)",
                 imported, self.session_id)
+        self._backfill_after_untrusted_read(db)
+
+    def _backfill_after_untrusted_read(self, db) -> None:
+        """静默空读恢复后补一次日序列（同一空读窗口只做一次）。
+
+        约束：只补「今日之前、接缝日之后、库里缺失」的 live_portfolio_daily
+        （复用 ``_backfill_live_daily_from_account_snapshots``，不覆盖已存在行，
+        14:30 日终仍以收盘口径写入）；不改现金/持仓。本轮账户快照已由正常采集
+        写入。失败只告警并回滚，不影响主循环。
+        """
+        since = self._acct_untrusted_since
+        if since is None or self._acct_gap_backfilled:
+            return
+        self._acct_gap_backfilled = True
+        gap_s = max(0.0, time.monotonic() - since)
+        try:
+            # 局部导入：live_service 模块级依赖 LiveEngine，避免循环导入。
+            from core.services.live_service import (
+                _backfill_live_daily_from_account_snapshots,
+            )
+            rows = _backfill_live_daily_from_account_snapshots(
+                db, self.session_id, engine=self)
+            logger.info(
+                "account read recovered after %.0fs：snapshot written, "
+                "live_portfolio_daily backfill rows=%s (session %s, %s)",
+                gap_s, rows, self.session_id, process_tag())
+        except Exception:  # noqa: BLE001 — 补写失败只告警，不影响主循环
+            try:
+                db.rollback()
+            except Exception:  # noqa: BLE001
+                pass
+            logger.warning(
+                "gap backfill after untrusted read failed (session %s)",
+                self.session_id, exc_info=True)
+        finally:
+            self._acct_untrusted_since = None
+            self._acct_gap_backfilled = False
 
     def _strategy_ctx_for_code(self, code: str):
         """外部持仓归属：股票池包含该代码的组合 → 其首个策略；否则
@@ -4835,6 +4938,10 @@ class LiveEngine:
             "message": message,
         })
         try:
+            # 只提示类（action=notice）不占「未处理告警」：健康总览按
+            # ack_summary.open 统计（非 acked 一律计入 open），故直接记 acked，
+            # 并用 ack_note 标明系统自动归档，避免被误读为人工确认。
+            auto_archived = action == "notice"
             db.add(LiveDecisionEvent(
                 live_session_id=self.session_id,
                 gate=_MANUAL_INTERVENTION_GATE,
@@ -4846,6 +4953,10 @@ class LiveEngine:
                 requested_qty=int(virtual_qty),
                 final_qty=int(real_qty),
                 message=message,
+                ack_status="acked" if auto_archived else "open",
+                ack_note=("系统自动归档（仅提示，无需人工确认）"
+                          if auto_archived else None),
+                ack_at=(now_shanghai() if auto_archived else None),
             ))
         except Exception:  # noqa: BLE001 — 观测链路失败不得影响记账
             logger.exception(

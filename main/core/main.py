@@ -71,9 +71,15 @@ async def lifespan(app: FastAPI):
         # status=running → 工作台显示「运行中」而 bridge-status=not_running。
         # 冷启动时引擎注册表必为空，安全统一置 stopped（逐条日志留原因），
         # 由用户手动重新启动。
-        n3 = recover_stale_running_live_sessions(db)
-        if n3:
-            logger.warning("启动恢复：%d 个僵尸 running 实盘会话已置 stopped", n3)
+        if os.environ.get("TQ_LIVE_STALE_RECOVERY_DISABLED") == "1":
+            # 测试进程专用开关：lifespan 走真实 SessionLocal，测试触发 lifespan
+            # 会误把正在运行的实盘会话置 stopped（2026-11-19 09:45:27 实证）。
+            logger.info(
+                "僵尸实盘会话清理已禁用（TQ_LIVE_STALE_RECOVERY_DISABLED=1）")
+        else:
+            n3 = recover_stale_running_live_sessions(db)
+            if n3:
+                logger.warning("启动恢复：%d 个僵尸 running 实盘会话已置 stopped", n3)
         # L1 旧交接目录清理（2026-11-16）：把 ths_ui.work_dir 下非活跃会话的数字
         # 目录移入 {work_dir}/_archive/<日期>/（空目录删除）。当前 running/stopping
         # 会话目录与引擎注册表键一律保留（cursor 仍在被消费的目录绝不动）；

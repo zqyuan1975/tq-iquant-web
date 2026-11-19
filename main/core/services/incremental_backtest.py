@@ -933,6 +933,22 @@ def capture_seam(db: Session, session_id: int, engine, today: Optional[date] = N
         if portfolio_id is not None and link.portfolio_strategy_id != portfolio_id:
             continue
         if link.seam_date is not None and not force:
+            # 接缝审计（纯日志）：已写定不覆盖时也留一条「锚点保留」，带上
+            # 版本（接缝日#成交游标）、现金、持仓数与行 updated_at——用于区分
+            # 「行被更新但字段未变」是否由接缝捕获导致（2026-11-19 排查）。
+            _kept = _seam_positions_count(link.seam_positions_json)
+            logger.info(
+                "[seam] 锚点保留（已写定不覆盖）：session=%s portfolio=%s "
+                "version=%s#%s seam_date=%s cursor=%s cash=%s positions=%s "
+                "row_updated_at=%s",
+                session_id, link.portfolio_strategy_id,
+                getattr(link.seam_date, "isoformat", lambda: link.seam_date)(),
+                getattr(link, "seam_trade_cursor", None),
+                getattr(link.seam_date, "isoformat", lambda: link.seam_date)(),
+                getattr(link, "seam_trade_cursor", None),
+                getattr(link, "seam_cash", None), _kept,
+                getattr(link, "updated_at", None),
+            )
             continue
         port = ports.get(link.portfolio_strategy_id)
         if port is None:
@@ -973,12 +989,13 @@ def capture_seam(db: Session, session_id: int, engine, today: Optional[date] = N
             )
             .scalar()
         )
+        seam_bar_time = datetime.now(_TZ).replace(tzinfo=None).isoformat()
         link.seam_positions_json = json.dumps({
             "positions": positions,
             # 接缝游标（P0，2026-11-16）：引擎恢复完成、首轮 tick 之前的时刻。
             # 首段重放会按它切掉接缝日的分钟 bar —— 接缝现金/持仓取自 recover
             # 之后，已含这些 bar 驱动的成交；再全量重放当日就会重复开仓/扣现金。
-            "seam_bar_time": datetime.now(_TZ).replace(tzinfo=None).isoformat(),
+            "seam_bar_time": seam_bar_time,
             "flow_cursor": int(flow_cursor) if flow_cursor is not None else 0,
         }, ensure_ascii=False)
         # 起账状态来自 recover 之后的引擎（已含当日成交）；记下已计入的成交
@@ -993,6 +1010,13 @@ def capture_seam(db: Session, session_id: int, engine, today: Optional[date] = N
         )
         link.seam_trade_cursor = int(cursor) if cursor is not None else 0
         changed = True
+        # 接缝审计（纯日志）：捕获时刻 + 锚点版本（接缝日#成交游标）+ 现金/持仓数。
+        logger.info(
+            "[seam] 锚点捕获：session=%s portfolio=%s version=%s#%s "
+            "seam_date=%s cursor=%s cash=%s positions=%s captured_at=%s",
+            session_id, link.portfolio_strategy_id, today.isoformat(),
+            link.seam_trade_cursor, today.isoformat(), link.seam_trade_cursor,
+            link.seam_cash, len(positions), seam_bar_time)
     if changed:
         db.commit()
 
@@ -1002,6 +1026,17 @@ def resolve_anchor(link: LiveSessionPortfolio, cfg: Optional[dict] = None) -> bo
     if link.seam_anchor_enabled is not None:
         return bool(link.seam_anchor_enabled)
     return bool((cfg or _cfg()).get("anchor_on_live_start", True))
+
+
+def _seam_positions_count(raw) -> int:
+    """接缝 JSON 的持仓条数（兼容旧纯 list 与 dict 两种格式，坏数据返回 0）。"""
+    try:
+        data = json.loads(raw or "[]")
+    except (TypeError, ValueError):
+        return 0
+    if isinstance(data, dict):
+        data = data.get("positions") or []
+    return len(data) if isinstance(data, list) else 0
 
 
 def _seam_payload(raw) -> tuple:
