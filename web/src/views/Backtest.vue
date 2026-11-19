@@ -10,6 +10,9 @@ import {
   replaySignals,
   sendUserBlock,
   getCapitalDerive,
+  getCapitalUtilization,
+  listCashOutlets,
+  evaluateCashOutlet,
   listPairingPlans, createPairingPlan, evaluatePairingPlan,
   approvePairingPlan, deletePairingPlan, getPairingPlan,
 } from '../api'
@@ -28,6 +31,8 @@ import type {
   ValidationVerdict,
   DataQuality, DataQualityPeriod,
   CapitalQuotaDerivation,
+  CapitalUtilizationStats,
+  CashOutletItem, CashOutletEvaluation,
   PairingPlanSummary, PairingPlanDetail,
 } from '../api'
 import { gateLabel, LAYER_LABEL, ACTION_LABEL } from '../utils/liveEvents'
@@ -176,6 +181,81 @@ async function loadCapitalDerive() {
   } finally {
     capitalDeriveLoading.value = false
   }
+}
+
+// ===== 资金池 C6：历史利用率 / 容量斜率 / 现金出口候选（全部只读）=====
+const utilization = ref<CapitalUtilizationStats | null>(null)
+const utilizationLoading = ref(false)
+const utilizationError = ref('')
+
+async function loadUtilization() {
+  const pid = currentRecord.value?.portfolio_strategy_id
+  if (!pid) {
+    utilizationError.value = '当前记录缺少组合信息，无法查询利用率'
+    return
+  }
+  utilizationLoading.value = true
+  utilizationError.value = ''
+  try {
+    utilization.value = await getCapitalUtilization({
+      portfolio_id: pid,
+      record_id: currentRecord.value?.id,
+      source: 'backtest',
+    })
+  } catch (e) {
+    utilization.value = null
+    utilizationError.value = errMsg(e)
+  } finally {
+    utilizationLoading.value = false
+  }
+}
+
+const outlets = ref<CashOutletItem[]>([])
+const outletsLoading = ref(false)
+const outletsError = ref('')
+const outletsDisabled = ref(false)
+const outletEvaluations = ref<Record<number, CashOutletEvaluation>>({})
+const outletEvaluating = ref<number | null>(null)
+const outletEvalError = ref('')
+
+async function loadOutlets() {
+  outletsLoading.value = true
+  outletsError.value = ''
+  try {
+    const data = await listCashOutlets()
+    outletsDisabled.value = data.enabled === false
+    outlets.value = data.items ?? []
+  } catch (e) {
+    outlets.value = []
+    outletsError.value = errMsg(e)
+  } finally {
+    outletsLoading.value = false
+  }
+}
+
+async function evaluateOutlet(row: CashOutletItem) {
+  outletEvaluating.value = row.id
+  outletEvalError.value = ''
+  try {
+    const result = await evaluateCashOutlet(row.id, {})
+    outletEvaluations.value = { ...outletEvaluations.value, [row.id]: result }
+  } catch (e) {
+    outletEvalError.value = errMsg(e)
+  } finally {
+    outletEvaluating.value = null
+  }
+}
+
+function outletCodesText(row: CashOutletItem): string {
+  const evaluation = outletEvaluations.value[row.id]
+  if (!evaluation) return row.verified ? '已验证' : '未验证'
+  return evaluation.status === 'READY' ? '可借（只读）' : evaluation.codes.join('、')
+}
+
+function ratioText(v: string | null | undefined): string {
+  if (v === null || v === undefined || v === '') return '—'
+  const n = Number(v)
+  return Number.isFinite(n) ? `${(n * 100).toFixed(2)}%` : String(v)
 }
 
 // echarts 实例（净值 + 回撤）
@@ -1611,6 +1691,11 @@ async function openDetail(id: number) {
   capitalDerive.value = null
   capitalDeriveError.value = ''
   capitalDeriveNotDerivable.value = ''
+  utilization.value = null
+  utilizationError.value = ''
+  outlets.value = []
+  outletsError.value = ''
+  outletEvaluations.value = {}
   selectedKey.value = null
   caCollapsed.value = true
   mrCollapsed.value = true
@@ -4473,6 +4558,105 @@ watch(theme, () => {
           说明：{{ capitalDerive.reasons.join('；') }}
         </p>
       </template>
+    </div>
+
+    <!-- 0021 C6：利用率分位 / 容量斜率 / 现金出口候选（全部只读，无执行） -->
+    <div class="card" style="margin-top:12px;padding:14px">
+      <div style="display:flex;align-items:center;gap:8px;margin-bottom:10px;flex-wrap:wrap">
+        <span style="font-weight:600;font-size:14px">🧮 资金池评估补充（只读）</span>
+        <span style="font-size:12px;color:var(--ink-soft)">C 阶段：只看不执行，未接实盘</span>
+      </div>
+
+      <div class="section-title" style="font-size:13px">历史利用率分位</div>
+      <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:8px">
+        <button class="btn btn-sm" :disabled="utilizationLoading"
+                @click="loadUtilization">
+          {{ utilizationLoading ? '查询中…' : (utilization ? '刷新利用率' : '查询利用率') }}
+        </button>
+        <span v-if="utilization" style="font-size:12px;color:var(--ink-soft)">
+          样本 {{ utilization.samples }} / 窗口 {{ utilization.window }}
+          <span v-if="utilization.status !== 'ok'">（降级：{{ utilization.degraded.join('、') }}）</span>
+        </span>
+      </div>
+      <p v-if="utilizationError" class="ca-msg ca-warn">{{ utilizationError }}</p>
+      <div v-if="utilization && utilization.enabled !== false"
+           style="display:flex;flex-wrap:wrap;gap:18px;font-size:13px">
+        <span>均值 <b>{{ ratioText(utilization.u_mean) }}</b></span>
+        <span>p50 <b>{{ ratioText(utilization.u_p50) }}</b></span>
+        <span>p90 <b>{{ ratioText(utilization.u_p90) }}</b></span>
+        <span>p95 <b>{{ ratioText(utilization.u_p95) }}</b></span>
+        <span>最大 <b>{{ ratioText(utilization.u_max) }}</b></span>
+        <span>当前 <b>{{ ratioText(utilization.u_current) }}</b></span>
+      </div>
+      <p v-else-if="utilization && utilization.enabled === false"
+         style="font-size:12px;color:var(--ink-soft);margin:0">
+        资金池开关未启用，不计算利用率分位。
+      </p>
+      <p v-if="utilization && utilization.status !== 'ok'"
+         style="font-size:12px;color:var(--warn);margin:6px 0 0">
+        样本不足：{{ utilization.reasons.join('；') }}
+      </p>
+
+      <div class="section-title" style="font-size:13px;margin-top:12px">容量斜率</div>
+      <div v-if="validation && validation.capacity_metrics"
+           style="display:flex;flex-wrap:wrap;gap:18px;font-size:13px">
+        <span v-if="validation.capacity_metrics.adv">
+          ADV 占比 <b>{{ ratioText(String(validation.capacity_metrics.adv.ratio)) }}</b>
+          （阈值 {{ ratioText(String(validation.capacity_metrics.adv.threshold)) }}）
+        </span>
+        <span v-if="validation.capacity_metrics.concentration">
+          单票集中 <b>{{ ratioText(String(validation.capacity_metrics.concentration.max_single_weight ?? '')) }}</b>
+        </span>
+        <span v-if="validation.capacity_metrics.exposure">
+          资金占用 <b>{{ ratioText(String(validation.capacity_metrics.exposure.recent_utilization)) }}</b>
+        </span>
+      </div>
+      <p style="font-size:12px;color:var(--ink-soft);margin:6px 0 0">
+        容量曲线斜率与边际收益需 ≥3 个规模点的同口径联合回测，当前未提供时返回
+        <b>PENDING_DATA</b>，不做猜测。
+      </p>
+
+      <div class="section-title" style="font-size:13px;margin-top:12px">现金出口候选</div>
+      <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:8px">
+        <button class="btn btn-sm" :disabled="outletsLoading" @click="loadOutlets">
+          {{ outletsLoading ? '查询中…' : (outlets.length ? '刷新出口' : '查询出口') }}
+        </button>
+        <span style="font-size:12px;color:var(--ink-soft)">未验证/过期一律不可借；执行按钮禁用</span>
+      </div>
+      <p v-if="outletsError" class="ca-msg ca-warn">{{ outletsError }}</p>
+      <p v-if="outletsDisabled" style="font-size:12px;color:var(--ink-soft);margin:0">
+        现金出口开关未启用（capital_pool.cash_outlet_enabled=false）。
+      </p>
+      <p v-else-if="outletEvalError" class="ca-msg ca-warn">{{ outletEvalError }}</p>
+      <table v-if="!outletsDisabled && outlets.length" style="margin-top:6px">
+        <thead><tr>
+          <th>代码</th><th>名称</th><th>流动性</th><th>风险</th>
+          <th>验证</th><th>评估</th><th>执行</th>
+        </tr></thead>
+        <tbody>
+          <tr v-for="o in outlets" :key="o.id">
+            <td>{{ o.code }}</td>
+            <td>{{ o.name }}</td>
+            <td>{{ o.liquidity === 't0' ? 'T+0' : o.liquidity === 't1' ? 'T+1' : '到期' }}{{ o.term_days ? ` / ${o.term_days}天` : '' }}</td>
+            <td>{{ o.risk_level || '—' }}</td>
+            <td>{{ o.verified ? `已验至 ${o.verify_expires_at || '—'}` : '未验证' }}</td>
+            <td>
+              <button class="btn btn-sm" :disabled="outletEvaluating === o.id"
+                      @click="evaluateOutlet(o)">
+                {{ outletEvaluating === o.id ? '评估中…' : '评估' }}
+              </button>
+              <span style="margin-left:6px;font-size:12px;color:var(--ink-soft)">{{ outletCodesText(o) }}</span>
+            </td>
+            <td>
+              <button class="btn btn-sm" disabled
+                      title="C 阶段只读：未接实盘，不能下单或划转">执行（未开放）</button>
+            </td>
+          </tr>
+        </tbody>
+      </table>
+      <p v-else-if="!outletsDisabled && !outletsLoading" style="font-size:12px;color:var(--ink-soft);margin:0">
+        暂无已登记的现金出口。
+      </p>
     </div>
 
     <!-- 回测告警：completed 但存在行情跳过/公式报错/输出线缺失/区间零信号 -->

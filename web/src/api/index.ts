@@ -3488,3 +3488,44 @@ export async function evaluateCashOutlet(
     `/capital/outlets/${outletId}/evaluate`, payload)
   return res.data.data
 }
+
+// 0021 C2：历史利用率分位（只读，可复算）
+export interface CapitalUtilizationSeriesPoint {
+  date: string | null
+  utilization: string
+  equity?: string | null
+  drawdown?: string | null
+}
+
+export interface CapitalUtilizationStats {
+  enabled?: boolean
+  status: string
+  samples: number
+  window: number
+  u_mean: string | null
+  u_p50: string | null
+  u_p90: string | null
+  u_p95: string | null
+  u_max: string | null
+  u_min: string | null
+  u_current: string | null
+  excluded: Record<string, number>
+  degraded: string[]
+  reasons: string[]
+  series?: CapitalUtilizationSeriesPoint[]
+  source: string
+  portfolio_id: number
+  record_id: number | null
+  session_id: number | null
+}
+
+export async function getCapitalUtilization(params: {
+  portfolio_id: number
+  source?: 'backtest' | 'live'
+  record_id?: number
+  window?: number
+}) {
+  const res = await api.get<ApiResponse<CapitalUtilizationStats>>(
+    '/capital/utilization', { params })
+  return res.data.data
+}
