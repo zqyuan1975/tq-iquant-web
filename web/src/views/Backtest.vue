@@ -13,6 +13,7 @@ import {
 import type {
   BacktestRecordItem, BacktestDetailItem, PortfolioItem,
   BacktestCompareResult,
+  BacktestCompareItem,
   SignalReplayResult,
   BacktestEvaluationItem, DecisionSummaryItem, DecisionEventItem,
   CrisisAlphaData, CrisisAlphaBenchmarkResolution,
@@ -932,6 +933,10 @@ const recordCompareError = ref('')
 const recordCompareData = ref<BacktestCompareResult | null>(null)
 const recordCompareChartEl = ref<HTMLElement | null>(null)
 let recordCompareChart: echarts.ECharts | null = null
+// 曲线点位总数：为 0 时只展示提示，不初始化空图表
+const recordCompareCurvePoints = computed(() =>
+  (recordCompareData.value?.records ?? []).reduce(
+    (n, it) => n + it.curve.filter(p => p.date && p.index_value !== null).length, 0))
 const RECORD_COMPARE_PCT_KEYS = new Set([
   'total_return', 'annual_return', 'max_drawdown', 'volatility', 'win_rate',
   'benchmark_return', 'excess_annual_return', 'total_cost_ratio',
@@ -953,6 +958,11 @@ function recordCompareParamText(v: string | number | boolean | null): string {
 
 function recordCompareStockText(v: number): string {
   return fmtMoney(v)
+}
+
+function recordCompareBenchmark(it: BacktestCompareItem): string {
+  const b = it.params?.benchmark_index
+  return b === null || b === undefined || b === '' ? '基准未记录' : `基准 ${String(b)}`
 }
 
 function renderRecordCompareChart() {
@@ -982,7 +992,7 @@ function renderRecordCompareChart() {
       name: `#${it.record.id} ${it.record.name}`,
       type: 'line',
       showSymbol: false,
-      lineWidth: 1.5,
+      lineStyle: { width: 1.5 },
       data: it.curve.filter(p => p.date && p.index_value !== null)
         .map(p => [p.date as string, p.index_value as number]),
     })),
@@ -997,12 +1007,16 @@ async function openRecordCompare() {
   recordCompareLoading.value = true
   try {
     recordCompareData.value = await compareBacktestRecords([...recordCompareSelected.value])
-    await nextTick()
-    renderRecordCompareChart()
   } catch (e) {
     recordCompareError.value = '对比失败：' + errMsg(e)
   } finally {
+    // 先结束 loading，让 v-else-if 的图表容器真正挂载，再初始化实例；
+    // 否则 setOption 发生在 loading 分支期间，ref 为 null，图表永久空白。
     recordCompareLoading.value = false
+  }
+  await nextTick()
+  if (recordCompareData.value && recordCompareCurvePoints.value > 0) {
+    renderRecordCompareChart()
   }
 }
 
@@ -3278,9 +3292,20 @@ watch(theme, () => {
             </div>
 
             <h4 style="margin:4px 0 8px">归一净值曲线（首日=1）</h4>
+            <p class="note" style="margin:0 0 8px">
+              各记录以自身首个净值 &gt; 0 的快照日归一为 1；x 轴为并集时间轴，
+              区间不同处不截交集、不补点，曲线只在各自区间内延伸。
+            </p>
             <div ref="recordCompareChartEl" style="width:100%;height:320px"></div>
+            <p v-if="recordCompareData && !recordCompareCurvePoints" class="note">
+              所选记录没有可用的组合日快照净值，无法绘制曲线（指标/成交对照仍可参考）。
+            </p>
 
             <h4 style="margin:16px 0 8px">指标对比</h4>
+            <p class="note" style="margin:0 0 8px">
+              数值取各记录回测完成时冻结的组合级评估（同一评估器），本次对比不重算；
+              各列区间/基准不同时，绝对水平不可直接横比。
+            </p>
             <div class="table-container">
               <table>
                 <thead>
@@ -3288,6 +3313,9 @@ watch(theme, () => {
                     <th>指标</th>
                     <th v-for="it in recordCompareData.records" :key="it.record.id">
                       #{{ it.record.id }} {{ it.record.name }}
+                      <div class="note" style="font-weight:400;white-space:nowrap">
+                        {{ it.record.start_date }} ~ {{ it.record.end_date }} · {{ recordCompareBenchmark(it) }}
+                      </div>
                     </th>
                   </tr>
                 </thead>
@@ -3303,6 +3331,10 @@ watch(theme, () => {
             </div>
 
             <h4 style="margin:16px 0 8px">参数 diff（<span style="color:var(--red)">红点</span>=不一致）</h4>
+            <p class="note" style="margin:0 0 8px">
+              嵌套参数按路径展开（strategies[...] / price_caliber.* / execution.* 等），数组按完整内容比较；
+              旧记录缺键显示「—」，表示口径未知，不等于取值为空。
+            </p>
             <div class="table-container" style="max-height:280px;overflow:auto">
               <table>
                 <thead>
@@ -3324,6 +3356,10 @@ watch(theme, () => {
             </div>
 
             <h4 style="margin:16px 0 8px">成交对比（每股净买入额：买 + / 卖 −）</h4>
+            <p class="note" style="margin:0 0 8px">
+              金额为绝对额，未按初始资金归一；初始资金/区间不同时，规模差异不代表交易强度差异。
+              明细按每股净买入额绝对值降序（同额按代码升序），最多显示 50 只。
+            </p>
             <div class="table-container">
               <table>
                 <thead>
@@ -3361,9 +3397,6 @@ watch(theme, () => {
                 </tbody>
               </table>
             </div>
-            <p v-if="recordCompareData.stock_rows_truncated" class="note">
-              仅显示净买入额绝对值最大的 50 只股票。
-            </p>
           </template>
         </div>
         <div class="modal-actions">

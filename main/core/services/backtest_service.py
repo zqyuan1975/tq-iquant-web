@@ -3288,7 +3288,7 @@ _COMPARE_MAX_STOCK_ROWS = 50
 
 
 def _compare_scalar_params(raw: Optional[str]) -> dict:
-    """params_snapshot → 标量键值（dict/list 值跳过，避免把大块快照塞进对比表）。"""
+    """params_snapshot → 标量键值（dict/list 值跳过，供成本与容量等只读取标量的场景）。"""
     try:
         params = json.loads(raw) if raw else {}
     except (TypeError, ValueError):
@@ -3299,6 +3299,57 @@ def _compare_scalar_params(raw: Optional[str]) -> dict:
         k: v for k, v in params.items()
         if v is None or isinstance(v, (str, int, float, bool))
     }
+
+
+def _flatten_param_value(prefix: str, value, out: dict) -> None:
+    """把嵌套参数展开成 path→值：dict 用 ``.`` 递归，dict 列表（strategies）
+    用 ``[id=N]`` 分组；标量/标量列表保持原值，diff 仍按完整值比较。"""
+    if isinstance(value, dict):
+        if not value:
+            out[prefix] = value
+            return
+        for k, v in value.items():
+            _flatten_param_value(f"{prefix}.{k}", v, out)
+    elif isinstance(value, list):
+        if value and all(isinstance(it, dict) for it in value):
+            for idx, item in enumerate(value):
+                label = item.get("id", idx)
+                for k, v in item.items():
+                    _flatten_param_value(f"{prefix}[{label}].{k}", v, out)
+        else:
+            out[prefix] = value
+    else:
+        out[prefix] = value
+
+
+def _compare_params_flat(raw: Optional[str]) -> dict:
+    """params_snapshot → 扁平参数（含嵌套 JSON/数组），避免只比标量漏掉关键差异。
+
+    顶层字段沿用原键名，嵌套 dict 展开为 ``a.b``，策略数组展开为
+    ``strategies[id=3].max_positions``；数组值整体保留，diff 按 JSON 全量比较。
+    """
+    try:
+        params = json.loads(raw) if raw else {}
+    except (TypeError, ValueError):
+        return {}
+    if not isinstance(params, dict):
+        return {}
+    out: dict = {}
+    for k, v in params.items():
+        _flatten_param_value(k, v, out)
+    return out
+
+
+def _compare_param_display(value):
+    """对比表展示值：标量原样；数组截断到前 8 项并标注总数；空 dict 转 JSON。"""
+    if isinstance(value, list):
+        shown = ", ".join(str(x) for x in value[:8])
+        if len(value) > 8:
+            shown += f" …（共 {len(value)} 项）"
+        return shown
+    if isinstance(value, dict):
+        return json.dumps(value, ensure_ascii=False, sort_keys=True)
+    return value
 
 
 def _compare_trade_summary(trades: list) -> dict:
@@ -3388,11 +3439,13 @@ def compare_records(
                 "cumulative_return": _f(s.cumulative_return),
                 "index_value": (tv / base) if (tv is not None and base) else None,
             })
+        if not curve:
+            warnings.append(f"记录 #{rid} 没有组合日快照，归一净值曲线为空")
         items.append({
             "record": _serialize_record(rec),
             "metrics": {k: ev_dict.get(k) for k, _ in _COMPARE_METRICS},
             "curve": curve,
-            "params": _compare_scalar_params(rec.params_snapshot),
+            "params": _compare_params_flat(rec.params_snapshot),
             "trade_summary": _compare_trade_summary(trades),
         })
 
@@ -3406,15 +3459,15 @@ def compare_records(
             "differs": len({round(v, 6) for v in present}) > 1 if present else False,
         })
 
-    # 参数 diff：并集键，标量值，值不齐/不等均标 differs
+    # 参数 diff：并集键（含嵌套 JSON/数组展开），值不齐/不等均标 differs
     param_keys = sorted({k for it in items for k in it["params"]})
     param_rows = []
     for k in param_keys:
-        values = [it["params"].get(k) for it in items]
+        raw_values = [it["params"].get(k) for it in items]
         param_rows.append({
-            "key": k, "values": values,
+            "key": k, "values": [_compare_param_display(v) for v in raw_values],
             "differs": len({json.dumps(v, ensure_ascii=False, sort_keys=True)
-                             for v in values}) > 1,
+                             for v in raw_values}) > 1,
         })
 
     # 成交 diff：每股净买入额（买 +、卖 −），按绝对值降序取前 N 只

@@ -58,6 +58,7 @@ vi.mock('../api', () => ({
   recomputePersistenceAnalysis: vi.fn(),
   getStockPools: vi.fn(),
   compareBacktestPools: vi.fn(),
+  compareBacktestRecords: vi.fn(),
   sendUserBlock: vi.fn(),
 }))
 
@@ -76,11 +77,12 @@ vi.mock('echarts', () => {
 })
 
 import Backtest from '../views/Backtest.vue'
+import * as echarts from 'echarts'
 import {
   getBacktestRecords, getBacktestDetail, runBacktest, getPortfolios,
   deleteBacktestRecord, recomputeCrisisAlpha, recomputeMarketRegime,
   recomputePersistenceAnalysis, getStockPools, compareBacktestPools,
-  sendUserBlock,
+  compareBacktestRecords, sendUserBlock,
 } from '../api'
 
 const scrollTargets: any[] = []
@@ -145,6 +147,56 @@ describe('Backtest.vue — 列表视图', () => {
     await flushPromises()
     expect(w.text()).toContain('已完成')
     expect(w.text()).toContain('失败')
+  })
+
+  it('对比所选：数据返回后先退出 loading 再初始化图表（容器已挂载）', async () => {
+    const completed = [
+      { ...mockRecords[0], id: 1, name: '回测A', status: 'completed' },
+      { ...mockRecords[0], id: 2, name: '回测B', status: 'completed' },
+    ]
+    ;(getBacktestRecords as any).mockResolvedValue(completed)
+    const item = (id: number) => ({
+      record: { ...completed[id - 1] },
+      metrics: {},
+      curve: [{ date: '2026-07-01', total_value: 100000, cumulative_return: 0, index_value: 1 }],
+      params: { benchmark_index: '000001.SH' },
+      trade_summary: {
+        trades_count: 0, buy_count: 0, sell_count: 0,
+        buy_amount: 0, sell_amount: 0, stocks: {},
+      },
+    })
+    ;(compareBacktestRecords as any).mockResolvedValue({
+      records: [item(1), item(2)],
+      metric_rows: [], stock_rows: [], stock_rows_truncated: false,
+      param_rows: [{
+        key: 'strategies[1].max_positions', values: [10, 20], differs: true,
+      }],
+      trade_totals: [
+        { trades_count: 0, buy_count: 0, sell_count: 0, buy_amount: 0, sell_amount: 0 },
+        { trades_count: 0, buy_count: 0, sell_count: 0, buy_amount: 0, sell_amount: 0 },
+      ],
+      warnings: [],
+    })
+
+    const w = mount(Backtest)
+    await flushPromises()
+
+    const boxes = w.findAll('tbody input[type=checkbox]')
+    await boxes[0].setValue(true)
+    await boxes[1].setValue(true)
+    const btn = w.findAll('button').find(b => b.text().startsWith('对比所选'))!
+    expect(btn.attributes('disabled')).toBeUndefined()
+    await btn.trigger('click')
+    await flushPromises()
+    await flushPromises()
+
+    expect(w.text()).toContain('归一净值曲线（首日=1）')
+    expect(w.text()).toContain('strategies[1].max_positions')
+    // 回归点：init 必须拿到已挂载的图表容器；此前 loading 未结束，ref 为 null → 永不绘图
+    const initArg = (echarts.init as any).mock.calls.at(-1)?.[0]
+    expect(initArg).toBeInstanceOf(HTMLElement)
+    expect((initArg as HTMLElement).style.height).toBe('320px')
+    w.unmount()
   })
 
   it('每行含[查看]按钮', async () => {

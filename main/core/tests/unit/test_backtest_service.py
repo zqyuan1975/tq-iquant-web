@@ -3306,6 +3306,44 @@ def test_compare_records_curves_metrics_and_diffs(db_session):
     assert payload["trade_totals"][1]["sell_count"] == 1
 
 
+def test_compare_records_nested_params_are_diffed(db_session):
+    """K2：嵌套 JSON/数组参数也必须进 diff，不能只比顶层标量。"""
+    ps, _ = _seed(db_session)
+    a = _seed_compare_record(
+        db_session, ps, "A", [100000, 101000], [],
+        {
+            "dividend_mode": "front",
+            "price_caliber": {"backtest_adjust": "front", "aligned_with_live": True},
+            "strategies": [{"id": 11, "formula_id": 3, "max_positions": 10}],
+            "stock_pool_codes": {"1": ["000001.SZ", "000002.SZ"]},
+        }, 0.01,
+    )
+    b = _seed_compare_record(
+        db_session, ps, "B", [100000, 99000], [],
+        {
+            "dividend_mode": "front",
+            "price_caliber": {"backtest_adjust": "back", "aligned_with_live": False},
+            "strategies": [{"id": 11, "formula_id": 3, "max_positions": 20}],
+            "stock_pool_codes": {"1": ["000001.SZ"]},
+        }, -0.01,
+    )
+
+    payload, err = svc.compare_records(db_session, [a.id, b.id])
+    assert err is None
+    rows = {r["key"]: r for r in payload["param_rows"]}
+
+    assert rows["price_caliber.backtest_adjust"]["values"] == ["front", "back"]
+    assert rows["price_caliber.backtest_adjust"]["differs"] is True
+    assert rows["strategies[11].max_positions"]["values"] == [10, 20]
+    assert rows["strategies[11].max_positions"]["differs"] is True
+    # 数组按完整 JSON 判 diff，展示值只截断不丢「不一致」结论
+    assert rows["stock_pool_codes.1"]["values"] == ["000001.SZ, 000002.SZ", "000001.SZ"]
+    assert rows["stock_pool_codes.1"]["differs"] is True
+    # 顶层标量仍保持原类型
+    assert rows["dividend_mode"]["values"] == ["front", "front"]
+    assert rows["dividend_mode"]["differs"] is False
+
+
 def test_compare_records_validates_ids(db_session):
     """K2：少于 2 条 / 记录不存在 都在 service 层给出明确错误（路由转 400/404）。"""
     ps, _ = _seed(db_session)
