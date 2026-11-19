@@ -112,12 +112,12 @@ def test_stale_native_dispatches_aggregated_5m_with_source_marker():
     bar_event = args[1]
     assert bar_event.period == "5m"
     assert bar_event.bar_time == TODAY
-    # OHLCV 来自聚合：open=首根、close=末根、high/low=极值、volume=累加
+    # OHLCV 来自聚合：open=首根、close=末根、high/low=极值、volume=累加后统一为股
     assert float(bar_event.stocks[STOCK]["open"]) == 10.0
     assert float(bar_event.stocks[STOCK]["close"]) == 10.5
     assert float(bar_event.stocks[STOCK]["high"]) == 10.6
     assert float(bar_event.stocks[STOCK]["low"]) == 9.9
-    assert bar_event.stocks[STOCK]["volume"] == 510
+    assert bar_event.stocks[STOCK]["volume"] == 51000
     # 注入给公式的 bars：当日聚合 bar 在末位并带来源标记，历史原生 bar 仍在
     injected = kwargs["bars_by_code"][STOCK]
     assert injected[-1]["source"] == "aggregated_1m"

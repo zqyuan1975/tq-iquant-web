@@ -206,3 +206,28 @@ def test_edit_rejects_invalid_pre_open_end_time():
         db, sid, {"pre_open_auction_end_time": "10:00"}, {})
     assert ok is False
     assert error[0] == 400
+
+
+def test_announce_pre_open_config_marks_bar_volume_unit():
+    """启动事件须带 live_bar_volume_unit=shares 版本标记（便于前后对比）。"""
+    from core.engine.live_engine import LiveEngine
+
+    engine = object.__new__(LiveEngine)
+    engine.ctx = SimpleNamespace(session_id=1)
+    engine._engine_key = "tdx"
+    engine._pre_open_config_announced = False
+    engine._pre_open = SimpleNamespace(
+        enabled=True, end_time=(9, 20), price_bias_pct=2.0)
+    engine._pre_open_config_source = "global"
+    engine._pre_open_config_overrides = []
+    captured = []
+    engine._file_handoff = None
+    engine._event_bus = SimpleNamespace(
+        emit=lambda event_type, payload: captured.append((event_type, payload)))
+
+    engine._announce_pre_open_config()
+
+    assert captured and captured[0][1]["live_bar_volume_unit"] == "shares"
+    # 只声明一次
+    engine._announce_pre_open_config()
+    assert len(captured) == 1

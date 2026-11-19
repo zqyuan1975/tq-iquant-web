@@ -22,7 +22,7 @@ from tq_iquant_shared.constants import SignalType, TradeType
 
 
 class _Synth:
-    """快照合成器桩：按 code 给「最近完成 1m bar」。volume 单位=手。"""
+    """快照合成器桩：按 code 给「最近完成 1m bar」。volume 单位=股（与合成器出口一致）。"""
 
     def __init__(self):
         self.bars = {}
@@ -82,7 +82,7 @@ def test_shrink_takes_min_of_daily_and_minute_and_enqueues_residual(monkeypatch)
     engine = _engine(monkeypatch)
     engine._daily_reference_volume = lambda code, d: 1_000_000  # 日线 5% → 50,000
     engine._snapshot_synth.bars["600000.SH"] = [
-        {"stime": "20261119093100", "volume": 1000, "close": 10.0},  # 1000 手 = 100,000 股
+        {"stime": "20261119093100", "volume": 100000, "close": 10.0},  # 100,000 股（=1000 手）
     ]  # 分钟 10% → 10,000
     order = _order(qty=30000)
     engine._apply_volume_cap(order, _portfolio())
@@ -103,7 +103,7 @@ def test_daily_cap_binds_when_tighter_than_minute(monkeypatch):
     engine = _engine(monkeypatch)
     engine._daily_reference_volume = lambda code, d: 100_000  # 5% → 5,000
     engine._snapshot_synth.bars["600000.SH"] = [
-        {"stime": "20261119093100", "volume": 1000, "close": 10.0},
+        {"stime": "20261119093100", "volume": 100000, "close": 10.0},
     ]
     order = _order(qty=30000)
     engine._apply_volume_cap(order, _portfolio())
@@ -118,7 +118,7 @@ def test_minute_ratio_zero_disables_minute_gate(monkeypatch):
     engine = _engine(monkeypatch)
     engine._daily_reference_volume = lambda code, d: 1_000_000  # 日线 5% → 50,000
     engine._snapshot_synth.bars["600000.SH"] = [
-        {"stime": "20261119093100", "volume": 100, "close": 10.0},  # 分钟层仅 1,000 股
+        {"stime": "20261119093100", "volume": 10000, "close": 10.0},  # 分钟层仅 10,000 股
     ]
     order = _order(qty=30000)
     engine._apply_volume_cap(order, _portfolio(minute_ratio="0"))
@@ -129,12 +129,12 @@ def test_minute_ratio_zero_disables_minute_gate(monkeypatch):
 def test_minute_ratio_null_falls_back_to_daily_ratio_not_ten_pct(monkeypatch):
     """NULL 未配置 → 分钟比例取日线占比（4%），不得硬编码 10%。
 
-    bar 1000 手 = 100,000 股：4% → 4,000；若误用 10% 会是 10,000。
+    bar 100,000 股（=1000 手）：4% → 4,000；若误用 10% 会是 10,000。
     """
     engine = _engine(monkeypatch)
     engine._daily_reference_volume = lambda code, d: 1_000_000  # 日线 4% → 40,000
     engine._snapshot_synth.bars["600000.SH"] = [
-        {"stime": "20261119093100", "volume": 1000, "close": 10.0},
+        {"stime": "20261119093100", "volume": 100000, "close": 10.0},
     ]
     order = _order(qty=30000)
     engine._apply_volume_cap(order, _portfolio(daily_ratio="0.04", minute_ratio=None))
@@ -212,7 +212,7 @@ def test_abandon_on_price_deviation(monkeypatch):
     key, entry = _entry(engine, ref_price="10.00")
     entry["last_bar_key"] = "20261119093000"
     engine._snapshot_synth.bars["600000.SH"] = [
-        {"stime": "20261119100000", "volume": 1000, "close": 10.30},  # +3% > 2%
+        {"stime": "20261119100000", "volume": 100000, "close": 10.30},  # +3% > 2%
     ]
     db = _db()
     engine._advance_volume_residual(db, key, entry)
@@ -231,7 +231,7 @@ def test_no_progress_abandons_after_max_attempts(monkeypatch):
     entry["attempts"] = 1
     # bar 量×10% 不足一手 → 可下量 0，且每根新 bar 计一次无进展
     engine._snapshot_synth.bars["600000.SH"] = [
-        {"stime": "20261119100000", "volume": 1, "close": 10.0},
+        {"stime": "20261119100000", "volume": 100, "close": 10.0},
     ]
     db = _db()
     engine._advance_volume_residual(db, key, entry)
@@ -250,7 +250,7 @@ def test_dispatch_once_per_bar_and_track_fills(monkeypatch):
     key, entry = _entry(engine, target=20000)
     entry["last_bar_key"] = "20261119095500"
     engine._snapshot_synth.bars["600000.SH"] = [
-        {"stime": "20261119100000", "volume": 1000, "close": 10.0},  # 分钟 10% → 10,000
+        {"stime": "20261119100000", "volume": 100000, "close": 10.0},  # 分钟 10% → 10,000
     ]
     calls = []
 
@@ -285,7 +285,7 @@ def test_dispatch_once_per_bar_and_track_fills(monkeypatch):
     row.filled_quantity = 10000
     db.commit()
     engine._snapshot_synth.bars["600000.SH"].append(
-        {"stime": "20261119100100", "volume": 1000, "close": 10.0})
+        {"stime": "20261119100100", "volume": 100000, "close": 10.0})
     engine._advance_volume_residual(db, key, entry)
 
     assert len(calls) == 2
@@ -298,7 +298,7 @@ def test_dispatch_once_per_bar_and_track_fills(monkeypatch):
     row2.filled_quantity = 10000
     db.commit()
     engine._snapshot_synth.bars["600000.SH"].append(
-        {"stime": "20261119100200", "volume": 1000, "close": 10.0})
+        {"stime": "20261119100200", "volume": 100000, "close": 10.0})
     engine._advance_volume_residual(db, key, entry)
 
     assert key not in engine._volume_residuals
@@ -327,3 +327,23 @@ def test_requote_is_not_recapped(monkeypatch):
     engine._apply_volume_cap(order, _portfolio())
     assert order.quantity == 5000
     assert not engine._volume_residuals
+
+
+def test_cap_regression_133_hand_bar_yields_532_shares(monkeypatch):
+    """量纲回归（对齐 2026-11-18 09:31 301600 实盘事件）：13,300 股 ×4% → 532 股。
+
+    修复前：合成 bar 出口=手（133），闸门再 ×100 得 13,300 股；
+    修复后：出口已统一为股（13,300），闸门不再 ×100。
+    最终上限必须仍逐位等于 532——既不能是 5.32（少乘一次），也不能是 53,200（多乘一次）。
+    """
+    engine = _engine(monkeypatch)
+    engine._daily_reference_volume = lambda code, d: None
+    engine._snapshot_synth.bars["600000.SH"] = [
+        {"stime": "20261119093100", "volume": 13300, "close": 10.0},
+    ]
+    order = _order(qty=700, trade_type=TradeType.SELL)
+    engine._apply_volume_cap(
+        order, _portfolio(daily_ratio="0.04", minute_ratio="0.04"))
+
+    assert order.quantity == 532
+    assert next(iter(engine._volume_residuals.values()))["target_qty"] == 168

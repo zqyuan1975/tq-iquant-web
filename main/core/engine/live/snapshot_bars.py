@@ -14,7 +14,8 @@ OHLCV 语义：
 - stime = 分钟结束时刻（与 TDX 1m K 线一致：10:50 分钟 → 10:51:00）；
 - open/close = 分钟内首/末采样 Now，high/low = 采样极值（5s 节拍下
   close 偏差 ≤ 采样间隔，极值可能漏掉采样间尖峰——1m 级信号/风控可接受）；
-- volume = 快照当日总量差分（Volume 为日累计口径），回退异常 clamp 为 0；
+- volume = 快照当日总量差分（Volume 为日累计口径，单位=手），回退异常 clamp 为 0；
+  对外输出（1m 与聚合）统一 ×100 转「股」，与 TQ K 线/回测同量纲；
 - 无成交分钟仍产 bar（volume=0、价格持平）——保持 bar 连续性，风控不漏判。
 
 时段门控：仅 A 股连续竞价时段（09:30-11:30 / 13:00-15:00，Asia/Shanghai，
@@ -74,13 +75,19 @@ def _f(v) -> Optional[float]:
 
 
 def _to_bar_dict(b: dict) -> dict:
+    """内部 1m bar → 对外 bar dict（volume 出口统一为「股」）。
+
+    快照 Volume 单位是手（实测：同一交易日快照累计量 = TQ 日线量 / 100），
+    内部差分仍按快照原始单位累计；对外输出乘 100 转股，保证合成 bar 与
+    TQ K 线、回测的 volume 同量纲（闸门/公式/聚合下游无需再换算）。
+    """
     return {
         "stime": b["label"].strftime("%Y%m%d%H%M%S"),
         "open": b["open"],
         "high": b["high"],
         "low": b["low"],
         "close": b["close"],
-        "volume": int(b["volume"]),
+        "volume": int(b["volume"]) * 100,
     }
 
 
@@ -119,7 +126,8 @@ def _aggregate_completed(
     逐分钟连续。缺任何一分钟（采样停摆/取数失败/开盘中途启动）整桶丢弃——绝不
     用残缺数据冒充周期 bar（与新鲜度闸 fail-safe 同口径）。
 
-    OHLCV：open=首根 open、close=末根 close、high/low=极值、volume=累加。
+    OHLCV：open=首根 open、close=末根 close、high/low=极值、volume=累加后 ×100 转股
+    （内部 1m 量是快照原始单位「手」，出口与 ``_to_bar_dict`` 一致统一为股）。
     输出带 ``source=aggregated_1m`` / ``period`` 标记，便于事后区分「聚合」与
     「TQ 原生」。
     """
@@ -144,7 +152,7 @@ def _aggregate_completed(
             "high": max(g["high"] for g in group),
             "low": min(g["low"] for g in group),
             "close": group[-1]["close"],
-            "volume": int(sum(int(g.get("volume") or 0) for g in group)),
+            "volume": int(sum(int(g.get("volume") or 0) for g in group)) * 100,
             "source": "aggregated_1m",
             "period": period,
         })

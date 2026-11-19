@@ -62,7 +62,7 @@ def test_minute_rollover_completes_bar_ohlc_volume_delta():
     assert b["high"] == pytest.approx(10.5)
     assert b["low"] == pytest.approx(9.9)
     assert b["close"] == pytest.approx(9.9)     # 分钟内末采样
-    assert b["volume"] == 200                   # 1200 - 1000（10.2/1600 归下一分钟）
+    assert b["volume"] == 20000                 # 200 手 → 出口统一为股（1200-1000）
 
 
 def test_open_at_reads_forming_and_completed_by_minute_end_label():
@@ -116,7 +116,7 @@ def test_volume_none_midway_does_not_break_other_codes():
 
     bars = s.completed_bars(["000001.SZ", "600000.SH"])
     assert len(bars["600000.SH"]) == 1                   # 其它股票照常采样
-    assert bars["600000.SH"][0]["volume"] == 300
+    assert bars["600000.SH"][0]["volume"] == 30000
     assert bars["600000.SH"][0]["close"] == pytest.approx(20.5)
     assert len(bars["000001.SZ"]) == 1                   # 量缺失只 clamp 到 0
     assert bars["000001.SZ"][0]["volume"] == 0
@@ -145,7 +145,7 @@ def test_fetch_failure_keeps_state_and_rollover():
     s.sample(datetime(2026, 11, 3, 10, 52, 10))   # 10:51 bar 完成
     bars = s.completed_bars(["000001.SZ"])["000001.SZ"]
     assert bars[-1]["stime"] == D1 + "105200"
-    assert bars[-1]["volume"] == 600              # 1600 - 1000（故障未破坏基线）
+    assert bars[-1]["volume"] == 60000            # 600 手（1600-1000，故障未破坏基线）
 
 
 def test_multi_minute_accumulates_and_count_window():
@@ -157,7 +157,7 @@ def test_multi_minute_accumulates_and_count_window():
     # 完成 bar：105100(vol0) 105200(600) 105300(700)；count=2 取末两根
     bars = s.completed_bars(["000001.SZ"], count=2)["000001.SZ"]
     assert [b["stime"][-6:] for b in bars] == ["105200", "105300"]
-    assert bars[0]["volume"] == 600 and bars[1]["volume"] == 700
+    assert bars[0]["volume"] == 60000 and bars[1]["volume"] == 70000
 
 
 def test_completed_bars_filters_unknown_codes():
@@ -180,7 +180,7 @@ def test_cross_day_resets_volume_baseline():
     s.sample(datetime(2026, 11, 4, 9, 32, 10))    # 滚动完成 09:31 bar
     bars = s.completed_bars(["000001.SZ"])["000001.SZ"]
     assert bars[-1]["stime"] == "20261104093200"
-    assert bars[-1]["volume"] == 200              # 新交易日差分基线已重置
+    assert bars[-1]["volume"] == 20000            # 新交易日差分基线已重置（200 手）
 
 
 def test_reset_clears_state():
@@ -309,7 +309,7 @@ def test_aggregated_bars_5m_ohlcv_and_source_marker():
     assert b["close"] == pytest.approx(10.5)     # 末根 close
     assert b["high"] == pytest.approx(10.6)      # 极值
     assert b["low"] == pytest.approx(9.9)
-    assert b["volume"] == 510                    # 100+101+102+103+104
+    assert b["volume"] == 51000                  # 累加 510 手 → 出口统一为股
     assert b["source"] == "aggregated_1m"
     assert b["period"] == "5m"
 

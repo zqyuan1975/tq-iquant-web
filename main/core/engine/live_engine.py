@@ -3014,6 +3014,8 @@ class LiveEngine:
 
         live_sessions 没有 params_snapshot 列，用决策事件留痕「这次到底用了
         什么窗口/让价、是会话覆盖还是全局」，供事后回溯与工作台展示。
+        同时落 ``live_bar_volume_unit=shares`` 版本标记：2026-11-20 起快照合成
+        bar 的 volume 在出口统一由「手」换算为「股」，便于前后实盘事件对比。
         """
         if self._pre_open_config_announced:
             return
@@ -3029,6 +3031,7 @@ class LiveEngine:
             "price_bias_pct": str(self._pre_open.price_bias_pct),
             "source": self._pre_open_config_source,
             "overrides": list(self._pre_open_config_overrides),
+            "live_bar_volume_unit": "shares",
         })
 
     def _trading_day_age(self, start: date, end: date) -> int:
@@ -5958,8 +5961,8 @@ class LiveEngine:
         })
 
     def _volume_cap_shares(self, code: str) -> Optional[int]:
-        """最近完成 1m bar 成交量（股）——快照合成源（TDX 快照 Volume 单位=手，
-        ×100 转股，与回测 TQ K 线量纲对齐）。无合成器/无 bar → None。"""
+        """最近完成 1m bar 成交量（股）——快照合成器出口已把手换算为股，
+        与回测 TQ K 线量纲一致。无合成器/无 bar → None。"""
         if self._snapshot_synth is None:
             return None
         try:
@@ -5970,7 +5973,7 @@ class LiveEngine:
             return None
         v = bars[-1].get("volume")
         try:
-            return int(v) * 100
+            return int(v)
         except (TypeError, ValueError):
             return None
 
@@ -6051,9 +6054,10 @@ class LiveEngine:
 
         - 日线层：单笔 ≤ 前 5 个有效交易日日均量（股）× volume_limit_ratio，
           与回测统一、严格不含当日（无前视）；
-        - 分钟层：**单次提交** ≤ 最近完成 1m bar 量 × minute_volume_limit_ratio
-          （独立参数；未配置 NULL 时回落到日线 volume_limit_ratio，即默认 4%，
-          不硬编码 10%——放宽单次可吃比例等同改风险偏好）；
+        - 分钟层：**单次提交** ≤ 最近完成 1m bar 量（股，合成器出口已由手换算）
+          × minute_volume_limit_ratio（独立参数；未配置 NULL 时回落到日线
+          volume_limit_ratio，即默认 4%，不硬编码 10%——放宽单次可吃比例等同
+          改风险偏好）；
         本次可提交量取两层较小值。缩掉的差额注册进当日残量补单队列，由后续
         新 1m bar 按同一口径续发，不再直接改 quantity 后丢弃（默认行为，无开关）。
 
@@ -6087,7 +6091,8 @@ class LiveEngine:
         bar_vol: Optional[int] = None
         if bar is not None:
             try:
-                bar_vol = int(bar.get("volume") or 0) * 100
+                # 合成器出口已统一为股（原为快照原始单位手），此处不再 ×100。
+                bar_vol = int(bar.get("volume") or 0)
             except (TypeError, ValueError):
                 bar_vol = None
 
@@ -6101,7 +6106,7 @@ class LiveEngine:
             self._rec_live(
                 "volume_cap", "fail_open", portfolio, order,
                 requested_qty=target, final_qty=target,
-                message="成交量约束无可用基准（近5日均量=%s，1m bar 量=%s），放行不缩量"
+                message="成交量约束无可用基准（近5日均量=%s 股，1m bar 量=%s 股），放行不缩量"
                         % (daily_ref, bar_vol),
             )
             return
@@ -6360,7 +6365,8 @@ class LiveEngine:
         bar_vol = 0
         if bar is not None:
             try:
-                bar_vol = int(bar.get("volume") or 0) * 100
+                # 合成器出口已统一为股，此处不再 ×100。
+                bar_vol = int(bar.get("volume") or 0)
             except (TypeError, ValueError):
                 bar_vol = 0
         if Decimal(str(minute_ratio or 0)) > 0 and bar_vol > 0:
