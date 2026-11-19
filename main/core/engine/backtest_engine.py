@@ -1,7 +1,8 @@
 from typing import Callable, Dict, List, Optional
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 from decimal import Decimal, ROUND_HALF_UP
 from dataclasses import replace
+import json
 import logging
 
 from .portfolio import Portfolio
@@ -32,9 +33,21 @@ from .market_rules import (  # noqa: F401
     session_allows_bar,
     trading_days_between,
 )
+from .capital_contracts import (
+    CAPITAL_POOL_VERSION,
+    PortfolioQuotaInput,
+    StrategyQuotaInput,
+    dec_str,
+    to_decimal,
+)
+from .capital_loan import LoanBook, Owner, REASON_MANUAL, SCOPE_PORTFOLIO
+from .capital_quota import derive_portfolio_quota
 from tq_iquant_shared.constants import SignalType, TradeType
 
 logger = logging.getLogger(__name__)
+
+# 资金池 L2 借据建模版本（0021 B3）：随快照写入，便于回测/实盘对照。
+LOAN_MODEL_VERSION = "loan-model-b3"
 
 
 # W4 按周期路由：同一时间戳可能同时存在多个周期（1d/1w/1mon 均为 00:00）。
@@ -73,6 +86,168 @@ def _ca_mode(portfolio) -> str:
     """公司行为记账口径：J4 exact 档为未复权价空间（backtest_raw），其余沿用
     backtest（复权价 + 比例分红）。"""
     return getattr(portfolio, "corporate_action_mode", None) or "backtest"
+
+
+def _loan_quota_input(portfolio, equity: Decimal) -> PortfolioQuotaInput:
+    """由内存组合装配一次推导输入（只读、无 IO；口径与 A2 一致）。"""
+    items = []
+    for ctx in portfolio.strategies:
+        items.append(StrategyQuotaInput(
+            strategy_id=ctx.strategy_id,
+            capital_ratio=getattr(ctx, "capital_ratio", None),
+            max_positions=getattr(ctx, "max_positions", None),
+            single_open_ratio=getattr(ctx, "single_open_ratio", None),
+            max_order_amount=getattr(ctx, "max_order_amount", None),
+            max_order_pct_equity=getattr(ctx, "max_order_pct_equity", None),
+        ))
+    return PortfolioQuotaInput(
+        portfolio_id=getattr(portfolio, "portfolio_id", None),
+        equity=equity,
+        equity_cap=getattr(portfolio, "equity_cap", None),
+        target_utilization=getattr(portfolio, "target_utilization", None),
+        max_holdings=getattr(portfolio, "max_holdings", None),
+        max_single_position_pct=getattr(portfolio, "max_single_position_pct", None),
+        strategies=items,
+    )
+
+
+def apply_loan_model(portfolio, plan, recorder, at: datetime) -> Optional[dict]:
+    """单组合回测内的 L2 借据建模（0021 B3，默认关闭）。
+
+    ``plan`` 为 None / ``enabled=False`` → 返回 None，交易链路零改动。
+    仅在组合**同时包含**出借方与借款方两个策略时成立（L2 口径；跨组合留待 E）。
+    借方额度与贷方额度均来自 A2 统一推导，注入 B2 的 ``capital_budget``：
+    贷方额度 = 自身 Entitlement − 借出本金，借方额度 = 自身 Entitlement + 借入本金。
+    权益取 run 起点的当前持仓/现金（不含未来数据），本金由配置给出（无前视）。
+    """
+    if not plan or plan.get("enabled") is False:
+        return None
+
+    lender_id = plan.get("lender_strategy_id")
+    borrower_id = plan.get("borrower_strategy_id")
+    lender = portfolio._find_strategy_by_id(lender_id)
+    borrower = portfolio._find_strategy_by_id(borrower_id)
+    if lender is None or borrower is None:
+        return {
+            "status": "rejected",
+            "reason": "strategy_not_in_portfolio",
+            "message": "L2 借据要求出借方与借款方同属该组合（跨组合见 E 阶段）",
+            "lender_strategy_id": lender_id,
+            "borrower_strategy_id": borrower_id,
+        }
+    if lender is borrower:
+        return {
+            "status": "rejected", "reason": "self_lending",
+            "message": "出借方与借款方不能是同一策略",
+        }
+
+    requested = to_decimal(plan.get("principal", plan.get("amount")))
+    if requested is None or requested <= 0:
+        return {
+            "status": "rejected", "reason": "invalid_principal",
+            "message": "本金缺失或非正，拒绝建模（不落默认值）",
+        }
+
+    equity = portfolio.current_value()
+    quota = derive_portfolio_quota(_loan_quota_input(portfolio, equity), enabled=True)
+    by_id = {s.strategy_id: s for s in quota.strategies}
+    lq = by_id.get(lender_id)
+    bq = by_id.get(borrower_id)
+    if lq is None or bq is None or lq.entitlement is None or bq.entitlement is None:
+        return {
+            "status": "rejected", "reason": "quota_not_derivable",
+            "message": "双方额度无法推导（见 quota.reasons），不建模借贷",
+            "quota": quota.to_dict(),
+        }
+
+    # 出借方自有需求优先：只有「额度 − 当前持仓市值」可出借，本金超出部分夹取。
+    lendable = lq.entitlement - portfolio._holdings_value(lender)
+    if lendable <= 0:
+        return {
+            "status": "rejected", "reason": "lender_entitlement_exhausted",
+            "message": "出借方可用额度不足以出借（额度 %s，持仓市值 %s）" % (
+                dec_str(lq.entitlement),
+                dec_str(portfolio._holdings_value(lender))),
+        }
+    amount = min(requested, lendable)
+    clamped = amount < requested
+
+    book = LoanBook()
+    lender_owner = Owner("strategy", lender_id)
+    borrower_owner = Owner("strategy", borrower_id)
+    book.deposit_lendable(lender_owner, lendable)
+    book.grant_credit(borrower_owner, amount)
+    try:
+        due_days = int(plan.get("due_days") or 365)
+    except (TypeError, ValueError):
+        due_days = 365
+    lot = book.lend(
+        lender=lender_owner,
+        borrower=borrower_owner,
+        principal=amount,
+        scope=SCOPE_PORTFOLIO,
+        created_at=at,
+        due_at=at + timedelta(days=due_days),
+        reason=REASON_MANUAL,
+    )
+
+    lender_budget = lq.entitlement - amount
+    borrower_budget = bq.entitlement + amount
+    # 已有显式额度时取更保守的一侧（不放大外部注入的上限）。
+    if getattr(lender, "capital_budget", None) is not None:
+        lender_budget = min(lender_budget, Decimal(lender.capital_budget))
+    if getattr(borrower, "capital_budget", None) is not None:
+        borrower_budget = min(borrower_budget, Decimal(borrower.capital_budget))
+    lender.capital_budget = lender_budget
+    borrower.capital_budget = borrower_budget
+
+    for ctx, budget, entitlement, role in (
+        (lender, lender_budget, lq.entitlement, "lender"),
+        (borrower, borrower_budget, bq.entitlement, "borrower"),
+    ):
+        recorder.record(
+            gate="capital_loan_budget", layer="capital_gate", action="trigger",
+            portfolio_id=getattr(portfolio, "portfolio_id", None),
+            strategy_id=ctx.strategy_id,
+            bar_time=at,
+            param_name="capital_budget", param_value=float(budget),
+            actual_value=float(entitlement),
+            message="L2 借据（%s）：本金 %s，额度 %s → %s" % (
+                role, dec_str(amount), dec_str(entitlement), dec_str(budget)),
+        )
+
+    state = {
+        "status": "applied",
+        "loan_model_version": LOAN_MODEL_VERSION,
+        "capital_pool_version": CAPITAL_POOL_VERSION,
+        "lender_strategy_id": lender_id,
+        "borrower_strategy_id": borrower_id,
+        "principal": dec_str(amount),
+        "requested_principal": dec_str(requested),
+        "clamped": clamped,
+        "entitlements": {
+            str(lender_id): dec_str(lq.entitlement),
+            str(borrower_id): dec_str(bq.entitlement),
+        },
+        "budgets": {
+            str(lender_id): dec_str(lender_budget),
+            str(borrower_id): dec_str(borrower_budget),
+        },
+        "loan": lot.to_dict(),
+        "loan_book": book.snapshot(),
+        "violations": book.check_invariants(),
+    }
+    if clamped:
+        recorder.record(
+            gate="capital_loan_clamped", layer="capital_gate", action="clamp",
+            portfolio_id=getattr(portfolio, "portfolio_id", None),
+            bar_time=at,
+            param_name="principal", param_value=float(requested),
+            actual_value=float(amount),
+            message="本金 %s 超出出借方可用额度，夹取为 %s"
+                    % (dec_str(requested), dec_str(amount)),
+        )
+    return state
 
 
 def build_prev_close_by_day(klines: dict) -> Dict[tuple, Decimal]:
@@ -180,6 +355,7 @@ class BacktestEngine:
         pending_order_max_days: int = PENDING_ORDER_MAX_DAYS,
         run_options: Optional[dict] = None,
         cancel_check: Optional[Callable[[], bool]] = None,
+        loan_model_plan: Optional[dict] = None,
     ) -> dict:
         """逐 bar 回测主链路。
 
@@ -216,6 +392,9 @@ class BacktestEngine:
         成交当根 bar 量，``prev5d_avg``=前 5 个交易日日均量，显式选择才生效）。
         cancel_check：K1 协作式取消（默认 None=不检查）。每根 bar 处理前调用，
         返回 True 即中止循环并返回 ``canceled=True`` + ``progress``，不产出部分结果。
+        loan_model_plan：资金池 L2 借据建模（0021 B3，默认 None=不启用）。仅当组合
+        同时包含出借/借款两策略时成立；额度来自 A2 推导并注入 B2 ``capital_budget``，
+        快照写 ``loan_model_version``。关闭/无效时交易链路逐位不变。
         """
         run_options = run_options or {}
         _first_bar_no_fill = bool(run_options.get("first_bar_no_fill", False))
@@ -237,6 +416,20 @@ class BacktestEngine:
 
         times = self._build_timeline(klines)
         total_bars = len(times)
+        # 资金池 L2 借据（0021 B3，默认关闭）：权益取 run 起点首个 bar 时间作为
+        # 起算时点（不用墙钟，回测可复现）；失败只落状态/事件，不改交易链路。
+        loan_state = None
+        if times:
+            loan_state = apply_loan_model(
+                portfolio, loan_model_plan, recorder, times[0][0])
+            if loan_state is not None and loan_state.get("status") != "applied":
+                recorder.record(
+                    gate="capital_loan_rejected", layer="capital_gate",
+                    action="reject",
+                    portfolio_id=getattr(portfolio, "portfolio_id", None),
+                    bar_time=times[0][0],
+                    message=(loan_state.get("message") or "")[:200],
+                )
         report_every = max(1, total_bars // 100)
         price_index = self._build_price_index(klines)
         # #2 成交量闸门分母（可选新口径）：成交日之前 5 个交易日日均量
@@ -903,6 +1096,20 @@ class BacktestEngine:
                 total_value = self._apply_equity_cap_distribution(
                     portfolio, total_value, t, recorder)
                 snap = portfolio.snapshot(t.date(), total_value, bar)
+                # 资金池 L2 借据（0021 B3）：建模成立时随快照写版本与额度块；
+                # 默认 None → 不新增任何键，旧快照逐位一致。
+                if loan_state is not None and loan_state.get("status") == "applied":
+                    snap["loan_model_version"] = loan_state["loan_model_version"]
+                    snap["capital_pool_version"] = loan_state["capital_pool_version"]
+                    snap["entitlement_json"] = json.dumps(
+                        {
+                            "loan_model_version": loan_state["loan_model_version"],
+                            "budgets": loan_state["budgets"],
+                            "entitlements": loan_state["entitlements"],
+                            "loan_book": loan_state["loan_book"],
+                        },
+                        ensure_ascii=False, sort_keys=True,
+                    )
                 # 填基准值：benchmark_data 是 {date: Decimal}，按当前 bar 日期取值；
                 # 缺失（基准停牌/非交易日/区间外）直接为 None（不做 carry-forward），
                 # Evaluator 喂基准序列时会过滤 None 值，全无则 benchmark_return 退化为 0。
@@ -1027,6 +1234,8 @@ class BacktestEngine:
             "risk_sell_fill_attempts": risk_fill_attempts,
             # 层 1：BUY 单数 / 单笔金额上限缩量数（服务层 >5% 告警）
             "execution_stats": run_stats,
+            # 资金池 L2 借据（0021 B3）：None=未启用/未成立，不影响任何旧消费方
+            "loan_model": loan_state,
         }
 
     def run_multi(

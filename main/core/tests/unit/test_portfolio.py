@@ -1437,6 +1437,23 @@ def test_rotation_replaces_weakest_on_strong_signal():
     assert any(ev.gate == "rotation_replaced" for ev in rec.drain())
 
 
+def test_rotation_respects_capital_budget():
+    """额度已用尽时轮动整体放弃（不得先卖后买不成，0021 B2/B3 接线）。"""
+    port, ctx = _rotation_portfolio()
+    rec = DecisionRecorder()
+    port.set_recorder(rec)
+    _hold_pair(ctx)
+    # 持仓市值 17000（7×1000 + 10×1000），额度 1000 已耗尽
+    ctx.capital_budget = Decimal("1000")
+
+    orders = _feed_history(port, _STRONG_CLOSES, final_signal_code="000003.SZ")
+
+    assert orders == []
+    gates = [ev.gate for ev in rec.drain()]
+    assert "capital_quota_exhausted" in gates
+    assert "rotation_replaced" not in gates
+
+
 def test_rotation_weak_signal_blocked():
     """新信号动量 -0.28 < 最弱 -0.30 + 滞环 0.05 → 不轮动，记 rotation_signal_weak。"""
     port, ctx = _rotation_portfolio()

@@ -27,6 +27,9 @@ class BacktestDailySnapshot(Base):
     # 默认关闭/旧记录为 NULL，读侧按 NULL 兜底，不影响任何既有口径。
     capital_pool_version = Column(String(40), nullable=True)
     entitlement_json = Column(Text, nullable=True)
+    # 资金池 L2 借据版本（0021 B3）：仅 loan_model 建模成立的 run 有值；
+    # 默认关闭/旧记录为 NULL，读侧按 NULL 兜底。
+    loan_model_version = Column(String(40), nullable=True)
     created_at = Column(DateTime, server_default=func.now())
 
     __table_args__ = (

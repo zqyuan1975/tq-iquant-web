@@ -113,9 +113,16 @@ class Portfolio:
         # 净值超上限后仓位封顶、超额现金闲置（等价"超容量撤回/封盘"），
         # 封堵 20%×增长净值 在长周期复利下开出不可实现的天文仓位。fixed 不受影响。
         self.equity_cap: Optional[Decimal] = None
+        # 资金池（0021 B3）：组合级目标利用率（None=按 0.95 缺省），仅被额度推导
+        # 读取，不参与任何现有交易/风控计算；未注入时行为与改动前逐位一致。
+        self.target_utilization: Optional[Decimal] = None
         # W3 上限处理模式：cap（默认，只封顶新开仓定量，与旧行为逐位一致）/
         # distribute（回测日终把「总资产 − cap」当外部流出扣出现金，不强制减仓）。
         self.equity_cap_mode: str = "cap"
+        # 资金池（0021 B3）：本 bar 内已排队买单的额度占用（strategy_id → 金额）。
+        # 只在 capital_budget 非 None 时写入；每根 bar 开头清空（上一 bar 的挂单
+        # 已在成交步落账，本 bar 的持仓市值已包含），避免同 bar 多信号超额。
+        self._budget_committed: Dict[int, Decimal] = {}
         # 决策闸门采集器（调参可观测性）：默认空采集器，set_recorder 注入。
         # 同步给 risk_manager（熔断/恢复在其内判定，需同一 recorder）。
         self.recorder = recorder or NULL_RECORDER
@@ -524,6 +531,8 @@ class Portfolio:
         inflight: Dict[int, set] = {
             sid: set(codes) for sid, codes in (inflight_opens or {}).items()
         }
+        # 资金池：本 bar 的额度占用从零开始（默认无额度时该 dict 恒空，零开销）。
+        self._budget_committed.clear()
         # W2 动态仓位：本 bar 组合总净值（现金 + 持仓按最近已知价市值），
         # _strategy_fund 据此按 capital_ratio 分配策略资金（fixed 模式不使用）。
         self._bar_equity = self.total_value(bar)
@@ -942,7 +951,8 @@ class Portfolio:
                 budget = Decimal(str(budget))
             except Exception:  # noqa: BLE001 - 非法额度按 0 处理（保守）
                 budget = Decimal(0)
-        held = self._holdings_value(ctx)
+        held = (self._holdings_value(ctx)
+                + self._budget_committed.get(ctx.strategy_id, Decimal(0)))
         remaining = budget - held
         if remaining <= 0:
             self._rec("capital_quota_exhausted", "capital_gate", "block",
@@ -962,6 +972,9 @@ class Portfolio:
                               % (fmt_money(remaining), fmt_price(close), lot))
             return 0
         if quantity <= cap_qty:
+            self._budget_committed[ctx.strategy_id] = (
+                self._budget_committed.get(ctx.strategy_id, Decimal(0))
+                + close * quantity)
             return quantity
         self._rec("capital_quota_shrink", "capital_gate", "shrink",
                   ctx, sig, bar,
@@ -970,6 +983,9 @@ class Portfolio:
                   message="策略额度 %s 已用 %s，本单 %d 股缩量至 %d 股"
                           % (fmt_money(budget), fmt_money(held),
                              int(quantity), int(cap_qty)))
+        self._budget_committed[ctx.strategy_id] = (
+            self._budget_committed.get(ctx.strategy_id, Decimal(0))
+            + close * cap_qty)
         return cap_qty
 
     def _signal_to_order(
@@ -1347,6 +1363,12 @@ class Portfolio:
                       message="OPEN 单笔开仓比例 %s × 策略资金 %s / 价 %s 取整后 %d 股 <%d"
                               % (fmt_pct(ctx.single_open_ratio), fmt_money(strategy_fund),
                                  fmt_price(close), quantity, lot))
+            return []
+        # 资金池策略额度闸（0021 B2/B3，默认 None=不约束）：换入同样受额度限制；
+        # 额度不足则不换仓（避免「先卖后买不成」的单边轮出）。
+        quantity = self._apply_capital_budget(
+            ctx, sig, bar, quantity, close, lot)
+        if quantity <= 0:
             return []
         weak_pos = ctx.positions[weakest_code]
         weak_close = bar.stocks[weakest_code]["close"]

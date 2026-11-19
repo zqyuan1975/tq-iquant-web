@@ -112,6 +112,11 @@ class BacktestRequest(BaseModel):
     # first_bar_no_fill=当日首根 bar 不接受买单（模拟「日线信号次日开盘才可能成交」）
     partial_fill_enabled: bool | None = None
     first_bar_no_fill: bool | None = None
+    # 资金池 L2 借据建模（0021 B3，默认 None=不启用）：
+    # {"lender_strategy_id": int, "borrower_strategy_id": int, "principal": float,
+    #  "due_days": int, "enabled": bool}。仅当两策略同属该组合时成立；
+    # 额度来自 A2 推导并注入 B2 capital_budget，快照写 loan_model_version。
+    loan_model_plan: dict | None = None
 
 
 class MultiBacktestRequest(BaseModel):

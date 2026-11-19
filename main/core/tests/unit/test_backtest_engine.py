@@ -1,5 +1,6 @@
 from datetime import datetime, date, timedelta
 from decimal import Decimal
+import json
 
 import polars as pl
 
@@ -2481,3 +2482,183 @@ def test_pending_order_max_days_zero_disables_expiry():
         port, klines=klines, signal_cache=cache, pending_order_max_days=0)
 
     assert not [d for d in result["decisions"] if d["gate"] == "pending_order_expired"]
+
+
+# ===========================================================================
+# 资金池 L2 借据建模（0021 B3，loan_model_plan 默认关闭）
+# ===========================================================================
+
+_LOAN_MAIN_CODE = "600000.SH"
+_LOAN_BORROW_CODES = ["%06d.SZ" % i for i in range(2, 10)]  # 8 只借款方标的
+_LOAN_DAYS = [datetime(2026, 8, 3 + i) for i in range(9)]
+
+
+def _loan_setup(conc=Decimal("0.02")):
+    """A（出借方）与 B（借款方）同组合；单票集中度 2% 使双方额度由 r×F 压到 2000。
+
+    双方 capital_ratio=0.5、单仓 10%、8 槽 → 各自 Entitlement = 8×2000 = 16000；
+    单笔下单量仍按 r×F = 5000（集中度只压额度，不改下单量）。
+    """
+    pm = PortfolioRiskManager(
+        max_drawdown=Decimal("0.9"), daily_loss_limit=Decimal("0.9"))
+    port = Portfolio(
+        portfolio_id=7, initial_capital=Decimal("100000"), risk_manager=pm)
+    port.max_single_position_pct = conc
+    lender = StrategyContext(
+        strategy_id=1, period="1d", capital_ratio=Decimal("0.5"),
+        max_positions=8, single_open_ratio=Decimal("0.1"))
+    borrower = StrategyContext(
+        strategy_id=2, period="1d", capital_ratio=Decimal("0.5"),
+        max_positions=8, single_open_ratio=Decimal("0.1"))
+    for ctx in (lender, borrower):
+        ctx.formula_signals = [
+            {"signal_name": "open_sig", "signal_type": SignalType.OPEN,
+             "trigger_value": 1},
+        ]
+        port.strategies.append(ctx)
+    return port, lender, borrower
+
+
+def _loan_klines_and_cache():
+    """9 个交易日、9 只标的、恒定价 10（无容量/涨跌停干扰）。
+
+    出借方第 1 日 1 个信号；借款方第 1–8 日每天 1 个新标的信号（次日开盘成交，
+    持仓逐日累积，额度闸才能逐次生效；同 bar 多单不计在途，故错开）。
+    """
+    codes = [_LOAN_MAIN_CODE] + _LOAN_BORROW_CODES
+    klines = {}
+    for code in codes:
+        klines[code] = {"1d": pl.DataFrame({
+            "datetime": _LOAN_DAYS,
+            "Open": [Decimal("10")] * len(_LOAN_DAYS),
+            "High": [Decimal("10.1")] * len(_LOAN_DAYS),
+            "Low": [Decimal("9.9")] * len(_LOAN_DAYS),
+            "Close": [Decimal("10")] * len(_LOAN_DAYS),
+            "Volume": [1_000_000] * len(_LOAN_DAYS),
+        })}
+    cache = {(1, _LOAN_MAIN_CODE, _LOAN_DAYS[0]): [{"name": "open_sig", "value": 1}]}
+    for i, code in enumerate(_LOAN_BORROW_CODES):
+        cache[(2, code, _LOAN_DAYS[i])] = [{"name": "open_sig", "value": 1}]
+    return klines, cache
+
+
+def _loan_fills(result, strategy_id):
+    return [t for t in result["trades"]
+            if t.strategy_id == strategy_id and t.trade_type == TradeType.BUY]
+
+
+def _loan_trade_key(t):
+    return (t.strategy_id, t.stock_code, t.trade_type, t.price, t.quantity)
+
+
+def test_loan_model_default_off_keeps_results_identical():
+    """plan=None 与 enabled=False 逐位一致；快照不出现 loan_model_version。"""
+    klines, cache = _loan_klines_and_cache()
+    port_a, _, _ = _loan_setup()
+    res_a = BacktestEngine().run(port_a, klines=klines, signal_cache=dict(cache))
+
+    port_b, _, _ = _loan_setup()
+    res_b = BacktestEngine().run(
+        port_b, klines=klines, signal_cache=dict(cache),
+        loan_model_plan={"enabled": False, "lender_strategy_id": 1,
+                         "borrower_strategy_id": 2, "principal": 10000})
+
+    assert res_a["loan_model"] is None
+    assert res_b["loan_model"] is None
+    assert [_loan_trade_key(t) for t in res_a["trades"]] == \
+           [_loan_trade_key(t) for t in res_b["trades"]]
+    assert res_a["snapshots"] == res_b["snapshots"]
+    assert all("loan_model_version" not in s for s in res_a["snapshots"])
+
+
+def test_loan_model_l2_extends_borrower_quota():
+    """L2：出借方让出 1 万额度，借款方可部署超过自身 Entitlement，且现金不为负。"""
+    klines, cache = _loan_klines_and_cache()
+    port, lender, borrower = _loan_setup()
+    result = BacktestEngine().run(
+        port, klines=klines, signal_cache=dict(cache),
+        loan_model_plan={"lender_strategy_id": 1, "borrower_strategy_id": 2,
+                         "principal": 10000, "due_days": 30})
+
+    state = result["loan_model"]
+    assert state["status"] == "applied"
+    assert state["budgets"] == {"1": "6000.00", "2": "26000.00"}
+    assert state["entitlements"] == {"1": "16000.00", "2": "16000.00"}
+    assert state["violations"] == []
+
+    main_filled = sum(t.amount for t in _loan_fills(result, 1))
+    borrow_filled = sum(t.amount for t in _loan_fills(result, 2))
+    # 出借方受让出后额度 6000 约束（1 笔 5000）；借款方 26000 > 自身 16000
+    assert main_filled == Decimal("5000")
+    assert Decimal("16000") < borrow_filled <= Decimal("26000")
+    assert lender.capital_budget == Decimal("6000")
+    assert borrower.capital_budget == Decimal("26000")
+    assert port.account.cash >= 0
+    # 未借出时借款方无额度上限（8 笔全成），借出后受 26000 约束 → 成交更少
+    port2, _, _ = _loan_setup()
+    res2 = BacktestEngine().run(port2, klines=klines, signal_cache=dict(cache))
+    assert sum(t.amount for t in _loan_fills(res2, 2)) > borrow_filled
+    assert borrow_filled < Decimal("40000")
+
+
+def test_loan_model_snapshot_carries_version_and_quota():
+    """快照写 loan_model_version / capital_pool_version / entitlement_json。"""
+    klines, cache = _loan_klines_and_cache()
+    port, _, _ = _loan_setup()
+    result = BacktestEngine().run(
+        port, klines=klines, signal_cache=dict(cache),
+        loan_model_plan={"lender_strategy_id": 1, "borrower_strategy_id": 2,
+                         "principal": 10000})
+
+    snaps = result["snapshots"]
+    assert snaps and all(s["loan_model_version"] == "loan-model-b3" for s in snaps)
+    assert all(s["capital_pool_version"] == "capital-pool-a1" for s in snaps)
+    payload = json.loads(snaps[-1]["entitlement_json"])
+    assert payload["loan_model_version"] == "loan-model-b3"
+    assert payload["budgets"] == {"1": "6000.00", "2": "26000.00"}
+    assert payload["loan_book"]["lots"][0]["principal"] == "10000"
+
+
+def test_loan_model_rejects_strategy_outside_portfolio():
+    """跨组合/不存在的策略 → rejected，且不改变任何交易结果。"""
+    klines, cache = _loan_klines_and_cache()
+    port, lender, borrower = _loan_setup()
+    result = BacktestEngine().run(
+        port, klines=klines, signal_cache=dict(cache),
+        loan_model_plan={"lender_strategy_id": 1, "borrower_strategy_id": 99,
+                         "principal": 10000})
+
+    assert result["loan_model"]["status"] == "rejected"
+    assert result["loan_model"]["reason"] == "strategy_not_in_portfolio"
+    assert lender.capital_budget is None and borrower.capital_budget is None
+    assert all("loan_model_version" not in s for s in result["snapshots"])
+    assert any(d["gate"] == "capital_loan_rejected" for d in result["decisions"])
+
+
+def test_loan_model_rejects_self_lending():
+    klines, cache = _loan_klines_and_cache()
+    port, lender, _ = _loan_setup()
+    result = BacktestEngine().run(
+        port, klines=klines, signal_cache=dict(cache),
+        loan_model_plan={"lender_strategy_id": 1, "borrower_strategy_id": 1,
+                         "principal": 10000})
+    assert result["loan_model"]["reason"] == "self_lending"
+    assert lender.capital_budget is None
+
+
+def test_loan_model_clamps_principal_to_lendable():
+    """本金超出出借方可用额度 → 夹取并记 capital_loan_clamped。"""
+    klines, cache = _loan_klines_and_cache()
+    port, lender, _ = _loan_setup()
+    result = BacktestEngine().run(
+        port, klines=klines, signal_cache=dict(cache),
+        loan_model_plan={"lender_strategy_id": 1, "borrower_strategy_id": 2,
+                         "principal": 100000})
+
+    state = result["loan_model"]
+    assert state["status"] == "applied"
+    assert state["clamped"] is True
+    assert state["principal"] == "16000.00"
+    assert state["budgets"] == {"1": "0.00", "2": "32000.00"}
+    assert lender.capital_budget == Decimal("0")
+    assert any(d["gate"] == "capital_loan_clamped" for d in result["decisions"])

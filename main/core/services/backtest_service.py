@@ -2966,6 +2966,8 @@ def _persist_result(
             # 资金池（0021 A5）：引擎未接入时为 None（列可空），默认路径不变
             capital_pool_version=snap.get("capital_pool_version"),
             entitlement_json=snap.get("entitlement_json"),
+            # 资金池 L2 借据（0021 B3）：未建模的 run 为 NULL，默认路径不变
+            loan_model_version=snap.get("loan_model_version"),
         ))
     ev = result.get("evaluations") or {}
     db.add(BacktestEvaluation(
@@ -4829,6 +4831,10 @@ def run_backtest(db: Session, ps: PortfolioStrategy, req,
         if equity_cap is not None:
             portfolio.equity_cap = Decimal(str(equity_cap))
         portfolio.equity_cap_mode = equity_cap_mode
+        # 资金池 L2 借据（0021 B3，默认 None=不启用）：额度推导用组合级目标利用率；
+        # NULL 表示按 0.95 缺省（A2），不改变任何既有回测结果。
+        portfolio.target_utilization = getattr(ps, "target_utilization", None)
+        _loan_plan = getattr(req, "loan_model_plan", None)
         # 层 1 容量模型（run 级，仅本轮内存生效）：sqrt 时启用参与率预算 +
         # sqrt 冲击 + 残量顺延，并停用旧 4% 成交量闸门的双重约束（引擎内互斥）。
         portfolio.capacity_model = capacity_model
@@ -4958,6 +4964,7 @@ def run_backtest(db: Session, ps: PortfolioStrategy, req,
                 _bt_cfg.get("pending_order_max_days", 20)),
             run_options=exec_flags,
             cancel_check=cancel_event.is_set,
+            loan_model_plan=_loan_plan,
         )
         t7 = datetime.now()
         _log_timing(f"[回测#{record_id}] 引擎逐bar回测: {(t7-t6).total_seconds():.1f}s")

@@ -136,6 +136,38 @@ def test_budget_below_one_lot_is_blocked():
     assert events[0].gate.startswith("capital_quota")
 
 
+# ---------------- 同 bar 多单：在途占用也要计入额度 ----------------
+def test_same_bar_burst_cannot_exceed_budget():
+    """同 bar 多只新开仓：已排队买单先占额度，避免「每单都按当前持仓算」超额。"""
+    ctx = _ctx(1, budget="25000")
+    port, recorder = _portfolio(ctx)
+    codes = ["000001.SZ", "000002.SZ", "000003.SZ", "000004.SZ"]
+
+    orders = port.on_bar(_bar(codes), signal_cache=_cache([(1, c) for c in codes]))
+
+    total = sum(o.quantity * D("10") for o in orders)
+    assert total <= D("25000")
+    # 首单 0.6×100000/10=6000 股（60000）→ 按额度缩到 2500 股（25000）；
+    # 后续单额度已耗尽被拦（若不计在途占用，则每单都会各自再买 2000/500 股）。
+    assert [o.quantity for o in orders] == [2500]
+    events = [e for e in recorder.drain() if e.gate.startswith("capital_quota")]
+    assert [e.action for e in events] == ["shrink", "block", "block", "block"]
+
+
+def test_budget_commitment_cleared_each_bar():
+    """上一 bar 的排队占用在下一 bar 开头清零（回测成交步已落账）。"""
+    ctx = _ctx(1, budget="30000")
+    port, _ = _portfolio(ctx)
+
+    first = port.on_bar(
+        _bar(["000001.SZ"]), signal_cache=_cache([(1, "000001.SZ")]))
+    second = port.on_bar(
+        _bar(["000002.SZ"]), signal_cache=_cache([(1, "000002.SZ")]))
+
+    assert first[0].quantity == 3000      # 30000 / 10
+    assert second[0].quantity == 3000     # 不因上 bar 占用被重复压缩
+
+
 # ---------------- 主从：各算各的额度 ----------------
 def test_master_and_slave_use_their_own_budget():
     master = _ctx(1, capital_ratio="0.6", budget="30000")
