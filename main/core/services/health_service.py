@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime
+from time import monotonic as _monotonic
 from typing import Any, Dict, List, Optional
 
 from core.api.status import get_status
@@ -39,6 +40,18 @@ LEVEL_OK = "ok"
 LEVEL_WARN = "warn"
 LEVEL_ERROR = "error"
 
+# 健康总览整体时间预算：多会话逐个聚合时，不能让某个会话的体检把接口拖过百秒
+# （此前未限流，实测 200s+ 仍在跑，且请求超时后线程不可取消）。超预算的会话
+# 直接降级为「未完成」并标注原因，已拿到的部分照常返回。
+_OVERVIEW_TOTAL_BUDGET_SECONDS = 12.0
+# 单会话体检预算（与启动体检 30 只/3s 对齐）：总览是告警级信息，宁可标注
+# 「未校验完整」也不允许扫全池。
+_OVERVIEW_DATA_HEALTH_MAX_CODES = 30
+_OVERVIEW_DATA_HEALTH_BUDGET_SECONDS = 2.0
+# 降级原因（前端/日志可直接展示）。
+REASON_OVERVIEW_BUDGET = "健康总览整体时间预算已耗尽，未做数据体检"
+REASON_DATA_TRUNCATED = "体检超出预算，仅校验部分标的"
+
 
 def _safe(label: str, fn, default=None):
     """读取子项；失败降级为 default 并写一条 WARNING（总览不因单项失败整体失败）。"""
@@ -58,7 +71,12 @@ def _channel_ok(primary: Optional[dict]) -> bool:
     return primary.get("online") is not False
 
 
-def _session_item(db, session: LiveSession, now: datetime) -> dict:
+def _session_item(db, session: LiveSession, now: datetime,
+                  data_budget: Optional[float] = None) -> dict:
+    """单会话聚合；``data_budget`` 是本会话体检可用的秒数（None=默认预算）。
+
+    体检预算耗尽时不再调用取数，直接标注「未完成 + 原因」，保证总览整体时长可控。
+    """
     sid = int(session.id)
     engine = live_service.ENGINES.get(sid)
 
@@ -77,10 +95,19 @@ def _session_item(db, session: LiveSession, now: datetime) -> dict:
     checks = (guard or {}).get("checks") or []
     failed = [c.get("label") for c in checks if not c.get("ok")]
 
-    data_health = _safe("data_health(%s)" % sid,
-                        lambda: live_service.session_data_health(
-                            db, sid, live_service.ENGINES, auto_fill=False))
-    data = {"available": False}
+    if data_budget is not None and data_budget <= 0:
+        data_health = {"available": False, "incomplete": True,
+                       "skipped": True, "reason": REASON_OVERVIEW_BUDGET}
+    else:
+        budget = (_OVERVIEW_DATA_HEALTH_BUDGET_SECONDS if data_budget is None
+                  else max(0.1, min(_OVERVIEW_DATA_HEALTH_BUDGET_SECONDS,
+                                    data_budget)))
+        data_health = _safe("data_health(%s)" % sid,
+                            lambda: live_service.session_data_health(
+                                db, sid, live_service.ENGINES, auto_fill=False,
+                                max_codes=_OVERVIEW_DATA_HEALTH_MAX_CODES,
+                                time_budget_seconds=budget))
+    data = {"available": False, "incomplete": False}
     if data_health:
         raw = data_health.get("health") or {}
         periods = {}
@@ -90,14 +117,28 @@ def _session_item(db, session: LiveSession, now: datetime) -> dict:
                 "empty": int(stats.get("empty") or 0),
                 "total": int(stats.get("total") or 0),
             }
+        in_progress = bool(data_health.get("in_progress"))
+        skipped = bool(data_health.get("skipped"))
+        truncated = bool(data_health.get("truncated") or raw.get("truncated"))
+        reason = data_health.get("reason")
+        if truncated and not skipped and not in_progress:
+            reason = "%s（已校验 %s/%s 只，其余未校验）" % (
+                REASON_DATA_TRUNCATED,
+                data_health.get("codes_checked", raw.get("checked_codes")),
+                data_health.get("codes_total"))
         data = {
             "available": bool(data_health.get("available", True)),
             "healthy": bool(raw.get("healthy")),
             "unavailable": bool(raw.get("unavailable")),
-            "reason": data_health.get("reason"),
+            "reason": reason,
             "codes_total": data_health.get("codes_total"),
+            "codes_checked": data_health.get("codes_checked",
+                                             raw.get("checked_codes")),
             "periods": periods,
             "bad_total": sum(p["stale"] + p["empty"] for p in periods.values()),
+            "truncated": truncated,
+            "in_progress": in_progress,
+            "incomplete": bool(in_progress or skipped or truncated),
         }
 
     start = datetime(now.year, now.month, now.day)
@@ -205,12 +246,25 @@ def overview(session_factory=None, now: Optional[datetime] = None) -> dict:
     core = _safe("status", get_status, {})
     core_data = (core or {}).get("data", {}).get("core", {}) if core else {}
 
+    # 整体预算：逐会话聚合（通道探测各 1s 封顶，体检按剩余预算分配），
+    # 预算耗尽后剩余会话不再体检，只标明「未完成 + 原因」。
+    deadline = _monotonic() + _OVERVIEW_TOTAL_BUDGET_SECONDS
     db = factory()
     try:
         sessions = db.query(LiveSession).order_by(LiveSession.id).all()
-        items = [_session_item(db, s, now) for s in sessions]
+        items = []
+        for s in sessions:
+            items.append(_session_item(db, s, now,
+                                       data_budget=deadline - _monotonic()))
     finally:
         db.close()
+
+    incomplete_sessions = [
+        {"session_id": it["id"], "name": it["name"],
+         "reason": (it.get("data") or {}).get("reason") or "数据体检未完成"}
+        for it in items
+        if (it.get("data") or {}).get("incomplete")
+    ]
 
     backup_status = _safe("backup_status", backup_service.get_status, {}) or {}
     watchdog = _watchdog_status()
@@ -247,6 +301,9 @@ def overview(session_factory=None, now: Optional[datetime] = None) -> dict:
         if data.get("unavailable"):
             _add(LEVEL_WARN, "会话「%s」数据体检不可用：%s"
                  % (item["name"], data.get("reason") or "行情通道不可用"))
+        elif data.get("incomplete"):
+            _add(LEVEL_WARN, "会话「%s」数据体检未完成：%s"
+                 % (item["name"], data.get("reason") or "未校验完整"))
         elif data.get("available") and not data.get("healthy"):
             _add(LEVEL_WARN, "会话「%s」数据缺失/陈旧 %d 项"
                  % (item["name"], int(data.get("bad_total") or 0)))
@@ -287,6 +344,8 @@ def overview(session_factory=None, now: Optional[datetime] = None) -> dict:
         "generated_at": now.isoformat(),
         "level": level,
         "problems": problems,
+        "partial": bool(incomplete_sessions),
+        "incomplete_sessions": incomplete_sessions,
         "core": {
             "online": True,
             "version": core_data.get("version"),

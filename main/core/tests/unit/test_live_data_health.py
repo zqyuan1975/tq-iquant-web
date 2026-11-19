@@ -181,3 +181,22 @@ def test_run_health_check_truncated_skips_fill():
     assert out["health"]["truncated"] is True
     assert out["auto_fill"]["reason"] == "budget_exhausted"
     assert len(disp.calls) == 1
+
+
+def test_check_data_health_logs_slow_quote(monkeypatch, caplog):
+    """单只取价超阈值要留痕：日志带会话/标的/周期/耗时，结果里带 slow_quotes。"""
+    monkeypatch.setattr(h, "_SLOW_QUOTE_SECONDS", 0.0)
+    disp = _Disp({c: _bars(date(2026, 11, 18)) for c in ("600000.SH", "000001.SZ")})
+    with caplog.at_level("WARNING", logger=h.logger.name):
+        health = h.check_data_health(disp, ["600000.SH", "000001.SZ"], ["1d"],
+                                     now=_NOW_OFF, calendar=_CAL, session_id=7)
+    assert health["slow_quote_count"] == 2
+    assert {q["code"] for q in health["slow_quotes"]} == {"600000.SH", "000001.SZ"}
+    assert "会话 7" in caplog.text and "600000.SH" in caplog.text
+
+
+def test_check_data_health_no_slow_quote_below_threshold():
+    disp = _Disp({"600000.SH": _bars(date(2026, 11, 18))})
+    health = h.check_data_health(disp, ["600000.SH"], ["1d"],
+                                 now=_NOW_OFF, calendar=_CAL, session_id=7)
+    assert health["slow_quote_count"] == 0

@@ -2690,14 +2690,76 @@ def session_channel_health(db: Session, session_id: int,
 def session_data_health(db: Session, session_id: int,
                         engines: Optional[Dict[int, LiveEngine]] = None,
                         auto_fill: bool = True,
-                        now: Optional[datetime] = None):
+                        now: Optional[datetime] = None,
+                        max_codes: Optional[int] = None,
+                        time_budget_seconds: Optional[float] = None):
     """F2：会话数据体检 + 非盘中自动补齐（只读，不改交易语义）。
 
     - 运行中：用引擎 dispatcher/日历（与实盘同一通道口径）；
     - 未运行：按会话引擎临时构造 dispatcher（tdx/ths 走本机 TQ；桥走 HTTP），
       构造失败返回 available=False 与原因；
     - 周期取会话内策略实际使用的 period（至少 1d），代码取组合股票池并集。
+
+    **必须有预算**：默认 ``max_codes=30`` / ``time_budget_seconds=2s``，超预算置
+    ``health.truncated=True``、``healthy=False`` 并提前收尾，绝不扫全池（掘金桥
+    单只 /quote 18–26s，全池会跑成小时级且调用方同步线程无法取消）。
+
+    **去重做在服务层**（本函数，而不是路由）：以 ``session_id`` 为键记录「在跑」
+    标记，并发请求直接返回 ``in_progress=True``；成功后结果缓存 30s，窗口内的
+    重复刷新直接复用。这样无论健康总览、数据体检路由还是其它调用方，都不会各自
+    起一个不可取消的同步线程。
+
+    **不做批量/并发取价**：``HttpBridgeDispatcher.query_quote`` 是单标的口径，
+    掘金/ QMT 桥内部又各自持全局锁串行执行，并发只会把请求排到同一把锁后面、
+    抬高 p99 并触发桥的 backlog 拒绝；真正批量需要改桥侧接口（一次多标的），
+    属独立改造，本期先用「限只数 + 时间预算 + 结果缓存」止血。
     """
+    if max_codes is None:
+        max_codes = _DATA_HEALTH_MAX_CODES
+    if time_budget_seconds is None:
+        time_budget_seconds = _DATA_HEALTH_TIME_BUDGET_SECONDS
+    sid = int(session_id)
+    cache_key = (sid, bool(auto_fill))
+    started = time.monotonic()
+    with _HEALTH_DEDUP_LOCK:
+        cached = _HEALTH_CACHE.get(cache_key)
+        if cached is not None and started - cached[0] <= _DATA_HEALTH_CACHE_TTL_SECONDS:
+            payload = json.loads(json.dumps(cached[1]))
+            payload["cached"] = True
+            payload["cached_age_seconds"] = round(started - cached[0], 1)
+            return payload
+        inflight_since = _HEALTH_INFLIGHT.get(sid)
+        if (inflight_since is not None
+                and started - inflight_since <= _DATA_HEALTH_INFLIGHT_STALE_SECONDS):
+            logger.info(
+                "数据体检去重：会话 %s 已有体检在执行（%.1fs），本次返回进行中",
+                sid, started - inflight_since)
+            return {
+                "session_id": sid, "available": False, "in_progress": True,
+                "reason": "同一会话已有数据体检在执行，请稍后刷新",
+                "inflight_seconds": round(started - inflight_since, 1),
+            }
+        _HEALTH_INFLIGHT[sid] = started
+    try:
+        payload = _collect_session_data_health(
+            db, sid, engines, auto_fill, now, max_codes, time_budget_seconds)
+    finally:
+        with _HEALTH_DEDUP_LOCK:
+            _HEALTH_INFLIGHT.pop(sid, None)
+    if payload is not None:
+        payload["cached"] = False
+        with _HEALTH_DEDUP_LOCK:
+            _HEALTH_CACHE[cache_key] = (time.monotonic(), json.loads(json.dumps(payload)))
+    return payload
+
+
+def _collect_session_data_health(db: Session, session_id: int,
+                                 engines: Optional[Dict[int, LiveEngine]],
+                                 auto_fill: bool,
+                                 now: Optional[datetime],
+                                 max_codes: int,
+                                 time_budget_seconds: float):
+    """``session_data_health`` 的实际取数体（预算/去重由外层负责）。"""
     session = db.query(LiveSession).filter(LiveSession.id == session_id).first()
     if session is None:
         return None
@@ -2734,7 +2796,10 @@ def session_data_health(db: Session, session_id: int,
             }
     result = run_health_check(
         dispatcher, sorted(pool_codes), periods,
-        auto_fill=auto_fill, now=now, calendar=calendar)
+        auto_fill=auto_fill, now=now, calendar=calendar,
+        max_codes=max_codes, time_budget_seconds=time_budget_seconds,
+        session_id=session_id)
+    health = result["health"]
     return {
         "session_id": session_id,
         "available": True,
@@ -2742,7 +2807,11 @@ def session_data_health(db: Session, session_id: int,
         "engine_running": engine is not None,
         "periods_checked": periods,
         "codes_total": len(pool_codes),
-        "health": result["health"],
+        "codes_checked": health.get("checked_codes"),
+        "truncated": bool(health.get("truncated")),
+        "budget": {"max_codes": max_codes,
+                   "time_budget_seconds": time_budget_seconds},
+        "health": health,
         "auto_fill": result["auto_fill"],
     }
 
@@ -4475,6 +4544,22 @@ def _backfill_live_daily_from_account_snapshots(
 _START_HEALTH_MAX_CODES = 30
 _START_HEALTH_TIME_BUDGET_SECONDS = 3.0
 
+# 只读数据体检（健康总览 / GET /sessions/{id}/data-health）同样必须有预算：
+# 这条路径此前未限流，会对每个会话逐只 /quote 扫全池（掘金桥单只 18–26s），
+# 把 /api/system/health-overview 拖到 200s+ 且请求超时后线程不可取消，前端每
+# 刷新一次就多一个大线程。这里的预算比启动更严（总览要聚合多个会话）。
+_DATA_HEALTH_MAX_CODES = 30
+_DATA_HEALTH_TIME_BUDGET_SECONDS = 2.0
+# 同一会话体检结果缓存 TTL：前端 15–30s 轮询，命中缓存直接返回，避免重复扫。
+_DATA_HEALTH_CACHE_TTL_SECONDS = 30.0
+# 在跑标记的兜底过期时间：异常退出未清标记时不至于让该会话永远「进行中」。
+_DATA_HEALTH_INFLIGHT_STALE_SECONDS = 180.0
+# 去重标记以 session_id 为键（auto_fill 语义不同也不并发跑，统一让后来者拿
+# 「进行中」）；结果缓存按 (session_id, auto_fill) 分开，避免补齐结果被误用。
+_HEALTH_DEDUP_LOCK = threading.Lock()
+_HEALTH_INFLIGHT: Dict[int, float] = {}
+_HEALTH_CACHE: Dict[Tuple[int, bool], Tuple[float, dict]] = {}
+
 
 def start_session(
     db: Session,
@@ -4693,6 +4778,7 @@ def start_session(
             auto_fill=True, calendar=getattr(engine, "_calendar", None),
             max_codes=_START_HEALTH_MAX_CODES,
             time_budget_seconds=_START_HEALTH_TIME_BUDGET_SECONDS,
+            session_id=session_id,
         )["health"]
         if not health.get("healthy"):
             msg = health_summary_text(health)

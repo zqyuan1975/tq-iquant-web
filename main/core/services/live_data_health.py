@@ -39,6 +39,11 @@ _WARM_COUNT = 240
 _PERIOD_TOLERANCE_DAYS = {"1w": 7, "1mon": 31}
 # 缺失清单最多返回的代码数（防止响应过大；总数另给 count）。
 _MAX_CODES = 50
+# 单只取价慢调用阈值（秒）：超过即写 WARNING 并记入 slow_quotes，便于定位哪只票/
+# 哪条通道在拖（2026-11-19 实测掘金桥单只 /quote 18–26s）。
+_SLOW_QUOTE_SECONDS = 5.0
+# slow_quotes 最多保留条数（避免响应体膨胀）。
+_MAX_SLOW_QUOTES = 20
 
 
 def _fallback_is_trading_day(d: date) -> bool:
@@ -113,12 +118,16 @@ def classify_bar_freshness(period: str, bars, expected_date: date) -> dict:
 
 def check_data_health(dispatcher, codes, periods, *, now: datetime = None,
                       calendar=None, max_codes: Optional[int] = None,
-                      time_budget_seconds: Optional[float] = None) -> dict:
+                      time_budget_seconds: Optional[float] = None,
+                      session_id: Optional[int] = None) -> dict:
     """逐 code × period 读取最新 bar 并汇总健康度（只读）。
 
-    ``max_codes`` / ``time_budget_seconds`` 用于启动链路：体检只是告警，
-    不允许串行遍历全池把启动请求长时间卡住（掘金桥单只 /quote 实测 ~8s）。
+    ``max_codes`` / ``time_budget_seconds`` 用于启动与健康总览链路：体检只是告警，
+    不允许串行遍历全池把调用方长时间卡住（掘金桥单只 /quote 实测 8–26s）。
     超出预算时提前收尾，并置 ``truncated=True`` 且 ``healthy=False``。
+
+    ``session_id`` 只用于慢调用留痕：单只取价超过 ``_SLOW_QUOTE_SECONDS`` 时写
+    WARNING（会话/标的/周期/耗时），并在结果 ``slow_quotes`` 里保留最近若干条。
 
     返回结构（可直接 JSON 序列化）：
     {version, checked_at, intraday, expected_dates, healthy, unavailable,
@@ -146,6 +155,7 @@ def check_data_health(dispatcher, codes, periods, *, now: datetime = None,
     total_checks = 0
     total_errors = 0
     budget_exhausted = False
+    slow_quotes: List[dict] = []
     for period in periods:
         stats = {"total": 0, "ok": 0, "stale": 0, "empty": 0, "error": 0,
                  "stale_codes": [], "empty_codes": [], "error_codes": []}
@@ -158,6 +168,7 @@ def check_data_health(dispatcher, codes, periods, *, now: datetime = None,
             stats["total"] += 1
             total_checks += 1
             checked_codes.add(code)
+            quote_started = _time.monotonic()
             try:
                 bars = dispatcher.query_quote(code, period=period, count=_CHECK_COUNT)
             except Exception as exc:  # noqa: BLE001 — 桥离线/通道异常都不阻断体检
@@ -167,6 +178,18 @@ def check_data_health(dispatcher, codes, periods, *, now: datetime = None,
                     stats["error_codes"].append(code)
                 logger.debug("数据体检取数失败 code=%s period=%s: %s", code, period, exc)
                 continue
+            finally:
+                elapsed = _time.monotonic() - quote_started
+                if elapsed >= _SLOW_QUOTE_SECONDS:
+                    logger.warning(
+                        "数据体检单只取价偏慢：会话 %s 标的 %s 周期 %s 耗时 %.2fs"
+                        "（桥/通道排队或数据源慢，超出阈值 %.1fs）",
+                        session_id, code, period, elapsed, _SLOW_QUOTE_SECONDS)
+                    if len(slow_quotes) < _MAX_SLOW_QUOTES:
+                        slow_quotes.append({
+                            "code": code, "period": period,
+                            "elapsed_seconds": round(elapsed, 2),
+                        })
             verdict = classify_bar_freshness(period, bars, expected[period])
             stats[verdict["status"]] += 1
             if verdict["status"] != "ok" and len(stats["%s_codes" % verdict["status"]]) < _MAX_CODES:
@@ -196,6 +219,8 @@ def check_data_health(dispatcher, codes, periods, *, now: datetime = None,
         "truncated": truncated,
         "requested_codes": len(requested_codes),
         "checked_codes": len(checked_codes),
+        "slow_quotes": slow_quotes,
+        "slow_quote_count": len(slow_quotes),
         "periods": per_period,
         "missing_codes": all_missing[:_MAX_CODES],
         "missing_count": len(all_missing),
@@ -205,7 +230,8 @@ def check_data_health(dispatcher, codes, periods, *, now: datetime = None,
 def auto_fill_missing(dispatcher, health: dict, codes, periods, *,
                       now: datetime = None, calendar=None,
                       max_pairs: Optional[int] = None,
-                      time_budget_seconds: Optional[float] = None) -> dict:
+                      time_budget_seconds: Optional[float] = None,
+                      session_id: Optional[int] = None) -> dict:
     """非盘中自动补齐：对缺失 (code, period) 用更大 count 重读一次。
 
     盘中禁止自动补齐（只报告）；非交易日 / 盘前盘后允许。重读只唤醒桥端/TQ
@@ -242,6 +268,7 @@ def auto_fill_missing(dispatcher, health: dict, codes, periods, *,
         if deadline is not None and _time.monotonic() >= deadline:
             truncated = True
             break
+        quote_started = _time.monotonic()
         try:
             bars = dispatcher.query_quote(code, period=period, count=_WARM_COUNT)
             if bars:
@@ -251,11 +278,18 @@ def auto_fill_missing(dispatcher, health: dict, codes, periods, *,
         except Exception:  # noqa: BLE001 — 补齐失败只计数，不阻断
             failed += 1
             logger.debug("数据补齐失败 code=%s period=%s", code, period, exc_info=True)
+        finally:
+            elapsed = _time.monotonic() - quote_started
+            if elapsed >= _SLOW_QUOTE_SECONDS:
+                logger.warning(
+                    "数据补齐单只取价偏慢：会话 %s 标的 %s 周期 %s 耗时 %.2fs",
+                    session_id, code, period, elapsed)
     if truncated:
         return {"triggered": True, "reason": "budget_exhausted",
                 "requested": requested_pairs, "warmed": warmed, "failed": failed,
                 "truncated": True}
-    after = check_data_health(dispatcher, codes, periods, now=now, calendar=calendar)
+    after = check_data_health(dispatcher, codes, periods, now=now, calendar=calendar,
+                              session_id=session_id)
     return {"triggered": True, "reason": "off_hours", "requested": requested_pairs,
             "warmed": warmed, "failed": failed, "after": after}
 
@@ -263,16 +297,19 @@ def auto_fill_missing(dispatcher, health: dict, codes, periods, *,
 def run_health_check(dispatcher, codes, periods, *, auto_fill: bool = True,
                      now: datetime = None, calendar=None,
                      max_codes: Optional[int] = None,
-                     time_budget_seconds: Optional[float] = None) -> dict:
+                     time_budget_seconds: Optional[float] = None,
+                     session_id: Optional[int] = None) -> dict:
     """体检 + 可选非盘中补齐；返回 {health, auto_fill}（health 为补齐后结果）。
 
-    启动链路应传 ``max_codes`` / ``time_budget_seconds``，保证体检不会把
-    启动请求卡在同步取数上；超预算时跳过补齐，直接返回部分结果。
+    启动链路与健康总览都应传 ``max_codes`` / ``time_budget_seconds``，保证体检
+    不会把调用方卡在同步取数上；超预算时跳过补齐，直接返回部分结果。
+    ``session_id`` 仅用于慢调用留痕。
     """
     now = now or now_shanghai()
     health = check_data_health(dispatcher, codes, periods, now=now, calendar=calendar,
                                max_codes=max_codes,
-                               time_budget_seconds=time_budget_seconds)
+                               time_budget_seconds=time_budget_seconds,
+                               session_id=session_id)
     result = {"health": health, "auto_fill": None}
     if health.get("truncated"):
         result["auto_fill"] = {"triggered": False, "reason": "budget_exhausted",
@@ -282,7 +319,8 @@ def run_health_check(dispatcher, codes, periods, *, auto_fill: bool = True,
         fill = auto_fill_missing(dispatcher, health, codes, periods,
                                  now=now, calendar=calendar,
                                  max_pairs=max_codes,
-                                 time_budget_seconds=time_budget_seconds)
+                                 time_budget_seconds=time_budget_seconds,
+                                 session_id=session_id)
         after = fill.pop("after", None)
         result["auto_fill"] = fill
         if after is not None:

@@ -51,7 +51,7 @@ def patched(monkeypatch):
             {"key": "client_online", "ok": True, "label": "客户端/桥在线"}]})
     monkeypatch.setattr(
         hs.live_service, "session_data_health",
-        lambda db, sid, engines, auto_fill=True: {
+        lambda db, sid, engines, auto_fill=True, **kw: {
             "available": True,
             "health": {"healthy": True, "periods": {
                 "1d": {"stale": 0, "empty": 0, "total": 3}}}})
@@ -165,7 +165,7 @@ def test_data_stale_disk_low_backup_missing_are_warns(session_factory, patched):
     db.close()
     patched.setattr(hs.live_service, "ENGINES", {sid: object()})
     patched.setattr(hs.live_service, "session_data_health",
-                    lambda db, sid, engines, auto_fill=True: {
+                    lambda db, sid, engines, auto_fill=True, **kw: {
                         "available": True,
                         "health": {"healthy": False, "periods": {
                             "1d": {"stale": 2, "empty": 1, "total": 3}}}})
@@ -221,3 +221,83 @@ def test_health_overview_api(monkeypatch):
 
     body = asyncio.run(_call()).json()
     assert body["code"] == 0 and body["data"]["level"] == "ok"
+
+
+def test_truncated_data_health_marks_session_incomplete(session_factory, patched):
+    """体检超预算截断：会话标记未完成、原因带已校验只数，顶层 partial 标明。"""
+    db = session_factory()
+    _session(db)
+    db.close()
+    patched.setattr(hs.live_service, "session_data_health",
+                    lambda db, sid, engines, auto_fill=True, **kw: {
+                        "available": True, "truncated": True,
+                        "codes_total": 496, "codes_checked": 30,
+                        "health": {"healthy": False, "periods": {
+                            "1d": {"stale": 0, "empty": 0, "total": 30}}}})
+
+    res = hs.overview(session_factory=session_factory, now=NOW)
+    item = res["sessions"][0]
+    assert item["data"]["incomplete"] is True
+    assert item["data"]["truncated"] is True
+    assert "30/496" in item["data"]["reason"]
+    assert res["partial"] is True
+    assert res["incomplete_sessions"] == [
+        {"session_id": item["id"], "name": item["name"],
+         "reason": item["data"]["reason"]}]
+    assert "数据体检未完成" in " ".join(p["text"] for p in res["problems"])
+
+
+def test_overview_total_budget_degrades_remaining_sessions(
+        session_factory, patched, monkeypatch):
+    """整体预算耗尽后，后续会话不再发起体检，只降级标注原因。"""
+    db = session_factory()
+    _session(db, name="会话A")
+    _session(db, name="会话B")
+    db.close()
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(hs, "_monotonic", lambda: clock["t"])
+    monkeypatch.setattr(hs, "_OVERVIEW_TOTAL_BUDGET_SECONDS", 5.0)
+    monkeypatch.setattr(hs, "_OVERVIEW_DATA_HEALTH_BUDGET_SECONDS", 3.0)
+    calls = []
+
+    def _slow(db, sid, engines, auto_fill=True, **kw):
+        calls.append(sid)
+        clock["t"] += 6.0  # 一次会话就吃掉整个总预算
+        return {"available": True, "truncated": True, "codes_total": 100,
+                "codes_checked": 30,
+                "health": {"healthy": False, "periods": {}}}
+
+    patched.setattr(hs.live_service, "session_data_health", _slow)
+
+    res = hs.overview(session_factory=session_factory, now=NOW)
+    assert len(calls) == 1  # 第二个会话未再发起体检
+    first, second = res["sessions"]
+    assert second["data"]["incomplete"] is True
+    assert second["data"]["reason"] == hs.REASON_OVERVIEW_BUDGET
+    assert second["data"]["codes_total"] is None
+    assert len(res["incomplete_sessions"]) == 2
+    assert res["partial"] is True
+    assert first["data"]["incomplete"] is True  # 第一个虽截断但已返回部分结果
+
+
+def test_in_progress_data_health_marks_incomplete(session_factory, patched):
+    """同一会话体检已在跑：总览降级为未完成，不重复取数。"""
+    db = session_factory()
+    _session(db)
+    db.close()
+    called = []
+
+    def _inflight(db, sid, engines, auto_fill=True, **kw):
+        called.append(sid)
+        return {"session_id": sid, "available": False, "in_progress": True,
+                "reason": "同一会话已有数据体检在执行，请稍后刷新"}
+
+    patched.setattr(hs.live_service, "session_data_health", _inflight)
+
+    res = hs.overview(session_factory=session_factory, now=NOW)
+    item = res["sessions"][0]
+    assert len(called) == 1
+    assert item["data"]["in_progress"] is True
+    assert item["data"]["incomplete"] is True
+    assert "已有数据体检在执行" in item["data"]["reason"]
+    assert res["partial"] is True
