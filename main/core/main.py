@@ -1,5 +1,5 @@
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import FileResponse, JSONResponse
 from contextlib import asynccontextmanager
 import logging
 import os
@@ -175,16 +175,8 @@ async def uncaught_exception_handler(request: Request, exc: Exception):
     )
 
 
-@app.get("/health")
-async def health():
-    """轻量探活（无鉴权）：版本 / 运行时长 / 实际端口 / pid。
-
-    自愈父进程（``--supervise``）与桌面壳都靠它判断后端是否真的在服务；
-    端口动态，以 ``data/runtime/server.json`` 记录的端口为准。
-
-    L6：``health.business_probe_enabled=true`` 时附加 ``business`` 业务心跳
-    （最近 bar / 轮次推进 / watchdog 扫描）；默认关闭时响应体与旧行为逐字一致。
-    """
+def _health_payload() -> dict:
+    """``/health`` 与 ``/api/health`` 共用的 JSON 载荷（字段/行为完全一致）。"""
     payload = runtime.health_payload()
     try:
         from core.services import business_health
@@ -194,6 +186,48 @@ async def health():
     except Exception:  # noqa: BLE001 — 业务探针失败不得让 /health 500
         logger.warning("业务级心跳采集失败（已忽略）", exc_info=True)
     return payload
+
+
+def _spa_index_file():
+    """前端 SPA 的 index.html 路径；未构建（dev/测试环境）时返回 None。"""
+    frozen = hasattr(_sys, "frozen") or bool(_sys.argv[0] and _sys.argv[0].endswith(".exe"))
+    base = _Path(_sys.argv[0]).resolve().parent
+    dist = (base / "_internal" / "web" / "dist") if frozen else (
+        _Path(__file__).resolve().parent.parent.parent / "web" / "dist")
+    index = dist / "index.html"
+    return index if index.exists() else None
+
+
+@app.get("/health")
+async def health(request: Request):
+    """轻量探活（无鉴权）：版本 / 运行时长 / 实际端口 / pid。
+
+    自愈父进程（``--supervise``）、桌面壳与外部监控都靠它判断后端是否真的在服务；
+    端口动态，以 ``data/runtime/server.json`` 记录的端口为准。
+
+    与前端「健康总览」页同路径（``/health``），按 ``Accept`` 内容协商分流：
+    浏览器地址栏访问（``Accept`` 含 ``text/html``）回退前端 SPA 的 index.html；
+    探针 / curl / 程序调用（``Accept: */*``、``application/json`` 或缺省）仍返回
+    原来的 JSON 探活，响应体、状态码、字段一律不变。稳定的纯 JSON 冗余入口是
+    ``GET /api/health``（两者等价）。
+
+    L6：``health.business_probe_enabled=true`` 时附加 ``business`` 业务心跳
+    （最近 bar / 轮次推进 / watchdog 扫描）；默认关闭时响应体与旧行为逐字一致。
+    """
+    if "text/html" in (request.headers.get("accept") or "").lower():
+        index = _spa_index_file()
+        if index is not None:
+            return FileResponse(index, media_type="text/html")
+    return _health_payload()
+
+
+@app.get("/api/health")
+async def api_health():
+    """纯 JSON 探活（``/health`` 的冗余稳定入口）：字段与 ``/health`` 完全一致。
+
+    供外部监控 / 探针长期引用；不受 ``Accept`` 内容协商影响，永远返回 JSON。
+    """
+    return _health_payload()
 
 
 @app.get("/debug-path")

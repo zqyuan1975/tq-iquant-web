@@ -36,6 +36,52 @@ async def test_spa_fallback_serves_index_html_for_frontend_routes():
 
 
 @pytest.mark.anyio
+@pytest.mark.skipif(not _DIST_EXISTS, reason="web/dist 未构建，跳过 SPA 回退测试")
+async def test_health_serves_spa_index_for_browser_navigation():
+    """浏览器地址栏访问 /health（Accept 含 text/html）→ 前端 index.html，不再被 JSON 挡住。"""
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.get(
+            "/health",
+            headers={"Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"},
+        )
+        assert resp.status_code == 200
+        assert "text/html" in resp.headers.get("content-type", "")
+        assert '<div id="app"></div>' in resp.text
+
+
+@pytest.mark.anyio
+async def test_health_still_json_for_probes():
+    """探针 / curl（Accept: */*、application/json 或缺省）仍拿原 JSON，字段不变。"""
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        for accept in ("*/*", "application/json", None):
+            headers = {"Accept": accept} if accept else {}
+            resp = await client.get("/health", headers=headers)
+            assert resp.status_code == 200, accept
+            assert "application/json" in resp.headers.get("content-type", ""), accept
+            body = resp.json()
+            assert body["ok"] is True
+            assert body["app"] == "tq-iquant"
+            assert body["version"]
+            assert body["pid"] > 0
+
+
+@pytest.mark.anyio
+async def test_api_health_returns_same_json_even_for_browser_accept():
+    """/api/health 是纯 JSON 冗余入口：字段与 /health 一致，且不参与内容协商。"""
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        plain = await client.get("/health")
+        api = await client.get("/api/health", headers={"Accept": "text/html"})
+        assert api.status_code == 200
+        assert "application/json" in api.headers.get("content-type", "")
+        assert api.json().keys() == plain.json().keys()
+        assert api.json()["app"] == "tq-iquant"
+        assert api.json()["pid"] > 0
+
+
+@pytest.mark.anyio
 async def test_unknown_api_path_still_returns_json_404():
     """未知 /api 路径必须保持 JSON 404，不能被 SPA 回退劫持。"""
     transport = ASGITransport(app=app)
