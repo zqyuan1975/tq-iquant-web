@@ -19,6 +19,11 @@ AppVersion={#AppVersion}
 AppVerName={#AppName} {#AppVersion}
 AppPublisher={#AppPublisher}
 DefaultDirName=D:\{#AppName}
+; 显式固定 Inno 的默认行为（DisableDirPage 缺省即 auto），行为零变化：
+; 全新安装照常显示「选择目标位置」页、可换盘；检测到同一 AppId 已安装（覆盖升级）时
+; 自动跳过该页、沿用上次安装目录，避免升级时手误换目录把 data\、config.yaml 甩在旧目录。
+; 此处写死为显式声明，防止以后被人改成 no 而拆掉升级保护。
+DisableDirPage=auto
 DefaultGroupName={#AppName}
 DisableProgramGroupPage=yes
 ; 安装到 D:\ 根目录需要管理员权限；程序日常运行不提权
