@@ -561,6 +561,11 @@ def test_same_timestamp_multi_period_both_processed():
     })
     pm = PortfolioRiskManager(max_drawdown=Decimal("0.9"), daily_loss_limit=Decimal("0.9"))
     port = Portfolio(portfolio_id=1, initial_capital=Decimal("200000"), risk_manager=pm)
+    # 本用例只验 #1b 周期路由（同刻两周期各自按本周期 open 成交）。本线（fix/model-fixes）
+    # 的 Portfolio.price_limit_check_enabled 默认已改为 True（#1 涨跌停约束默认开），
+    # 而合成数据 1m 前收 10.0 → 涨停价 11.00，d1 的 1m open 11.0 恰好贴板会被闸门延后。
+    # 故此处显式关闭涨跌停闸，隔离出周期路由行为；断言与 master 逐字一致。
+    port.price_limit_check_enabled = False
     for sid, period in ((1, "1d"), (2, "1m")):
         ctx = StrategyContext(strategy_id=sid, period=period, capital_ratio=Decimal("0.3"), max_positions=5)
         ctx.formula_signals = [{"signal_name": "open_sig", "signal_type": SignalType.OPEN, "trigger_value": 1}]
@@ -614,8 +619,8 @@ def test_risk_peak_intrabar_but_daily_loss_only_at_day_end():
     rm = port.risk_manager
     orig_peak, orig_daily = rm.update_peak, rm.update_daily
     counts = {"peak": 0, "daily": 0}
-    def spy_peak(v, d): counts["peak"] += 1; return orig_peak(v, d)
-    def spy_daily(v, d, cap): counts["daily"] += 1; return orig_daily(v, d, cap)
+    def spy_peak(v, d, **kwargs): counts["peak"] += 1; return orig_peak(v, d, **kwargs)
+    def spy_daily(v, d, cap, **kwargs): counts["daily"] += 1; return orig_daily(v, d, cap, **kwargs)
     rm.update_peak, rm.update_daily = spy_peak, spy_daily
     BacktestEngine().run(port, klines=klines, signal_cache={})
     assert counts["peak"] == 3
