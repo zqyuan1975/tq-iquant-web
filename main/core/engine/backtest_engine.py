@@ -10,6 +10,11 @@ from .position import Position, is_convertible_bond, lot_size_for
 from .execution_engine import ExecutionEngine, SimulatedDispatcher, SimulatedT1Checker
 from .cash_allocator import MIN_FILL_RATIO, allocate_batch_buys
 from .capacity import CapacityBudget
+from .cash_outlet_model import (
+    CASH_OUTLET_MODEL_VERSION,
+    CashOutletPlanError,
+    build_cash_yield_contribution,
+)
 from .format import fmt_money
 from .evaluator import Evaluator
 from .event import BarEvent, OrderEvent, TradeEvent
@@ -356,6 +361,7 @@ class BacktestEngine:
         run_options: Optional[dict] = None,
         cancel_check: Optional[Callable[[], bool]] = None,
         loan_model_plan: Optional[dict] = None,
+        cash_outlet_plan: Optional[dict] = None,
     ) -> dict:
         """逐 bar 回测主链路。
 
@@ -395,6 +401,9 @@ class BacktestEngine:
         loan_model_plan：资金池 L2 借据建模（0021 B3，默认 None=不启用）。仅当组合
         同时包含出借/借款两策略时成立；额度来自 A2 推导并注入 B2 ``capital_budget``，
         快照写 ``loan_model_version``。关闭/无效时交易链路逐位不变。
+        cash_outlet_plan：现金出口收益率建模（0021 C5，默认 None=不启用）。只按
+        日终闲置现金估算利息与可用时点，结果单列在 ``cash_yield_contribution``，
+        不改现金/净值/成交/策略指标；plan 非法时降级为 ``enabled=False``。
         """
         run_options = run_options or {}
         _first_bar_no_fill = bool(run_options.get("first_bar_no_fill", False))
@@ -1216,6 +1225,19 @@ class BacktestEngine:
         risk_fill_attempts = sum(
             1 for t in trades if getattr(t, "signal_type", None) in _RISK_SELL_TYPES
         )
+        # 0021 C5：现金出口利息（默认 None=不计算）。只读日终快照，单列返回，
+        # 不改现金/净值/成交；plan 非法降级为 enabled=False，不中断回测。
+        cash_yield = None
+        if cash_outlet_plan is not None:
+            try:
+                cash_yield = build_cash_yield_contribution(
+                    snapshots, cash_outlet_plan)
+            except CashOutletPlanError as exc:
+                cash_yield = {
+                    "version": CASH_OUTLET_MODEL_VERSION,
+                    "enabled": False, "status": "invalid",
+                    "reason": str(exc),
+                }
         return {
             "trades": trades,
             "snapshots": snapshots,
@@ -1236,6 +1258,8 @@ class BacktestEngine:
             "execution_stats": run_stats,
             # 资金池 L2 借据（0021 B3）：None=未启用/未成立，不影响任何旧消费方
             "loan_model": loan_state,
+            # 现金出口利息（0021 C5）：None=未启用；与策略指标分离
+            "cash_yield_contribution": cash_yield,
         }
 
     def run_multi(

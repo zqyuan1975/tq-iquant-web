@@ -4835,6 +4835,8 @@ def run_backtest(db: Session, ps: PortfolioStrategy, req,
         # NULL 表示按 0.95 缺省（A2），不改变任何既有回测结果。
         portfolio.target_utilization = getattr(ps, "target_utilization", None)
         _loan_plan = getattr(req, "loan_model_plan", None)
+        # 现金出口收益率（0021 C5，默认 None=不启用）：只读日终现金，单列返回
+        _cash_outlet_plan = getattr(req, "cash_outlet_plan", None)
         # 层 1 容量模型（run 级，仅本轮内存生效）：sqrt 时启用参与率预算 +
         # sqrt 冲击 + 残量顺延，并停用旧 4% 成交量闸门的双重约束（引擎内互斥）。
         portfolio.capacity_model = capacity_model
@@ -4965,6 +4967,7 @@ def run_backtest(db: Session, ps: PortfolioStrategy, req,
             run_options=exec_flags,
             cancel_check=cancel_event.is_set,
             loan_model_plan=_loan_plan,
+            cash_outlet_plan=_cash_outlet_plan,
         )
         t7 = datetime.now()
         _log_timing(f"[回测#{record_id}] 引擎逐bar回测: {(t7-t6).total_seconds():.1f}s")
@@ -5123,6 +5126,8 @@ def run_backtest(db: Session, ps: PortfolioStrategy, req,
         "evaluations": result.get("evaluations") or {},
         "warnings": warnings,
         "gate": gate,
+        # 0021 C5：现金出口利息（None=未启用），与策略指标分离
+        "cash_yield_contribution": result.get("cash_yield_contribution"),
     }
 
 

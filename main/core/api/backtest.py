@@ -117,6 +117,9 @@ class BacktestRequest(BaseModel):
     #  "due_days": int, "enabled": bool}。仅当两策略同属该组合时成立；
     # 额度来自 A2 推导并注入 B2 capital_budget，快照写 loan_model_version。
     loan_model_plan: dict | None = None
+    # 现金出口收益率建模（0021 C5，默认 None=不启用）：只估利息与可用时点，
+    # 单列返回 cash_yield_contribution，不并入净值/成交/策略指标。
+    cash_outlet_plan: dict | None = None
     # 资金池拼盘（0021 B6）：由 L2 拼盘向导带出；回测成功后把记录绑到拼盘头。
     pairing_plan_id: int | None = None
 
