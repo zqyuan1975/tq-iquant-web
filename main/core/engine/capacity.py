@@ -14,9 +14,10 @@
 """
 
 from bisect import bisect_right
+from dataclasses import dataclass, field
 from datetime import date, datetime
 from decimal import Decimal
-from typing import Dict, Optional, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 
 # 取数优先级：日线优先（天然是「当日成交量」）；没有日线时按最细周期逐日累加。
@@ -204,4 +205,272 @@ def capacity_model_version(model: str, *, daily_small: Decimal, daily_large: Dec
         pct(daily_small), pct(daily_large),
         pct(five_day_small), pct(five_day_large),
         Decimal(str(impact_k)).normalize(),
+    )
+
+
+# ---------------------------------------------------------------------------
+# C3：容量曲线 / 斜率 / ADV 参与率重叠
+# ---------------------------------------------------------------------------
+#
+# 口径（0019 §4 / 0020 H4-H6）：
+# - 曲线点必须由调用方用「截至该规模、仅历史数据」的联合回测结果构造，
+#   本模块只做纯计算，不取行情、不引入未来成交量；
+# - 边际收益是「目标规模下的斜率」，不是全期平均收益；
+# - 数据不足返回 ``PENDING_DATA``，所有斜率/衰减置 None，绝不猜测。
+
+CAPACITY_CURVE_VERSION = "capacity-curve-c3"
+STATUS_CURVE_OK = "ok"
+STATUS_CURVE_PENDING = "PENDING_DATA"
+DEFAULT_MIN_CURVE_POINTS = 3
+DEFAULT_MAX_CURVE_GAP = Decimal("1.0")  # 相邻规模点最大间隔（倍数）
+
+
+@dataclass(frozen=True)
+class CapacityCurvePoint:
+    """一个规模点：``scale`` 为目标规模倍数（1.0=当前规模），``net_return`` 为其净收益。"""
+
+    scale: Decimal
+    net_return: Decimal
+
+
+@dataclass(frozen=True)
+class CapacityCurve:
+    status: str
+    points: int
+    slope: Optional[Decimal] = None
+    marginal_1x: Optional[Decimal] = None
+    marginal_2x: Optional[Decimal] = None
+    return_1x: Optional[Decimal] = None
+    return_2x: Optional[Decimal] = None
+    curve_decay_2x: Optional[Decimal] = None
+    reasons: List[str] = field(default_factory=list)
+    version: str = CAPACITY_CURVE_VERSION
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "version": self.version,
+            "status": self.status,
+            "points": self.points,
+            "slope": _dec(self.slope),
+            "marginal_1x": _dec(self.marginal_1x),
+            "marginal_2x": _dec(self.marginal_2x),
+            "return_1x": _dec(self.return_1x),
+            "return_2x": _dec(self.return_2x),
+            "curve_decay_2x": _dec(self.curve_decay_2x),
+            "reasons": list(self.reasons),
+        }
+
+
+def _dec(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    return format(Decimal(str(value)), "f")
+
+
+def _num(value: Any) -> Optional[Decimal]:
+    if value is None:
+        return None
+    try:
+        d = Decimal(str(value))
+    except Exception:  # noqa: BLE001 — 非数值视为缺失
+        return None
+    return d if d.is_finite() else None
+
+
+def _linear_interp(points: Sequence[CapacityCurvePoint],
+                   x: Decimal) -> Optional[Decimal]:
+    """在已按 scale 升序的点上线性插值收益；超出范围返回 None（不外推）。"""
+    if not points:
+        return None
+    if x < points[0].scale or x > points[-1].scale:
+        return None
+    for left, right in zip(points, points[1:]):
+        if left.scale <= x <= right.scale:
+            if right.scale == left.scale:
+                return left.net_return
+            ratio = (x - left.scale) / (right.scale - left.scale)
+            return left.net_return + ratio * (right.net_return - left.net_return)
+    return points[-1].net_return
+
+
+def _central_slope(points: Sequence[CapacityCurvePoint],
+                   x: Decimal) -> Optional[Decimal]:
+    """在 x 处取中心差分斜率；端点退化为单侧差分。"""
+    exact = [i for i, p in enumerate(points) if p.scale == x]
+    if exact:
+        i = exact[0]
+        if i == 0 and len(points) > 1:
+            left, right = points[0], points[1]
+        elif i == len(points) - 1 and i > 0:
+            left, right = points[-2], points[-1]
+        elif 0 < i < len(points) - 1:
+            left, right = points[i - 1], points[i + 1]
+        else:
+            return None
+    else:
+        for left, right in zip(points, points[1:]):
+            if left.scale < x < right.scale:
+                break
+        else:
+            return None
+    span = right.scale - left.scale
+    if span == 0:
+        return None
+    return (right.net_return - left.net_return) / span
+
+
+def compute_capacity_curve(
+    points: Sequence[Any],
+    *,
+    min_points: int = DEFAULT_MIN_CURVE_POINTS,
+    max_gap: Any = DEFAULT_MAX_CURVE_GAP,
+) -> CapacityCurve:
+    """容量曲线斜率与边际收益（C3）。
+
+    ``points`` 支持 ``CapacityCurvePoint`` 或 ``(scale, net_return)`` 二元组；
+    只使用调用方给出的历史点，按 scale 升序后计算：
+
+    - ``slope``：首尾整体斜率（每增加 1 倍规模，净收益的变化）；
+    - ``marginal_1x`` / ``marginal_2x``：1x/2x 处中心差分斜率（目标规模的边际收益）；
+    - ``curve_decay_2x``：``1 - return(2x)/return(1x)``，1x 收益 ≤0 时置 None。
+
+    任一点缺失/非有限、规模重复、点数不足或相邻间隔超过 ``max_gap`` 时
+    返回 ``PENDING_DATA``，所有数值为 None。
+    """
+    parsed: List[CapacityCurvePoint] = []
+    for item in points or []:
+        if isinstance(item, CapacityCurvePoint):
+            scale, ret = item.scale, item.net_return
+        else:
+            try:
+                scale, ret = item[0], item[1]
+            except Exception:  # noqa: BLE001 — 结构错误按数据不足处理
+                return CapacityCurve(STATUS_CURVE_PENDING, 0,
+                                     reasons=["points 结构非法"])
+        s, r = _num(scale), _num(ret)
+        if s is None or r is None:
+            return CapacityCurve(STATUS_CURVE_PENDING, len(parsed),
+                                 reasons=["存在缺失/非有限点，不能猜测"])
+        parsed.append(CapacityCurvePoint(scale=s, net_return=r))
+
+    parsed.sort(key=lambda p: p.scale)
+    if len(parsed) < max(2, int(min_points)):
+        return CapacityCurve(
+            STATUS_CURVE_PENDING, len(parsed),
+            reasons=["有效规模点 %d < 最少 %d，返回 PENDING_DATA"
+                     % (len(parsed), max(2, int(min_points)))])
+    for left, right in zip(parsed, parsed[1:]):
+        if right.scale == left.scale:
+            return CapacityCurve(STATUS_CURVE_PENDING, len(parsed),
+                                 reasons=["规模点重复：%s" % _dec(left.scale)])
+        if max_gap is not None and right.scale - left.scale > _num(max_gap):
+            return CapacityCurve(STATUS_CURVE_PENDING, len(parsed),
+                                 reasons=["相邻规模点间隔过大（>%s）"
+                                          % _dec(max_gap)])
+
+    total_span = parsed[-1].scale - parsed[0].scale
+    slope = ((parsed[-1].net_return - parsed[0].net_return) / total_span
+             if total_span else None)
+    m1 = _central_slope(parsed, Decimal("1"))
+    m2 = _central_slope(parsed, Decimal("2"))
+    r1 = _linear_interp(parsed, Decimal("1"))
+    r2 = _linear_interp(parsed, Decimal("2"))
+    decay = (Decimal(1) - r2 / r1) if (r1 is not None and r2 is not None
+                                       and r1 > 0) else None
+    reasons = ["斜率与边际收益仅用调用方提供的规模点计算，不读取未来成交量"]
+    return CapacityCurve(
+        STATUS_CURVE_OK, len(parsed),
+        slope=slope, marginal_1x=m1, marginal_2x=m2,
+        return_1x=r1, return_2x=r2, curve_decay_2x=decay, reasons=reasons,
+    )
+
+
+@dataclass(frozen=True)
+class CapacityParticipation:
+    """ADV 参与率与同票重叠（C3）；缺失 ADV 时 status=PENDING_DATA。"""
+
+    status: str
+    lender_participation: Optional[Decimal] = None
+    borrower_participation: Optional[Decimal] = None
+    same_code_participation: Optional[Decimal] = None
+    overlap: Optional[Decimal] = None
+    bid_probability: Optional[Decimal] = None
+    reasons: List[str] = field(default_factory=list)
+    version: str = CAPACITY_CURVE_VERSION
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "version": self.version,
+            "status": self.status,
+            "lender_participation": _dec(self.lender_participation),
+            "borrower_participation": _dec(self.borrower_participation),
+            "same_code_participation": _dec(self.same_code_participation),
+            "overlap": _dec(self.overlap),
+            "bid_probability": _dec(self.bid_probability),
+            "reasons": list(self.reasons),
+        }
+
+
+def compute_participation(
+    *,
+    adv_by_code: Mapping[str, Any],
+    lender_amount_by_code: Mapping[str, Any],
+    borrower_amount_by_code: Mapping[str, Any],
+    contested_ratio: Any = Decimal("0.02"),
+) -> CapacityParticipation:
+    """ADV 参与率与同票重叠（C3）。
+
+    - ``lender/borrower_participation``：各自日均下单额 / 对应 ADV 之和；
+    - ``same_code_participation``：双方共同持仓票的合计额 / 这些票的 ADV 之和（H4 用）；
+    - ``overlap``：共同票上较小一方的占用 / 共同票 ADV 之和（重叠程度）；
+    - ``bid_probability``：同票参与率 / ``contested_ratio``（2% 视为完全争抢），
+      封顶 1；这是待实盘校准的启发式，评估侧只作软判据。
+
+    ADV 缺失或分母 ≤0 时返回 ``PENDING_DATA``，不把缺失当 0 参与率。
+    """
+    codes = set(lender_amount_by_code) | set(borrower_amount_by_code)
+    if not codes:
+        return CapacityParticipation(STATUS_CURVE_PENDING,
+                                     reasons=["无下单金额数据"])
+
+    adv: Dict[str, Decimal] = {}
+    for code in codes:
+        value = _num(adv_by_code.get(code))
+        if value is not None and value > 0:
+            adv[code] = value
+    if not adv:
+        return CapacityParticipation(
+            STATUS_CURVE_PENDING,
+            reasons=["ADV 全部缺失/为 0，无法计算参与率"])
+
+    def amount(mapping: Mapping[str, Any], code: str) -> Decimal:
+        return _num(mapping.get(code)) or Decimal(0)
+
+    total_adv = sum(adv.values())
+    common = [c for c in codes
+              if c in adv
+              and amount(lender_amount_by_code, c) > 0
+              and amount(borrower_amount_by_code, c) > 0]
+    common_adv = sum(adv[c] for c in common)
+    lender_common = sum(amount(lender_amount_by_code, c) for c in common)
+    borrower_common = sum(amount(borrower_amount_by_code, c) for c in common)
+    same_code = ((lender_common + borrower_common) / common_adv
+                 if common_adv > 0 else None)
+    overlap = (sum(min(amount(lender_amount_by_code, c),
+                       amount(borrower_amount_by_code, c)) for c in common)
+               / common_adv if common_adv > 0 else None)
+    cap = _num(contested_ratio) or Decimal("0.02")
+    bid = (min(Decimal(1), same_code / cap)
+           if same_code is not None and cap > 0 else None)
+
+    return CapacityParticipation(
+        STATUS_CURVE_OK if common else "ok_no_common",
+        lender_participation=(sum(amount(lender_amount_by_code, c)
+                                  for c in adv) / total_adv),
+        borrower_participation=(sum(amount(borrower_amount_by_code, c)
+                                    for c in adv) / total_adv),
+        same_code_participation=same_code,
+        overlap=overlap,
+        bid_probability=bid,
+        reasons=["参与率分母为对应 ADV 之和；缺失 ADV 的票被排除并单独计数"],
     )
