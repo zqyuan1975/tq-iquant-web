@@ -94,7 +94,7 @@ export interface PortfolioItem {
   price_limit_check_enabled: boolean  // #1 涨跌停校验（回测成交 + 实盘下单前置，默认开）
   volume_limit_enabled: boolean       // #2 成交量/流动性约束（回测，默认关）
   volume_limit_ratio: number          // 日线流动性目标：单笔 ≤ 前5日均量 × 本比例（默认 0.10）
-  minute_volume_limit_ratio: number | null  // 实盘单次可下单量：≤ 最近完成 1m bar 量 × 本比例（默认 0.10；0=关闭分钟闸门；仅实盘读）
+  minute_volume_limit_ratio: number | null  // 实盘单次可下单量：≤ 最近完成 1m bar 量 × 本比例（NULL=跟随 volume_limit_ratio，默认 4%；0=关闭分钟闸门；仅实盘读）
   adaptive_slippage_enabled: boolean  // #4 自适应滑点（回测，默认关）：冲击随订单量占成交量比例上浮
   slippage_impact_coef: number        // 滑点冲击系数（默认 0.10，封顶滑点 10%）
   position_sizing: string             // W2 仓位模型：dynamic（默认）|fixed

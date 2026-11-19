@@ -5884,9 +5884,10 @@ class LiveEngine:
         - 日线层：单笔 ≤ 前 5 个有效交易日日均量（股）× volume_limit_ratio，
           与回测统一、严格不含当日（无前视）；
         - 分钟层：**单次提交** ≤ 最近完成 1m bar 量 × minute_volume_limit_ratio
-          （独立参数，不再复用日线 4%）；
+          （独立参数；未配置 NULL 时回落到日线 volume_limit_ratio，即默认 4%，
+          不硬编码 10%——放宽单次可吃比例等同改风险偏好）；
         本次可提交量取两层较小值。缩掉的差额注册进当日残量补单队列，由后续
-        新 1m bar 按同一口径续发，不再直接改 quantity 后丢弃。
+        新 1m bar 按同一口径续发，不再直接改 quantity 后丢弃（默认行为，无开关）。
 
         盘前无已完成 1m bar：按日线口径放行，并落 ``volume_cap/daily_fallback``
         事件（可事后追溯）；日线基准也取不到 → fail-open 留痕。
@@ -5904,7 +5905,10 @@ class LiveEngine:
         daily_ratio = getattr(portfolio, "volume_limit_ratio", None)
         minute_ratio = getattr(portfolio, "minute_volume_limit_ratio", None)
         if minute_ratio is None:
-            minute_ratio = Decimal("0.10")
+            # NULL 回落：与日线占比一致（现存组合 volume_limit_ratio=4%），
+            # 保持改动前的风险偏好；10% 仅作为显式可选值。
+            minute_ratio = (daily_ratio if daily_ratio is not None
+                            else Decimal("0.04"))
         target = int(order.quantity)
         if target <= 0:
             return
@@ -6181,7 +6185,10 @@ class LiveEngine:
             allowed = min(allowed, daily_cap)
         minute_ratio = getattr(portfolio, "minute_volume_limit_ratio", None)
         if minute_ratio is None:
-            minute_ratio = Decimal("0.10")
+            # NULL 回落：与日线占比一致（现存组合 volume_limit_ratio=4%），
+            # 保持改动前的风险偏好；10% 仅作为显式可选值。
+            minute_ratio = (daily_ratio if daily_ratio is not None
+                            else Decimal("0.04"))
         bar_vol = 0
         if bar is not None:
             try:

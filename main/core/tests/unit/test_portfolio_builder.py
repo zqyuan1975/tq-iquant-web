@@ -170,6 +170,29 @@ def test_assemble_initial_capital_override_applied(db):
     assert port.account.cash == Decimal("1000000")
 
 
+def test_assemble_minute_ratio_null_falls_back_to_daily_ratio(db):
+    """minute_volume_limit_ratio=NULL → 回落 volume_limit_ratio（现存组合 4%），
+    不硬编码 10%，保持改动前的单次可下单风险偏好。"""
+    ps, strategies = _build(db, ["000001.SZ", "600000.SH"], ["000001.SZ"])
+    ps.volume_limit_ratio = Decimal("0.04")
+    ps.minute_volume_limit_ratio = None
+    db.commit()
+    port = assemble_portfolio(ps, strategies, db)
+    assert port.minute_volume_limit_ratio == Decimal("0.04")
+    assert port.minute_volume_limit_ratio == port.volume_limit_ratio
+
+
+def test_assemble_minute_ratio_explicit_override(db):
+    """显式配置 0.10 → 覆盖日线占比（放宽只能显式选择）。"""
+    ps, strategies = _build(db, ["000001.SZ", "600000.SH"], ["000001.SZ"])
+    ps.volume_limit_ratio = Decimal("0.04")
+    ps.minute_volume_limit_ratio = Decimal("0.10")
+    db.commit()
+    port = assemble_portfolio(ps, strategies, db)
+    assert port.minute_volume_limit_ratio == Decimal("0.10")
+    assert port.volume_limit_ratio == Decimal("0.04")
+
+
 def test_assemble_initial_capital_override_none_keeps_ps_capital(db):
     """override 缺省（None）→ 维持现行为：用组合自身 initial_capital。"""
     ps, strategies = _build(db, ["000001.SZ", "600000.SH"], ["000001.SZ"])

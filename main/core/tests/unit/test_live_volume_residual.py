@@ -114,7 +114,7 @@ def test_daily_cap_binds_when_tighter_than_minute(monkeypatch):
 
 
 def test_minute_ratio_zero_disables_minute_gate(monkeypatch):
-    """0 = 关闭分钟闸门（只按日线口径）；NULL = 默认 10%。"""
+    """0 = 关闭分钟闸门（只按日线口径）；NULL = 回落日线占比。"""
     engine = _engine(monkeypatch)
     engine._daily_reference_volume = lambda code, d: 1_000_000  # 日线 5% → 50,000
     engine._snapshot_synth.bars["600000.SH"] = [
@@ -124,6 +124,24 @@ def test_minute_ratio_zero_disables_minute_gate(monkeypatch):
     engine._apply_volume_cap(order, _portfolio(minute_ratio="0"))
     assert order.quantity == 30000  # 分钟闸门关闭，不缩量
     assert not engine._volume_residuals
+
+
+def test_minute_ratio_null_falls_back_to_daily_ratio_not_ten_pct(monkeypatch):
+    """NULL 未配置 → 分钟比例取日线占比（4%），不得硬编码 10%。
+
+    bar 1000 手 = 100,000 股：4% → 4,000；若误用 10% 会是 10,000。
+    """
+    engine = _engine(monkeypatch)
+    engine._daily_reference_volume = lambda code, d: 1_000_000  # 日线 4% → 40,000
+    engine._snapshot_synth.bars["600000.SH"] = [
+        {"stime": "20261119093100", "volume": 1000, "close": 10.0},
+    ]
+    order = _order(qty=30000)
+    engine._apply_volume_cap(order, _portfolio(daily_ratio="0.04", minute_ratio=None))
+
+    assert order.quantity == 4000  # 分钟 4%，非 10%
+    entry = next(iter(engine._volume_residuals.values()))
+    assert entry["target_qty"] == 26000
 
 
 # ---------------- 盘前兜底 ----------------

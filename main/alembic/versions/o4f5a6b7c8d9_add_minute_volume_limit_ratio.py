@@ -10,7 +10,8 @@ bar 量」执行，同一比例两套分母，实盘单次可下单量被压到�
 - volume_limit_ratio 只承担日线流动性目标（回测/实盘统一为前 5 个交易日
   日均量 × ratio，严格不含当日）；
 - 新增 minute_volume_limit_ratio，仅实盘使用，控制「单次提交 ≤ 最近完成
-  1m bar 量 × 该比例」。NULL=未配置（引擎回落默认 0.10），0=关闭分钟闸门。
+  1m bar 量 × 该比例」。NULL=未配置（回落日线 volume_limit_ratio，现存组合
+  即 4%；10% 只能显式配置），0=关闭分钟闸门。
 """
 from alembic import op
 import sqlalchemy as sa

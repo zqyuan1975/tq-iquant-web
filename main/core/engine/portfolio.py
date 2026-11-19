@@ -210,10 +210,13 @@ class Portfolio:
         #   （股）× 本比例。回测与实盘统一口径，且严格只用 t 日之前的数据（无前视）。
         # - minute_volume_limit_ratio 为「实盘单次可下单量」：单次提交 ≤ 最近完成
         #   1m bar 量 × 本比例。仅实盘消费；回测无分钟执行，不读该字段。
-        # 缩量后的残量由实盘补单队列按后续 bar 续发；回测按 bar 顺延/残量切片。
+        #   NULL/未配置回落到 volume_limit_ratio（现存组合=4%，与改动前一致）；
+        #   10% 只能显式配置，不作为默认（放宽单次可吃比例等同改风险偏好）。
+        # 缩量后的残量由实盘补单队列按后续 bar 续发（默认开启，无开关）；
+        # 回测按 bar 顺延/残量切片。
         self.volume_limit_enabled: bool = False
         self.volume_limit_ratio: Decimal = Decimal("0.10")
-        self.minute_volume_limit_ratio: Decimal = Decimal("0.10")
+        self.minute_volume_limit_ratio: Decimal = Decimal("0.04")
         # #4 自适应滑点（可选，默认关）：开启后回测成交步按订单量占当根 bar
         # 成交量比例动态加冲击成本（由 BacktestEngine 构造 dispatcher 时透传
         # bar_volumes + 系数）。类默认 False，直接构造 Portfolio 的引擎单测

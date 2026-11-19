@@ -1155,6 +1155,8 @@ def test_volume_cap_shrinks_buy_order():
     port.volume_limit_enabled = True
     from decimal import Decimal as D
     port.volume_limit_ratio = D("0.1")
+    # 2026-11-19 拆参后：单次可下单量由分钟层单独控制，此处显式配 10%
+    port.minute_volume_limit_ratio = D("0.1")
     disp = _AcctDispatcher()
     engine, synth = _engine_with_synth_volume(port, disp, 300)
     order = _order(D("10"))
@@ -1191,6 +1193,7 @@ def test_volume_cap_sell_shrinks_without_lot_floor():
     port.volume_limit_enabled = True
     from decimal import Decimal as D
     port.volume_limit_ratio = D("0.1")
+    port.minute_volume_limit_ratio = D("0.1")  # 拆参后分钟层独立控制
     disp = _AcctDispatcher()
     engine, synth = _engine_with_synth_volume(port, disp, 300)
     order = _order(D("10"))
