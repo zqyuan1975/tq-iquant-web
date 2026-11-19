@@ -83,9 +83,9 @@ class SimulatedDispatcher(OrderDispatcher):
         """成本参数来自组合表，默认值 = 历史硬编码值，老调用不破。
 
         bar_volumes / slippage_impact_coef：#4 自适应滑点（可选）。两者均非 None
-        时有效滑点 = slippage + coef×订单股数/(bar成交量×100)，封顶 0.10；
+        时有效滑点 = slippage + coef×订单股数/bar成交量(股)，封顶 0.10；
         任一缺失或该票无量时回退固定 slippage（原行为）。bar_volumes 值为
-        TDX Volume（单位=手，×100 转股数）。
+        TQ Volume（单位=股，与实盘合成 bar 出口同量纲，直接按股数占比计算）。
         impact_model（层 1）：``linear``=旧口径逐位不变；``sqrt``=20bps 基础 +
         k×√参与率，冲击 > impact_cap 判「不可成交」（返回 None，不下单）。
         price_limits：{(code): (跌停价, 涨停价)}，可选。提供时把**含滑点的成交价**

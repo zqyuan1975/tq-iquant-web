@@ -572,7 +572,7 @@ class BacktestEngine:
                                     deferred.append(order)
                                     continue
                     # #2 成交量/流动性约束（可选，默认关）：单 bar 成交量 × ratio 为
-                    # 成交股数上限（TDX Volume 单位=手，×100 转股数，向下取整手）。
+                    # 成交股数上限（TQ Volume 单位=股，直接使用，向下取整手）。
                     # 订单量 ≤ 上限 → 照常；> 上限且上限 ≥ 一手 → 缩量成交（每次记）；
                     # 上限不足一手 → 延后至量足 bar（每订单仅首次记 1 条）。
                     # 4b. 执行档位 partial_fill（N1，默认关）：成交量上限缩量后
