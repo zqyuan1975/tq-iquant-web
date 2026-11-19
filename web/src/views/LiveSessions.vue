@@ -1830,113 +1830,140 @@ onUnmounted(() => {
   </div>
 
   <div v-if="loading" class="card" style="padding:12px"><p>加载中…</p></div>
-  <div v-else class="card table-wrap">
-    <table>
-      <thead><tr><th>ID</th><th>名称</th><th>组合策略</th><th>执行模式</th><th>引擎</th><th>模式</th><th>资金基准</th><th>状态</th><th>存量仓风控</th><th>操作</th></tr></thead>
+  <div v-else class="card table-wrap sessions-wrap">
+    <table class="sessions-table">
+      <thead>
+        <tr>
+          <th class="col-id">ID · 名称</th>
+          <th class="col-strategy">组合策略<span class="th-sub">执行模式 · 引擎 · 模式</span></th>
+          <th class="col-baseline">资金基准</th>
+          <th class="col-status">状态</th>
+          <th class="col-scope">存量仓风控</th>
+          <th class="col-actions">操作</th>
+        </tr>
+      </thead>
       <tbody>
         <tr v-for="s in sessions" :key="s.id">
-          <td style="color:var(--ink-soft)">#{{ s.id }}</td>
-          <td>{{ s.name }}</td>
-          <td style="color:var(--ink-soft)">
-            <span v-for="p in portfolioStatuses(s)" :key="p.portfolio_id" class="portfolio-chip">
-              {{ portfolioName(p.portfolio_id) }}
-              <span v-if="p.status === 'circuit_broken'" class="badge badge-red" style="margin-left:4px">熔断</span>
-              <button v-if="p.status === 'circuit_broken'" @click="recoverBreaker(s, p.portfolio_id)" class="btn btn-sm" style="margin-left:4px">恢复</button>
-            </span>
-            <span v-if="portfolioStatuses(s).length === 0">-</span>
+          <td class="col-id" data-label="ID · 名称">
+            <div class="sess-id">#{{ s.id }}</div>
+            <div class="sess-name">{{ s.name }}</div>
           </td>
-          <td>
-            <span class="badge" :class="isAlert(s) ? 'badge-blue' : 'badge-purple'"
-              :title="isAlert(s) ? '半自动预警：仅 TQ 行情 + send_warn 推送预警，不下单' : '全自动：按交易引擎下单'"
-            >{{ executionModeLabel(s.execution_mode) }}</span>
+          <td class="col-strategy" data-label="组合策略">
+            <div class="strat-chips">
+              <span v-for="p in portfolioStatuses(s)" :key="p.portfolio_id" class="portfolio-chip">
+                {{ portfolioName(p.portfolio_id) }}
+                <span v-if="p.status === 'circuit_broken'" class="badge badge-red">熔断</span>
+                <button v-if="p.status === 'circuit_broken'" @click="recoverBreaker(s, p.portfolio_id)" class="btn btn-sm">恢复</button>
+              </span>
+              <span v-if="portfolioStatuses(s).length === 0" class="muted">-</span>
+            </div>
+            <div class="sess-meta">
+              <span class="badge" :class="isAlert(s) ? 'badge-blue' : 'badge-purple'"
+                :title="isAlert(s) ? '半自动预警：仅 TQ 行情 + send_warn 推送预警，不下单' : '全自动：按交易引擎下单'"
+              >{{ executionModeLabel(s.execution_mode) }}</span>
+              <span class="badge badge-gray" :title="isAlert(s) ? '预警模式：固定走通达信 TQ 行情计算信号，不下单' : '全自动：按交易引擎下单'">{{ engineLabel(s.engine) }}</span>
+              <span class="meta-mode" :title="`模式：${s.mode === 'simulation' ? '仿真' : '实盘'}`">{{ s.mode === 'simulation' ? '仿真' : '实盘' }}</span>
+            </div>
           </td>
-          <td>
-            <span class="badge badge-gray" :title="isAlert(s) ? '预警模式：固定走通达信 TQ 行情计算信号，不下单' : '全自动：按交易引擎下单'">{{ engineLabel(s.engine) }}</span>
+          <td class="col-baseline" data-label="资金基准">
+            <div class="baseline-cell">
+              <span
+                class="baseline-value num"
+                :class="{ 'is-default': s.live_capital == null }"
+                :title="s.live_capital != null ? '手动填写的实盘资金基准（只缩不放）' : '以真实通道总资产为基准（只缩不放）'"
+              >{{ s.live_capital != null ? formatMoney2(s.live_capital) : '真实总资产' }}</span>
+              <button
+                class="btn btn-sm baseline-reset" data-test="baseline-reset"
+                :disabled="!resetWindow.allowed"
+                :title="resetWindow.allowed ? '重置资金基准（留空=当日收盘总资产，只能小于真实总资产）' : resetWindow.reason"
+                @click="openBaseline(s)"
+              >重置</button>
+            </div>
           </td>
-          <td>{{ s.mode === 'simulation' ? '仿真' : '实盘' }}</td>
-          <td>
-            <span :title="s.live_capital != null ? '手动填写的实盘资金基准（只缩不放）' : '以真实通道总资产为基准（只缩不放）'">
-              {{ s.live_capital != null ? formatMoney2(s.live_capital) : '真实总资产' }}
-            </span>
-            <button
-              class="btn btn-sm" style="margin-left:6px" data-test="baseline-reset"
-              :disabled="!resetWindow.allowed"
-              :title="resetWindow.allowed ? '重置资金基准（留空=当日收盘总资产，只能小于真实总资产）' : resetWindow.reason"
-              @click="openBaseline(s)"
-            >重置</button>
+          <td class="col-status" data-label="状态">
+            <div class="status-cell">
+              <span class="badge"
+                :class="s.status === 'running' ? 'badge-green' : s.status === 'stopping' ? 'badge-orange' : 'badge-gray'"
+              >{{ s.status === 'running' ? '运行中' : s.status === 'stopping' ? '停止中' : '已停止' }}</span>
+              <div v-if="s.status === 'running'" class="status-tags">
+                <!-- C4：真的在操作多个账户 → 徽标提示（不阻断） -->
+                <span v-if="multiAccountBanner"
+                  class="badge badge-orange"
+                  title="当前有多个实盘账户并行运行，下单前请确认窗口对应的账户">多账户并行中</span>
+                <!-- 状态陈旧保护：后端重启后引擎未恢复时，DB 可能仍留 running；以引擎
+                     注册表（engine_running）为准提示，避免误以为在自动交易。 -->
+                <span v-if="s.engine_running === false"
+                  class="badge badge-red"
+                  title="状态陈旧：后端重启后引擎未恢复，实际未运行；请重新启动会话">引擎未启动</span>
+                <!-- 「工作台聚焦」≠「是否被监控」：所有 running 会话都并行订阅 SSE、并行监控；
+                     该徽标仅表示工作台当前聚焦展示哪一个会话。 -->
+                <span v-if="s.id === watchedSessionId"
+                  class="badge badge-blue"
+                  title="工作台聚焦：仅表示工作台当前聚焦展示该会话；所有运行中会话都在并行监控与订阅">工作台聚焦</span>
+                <!-- 监控正常：引擎在册（engine_running=true）才算真的在被监控；后端未返回该字段时不显示，避免误报。 -->
+                <span v-if="s.engine_running === true"
+                  class="badge badge-green"
+                  title="监控正常：引擎在册，轮询与风控在线">监控正常</span>
+              </div>
+            </div>
           </td>
-          <td>
-            <span class="badge"
-              :class="s.status === 'running' ? 'badge-green' : s.status === 'stopping' ? 'badge-orange' : 'badge-gray'"
-            >{{ s.status === 'running' ? '运行中' : s.status === 'stopping' ? '停止中' : '已停止' }}</span>
-            <!-- C4：真的在操作多个账户 → 徽标提示（不阻断） -->
-            <span v-if="s.status === 'running' && multiAccountBanner"
-              class="badge badge-orange" style="margin-left:4px"
-              title="当前有多个实盘账户并行运行，下单前请确认窗口对应的账户">多账户并行中</span>
-            <!-- 状态陈旧保护：后端重启后引擎未恢复时，DB 可能仍留 running；以引擎
-                 注册表（engine_running）为准提示，避免误以为在自动交易。 -->
-            <span v-if="s.status === 'running' && s.engine_running === false"
-              class="badge badge-red" style="margin-left:4px"
-              title="状态陈旧：后端重启后引擎未恢复，实际未运行；请重新启动会话">引擎未启动</span>
-            <!-- 「工作台聚焦」≠「是否被监控」：所有 running 会话都并行订阅 SSE、并行监控；
-                 该徽标仅表示工作台当前聚焦展示哪一个会话。 -->
-            <span v-if="s.status === 'running' && s.id === watchedSessionId"
-              class="badge badge-blue" style="margin-left:4px"
-              title="工作台聚焦：仅表示工作台当前聚焦展示该会话；所有运行中会话都在并行监控与订阅">工作台聚焦</span>
-            <!-- 监控正常：引擎在册（engine_running=true）才算真的在被监控；后端未返回该字段时不显示，避免误报。 -->
-            <span v-if="s.status === 'running' && s.engine_running === true"
-              class="badge badge-green" style="margin-left:4px"
-              title="监控正常：引擎在册，轮询与风控在线">监控正常</span>
+          <td class="col-scope" data-label="存量仓风控">
+            <div class="scope-cell">
+              <!-- 存量/外部持仓是否纳入风控（代卖）：会话级开关，默认关闭 -->
+              <span
+                class="badge"
+                :class="sellScopeOf(s) === 'full' ? 'badge-orange' : 'badge-gray'"
+                :title="sellScopeTitle(s)"
+                data-test="sell-scope-badge"
+              >{{ sellScopeOf(s) === 'full' ? '存量仓已纳入' : '仅平台自建仓' }}</span>
+              <button
+                class="btn btn-sm" data-test="sell-scope-toggle"
+                :disabled="s.status === 'stopping' || sellScopeBusy === s.id"
+                :title="sellScopeOf(s) === 'full' ? '关闭后不再对存量/外部仓下新卖单（已提交未成交委托不撤销）' : '开启前会先做全量对账，账不齐会拒绝'"
+                @click="toggleSellScope(s)"
+              >{{ sellScopeBusy === s.id ? '切换中…' : (sellScopeOf(s) === 'full' ? '关闭' : '开启') }}</button>
+            </div>
           </td>
-          <td>
-            <!-- 存量/外部持仓是否纳入风控（代卖）：会话级开关，默认关闭 -->
-            <span
-              class="badge"
-              :class="sellScopeOf(s) === 'full' ? 'badge-orange' : 'badge-gray'"
-              :title="sellScopeTitle(s)"
-              data-test="sell-scope-badge"
-            >{{ sellScopeOf(s) === 'full' ? '存量仓已纳入' : '仅平台自建仓' }}</span>
-            <button
-              class="btn btn-sm" style="margin-left:6px" data-test="sell-scope-toggle"
-              :disabled="s.status === 'stopping' || sellScopeBusy === s.id"
-              :title="sellScopeOf(s) === 'full' ? '关闭后不再对存量/外部仓下新卖单（已提交未成交委托不撤销）' : '开启前会先做全量对账，账不齐会拒绝'"
-              @click="toggleSellScope(s)"
-            >{{ sellScopeBusy === s.id ? '切换中…' : (sellScopeOf(s) === 'full' ? '关闭' : '开启') }}</button>
-          </td>
-          <td>
-            <button v-if="s.status === 'stopped'" @click="startSession(s.id)" class="btn btn-sm btn-primary"
-              :disabled="startingIds.has(s.id)">{{ startingIds.has(s.id) ? '启动中…' : '启动' }}</button>
-            <button v-if="s.status === 'running'" @click="stopSession(s.id)" class="btn btn-sm btn-danger">停止</button>
-            <button v-if="s.status === 'stopping'" class="btn btn-sm" disabled
-              title="引擎正在退出中，停止完成后才会释放引擎/账户占用">停止中…</button>
-            <button v-if="s.status === 'running' && s.id !== watchedSessionId" @click="watchSession(s.id)" class="btn btn-sm">监控</button>
-            <button
-              v-if="s.status !== 'stopping'"
-              @click="openCashFlows(s)"
-              class="btn btn-sm" data-test="cash-flow-open"
-              title="登记入金/出金/分红等外部现金流（不记台账会扭曲净值、收益率、回撤、日亏）"
-            >存取款/分红</button>
-            <button
-              v-if="s.status !== 'stopping'"
-              @click="openGuard(s)" class="btn btn-sm" data-test="channel-guard-open"
-              title="通道级守护：检查客户端/桥、运行态引擎、备用通道与待生效配置"
-            >通道守护</button>
-            <button
-              v-if="(s.split_remainder_count || 0) > 0"
-              @click="openSplitRemainders(s)" class="btn btn-sm" data-test="split-reorder-open"
-              title="停止时丢失的拆单子单剩余量；需会话运行中才能补发"
-            >补发拆单剩余（{{ s.split_remainder_count }}）</button>
-            <button
-              v-if="s.status !== 'stopping'"
-              @click="openEdit(s)" class="btn btn-sm" data-test="session-edit-open"
-              title="编辑会话配置；运行中除名称外，其余修改下次启动生效"
-            >编辑</button>
-            <button v-if="s.status === 'stopped'" @click="deleteSession(s)" class="btn btn-sm">删除</button>
-            <!-- 结构化 409：按 data.rule 指名占用者（C1 引擎占用 / C2 账户占用 / C3 键鼠硬拦 / 参数漂移阻断） -->
-            <div v-if="startErrors[s.id]" class="start-error" data-test="start-error">{{ startErrors[s.id] }}</div>
-            <!-- start 返回的通道建议类告警（非阻断）：如所选引擎与推荐通道不一致 -->
-            <div v-if="startWarnings[s.id]?.length" class="start-warning" data-test="start-warning">
-              <div v-for="w in startWarnings[s.id]" :key="w">{{ w }}</div>
+          <td class="col-actions" data-label="操作">
+            <div class="op-cell">
+              <div class="op-primary">
+                <button v-if="s.status === 'stopped'" @click="startSession(s.id)" class="btn btn-sm btn-primary"
+                  :disabled="startingIds.has(s.id)">{{ startingIds.has(s.id) ? '启动中…' : '启动' }}</button>
+                <button v-if="s.status === 'running'" @click="stopSession(s.id)" class="btn btn-sm btn-danger">停止</button>
+                <button v-if="s.status === 'stopping'" class="btn btn-sm" disabled
+                  title="引擎正在退出中，停止完成后才会释放引擎/账户占用">停止中…</button>
+                <button v-if="s.status === 'running' && s.id !== watchedSessionId" @click="watchSession(s.id)" class="btn btn-sm">监控</button>
+              </div>
+              <div class="op-secondary">
+                <button
+                  v-if="s.status !== 'stopping'"
+                  @click="openCashFlows(s)"
+                  class="btn btn-sm" data-test="cash-flow-open"
+                  title="登记入金/出金/分红等外部现金流（不记台账会扭曲净值、收益率、回撤、日亏）"
+                >存取款/分红</button>
+                <button
+                  v-if="s.status !== 'stopping'"
+                  @click="openGuard(s)" class="btn btn-sm" data-test="channel-guard-open"
+                  title="通道级守护：检查客户端/桥、运行态引擎、备用通道与待生效配置"
+                >通道守护</button>
+                <button
+                  v-if="(s.split_remainder_count || 0) > 0"
+                  @click="openSplitRemainders(s)" class="btn btn-sm" data-test="split-reorder-open"
+                  title="停止时丢失的拆单子单剩余量；需会话运行中才能补发"
+                >补发拆单剩余（{{ s.split_remainder_count }}）</button>
+                <button
+                  v-if="s.status !== 'stopping'"
+                  @click="openEdit(s)" class="btn btn-sm" data-test="session-edit-open"
+                  title="编辑会话配置；运行中除名称外，其余修改下次启动生效"
+                >编辑</button>
+                <button v-if="s.status === 'stopped'" @click="deleteSession(s)" class="btn btn-sm btn-danger">删除</button>
+              </div>
+              <!-- 结构化 409：按 data.rule 指名占用者（C1 引擎占用 / C2 账户占用 / C3 键鼠硬拦 / 参数漂移阻断） -->
+              <div v-if="startErrors[s.id]" class="start-error" data-test="start-error">{{ startErrors[s.id] }}</div>
+              <!-- start 返回的通道建议类告警（非阻断）：如所选引擎与推荐通道不一致 -->
+              <div v-if="startWarnings[s.id]?.length" class="start-warning" data-test="start-warning">
+                <div v-for="w in startWarnings[s.id]" :key="w">{{ w }}</div>
+              </div>
             </div>
           </td>
         </tr>
@@ -3580,5 +3607,109 @@ onUnmounted(() => {
 /* 视口高度不足时事件日志不再霸占过多高度（其余内容在 .content 内滚动） */
 @media (max-height: 820px) {
   .event-log { max-height: min(420px, 34vh); }
+}
+
+/* ===== 实盘会话列表：10 项信息收敛为 6 列 =====
+   原表把「执行模式 / 引擎 / 模式」各占一列、状态徽标与 5 个按钮全挤在单行，
+   页面宽度有限时单元格内文字/按钮互相粘连。此处只改展现层：
+   1) 会话身份（ID + 名称）合并；
+   2) 组合策略与执行模式/引擎/模式合为一列，徽标上下分组；
+   3) 资金基准值与「重置」按钮改为上下排布，不再连成一串数字；
+   4) 状态主徽标与次要徽标分行，行内用 gap 分隔；
+   5) 操作分主操作（启动/停止/监控）与次级入口两行。
+   所有按钮、可见性条件、接口调用与权限判定均保持原样。 */
+.sessions-table { min-width: 1080px; }
+.sessions-table thead th { white-space: normal; line-height: 1.3; }
+.sessions-table thead th.col-id { width: 128px; }
+.sessions-table thead th.col-strategy { width: 250px; }
+.sessions-table thead th.col-baseline { width: 132px; }
+.sessions-table thead th.col-status { width: 210px; }
+.sessions-table thead th.col-scope { width: 132px; }
+.sessions-table thead th.col-actions { width: 236px; }
+.sessions-table tbody td { vertical-align: top; padding: 10px 12px; }
+.sessions-table .th-sub {
+  display: block;
+  margin-top: 2px;
+  font-size: 10px;
+  font-weight: 500;
+  letter-spacing: .04em;
+  text-transform: none;
+  color: var(--ink-faint);
+}
+.sess-id {
+  font-size: 12px;
+  color: var(--ink-soft);
+  font-variant-numeric: tabular-nums;
+}
+.sess-name {
+  font-weight: 600;
+  color: var(--ink);
+  line-height: 1.35;
+  word-break: break-word;
+}
+.strat-chips { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+.strat-chips .portfolio-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  margin-right: 0;
+  font-size: 13px;
+  color: var(--ink-soft);
+}
+.sess-meta {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  margin-top: 7px;
+}
+.meta-mode { font-size: 12px; color: var(--ink-soft); }
+.baseline-cell { display: flex; flex-direction: column; align-items: flex-start; gap: 5px; }
+.baseline-value { font-size: 14px; font-weight: 600; white-space: nowrap; }
+.baseline-value.is-default { font-weight: 500; color: var(--ink-soft); }
+.baseline-reset { color: var(--ink-soft); }
+.status-cell { display: flex; flex-direction: column; align-items: flex-start; gap: 6px; }
+.status-tags { display: flex; flex-wrap: wrap; align-items: center; gap: 5px; }
+.scope-cell { display: flex; flex-direction: column; align-items: flex-start; gap: 6px; }
+.op-cell { display: flex; flex-direction: column; align-items: flex-start; gap: 7px; }
+.op-primary, .op-secondary { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+/* 次级入口弱化边框与文字，仍保持可点；删除保留危险色 */
+.op-secondary .btn:not(.btn-danger) {
+  border-color: var(--line);
+  color: var(--ink-soft);
+}
+.op-secondary .btn:not(.btn-danger):hover {
+  background: var(--ink);
+  color: var(--bg);
+  border-color: var(--ink);
+}
+/* 窄屏（≤760px）：表头隐藏，每行改为「标签 + 内容」的卡片式堆叠，免横向挤压 */
+@media (max-width: 760px) {
+  .sessions-table { min-width: 0; }
+  .sessions-table thead { display: none; }
+  .sessions-table, .sessions-table tbody, .sessions-table tr, .sessions-table td { display: block; width: auto; }
+  .sessions-table tbody tr {
+    padding: 10px 12px;
+    border-bottom: 1px solid var(--line);
+  }
+  .sessions-table tbody tr:last-child { border-bottom: none; }
+  .sessions-table tbody tr:hover { background: var(--hover-bg); }
+  .sessions-table tbody tr:hover td { background: transparent; }
+  .sessions-table tbody td {
+    display: flex;
+    align-items: flex-start;
+    gap: 10px;
+    padding: 4px 0;
+    border-bottom: none;
+  }
+  .sessions-table tbody td::before {
+    content: attr(data-label);
+    flex: 0 0 84px;
+    padding-top: 3px;
+    font-size: 11px;
+    letter-spacing: .06em;
+    color: var(--ink-faint);
+  }
+  .sess-id { font-size: 11px; }
 }
 </style>
