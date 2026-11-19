@@ -117,6 +117,8 @@ class BacktestRequest(BaseModel):
     #  "due_days": int, "enabled": bool}。仅当两策略同属该组合时成立；
     # 额度来自 A2 推导并注入 B2 capital_budget，快照写 loan_model_version。
     loan_model_plan: dict | None = None
+    # 资金池拼盘（0021 B6）：由 L2 拼盘向导带出；回测成功后把记录绑到拼盘头。
+    pairing_plan_id: int | None = None
 
 
 class MultiBacktestRequest(BaseModel):
@@ -588,7 +590,16 @@ def run_backtest(req: BacktestRequest, db: Session = Depends(get_db)):
             detail="回测正在进行中，请等待当前回测完成后再启动（已达并发上限）",
         )
     try:
-        return ok(_svc_run_backtest(db, ps, req))
+        payload = _svc_run_backtest(db, ps, req)
+        if req.pairing_plan_id:
+            try:
+                from core.services import pairing_service
+                pairing_service.link_backtest(
+                    db, req.pairing_plan_id, payload.get("record_id"))
+            except Exception:  # noqa: BLE001 — 绑定失败不影响回测结果
+                logger.warning("拼盘回测记录绑定失败 plan=%s", req.pairing_plan_id,
+                               exc_info=True)
+        return ok(payload)
     except MarketGateUnavailableError as exc:
         # 门控基准取数/公式无输出：属可操作的配置/数据问题，明确回 400
         # （不落 record，service 层在写库前抛出）。其它异常保持 500 语义不变。

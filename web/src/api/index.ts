@@ -1316,6 +1316,8 @@ export interface BacktestRequest {
   daily_close_peak_enabled?: boolean            // 日末 peak 保护（默认关）：仅当日最后一根 bar 更新峰值/回撤
   daily_loss_basis?: 'equity' | 'initial' | null   // 日内亏损分母 run 级覆盖（null/undefined=跟随组合）
   market_gate_enabled?: boolean | null             // 市场多空门控 run 级三态覆盖（null/undefined=跟随组合）
+  loan_model_plan?: Record<string, unknown>        // 资金池 B3：L2 拼盘借贷计划（默认不带）
+  pairing_plan_id?: number                         // 资金池 B6：回测完成后绑定该拼盘
 }
 
 // C7 IS/OOS 采纳门槛评估结果（回测完成时返回；未启用为 null）
@@ -3288,5 +3290,123 @@ export async function getCapitalDerive(params: {
   gross_exposure?: number
 }) {
   const res = await api.get<ApiResponse<CapitalQuotaDerivation>>('/capital/derive', { params })
+  return res.data.data
+}
+
+// ---------------------------------------------------------------------------
+// 资金池拼盘（0021 B6，L2 草稿/评估/批准；默认开关关闭时返回 enabled=false）
+// ---------------------------------------------------------------------------
+export interface PairingSelectOption {
+  id: number
+  label: string
+  detail?: string
+}
+
+export interface PairingHardCheck {
+  code: string
+  rule: string
+  state: string        // pass|fail|pending
+  message: string
+  detail: Record<string, unknown>
+}
+
+export interface PairingSoftFeature {
+  feature: string
+  state: string        // pass|warn|fail|pending
+  value: number | null
+  message: string
+  pending_code?: string | null
+  detail?: Record<string, unknown>
+}
+
+export interface PairingEvalResult {
+  id: number
+  status: string       // GO|WATCH|NO_GO
+  eval_kind: string
+  eval_version: string | null
+  threshold_version: string | null
+  decided_at: string | null
+  reasons: string[]
+  hard: PairingHardCheck[]
+  soft: PairingSoftFeature[]
+  metrics: Record<string, number | null>
+  counts: Record<string, number>
+}
+
+export interface PairingPlanSummary {
+  id: number
+  name: string
+  scope: string
+  status: string       // DRAFT|APPROVED|WATCH|SUSPENDED|ARCHIVED
+  portfolio_strategy_id: number
+  lender_strategy_id: number | null
+  borrower_strategy_id: number | null
+  principal: string | null
+  loan_term_days: number
+  pairing_version: string | null
+  backtest_record_id: number | null
+  created_at: string | null
+  approved_at: string | null
+  eval: PairingEvalResult | null
+}
+
+export interface PairingPlanDetail extends PairingPlanSummary {
+  binding: Record<string, unknown>
+  evidence: Record<string, unknown>
+  edge: {
+    id: number
+    lender_id: number
+    borrower_id: number
+    status: string
+    max_share: string | null
+    evaluation_id: number | null
+  } | null
+  loan_model_plan: Record<string, unknown>
+}
+
+export async function createPairingPlan(payload: {
+  name: string
+  portfolio_strategy_id: number
+  lender_strategy_id: number
+  borrower_strategy_ids: number[]
+  principal: number
+  loan_term_days?: number
+  recall_notice_days?: number
+  release_delay_days?: number
+  max_share?: number
+  scope?: string
+}) {
+  const res = await api.post<ApiResponse<PairingPlanDetail>>('/pairing/plans', payload)
+  return res.data.data
+}
+
+export async function listPairingPlans(params?: { scope?: string; status?: string }) {
+  const res = await api.get<ApiResponse<PairingPlanSummary[] | { enabled: boolean }>>(
+    '/pairing/plans', { params })
+  return res.data.data
+}
+
+export async function getPairingPlan(planId: number) {
+  const res = await api.get<ApiResponse<PairingPlanDetail>>(`/pairing/plans/${planId}`)
+  return res.data.data
+}
+
+export async function evaluatePairingPlan(planId: number) {
+  const res = await api.post<ApiResponse<PairingEvalResult>>(`/pairing/plans/${planId}/evaluate`)
+  return res.data.data
+}
+
+export async function approvePairingPlan(planId: number) {
+  const res = await api.post<ApiResponse<PairingPlanDetail>>(`/pairing/plans/${planId}/approve`)
+  return res.data.data
+}
+
+export async function deletePairingPlan(planId: number) {
+  const res = await api.delete<ApiResponse<{ deleted: number }>>(`/pairing/plans/${planId}`)
+  return res.data.data
+}
+
+export async function getPairingLoanModelPlan(planId: number) {
+  const res = await api.get<ApiResponse<Record<string, unknown>>>(`/pairing/plans/${planId}/loan-model-plan`)
   return res.data.data
 }

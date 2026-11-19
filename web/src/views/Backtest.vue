@@ -10,6 +10,8 @@ import {
   replaySignals,
   sendUserBlock,
   getCapitalDerive,
+  listPairingPlans, createPairingPlan, evaluatePairingPlan,
+  approvePairingPlan, deletePairingPlan, getPairingPlan,
 } from '../api'
 import type {
   BacktestRecordItem, BacktestDetailItem, PortfolioItem,
@@ -26,6 +28,7 @@ import type {
   ValidationVerdict,
   DataQuality, DataQualityPeriod,
   CapitalQuotaDerivation,
+  PairingPlanSummary, PairingPlanDetail,
 } from '../api'
 import { gateLabel, LAYER_LABEL, ACTION_LABEL } from '../utils/liveEvents'
 import { deriveBlockCode } from '../utils/blockCode'
@@ -121,7 +124,7 @@ const showBacktestGuide = ref(false)
 const submitting = ref(false)
 // 高级选项（评估口径 / IS-OOS 采纳门槛 / 费用预留 / 自适应滑点）默认折叠：发起回测默认走增强前的基础方式
 const showAdvanced = ref(false)
-const form = ref({ portfolio_strategy_id: 0, name: '', start_date: '', end_date: '', dividend_mode: 'front', evaluation_profile: 'absolute', is_oos_gate_enabled: false, oos_gate_min_ratio: 0.5, fee_reserve_enabled: false, bond_t0_enabled: false, bond_lot_enabled: false, adaptive_slippage_enabled: undefined as boolean | undefined, slippage_impact_coef: undefined as string | undefined, volume_limit_enabled: undefined as boolean | undefined, volume_limit_ratio: undefined as string | undefined, equity_cap: undefined as string | undefined, capacity_model: '' as '' | 'linear' | 'sqrt', capacity_impact_k: '0.1' as string, daily_close_peak_enabled: false, daily_loss_basis: '' as '' | 'equity' | 'initial', market_gate_enabled: '' as '' | 'true' | 'false' })
+const form = ref({ portfolio_strategy_id: 0, name: '', start_date: '', end_date: '', dividend_mode: 'front', evaluation_profile: 'absolute', is_oos_gate_enabled: false, oos_gate_min_ratio: 0.5, fee_reserve_enabled: false, bond_t0_enabled: false, bond_lot_enabled: false, adaptive_slippage_enabled: undefined as boolean | undefined, slippage_impact_coef: undefined as string | undefined, volume_limit_enabled: undefined as boolean | undefined, volume_limit_ratio: undefined as string | undefined, equity_cap: undefined as string | undefined, capacity_model: '' as '' | 'linear' | 'sqrt', capacity_impact_k: '0.1' as string, liquidity_caliber: '' as '' | 'same_day_bar' | 'prev5d_avg', daily_close_peak_enabled: false, daily_loss_basis: '' as '' | 'equity' | 'initial', market_gate_enabled: '' as '' | 'true' | 'false', loan_model_plan: undefined as Record<string, unknown> | undefined, pairing_plan_id: undefined as number | undefined })
 const gateBanner = ref<BacktestGateResult | null>(null)
 
 // ===== 详情视图 =====
@@ -1313,6 +1316,148 @@ function scrollToCapacityStructure() {
     ?.scrollIntoView({ behavior: 'smooth', block: 'center' })
 }
 
+// ---- 资金池 L2 拼盘（0021 B6）----
+const showPairing = ref(false)
+const pairingPlans = ref<PairingPlanSummary[]>([])
+const pairingDetail = ref<PairingPlanDetail | null>(null)
+const pairingBusy = ref(false)
+const pairingError = ref('')
+const pairingForm = ref({
+  name: '',
+  portfolio_strategy_id: 0,
+  lender_strategy_id: 0,
+  borrower_strategy_id: 0,
+  principal: 100000,
+  loan_term_days: 365,
+  recall_notice_days: 2,
+})
+
+const pairingStrategies = computed(() => {
+  const p = portfolios.value.find(it => it.id === pairingForm.value.portfolio_strategy_id)
+  return (p?.strategies || []) as Array<{ id: number; name: string }>
+})
+
+function resetPairingMembers() {
+  const list = pairingStrategies.value
+  pairingForm.value.lender_strategy_id = list[0]?.id || 0
+  pairingForm.value.borrower_strategy_id = list[1]?.id || 0
+}
+
+function openPairing() {
+  const p = portfolios.value[0]
+  pairingForm.value = {
+    name: '',
+    portfolio_strategy_id: p?.id || 0,
+    lender_strategy_id: 0,
+    borrower_strategy_id: 0,
+    principal: 100000,
+    loan_term_days: 365,
+    recall_notice_days: 2,
+  }
+  resetPairingMembers()
+  pairingError.value = ''
+  pairingDetail.value = null
+  showPairing.value = true
+  loadPairingPlans()
+}
+
+async function loadPairingPlans() {
+  try {
+    const data = await listPairingPlans()
+    if (Array.isArray(data)) {
+      pairingPlans.value = data
+      pairingError.value = ''
+    } else {
+      pairingPlans.value = []
+      pairingError.value = (data as { reasons?: string[] })?.reasons?.join('；')
+        || '资金池/拼盘开关未启用'
+    }
+  } catch (e) {
+    pairingError.value = errMsg(e)
+  }
+}
+
+async function createPairing() {
+  const f = pairingForm.value
+  if (!f.portfolio_strategy_id) { alert('请选择组合'); return }
+  if (!f.lender_strategy_id || !f.borrower_strategy_id) { alert('请选择出借方与借款方策略'); return }
+  if (f.lender_strategy_id === f.borrower_strategy_id) { alert('出借方与借款方不能是同一策略'); return }
+  if (!(f.principal > 0)) { alert('借出本金必须大于 0'); return }
+  pairingBusy.value = true
+  pairingError.value = ''
+  try {
+    pairingDetail.value = await createPairingPlan({
+      name: f.name.trim() || 'L2 拼盘',
+      portfolio_strategy_id: f.portfolio_strategy_id,
+      lender_strategy_id: f.lender_strategy_id,
+      borrower_strategy_ids: [f.borrower_strategy_id],
+      principal: Number(f.principal),
+      loan_term_days: Number(f.loan_term_days) || 365,
+      recall_notice_days: Number(f.recall_notice_days) || 2,
+      scope: 'L2',
+    })
+    await loadPairingPlans()
+  } catch (e) {
+    pairingError.value = errMsg(e)
+  } finally {
+    pairingBusy.value = false
+  }
+}
+
+async function evaluatePairing(plan: PairingPlanSummary) {
+  pairingBusy.value = true
+  try {
+    await evaluatePairingPlan(plan.id)
+    pairingDetail.value = await getPairingPlan(plan.id)
+    await loadPairingPlans()
+  } catch (e) {
+    pairingError.value = errMsg(e)
+  } finally {
+    pairingBusy.value = false
+  }
+}
+
+async function approvePairing(plan: PairingPlanSummary) {
+  if (!confirm(`批准拼盘「${plan.name}」？批准后仍不触发实盘。`)) return
+  pairingBusy.value = true
+  try {
+    pairingDetail.value = await approvePairingPlan(plan.id)
+    await loadPairingPlans()
+  } catch (e) {
+    pairingError.value = errMsg(e)
+  } finally {
+    pairingBusy.value = false
+  }
+}
+
+async function removePairing(plan: PairingPlanSummary) {
+  if (!confirm(`删除草稿拼盘「${plan.name}」？`)) return
+  pairingBusy.value = true
+  try {
+    await deletePairingPlan(plan.id)
+    if (pairingDetail.value?.id === plan.id) pairingDetail.value = null
+    await loadPairingPlans()
+  } catch (e) {
+    pairingError.value = errMsg(e)
+  } finally {
+    pairingBusy.value = false
+  }
+}
+
+async function applyPairingToBacktest(plan: PairingPlanSummary) {
+  try {
+    const detail = await getPairingPlan(plan.id)
+    openForm()
+    form.value.portfolio_strategy_id = detail.portfolio_strategy_id
+    form.value.name = `${detail.name}-合并回测`
+    form.value.loan_model_plan = detail.loan_model_plan
+    form.value.pairing_plan_id = detail.id
+    showPairing.value = false
+  } catch (e) {
+    pairingError.value = errMsg(e)
+  }
+}
+
 function openForm() {
   const today = new Date()
   const fmt = (d: Date) => {
@@ -1343,6 +1488,9 @@ function openForm() {
     daily_close_peak_enabled: false,
     daily_loss_basis: '',
     market_gate_enabled: '',
+    // 资金池拼盘（0021 B6）：从「新建拼盘」带入；默认不带
+    loan_model_plan: undefined as Record<string, unknown> | undefined,
+    pairing_plan_id: undefined as number | undefined,
   }
   showForm.value = true
 }
@@ -1428,6 +1576,12 @@ async function submit() {
             ? {
                 liquidity_caliber: form.value.liquidity_caliber as
                   'same_day_bar' | 'prev5d_avg',
+              }
+            : {}),
+          ...(form.value.loan_model_plan
+            ? {
+                loan_model_plan: form.value.loan_model_plan,
+                pairing_plan_id: form.value.pairing_plan_id,
               }
             : {}),
     })
@@ -3478,6 +3632,10 @@ watch(theme, () => {
               title="重算指定组合区间的公式信号，可选与实盘委托按日期/股票/方向对照">
         信号回放
       </button>
+      <button class="btn btn-sm" @click="openPairing"
+              title="资金池 L2 拼盘：同组合内主策略出资、搭配策略借款（默认开关关闭）">
+        新建拼盘
+      </button>
       <button @click="openForm" class="btn btn-primary">+ 发起回测</button>
     </PageHeader>
 
@@ -4019,6 +4177,102 @@ watch(theme, () => {
         <div class="modal-actions">
           <button @click="submit" class="btn btn-primary" :disabled="submitting">{{ submitting ? '运行中...' : '确定' }}</button>
           <button @click="showForm = false" class="btn" :disabled="submitting">取消</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- ============ 资金池 L2 拼盘（0021 B6）Modal ============ -->
+    <div v-if="showPairing" class="modal-overlay modal-lg" @click.self="showPairing = false">
+      <div class="modal-content">
+        <h3 style="margin:0">新建 L2 拼盘（同组合内出资 / 借款）</h3>
+        <div class="modal-body">
+          <div v-if="pairingError" style="color:var(--red);margin-bottom:8px">{{ pairingError }}</div>
+          <p style="color:var(--ink-soft);margin:4px 0 12px">
+            阶段 B 仅同组合、1 个借款方；评估通过只代表可进入合并回测，不会启动实盘。
+          </p>
+          <div class="form-group">
+            <label class="group-label">拼盘配置</label>
+            <div class="field-grid">
+              <div class="field-row field-span-2">
+                <span class="field-label">名称</span>
+                <input v-model="pairingForm.name" placeholder="例如：主策略 + 搭配策略" />
+              </div>
+              <div class="field-row field-span-2">
+                <span class="field-label">组合</span>
+                <select v-model="pairingForm.portfolio_strategy_id" @change="resetPairingMembers">
+                  <option :value="0" disabled>请选择组合</option>
+                  <option v-for="p in portfolios" :key="p.id" :value="p.id">{{ p.name }}</option>
+                </select>
+              </div>
+              <div class="field-row">
+                <span class="field-label">出借方策略</span>
+                <select v-model="pairingForm.lender_strategy_id">
+                  <option v-for="s in pairingStrategies" :key="s.id" :value="s.id">{{ s.name }}</option>
+                </select>
+              </div>
+              <div class="field-row">
+                <span class="field-label">借款方策略</span>
+                <select v-model="pairingForm.borrower_strategy_id">
+                  <option v-for="s in pairingStrategies" :key="s.id" :value="s.id">{{ s.name }}</option>
+                </select>
+              </div>
+              <div class="field-row">
+                <span class="field-label">借出本金</span>
+                <input type="number" v-model.number="pairingForm.principal" min="0" />
+              </div>
+              <div class="field-row">
+                <span class="field-label">借期（天）</span>
+                <input type="number" v-model.number="pairingForm.loan_term_days" min="1" />
+              </div>
+            </div>
+          </div>
+
+          <div v-if="pairingPlans.length" class="form-group">
+            <label class="group-label">已建拼盘</label>
+            <div class="table-wrap">
+              <table>
+                <thead><tr><th>ID</th><th>名称</th><th>状态</th><th>评估</th><th>本金</th><th>操作</th></tr></thead>
+                <tbody>
+                  <tr v-for="p in pairingPlans" :key="p.id">
+                    <td>{{ p.id }}</td>
+                    <td>{{ p.name }}</td>
+                    <td>{{ p.status }}</td>
+                    <td :style="{ color: p.eval?.status === 'GO' ? 'var(--green)' : p.eval?.status === 'NO_GO' ? 'var(--red)' : 'var(--ink-soft)' }">
+                      {{ p.eval?.status || '—' }}
+                    </td>
+                    <td>{{ p.principal || '—' }}</td>
+                    <td style="white-space:nowrap">
+                      <button class="btn btn-sm" :disabled="pairingBusy" @click="evaluatePairing(p)">重新评估</button>
+                      <button class="btn btn-sm" :disabled="pairingBusy || p.status !== 'DRAFT'" @click="approvePairing(p)">批准</button>
+                      <button class="btn btn-sm" :disabled="pairingBusy" @click="applyPairingToBacktest(p)">带入回测</button>
+                      <button class="btn btn-sm" :disabled="pairingBusy || p.status !== 'DRAFT'" @click="removePairing(p)">删除</button>
+                    </td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+
+          <div v-if="pairingDetail?.eval" class="card" style="padding:10px">
+            <p style="margin:0 0 6px">
+              评估结论：<b>{{ pairingDetail.eval.status }}</b>
+              <span v-if="pairingDetail.eval.reasons.length">（{{ pairingDetail.eval.reasons.join('；') }}）</span>
+            </p>
+            <ul style="margin:0;padding-left:18px">
+              <li v-for="h in pairingDetail.eval.hard" :key="h.code">
+                {{ h.code }} {{ h.state === 'pass' ? '通过' : h.state === 'fail' ? '失败' : '待定' }}：{{ h.message }}
+              </li>
+              <li v-for="s in pairingDetail.eval.soft" :key="s.feature">
+                {{ s.feature }}：{{ s.message }}<span v-if="s.pending_code">（{{ s.pending_code }}）</span>
+              </li>
+            </ul>
+          </div>
+        </div>
+        <div class="modal-actions">
+          <button class="btn btn-primary" :disabled="pairingBusy" @click="createPairing">
+            {{ pairingBusy ? '处理中...' : '创建草稿并评估' }}
+          </button>
+          <button class="btn" @click="showPairing = false">关闭</button>
         </div>
       </div>
     </div>
