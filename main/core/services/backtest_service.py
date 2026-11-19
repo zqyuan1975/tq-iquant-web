@@ -66,6 +66,7 @@ from core.engine.market_gate import (
 )
 from core.services.acceptance import ACCEPTANCE_PROFILES, compute_acceptance
 from core.services import backtest_cancel
+from core.services import portfolio_settings
 from core.engine.regime_alpha import (
     QUADRANT_STYLE_INDICES,
     RegimeAlphaAnalyzer,
@@ -927,6 +928,7 @@ def build_params_snapshot(ps, dividend_mode: str = "front",
                           volume_limit_enabled: bool | None = None,
                           volume_limit_ratio=None,
                           equity_cap=None,
+                          equity_cap_mode: str = "cap",
                           daily_close_peak_enabled: bool = False,
                           daily_loss_basis: str = "equity",
                           data_start: str | None = None,
@@ -983,6 +985,11 @@ def build_params_snapshot(ps, dividend_mode: str = "front",
     payload["bond_lot_enabled"] = bool(bond_lot_enabled)
     payload["daily_close_peak_enabled"] = bool(daily_close_peak_enabled)
     payload["daily_loss_basis"] = daily_loss_basis
+    # equity_cap 处理模式（2026-11-19 层 2）：cap=只封顶新开仓定量（旧行为）；
+    # distribute=日终把超上限部分作为外部流出扣现。显式写入（老记录缺该键即 cap），
+    # 与 equity_cap 一起决定结果可比性。
+    payload["equity_cap_mode"] = (
+        equity_cap_mode if equity_cap_mode in ("cap", "distribute") else "cap")
     for name, val in (
         ("adaptive_slippage_enabled", adaptive_slippage_enabled),
         ("slippage_impact_coef", slippage_impact_coef),
@@ -4562,6 +4569,12 @@ def run_backtest(db: Session, ps: PortfolioStrategy, req,
     volume_limit_ratio = getattr(req, "volume_limit_ratio", None)
     # 容量上限 run 级覆盖（None=用组合默认）
     equity_cap = getattr(req, "equity_cap", None)
+    # 上限处理模式 run 级覆盖（None=跟随组合 JSON 配置；组合侧缺省 cap，旧行为）
+    _ec_mode_req = getattr(req, "equity_cap_mode", None)
+    equity_cap_mode = (
+        _ec_mode_req if _ec_mode_req in ("cap", "distribute")
+        else portfolio_settings.get_equity_cap_mode(ps.id)
+    )
     # 日末 peak 保护（默认关；纯 1d 行为不变）
     daily_close_peak_enabled = bool(
         getattr(req, "daily_close_peak_enabled", False)
@@ -4662,6 +4675,7 @@ def run_backtest(db: Session, ps: PortfolioStrategy, req,
             volume_limit_enabled=volume_limit_enabled,
             volume_limit_ratio=volume_limit_ratio,
             equity_cap=equity_cap,
+            equity_cap_mode=equity_cap_mode,
             daily_close_peak_enabled=daily_close_peak_enabled,
             daily_loss_basis=daily_loss_basis,
             data_start=req.start_date,
@@ -4734,6 +4748,7 @@ def run_backtest(db: Session, ps: PortfolioStrategy, req,
             portfolio.volume_limit_ratio = Decimal(str(volume_limit_ratio))
         if equity_cap is not None:
             portfolio.equity_cap = Decimal(str(equity_cap))
+        portfolio.equity_cap_mode = equity_cap_mode
         t1 = datetime.now()
         # klines 含公式预热段（早于 start，保证首根 bar 公式有效值）
         # 时点池关闭（默认）时不传 pool_codes：取数口径与改动前逐字一致
@@ -5141,6 +5156,8 @@ def run_multi_backtest(db: Session, portfolios: list, req) -> dict:
         _basis = daily_loss_basis if daily_loss_basis in ("equity", "initial") else (
             getattr(ps, "daily_loss_basis", None) or "equity")
         portfolio.risk_manager.daily_loss_on_equity_enabled = (_basis != "initial")
+        # 上限处理模式（组合 JSON 侧配置；缺省 cap=旧行为）
+        portfolio.equity_cap_mode = portfolio_settings.get_equity_cap_mode(ps.id)
         # 市场多空门控：run 级三态覆盖（None=跟随组合；策略 on 可单独启用）
         _gate_req = getattr(req, "market_gate_enabled", None)
         gate_enabled = gate_enabled_for(ps, strategies, _gate_req)
@@ -5233,6 +5250,7 @@ def run_multi_backtest(db: Session, portfolios: list, req) -> dict:
                 status="running",
                 params_snapshot=build_params_snapshot(
                     ps, dividend_mode=dividend_mode,
+                    equity_cap_mode=portfolio_settings.get_equity_cap_mode(ps.id),
                     daily_loss_basis=(daily_loss_basis if daily_loss_basis in
                                       ("equity", "initial") else
                                       (getattr(ps, "daily_loss_basis", None) or "equity")),

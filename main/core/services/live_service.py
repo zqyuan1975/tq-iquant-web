@@ -81,6 +81,7 @@ from core.engine.execution_engine import ShadowDispatcher
 from core.engine.live.market_data import MarketDataService
 from core.engine.live.fallback_quote import FallbackQuoteDispatcher
 from core.engine.live.timing import now_shanghai
+from core.services import portfolio_settings
 from core.services.live_data_health import (
     health_summary_text,
     run_health_check,
@@ -1374,6 +1375,10 @@ def build_engine(
             getattr(ps, "max_single_position_pct", None))
         port.min_cash_reserve_pct = _pct_or_none(
             getattr(ps, "min_cash_reserve_pct", None))
+        # 上限处理模式（组合 JSON 侧配置）：会话启动时一次性读入内存，
+        # 改完需重启会话才生效（与 sell_scope 即时切换不同）。实盘只按 cap
+        # 封顶（distribute 出金仅回测模拟，实盘不自动出金）。
+        port.equity_cap_mode = portfolio_settings.get_equity_cap_mode(ps.id)
         try:
             weight = float(ps.initial_capital or 0)
         except (TypeError, ValueError):

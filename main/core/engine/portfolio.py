@@ -113,6 +113,9 @@ class Portfolio:
         # 净值超上限后仓位封顶、超额现金闲置（等价"超容量撤回/封盘"），
         # 封堵 20%×增长净值 在长周期复利下开出不可实现的天文仓位。fixed 不受影响。
         self.equity_cap: Optional[Decimal] = None
+        # W3 上限处理模式：cap（默认，只封顶新开仓定量，与旧行为逐位一致）/
+        # distribute（回测日终把「总资产 − cap」当外部流出扣出现金，不强制减仓）。
+        self.equity_cap_mode: str = "cap"
         # 决策闸门采集器（调参可观测性）：默认空采集器，set_recorder 注入。
         # 同步给 risk_manager（熔断/恢复在其内判定，需同一 recorder）。
         self.recorder = recorder or NULL_RECORDER

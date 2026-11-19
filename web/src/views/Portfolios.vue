@@ -65,6 +65,11 @@ const DAILY_LOSS_BASES = [
   { value: 'equity', label: '昨日收盘净值（默认，阈值随净值滚动）' },
   { value: 'initial', label: '初始资金（旧口径，阈值恒定）' },
 ]
+// equity_cap 处理模式：cap=只封顶新开仓定量（默认）；distribute=回测日终出金
+const EQUITY_CAP_MODES = [
+  { value: 'cap', label: '封顶（只限制新开仓定量，默认）' },
+  { value: 'distribute', label: '日终出金（仅回测，超上限部分扣现）' },
+]
 
 // 实盘预警调度（alert 半自动）：NULL=跟随默认；rank 与后端 validate_signal_config 同口径
 const SIGNAL_FREQUENCIES = ['1m', '5m', '15m', '30m', '1h', '1d', '1w', '1mon']
@@ -121,6 +126,7 @@ interface FieldMeta {
   placeholder?: string
   options?: string
   hint?: string
+  hintBelow?: boolean  // select/number 也把 hint 渲染成字段下方说明（默认只在 switch/percent 显示）
   showIf?: string | { key: string; equals: unknown } | ((form: Record<string, any>) => boolean)
 }
 const PORTFOLIO_GROUPS: { title: string; hint?: string; fields: FieldMeta[] }[] = [
@@ -155,7 +161,8 @@ const PORTFOLIO_GROUPS: { title: string; hint?: string; fields: FieldMeta[] }[] 
   ]},
   { title: '仓位与现金管理', fields: [
     { key: 'position_sizing', label: '仓位模型', span: 2, type: 'select', options: 'positionSizings', hint: '动态=按组合当前总净值分配资金；固定=按初始资金（旧行为）' },
-    { key: 'equity_cap', label: '容量上限（元）', span: 2, type: 'number', placeholder: '不设上限', showIf: { key: 'position_sizing', equals: 'dynamic' }, hint: '动态仓位的资金封顶：净值超上限后仓位不再放大（模拟超容量撤回/封盘），None=不设上限' },
+    { key: 'equity_cap', label: '容量上限（元）', span: 2, type: 'number', placeholder: '不设上限', hintBelow: true, showIf: { key: 'position_sizing', equals: 'dynamic' }, hint: '动态仓位的资金封顶：净值超上限后新开仓按 min(总资产, 上限) 定量。只影响新开仓定量，不会强制减仓；可随时改或清空（清空=不设上限）。实盘会话启动时读取一次（内存快照），改完需重启会话才生效。' },
+    { key: 'equity_cap_mode', label: '上限处理模式', span: 2, type: 'select', options: 'equityCapModes', hintBelow: true, showIf: { key: 'position_sizing', equals: 'dynamic' }, hint: '封顶=只限制新开仓定量（默认，与旧行为一致）；日终出金=回测每天收盘把「总资产−上限」作为外部流出扣出现金（仅回测模拟，不卖存量持仓）。同样只影响新开仓定量、不会强制减仓；实盘会话启动时读取一次，改完需重启会话才生效（与 sell_scope 的即时切换不同）。' },
     { key: 'max_single_position_pct', label: '单票上限', span: 1, type: 'percent', placeholder: '留空=不限制', hint: '按「买入后该票市值 ÷ 组合总资产」判定，留空或 0 表示不限制。仅实盘生效，回测不读。' },
     { key: 'min_cash_reserve_pct', label: '现金下限', span: 1, type: 'percent', placeholder: '留空=不限制', hint: '按「买入后剩余现金 ÷ 组合总资产」判定，留空或 0 表示不限制。仅实盘生效，回测不读。' },
     { key: 'daily_loss_basis', label: '日内亏损熔断口径', span: 2, type: 'select', options: 'dailyLossBases', hint: '分母：净值=上一交易日收盘净值（默认，5% 阈值随净值滚动）；初始资金=按 initial_capital 固定阈值（旧口径，净值增长后相对变严）' },
@@ -273,6 +280,7 @@ function emptyPortfolioForm(): Record<string, any> {
     position_sizing: 'dynamic', daily_loss_basis: 'equity', cash_enhance_enabled: false,
     cash_enhance_equity_threshold: null, cash_enhance_position_ratio_threshold: null,
     equity_cap: null,
+    equity_cap_mode: 'cap',
     // 单票上限 / 现金下限：默认不限制（null → 输入框留空，提交 null，后端 NULL=不设限）。
     // 绝不能预填非 0 值——会立刻改变次日实际报单结果。
     max_single_position_pct: null, min_cash_reserve_pct: null,
@@ -585,6 +593,7 @@ async function openEditPortfolio(p: PortfolioItem) {
     cash_enhance_equity_threshold: detail.cash_enhance_equity_threshold,
     cash_enhance_position_ratio_threshold: detail.cash_enhance_position_ratio_threshold,
     equity_cap: detail.equity_cap ?? null,
+    equity_cap_mode: detail.equity_cap_mode || 'cap',
     max_single_position_pct: detail.max_single_position_pct ?? null,
     min_cash_reserve_pct: detail.min_cash_reserve_pct ?? null,
     market_gate_enabled: detail.market_gate_enabled ?? false,
@@ -769,6 +778,7 @@ function optionsOf(src: string | undefined, pid?: number) {
   if (src === 'slaveExitModes') return SLAVE_EXIT_MODES.map(m => ({ value: m.value, label: m.label }))
   if (src === 'positionSizings') return POSITION_SIZINGS.map(s => ({ value: s.value, label: s.label }))
   if (src === 'dailyLossBases') return DAILY_LOSS_BASES.map(s => ({ value: s.value, label: s.label }))
+  if (src === 'equityCapModes') return EQUITY_CAP_MODES.map(s => ({ value: s.value, label: s.label }))
   if (src === 'riskTimings') return RISK_TIMINGS.map(t => ({ value: t.value, label: t.label }))
   if (src === 'requotePriceModes') return [
     { value: 'tick', label: '固定 1 档（原行为）' },
@@ -882,7 +892,7 @@ onMounted(loadPortfolios)
                 v-for="fld in g.fields" :key="fld.key"
                 v-show="fieldVisible(fld, portfolioForm)"
                 class="field-row"
-                :class="[fld.span === 2 ? 'field-span-2' : '', ((fld.type === 'percent' && fld.hint) || portfolioFieldErrors[fld.key]) ? 'field-row--hinted' : '']"
+                :class="[fld.span === 2 ? 'field-span-2' : '', ((fld.type === 'percent' && fld.hint) || fld.hintBelow || portfolioFieldErrors[fld.key]) ? 'field-row--hinted' : '']"
               >
                 <FieldLabel :text="fld.label" />
                 <label v-if="fld.type === 'switch'" class="switch-row">
@@ -901,7 +911,7 @@ onMounted(loadPortfolios)
                   <option v-for="o in optionsOf(fld.options)" :key="o.value ?? 'null'" :value="o.value">{{ o.label }}</option>
                 </select>
                 <span v-if="fld.type === 'percent'" class="field-suffix">%</span>
-                <span v-if="fld.type === 'percent' && fld.hint" class="field-hint field-hint--below">{{ fld.hint }}</span>
+                <span v-if="(fld.type === 'percent' || fld.hintBelow) && fld.hint" class="field-hint field-hint--below">{{ fld.hint }}</span>
                 <span v-if="portfolioFieldErrors[fld.key]" class="field-error" data-test="portfolio-field-error">{{ portfolioFieldErrors[fld.key] }}</span>
               </div>
             </div>

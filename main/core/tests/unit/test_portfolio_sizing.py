@@ -82,3 +82,111 @@ def test_default_position_sizing_is_dynamic():
     pm = PortfolioRiskManager(max_drawdown=Decimal("0.2"), daily_loss_limit=Decimal("0.05"))
     port = Portfolio(portfolio_id=1, initial_capital=Decimal("100000"), risk_manager=pm)
     assert port.position_sizing == "dynamic"
+
+
+# ---------------------------------------------------------------------------
+# 层 2：equity_cap_mode（cap 默认 / distribute 日终出金）
+# ---------------------------------------------------------------------------
+from types import SimpleNamespace
+
+from core.engine.backtest_engine import BacktestEngine
+
+
+class _Recorder:
+    def __init__(self):
+        self.events = []
+
+    def __bool__(self):
+        return True
+
+    def record(self, **kw):
+        self.events.append(kw)
+
+
+def _engine():
+    # 只测纯函数式 helper：跳过重量级 __init__
+    return object.__new__(BacktestEngine)
+
+
+def _pf(cap, mode, cash):
+    return SimpleNamespace(
+        equity_cap=None if cap is None else Decimal(str(cap)),
+        equity_cap_mode=mode,
+        account=SimpleNamespace(cash=Decimal(str(cash))),
+        portfolio_id=1,
+    )
+
+
+def test_default_equity_cap_mode_is_cap():
+    pm = PortfolioRiskManager(max_drawdown=Decimal("0.2"), daily_loss_limit=Decimal("0.05"))
+    port = Portfolio(portfolio_id=1, initial_capital=Decimal("100000"), risk_manager=pm)
+    assert port.equity_cap_mode == "cap"
+
+
+def test_distribute_withdraws_excess_from_cash():
+    pf = _pf(100, "distribute", 50)
+    rec = _Recorder()
+    out = _engine()._apply_equity_cap_distribution(
+        pf, Decimal("130"), datetime(2026, 7, 30, 15, 0), rec)
+    assert out == Decimal("100")
+    assert pf.account.cash == Decimal("20")
+    assert len(rec.events) == 1
+    ev = rec.events[0]
+    assert (ev["gate"], ev["action"]) == ("equity_cap", "distribute")
+    assert "外部流出" in ev["message"]
+
+
+def test_distribute_below_cap_is_noop():
+    pf = _pf(100, "distribute", 50)
+    out = _engine()._apply_equity_cap_distribution(
+        pf, Decimal("100"), datetime(2026, 7, 30, 15, 0), None)
+    assert out == Decimal("100")
+    assert pf.account.cash == Decimal("50")
+
+
+def test_cap_mode_is_noop():
+    """默认 cap：即使超上限也不出金（与改动前逐位一致）。"""
+    pf = _pf(100, "cap", 50)
+    out = _engine()._apply_equity_cap_distribution(
+        pf, Decimal("130"), datetime(2026, 7, 30, 15, 0), None)
+    assert out == Decimal("130")
+    assert pf.account.cash == Decimal("50")
+
+
+def test_no_cap_is_noop_in_distribute():
+    pf = _pf(None, "distribute", 50)
+    out = _engine()._apply_equity_cap_distribution(
+        pf, Decimal("130"), datetime(2026, 7, 30, 15, 0), None)
+    assert out == Decimal("130")
+    assert pf.account.cash == Decimal("50")
+
+
+def test_market_value_exceeds_cap_does_not_force_sell():
+    """存量市值超上限且无现金：不出金、不卖股，只记 skip 事件。"""
+    pf = _pf(100, "distribute", 0)
+    rec = _Recorder()
+    out = _engine()._apply_equity_cap_distribution(
+        pf, Decimal("130"), datetime(2026, 7, 30, 15, 0), rec)
+    assert out == Decimal("130")
+    assert pf.account.cash == Decimal("0")
+    assert rec.events[0]["action"] == "skip"
+    assert "不强制减仓" in rec.events[0]["message"]
+
+
+def test_distribute_mode_still_caps_sizing():
+    """distribute 不改变定量口径：新开仓仍按 min(总资产, cap) 计算。"""
+    pm = PortfolioRiskManager(max_drawdown=Decimal("0.2"), daily_loss_limit=Decimal("0.05"))
+    port = Portfolio(portfolio_id=1, initial_capital=Decimal("100000"),
+                     risk_manager=pm, position_sizing="dynamic")
+    port.equity_cap = Decimal("50000")
+    port.equity_cap_mode = "distribute"
+    ctx = StrategyContext(
+        strategy_id=1, period="1d", capital_ratio=Decimal("0.6"), max_positions=5,
+    )
+    ctx.strategy_risk = StrategyRiskManager(
+        stop_loss_ratio=Decimal("0.1"), take_profit_ratio=Decimal("0.2"),
+        trailing_stop_ratio=Decimal("0"),
+    )
+    port.strategies.append(ctx)
+    port.on_bar(_bar("10", datetime(2026, 7, 30, 15, 0)), signal_cache={})
+    assert port._strategy_fund(ctx) == ctx.capital_ratio * Decimal("50000")

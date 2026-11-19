@@ -126,6 +126,9 @@ def assemble_portfolio(
     # W3 容量上限（可选，默认 None）：dynamic 仓位封顶，防长周期复利开出天文仓位
     _cap = getattr(ps, "equity_cap", None)
     port.equity_cap = Decimal(str(_cap)) if _cap is not None else None
+    # 上限处理模式（cap=默认旧行为 / distribute=回测日终出金；组合 JSON 侧配置，
+    # 由调用方在装配后按组合读取覆盖，ORM 无该列）
+    port.equity_cap_mode = getattr(ps, "equity_cap_mode", None) or "cap"
     # 组合级股票池成分（继承用）：策略 stock_pool_id 为空时回退到此
     portfolio_pool_codes = {
         row.stock_code

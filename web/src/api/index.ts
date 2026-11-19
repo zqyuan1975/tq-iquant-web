@@ -102,6 +102,7 @@ export interface PortfolioItem {
   cash_enhance_equity_threshold: number | null
   cash_enhance_position_ratio_threshold: number | null
   equity_cap: number | null            // W3 容量上限（dynamic 仓位资金封顶，None=不设上限）
+  equity_cap_mode: string              // 上限处理模式：cap（默认，只封顶定量）| distribute（回测日终出金）
   max_single_position_pct: number | null  // 单票上限（0~1 比例，null=不限制；仅实盘生效）
   min_cash_reserve_pct: number | null     // 现金下限（0~1 比例，null=不限制；仅实盘生效）
   // 市场多空门控（默认关）：基准指数空头时禁止开仓/加仓，持仓不强平

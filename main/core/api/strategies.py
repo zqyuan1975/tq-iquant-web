@@ -170,8 +170,14 @@ class PortfolioCreate(BaseModel):
     cash_enhance_enabled: bool = False
     cash_enhance_equity_threshold: float | None = None
     cash_enhance_position_ratio_threshold: float | None = None
-    # W3 容量上限（可选，默认 None）：dynamic 仓位资金封顶，超净值部分闲置（撤回/封盘）
+    # W3 容量上限（可选，默认 None）：dynamic 仓位资金封顶，超净值部分闲置（撤回/封盘）。
+    # None=请求未携带（编辑不动已有值），允许随时改成任意正数或清空。
     equity_cap: float | None = None
+    # 上限处理模式（2026-11-19 层 2）：cap=只封顶新开仓定量（默认/旧行为）；
+    # distribute=回测日终把「总资产−cap」作为外部流出扣现（不强制减仓）。
+    # None=请求未携带（编辑不动已有值）。落 data/portfolio_settings.json，
+    # 不新增表/迁移；实盘会话启动时读入内存，改完需重启会话生效。
+    equity_cap_mode: str | None = None
     # 实盘风控闸（仅实盘生效，回测不读）：None=不限制；按「买入后该票市值 ÷ 总资产」
     # 「买入后剩余现金 ÷ 总资产」判定，实盘 LiveEngine 从列读取
     max_single_position_pct: float | None = None
@@ -374,6 +380,9 @@ def _validate_portfolio(req: PortfolioCreate, db: Session) -> str | None:
         )
     if req.equity_cap is not None and req.equity_cap <= 0:
         return f"equity_cap 必须 > 0（None=不设上限），收到 {req.equity_cap}"
+    if req.equity_cap_mode not in (None, "cap", "distribute"):
+        return (f"equity_cap_mode 仅支持 cap/distribute（None=不改），"
+                f"收到 {req.equity_cap_mode!r}")
     # 实盘单票上限 / 现金下限：None/0=不限制；显式值须在 [0,1]
     for _k in ("max_single_position_pct", "min_cash_reserve_pct"):
         _v = getattr(req, _k, None)

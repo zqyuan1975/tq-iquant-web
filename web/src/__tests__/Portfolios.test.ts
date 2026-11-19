@@ -663,6 +663,27 @@ describe('Portfolios.vue — 门控条件输入留空归一为 null（不再 422
     expect((createPortfolio as any).mock.calls[0][0].equity_cap).toBeNull()
   })
 
+  it('上限处理模式默认 cap，可切 distribute 并随创建提交；说明含三条约束', async () => {
+    ;(createPortfolio as any).mockResolvedValue({ id: 99 })
+    const w = mount(Portfolios)
+    await flushPromises()
+    await w.find('button.btn-primary').trigger('click')
+    await w.find('input[data-field="name"]').setValue('CAP_MODE')
+    await w.find('select[data-field="stock_pool_id"]').setValue('1')
+
+    const sel = w.find('select[data-field="equity_cap_mode"]')
+    expect((sel.element as HTMLSelectElement).value).toBe('cap')
+    await sel.setValue('distribute')
+    // 说明文案：只影响新开仓定量 / 不强制减仓 / 重启会话生效
+    expect(w.text()).toContain('只影响新开仓定量')
+    expect(w.text()).toContain('不会强制减仓')
+    expect(w.text()).toContain('重启会话才生效')
+
+    await w.find('.modal-actions button.btn-primary').trigger('click')
+    await flushPromises()
+    expect((createPortfolio as any).mock.calls[0][0].equity_cap_mode).toBe('distribute')
+  })
+
   it('开市场状态闸、趋势字段清空 → payload 为 null', async () => {
     ;(createStrategy as any).mockResolvedValue({ id: 77 })
     const w = mount(Portfolios)

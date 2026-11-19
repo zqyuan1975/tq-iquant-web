@@ -15,6 +15,8 @@
 """
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
+
+from core.services import portfolio_settings
 import json
 import re
 
@@ -123,6 +125,8 @@ def serialize_portfolio(db: Session, p: PortfolioStrategy) -> dict:
             if p.cash_enhance_position_ratio_threshold is not None else None
         ),
         "equity_cap": (float(p.equity_cap) if p.equity_cap is not None else None),
+        # 上限处理模式（组合 JSON 侧配置，缺省 cap=旧行为）
+        "equity_cap_mode": portfolio_settings.get_equity_cap_mode(p.id),
         # 实盘单票上限 / 现金下限：NULL=不限制，原样回给前端（百分比由前端换算）
         "max_single_position_pct": (
             float(p.max_single_position_pct)
@@ -364,6 +368,17 @@ def get_portfolio(db: Session, pid: int) -> dict | None:
     return serialize_portfolio(db, p)
 
 
+def _apply_equity_cap_mode(pid: int, req) -> None:
+    """组合 JSON 侧字段（不落表）：仅当请求显式携带 equity_cap_mode 时写入。
+
+    None / "cap" 都归一为默认值（删除键），文件缺失即 cap，与旧行为一致。
+    """
+    sent = set(getattr(req, "model_fields_set", None) or ())
+    if "equity_cap_mode" not in sent:
+        return
+    portfolio_settings.set_equity_cap_mode(pid, getattr(req, "equity_cap_mode", None))
+
+
 def create_portfolio(db: Session, req) -> dict:
     """建组合 + 子策略（两步 commit）。req 已校验合法。"""
     p = PortfolioStrategy()
@@ -379,6 +394,8 @@ def create_portfolio(db: Session, req) -> dict:
     _create_strategies_two_step(db, p.id, req.strategies)
     db.commit()
     db.refresh(p)
+    pid = p.id
+    _apply_equity_cap_mode(pid, req)
     return serialize_portfolio(db, p)
 
 
@@ -396,6 +413,7 @@ def update_portfolio(db: Session, pid: int, req) -> dict | None:
     _apply_portfolio_fields(p, req)
     db.commit()
     db.refresh(p)
+    _apply_equity_cap_mode(pid, req)
     return serialize_portfolio(db, p)
 
 
@@ -416,6 +434,7 @@ def delete_portfolio(db: Session, pid: int) -> bool:
     )
     db.delete(p)
     db.commit()
+    portfolio_settings.delete_portfolio_settings(pid)
     return True
 
 

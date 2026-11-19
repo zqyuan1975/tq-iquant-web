@@ -83,6 +83,10 @@ class BacktestRequest(BaseModel):
     volume_limit_ratio: float | None = None
     # 容量上限 run 级覆盖（None=用组合默认）：临时封顶 dynamic 仓位资金基座
     equity_cap: float | None = None
+    # 上限处理模式 run 级覆盖（None=跟随组合 JSON 配置）：
+    # cap=只封顶新开仓定量（默认，旧行为）；distribute=日终把超上限部分
+    # 作为外部流出扣出现金（仅回测生效，不强制减仓）
+    equity_cap_mode: str | None = None
     # 日末 peak 保护（默认关）：开启后 peak/max_drawdown 只在当日最后一根 bar 更新，
     # 避免混合周期粗 bar 的周期末 close 污染峰值；纯 1d 行为不变
     daily_close_peak_enabled: bool = False
@@ -515,6 +519,10 @@ def _validate_backtest_request(req: BacktestRequest) -> Optional[str]:
     # 容量上限 run 级覆盖：必须 > 0
     if req.equity_cap is not None and req.equity_cap <= 0:
         return f"equity_cap 必须 > 0（None=不设上限/用组合默认），收到 {req.equity_cap}"
+    # 上限处理模式：None=跟随组合；显式值仅限 cap/distribute
+    if req.equity_cap_mode not in (None, "cap", "distribute"):
+        return (f"equity_cap_mode 仅支持 cap/distribute（None=跟随组合），"
+                f"收到 {req.equity_cap_mode!r}")
     # 日内亏损熔断分母口径 run 级覆盖：None=跟随组合，显式值仅限 equity/initial
     if req.daily_loss_basis is not None and req.daily_loss_basis not in ("equity", "initial"):
         return (f"daily_loss_basis 仅支持 equity/initial（None=跟随组合），"

@@ -695,6 +695,10 @@ class BacktestEngine:
                     portfolio, ca_reinvest, bar, t, trades, recorder)
                 ca_reinvest = []
             if is_day_end:
+                # 4e. equity_cap 复利收口（mode=distribute，默认 cap 无操作）：
+                #     日终把超上限部分作为外部流出扣出现金，先于快照落账。
+                total_value = self._apply_equity_cap_distribution(
+                    portfolio, total_value, t, recorder)
                 snap = portfolio.snapshot(t.date(), total_value, bar)
                 # 填基准值：benchmark_data 是 {date: Decimal}，按当前 bar 日期取值；
                 # 缺失（基准停牌/非交易日/区间外）直接为 None（不做 carry-forward），
@@ -1267,6 +1271,9 @@ class BacktestEngine:
                 snap = None
                 day_strategy_snaps = []
                 if is_day_end:
+                    # 4e. equity_cap 复利收口（mode=distribute，默认 cap 无操作）
+                    total_value = self._apply_equity_cap_distribution(
+                        portfolio, total_value, t, recorder)
                     snap = portfolio.snapshot(t.date(), total_value, bar)
                     snap["benchmark_value"] = (
                         benchmark_data.get(t.date()) if benchmark_data else None)
@@ -1520,6 +1527,50 @@ class BacktestEngine:
             portfolio_id=portfolio.portfolio_id, strategy_id=act.strategy_id,
             stock_code=act.code, bar_time=t, requested_qty=qty, final_qty=applied,
             message="强制了结 %d 股 @ %s（%s）" % (applied, price, act.reason))
+
+    def _apply_equity_cap_distribution(self, portfolio, total_value, t, recorder=None):
+        """equity_cap_mode=distribute：日终把「总资产 − cap」作为外部流出扣出现金。
+
+        只在设了 cap 且 mode=distribute 时生效；cap 模式（默认）直接原值返回，
+        保证「不设 cap / cap 模式」的结果与改动前逐位一致。
+
+        边界：只扣可用现金，不强制减仓——市值本身超过 cap 或现金不足时，按
+        min(超出额, 现金) 出金（最多扣到现金为 0），不产生卖单；出金记一条
+        equity_cap 决策事件便于审计（不新增流水表，按约定押后）。
+        """
+        cap = getattr(portfolio, "equity_cap", None)
+        mode = getattr(portfolio, "equity_cap_mode", "cap") or "cap"
+        if cap is None or mode != "distribute":
+            return total_value
+        excess = Decimal(total_value) - Decimal(cap)
+        if excess <= 0:
+            return total_value
+        cash = portfolio.account.cash
+        withdraw = min(excess, cash)
+        if withdraw <= 0:
+            if recorder is not None and bool(recorder):
+                recorder.record(
+                    gate="equity_cap", layer="capital_gate", action="skip",
+                    portfolio_id=portfolio.portfolio_id,
+                    bar_time=t, param_name="equity_cap",
+                    param_value=float(cap), actual_value=float(total_value),
+                    message=("权益上限：总资产超上限但无可分配现金，"
+                             "存量市值不强制减仓，本日不出金"),
+                )
+            return total_value
+        portfolio.account.cash = cash - withdraw
+        if recorder is not None and bool(recorder):
+            recorder.record(
+                gate="equity_cap", layer="capital_gate", action="distribute",
+                portfolio_id=portfolio.portfolio_id,
+                bar_time=t, param_name="equity_cap",
+                param_value=float(cap), actual_value=float(total_value),
+                message=("权益上限出金：总资产 %s 超上限 %s，"
+                         "现金扣出 %s 作为外部流出"
+                         % (fmt_money(total_value), fmt_money(cap),
+                            fmt_money(withdraw))),
+            )
+        return total_value - withdraw
 
     def _execute_ca_reinvest(self, portfolio, intents, bar, t, trades, recorder):
         """分红再投资：当日收盘价买入整手，不足一手（或现金不够）留现金并记事件。"""

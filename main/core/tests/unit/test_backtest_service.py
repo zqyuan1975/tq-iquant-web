@@ -982,6 +982,27 @@ def test_build_params_snapshot_includes_dividend_mode():
     assert snap2["data_start_date"] == "2015-01-05"
 
 
+def test_build_params_snapshot_includes_equity_cap_mode():
+    """层 2：mode 必须冻结进快照（缺省 cap，老记录无该键即 v1/cap）。"""
+    ps = SimpleNamespace(
+        benchmark_index="000300.SH", initial_capital=Decimal("1000000"),
+        max_drawdown=Decimal("0.2"), daily_loss_limit=Decimal("0.05"),
+        max_holdings=10, min_commission=Decimal("5"),
+        buy_commission_rate=Decimal("0.00025"), sell_commission_rate=Decimal("0.00025"),
+        stamp_duty_rate=Decimal("0.0005"), slippage=Decimal("0"),
+        trading_session="full", stock_pool_id=2,
+    )
+    snap = json.loads(svc.build_params_snapshot(ps, dividend_mode="back"))
+    assert snap["equity_cap_mode"] == "cap"
+    snap2 = json.loads(svc.build_params_snapshot(
+        ps, dividend_mode="back", equity_cap_mode="distribute"))
+    assert snap2["equity_cap_mode"] == "distribute"
+    # 非法值回落 cap，避免脏值落库
+    snap3 = json.loads(svc.build_params_snapshot(
+        ps, dividend_mode="back", equity_cap_mode="bogus"))
+    assert snap3["equity_cap_mode"] == "cap"
+
+
 def test_build_params_snapshot_freezes_strategy_params_and_pool_composition():
     """2026-11-16 P1：策略级参数/池成分/口径版本全部冻进 params_snapshot（纯 JSON）。"""
     ps = SimpleNamespace(
@@ -1927,6 +1948,8 @@ _SNAPSHOT_KEYS = {
     "adaptive_slippage_enabled", "slippage_impact_coef",
     "cash_enhance_enabled", "cash_enhance_equity_threshold",
     "cash_enhance_position_ratio_threshold", "equity_cap",
+    # 层 2（2026-11-19）：上限处理模式（cap 默认 / distribute 日终出金）
+    "equity_cap_mode",
     "fee_reserve_enabled",
     "bond_t0_enabled", "bond_lot_enabled",
     "daily_close_peak_enabled",
