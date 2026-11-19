@@ -288,7 +288,7 @@ def _section(title: str, body: str) -> str:
 
 
 def _cost_capacity_section(detail: dict) -> str:
-    """二、成本与容量：显性成本拖累 / 滑点实现偏差 / 容量与冲击成本。
+    """二、成本与容量：显性成本拖累 / 相对收盘偏离 / 容量与冲击成本。
 
     数据来自详情序列化时的 cost_capacity 块（按 trades + snapshots 现算，
     不新增落库列），因此历史记录同样可直接出报告。
@@ -306,8 +306,8 @@ def _cost_capacity_section(detail: dict) -> str:
         _kpi("成本拖累占比", pct(ex.get("cost_drag_ratio")),
              sub="成本 / 毛利（毛利=净收益+成本）"),
         _kpi("成本 / 成交额", f"{num(ex.get('cost_bps'))} bps", sub="双边换手口径"),
-        _kpi("滑点实现偏差", f"{num(sl.get('realized_deviation_bps'))} bps",
-             sub=f"配置 {num(sl.get('configured_bps'))} bps"),
+        _kpi("相对收盘偏离", f"{num(sl.get('realized_deviation_bps'))} bps",
+             sub="成交价 vs 持仓快照隐含收盘价"),
         _kpi("容量压力", esc(cap.get("pressure_level") or "—"),
              sub=f"最大单笔占净值 {pct(cap.get('max_trade_pct_equity'))}"),
     ]
@@ -327,10 +327,9 @@ def _cost_capacity_section(detail: dict) -> str:
     slip_tbl = _table(
         ["项目", "数值"],
         [
-            ["配置固定滑点", f"{num(sl.get('configured_bps'))} bps"],
-            ["实测实现偏差（买高/卖低为正）", f"{num(sl.get('realized_deviation_bps'))} bps"],
-            ["固定滑点无法解释的部分", f"{num(sl.get('excess_bps'))} bps"],
-            ["对应金额", money(sl.get("excess_cost_amount"))],
+            ["配置固定滑点（已在成交价内扣除）", f"{num(sl.get('configured_bps'))} bps"],
+            ["相对收盘偏离（负=成交价低于参考价）",
+             f"{num(sl.get('realized_deviation_bps'))} bps"],
             ["可匹配成交 / 总成交",
              f"{sl.get('matched_trades') or 0} / {sl.get('trades_count') or 0} 笔"],
         ],
@@ -350,16 +349,16 @@ def _cost_capacity_section(detail: dict) -> str:
     )
     note = (
         '<div class="meta"><div class="gen">'
-        "口径说明：回测未落库行情，滑点实现偏差以「成交价 vs 同日持仓隐含收盘价"
-        "（市值/数量，缺失时取最近快照）」估算，买高/卖低记为正；它与配置固定滑点的"
-        "差额近似市场冲击与择时代价。容量按单笔成交额占当日净值比例衡量，"
+        "口径说明：相对收盘偏离是成交价相对「持仓快照隐含收盘价（市值/数量）」的偏离——"
+        "买入比当日收盘，卖出因当日已清仓回退到前一交易日收盘；负值只表示成交价低于该参考价，"
+        "不代表真实成交质量，配置的滑点仍已在成交价里扣过。容量按单笔成交额占当日净值比例衡量，"
         f"≥{pct(cap.get('large_trade_threshold_pct'))} 记为大额。"
         "</div></div>"
     )
     body = (
         '<div class="kpi-grid">' + "".join(cards) + "</div>"
         + "<h3>2.1 显性成本</h3>" + cost_tbl
-        + "<h3>2.2 滑点实现偏差</h3>" + slip_tbl
+        + "<h3>2.2 相对收盘偏离</h3>" + slip_tbl
         + "<h3>2.3 容量与冲击成本</h3>" + cap_tbl
         + note
     )

@@ -1127,16 +1127,13 @@ const dragView = computed(() => {
   return { ratio, tone, dash: DONUT_C * ratio, offset: DONUT_C * (1 - ratio) }
 })
 
-/** 滑点实测 vs 配置：以 0 为中点的对称刻度，负值落在左侧。 */
+/** 相对收盘偏离：负值只表示成交价低于参考价，不代表真实滑点。 */
 const slippageView = computed(() => {
   const s = costCapacity.value?.slippage
   if (!s) return null
-  const cfg = s.configured_bps ?? 0
   const real = s.realized_deviation_bps ?? 0
-  const domain = Math.max(Math.abs(cfg), Math.abs(real), 1) * 1.35
-  const pos = (v: number) => clampPct(50 + v / domain * 50)
-  const tone = real > cfg + 0.01 ? 'bad' : real < cfg - 0.01 ? 'ok' : 'neutral'
-  return { cfg, real, tone, cfgPos: pos(cfg), realPos: pos(real) }
+  const tone = real > 0.01 ? 'bad' : real < -0.01 ? 'ok' : 'neutral'
+  return { tone }
 })
 
 /** 容量压力：以「大额阈值 ×2」与当前最大单笔占净值的较大值为刻度上限。 */
@@ -5437,7 +5434,7 @@ watch(theme, () => {
       </template>
     </div>
 
-    <!-- K5 成本与容量（详情接口现算：显性成本 / 滑点实现偏差 / 容量与冲击） -->
+    <!-- K5 成本与容量（详情接口现算：显性成本 / 相对收盘偏离 / 容量与冲击） -->
     <div class="ca-section" v-if="costCapacity">
       <div class="section-title ca-header"><span>成本与容量</span></div>
       <div class="metric-grid">
@@ -5481,25 +5478,14 @@ watch(theme, () => {
         </div>
 
         <div class="metric-card" v-if="slippageView">
-          <span class="metric-kicker">滑点实现偏差</span>
+          <span class="metric-kicker">相对收盘偏离</span>
           <div class="metric-headline">
             <span class="metric-value" :class="'metric-tone--' + slippageView.tone">{{ bpsText(costCapacity.slippage.realized_deviation_bps) }}</span>
-            <span class="metric-sub">实测 · 买高/卖低为正</span>
+            <span class="metric-sub">成交价 vs 持仓快照隐含收盘价</span>
           </div>
-          <div class="metric-scale">
-            <div class="metric-scale-track"></div>
-            <div class="metric-scale-zero" style="left: 50%"></div>
-            <div class="metric-scale-mark metric-scale-mark--config" :style="{ left: slippageView.cfgPos + '%' }">
-              <span>配置 {{ bpsText(costCapacity.slippage.configured_bps) }}</span><i></i>
-            </div>
-            <div class="metric-scale-mark metric-scale-mark--realized" :class="'metric-tone--' + slippageView.tone"
-                 :style="{ left: slippageView.realPos + '%' }">
-              <i></i><span>实测 {{ bpsText(costCapacity.slippage.realized_deviation_bps) }}</span>
-            </div>
-          </div>
+          <p class="metric-note">负值=成交价低于该参考价，不代表真实成交质量</p>
           <div class="metric-mini-row">
-            <div><span>固定滑点无法解释</span><b>{{ bpsText(costCapacity.slippage.excess_bps) }}</b></div>
-            <div><span>对应金额</span><b>{{ fmtMoney(costCapacity.slippage.excess_cost_amount) }}</b></div>
+            <div><span>配置滑点（已含在成交价）</span><b>{{ bpsText(costCapacity.slippage.configured_bps) }}</b></div>
             <div><span>可匹配成交 / 总成交</span><b>{{ costCapacity.slippage.matched_trades }} / {{ costCapacity.slippage.trades_count }} 笔</b></div>
           </div>
         </div>
@@ -5584,8 +5570,9 @@ watch(theme, () => {
         </div>
       </div>
       <p class="ca-note">
-        口径：回测未落库行情，滑点实现偏差以「成交价 vs 同日持仓隐含收盘价（市值/数量，
-        缺失时取最近快照）」估算，买高/卖低记为正；与配置固定滑点的差额近似冲击/择时代价。
+        口径：相对收盘偏离是成交价相对「持仓快照隐含收盘价（市值/数量）」的偏离——买入比当日收盘，
+        卖出因当日已清仓回退到前一交易日收盘；负值只表示成交价低于该参考价，不代表真实成交质量，
+        配置的滑点仍已在成交价里扣过、不影响净值。
       </p>
     </div>
 

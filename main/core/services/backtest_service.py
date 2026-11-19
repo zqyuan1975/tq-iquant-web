@@ -3592,13 +3592,14 @@ def _implied_close_prices(snaps: list) -> Dict[str, list]:
 def build_cost_capacity(
     snaps: list, trades: list, params: Optional[dict] = None,
 ) -> Optional[dict]:
-    """K5 成本与容量分析：显性成本拖累 / 滑点实现偏差 / 容量与冲击。
+    """K5 成本与容量分析：显性成本拖累 / 相对收盘偏离 / 容量与冲击。
 
     - 显性成本：佣金 + 印花税 + 过户费（成本拖累占比 = 成本 / 毛利，
       毛利 = 净收益 + 成本；毛利 ≤ 0 时占比无意义，返回 None）
-    - 滑点实现偏差：成交价 vs 同日（缺失时取最近快照）持仓隐含收盘价，
-      买高/卖低记为正（不利）；再与 params 中的固定滑点比较，得到
-      「固定滑点无法解释的部分」，作为市场冲击/择时代价的近似
+    - 相对收盘偏离：成交价 vs「持仓快照隐含收盘价」（市值/数量，缺失时取最近快照）。
+      买卖两侧参考日不同（买入=当日收盘；卖出当日已清仓→回退前一交易日收盘），
+      负值只表示成交价低于参考价，**不是真实滑点**；固定滑点已在成交价里扣过。
+      该口径保留历史字段名 realized_deviation_bps，展示层按「相对收盘偏离」呈现。
     - 容量：单笔成交额占当日净值比例的分位数/大额占比，给出压力等级
 
     无 trades 且无 snapshots 时返回 None（前端/报告整块隐藏）。
@@ -3631,7 +3632,7 @@ def build_cost_capacity(
         total_cost / gross_profit
         if gross_profit is not None and gross_profit > 0 else None)
 
-    # ---- 滑点实现偏差 ----
+    # ---- 相对收盘偏离（展示口径；excess_* 字段仅为兼容保留，不再展示） ----
     implied = _implied_close_prices(snaps)
     deviation_amount = 0.0      # 正 = 对己不利
     matched_amount = 0.0

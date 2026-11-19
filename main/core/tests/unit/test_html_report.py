@@ -590,6 +590,10 @@ def test_cost_capacity_section_renders_numbers():
     assert "12.50 bps" in html
     assert "12 / 50" not in html  # 匹配笔数是 40/50
     assert "40 / 50" in html
+    assert "相对收盘偏离" in html
+    # 误导性口径已移除：不再展示「固定滑点无法解释」与其折算金额
+    assert "固定滑点无法解释" not in html
+    assert "500.00" not in html
     assert "容量压力等级" in html
 
 
