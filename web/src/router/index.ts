@@ -10,7 +10,11 @@ const router = createRouter({
     { path: '/portfolios', name: 'portfolios', component: () => import('../views/Portfolios.vue') },
     { path: '/backtest', name: 'backtest', component: () => import('../views/Backtest.vue') },
     { path: '/backtest/analysis', name: 'backtest-analysis', component: () => import('../views/BacktestAnalysis.vue') },
+    { path: '/incremental', name: 'incremental', component: () => import('../views/IncrementalBacktest.vue') },
     { path: '/live', name: 'live', component: () => import('../views/LiveSessions.vue') },
+    { path: '/health', name: 'health', component: () => import('../views/HealthOverview.vue') },
+    { path: '/events', name: 'events', component: () => import('../views/EventSearch.vue') },
+    { path: '/troubleshooting', name: 'troubleshooting', component: () => import('../views/Troubleshooting.vue') },
     { path: '/system', name: 'system', component: () => import('../views/SystemConfig.vue') },
   ],
 })

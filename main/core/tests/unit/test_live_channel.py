@@ -191,22 +191,38 @@ def test_channel_status_uses_session_engine(monkeypatch):
     assert data["label"].startswith("通达信")
 
 
-def test_channel_no_running_engine_reports_undetected(monkeypatch):
-    """引擎未运行 → online=None + engine_running=False，且不再做客户端探活。
+def test_channel_tdx_no_engine_probes_client_window(monkeypatch):
+    """引擎未运行也要真实探测：tdx 看客户端窗口，不在 → 离线（不默绿）。
 
-    历史缺陷（2026-11-04）：无引擎时 `_probe_channel_online` 另建 dispatcher
-    做 TQ 心跳，只要通达信客户端开着就返回 True，后端重启后工作台仍显示「在线」。
+    探针只做窗口存在性判断，不构造 TdxTqDispatcher（TQ 调用会冻结客户端）。
     """
     monkeypatch.setattr(svc, "load_config", lambda: _cfg(False))
+    monkeypatch.setattr(svc, "_window_present", lambda key: False)
 
     class _Boom:
         def __init__(self, **kw):
-            raise AssertionError("引擎未运行不应构造 dispatcher 探活")
+            raise AssertionError("窗口探针不得构造 dispatcher")
 
     monkeypatch.setattr(svc, "TdxTqDispatcher", _Boom)
+    svc._PROBE_CACHE.clear()
     data = svc.channel_status(engine_key="tdx", engines={})
-    assert data["online"] is None
+    assert data["online"] is False
+    assert data["online_source"] == "probe"
     assert data["engine_running"] is False
+
+
+def test_channel_ths_no_engine_probes_client_window(monkeypatch):
+    """同花顺：xiadan/hexin 窗口在 → 在线；同一套 online 布尔语义。"""
+    monkeypatch.setattr(svc, "load_config", lambda: _cfg(False))
+    monkeypatch.setattr(svc, "_window_present", lambda key: key == "ths")
+    svc._PROBE_CACHE.clear()
+    data = svc.channel_status(engine_key="ths", engines={})
+    assert data["online"] is True
+    assert data["online_source"] == "probe"
+    svc._PROBE_CACHE.clear()
+    monkeypatch.setattr(svc, "_window_present", lambda key: False)
+    data = svc.channel_status(engine_key="ths", engines={})
+    assert data["online"] is False
 
 
 def test_channel_running_engine_reports_real_heartbeat(monkeypatch):
@@ -261,16 +277,117 @@ def test_channel_running_iquant_engine_reports_running(monkeypatch):
     assert data["online"] is True
 
 
-def test_channel_goldminer_no_running_engine_stays_undetected(monkeypatch):
-    """无掘金引擎在跑时保持原语义：engine_running=False、online=None（未检测）。"""
+def test_channel_goldminer_no_running_engine_probes_bridge(monkeypatch):
+    """无掘金引擎在跑时也探 7801 桥：不可达 → 离线（不再有「未检测」第三态）。"""
     import types
 
     monkeypatch.setattr(svc, "load_config", lambda: _cfg(False))
+    seen = {}
+
+    class FakeBridge:
+        def __init__(self, base_url=None, **kw):
+            seen["base_url"] = base_url
+
+        def heartbeat(self):
+            return False
+
+    monkeypatch.setattr(svc, "HttpBridgeDispatcher", FakeBridge)
     tdx = types.SimpleNamespace(
         dispatcher=types.SimpleNamespace(channel="tdx_tq", heartbeat=lambda: True))
+    svc._PROBE_CACHE.clear()
     data = svc.channel_status(engine_key="goldminer", engines={1: tdx})
     assert data["engine_running"] is False
-    assert data["online"] is None
+    assert data["online"] is False
+    assert data["online_source"] == "probe"
+    assert seen["base_url"] == "http://127.0.0.1:7801"
+
+
+def test_channel_iquant_without_engine_probes_production_bridge(monkeypatch):
+    """无运行引擎（会话未启动）时 QMT 仍按常驻桥探活：桥可达 → 在线。
+
+    QMT 桥是常驻 HTTP 服务，可达性与会话是否启动无关；卡片必须真实反映桥
+    是否可达，不能因为「没有引擎」就一律显示未检测。
+    """
+    monkeypatch.setattr(svc, "load_config", lambda: _cfg(False))
+    seen = {}
+
+    class FakeBridge:
+        def __init__(self, base_url=None, **kw):
+            seen["base_url"] = base_url
+
+        def heartbeat(self):
+            return True
+
+    monkeypatch.setattr(svc, "HttpBridgeDispatcher", FakeBridge)
+    svc._PROBE_CACHE.clear()
+    data = svc.channel_status(engine_key="iquant", engines={})
+    assert seen["base_url"] == "http://127.0.0.1:8790"   # 只探生产仿真桥
+    assert data["engine_running"] is False
+    assert data["online"] is True
+    assert data["online_source"] == "probe"
+
+
+def test_channel_iquant_bridge_down_reports_offline_not_green(monkeypatch):
+    """桥没运行 → online=False（离线/异常），绝不默认亮绿，也不退回 None 未检测。"""
+    monkeypatch.setattr(svc, "load_config", lambda: _cfg(False))
+
+    class FakeBridge:
+        def __init__(self, base_url=None, **kw):
+            pass
+
+        def heartbeat(self):
+            return False
+
+    monkeypatch.setattr(svc, "HttpBridgeDispatcher", FakeBridge)
+    svc._PROBE_CACHE.clear()
+    data = svc.channel_status(engine_key="iquant", engines={})
+    assert data["online"] is False
+    assert data["online"] is not None
+    assert data["online_source"] == "probe"
+
+
+def test_channel_iquant_probe_exception_reports_offline(monkeypatch):
+    """探活自身异常（依赖缺失/构造失败）同样判离线，不得抛到页面请求。"""
+    monkeypatch.setattr(svc, "load_config", lambda: _cfg(False))
+
+    class BoomBridge:
+        def __init__(self, **kw):
+            raise OSError("connect failed")
+
+    monkeypatch.setattr(svc, "HttpBridgeDispatcher", BoomBridge)
+    data = svc.channel_status(engine_key="iquant", engines={})
+    assert data["online"] is False
+    assert data["online_source"] == "probe"
+
+
+def test_channel_detail_quant_reports_8790_only(monkeypatch):
+    """QMT 卡片次要信息只报生产 8790 仿真桥；8791 信用腿非生产未启用，不得出现。"""
+    monkeypatch.setattr(svc, "load_config", lambda: _cfg(False))
+    monkeypatch.setattr(svc, "HttpBridgeDispatcher", None)   # 不探活，避免真实网络
+    data = svc.channel_status(engine_key="iquant", engines={})
+    assert "http://127.0.0.1:8790" in data["detail"]
+    assert "8791" not in data["detail"]
+    assert data["configured"] is False   # 依赖缺失 → 未配置
+    assert data["online"] is False       # 探不到 → 离线，不臆造在线
+
+
+def test_channel_detail_present_and_consistent_for_all_four(monkeypatch):
+    """四通道同一套字段：configured 是布尔、detail 非空（端口/账号/窗口）。"""
+    monkeypatch.setattr(
+        svc, "load_config", lambda: _cfg(False, tq_trade={"account": "A1"}))
+    monkeypatch.setattr(svc, "HttpBridgeDispatcher", None)
+    monkeypatch.setattr(svc, "_window_present", lambda key: False)
+    details = {}
+    for key in ("tdx", "ths", "goldminer", "iquant"):
+        data = svc.channel_status(engine_key=key, engines={})
+        assert isinstance(data["configured"], bool)
+        assert data["detail"], key
+        assert isinstance(data["online"], bool)   # 四通道恒为布尔，无第三态
+        details[key] = data["detail"]
+    assert "A1" in details["tdx"]                       # 资金账号
+    assert details["ths"]                               # 窗口标题
+    assert details["goldminer"].startswith("http://")   # 掘金桥地址
+    assert details["iquant"].startswith("HTTP 桥 http://")
 
 
 def test_channel_ignores_engines_of_other_channels(monkeypatch):
@@ -278,11 +395,13 @@ def test_channel_ignores_engines_of_other_channels(monkeypatch):
     import types
 
     monkeypatch.setattr(svc, "load_config", lambda: _cfg(False))
+    monkeypatch.setattr(svc, "_window_present", lambda key: False)
     ths = types.SimpleNamespace(
         dispatcher=types.SimpleNamespace(channel="ths_ui", heartbeat=lambda: True))
+    svc._PROBE_CACHE.clear()
     data = svc.channel_status(engine_key="tdx", engines={7: ths})
     assert data["engine_running"] is False
-    assert data["online"] is None
+    assert data["online"] is False   # 别的通道的引擎不算数，按本通道真实探测判离线
 
 
 def test_channel_status_prefers_engine_state_without_probe(monkeypatch):
@@ -439,10 +558,10 @@ def test_make_dispatcher_iquant_reads_timeouts_from_config(monkeypatch):
     assert seen["slow_threshold"] == 6.0
     assert seen["slow_warn_interval"] == 120.0
 
-    # 未配置 → 默认（本机 loopback 桥：10s 超时 / 5s 慢阈值 / 300s 冷却窗）
+    # 未配置 → 默认（本机 loopback 桥：15s 读超时 / 5s 慢阈值 / 300s 冷却窗）
     monkeypatch.setattr(svc, "load_config", lambda: _cfg(False))
     svc.make_dispatcher("iquant", "simulation")
-    assert seen["timeout"] == 10.0
+    assert seen["timeout"] == 15.0
     assert seen["slow_threshold"] == 5.0
     assert seen["slow_warn_interval"] == 300.0
 
@@ -629,6 +748,39 @@ def test_create_session_empty_signal_file_path_becomes_none(db_session):
     assert row2.signal_file_path is None
 
 
+# ---------------- 14:50 提前收盘价：advance_close_* 会话配置（功能二） ----------------
+
+def test_create_session_persists_advance_close(db_session):
+    """create_session 透传提前收盘价开关/时点；get/list 序列化可见。"""
+    data = svc.create_session(
+        db_session, {"name": "adv", "engine": "tdx",
+                     "advance_close_enabled": True,
+                     "advance_close_time": "14:55"}, "simulation")
+    row = db_session.query(svc.LiveSession).filter_by(id=data["id"]).first()
+    assert row.advance_close_enabled is True
+    assert row.advance_close_time == "14:55"
+    detail = svc.get_session(db_session, data["id"])
+    assert detail["advance_close_enabled"] is True
+    assert detail["advance_close_time"] == "14:55"
+    assert detail["advance_close_done_date"] is None
+    listed = svc.list_sessions(db_session)
+    assert listed[0]["advance_close_enabled"] is True
+
+
+def test_create_session_advance_close_defaults_and_clamp(db_session):
+    """缺省 → 关 + 14:51；时点越界（早于 14:51 / 晚于 14:59）回退 14:51。"""
+    data = svc.create_session(
+        db_session, {"name": "adv2", "engine": "tdx"}, "simulation")
+    row = db_session.query(svc.LiveSession).filter_by(id=data["id"]).first()
+    assert row.advance_close_enabled is False
+    assert row.advance_close_time == "14:51"
+    data2 = svc.create_session(
+        db_session, {"name": "adv3", "engine": "tdx",
+                     "advance_close_time": "09:35"}, "simulation")
+    row2 = db_session.query(svc.LiveSession).filter_by(id=data2["id"]).first()
+    assert row2.advance_close_time == "14:51"
+
+
 # ---------------- A-6：create_session 默认引擎（tq_trade.default_engine 覆盖） ----------------
 
 def test_default_engine_prefers_tq_trade_override(monkeypatch):
@@ -662,6 +814,48 @@ def test_bridge_probe_message_three_tiers():
     assert "应答格式不符" in protocol
     # 未知原因兜底仍给出 URL，不丢上下文
     assert url in svc.bridge_probe_message("goldminer_bridge", "unreachable", url)
+
+
+def test_live_sell_scope_default_platform_only_and_invalid_fallback(monkeypatch):
+    """卖出范围默认口径：缺键/非法 → platform_only（默认关闭，不代卖存量仓）。"""
+    monkeypatch.setattr(svc, "load_config", lambda: _cfg(False))
+    assert svc.live_sell_scope() == "platform_only"
+    monkeypatch.setattr(
+        svc, "load_config", lambda: _cfg(False, tq_trade={"live_sell_scope": ""}))
+    assert svc.live_sell_scope() == "platform_only"
+    monkeypatch.setattr(
+        svc, "load_config", lambda: _cfg(False, tq_trade={"live_sell_scope": "xyz"}))
+    assert svc.live_sell_scope() == "platform_only"
+    monkeypatch.setattr(
+        svc, "load_config",
+        lambda: _cfg(False, tq_trade={"live_sell_scope": "full"}))
+    assert svc.live_sell_scope() == "full"
+    monkeypatch.setattr(
+        svc, "load_config",
+        lambda: _cfg(False, tq_trade={"live_sell_scope": "platform_only"}))
+    assert svc.live_sell_scope() == "platform_only"
+
+
+def test_resolve_session_sell_scope_prefers_session_then_global(monkeypatch):
+    """会话级档位优先：NULL/非法回退全局；会话列有效时不读全局。"""
+    monkeypatch.setattr(
+        svc, "load_config", lambda: _cfg(False, tq_trade={"live_sell_scope": "full"}))
+    # 会话显式 platform_only → 压过全局 full
+    assert svc.resolve_session_sell_scope(
+        SimpleNamespace(sell_scope="platform_only")) == "platform_only"
+    # 会话显式 full → 保持
+    assert svc.resolve_session_sell_scope(
+        SimpleNamespace(sell_scope="full")) == "full"
+    # NULL/空/非法 → 回退全局 full
+    assert svc.resolve_session_sell_scope(
+        SimpleNamespace(sell_scope=None)) == "full"
+    assert svc.resolve_session_sell_scope(
+        SimpleNamespace(sell_scope="xyz")) == "full"
+    # 全局也非法 → 再回退默认 platform_only
+    monkeypatch.setattr(
+        svc, "load_config", lambda: _cfg(False, tq_trade={"live_sell_scope": "bad"}))
+    assert svc.resolve_session_sell_scope(
+        SimpleNamespace(sell_scope=None)) == "platform_only"
 
 
 def test_default_engine_empty_or_invalid_falls_back_to_legacy(monkeypatch):
@@ -737,3 +931,32 @@ def test_make_dispatcher_ths_passes_file_mode_params(monkeypatch):
     assert seen["execute_interval_seconds"] == 5
     assert seen["work_dir"] == "data/ths"
     assert seen["session_id"] == 7
+
+
+def test_position_cost_negative_cost_not_faked_with_price():
+    """B5：柜台成本为负/0（送转分红后常见）→ 成本未知(0)，不得用 市值÷数量 冒充现价。
+
+    旧实现回退成现价：盈亏恒 0、风控形同失效，且成本随价格每轮漂移。
+    """
+    from decimal import Decimal
+    from core.engine.live_engine import _position_cost
+    assert _position_cost({"cost": -475.0, "market_value": 727.0}, 20) == 0
+    assert _position_cost({"cost": 0, "market_value": 727.0}, 20) == 0
+    # 显式给出 cost=None（桥取不到成本属性）语义是「未知」，不是「没这一列」：
+    # 绝不能回退 市值÷股数（=现价冒充成本，盈亏恒 0、成本每轮漂移）
+    assert _position_cost({"cost": None, "market_value": 727.0}, 20) == 0
+    # 字段缺失（旧桥/通道不给 cost）仍保留市值÷股数估值兜底
+    assert _position_cost({"market_value": 727.0}, 20) == Decimal("36.35")
+    assert _position_cost({"cost": 36.43}, 20) == Decimal("36.43")
+
+
+def test_mirror_bridge_clears_stale_cost_when_unknown():
+    """B5：镜面覆盖拿到未知成本时清回 0（未知标记），不留上一轮旧成本。"""
+    from decimal import Decimal
+    from datetime import date
+    from core.engine.position import Position
+    pos = Position("300413.SZ")
+    pos.quantity = 20
+    pos.avg_cost = Decimal("36.43")
+    pos.mirror_bridge(20, 20, Decimal("0"), date(2026, 11, 10))
+    assert pos.avg_cost == 0

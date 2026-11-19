@@ -4,15 +4,21 @@ from typing import List, Optional
 from urllib.parse import quote
 
 from fastapi import APIRouter, Depends, HTTPException
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, Response
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from core.api.response import err, ok
 from core.config import load_config
 from core.db import get_db
-from core.models import PortfolioStrategy
+from core.models import BacktestRecord, PortfolioStrategy
+from core.engine.market_gate import MarketGateUnavailableError
+from core.services import backtest_cancel
 from core.services.html_report import build_html_report
+from core.services.backtest_export import (
+    CSV_KINDS, PdfExportUnavailable, build_csv, html_to_pdf,
+)
+from core.services.signal_replay import replay_signals as _svc_replay_signals
 
 router = APIRouter(prefix="/api/backtest", tags=["backtest"])
 
@@ -83,6 +89,36 @@ class BacktestRequest(BaseModel):
     # 日内亏损熔断分母口径 run 级覆盖（None=跟随组合配置）：
     # equity=上一交易日收盘净值；initial=初始资金（旧口径，阈值恒定）
     daily_loss_basis: str | None = None
+    # 市场多空门控 run 级三态覆盖（None=跟随组合市场门控配置）：
+    # True=强制开启，False=强制关闭；空头状态只禁开仓/加仓，持仓不强平
+    market_gate_enabled: bool | None = None
+    # 执行档位（N1，2026-11-18）：None/legacy=旧成交口径（默认，行为逐字不变）；
+    # realistic=一次性打开「涨跌停校验 + 成交量约束(10%) + 自适应滑点 + 日终抬峰」
+    execution_profile: str | None = None
+    # 执行档位逐开关覆盖（None=跟随档位）：成交量不足时买单单部分成交，残量顺延；
+    # first_bar_no_fill=当日首根 bar 不接受买单（模拟「日线信号次日开盘才可能成交」）
+    partial_fill_enabled: bool | None = None
+    first_bar_no_fill: bool | None = None
+
+
+class MultiBacktestRequest(BaseModel):
+    """N1 多组合共享现金回测（2026-11-18）：≥2 个组合共用同一资金池。
+
+    与单组合回测的区别只在资金审批：共享可用额（Σcash − Σ在途BUY）统一逐笔
+    过 ``cash_allocator``。逐组合仍落独立 ``backtest_records``，另有一个
+    ``backtest_run_groups`` 批记录承载聚合曲线。
+    """
+    portfolio_strategy_ids: List[int]
+    name: str = "多组合回测"
+    start_date: date
+    end_date: date
+    dividend_mode: str = "front"
+    evaluation_profile: str = "absolute"
+    daily_loss_basis: str | None = None
+    market_gate_enabled: bool | None = None
+    execution_profile: str | None = None
+    partial_fill_enabled: bool | None = None
+    first_bar_no_fill: bool | None = None
 
 
 class PoolCompareRequest(BaseModel):
@@ -92,6 +128,20 @@ class PoolCompareRequest(BaseModel):
     end_date: date
     name_prefix: str = "换池对比"
     dividend_mode: str = "dual"
+
+
+class CompareRecordsRequest(BaseModel):
+    """K2 多记录横向对比：2~10 条已完成记录，只读汇总。"""
+    record_ids: List[int]
+
+
+class SignalReplayRequest(BaseModel):
+    """N3 信号回放校验：同组合同区间重算信号，可选与实盘会话委托对照。"""
+    portfolio_strategy_id: int
+    start_date: date
+    end_date: date
+    dividend_mode: str = "front"
+    session_id: int | None = None
 
 
 class WalkForwardRequest(BaseModel):
@@ -134,6 +184,7 @@ from core.services.backtest_service import (  # noqa: E402
     build_klines,
     build_benchmark_data,
     build_signal_cache,
+    DIVIDEND_MODES,
     warmup_counts_by_period,
     _convert_market_data,
     _convert_market_data_multi,
@@ -142,6 +193,7 @@ from core.services.backtest_service import (  # noqa: E402
     _slice_klines_from,
     _MINUTE_PERIODS,
     list_records as _svc_list_records,
+    compare_records as _svc_compare_records,
     get_record_detail as _svc_get_record_detail,
     delete_record as _svc_delete_record,
     run_backtest as _svc_run_backtest,
@@ -153,6 +205,9 @@ from core.services.backtest_service import (  # noqa: E402
     recompute_validation as _svc_recompute_validation,
     recompute_persistence as _svc_recompute_persistence,
     run_pool_comparison as _svc_run_pool_comparison,
+    run_multi_backtest as _svc_run_multi_backtest,
+    list_run_groups as _svc_list_run_groups,
+    get_run_group as _svc_get_run_group,
 )
 from core.services.walk_forward_service import (  # noqa: E402
     run_walk_forward as _svc_run_walk_forward,
@@ -178,6 +233,34 @@ def list_records(db: Session = Depends(get_db)):
     return ok(_svc_list_records(db))
 
 
+@router.post("/records/compare")
+def compare_records(req: CompareRecordsRequest, db: Session = Depends(get_db)):
+    """K2 多记录横向对比（只读）：曲线叠加 + 指标表 + 参数 diff + 成交 diff。
+
+    用 POST 避免与 ``GET /records/{record_id}`` 的路径参数歧义；
+    记录不存在 → 404，条数越界/不足 → 400。
+    """
+    payload, msg = _svc_compare_records(db, req.record_ids)
+    if payload is None:
+        return err(404 if msg and "不存在" in msg else 400, msg)
+    return ok(payload)
+
+
+@router.post("/signal-replay")
+def signal_replay(req: SignalReplayRequest, db: Session = Depends(get_db)):
+    """N3 信号回放校验：重算区间信号，可选与实盘会话委托按 (日期,股票,方向) 对照。
+
+    只读、不落库；组合不存在 → 404，日期区间非法 → 400。
+    """
+    payload, msg = _svc_replay_signals(
+        db, req.portfolio_strategy_id, req.start_date, req.end_date,
+        dividend_mode=req.dividend_mode, session_id=req.session_id,
+    )
+    if payload is None:
+        return err(404 if msg and "不存在" in msg else 400, msg)
+    return ok(payload)
+
+
 @router.get("/records/{record_id}")
 def get_record(record_id: int, profile: Optional[str] = None, db: Session = Depends(get_db)):
     # B6：?profile=absolute|relative 临时切换验收口径查看（不改记录存储口径）
@@ -200,6 +283,25 @@ def delete_record(record_id: int, db: Session = Depends(get_db)):
         status = 409 if (msg and "运行中" in msg) else 404
         return err(status, msg)
     return ok()
+
+
+@router.post("/records/{record_id}/cancel")
+def cancel_record(record_id: int, db: Session = Depends(get_db)):
+    """K1 协作式取消：请求中止正在运行的回测（引擎在下一根 bar 前退出）。
+
+    同步内联执行无法强杀，故只置位取消令牌；记录最终由 service 层标
+    ``canceled`` 并写入进度。多组合回测的任一子记录会中止整批。
+    - 404：记录不存在
+    - 409：记录不在运行中，或不在本进程运行列表（已结束/其它实例执行）
+    """
+    rec = db.get(BacktestRecord, record_id)
+    if rec is None:
+        return err(404, "回测记录不存在")
+    if rec.status != "running":
+        return err(409, "回测不在运行中，无法取消")
+    if not backtest_cancel.cancel(record_id):
+        return err(409, "该回测不在本进程运行列表中（可能已结束），无法取消")
+    return ok({"record_id": record_id, "cancel_requested": True})
 
 
 @router.post("/records/{record_id}/crisis-alpha/recompute")
@@ -297,8 +399,8 @@ def compare_pool_robustness(req: PoolCompareRequest, db: Session = Depends(get_d
         return err(400, f"开始日期不可在未来，收到 {req.start_date}（今天 {today}）")
     if req.end_date > today:
         return err(400, f"结束日期不可在未来，收到 {req.end_date}（今天 {today}）")
-    if req.dividend_mode not in ("front", "back", "dual"):
-        return err(400, f"复权模式仅支持 front/back/dual，收到 {req.dividend_mode!r}")
+    if req.dividend_mode not in DIVIDEND_MODES:
+        return err(400, f"复权模式仅支持 {'/'.join(DIVIDEND_MODES)}，收到 {req.dividend_mode!r}")
 
     if not _try_acquire_slot():
         raise HTTPException(
@@ -335,6 +437,55 @@ def export_record_html(record_id: int, db: Session = Depends(get_db)):
     )
 
 
+_CSV_KIND_LABEL = {"trades": "成交明细", "snapshots": "日快照", "metrics": "指标汇总"}
+
+
+@router.get("/records/{record_id}/export/csv")
+def export_record_csv(
+    record_id: int, kind: str = "trades", db: Session = Depends(get_db),
+):
+    """K6 导出 CSV（kind=trades|snapshots|metrics）。
+
+    与 HTML 导出一致：文件下载例外于统一 envelope，直接返回 text/csv +
+    Content-Disposition；带 UTF-8 BOM，Excel 打开不乱码。
+    """
+    if kind not in CSV_KINDS:
+        return err(400, f"不支持的导出类型：{kind}（可选 {'/'.join(CSV_KINDS)}）")
+    detail = _svc_get_record_detail(db, record_id)
+    if detail is None:
+        return err(404, "回测记录不存在")
+    text = build_csv(detail, kind)
+    rec = detail.get("record") or {}
+    fname = quote(f"回测-{rec.get('name') or record_id}-{_CSV_KIND_LABEL[kind]}.csv")
+    return Response(
+        content=text.encode("utf-8"),
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": f"attachment; filename*=UTF-8''{fname}"},
+    )
+
+
+@router.get("/records/{record_id}/export/pdf")
+def export_record_pdf(record_id: int, db: Session = Depends(get_db)):
+    """K6 导出 PDF：无头浏览器打印离线 HTML 报告（中文字体/图表与在线一致）。
+
+    离线环境无 Edge/Chrome 时返回 503 并提示改用 CSV/HTML（不静默降级）。
+    """
+    detail = _svc_get_record_detail(db, record_id)
+    if detail is None:
+        return err(404, "回测记录不存在")
+    try:
+        pdf = html_to_pdf(build_html_report(detail))
+    except PdfExportUnavailable as exc:
+        return err(503, str(exc))
+    rec = detail.get("record") or {}
+    fname = quote(f"回测报告-{rec.get('name') or record_id}.pdf")
+    return Response(
+        content=pdf,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f"attachment; filename*=UTF-8''{fname}"},
+    )
+
+
 def _validate_backtest_request(req: BacktestRequest) -> Optional[str]:
     """回测请求基础校验，返回错误消息或 None（通过）。
     校验日期区间：start < end，且 start 不在未来（TQ 拉不到未来行情）。
@@ -348,8 +499,8 @@ def _validate_backtest_request(req: BacktestRequest) -> Optional[str]:
         return f"结束日期不可在未来，收到 {req.end_date}（今天 {today}）"
     if not req.name.strip():
         return "回测名称不能为空"
-    if req.dividend_mode not in ("front", "back", "dual"):
-        return f"复权模式仅支持 front/back/dual，收到 {req.dividend_mode!r}"
+    if req.dividend_mode not in DIVIDEND_MODES:
+        return f"复权模式仅支持 {'/'.join(DIVIDEND_MODES)}，收到 {req.dividend_mode!r}"
     if req.evaluation_profile not in ("absolute", "relative"):
         return f"评估口径仅支持 absolute/relative，收到 {req.evaluation_profile!r}"
     # C7：门槛比例须在 [0.1, 2]（<0.1 过松失意义，>2 要求 OOS 两倍于 IS 已失合理性）
@@ -368,6 +519,10 @@ def _validate_backtest_request(req: BacktestRequest) -> Optional[str]:
     if req.daily_loss_basis is not None and req.daily_loss_basis not in ("equity", "initial"):
         return (f"daily_loss_basis 仅支持 equity/initial（None=跟随组合），"
                 f"收到 {req.daily_loss_basis!r}")
+    # 执行档位：None=legacy（旧成交口径）；显式值仅限 legacy/realistic
+    if req.execution_profile not in (None, "", "legacy", "realistic"):
+        return (f"execution_profile 仅支持 legacy/realistic（None=legacy），"
+                f"收到 {req.execution_profile!r}")
     return None
 
 
@@ -397,8 +552,104 @@ def run_backtest(req: BacktestRequest, db: Session = Depends(get_db)):
         )
     try:
         return ok(_svc_run_backtest(db, ps, req))
+    except MarketGateUnavailableError as exc:
+        # 门控基准取数/公式无输出：属可操作的配置/数据问题，明确回 400
+        # （不落 record，service 层在写库前抛出）。其它异常保持 500 语义不变。
+        return err(400, str(exc))
     finally:
         _release_slot()
+
+
+# ---------------------------------------------------------------------------
+# N1 多组合共享现金回测（2026-11-18）
+# ---------------------------------------------------------------------------
+def _validate_multi_request(req: MultiBacktestRequest) -> Optional[str]:
+    """多组合回测请求校验：≥2 个不重复组合 + 日期/口径与单组合同一套规则。"""
+    if len(req.portfolio_strategy_ids) < 2:
+        return "多组合回测至少需要 2 个组合策略"
+    if len(set(req.portfolio_strategy_ids)) != len(req.portfolio_strategy_ids):
+        return "portfolio_strategy_ids 不可重复"
+    if req.start_date >= req.end_date:
+        return f"开始日期必须早于结束日期，收到 {req.start_date} ~ {req.end_date}"
+    today = date.today()
+    if req.start_date > today:
+        return f"开始日期不可在未来，收到 {req.start_date}（今天 {today}）"
+    if req.end_date > today:
+        return f"结束日期不可在未来，收到 {req.end_date}（今天 {today}）"
+    if req.dividend_mode not in DIVIDEND_MODES:
+        return f"复权模式仅支持 {'/'.join(DIVIDEND_MODES)}，收到 {req.dividend_mode!r}"
+    if req.evaluation_profile not in ("absolute", "relative"):
+        return f"评估口径仅支持 absolute/relative，收到 {req.evaluation_profile!r}"
+    if req.daily_loss_basis not in (None, "equity", "initial"):
+        return (f"daily_loss_basis 仅支持 equity/initial（None=跟随组合），"
+                f"收到 {req.daily_loss_basis!r}")
+    if req.execution_profile not in (None, "", "legacy", "realistic"):
+        return (f"execution_profile 仅支持 legacy/realistic（None=legacy），"
+                f"收到 {req.execution_profile!r}")
+    return None
+
+
+@router.post("/run-multi")
+def run_multi_backtest(req: MultiBacktestRequest, db: Session = Depends(get_db)):
+    """多组合共享现金回测（N1）：≥2 个组合共用同一资金池，同步内联执行。
+
+    与 ``POST /api/backtest`` 共用同一个并发槽（同一时刻最多 N 个回测在跑），
+    超限同样返回真实 HTTP 409。
+    """
+    err_msg = _validate_multi_request(req)
+    if err_msg:
+        return err(400, err_msg)
+    portfolios = (
+        db.query(PortfolioStrategy)
+        .filter(PortfolioStrategy.id.in_(req.portfolio_strategy_ids))
+        .all()
+    )
+    found = {p.id for p in portfolios}
+    missing = [pid for pid in req.portfolio_strategy_ids if pid not in found]
+    if missing:
+        return err(404, f"组合策略不存在：{missing}")
+    # 保持请求顺序（资金优先级 = 用户看到的顺序）
+    order = {pid: i for i, pid in enumerate(req.portfolio_strategy_ids)}
+    portfolios.sort(key=lambda p: order.get(p.id, 0))
+
+    if not _try_acquire_slot():
+        raise HTTPException(
+            status_code=409,
+            detail="回测正在进行中，请等待当前回测完成后再启动（已达并发上限）",
+        )
+    try:
+        return ok(_svc_run_multi_backtest(db, portfolios, req))
+    except MarketGateUnavailableError as exc:
+        return err(400, str(exc))
+    except ValueError as exc:
+        # 取不到行情等可操作的数据问题（不落 running 记录）
+        return err(400, str(exc))
+    finally:
+        _release_slot()
+
+
+@router.get("/run-groups")
+def list_run_groups(db: Session = Depends(get_db)):
+    """多组合回测批列表（id 倒序；含 status 与参数快照）。"""
+    return ok(_svc_list_run_groups(db))
+
+
+@router.get("/run-groups/{group_id}")
+def get_run_group(group_id: int, db: Session = Depends(get_db)):
+    """批详情：组信息 + 子记录 + 聚合曲线。"""
+    payload = _svc_get_run_group(db, group_id)
+    if payload is None:
+        return err(404, "多组合回测批不存在")
+    return ok(payload)
+
+
+@router.get("/run-groups/{group_id}/aggregate")
+def get_run_group_aggregate(group_id: int, db: Session = Depends(get_db)):
+    """仅聚合曲线（前端画多组合合计净值用）。"""
+    payload = _svc_get_run_group(db, group_id)
+    if payload is None:
+        return err(404, "多组合回测批不存在")
+    return ok(payload.get("aggregate") or {})
 
 
 # ---------------------------------------------------------------------------
@@ -413,8 +664,8 @@ def _validate_walk_forward_request(req: WalkForwardRequest) -> Optional[str]:
         return f"开始日期不可在未来，收到 {req.start_date}（今天 {today}）"
     if req.end_date > today:
         return f"结束日期不可在未来，收到 {req.end_date}（今天 {today}）"
-    if req.dividend_mode not in ("front", "back", "dual"):
-        return f"复权模式仅支持 front/back/dual，收到 {req.dividend_mode!r}"
+    if req.dividend_mode not in DIVIDEND_MODES:
+        return f"复权模式仅支持 {'/'.join(DIVIDEND_MODES)}，收到 {req.dividend_mode!r}"
     if req.evaluation_profile not in ("absolute", "relative"):
         return f"评估口径仅支持 absolute/relative，收到 {req.evaluation_profile!r}"
     if req.train_years < 1:
@@ -489,8 +740,8 @@ def _validate_param_perturb_request(req: ParamPerturbRequest) -> Optional[str]:
         return f"开始日期不可在未来，收到 {req.start_date}（今天 {today}）"
     if req.end_date > today:
         return f"结束日期不可在未来，收到 {req.end_date}（今天 {today}）"
-    if req.dividend_mode not in ("front", "back", "dual"):
-        return f"复权模式仅支持 front/back/dual，收到 {req.dividend_mode!r}"
+    if req.dividend_mode not in DIVIDEND_MODES:
+        return f"复权模式仅支持 {'/'.join(DIVIDEND_MODES)}，收到 {req.dividend_mode!r}"
     if req.evaluation_profile not in ("absolute", "relative"):
         return f"评估口径仅支持 absolute/relative，收到 {req.evaluation_profile!r}"
     # 扰动幅度上限 50%：再大已不是"微"扰，且 int 参数缩放失真严重

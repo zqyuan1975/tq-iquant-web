@@ -9,7 +9,9 @@ _RANK = {
     "1m": 0, "5m": 1, "15m": 2, "30m": 3, "1h": 4,
     "1d": 5, "1w": 6, "1mon": 7,
 }
-_DEFAULT_AT = {"1d": "14:30", "1w": "09:00", "1mon": "09:00"}
+# 默认推送时点：1d 等收盘价落定后用完整日线（15:05）；1w/1mon 在周期首个交易日
+# 09:00 用上一个完整周期（data_end 默认 completed，不会用未完成周/月 bar）。
+_DEFAULT_AT = {"1d": "15:05", "1w": "09:00", "1mon": "09:00"}
 
 
 def default_signal_at(frequency: str) -> str:

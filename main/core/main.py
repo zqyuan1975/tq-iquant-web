@@ -1,10 +1,13 @@
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import FileResponse, JSONResponse
 from contextlib import asynccontextmanager
 import logging
+import os
 
 from core.db import init_db, SessionLocal
+from core.version import APP_VERSION
 from core.api.stock_pools import router as stock_pools_router
+from core.api.corporate_actions import router as corporate_actions_router
 from core.api.formulas import router as formulas_router
 from core.api.strategies import router as strategies_router
 from core.api.backtest import router as backtest_router
@@ -12,6 +15,8 @@ from core.api.live import router as live_router
 from core.api.system import router as system_router
 from core.api.status import router as status_router
 from core.api.tdx import router as tdx_router
+from core.api.incremental import router as incremental_router
+from core.api.market_gate import router as market_gate_router
 from core.logging_config import setup_logging
 from core.services.backtest_service import (
     recover_stale_running_backtests, recover_stale_running_batch_runs,
@@ -19,8 +24,13 @@ from core.services.backtest_service import (
 from core.services.live_service import (
     ENGINES, recover_stale_running_live_sessions,
 )
-from core.engine.live.engine_watchdog import EngineWatchdog
+from core.engine.live.engine_watchdog import (
+    EngineWatchdog, record_channel_decision,
+)
+from core.services.backup_service import BackupScheduler
+from core.services.incremental_backtest import IncrementalBacktestScheduler
 from core.services.auto_shutdown import arm as arm_auto_shutdown
+from core import runtime
 
 
 logger = logging.getLogger(__name__)
@@ -29,9 +39,20 @@ logger = logging.getLogger(__name__)
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     setup_logging()
+    # 记录本次进程的实际监听端口 / pid / 版本到 data/runtime/server.json：
+    # 打包版端口动态（8888~8898），自愈父进程与第二次双击都靠它找到本实例。
+    runtime.mark_serving(runtime.resolve_bound_port())
     init_db()
-    # 打包版启用自动退出：浏览器标签页全部关闭后自动退出进程，避免残留占用端口
-    if _is_frozen():
+    # L5：启动版本校验（默认关闭）。只读比对 alembic_version 与代码 head，
+    # 不执行任何迁移；开关关闭时无日志、零副作用。
+    try:
+        from core.services import upgrade_service
+        upgrade_service.startup_check()
+    except Exception:  # noqa: BLE001 — 版本校验失败不得阻断启动
+        logger.warning("启动版本校验异常（已忽略）", exc_info=True)
+    # 打包版启用自动退出：浏览器标签页全部关闭后自动退出进程，避免残留占用端口。
+    # 自愈子进程（--serve）必须常驻，不做「关标签页即退出」，否则父进程会反复重启。
+    if _is_frozen() and not runtime.auto_shutdown_suppressed():
         arm_auto_shutdown()
         logger.info("打包模式：已启用自动退出（全部标签页关闭后自动退出）")
     # #5: 清理上次进程崩溃/重启残留的僵尸 running 回测记录（同步内联执行，
@@ -53,23 +74,78 @@ async def lifespan(app: FastAPI):
         n3 = recover_stale_running_live_sessions(db)
         if n3:
             logger.warning("启动恢复：%d 个僵尸 running 实盘会话已置 stopped", n3)
-    # 进程内引擎存活监控（daemon 线程，30s 扫描）：只发现 + 告警（logger/SSE），
-    # 不干预交易。冷启动注册表为空时安全空转；进程本身崩溃时该线程随之消失，
-    # 需外部 watchdog（scripts/ops/watch_live_backend.ps1）兜底。
+        # L1 旧交接目录清理（2026-11-16）：把 ths_ui.work_dir 下非活跃会话的数字
+        # 目录移入 {work_dir}/_archive/<日期>/（空目录删除）。当前 running/stopping
+        # 会话目录与引擎注册表键一律保留（cursor 仍在被消费的目录绝不动）；
+        # 失败只告警，不得阻断启动。
+        try:
+            from core.engine.live.file_handoff import archive_stale_session_dirs
+            from core.services.live_service import ths_ui_config
+            from core.models import LiveSession as _LiveSession
+            active_ids = {
+                row.id for row in db.query(_LiveSession)
+                .filter(_LiveSession.status.in_(("running", "stopping"))).all()
+            } | set(ENGINES.keys())
+            archive_stale_session_dirs(ths_ui_config()["work_dir"], active_ids)
+        except Exception:  # noqa: BLE001 — 清理失败只告警
+            logger.warning("旧交接目录清理失败（忽略，不影响启动）", exc_info=True)
+    # 进程内引擎存活监控（daemon 线程，30s 扫描）：只做「通道停摆 / 轮次卡住」
+    # 的检测与告警（logger / SSE / live_decision_events），**不重启进程**——它随
+    # 进程一起消失，没法救自己。进程级崩溃/无响应的自愈由 `--supervise` 父进程
+    # （core/supervisor.py）负责，两者职责不重叠。
     watchdog = None
     try:
-        watchdog = EngineWatchdog(lambda: ENGINES)
+        # 通道类故障单次判定即落 live_decision_events（gate=channel_offline/
+        # channel_recovered），几分钟闪断也能在库里查到（2026-11-13）。
+        # unregister_fn：DB 已 stopped/stopping 而本进程引擎仍在跑（另一进程
+        # 收到 stop 的错配，2026-11-18 实证）时，自愈把孤儿引擎移出注册表。
+        # 仅异常分支触发；正常 stop 由路由同步置 _running=False，不会走到这里。
+        watchdog = EngineWatchdog(
+            lambda: ENGINES, persist_fn=record_channel_decision,
+            unregister_fn=lambda sid: ENGINES.pop(sid, None))
         watchdog.start()
         logger.info("实盘引擎存活监控已启动（进程内，30s 扫描）")
     except Exception:  # noqa: BLE001 — 监控启动失败不得阻断主服务
         logger.exception("实盘引擎存活监控启动失败（主服务继续运行）")
         watchdog = None
+    # 内嵌数据备份调度（daemon 线程，每日 backup.daily_at 默认 15:10）：
+    # VACUUM INTO 一致性副本 + WAL 收敛；独立线程，不占用事件循环、不碰实盘锁。
+    backup_scheduler = None
+    if os.environ.get("TQ_BACKUP_SCHEDULER_DISABLED") == "1":
+        logger.info("数据备份调度已禁用（TQ_BACKUP_SCHEDULER_DISABLED=1）")
+    else:
+        try:
+            backup_scheduler = BackupScheduler()
+            backup_scheduler.start()
+            logger.info("数据备份调度已启动（进程内，每日定时）")
+        except Exception:  # noqa: BLE001 — 备份调度失败不得阻断交易主服务
+            logger.exception("数据备份调度启动失败（主服务继续运行）")
+            backup_scheduler = None
+    # 接缝续跑增量回测调度（daemon 线程，每日 15:10 续跑 + 每周双跑校验）：
+    # 复用 DailyCloser 15:05 已取到的日线，不进 _BACKTEST_LOCK 队列。
+    incr_scheduler = None
+    if os.environ.get("TQ_INCREMENTAL_SCHEDULER_DISABLED") == "1":
+        logger.info("增量回测调度已禁用（TQ_INCREMENTAL_SCHEDULER_DISABLED=1）")
+    else:
+        try:
+            incr_scheduler = IncrementalBacktestScheduler()
+            incr_scheduler.start()
+            logger.info("增量回测调度已启动（进程内，每日续跑 + 每周双跑校验）")
+        except Exception:  # noqa: BLE001 — 调度失败不得阻断交易主服务
+            logger.exception("增量回测调度启动失败（主服务继续运行）")
+            incr_scheduler = None
     yield
+    if incr_scheduler is not None:
+        incr_scheduler.stop()
+    if backup_scheduler is not None:
+        backup_scheduler.stop()
     if watchdog is not None:
         watchdog.stop()
+    # 正常退出清理 server.json（只删属于本进程的那份）；被强杀时由父进程/下次启动覆盖
+    runtime.mark_stopped()
 
 
-app = FastAPI(title="创懿私募基金量化投资平台", version="1.0.0", lifespan=lifespan)
+app = FastAPI(title="创懿私募基金量化投资平台", version=APP_VERSION, lifespan=lifespan)
 
 app.include_router(stock_pools_router)
 app.include_router(formulas_router)
@@ -79,6 +155,9 @@ app.include_router(live_router)
 app.include_router(system_router)
 app.include_router(status_router)
 app.include_router(tdx_router)
+app.include_router(incremental_router)
+app.include_router(market_gate_router)
+app.include_router(corporate_actions_router)
 
 
 @app.exception_handler(Exception)
@@ -96,9 +175,59 @@ async def uncaught_exception_handler(request: Request, exc: Exception):
     )
 
 
+def _health_payload() -> dict:
+    """``/health`` 与 ``/api/health`` 共用的 JSON 载荷（字段/行为完全一致）。"""
+    payload = runtime.health_payload()
+    try:
+        from core.services import business_health
+
+        if business_health.probe_enabled():
+            payload["business"] = business_health.snapshot()
+    except Exception:  # noqa: BLE001 — 业务探针失败不得让 /health 500
+        logger.warning("业务级心跳采集失败（已忽略）", exc_info=True)
+    return payload
+
+
+def _spa_index_file():
+    """前端 SPA 的 index.html 路径；未构建（dev/测试环境）时返回 None。"""
+    frozen = hasattr(_sys, "frozen") or bool(_sys.argv[0] and _sys.argv[0].endswith(".exe"))
+    base = _Path(_sys.argv[0]).resolve().parent
+    dist = (base / "_internal" / "web" / "dist") if frozen else (
+        _Path(__file__).resolve().parent.parent.parent / "web" / "dist")
+    index = dist / "index.html"
+    return index if index.exists() else None
+
+
 @app.get("/health")
-async def health():
-    return {"ok": True}
+async def health(request: Request):
+    """轻量探活（无鉴权）：版本 / 运行时长 / 实际端口 / pid。
+
+    自愈父进程（``--supervise``）、桌面壳与外部监控都靠它判断后端是否真的在服务；
+    端口动态，以 ``data/runtime/server.json`` 记录的端口为准。
+
+    与前端「健康总览」页同路径（``/health``），按 ``Accept`` 内容协商分流：
+    浏览器地址栏访问（``Accept`` 含 ``text/html``）回退前端 SPA 的 index.html；
+    探针 / curl / 程序调用（``Accept: */*``、``application/json`` 或缺省）仍返回
+    原来的 JSON 探活，响应体、状态码、字段一律不变。稳定的纯 JSON 冗余入口是
+    ``GET /api/health``（两者等价）。
+
+    L6：``health.business_probe_enabled=true`` 时附加 ``business`` 业务心跳
+    （最近 bar / 轮次推进 / watchdog 扫描）；默认关闭时响应体与旧行为逐字一致。
+    """
+    if "text/html" in (request.headers.get("accept") or "").lower():
+        index = _spa_index_file()
+        if index is not None:
+            return FileResponse(index, media_type="text/html")
+    return _health_payload()
+
+
+@app.get("/api/health")
+async def api_health():
+    """纯 JSON 探活（``/health`` 的冗余稳定入口）：字段与 ``/health`` 完全一致。
+
+    供外部监控 / 探针长期引用；不受 ``Accept`` 内容协商影响，永远返回 JSON。
+    """
+    return _health_payload()
 
 
 @app.get("/debug-path")

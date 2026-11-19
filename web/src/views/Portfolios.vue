@@ -8,6 +8,9 @@ import {
   type PortfolioItem, type StockPoolItem, type FormulaItem,
 } from '../api'
 import PageHeader from '../components/PageHeader.vue'
+import FieldLabel from '../components/FieldLabel.vue'
+import { BENCHMARKS, DEFAULT_BENCHMARK } from '../utils/benchmarks'
+import { MARKET_GATE_ENGINES, MARKET_GATE_MODES, MARKET_GATE_VOTE_MODES } from '../utils/marketGate'
 
 // ===== 数据 =====
 const portfolios = ref<PortfolioItem[]>([])
@@ -34,19 +37,12 @@ const strategyForm = ref<Record<string, any>>(emptyStrategyForm())
 
 // ===== 枚举 =====
 // 周期取 TQ 公式支持 ∩ QMT 桥 xtdata 交集（open-questions Q4）+ C6 三段式：
-// 1m/5m/15m/30m/1h 走桥 BarPoller + 边界分发；1d 走 14:30 快照；1w/1mon 走通达信注入。
+// 1m/5m/15m/30m/1h 走桥 BarPoller + 边界分发；1d 走 15:05 收盘落定轮次（B 开启时
+// 14:50 定信号 + 14:52 bar 开盘价报单）；1w/1mon 走通达信注入（仅周期末）。
 // 60m 两端都不认。
 const PERIODS = ['1m', '5m', '15m', '30m', '1h', '1d', '1w', '1mon']
-// 基准指数可选集（TQ 指数日线可取，与回测页基准 guard 同集合；默认沪深300）
-const BENCHMARK_OPTIONS = [
-  { code: '000300.SH', name: '沪深300' },
-  { code: '000905.SH', name: '中证500' },
-  { code: '000852.SH', name: '中证1000' },
-  { code: '000688.SH', name: '科创50' },
-  { code: '399006.SZ', name: '创业板指' },
-  { code: '000001.SH', name: '上证指数' },
-  { code: '399001.SZ', name: '深证成指' },
-]
+// 基准指数可选集（TQ 指数日线可取，与回测页基准 guard 同集合；默认上证指数）
+const BENCHMARK_OPTIONS = BENCHMARKS
 const ROLES = [
   { value: 'independent', label: '独立' },
   { value: 'master', label: '主策略' },
@@ -86,9 +82,11 @@ const RISK_TIMINGS = [
 // 百分比字段集合（后台存小数，前台输入/显示百分比，提交时 ÷100 转回小数）
 const PORTFOLIO_RATIO_FIELDS = new Set([
   'max_drawdown', 'daily_loss_limit',
-  'buy_commission_rate', 'sell_commission_rate', 'stamp_duty_rate', 'slippage',
+  'buy_commission_rate', 'sell_commission_rate', 'stamp_duty_rate', 'transfer_fee_rate', 'slippage',
   'volume_limit_ratio', 'cash_enhance_position_ratio_threshold',
   'slippage_impact_coef',
+  'max_single_position_pct', 'min_cash_reserve_pct',
+  'market_gate_bear_reduce_ratio',
 ])
 const STRATEGY_RATIO_FIELDS = new Set([
   'capital_ratio', 'single_open_ratio',
@@ -102,10 +100,16 @@ const STRATEGY_RATIO_FIELDS = new Set([
 // （开关打开但阈值留空是最常见的自然操作，不能因此保存失败）
 const NULLABLE_NUMERIC_FIELDS = new Set([
   'equity_cap',
+  'max_single_position_pct', 'min_cash_reserve_pct',
   'max_order_amount',
+  // H3 切片增强：笔数/子单最小量/间隔/量占比均可留空，由后端按阈值或成交量推导
+  'split_order_count', 'split_order_min_qty',
+  'split_order_interval_seconds', 'split_order_volume_pct',
   'cash_enhance_equity_threshold', 'cash_enhance_position_ratio_threshold',
   'trend_trailing_stop_ratio', 'trend_max_positions',
-  'signal_weekday',
+  'signal_weekday', 'risk_cooldown_days',
+  'priority',
+  'market_gate_strength_threshold',
 ])
 
 // 表单字段元数据：key/名称/一行几个（≤2 保证不溢出）。分组用于弹窗分区。
@@ -117,44 +121,56 @@ interface FieldMeta {
   placeholder?: string
   options?: string
   hint?: string
-  showIf?: string | { key: string; equals: unknown }
+  showIf?: string | { key: string; equals: unknown } | ((form: Record<string, any>) => boolean)
 }
-const PORTFOLIO_GROUPS: { title: string; fields: FieldMeta[] }[] = [
+const PORTFOLIO_GROUPS: { title: string; hint?: string; fields: FieldMeta[] }[] = [
   { title: '基本信息', fields: [
     { key: 'name', label: '名称', span: 2, type: 'text', placeholder: '例如：稳健组合' },
     { key: 'stock_pool_id', label: '股票池', span: 1, type: 'select', options: 'pools' },
-    { key: 'benchmark_index', label: '基准指数', span: 1, type: 'select', options: 'benchmarks', hint: '用于回测超额与 crisis alpha 对比；TQ 指数日线可取，默认沪深300' },
-    { key: 'initial_capital', label: '初始资金（元）', span: 2, type: 'number' },
+    { key: 'benchmark_index', label: '基准指数', span: 2, type: 'select', options: 'benchmarks', hint: '用于回测超额与 crisis alpha 对比，同时作为市场多空门控判别基准；默认上证指数（000001.SH），通达信可自动下载日线' },
+    { key: 'initial_capital', label: '初始资金（元）', span: 1, type: 'number' },
+    { key: 'priority', label: '下单优先级', span: 1, type: 'number', placeholder: '0', hint: '同一 bar 多组合并发时数值越大越先分配资金并下单；0=默认顺序' },
+    { key: 'trading_session', label: '交易时段', span: 2, type: 'select', options: 'sessions' },
   ]},
   { title: '风控参数', fields: [
     { key: 'max_drawdown', label: '最大回撤', span: 1, type: 'percent', placeholder: '20' },
     { key: 'daily_loss_limit', label: '日亏损限', span: 1, type: 'percent', placeholder: '5' },
-    { key: 'max_holdings', label: '最大持仓数', span: 2, type: 'number', placeholder: '10' },
+    { key: 'max_holdings', label: '最大持仓数', span: 1, type: 'number', placeholder: '10' },
+    { key: 'risk_cooldown_days', label: '风控冷静期（交易日）', span: 2, type: 'number', placeholder: '1', hint: '止损/止盈/移动止损卖出成交后，同一策略同一股票在该天数内禁止新开仓（当日算第 1 天）；0=关闭' },
   ]},
   { title: '交易成本', fields: [
     { key: 'min_commission', label: '最低佣金（元）', span: 1, type: 'number', placeholder: '5' },
     { key: 'buy_commission_rate', label: '买佣金率', span: 1, type: 'percent', placeholder: '0.025' },
     { key: 'sell_commission_rate', label: '卖佣金率', span: 1, type: 'percent', placeholder: '0.025' },
     { key: 'stamp_duty_rate', label: '印花税率', span: 1, type: 'percent', placeholder: '0.05' },
-    { key: 'slippage', label: '滑点', span: 2, type: 'percent', placeholder: '0' },
-  ]},
-  { title: '交易时段', fields: [
-    { key: 'trading_session', label: '交易时段', span: 2, type: 'select', options: 'sessions' },
+    { key: 'transfer_fee_rate', label: '过户费率', span: 1, type: 'percent', placeholder: '0.001', hint: '买卖双向按成交额计收，A 股现行 0.001%' },
+    { key: 'slippage', label: '滑点', span: 1, type: 'percent', placeholder: '0', hint: '按成交额比例的单边滑点成本，0 表示不模拟' },
   ]},
   { title: '执行真实感', fields: [
-    { key: 'price_limit_check_enabled', label: '涨跌停约束', span: 1, type: 'switch', hint: '涨停买不进/跌停卖不出，延后重试' },
+    { key: 'price_limit_check_enabled', label: '涨跌停校验', span: 1, type: 'switch', hint: '默认开启。回测：涨停买不进/跌停卖不出，延后重试；实盘：下单前拦截并落拒单事件（通达信 TQ / 同花顺生效，QMT/掘金桥无前收数据恒放行）' },
     { key: 'volume_limit_enabled', label: '成交量约束', span: 1, type: 'switch', hint: '按 bar 成交量占比封顶' },
-    { key: 'volume_limit_ratio', label: '成交量占比上限', span: 2, type: 'percent', placeholder: '10', showIf: { key: 'volume_limit_enabled', equals: true } },
     { key: 'adaptive_slippage_enabled', label: '自适应滑点', span: 1, type: 'switch', hint: '滑点随订单量占 bar 成交量比例上浮（市场冲击成本）' },
+    { key: 'volume_limit_ratio', label: '成交量占比上限', span: 2, type: 'percent', placeholder: '10', showIf: { key: 'volume_limit_enabled', equals: true } },
     { key: 'slippage_impact_coef', label: '滑点冲击系数', span: 1, type: 'percent', placeholder: '10', showIf: { key: 'adaptive_slippage_enabled', equals: true }, hint: '订单吞掉整根 bar 成交量时冲击 10%，封顶' },
   ]},
   { title: '仓位与现金管理', fields: [
     { key: 'position_sizing', label: '仓位模型', span: 2, type: 'select', options: 'positionSizings', hint: '动态=按组合当前总净值分配资金；固定=按初始资金（旧行为）' },
     { key: 'equity_cap', label: '容量上限（元）', span: 2, type: 'number', placeholder: '不设上限', showIf: { key: 'position_sizing', equals: 'dynamic' }, hint: '动态仓位的资金封顶：净值超上限后仓位不再放大（模拟超容量撤回/封盘），None=不设上限' },
+    { key: 'max_single_position_pct', label: '单票上限', span: 1, type: 'percent', placeholder: '留空=不限制', hint: '按「买入后该票市值 ÷ 组合总资产」判定，留空或 0 表示不限制。仅实盘生效，回测不读。' },
+    { key: 'min_cash_reserve_pct', label: '现金下限', span: 1, type: 'percent', placeholder: '留空=不限制', hint: '按「买入后剩余现金 ÷ 组合总资产」判定，留空或 0 表示不限制。仅实盘生效，回测不读。' },
     { key: 'daily_loss_basis', label: '日内亏损熔断口径', span: 2, type: 'select', options: 'dailyLossBases', hint: '分母：净值=上一交易日收盘净值（默认，5% 阈值随净值滚动）；初始资金=按 initial_capital 固定阈值（旧口径，净值增长后相对变严）' },
     { key: 'cash_enhance_enabled', label: '现金管理增强（预留）', span: 2, type: 'switch', hint: '命中阈值仅记录决策事件，暂不自动下单' },
     { key: 'cash_enhance_equity_threshold', label: '净资产阈值（元）', span: 1, type: 'number', showIf: { key: 'cash_enhance_enabled', equals: true } },
     { key: 'cash_enhance_position_ratio_threshold', label: '仓位占比阈值', span: 1, type: 'percent', placeholder: '30', showIf: { key: 'cash_enhance_enabled', equals: true } },
+  ]},
+  { title: '市场多空门控', hint: '基准指数空头时禁止开仓/加仓，持仓不强平；回测/实盘同口径（同一判别内核）。配置在实盘会话启动时读取一次，运行中修改需停止再启动。', fields: [
+    { key: 'market_gate_enabled', label: '启用门控', span: 2, type: 'switch', hint: '空头状态拦截 OPEN/ADD；CLOSE/REDUCE/止损/止盈/移动止损不受影响；未定状态放行' },
+    { key: 'market_gate_engine', label: '判别引擎', span: 2, type: 'select', options: 'gateEngines', showIf: (f: Record<string, any>) => !!f.market_gate_enabled, hint: 'python=内置公式（回测/实盘均可用）；tdx=通达信客户端公式库（按公式名取状态列）' },
+    { key: 'market_gate_formula_name', label: '通达信公式名', span: 2, type: 'text', placeholder: '留空=TQGATE', showIf: (f: Record<string, any>) => !!f.market_gate_enabled && f.market_gate_engine === 'tdx', hint: '仅判别引擎=通达信时生效，留空使用默认公式名 TQGATE' },
+    { key: 'market_gate_indices', label: '投票指数列表', span: 2, type: 'text', placeholder: '留空=仅基准指数，如 000300.SH,000985.CSI', showIf: (f: Record<string, any>) => !!f.market_gate_enabled, hint: '逗号分隔的指数代码；留空=只用组合基准指数（旧语义）。每个指数独立判 M 状态后按投票模式聚合。' },
+    { key: 'market_gate_vote_mode', label: '投票模式', span: 2, type: 'select', options: 'gateVoteModes', showIf: (f: Record<string, any>) => !!f.market_gate_enabled, hint: '任一空头即拦（默认，与单指数旧语义一致）/ 过半 / 全部空头才拦' },
+    { key: 'market_gate_strength_threshold', label: '空头强度门槛', span: 1, type: 'number', placeholder: '0=不设门槛', showIf: (f: Record<string, any>) => !!f.market_gate_enabled, hint: '只有空头强度 ≥ 该值（0-100）才计入空头票；0=不设门槛' },
+    { key: 'market_gate_bear_reduce_ratio', label: '空头减仓比例', span: 1, type: 'percent', placeholder: '0=关闭', showIf: (f: Record<string, any>) => !!f.market_gate_enabled, hint: '空头连续段内每只持仓按该比例减仓一次（0=只拦开仓，不减仓）' },
   ]},
 ]
 
@@ -191,9 +207,10 @@ const STRATEGY_GROUPS: { title: string; hint?: string; fields: FieldMeta[] }[] =
     { key: 'rotation_hysteresis', label: '轮动滞后', span: 1, type: 'percent', placeholder: '5', showIf: { key: 'rotation_enabled', equals: true } },
     { key: 'trend_trailing_stop_ratio', label: '趋势移动止损', span: 1, type: 'percent', placeholder: '3', showIf: { key: 'regime_filter_enabled', equals: true } },
     { key: 'trend_max_positions', label: '趋势最大持仓', span: 1, type: 'number', placeholder: '5', showIf: { key: 'regime_filter_enabled', equals: true } },
+    { key: 'market_gate_mode', label: '门控覆盖', span: 1, type: 'select', options: 'gateModes', hint: 'inherit=跟随组合（默认）/ off=本策略不受门控 / on=组合未开也强制' },
     { key: 'exposure_cap_enabled', label: '策略级敞口上限', span: 2, type: 'switch', hint: '总持仓市值 ≤ capital_ratio × 初始资金' },
   ]},
-  { title: '实盘预警调度', hint: '实盘预警（alert 半自动）按此调度推送；每日收盘后发信号请设 15:05，次日开盘操作。', fields: [
+  { title: '实盘预警调度（信号推送时机）', hint: '实盘预警（alert 半自动）按此调度推送；每日收盘后发信号请设 15:05，次日开盘操作。注意：本组只管「什么时候推送信号」，不决定信号算出来后什么时候下单（下单时点见下方「执行控制」的风控执行时点）。', fields: [
     { key: 'signal_frequency', label: '信号频率', span: 1, type: 'select', options: 'signalFrequencies' },
     { key: 'signal_at', label: '推送时点', span: 1, type: 'text', placeholder: 'HH:MM，按频率默认（如 15:05）' },
     { key: 'signal_weekday', label: '周几推送', span: 1, type: 'number', placeholder: '1-5（仅 1w，默认周一）' },
@@ -201,11 +218,18 @@ const STRATEGY_GROUPS: { title: string; hint?: string; fields: FieldMeta[] }[] =
   ]},
   { title: '执行控制', hint: '单笔最大金额=回测/实盘双端生效；重下/拆单/风控时点=仅实盘生效（回测忽略）。重下=撤单后有限追价重下；拆单=TDX 大额拆单。', fields: [
     { key: 'max_order_amount', label: '单笔最大金额（元）', span: 1, type: 'number', placeholder: '留空=不限', hint: 'BUY 审批金额超此值缩量到整手股数（回测/实盘双端生效）' },
-    { key: 'requote_enabled', label: '撤单追价重下', span: 1, type: 'switch', hint: '超时撤单成功后剩余量按 1 个最小报价单位追价重下（限次数）' },
-    { key: 'requote_max_attempts', label: '重试次数', span: 1, type: 'number', placeholder: '2', hint: '追价重下次数上限 0-10' },
+    { key: 'requote_enabled', label: '撤单追价重下', span: 1, type: 'switch', hint: '超时撤单成功后剩余量按 1 个最小报价单位追价重下（买 +1 tick / 卖 −1 tick）。仅当引擎按 cancel_unfilled_minutes 主动超时撤单、且该单收敛为 canceled 才触发；GUI 手动撤单、收盘自动撤单不触发' },
+    { key: 'requote_max_attempts', label: '追价重下次数', span: 1, type: 'number', placeholder: '2', hint: '对应 requote_max_attempts（0–10，默认 2）。与「撤单追价重下」是同一套参数的两个字段（开关 + 次数上限），不是「撤单重试次数」' },
+    { key: 'requote_price_mode', label: '追价价源', span: 1, type: 'select', options: 'requotePriceModes', hint: 'tick=固定追 1 个最小变动价（原行为）；adaptive=按最新 1m 收盘价追，但不超过「最大追价档数」' },
+    { key: 'requote_max_slippage_ticks', label: '最大追价档数', span: 1, type: 'number', placeholder: '5', hint: 'adaptive 模式下追价幅度上限（0–100 档）；0 等同 tick 行为' },
     { key: 'split_order_enabled', label: '大额拆单', span: 1, type: 'switch', hint: '单笔金额超阈值时拆单（TDX 通道，批次2 接线）' },
     { key: 'split_order_threshold', label: '拆单阈值（元）', span: 1, type: 'number', placeholder: '500000' },
-    { key: 'risk_timing', label: '风控执行时点', span: 2, type: 'select', options: 'riskTimings', hint: 'next_day=当日信号次日执行（回测对齐）；immediate=当日确认立即执行' },
+    { key: 'split_order_count', label: '切片笔数', span: 1, type: 'number', placeholder: '留空=按阈值推导', hint: '显式指定拆单笔数；留空/0 按「成交额 ÷ 阈值」向上取整' },
+    { key: 'split_order_min_qty', label: '子单最小量（股）', span: 1, type: 'number', placeholder: '留空=不限', hint: '每笔不低于该股数，超过则减少拆单笔数' },
+    { key: 'split_order_interval_seconds', label: '子单间隔（秒）', span: 1, type: 'number', placeholder: '留空=成交驱动立即续发', hint: '成交后额外等待再发下一笔；受主循环 60s 粒度限制' },
+    { key: 'split_order_interval_jitter', label: '间隔随机化', span: 1, type: 'switch', hint: '间隔按 0.5–1.5 倍随机，避免固定节奏被识别' },
+    { key: 'split_order_volume_pct', label: '单笔量占 bar 比例', span: 1, type: 'number', placeholder: '留空=不限', hint: '0–1：单笔不超过最近完成 1m bar 成交量 × 比例；与阈值共同决定笔数（取更大）' },
+    { key: 'risk_timing', label: '风控执行时点', span: 2, type: 'select', options: 'riskTimings', hint: '按子策略生效（不是全局），仅实盘生效、回测不读该键。next_day=次一交易日执行：盘前集合竞价开启时优先在 09:15–09:20（截止 pre_open_auction_end_time）报出，未报成才回落到首根分钟 bar（约 09:31）；immediate=当 bar 即提交。只有 1d/1w/1mon 且 bar_time 为 00:00 的日线信号才进这道闸——分钟周期策略的风控单 signal_bar_date 为空，两种取值没有差别' },
   ]},
 ]
 
@@ -220,10 +244,15 @@ function emptyStrategyForm(): Record<string, any> {
     add_position_ratio: 0.1, reduce_position_ratio: 0.3,
     rotation_enabled: false, rotation_momentum_bars: 20, rotation_hysteresis: 0.05,
     regime_filter_enabled: false, trend_trailing_stop_ratio: null, trend_max_positions: null,
+    market_gate_mode: 'inherit',
     exposure_cap_enabled: false,
     max_order_amount: null,
     requote_enabled: false, requote_max_attempts: 2,
+    requote_price_mode: 'tick', requote_max_slippage_ticks: 5,
     split_order_enabled: false, split_order_threshold: 500000,
+    split_order_count: null, split_order_min_qty: null,
+    split_order_interval_seconds: null, split_order_interval_jitter: false,
+    split_order_volume_pct: null,
     risk_timing: 'next_day',
     signal_frequency: null, signal_at: '', signal_weekday: null, signal_data_end: null,
   }
@@ -231,17 +260,27 @@ function emptyStrategyForm(): Record<string, any> {
 
 function emptyPortfolioForm(): Record<string, any> {
   return {
-    name: '', stock_pool_id: 0, benchmark_index: '000300.SH',
-    initial_capital: 500000, max_drawdown: 0.2, daily_loss_limit: 0.05,
+    name: '', stock_pool_id: 0, benchmark_index: DEFAULT_BENCHMARK,
+    initial_capital: 2000000, max_drawdown: 0.2, daily_loss_limit: 0.05,
     max_holdings: 10,
+    priority: 0,
     min_commission: 5, buy_commission_rate: 0.00025, sell_commission_rate: 0.00025,
-    stamp_duty_rate: 0.0005, slippage: 0,
+    stamp_duty_rate: 0.0005, transfer_fee_rate: 0.00001, slippage: 0.002,
+    risk_cooldown_days: 1,
     trading_session: 'full', status: 'active',
     price_limit_check_enabled: true, volume_limit_enabled: false, volume_limit_ratio: 0.1,
     adaptive_slippage_enabled: false, slippage_impact_coef: 0.1,
     position_sizing: 'dynamic', daily_loss_basis: 'equity', cash_enhance_enabled: false,
     cash_enhance_equity_threshold: null, cash_enhance_position_ratio_threshold: null,
     equity_cap: null,
+    // 单票上限 / 现金下限：默认不限制（null → 输入框留空，提交 null，后端 NULL=不设限）。
+    // 绝不能预填非 0 值——会立刻改变次日实际报单结果。
+    max_single_position_pct: null, min_cash_reserve_pct: null,
+    // 市场多空门控默认关（回测/实盘同口径）
+    market_gate_enabled: false, market_gate_engine: 'python', market_gate_formula_name: '',
+    // E3 门控维度扩展：默认值 = 单指数 / any / 不设门槛 / 不减仓（旧语义）
+    market_gate_indices: '', market_gate_vote_mode: 'any',
+    market_gate_strength_threshold: null, market_gate_bear_reduce_ratio: 0,
     strategies: [],
   }
 }
@@ -329,8 +368,17 @@ function buildPortfolioPayload(): PortfolioRequest {
     out[fld.key] = payloadValue(fld, f)
   }
   out.status = f.status
+  // E3：投票指数列表在表单里是逗号分隔文本，提交转字符串数组（空数组=仅基准指数）
+  if (typeof out.market_gate_indices === 'string') {
+    out.market_gate_indices = (out.market_gate_indices as string)
+      .split(/[,，\s]+/).map(s => s.trim()).filter(Boolean)
+  }
   // equity_cap 容量上限：0 归一为 null（不设上限），后端校验须 >0
   if (out.equity_cap === 0) out.equity_cap = null
+  // 单票上限 / 现金下限：留空或 0 一律归一 null（后端 NULL=不限制）
+  for (const k of ['max_single_position_pct', 'min_cash_reserve_pct'] as const) {
+    if (out[k] === 0 || out[k] === '' || out[k] === undefined) out[k] = null
+  }
   return out as unknown as PortfolioRequest
 }
 
@@ -358,6 +406,34 @@ function num(v: unknown): number | null {
   if (v === '' || v === null || v === undefined) return null
   const n = Number(v)
   return Number.isFinite(n) ? n : null
+}
+
+// 单票上限 / 现金下限：0–100 百分比（留空或 0 = 不限制）。非法值行内提示。
+const portfolioFieldErrors = ref<Record<string, string>>({})
+const OPTIONAL_PCT_LIMITS = [
+  { key: 'max_single_position_pct', label: '单票上限' },
+  { key: 'min_cash_reserve_pct', label: '现金下限' },
+] as const
+
+function validateOptionalPctLimits(): boolean {
+  const errs: Record<string, string> = {}
+  for (const { key, label } of OPTIONAL_PCT_LIMITS) {
+    const raw = portfolioForm.value[key]
+    if (raw === '' || raw === null || raw === undefined) continue
+    const n = Number(raw)
+    if (!Number.isFinite(n) || n < 0 || n > 100) {
+      errs[key] = `${label}需在 0–100 之间（留空或 0 表示不限制）`
+    }
+  }
+  portfolioFieldErrors.value = errs
+  return Object.keys(errs).length === 0
+}
+
+function clearPortfolioFieldError(key: string) {
+  if (!portfolioFieldErrors.value[key]) return
+  const next = { ...portfolioFieldErrors.value }
+  delete next[key]
+  portfolioFieldErrors.value = next
 }
 
 // 可见且必填的数值字段留空 → 明确提示，而不是把 '' 交给后端换回框架级 422
@@ -390,7 +466,8 @@ function validatePortfolioPayload(p: Record<string, unknown>): string | null {
   }
   if ((num(p.min_commission) ?? 0) < 0) return '最低佣金不能为负'
   for (const [k, label] of [['buy_commission_rate', '买入佣金率'], ['sell_commission_rate', '卖出佣金率'],
-                            ['stamp_duty_rate', '印花税率'], ['slippage', '滑点']] as const) {
+                            ['stamp_duty_rate', '印花税率'], ['transfer_fee_rate', '过户费率'],
+                            ['slippage', '滑点']] as const) {
     const n = num(p[k])
     if (n !== null && !(n >= 0 && n <= 0.5)) return `${label} 须在 [0, 0.5]`
   }
@@ -436,11 +513,25 @@ function validateStrategyPayload(p: Record<string, unknown>): string | null {
   if (wd !== null && !(wd >= 1 && wd <= 5)) return '周几推送须为 1-5'
   // 实盘执行（批次1，与后端 _validate_execution_config 同口径）
   const rma = num(p.requote_max_attempts)
-  if (rma !== null && !(rma >= 0 && rma <= 10)) return '重试次数须在 [0,10]'
+  if (rma !== null && !(rma >= 0 && rma <= 10)) return '追价重下次数须在 [0,10]（requote_max_attempts）'
   const moa = num(p.max_order_amount)
   if (moa !== null && moa <= 0) return '单笔最大金额须大于 0'
   const sot = num(p.split_order_threshold)
   if (sot !== null && sot < 0) return '拆单阈值不能为负'
+  // H3/H4：切片与自适应追价（与后端 _validate_execution_config 同口径）
+  const soc = num(p.split_order_count)
+  if (soc !== null && soc < 0) return '切片笔数不能为负'
+  const somq = num(p.split_order_min_qty)
+  if (somq !== null && somq < 0) return '子单最小量不能为负'
+  const soi = num(p.split_order_interval_seconds)
+  if (soi !== null && soi < 0) return '子单间隔不能为负'
+  const sovp = num(p.split_order_volume_pct)
+  if (sovp !== null && !(sovp > 0 && sovp <= 1)) return '单笔量占 bar 比例须在 (0,1]'
+  if (p.requote_price_mode && !['tick', 'adaptive'].includes(String(p.requote_price_mode))) {
+    return '追价价源须为 tick 或 adaptive'
+  }
+  const rms = num(p.requote_max_slippage_ticks)
+  if (rms !== null && !(rms >= 0 && rms <= 100)) return '最大追价档数须在 [0,100]'
   if (p.risk_timing && !['next_day', 'immediate'].includes(String(p.risk_timing))) {
     return '风控执行时点须为 next_day 或 immediate'
   }
@@ -451,6 +542,7 @@ function validateStrategyPayload(p: Record<string, unknown>): string | null {
 function openCreatePortfolio() {
   editingPortfolioId.value = null
   portfolioForm.value = emptyPortfolioForm()
+  portfolioFieldErrors.value = {}
   // 把比例默认值转成百分比显示
   for (const k of PORTFOLIO_RATIO_FIELDS) {
     portfolioForm.value[k] = toPercent(portfolioForm.value[k], true)
@@ -460,6 +552,7 @@ function openCreatePortfolio() {
 
 async function openEditPortfolio(p: PortfolioItem) {
   editingPortfolioId.value = p.id
+  portfolioFieldErrors.value = {}
   let detail: PortfolioItem
   try {
     detail = await getPortfolioDetail(p.id)
@@ -469,14 +562,17 @@ async function openEditPortfolio(p: PortfolioItem) {
   }
   portfolioForm.value = {
     name: detail.name, stock_pool_id: detail.stock_pool_id,
-    benchmark_index: detail.benchmark_index || '000300.SH',
+    benchmark_index: detail.benchmark_index || DEFAULT_BENCHMARK,
     initial_capital: detail.initial_capital, max_drawdown: detail.max_drawdown,
     daily_loss_limit: detail.daily_loss_limit, max_holdings: detail.max_holdings,
+    priority: detail.priority ?? 0,
     min_commission: detail.min_commission ?? 5,
     buy_commission_rate: detail.buy_commission_rate ?? 0.00025,
     sell_commission_rate: detail.sell_commission_rate ?? 0.00025,
     stamp_duty_rate: detail.stamp_duty_rate ?? 0.0005,
+    transfer_fee_rate: detail.transfer_fee_rate ?? 0.00001,
     slippage: detail.slippage ?? 0,
+    risk_cooldown_days: detail.risk_cooldown_days ?? 1,
     trading_session: detail.trading_session, status: detail.status,
     price_limit_check_enabled: detail.price_limit_check_enabled,
     volume_limit_enabled: detail.volume_limit_enabled,
@@ -489,6 +585,15 @@ async function openEditPortfolio(p: PortfolioItem) {
     cash_enhance_equity_threshold: detail.cash_enhance_equity_threshold,
     cash_enhance_position_ratio_threshold: detail.cash_enhance_position_ratio_threshold,
     equity_cap: detail.equity_cap ?? null,
+    max_single_position_pct: detail.max_single_position_pct ?? null,
+    min_cash_reserve_pct: detail.min_cash_reserve_pct ?? null,
+    market_gate_enabled: detail.market_gate_enabled ?? false,
+    market_gate_engine: detail.market_gate_engine || 'python',
+    market_gate_formula_name: detail.market_gate_formula_name || '',
+    market_gate_indices: (detail.market_gate_indices || []).join(','),
+    market_gate_vote_mode: detail.market_gate_vote_mode || 'any',
+    market_gate_strength_threshold: detail.market_gate_strength_threshold ?? null,
+    market_gate_bear_reduce_ratio: detail.market_gate_bear_reduce_ratio ?? 0,
     strategies: [],
   }
   // 比例字段转百分比显示
@@ -509,8 +614,11 @@ function errMsg(e: any): string {
 
 async function submitPortfolio() {
   const payload = buildPortfolioPayload()
+  // 单票上限/现金下限非法值走行内提示；其它门控仍走 alert。任一不通过都不发请求
+  const pctOk = validateOptionalPctLimits()
   const gateMsg = validatePortfolioPayload(payload as unknown as Record<string, unknown>)
   if (gateMsg) { alert(gateMsg); return }
+  if (!pctOk) return
   try {
     if (editingPortfolioId.value === null) {
       await createPortfolio(payload)
@@ -566,12 +674,20 @@ function openEditStrategy(pid: number, s: StrategyDetail) {
     rotation_enabled: s.rotation_enabled, rotation_momentum_bars: s.rotation_momentum_bars,
     rotation_hysteresis: s.rotation_hysteresis, regime_filter_enabled: s.regime_filter_enabled,
     trend_trailing_stop_ratio: s.trend_trailing_stop_ratio, trend_max_positions: s.trend_max_positions,
+    market_gate_mode: s.market_gate_mode || 'inherit',
     exposure_cap_enabled: s.exposure_cap_enabled,
     max_order_amount: s.max_order_amount ?? null,
     requote_enabled: s.requote_enabled ?? false,
     requote_max_attempts: s.requote_max_attempts ?? 2,
+    requote_price_mode: s.requote_price_mode ?? 'tick',
+    requote_max_slippage_ticks: s.requote_max_slippage_ticks ?? 5,
     split_order_enabled: s.split_order_enabled ?? false,
     split_order_threshold: s.split_order_threshold ?? 500000,
+    split_order_count: s.split_order_count ?? null,
+    split_order_min_qty: s.split_order_min_qty ?? null,
+    split_order_interval_seconds: s.split_order_interval_seconds ?? null,
+    split_order_interval_jitter: s.split_order_interval_jitter ?? false,
+    split_order_volume_pct: s.split_order_volume_pct ?? null,
     risk_timing: s.risk_timing ?? 'next_day',
     signal_frequency: s.signal_frequency ?? null,
     signal_at: s.signal_at ?? '',
@@ -626,9 +742,13 @@ async function removeStrategy(pid: number, s: StrategyDetail) {
   loadPortfolios()  // 刷新列表徽章
 }
 
-// 表单字段是否显示（showIf 条件：字符串=按 role 匹配，对象=按布尔/等值匹配）
-function fieldVisible(fld: { showIf?: string | { key: string; equals: unknown } }, form: Record<string, any>): boolean {
+// 表单字段是否显示（showIf 条件：函数=自定义，字符串=按 role 匹配，对象=按布尔/等值匹配）
+function fieldVisible(
+  fld: { showIf?: string | { key: string; equals: unknown } | ((form: Record<string, any>) => boolean) },
+  form: Record<string, any>,
+): boolean {
   if (!fld.showIf) return true
+  if (typeof fld.showIf === 'function') return !!fld.showIf(form)
   if (typeof fld.showIf === 'string') return form.role === fld.showIf
   return form[fld.showIf.key] === fld.showIf.equals
 }
@@ -650,6 +770,13 @@ function optionsOf(src: string | undefined, pid?: number) {
   if (src === 'positionSizings') return POSITION_SIZINGS.map(s => ({ value: s.value, label: s.label }))
   if (src === 'dailyLossBases') return DAILY_LOSS_BASES.map(s => ({ value: s.value, label: s.label }))
   if (src === 'riskTimings') return RISK_TIMINGS.map(t => ({ value: t.value, label: t.label }))
+  if (src === 'requotePriceModes') return [
+    { value: 'tick', label: '固定 1 档（原行为）' },
+    { value: 'adaptive', label: '按最新价自适应（受最大档数限制）' },
+  ]
+  if (src === 'gateEngines') return MARKET_GATE_ENGINES.map(e => ({ value: e.value, label: e.label }))
+  if (src === 'gateVoteModes') return MARKET_GATE_VOTE_MODES.map(e => ({ value: e.value, label: e.label }))
+  if (src === 'gateModes') return MARKET_GATE_MODES.map(e => ({ value: e.value, label: e.label }))
   if (src === 'signalFrequencies') return [
     { value: null, label: '跟随周期（period）' },
     ...SIGNAL_FREQUENCIES.map(f => ({ value: f, label: f })),
@@ -740,7 +867,7 @@ onMounted(loadPortfolios)
     </div>
 
     <!-- ============ 组合编辑 Modal ============ -->
-    <div v-if="showPortfolioForm" class="modal-overlay modal-lg" @click.self="showPortfolioForm = false">
+    <div v-if="showPortfolioForm" class="modal-overlay modal-lg modal-dense modal-dense--3col" @click.self="showPortfolioForm = false">
       <div class="modal-content">
         <div style="display:flex;align-items:center;justify-content:space-between;gap:8px">
           <h3 style="margin:0">{{ editingPortfolioId === null ? '新建组合' : '编辑组合' }}</h3>
@@ -749,14 +876,15 @@ onMounted(loadPortfolios)
 
         <div class="modal-body">
           <div v-for="g in PORTFOLIO_GROUPS" :key="g.title">
-            <label class="group-label">{{ g.title }}</label>
+            <label class="group-label">{{ g.title }}<span v-if="g.hint" class="group-hint">{{ g.hint }}</span></label>
             <div class="field-grid">
               <div
                 v-for="fld in g.fields" :key="fld.key"
                 v-show="fieldVisible(fld, portfolioForm)"
-                class="field-row" :class="fld.span === 2 ? 'field-span-2' : ''"
+                class="field-row"
+                :class="[fld.span === 2 ? 'field-span-2' : '', ((fld.type === 'percent' && fld.hint) || portfolioFieldErrors[fld.key]) ? 'field-row--hinted' : '']"
               >
-                <span class="field-label">{{ fld.label }}</span>
+                <FieldLabel :text="fld.label" />
                 <label v-if="fld.type === 'switch'" class="switch-row">
                   <input type="checkbox" :data-field="fld.key" v-model="portfolioForm[fld.key]" />
                   <span v-if="fld.hint" class="field-hint">{{ fld.hint }}</span>
@@ -767,11 +895,14 @@ onMounted(loadPortfolios)
                   :data-field="fld.key"
                   v-model="portfolioForm[fld.key]"
                   :placeholder="fld.placeholder"
+                  @input="clearPortfolioFieldError(fld.key)"
                 />
-                <select v-else :data-field="fld.key" v-model="portfolioForm[fld.key]">
+                <select v-else class="field-select" :data-field="fld.key" v-model="portfolioForm[fld.key]">
                   <option v-for="o in optionsOf(fld.options)" :key="o.value ?? 'null'" :value="o.value">{{ o.label }}</option>
                 </select>
                 <span v-if="fld.type === 'percent'" class="field-suffix">%</span>
+                <span v-if="fld.type === 'percent' && fld.hint" class="field-hint field-hint--below">{{ fld.hint }}</span>
+                <span v-if="portfolioFieldErrors[fld.key]" class="field-error" data-test="portfolio-field-error">{{ portfolioFieldErrors[fld.key] }}</span>
               </div>
             </div>
           </div>
@@ -822,8 +953,8 @@ onMounted(loadPortfolios)
                       <td>动态=按当前净值分配资金（复利）；固定=按初始资金（保守）。</td></tr>
                   <tr><td>容量上限</td><td>仓位与现金管理</td><td>不设上限</td>
                       <td>动态仓位的资金封顶；净值超上限后仓位不再放大（模拟超容量撤回/封盘）。</td></tr>
-                  <tr><td>涨跌停约束</td><td>执行真实感</td><td>开</td>
-                      <td>涨停买不进/跌停卖不出，延后重试。</td></tr>
+                  <tr><td>涨跌停校验</td><td>执行真实感</td><td>开</td>
+                      <td>默认开启。回测：涨停买不进/跌停卖不出，延后重试；实盘：下单前拦截（拒单 + 决策事件），仅通达信 TQ / 同花顺通道可校验，QMT/掘金桥无前收数据恒放行。</td></tr>
                   <tr><td>成交量约束</td><td>执行真实感</td><td>关</td>
                       <td>单笔成交 ≤ 当日成交量 × 占比，超限缩量或延后。</td></tr>
                   <tr><td>自适应滑点</td><td>执行真实感</td><td>关</td>
@@ -867,6 +998,24 @@ onMounted(loadPortfolios)
               <p class="guide-note">· 动态仓位下建议先用「回归验证」（walk-forward）做样本外检验，再决定是否实盘。</p>
             </div>
           </div>
+          <div class="form-group">
+            <label class="group-label">五、本轮新增组合级开关（2026-11-18，默认关闭）</label>
+            <div class="guide-block">
+              <p class="guide-step"><b>下单优先级 priority</b>：默认 0。同一 bar 多组合并发时数值越大越先分配资金并下单；
+                0＝按默认顺序。改后<b>需重启实盘会话</b>。</p>
+              <p class="guide-step"><b>门控多指数投票</b>：market_gate_indices 默认空（只用基准指数）；vote_mode=any
+                （任一空头即拦，旧语义）/ majority / all；strength_threshold=0（不设空头强度门槛）；
+                bear_reduce_ratio=0（空头只拦开仓、不减仓）。改后<b>需重启实盘会话</b>。</p>
+              <p class="guide-step"><b>熔断动作 breaker_action</b>：默认 halt（只停开仓，不减仓、不通知）；
+                notify=仅通知、half=减半仓、liquidate=清仓，均为显式选择，改后<b>需重启实盘会话</b>。</p>
+              <p class="guide-step"><b>公司行为 / 时点股票池</b>：corporate_actions_enabled、
+                dividend_reinvest_enabled、suspension_dispose_days、delist_force_close_enabled、pool_pit_enabled
+                均默认 0；关闭＝不应用公司行为、不处置长期停牌/退市（退市只记 notice）、按静态股票池判定。
+                改后<b>需重启实盘会话</b>（回测按次生效）。</p>
+              <p class="guide-note">· 资金池模式（capital_pool_mode=off、capital_pool_rebalance_enabled=0）
+                属于会话级开关，见实盘页「配置指南」；组合级不重复配置。</p>
+            </div>
+          </div>
         </div>
         <div class="modal-actions">
           <button @click="showGuide = false" class="btn btn-primary">知道了</button>
@@ -875,7 +1024,7 @@ onMounted(loadPortfolios)
     </div>
 
     <!-- ============ 子策略编辑 Modal ============ -->
-    <div v-if="showStrategyForm" class="modal-overlay modal-lg" @click.self="showStrategyForm = false">
+    <div v-if="showStrategyForm" class="modal-overlay modal-lg modal-dense" @click.self="showStrategyForm = false">
       <div class="modal-content">
         <div style="display:flex;align-items:center;justify-content:space-between;gap:8px">
           <h3 style="margin:0">{{ editingStrategyId === null ? '新建子策略' : '编辑子策略' }}</h3>
@@ -891,7 +1040,7 @@ onMounted(loadPortfolios)
                 v-show="fieldVisible(fld, strategyForm)"
                 class="field-row" :class="fld.span === 2 ? 'field-span-2' : ''"
               >
-                <span class="field-label">{{ fld.label }}</span>
+                <FieldLabel :text="fld.label" />
                 <label v-if="fld.type === 'switch'" class="switch-row">
                   <input type="checkbox" :data-field="fld.key" v-model="strategyForm[fld.key]" />
                   <span v-if="fld.hint" class="field-hint">{{ fld.hint }}</span>
@@ -903,7 +1052,7 @@ onMounted(loadPortfolios)
                   v-model="strategyForm[fld.key]"
                   :placeholder="fld.placeholder"
                 />
-                <select v-else :data-field="fld.key" v-model="strategyForm[fld.key]">
+                <select v-else class="field-select" :data-field="fld.key" v-model="strategyForm[fld.key]">
                   <option v-for="o in optionsOf(fld.options, strategyPortfolioId!)" :key="o.value ?? 'null'" :value="o.value">{{ o.label }}</option>
                 </select>
                 <span v-if="fld.type === 'percent'" class="field-suffix">%</span>
@@ -974,4 +1123,13 @@ onMounted(loadPortfolios)
 
 <style scoped>
 .group-hint { margin-left: 8px; font-size: 11px; font-weight: 400; color: var(--ink-faint); }
+/* 带说明/行内错误的字段：说明与错误各占一行，避免挤占输入框宽度 */
+.field-row--hinted { flex-wrap: wrap; }
+.field-hint--below { flex: 1 0 100%; margin-top: -2px; }
+.field-error { flex: 1 0 100%; font-size: 11px; color: var(--red); line-height: 1.3; }
+/* 小屏：子策略行内容与操作按钮换行，避免按钮被行内长文本挤出可视区 */
+@media (max-width: 1100px) {
+  .sub-strategy-row { flex-wrap: wrap; row-gap: 4px; }
+  .sub-strategy-actions { margin-left: 0; width: 100%; justify-content: flex-end; }
+}
 </style>

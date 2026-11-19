@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest'
 import { mount, flushPromises } from '@vue/test-utils'
 import { h, ref, watch, onMounted, nextTick } from 'vue'
-import { useTheme, resetTheme } from '../composables/useTheme'
+import { useTheme, resetTheme, initTheme } from '../composables/useTheme'
 
 const mockDispose = vi.fn()
 const mockSetOption = vi.fn()
@@ -40,6 +40,34 @@ describe('useTheme', () => {
   })
 
   it('applies data-theme to documentElement', () => {
+    const { toggle } = useTheme()
+    toggle()
+    expect(document.documentElement.dataset.theme).toBe('dark')
+    toggle()
+    expect(document.documentElement.dataset.theme).toBe('light')
+  })
+
+  it('首次初始化不写 localStorage（不把默认值固化成用户选择）', () => {
+    initTheme()
+    expect(localStorage.getItem('theme')).toBeNull()
+  })
+
+  it('以真实渲染值为基准翻转：DOM 被外部改动后一次点击即可见变化', () => {
+    const { theme, toggle } = useTheme()
+    expect(theme.value).toBe('light')
+    // 模拟状态与界面脱节：DOM 已是 dark，ref 仍是 light
+    document.documentElement.dataset.theme = 'dark'
+    toggle()
+    expect(document.documentElement.dataset.theme).toBe('light')
+    expect(theme.value).toBe('light')
+  })
+
+  it('承载 useTheme 的组件卸载后仍能切换（watcher 不随组件作用域失效）', async () => {
+    const Demo = { setup() { useTheme(); return () => h('div') } }
+    const w = mount(Demo)
+    await flushPromises()
+    w.unmount()
+
     const { toggle } = useTheme()
     toggle()
     expect(document.documentElement.dataset.theme).toBe('dark')

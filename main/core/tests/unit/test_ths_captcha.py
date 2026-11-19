@@ -47,7 +47,9 @@ def test_clamp_qty_sell_no_lot_floor():
     assert ThsUiDispatcher._clamp_qty(500, 350, "600000.SH", False) == 350
 
 
-# ---- 验证码输入框清空方式：WM_SETTEXT 直写，禁用 ^a（字面 a 漏入首位）----
+# ---- 验证码键入方式：必须走真实键盘事件（type_keys），不得用 set_edit_text ----
+# 2026-11-06 真机实证：验证码弹窗 Edit 是自绘控件，set_edit_text（WM_SETTEXT）
+# 不抛异常但输入框保持空白，确定按钮拿不到验证码 → 必须逐字符真实按键。
 
 from types import SimpleNamespace
 
@@ -64,11 +66,15 @@ class _FakeBtn:
 
 
 def _mk_captcha_env(monkeypatch, ocr_code="1234"):
-    """构造验证码弹窗环境：返回 (dispatcher, edit, dlg, ok_btn)。"""
+    """构造验证码弹窗环境：返回 (dispatcher, edit, dlg, ok_btn)。
+
+    `_find_captcha_dialog` 默认返回 None（视为提交后弹窗已消失）；
+    用例按实现的「每轮重新定位弹窗」调用顺序自行编排返回值。
+    """
     d = ThsUiDispatcher(captcha_ocr=True, execute_mode="direct")
     edit = SimpleNamespace(
-        click=lambda: None,
-        type_keys=lambda k, **kw: edit.keys.append(k),
+        set_focus=lambda: None,
+        type_keys=lambda k, pause=0.0: edit.keys.append(k),
         set_edit_text=lambda t: edit.sets.append(t),
         keys=[], sets=[],
     )
@@ -84,54 +90,60 @@ def _mk_captcha_env(monkeypatch, ocr_code="1234"):
 
     monkeypatch.setattr(d, "_captcha_crop", lambda dlg_, edit_, rect: crop)
     monkeypatch.setattr(d, "_ocr_digits", lambda img: ocr_code)
-    monkeypatch.setattr(d, "_get_ocr_engine", lambda: object())
-    state = {"n": 0}
-
-    def _find():
-        state["n"] += 1
-        return dlg if state["n"] == 1 else None  # 提交后弹窗消失
-    monkeypatch.setattr(d, "_find_captcha_dialog", _find)
+    monkeypatch.setattr(d, "_find_captcha_dialog", lambda: None)  # 提交即消失
     monkeypatch.setattr(
         "core.engine.ths_ui_dispatcher.ImageGrab",
         SimpleNamespace(grab=lambda bbox=None: crop))
     return d, edit, dlg, ok_btn
 
 
-def test_solve_captcha_uses_sendinput_not_set_edit_text(monkeypatch):
-    """清空+写入必须走真实键盘事件（SendInput）；WM_SETTEXT 对自绘 Edit 无效。"""
-    d, edit, dlg, ok_btn = _mk_captcha_env(monkeypatch)
-    assert d._solve_captcha(dlg) is True
-    assert edit.sets == []
-    assert edit.keys[0] == "^a{DELETE}"
-    assert "".join(edit.keys[1:]) == "1234"
-
-
-def test_solve_captcha_retry_uses_sendinput(monkeypatch):
-    """首错后验证码刷新 → 重试同样走真实键盘事件，不使用 set_edit_text。"""
+def test_solve_captcha_types_code_with_type_keys(monkeypatch):
+    """清空+写入必须走真实按键：set_edit_text 对自绘 Edit 无效（真机实证输入框
+    保持空白），实现改为先清空、再逐字符 type_keys。"""
     d, edit, dlg, ok_btn = _mk_captcha_env(monkeypatch)
     state = {"n": 0}
 
     def _find():
         state["n"] += 1
-        return dlg if state["n"] == 1 else None   # 第一次提交后仍在 → 重试
+        return dlg if state["n"] == 1 else None   # 定位到弹窗，提交后消失
+    monkeypatch.setattr(d, "_find_captcha_dialog", _find)
+    assert d._solve_captcha(dlg) is True
+    assert edit.sets == []                       # 不走 WM_SETTEXT（set_edit_text）
+    assert edit.keys == ["^a{DELETE}", "1", "2", "3", "4"]   # 清空 + 逐字符键入
+
+
+def test_solve_captcha_retry_retypes_code(monkeypatch):
+    """首错后验证码刷新 → 重试轮重新定位弹窗并重新键入（仍走 type_keys）。"""
+    d, edit, dlg, ok_btn = _mk_captcha_env(monkeypatch)
+    state = {"n": 0}
+
+    def _find():
+        state["n"] += 1
+        return dlg if state["n"] <= 3 else None   # 第一次提交后仍在 → 重试
     monkeypatch.setattr(d, "_find_captcha_dialog", _find)
     assert d._solve_captcha(dlg) is True
     assert edit.sets == []
-    assert "".join(edit.keys) == "^a{DELETE}1234"
+    assert edit.keys == ["^a{DELETE}", "1", "2", "3", "4"] * 2
 
 
 # ---- TDX「下单确认」弹窗自动点击（无人值守）----
 
-def test_tdx_pick_confirm_dialog_selects_new_dialog():
-    """只挑「新增的、含确认按钮的」#32770 弹窗；基线内/无关窗口跳过。"""
+def test_tdx_pick_confirm_dialog_selects_new_dialog(monkeypatch):
+    """只挑「新增的、含确认按钮的、属主为通达信」的 #32770 弹窗；
+    基线内/无关窗口跳过。"""
     from types import SimpleNamespace
     from core.engine.tdx_tq_dispatcher import TdxTqDispatcher
+    from core.engine.live import win_dialog_scope as wds
+
+    # 归属判定统一 fail-closed：显式声明这些弹窗属主为通达信进程
+    monkeypatch.setattr(wds, "window_image_name", lambda pid: "tdxw.exe")
 
     def mk(hwnd, btn_text=None, cls="#32770", visible=True):
         btns = [SimpleNamespace(window_text=lambda t=btn_text: t)] if btn_text else []
         return SimpleNamespace(
             handle=hwnd, class_name=lambda c=cls: c,
             is_visible=lambda: visible,
+            process_id=lambda: 100,
             descendants=lambda class_name=None: btns)
 
     base = mk(1, "设置")           # 基线内 → 跳过
@@ -162,7 +174,8 @@ def test_dialog_matches_channel_by_image_name(monkeypatch):
     assert wds.dialog_matches_channel(mk(200), "ths") is True      # 同花顺
     assert wds.dialog_matches_channel(mk(200), "tdx") is False
     assert wds.dialog_matches_channel(mk(300), "tdx") is False     # 无关进程
-    assert wds.dialog_matches_channel(mk(400), "tdx") is True      # PID 读取失败 → fail-open
+    # 2026-11-09 统一为 fail-closed：归属读不出就不点（与主路径 tdxw.exe 严格过滤一致）
+    assert wds.dialog_matches_channel(mk(400), "tdx") is False     # 映像名读不出 → 不放行
     assert wds.dialog_matches_channel(mk(200), "iquant") is True   # 未知通道 → 不过滤
 
 

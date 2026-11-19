@@ -23,14 +23,17 @@ class Account:
         # 启用后 approve_order 按「价×量 + 佣金」口径审批，避免 apply_trade
         # 扣佣金后现金为负。仅买入方向需要预留（卖出费用从卖出款内扣，不会负）。
         self.buy_fee_cfg: Optional[tuple] = None
+        # 过户费率（双向）：仅费用预留启用时参与 _buy_needed（与成交计费同口径）
+        self.buy_transfer_fee_rate: Decimal = Decimal("0")
 
     def _buy_needed(self, quantity: int, price: Decimal) -> Decimal:
-        """买入所需资金：默认 价×量；启用费用预留时含佣金 max(最低佣金, 金额×费率)。"""
+        """买入所需资金：默认 价×量；启用费用预留时含佣金+过户费（2026-11-11）。"""
         amount = price * quantity
         if self.buy_fee_cfg is None:
             return amount
         min_commission, buy_rate = self.buy_fee_cfg
-        return amount + max(min_commission, amount * buy_rate)
+        return (amount + max(min_commission, amount * buy_rate)
+                + amount * self.buy_transfer_fee_rate)
 
     @property
     def market_value(self) -> Decimal:
@@ -108,11 +111,13 @@ class Account:
         self.cash += amount
 
     def apply_trade(self, trade: TradeEvent) -> None:
-        """成交后更新现金：买扣（金额+佣金+印花税），卖加（金额-佣金-印花税）。"""
+        """成交后更新现金：买扣（金额+佣金+印花税+过户费），卖加（金额-各项费用）。"""
+        fees = (trade.commission + trade.stamp_duty
+                + getattr(trade, "transfer_fee", Decimal("0")))
         if trade.trade_type == TradeType.BUY:
-            self.deduct_cash(trade.amount + trade.commission + trade.stamp_duty)
+            self.deduct_cash(trade.amount + fees)
         else:
-            self.add_cash(trade.amount - trade.commission - trade.stamp_duty)
+            self.add_cash(trade.amount - fees)
 
     def apply_reverse(self, trade: TradeEvent) -> None:
         """反向修正（切片5 G6）：撤回已 apply_trade 的成交（拒单/撤单）。
@@ -122,6 +127,8 @@ class Account:
         仅在已 apply_trade 且后来确认未成/撤单时调用；submitted 阶段未 apply，无需调用。
         """
         if trade.trade_type == TradeType.BUY:
-            self.add_cash(trade.amount + trade.commission + trade.stamp_duty)
+            self.add_cash(trade.amount + trade.commission + trade.stamp_duty
+                          + getattr(trade, "transfer_fee", Decimal("0")))
         else:
-            self.deduct_cash(trade.amount - trade.commission - trade.stamp_duty)
+            self.deduct_cash(trade.amount - trade.commission - trade.stamp_duty
+                             - getattr(trade, "transfer_fee", Decimal("0")))

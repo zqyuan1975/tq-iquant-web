@@ -198,6 +198,9 @@ class SignalMonitor:
             "actual_value": None,
             "requested_qty": None,
             "final_qty": None,
-            "message": message[:200],
+            # 500 字符上限（原 200）：这是 SSE-only 事件（不落库），TQ 公式异常
+            # 的尾段常带具体变量/行号，200 会切掉真正可定位的信息；代码/公式名
+            # 已在 param_name 里，不依赖 message。
+            "message": (message or "")[:500],
             "bar_time": None,
         })

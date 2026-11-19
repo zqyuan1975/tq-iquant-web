@@ -90,7 +90,9 @@ class ExternalSignalFileSource:
         # 信号写入文件，游标把启动前存量（含窗口内近端补齐行）全部挡掉，
         # 只消费启动后新触发的信号。
         self._last_read_time: datetime = self._clock()
-        self._seen_codes: Set[str] = set()  # 本日已处理代码（防重复）
+        # 文件缺失告警去重：只在「存在 → 缺失」状态跳变时打一条 WARNING，
+        # 避免每 60s tick 刷屏，同时让填错路径可见（不再静默当无信号）。
+        self._missing_warned = False
 
     def read_new_signals(self) -> List[Dict]:
         """增量读取新信号行，解析为标准化信号 dict 列表。
@@ -104,8 +106,11 @@ class ExternalSignalFileSource:
         ② lookback 窗口——只返回 signal_time >= now - lookback_seconds 的信号。
         游标推进：本轮文件全部可解析行中最晚 signal_time（单调不回退，防补齐
         旧行把游标拉回过去）。编码 GBK（通达信输出）。解析失败的行跳过 +
-        warning 留痕。去重：同代码（_seen_codes）同日只返回第一条；公式名不
-        匹配的行不占去重名额（同代码换匹配公式后仍可触发）。
+        warning 留痕。
+
+        去重不在本层做：文件不含买卖方向（方向由策略公式信号配置决定），
+        同代码同日可能先出买入、后出卖出行。引擎按「同代码 + 同日 + 同方向」
+        去重（各认第一条），本层只保证「不重读已消费的时间窗」。
         """
         now = self._clock()
         cutoff = now - timedelta(seconds=self._lookback_seconds)
@@ -127,9 +132,6 @@ class ExternalSignalFileSource:
             # ② lookback 窗口：晚到的陈旧行不交易（股价已拉升/条件已消失）
             if sig["time"] < cutoff:
                 continue
-            if sig["code"] in self._seen_codes:
-                continue
-            self._seen_codes.add(sig["code"])
             signals.append(sig)
         # 游标单调推进 = 文件中最晚信号时间（仅前进，防补齐行把游标拉回过去）
         if latest is not None and latest > self._last_read_time:
@@ -137,27 +139,36 @@ class ExternalSignalFileSource:
         return signals
 
     def reset_daily(self):
-        """每日重置：清空 seen_codes，游标归位当前时间。
+        """每日重置：时间戳游标归位当前时间（方向去重集合由引擎维护并同步清空）。
 
-        供调用方在新交易日（预警文件按日轮转/换新文件路径）调用；时间戳游标
-        归位当前时间，与「启动后新信号才消费」同语义——新文件的行只要时间晚于
+        供调用方在新交易日（预警文件按日轮转/换新文件路径）调用；游标归位
+        当前时间，与「启动后新信号才消费」同语义——新文件的行只要时间晚于
         重置时点且落在 lookback 窗口内即消费。
         """
-        self._seen_codes = set()
         self._last_read_time = self._clock()
 
     # ------------------------------------------------------------------
     def _read_complete_lines(self) -> List[str]:
-        """读文件并按 \\n 切行。编码 GBK；末段无换行符视为同花顺正在写半行，
-        不消费（待补全后下一轮读出）。文件不存在/读失败 → 空列表。"""
+        """读文件并按 \\n 切行。编码 GBK；末段无换行符视为通达信正在写半行，
+        不消费（待补全后下一轮读出）。文件不存在/读失败 → 空列表（fail-closed：
+        无信号即不下单）。"""
         try:
             with open(self._path, "rb") as f:
                 raw = f.read()
         except FileNotFoundError:
+            if not self._missing_warned:
+                self._missing_warned = True
+                logger.warning(
+                    "外部信号文件不存在（等待通达信条件预警输出，后续同状态不再告警）：%s",
+                    self._path,
+                )
             return []
         except OSError:
             logger.warning("外部信号文件读取失败：%s", self._path, exc_info=True)
             return []
+        if self._missing_warned:
+            self._missing_warned = False
+            logger.info("外部信号文件已出现，恢复读取：%s", self._path)
         try:
             text = raw.decode("gbk", errors="replace")
         except Exception:  # noqa: BLE001 — decode(errors=replace) 实际不抛，兜底留痕

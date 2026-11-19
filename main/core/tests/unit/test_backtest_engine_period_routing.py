@@ -7,7 +7,7 @@
 新引擎：时间轴为 (datetime, period) 步；价格索引按 (datetime, period) 键；
 每步只驱动 period 相同的策略、只成交 order.period 相同的订单。
 """
-from datetime import datetime
+from datetime import date, datetime
 from decimal import Decimal
 
 import polars as pl
@@ -178,10 +178,222 @@ def test_daily_close_peak_guard_ignores_coarse_period_future_close():
     assert [e for e in result["decisions"] if e["gate"] == "max_drawdown"] == []
 
 
-def test_daily_close_peak_guard_default_off_preserves_existing_behavior():
-    """默认关闭：粗周期每步仍更新 peak，复现原假回撤行为（保证开关默认零变化）。"""
+def test_daily_close_peak_guard_default_off_still_ignores_coarse_future_close():
+    """默认关闭（D8，2026-11-12）：粗周期 1w 在未来时点的 close 也不得抬峰。
+
+    旧行为是「默认关闭 = 每步都抬峰」，混合周期下会被粗 bar 的周期末 close 前视
+    污染（本用例旧断言为假回撤事件存在）。阶段二 D8 判定为真缺陷并修正：粗周期
+    bar（1d/1w/1mon）只在「日终估值步」抬峰，分钟 bar 才每根抬 —— 该修正是默认
+    生效的（`daily_close_peak_enabled` 仍是可选的更严格模式，收紧为全部只在
+    日终步抬峰，默认关）。
+    """
     port, klines = _mixed_period_portfolio_with_coarse_close()
 
     result = BacktestEngine().run(port, klines=klines)
 
-    assert [e for e in result["decisions"] if e["gate"] == "max_drawdown"]
+    assert [e for e in result["decisions"] if e["gate"] == "max_drawdown"] == []
+    assert port.risk_manager.peak_value == Decimal("10000")
+
+
+def test_pure_daily_backtest_still_updates_peak_every_day():
+    """纯日线回测：唯一时间戳步即日终步，峰值仍逐日更新（D8 不影响纯日线口径）。"""
+    stock = "000001.SZ"
+    dates = [datetime(2026, 7, 27), datetime(2026, 7, 28), datetime(2026, 7, 29)]
+    df_1d = pl.DataFrame({
+        "datetime": dates,
+        "Open": [Decimal("10")] * 3,
+        "High": [Decimal("10")] * 3,
+        "Low": [Decimal("10")] * 3,
+        "Close": [Decimal("10"), Decimal("11"), Decimal("12")],
+        "Volume": [1000] * 3,
+    })
+    pm = PortfolioRiskManager(
+        max_drawdown=Decimal("0.9"), daily_loss_limit=Decimal("0.9"))
+    port = Portfolio(portfolio_id=1, initial_capital=Decimal("10000"),
+                     risk_manager=pm)
+    port.account.cash = Decimal("0")
+    ctx = StrategyContext(
+        strategy_id=1, period="1d", capital_ratio=Decimal("1.0"), max_positions=5)
+    ctx.strategy_risk = StrategyRiskManager(
+        stop_loss_ratio=Decimal("0.9"), take_profit_ratio=Decimal("9"),
+        trailing_stop_ratio=Decimal("0"))
+    pos = Position(stock)
+    pos.quantity = 1000
+    pos.avg_cost = Decimal("10")
+    pos.highest_price = Decimal("10")
+    ctx.positions[stock] = pos
+    port.strategies.append(ctx)
+
+    BacktestEngine().run(port, klines={stock: {"1d": df_1d}})
+
+    # 1000 股 × 12 = 12000，日线收盘逐日抬峰到最高 12000
+    assert port.risk_manager.peak_value == Decimal("12000")
+
+
+def test_period_order_covers_1h_and_legacy_60m_alias():
+    """周期键名：全系统周期串为 "1h"，"60m" 仅作历史别名，二者同权重且落在 30m 与 1d 之间。"""
+    from core.engine.backtest_engine import _PERIOD_ORDER
+
+    assert _PERIOD_ORDER["1h"] == _PERIOD_ORDER["60m"]
+    assert _PERIOD_ORDER["30m"] < _PERIOD_ORDER["1h"] < _PERIOD_ORDER["1d"]
+    assert _PERIOD_ORDER.get("1h", 99) != 99
+
+
+def test_timeline_orders_same_timestamp_fine_to_coarse():
+    """同时间戳多周期处理顺序为细→粗（与实盘 periods_on_boundary 同序）。
+
+    10:30 同时有 1m/5m/15m/30m/1h 五档；00:00 同时有 1d/1w/1mon 三档。
+    """
+    stock = "000001.SZ"
+    day = datetime(2026, 7, 30)
+    def _df(t):
+        return pl.DataFrame({
+            "datetime": [t],
+            "Open": [Decimal("10")], "High": [Decimal("10")],
+            "Low": [Decimal("10")], "Close": [Decimal("10")], "Volume": [1000],
+        })
+    klines = {stock: {
+        "1mon": _df(day), "1w": _df(day), "1d": _df(day),
+        "1h": _df(datetime(2026, 7, 30, 10, 30)),
+        "30m": _df(datetime(2026, 7, 30, 10, 30)),
+        "15m": _df(datetime(2026, 7, 30, 10, 30)),
+        "5m": _df(datetime(2026, 7, 30, 10, 30)),
+        "1m": _df(datetime(2026, 7, 30, 10, 30)),
+    }}
+
+    timeline = BacktestEngine()._build_timeline(klines)
+
+    assert [p for t, p in timeline if t == datetime(2026, 7, 30, 10, 30)] == [
+        "1m", "5m", "15m", "30m", "1h",
+    ]
+    assert [p for t, p in timeline if t == day] == ["1d", "1w", "1mon"]
+
+
+# ---------------------------------------------------------------- 分钟级成交口径
+# 口径 = 「下一根同周期 bar 的 open ×(1±滑点)」，与日线口径同构：
+# - 信号 bar 只驱动信号，成交发生在该周期下一根 bar 的成交步（backtest_engine
+#   run 第 1 步 `_bar_open_prices(price_index, t, period)` → SimulatedDispatcher
+#   `fill_price = open ×(1±slippage)`）；
+# - 跨午休 = 11:30 bar 的信号在 13:05 bar 成交（取 13:00 开盘价）；
+# - 日内最后一根 = 15:00 bar 的信号顺延到次一交易日首根 bar（取次日开盘价）；
+# - 接缝跨日 = 段末未成交的在途单由 `initial_pending_orders` 在次段首根成交。
+def _minute_port(stock, cash="100000"):
+    pm = PortfolioRiskManager(
+        max_drawdown=Decimal("0.9"), daily_loss_limit=Decimal("0.9"))
+    port = Portfolio(portfolio_id=1, initial_capital=Decimal(cash),
+                     risk_manager=pm)
+    ctx = StrategyContext(
+        strategy_id=1, period="5m",
+        capital_ratio=Decimal("1.0"), max_positions=5,
+        single_open_ratio=Decimal("0.5"),
+    )
+    ctx.stock_pool = {stock}
+    ctx.formula_signals = [
+        {"signal_name": "open_sig", "signal_type": SignalType.OPEN,
+         "trigger_value": 1},
+    ]
+    ctx.strategy_risk = StrategyRiskManager(
+        stop_loss_ratio=Decimal("0.9"), take_profit_ratio=Decimal("9"),
+        trailing_stop_ratio=Decimal("0"))
+    port.strategies.append(ctx)
+    return port
+
+
+def _df_5m(rows):
+    return pl.DataFrame({
+        "datetime": [r[0] for r in rows],
+        "Open": [r[1] for r in rows],
+        "High": [r[2] for r in rows],
+        "Low": [r[3] for r in rows],
+        "Close": [r[4] for r in rows],
+        "Volume": [1000 for _ in rows],
+    })
+
+
+def _d(v):
+    return Decimal(str(v))
+
+
+def test_minute_signal_across_lunch_break_fills_next_bar_open():
+    """跨午休：11:30 bar 信号 → 13:05 bar 成交，取 13:05 的 open（=13:00 价）。"""
+    stock = "000001.SZ"
+    rows = [
+        (datetime(2026, 7, 30, 11, 30), _d("10"), _d("10"), _d("10"),
+         _d("10")),
+        (datetime(2026, 7, 30, 13, 5), _d("10.5"), _d("10.6"), _d("10.4"),
+         _d("10.5")),
+        (datetime(2026, 7, 30, 14, 0), _d("11"), _d("11"), _d("11"), _d("11")),
+    ]
+    port = _minute_port(stock)
+    cache = {(1, stock, datetime(2026, 7, 30, 11, 30)): [
+        {"name": "open_sig", "value": 1}]}
+
+    result = BacktestEngine().run(
+        port, klines={stock: {"5m": _df_5m(rows)}}, signal_cache=cache)
+
+    trades = result["trades"]
+    assert len(trades) == 1
+    assert trades[0].trade_type == TradeType.BUY
+    assert trades[0].trade_time == datetime(2026, 7, 30, 13, 5)
+    assert trades[0].price == _d("10.5")
+
+
+def test_minute_last_bar_of_day_fills_next_day_first_bar_open():
+    """日内最后一根（15:00）信号不当日成交，顺延到次一交易日首根 bar 的 open。"""
+    stock = "000001.SZ"
+    rows = [
+        (datetime(2026, 7, 30, 15, 0), _d("10"), _d("10"), _d("10"), _d("10")),
+        (datetime(2026, 7, 31, 9, 35), _d("10.2"), _d("10.2"), _d("10.2"),
+         _d("10.2")),
+        (datetime(2026, 7, 31, 9, 40), _d("10.4"), _d("10.4"), _d("10.4"),
+         _d("10.4")),
+    ]
+    port = _minute_port(stock)
+    cache = {(1, stock, datetime(2026, 7, 30, 15, 0)): [
+        {"name": "open_sig", "value": 1}]}
+
+    result = BacktestEngine().run(
+        port, klines={stock: {"5m": _df_5m(rows)}}, signal_cache=cache)
+
+    trades = result["trades"]
+    assert len(trades) == 1
+    # 取次日首根（09:35）open=10.2，而不是信号 bar 的 close=10 或再下一根 10.4
+    assert trades[0].trade_time == datetime(2026, 7, 31, 9, 35)
+    assert trades[0].price == _d("10.2")
+
+
+def test_minute_pending_order_crosses_incremental_seam_fills_next_segment_open():
+    """接缝跨日：段末未成交的 5m 单在次段首根 bar 成交（取该 bar open）。"""
+    from core.services import incremental_backtest as ib
+
+    stock = "000001.SZ"
+    day1 = [(datetime(2026, 7, 30, 15, 0), _d("10"), _d("10"), _d("10"),
+             _d("10"))]
+    day2 = [
+        (datetime(2026, 7, 31, 9, 35), _d("10.2"), _d("10.2"), _d("10.2"),
+         _d("10.2")),
+        (datetime(2026, 7, 31, 9, 40), _d("10.4"), _d("10.4"), _d("10.4"),
+         _d("10.4")),
+    ]
+    cache = {(1, stock, datetime(2026, 7, 30, 15, 0)): [
+        {"name": "open_sig", "value": 1}]}
+
+    port = _minute_port(stock)
+    first = BacktestEngine().run(
+        port, klines={stock: {"5m": _df_5m(day1)}}, signal_cache=cache)
+    assert first["trades"] == []
+    assert len(first["pending_orders"]) == 1
+
+    payload = ib.state_payload(
+        port, date(2026, 7, 30), pending_orders=first["pending_orders"],
+        as_of_bar_time=datetime(2026, 7, 30, 15, 0), day_complete=True)
+    resumed = _minute_port(stock)
+    pending = ib.restore_portfolio(resumed, payload)
+    tail = BacktestEngine().run(
+        resumed, klines={stock: {"5m": _df_5m(day2)}}, signal_cache={},
+        initial_pending_orders=pending)
+
+    assert len(tail["trades"]) == 1
+    assert tail["trades"][0].trade_time == datetime(2026, 7, 31, 9, 35)
+    assert tail["trades"][0].price == _d("10.2")
+

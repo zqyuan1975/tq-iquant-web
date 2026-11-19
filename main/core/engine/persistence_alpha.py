@@ -123,10 +123,12 @@ def _fifo_lots(trades: List[dict]) -> List[Tuple[float, int]]:
     for tr in sorted(trades, key=lambda t: t["bar_time"]):
         key = (tr["strategy_id"], tr["stock_code"])
         if tr["trade_type"] == "BUY":
-            cost_ps = _f((tr["commission"] + tr["stamp_duty"]) / max(tr["quantity"], 1))
+            cost_ps = _f((tr["commission"] + tr["stamp_duty"]
+                          + tr.get("transfer_fee", 0)) / max(tr["quantity"], 1))
             fifo.setdefault(key, []).append([_f(tr["price"]), int(tr["quantity"]), cost_ps])
         elif tr["trade_type"] == "SELL":
-            sell_cost_ps = _f((tr["commission"] + tr["stamp_duty"]) / max(tr["quantity"], 1))
+            sell_cost_ps = _f((tr["commission"] + tr["stamp_duty"]
+                               + tr.get("transfer_fee", 0)) / max(tr["quantity"], 1))
             remaining = int(tr["quantity"])
             queue = fifo.get(key, [])
             while remaining > 0 and queue:
@@ -152,7 +154,8 @@ def _year_turnover_cost(trades: List[dict], year: int, nav_series) -> Tuple[Opti
     if not yr:
         return None, None
     total_amount = sum(_f(t["amount"]) for t in yr)
-    total_cost = sum(_f(t["commission"] + t["stamp_duty"]) for t in yr)
+    total_cost = sum(_f(t["commission"] + t["stamp_duty"]
+                        + t.get("transfer_fee", 0)) for t in yr)
     dts = sorted(d for d in nav_series if d.year == year)
     if not dts:
         return None, None

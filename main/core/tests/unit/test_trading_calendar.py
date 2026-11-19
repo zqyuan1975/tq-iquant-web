@@ -11,7 +11,7 @@ from datetime import date, datetime
 import pytest
 
 from core.engine.trading_calendar import TradingCalendar
-from core.engine.live.calendar import BUILTIN_CLOSURES
+from core.engine.live.calendar import BUILTIN_CLOSURES, BUILTIN_HALF_DAYS
 
 
 # 2026 年部分交易日（真实日历，用于断言；桥 provider 一般返回整年）
@@ -79,6 +79,23 @@ def test_provider_returns_empty_fail_open_on_weekday():
     assert cal.is_trading_day(date(2026, 8, 22)) is False
 
 
+def test_last_trading_day_of_week_and_month():
+    """周期末识别：周线认本周最后一个交易日、月线认本月最后一个交易日。"""
+    # 覆盖 08-24..08-31；集合内 08-28（周五）休市、08-31（周一）为 8 月最后交易日
+    cal = TradingCalendar(_provider([
+        date(2026, 8, 24), date(2026, 8, 26),
+        date(2026, 8, 27), date(2026, 8, 31),
+    ]))
+    # 周五休市 → 08-27（周四）成为本周最后一个交易日
+    assert cal.is_last_trading_day_of_week(date(2026, 8, 27)) is True
+    assert cal.is_last_trading_day_of_week(date(2026, 8, 26)) is False
+    # 月末：08-31 是 8 月最后一个交易日；08-27 不是
+    assert cal.is_last_trading_day_of_month(date(2026, 8, 31)) is True
+    assert cal.is_last_trading_day_of_month(date(2026, 8, 27)) is False
+    # 非交易日直接返回 False（不会把周末当周期末）
+    assert cal.is_last_trading_day_of_week(date(2026, 8, 29)) is False
+
+
 def test_calendar_caches_per_year_single_provider_call():
     """同一自然年只拉一次日历（缓存）。"""
     calls = {"n": 0}
@@ -111,6 +128,39 @@ def test_trading_blocked_at_and_after_close():
     cal = TradingCalendar(_provider([date(2026, 8, 24)]))
     assert cal.is_trading_allowed(datetime(2026, 8, 24, 15, 0)) is False
     assert cal.is_trading_allowed(datetime(2026, 8, 24, 15, 30)) is False
+
+
+def test_trading_blocked_during_lunch_break():
+    """P2-5：11:30–13:00 午休禁报（11:30 边界 bar 的单不再排进 TDX/被 QMT 拒）。"""
+    cal = TradingCalendar(_provider([date(2026, 8, 24)]))
+    assert cal.is_trading_allowed(datetime(2026, 8, 24, 11, 29)) is True
+    assert cal.is_trading_allowed(datetime(2026, 8, 24, 11, 30)) is False
+    assert cal.is_trading_allowed(datetime(2026, 8, 24, 12, 0)) is False
+    assert cal.is_trading_allowed(datetime(2026, 8, 24, 12, 59)) is False
+    # 13:00 起恢复正常派发
+    assert cal.is_trading_allowed(datetime(2026, 8, 24, 13, 0)) is True
+    assert cal.is_trading_allowed(datetime(2026, 8, 24, 14, 0)) is True
+
+
+def test_is_lunch_break_left_closed_right_open():
+    """午休判定左闭右开（11:30 起、13:00 止），与 is_trading_allowed 同一组常量。"""
+    cal = TradingCalendar(_provider([date(2026, 8, 24)]))
+    assert cal.is_lunch_break(datetime(2026, 8, 24, 11, 29, 59)) is False
+    assert cal.is_lunch_break(datetime(2026, 8, 24, 11, 30)) is True
+    assert cal.is_lunch_break(datetime(2026, 8, 24, 12, 0)) is True
+    assert cal.is_lunch_break(datetime(2026, 8, 24, 12, 59, 59)) is True
+    assert cal.is_lunch_break(datetime(2026, 8, 24, 13, 0)) is False
+    # 与下单总闸口径互为镜像：午休内禁报，11:29 与 13:00 允许
+    assert cal.is_trading_allowed(datetime(2026, 8, 24, 11, 29, 59)) is True
+    assert cal.is_trading_allowed(datetime(2026, 8, 24, 11, 30)) is False
+    assert cal.is_trading_allowed(datetime(2026, 8, 24, 13, 0)) is True
+
+
+def test_lunch_end_at_is_same_day_1300():
+    """暂停状态回报的「下次恢复」= 当日 13:00:00。"""
+    cal = TradingCalendar(_provider([date(2026, 8, 24)]))
+    assert cal.lunch_end_at(datetime(2026, 8, 24, 11, 45, 12, 500000)) == \
+        datetime(2026, 8, 24, 13, 0)
 
 
 def test_trading_blocked_on_weekend_even_at_session_time():
@@ -248,3 +298,123 @@ def test_builtin_2026_matches_official_schedule():
               date(2026, 5, 6), date(2026, 6, 22), date(2026, 9, 28),
               date(2026, 10, 8)):
         assert d not in closed
+
+
+# ---------------- 半日市（P2-10）----------------
+
+_HALF_DAY = date(2026, 12, 31)  # 周四（合成半日市，仅用于验证机制）
+
+
+def _half_day_cal():
+    return TradingCalendar(
+        _provider([date(2026, 12, 30), _HALF_DAY]),
+        half_day_provider=lambda year: ["2026-12-31"],
+    )
+
+
+def test_half_day_morning_allowed_afternoon_blocked():
+    """半日市：09:30 可交易，11:30 起（含原下午时段）不可交易。"""
+    cal = _half_day_cal()
+    assert cal.is_half_day(_HALF_DAY) is True
+    assert cal.is_trading_allowed(datetime(2026, 12, 31, 9, 30)) is True
+    assert cal.is_trading_allowed(datetime(2026, 12, 31, 10, 45)) is True
+    assert cal.is_trading_allowed(datetime(2026, 12, 31, 11, 29)) is True
+    # 11:30 边界（左闭右开）与整个下午一律禁报
+    assert cal.is_trading_allowed(datetime(2026, 12, 31, 11, 30)) is False
+    assert cal.is_trading_allowed(datetime(2026, 12, 31, 13, 30)) is False
+    assert cal.is_trading_allowed(datetime(2026, 12, 31, 14, 59)) is False
+    assert cal.session_close_time(_HALF_DAY).isoformat() == "11:30:00"
+    assert cal.status()["half_days"]["2026"] == 1
+
+
+def test_normal_day_unaffected_by_half_day_source():
+    """同一日历下，非半日市日期的时段判定保持原样（09:30–15:00 含午休）。"""
+    cal = _half_day_cal()
+    normal = date(2026, 12, 30)
+    assert cal.is_half_day(normal) is False
+    assert cal.is_trading_allowed(datetime(2026, 12, 30, 9, 30)) is True
+    assert cal.is_trading_allowed(datetime(2026, 12, 30, 13, 30)) is True
+    assert cal.is_trading_allowed(datetime(2026, 12, 30, 14, 59)) is True
+    assert cal.is_trading_allowed(datetime(2026, 12, 30, 11, 45)) is False  # 午休
+    assert cal.session_close_time(normal).isoformat() == "15:00:00"
+
+
+def test_half_day_source_unavailable_fail_open_warn_once(caplog):
+    """半日市数据不可用：fail-open（按全天交易）+ 每年一条 WARNING/risk 事件。"""
+    caplog.set_level("WARNING", logger="core.engine.live.calendar")
+    events = []
+    cal = TradingCalendar(_provider([date(2030, 1, 7)]))  # 2030 无内置半日市表
+    cal.on_degraded = events.append
+
+    assert cal.is_half_day(date(2030, 1, 7)) is False
+    # 不因半日市数据缺失拒绝交易
+    assert cal.is_trading_allowed(datetime(2030, 1, 7, 13, 30)) is True
+    half_warns = [r for r in caplog.records
+                  if r.levelname == "WARNING" and "半日市" in r.message]
+    assert len(half_warns) == 1
+    assert [e["rule"] for e in events] == ["half_day_calendar_degraded"]
+
+    # 同年重复判定不再新增告警（退避窗内不重复打源）
+    cal.is_trading_allowed(datetime(2030, 1, 8, 13, 30))
+    assert len([r for r in caplog.records
+                if r.levelname == "WARNING" and "半日市" in r.message]) == 1
+    assert len(events) == 1
+
+
+def test_builtin_half_day_table_covers_2026_2027_without_warning(caplog):
+    """已核对年份（2026/2027）收录空集合 = 确认无半日市，不触发退化告警。"""
+    caplog.set_level("WARNING", logger="core.engine.live.calendar")
+    assert BUILTIN_HALF_DAYS[2026] == frozenset()
+    assert BUILTIN_HALF_DAYS[2027] == frozenset()
+    cal = TradingCalendar(_provider([date(2026, 8, 24)]))
+    assert cal.is_half_day(date(2026, 8, 24)) is False
+    assert cal.is_trading_allowed(datetime(2026, 8, 24, 14, 0)) is True
+    assert not [r for r in caplog.records if "半日市" in r.message]
+
+
+# ---------------- 2027 年休市表 ----------------
+
+def test_builtin_2027_matches_official_schedule():
+    """2027 年内置休市表与国办发明电〔2026〕10号一致（工作日休市逐项抽查）。"""
+    closed = BUILTIN_CLOSURES[2027]
+    for d in (date(2027, 1, 1),                                   # 元旦
+              date(2027, 2, 5), date(2027, 2, 8), date(2027, 2, 12),  # 春节
+              date(2027, 4, 5),                                   # 清明
+              date(2027, 5, 3), date(2027, 5, 5),                 # 劳动节
+              date(2027, 6, 9),                                   # 端午
+              date(2027, 9, 15),                                  # 中秋
+              date(2027, 10, 1), date(2027, 10, 7)):              # 国庆
+        assert d in closed
+    # 复市日/节前最后一个交易日不是休市
+    for d in (date(2027, 1, 4), date(2027, 2, 4), date(2027, 2, 15),
+              date(2027, 4, 6), date(2027, 5, 6), date(2027, 6, 10),
+              date(2027, 9, 16), date(2027, 10, 8)):
+        assert d not in closed
+    # 周末不重复收录（由周末硬规则覆盖）
+    for d in closed:
+        assert d.weekday() < 5
+
+
+def test_2027_holiday_closed_and_normal_workday_open():
+    """2027 休市日判不可交易；普通工作日/节前最后一个交易日判可交易。"""
+    cal = TradingCalendar(_provider([]))  # 全部源为空 → 内置表
+    assert cal.is_trading_day(date(2027, 2, 8)) is False      # 春节（周一）
+    assert cal.is_trading_day(date(2027, 10, 4)) is False     # 国庆（周一）
+    assert cal.is_trading_day(date(2027, 6, 9)) is False      # 端午（周三）
+    assert cal.is_trading_allowed(datetime(2027, 2, 8, 10, 0)) is False
+    # 春节前最后一个交易日（2027-02-04 周四）正常交易
+    assert cal.is_trading_day(date(2027, 2, 4)) is True
+    assert cal.is_trading_allowed(datetime(2027, 2, 4, 10, 0)) is True
+    assert cal.is_trading_day(date(2027, 10, 8)) is True       # 国庆后复市
+
+
+def test_2027_weekend_makeup_workdays_still_closed():
+    """2027 调休上班日全部是周末（1/31、2/14、5/8、9/26、10/9）：
+    国务院"上班"不等于交易所开市，A 股周末硬休市。"""
+    cal = TradingCalendar(_provider(["2027-01-31", "2027-02-14", "2027-05-08",
+                                     "2027-09-26", "2027-10-09"]))
+    for d in (date(2027, 1, 31), date(2027, 2, 14), date(2027, 5, 8),
+              date(2027, 9, 26), date(2027, 10, 9)):
+        assert d.weekday() >= 5
+        assert cal.is_trading_day(d) is False
+        assert cal.is_trading_allowed(datetime(d.year, d.month, d.day, 10, 0)) is False

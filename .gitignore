@@ -48,6 +48,8 @@ logs/
 *.log
 main/stdin.empty
 web/stdin.empty
+# 源码版后端运行期写出的实例信息（server.json：端口/pid/版本），运行时产物不入库
+/data/runtime/
 
 # Local machine paths (TDX/iQuant install paths)
 config.yaml
@@ -86,3 +88,8 @@ main/core/tests/unit/test_dbg_pywinauto.py
 
 # Local ops scripts at repo root (not part of the platform)
 scripts/
+
+# Daily diagnostics / intermediate artifacts
+# 工作区约定：每日诊断与中间产物放在 YYYY-MM-DD/<task-slug>/work/ 下，
+# 只用于当日追溯，不属平台代码，不进版本库；否则会让打包产物的 git_dirty 恒为 true。
+/2026-*/

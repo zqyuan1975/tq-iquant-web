@@ -12,9 +12,39 @@ from .format import fmt_money, fmt_price
 from tq_iquant_shared.constants import TradeType, SignalType
 
 
+# 卖出印花税分段表（2026-11-16 P1 核查修复）：此前恒按 0.0005，2023-08-28 前实为
+# 0.001（2008-09-19 起单边 0.1%，更早双边 0.3% 不在回测覆盖范围，按 0.1% 兜底）。
+# 版本号写入 backtest_records.params_snapshot（stamp_duty_segments），新旧结果不可混比。
+STAMP_DUTY_SEGMENTS_VERSION = "cn_a_share_sell_2008_20230828_v2"
+STAMP_DUTY_SEGMENTS = (
+    (date(2023, 8, 28), Decimal("0.0005")),
+    (date.min, Decimal("0.001")),
+)
+_CURRENT_STAMP_DUTY_RATE = Decimal("0.0005")
+
+
+def stamp_duty_rate_on(day, configured_rate: Decimal = _CURRENT_STAMP_DUTY_RATE) -> Decimal:
+    """按成交日返回卖出印花税率。
+
+    组合配置的 ``stamp_duty_rate`` 是用户显式口径：不等于现行默认 0.0005 时全区间
+    照用（保住「可配置费率」语义，如测试/自定义模型）；等于默认值时按交易所历史
+    分段（2023-08-28 前 0.1%）。日线及以上/分钟级的 ``order.bar_time`` 均为成交
+    当日时间戳，直接取 date 比较。
+    """
+    if configured_rate != _CURRENT_STAMP_DUTY_RATE or day is None:
+        return configured_rate
+    d = day.date() if hasattr(day, "date") else day
+    for start, rate in STAMP_DUTY_SEGMENTS:
+        if d >= start:
+            return rate
+    return configured_rate
+
+
 class OrderDispatcher(ABC):
     @abstractmethod
-    def place_order(self, order: OrderEvent) -> Optional[TradeEvent]:
+    def place_order(self, order: OrderEvent,
+                    price_type: Optional[str] = None) -> Optional[TradeEvent]:
+        """下单。price_type 仅盘前集合竞价路径传 "limit"（按单覆盖），默认 None。"""
         ...
 
     def execution_receipts(self) -> list:
@@ -41,9 +71,11 @@ class SimulatedDispatcher(OrderDispatcher):
         buy_commission_rate: Decimal = Decimal("0.00025"),
         sell_commission_rate: Decimal = Decimal("0.00025"),
         stamp_duty_rate: Decimal = Decimal("0.0005"),
+        transfer_fee_rate: Decimal = Decimal("0.00001"),
         slippage: Decimal = Decimal("0"),
         bar_volumes: dict = None,
         slippage_impact_coef: Optional[Decimal] = None,
+        price_limits: dict = None,
     ):
         """成本参数来自组合表，默认值 = 历史硬编码值，老调用不破。
 
@@ -51,15 +83,22 @@ class SimulatedDispatcher(OrderDispatcher):
         时有效滑点 = slippage + coef×订单股数/(bar成交量×100)，封顶 0.10；
         任一缺失或该票无量时回退固定 slippage（原行为）。bar_volumes 值为
         TDX Volume（单位=手，×100 转股数）。
+        price_limits：{(code): (跌停价, 涨停价)}，可选。提供时把**含滑点的成交价**
+        夹进该区间（2026-11-16 修复滑点越板：闸门只比 open 与涨跌停，开盘贴板时
+        含滑点成交价可越板）；未提供（涨跌停校验关闭/无前收/新股窗口）不夹取。
         """
         self.open_prices = open_prices or {}
         self.min_commission = min_commission
         self.buy_commission_rate = buy_commission_rate
         self.sell_commission_rate = sell_commission_rate
         self.stamp_duty_rate = stamp_duty_rate
+        # 过户费（双向，2026-11-11 补齐）：A 股现行按成交额 0.001% 双边收取。
+        # 默认值与非零，历史回测需重跑才与新口径可比。
+        self.transfer_fee_rate = transfer_fee_rate
         self.slippage = slippage
         self.bar_volumes = bar_volumes
         self.slippage_impact_coef = slippage_impact_coef
+        self.price_limits = price_limits or {}
 
     def _effective_slippage(self, order: OrderEvent) -> Decimal:
         """#4 自适应滑点：市场冲击随订单量占 bar 成交量比例线性上浮，封顶 0.10。
@@ -87,11 +126,30 @@ class SimulatedDispatcher(OrderDispatcher):
             fill_price = price * (Decimal("1") + slippage)
         else:
             fill_price = price * (Decimal("1") - slippage)
+        # 滑点越板夹取（2026-11-16）：开盘贴板时 open 合法但含滑点成交价会越板
+        # （买入 > 涨停 / 卖出 < 跌停 = 凭空多付或少收）。只夹「滑点推出去的那一侧」：
+        # 买价只受涨停上限约束、卖价只受跌停下限约束——若原始 open 本身就在区间外
+        # （数据缺口/复牌跳空），保持不变，避免把「已成交价」反向拉回制造假收益。
+        bounds = self.price_limits.get(order.stock_code)
+        if bounds:
+            _low, _high = bounds
+            if order.trade_type.value == "BUY":
+                if _high is not None and fill_price > _high:
+                    fill_price = _high
+            else:
+                if _low is not None and fill_price < _low:
+                    fill_price = _low
         amount = fill_price * order.quantity
         is_sell = order.trade_type.value == "SELL"
         rate = self.sell_commission_rate if is_sell else self.buy_commission_rate
         commission = max(self.min_commission, amount * rate)
-        stamp_duty = amount * self.stamp_duty_rate if is_sell else Decimal("0")
+        # 印花税按成交日分段（2023-08-28 前 0.1%，之后 0.05%），见 stamp_duty_rate_on
+        stamp_duty = (
+            amount * stamp_duty_rate_on(order.bar_time, self.stamp_duty_rate)
+            if is_sell else Decimal("0")
+        )
+        # 过户费：买卖双向按成交额计（组合 transfer_fee_rate，默认 0.001%）
+        transfer_fee = amount * self.transfer_fee_rate
         return TradeEvent(
             strategy_id=order.strategy_id,
             portfolio_id=order.portfolio_id,
@@ -102,6 +160,7 @@ class SimulatedDispatcher(OrderDispatcher):
             amount=amount,
             commission=commission,
             stamp_duty=stamp_duty,
+            transfer_fee=transfer_fee,
             trade_time=order.bar_time,
             signal_type=order.signal_type,
             signal_name=order.signal_name,
@@ -215,9 +274,15 @@ class ExecutionEngine:
                 lot_size=lot,
                 cash_override=available_cash_cap,
             )
+            # 现金 binding 值 = min(账本现金, 真实可用上限)：文案与事件 actual_value
+            # 必须打这个值，不能只打 account.cash（2026-11-10 001311 实证：文案
+            # 「按可用现金 107,164.10」而真正 binding 的是 cash_cap=5,155.30）。
+            cash_cap = account.cash
+            if available_cash_cap is not None and available_cash_cap < cash_cap:
+                cash_cap = available_cash_cap
             # binding 约束判定：敞口余量 < 现金 → 缩量/拒单归因于策略敞口上限
             exposure_binds = use_exposure and (
-                strategy_capital_limit - pos_value < account.cash
+                strategy_capital_limit - pos_value < cash_cap
             )
             if not approved or qty < lot:
                 # 资金不足：不足 1 手拒单（account.insufficient_count 已在 approve_order 内自增）
@@ -235,11 +300,11 @@ class ExecutionEngine:
                     self._rec_gate(
                         "insufficient_funds", "reject", order, "capital_gate",
                         requested=order.quantity, final=0,
-                        param_name="cash", actual_value=float(account.cash),
+                        param_name="cash", actual_value=float(cash_cap),
                         message="资金不足拒单：需 %s 元买 %d 股 @%s，可用现金 %s（缩量后 %d 股<1手）"
                                 % (fmt_money(order.price * order.quantity if order.price else 0),
                                    order.quantity, fmt_price(order.price),
-                                   fmt_money(account.cash), qty),
+                                   fmt_money(cash_cap), qty),
                     )
                 return None
             if qty < order.quantity:
@@ -260,9 +325,11 @@ class ExecutionEngine:
                     self._rec_gate(
                         "order_shrunk", "shrink", order, "capital_gate",
                         requested=order.quantity, final=qty,
-                        param_name="cash", actual_value=float(account.cash),
+                        param_name="cash", actual_value=float(cash_cap),
                         message="资金不足缩量：请求 %d 股，按可用现金 %s 缩至 %d 股 @%s"
-                                % (order.quantity, fmt_money(account.cash), qty, fmt_price(order.price)),
+                                "（账本现金 %s）"
+                                % (order.quantity, fmt_money(cash_cap), qty,
+                                   fmt_price(order.price), fmt_money(account.cash)),
                     )
             # 策略级单笔最大买入金额（None=不限）：审批通过后金额封顶，
             # 缩到该金额能买的整手股数（不足 1 手拒单）。仅 BUY 路径。
@@ -353,14 +420,29 @@ class ExecutionEngine:
             )
         if min_commission is None:
             min_commission = getattr(self._dispatcher, "min_commission", Decimal("5"))
+        # 过户费（双向）：资金拟合必须与成交计费同口径，否则末手可能超现金
+        transfer_rate = getattr(
+            self._dispatcher, "transfer_fee_rate", Decimal("0"))
         for q in (quantity, quantity - lot_size):
             if q < lot_size:
                 continue
             amount = price * q
             commission = max(min_commission, amount * buy_rate)
-            if amount + commission <= cash:
+            if amount + commission + amount * transfer_rate <= cash:
                 return q
         return 0
+
+    def _place(self, order: OrderEvent,
+               price_type: Optional[str] = None) -> Optional[TradeEvent]:
+        """调通道下单；price_type 仅在盘前路径非空时透传（按单覆盖委托价类型）。
+
+        有值时要求通道接受该关键字（HttpBridgeDispatcher）；其它 dispatcher /
+        回测 SimulatedDispatcher / 测试替身通常只声明 place_order(order)，
+        因此默认分支不传该参数，保持既有签名与行为。
+        """
+        if price_type:
+            return self._dispatcher.place_order(order, price_type=price_type)
+        return self._dispatcher.place_order(order)
 
     def execute(
         self,
@@ -373,6 +455,7 @@ class ExecutionEngine:
         strategy_capital_limit: Optional[Decimal] = None,
         max_order_amount: Optional[Decimal] = None,
         buy_fee_cfg: Optional[tuple] = None,
+        price_type: Optional[str] = None,
     ) -> Optional[TradeEvent]:
         """执行订单。
 
@@ -394,6 +477,10 @@ class ExecutionEngine:
         place_order 即真实发单、无法二次改量重发，故该钳制必须在发单前按委托价
         完成；回测（apply=True）不传，维持成交后按实际成交价（含滑点+费用）的
         最终兜底，行为不变。
+
+        price_type（可选，仅盘前集合竞价路径传 "limit"）：按单覆盖桥的委托价类型
+        （QMT 桥 prType=11、审批价原样下发）；None = 通道按配置默认。仅在有值时
+        透传给 place_order，回测/其它通道（不接受该参数）行为不变。
         """
         capped = self.cap_quantity(
             order, account, position,
@@ -436,7 +523,7 @@ class ExecutionEngine:
                     )
                     order.quantity = fit_qty
 
-        trade = self._dispatcher.place_order(order)
+        trade = self._place(order, price_type)
         if not trade:
             return None
 
@@ -446,7 +533,10 @@ class ExecutionEngine:
         # 跳空高开时实际成本 > 审批金额，不加此守卫则 deduct_cash 后现金为负。
         if apply and order.trade_type == TradeType.BUY:
             buy_lot = self._lot(order.stock_code)
-            cost = trade.amount + trade.commission + trade.stamp_duty
+            # P2-1：判据必须与 account.apply_trade 的扣款口径一致（含过户费）。
+            # 漏 transfer_fee 时「现金刚好够佣金+印花税」的单会扣出极小负现金。
+            cost = (trade.amount + trade.commission + trade.stamp_duty
+                    + trade.transfer_fee)
             # R2：二次审批触发条件 = 实际成本超现金 或 超策略敞口余量（capital_ratio ×
             # 初始资金 − 策略持仓市值）。跳空高开后实际成交价 > 审批价，即使现金充足，
             # 也可能突破策略级敞口上限——不加该条件则 exposure_cap 被绕过。
@@ -490,7 +580,7 @@ class ExecutionEngine:
                                 % (order.quantity, qty, fmt_price(trade.price)),
                     )
                     order.quantity = qty
-                    trade = self._dispatcher.place_order(order)
+                    trade = self._place(order, price_type)
                     if not trade:
                         return None
 
@@ -500,7 +590,9 @@ class ExecutionEngine:
             # 费用可覆盖的最大整手倍数；不足一手拒单。
             if order.trade_type == TradeType.BUY:
                 fee_lot = self._lot(order.stock_code)
-                cost = trade.amount + trade.commission + trade.stamp_duty
+                # P2-1：同口径含过户费（account.apply_trade 会扣 transfer_fee）
+                cost = (trade.amount + trade.commission + trade.stamp_duty
+                        + trade.transfer_fee)
                 if cost > account.cash:
                     fit_qty = self._fit_buy_qty_to_cash(
                         trade.price, account.cash, order.quantity, fee_lot
@@ -523,14 +615,20 @@ class ExecutionEngine:
                                     % (order.quantity, fit_qty, fmt_price(trade.price)),
                         )
                         order.quantity = fit_qty
-                        trade = self._dispatcher.place_order(order)
+                        trade = self._place(order, price_type)
                         if not trade:
                             return None
-                        cost = trade.amount + trade.commission + trade.stamp_duty
-            # 统一用 apply_trade 更新账户和持仓
-            account.apply_trade(trade)
+                        cost = (trade.amount + trade.commission + trade.stamp_duty
+                                + trade.transfer_fee)
+            # 统一用 apply_trade 更新账户和持仓。顺序固定为「先持仓、后现金」：
+            # 持仓返回**实际扣减量**（卖出可能少于成交数量），现金按该量缩放后的
+            # 成交额入账，避免持仓不足时现金凭空增加（P0-1）。
+            applied = trade.quantity
             if position is not None:
-                position.apply_trade(trade)
+                applied = position.apply_trade(trade)
+                if applied != trade.quantity:
+                    trade = trade.scaled_to(applied)
+            account.apply_trade(trade)
 
         return trade
 
@@ -551,4 +649,73 @@ class ExecutionEngine:
             quantity=qty,
             price=None,
             bar_time=None,
+        )
+
+class ShadowDispatcher(OrderDispatcher):
+    """B5 影子模式：真实行情/心跳走内层 dispatcher，成交按订单价本地模拟。
+
+    - 不向真实柜台发任何委托/撤单：place_order 本地撮合，cancel_order 直接成功，
+      query_positions 恒空（避免把真实持仓混入影子账本）；
+    - 行情/心跳/窗口探测全部委托给内层真实 dispatcher，保证信号与实盘同源；
+    - 成本沿用 SimulatedDispatcher 同口径费率（影子只用于演练，不与真实费率对账）。
+    """
+
+    supports_remark = True
+
+    def __init__(self, inner=None):
+        super().__init__()
+        self._inner = inner
+        self.last_cancel_result = None
+
+    def __getattr__(self, name):
+        inner = self.__dict__.get("_inner")
+        if inner is not None:
+            return getattr(inner, name)
+        raise AttributeError(name)
+
+    def heartbeat(self) -> bool:
+        if self._inner is None:
+            return True
+        return bool(self._inner.heartbeat())
+
+    def query_positions(self) -> list:
+        return []
+
+    def cancel_order(self, order_ref: str, stock_code: str = "") -> bool:
+        self.last_cancel_result = True
+        return True
+
+    def order_id(self, order: OrderEvent) -> str:
+        return "shadow-%s-%s-%s" % (
+            order.stock_code, order.trade_type.value, order.quantity)
+
+    def place_order(self, order: OrderEvent,
+                    price_type: Optional[str] = None) -> Optional[TradeEvent]:
+        """本地撮合：按订单价成交，不触碰内层真实通道。"""
+        price = getattr(order, "price", None)
+        if not price or price <= 0:
+            return None
+        fill_price = Decimal(str(price))
+        amount = fill_price * order.quantity
+        is_sell = order.trade_type.value == "SELL"
+        commission = max(Decimal("5"), amount * Decimal("0.00025"))
+        stamp_duty = (
+            amount * stamp_duty_rate_on(order.bar_time, Decimal("0.0005"))
+            if is_sell else Decimal("0")
+        )
+        transfer_fee = amount * Decimal("0.00001")
+        return TradeEvent(
+            strategy_id=order.strategy_id,
+            portfolio_id=order.portfolio_id,
+            stock_code=order.stock_code,
+            trade_type=order.trade_type,
+            price=fill_price,
+            quantity=order.quantity,
+            amount=amount,
+            commission=commission,
+            stamp_duty=stamp_duty,
+            transfer_fee=transfer_fee,
+            trade_time=order.bar_time,
+            signal_type=order.signal_type,
+            signal_name=order.signal_name,
         )

@@ -42,7 +42,13 @@ def _watchdog(engines, **kw):
     kw.setdefault("now_fn", lambda: NOW)
     kw.setdefault("mono_fn", lambda: 0.0)
     kw.setdefault("snapshot_fn", lambda sid: None)
+    # 默认注入「DB running」：单测不读真实 dev.db，也避免错配自检干扰既有断言
+    kw.setdefault("session_status_fn", lambda sid: "running")
+    # 默认无 DB 启动时刻（错配自愈的「同代」判据恒不满足 → 只告警不杀）
+    kw.setdefault("session_started_at_fn", lambda sid: None)
     kw.setdefault("in_session_fn", lambda dt: True)
+    # 客户端窗口探针注入固定「在线」：单测不依赖本机是否真的开着通达信
+    kw.setdefault("client_online_fn", lambda ch: True)
     # 默认关掉引擎层阈值，避免干扰通道探针断言
     kw.setdefault("timeout_seconds", 10 ** 9)
     kw.setdefault("execution_stall_seconds", 180)
@@ -258,6 +264,37 @@ def test_overnight_gap_not_counted_as_stall():
     assert eng.events == []
 
 
+def test_goldminer_snapshot_stall_alerts_even_if_bridge_online():
+    """掘金行情走 TQ 快照合成：桥心跳正常但快照停摆也必须告警（P1 2026-11-09）。"""
+    eng = _Engine(channel="goldminer_bridge",
+                  started=NOW - timedelta(seconds=900), tick=NOW)
+    eng._snapshot_synth = SimpleNamespace(
+        last_completed_at=NOW - timedelta(seconds=200))
+    wd = _watchdog({1: eng}, market_stall_seconds=180)
+    wd.scan()
+    alerts = _risk(eng, "market_data_stalled")
+    assert len(alerts) == 1
+    assert alerts[0]["basis"] == "snapshot_1m"
+
+
+def test_same_day_start_basis_clamped_to_open_no_0930_false_alarm():
+    """同日起步（09:20 启动）：09:30:30 尚无闭合 1m bar 不得报假警；09:35 真停滞才报。"""
+    started = datetime(2026, 11, 5, 9, 20)
+    early = datetime(2026, 11, 5, 9, 30, 30)
+    eng1 = _Engine(channel="tdx_tq", started=started, tick=early)
+    eng1._snapshot_synth = SimpleNamespace(last_completed_at=None)
+    wd1 = _watchdog({1: eng1}, now_fn=lambda: early, market_stall_seconds=180)
+    wd1.scan()
+    assert _risk(eng1, "market_data_stalled") == []
+
+    late = datetime(2026, 11, 5, 9, 35, 0)
+    eng2 = _Engine(channel="tdx_tq", started=started, tick=late)
+    eng2._snapshot_synth = SimpleNamespace(last_completed_at=None)
+    wd2 = _watchdog({2: eng2}, now_fn=lambda: late, market_stall_seconds=180)
+    wd2.scan()
+    assert len(_risk(eng2, "market_data_stalled")) == 1
+
+
 def test_market_data_recovery_clears_active_alarms():
     """误报解除后 active_alarms 必须清空（面板不挂红标）。"""
     eng = _Engine(channel="tdx_tq", started=NOW - timedelta(seconds=900), tick=NOW)
@@ -266,7 +303,7 @@ def test_market_data_recovery_clears_active_alarms():
     wd = _watchdog({1: eng}, market_stall_seconds=180)
     wd.scan()
     assert wd.status()["active_alarms"] == [
-        {"session_id": 1, "rule": "market_data_stalled"}]
+        {"session_id": 1, "rule": "market_data_stalled", "channel": "tdx_tq"}]
 
     eng._snapshot_synth.last_completed_at = NOW
     wd.scan()
@@ -330,3 +367,234 @@ def test_config_seconds_invalid_falls_back_to_default():
     assert config_seconds(
         "heartbeat_timeout_seconds", 90,
         {"live": {"heartbeat_timeout_seconds": 45}}) == 45
+
+
+# ---------------- 进程/会话状态错配（DB stopped，本进程引擎仍在跑） ----------------
+
+def _running_engine():
+    """引擎处于运行态且行情新鲜，避免其它探针产生告警干扰断言。"""
+    eng = _Engine(channel="tdx_tq", started=NOW - timedelta(seconds=3600), tick=NOW)
+    eng._available_bar = SimpleNamespace(bar_time=NOW, period="1m")
+    return eng
+
+
+def _orphan_engine():
+    """引擎仍在注册表但快照/心跳均已静默（自愈证据充分的那种孤儿）。"""
+    eng = _Engine(channel="tdx_tq", started=NOW - timedelta(seconds=3600),
+                  tick=NOW - timedelta(seconds=900))
+    eng._available_bar = SimpleNamespace(
+        bar_time=NOW - timedelta(seconds=900), period="1m")
+    return eng
+
+
+def test_owner_mismatch_alerts_once_and_persists():
+    eng = _running_engine()
+    persisted = []
+    wd = _watchdog({1: eng}, session_status_fn=lambda sid: "stopped",
+                   persist_fn=lambda **kw: persisted.append(kw))
+    wd.scan()
+
+    alerts = _risk(eng, "engine_owner_mismatch")
+    assert len(alerts) == 1
+    assert alerts[0]["db_status"] == "stopped"
+    assert "进程/会话状态错配" in alerts[0]["message"]
+    assert "pid=" in alerts[0]["message"]
+    assert len(persisted) == 1
+    assert persisted[0]["gate"] == "engine_owner_mismatch"
+    assert persisted[0]["action"] == "trigger"
+    assert wd.status()["owner_mismatch"] == [
+        {"session_id": 1, "db_status": "stopped"}]
+
+    wd.scan()  # 重复周期内不重复 ERROR/落库
+    assert len(_risk(eng, "engine_owner_mismatch")) == 1
+    assert len(persisted) == 1
+
+
+def test_owner_mismatch_stopping_status_also_detected():
+    eng = _running_engine()
+    wd = _watchdog({1: eng}, session_status_fn=lambda sid: "stopping")
+    wd.scan()
+    assert len(_risk(eng, "engine_owner_mismatch")) == 1
+
+
+def test_owner_mismatch_recovers_when_db_running_again():
+    eng = _running_engine()
+    status = {"value": "stopped"}
+    persisted = []
+    wd = _watchdog({1: eng}, session_status_fn=lambda sid: status["value"],
+                   persist_fn=lambda **kw: persisted.append(kw))
+    wd.scan()
+    assert len(_risk(eng, "engine_owner_mismatch")) == 1
+
+    status["value"] = "running"
+    wd.scan()
+    recovered = [e for e in eng.events
+                 if e["type"] == "engine_owner_recovered"]
+    assert len(recovered) == 1
+    assert persisted[-1]["gate"] == "engine_owner_recovered"
+    assert wd.status()["owner_mismatch"] == []
+
+
+def test_owner_mismatch_silenced_by_startup_grace():
+    eng = _Engine(channel="tdx_tq", started=NOW - timedelta(seconds=30), tick=NOW)
+    eng._available_bar = SimpleNamespace(bar_time=NOW, period="1m")
+    wd = _watchdog({1: eng}, session_status_fn=lambda sid: "stopped",
+                   grace_seconds=120)
+    wd.scan()
+    assert eng.events == []
+
+
+def test_owner_mismatch_not_checked_when_engine_stopped():
+    eng = _Engine(channel="tdx_tq", started=NOW - timedelta(seconds=3600),
+                  tick=NOW, running=False)
+    wd = _watchdog({1: eng}, session_status_fn=lambda sid: "stopped")
+    wd.scan()
+    assert eng.events == []
+
+
+def test_owner_mismatch_status_probe_failure_is_ignored():
+    eng = _running_engine()
+
+    def boom(sid):
+        raise RuntimeError("db down")
+
+    wd = _watchdog({1: eng}, session_status_fn=boom)
+    wd.scan()
+    assert _risk(eng, "engine_owner_mismatch") == []
+
+
+def test_process_tag_contains_pid():
+    from core.runtime import process_tag
+    tag = process_tag()
+    assert tag.startswith("pid=")
+    assert "port=" in tag
+
+
+# ---------------- 错配自愈（仅在注入 unregister_fn 的生产路径启用） ----------------
+
+def test_owner_mismatch_self_heal_stops_and_unregisters():
+    engines = {}
+    eng = _orphan_engine()
+    eng._stop_requested = False
+    engines[1] = eng
+    unregistered = []
+
+    def unregister(sid):
+        unregistered.append(sid)
+        engines.pop(sid, None)
+
+    wd = _watchdog(engines, session_status_fn=lambda sid: "stopped",
+                   session_started_at_fn=lambda sid: eng._started_at,
+                   timeout_seconds=90,
+                   unregister_fn=unregister)
+    wd.scan()
+
+    assert eng._running is False          # 循环下一拍退出
+    assert eng._stop_requested is True    # 拒单闸同步关闭
+    assert unregistered == [1]
+    assert 1 not in engines
+    assert len(_risk(eng, "engine_owner_mismatch")) == 1
+
+    wd.scan()  # 已移出注册表：不重复告警、不残留错配态
+    assert len(_risk(eng, "engine_owner_mismatch")) == 1
+    assert wd.status()["owner_mismatch"] == []
+
+
+def test_owner_mismatch_no_self_heal_without_unregister():
+    """默认（未注入 unregister_fn）只告警，不动引擎——保持既有语义/单测安全。"""
+    eng = _running_engine()
+    wd = _watchdog({1: eng}, session_status_fn=lambda sid: "stopped")
+    wd.scan()
+    assert eng._running is True
+    assert len(_risk(eng, "engine_owner_mismatch")) == 1
+
+
+def test_owner_mismatch_fresh_activity_skips_self_heal():
+    """DB 已停 + 引擎健在 + 快照新鲜 → 证据不足，只告警不自愈（2026-11-19 错杀回归）。
+
+    事故形态：DB 被写成 stopped，引擎仍在每 5s 落快照。此时看门狗若照旧按
+    DB 一行 stopped 就杀引擎，等于盘中掐断健在的交易链路。
+    """
+    engines = {}
+    eng = _running_engine()          # 心跳/行情新鲜
+    engines[1] = eng
+    unregistered = []
+    persisted = []
+
+    def unregister(sid):
+        unregistered.append(sid)
+        engines.pop(sid, None)
+
+    wd = _watchdog(engines, session_status_fn=lambda sid: "stopped",
+                   session_started_at_fn=lambda sid: eng._started_at,
+                   snapshot_fn=lambda sid: NOW - timedelta(seconds=5),
+                   timeout_seconds=90,
+                   unregister_fn=unregister,
+                   persist_fn=lambda **kw: persisted.append(kw))
+    wd.scan()
+
+    assert eng._running is True            # 不杀健在引擎
+    assert unregistered == []
+    assert 1 in engines
+    alerts = _risk(eng, "engine_owner_mismatch")
+    assert len(alerts) == 1
+    assert "证据不足，跳过自愈" in alerts[0]["message"]
+    assert alerts[0]["self_heal"] is False
+    # 告警仍落库（让用户看到错配），只是不执行自愈
+    assert len(persisted) == 1
+    assert persisted[0]["gate"] == "engine_owner_mismatch"
+
+    wd.scan()  # 继续保持新鲜 → 仍不杀
+    assert eng._running is True
+    assert unregistered == []
+
+
+def test_owner_mismatch_different_generation_skips_self_heal():
+    """引擎与 DB started_at 不同代（DB 是上一次启动/另一代）→ 证据不足不杀。"""
+    engines = {}
+    eng = _orphan_engine()
+    engines[1] = eng
+    unregistered = []
+    wd = _watchdog(engines, session_status_fn=lambda sid: "stopped",
+                   session_started_at_fn=lambda sid: NOW - timedelta(seconds=300),
+                   timeout_seconds=90,
+                   unregister_fn=lambda sid: unregistered.append(sid))
+    wd.scan()
+    assert eng._running is True
+    assert unregistered == []
+    assert "不同代" in _risk(eng, "engine_owner_mismatch")[0]["message"]
+
+
+def test_owner_mismatch_self_heal_unregister_failure_is_tolerated():
+    eng = _orphan_engine()
+
+    def boom(sid):
+        raise RuntimeError("registry busy")
+
+    wd = _watchdog({1: eng}, session_status_fn=lambda sid: "stopped",
+                   session_started_at_fn=lambda sid: eng._started_at,
+                   timeout_seconds=90,
+                   unregister_fn=boom)
+    wd.scan()  # 不抛异常；标志已置，告警仍留痕
+    assert eng._running is False
+    assert len(_risk(eng, "engine_owner_mismatch")) == 1
+
+
+def test_owner_mismatch_stale_snapshot_after_registry_pop_is_ignored():
+    """stop_session 先 pop 注册表再 commit：扫描快照取到旧引擎不应判错配。"""
+    eng = _running_engine()
+    calls = {"n": 0}
+    live = {1: eng}
+
+    def provider():
+        calls["n"] += 1
+        return dict(live) if calls["n"] == 1 else {}
+
+    wd = EngineWatchdog(
+        provider, now_fn=lambda: NOW, mono_fn=lambda: 0.0,
+        snapshot_fn=lambda sid: None, session_status_fn=lambda sid: "stopping",
+        in_session_fn=lambda dt: True, client_online_fn=lambda ch: True,
+        timeout_seconds=10 ** 9, grace_seconds=120)
+    wd.scan()
+    assert _risk(eng, "engine_owner_mismatch") == []
+    assert eng._running is True

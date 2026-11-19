@@ -15,8 +15,14 @@
 """
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
+import json
+import re
 
 from core.models import PortfolioStrategy, Strategy
+from core.engine.market_gate import parse_gate_indices
+
+_GATE_INDEX_RE = re.compile(r"^[0-9A-Za-z]{6}\.[A-Za-z]{2,4}$")
+MAX_GATE_INDICES = 10
 
 
 def serialize_strategy(s: Strategy) -> dict:
@@ -47,6 +53,8 @@ def serialize_strategy(s: Strategy) -> dict:
         "regime_filter_enabled": bool(s.regime_filter_enabled) if s.regime_filter_enabled is not None else False,
         "trend_trailing_stop_ratio": float(s.trend_trailing_stop_ratio) if s.trend_trailing_stop_ratio is not None else None,
         "trend_max_positions": s.trend_max_positions,
+        # E3 策略级门控覆盖（默认 inherit=跟随组合）
+        "market_gate_mode": getattr(s, "market_gate_mode", None) or "inherit",
         # #3 策略级敞口上限（默认关）
         "exposure_cap_enabled": bool(s.exposure_cap_enabled) if s.exposure_cap_enabled is not None else False,
         # 策略级单笔最大买入金额（元，None=不限）
@@ -56,6 +64,16 @@ def serialize_strategy(s: Strategy) -> dict:
         "requote_max_attempts": s.requote_max_attempts if s.requote_max_attempts is not None else 2,
         "split_order_enabled": bool(s.split_order_enabled) if s.split_order_enabled is not None else False,
         "split_order_threshold": float(s.split_order_threshold) if s.split_order_threshold is not None else 500000.0,
+        # H3/H4 切片与自适应追价
+        "split_order_count": s.split_order_count,
+        "split_order_min_qty": s.split_order_min_qty,
+        "split_order_interval_seconds": s.split_order_interval_seconds,
+        "split_order_interval_jitter": bool(s.split_order_interval_jitter),
+        "split_order_volume_pct": s.split_order_volume_pct,
+        "requote_price_mode": s.requote_price_mode or "tick",
+        "requote_max_slippage_ticks": (
+            s.requote_max_slippage_ticks
+            if s.requote_max_slippage_ticks is not None else 5),
         "risk_timing": s.risk_timing or "next_day",
         "signal_frequency": s.signal_frequency,
         "signal_at": s.signal_at,
@@ -85,9 +103,11 @@ def serialize_portfolio(db: Session, p: PortfolioStrategy) -> dict:
         "buy_commission_rate": float(p.buy_commission_rate) if p.buy_commission_rate is not None else None,
         "sell_commission_rate": float(p.sell_commission_rate) if p.sell_commission_rate is not None else None,
         "stamp_duty_rate": float(p.stamp_duty_rate) if p.stamp_duty_rate is not None else None,
+        "transfer_fee_rate": float(p.transfer_fee_rate) if p.transfer_fee_rate is not None else 0.00001,
+        "risk_cooldown_days": int(p.risk_cooldown_days) if p.risk_cooldown_days is not None else 1,
         "slippage": float(p.slippage) if p.slippage is not None else None,
         "trading_session": p.trading_session,
-        "price_limit_check_enabled": bool(p.price_limit_check_enabled) if p.price_limit_check_enabled is not None else False,
+        "price_limit_check_enabled": bool(p.price_limit_check_enabled) if p.price_limit_check_enabled is not None else True,
         "volume_limit_enabled": bool(p.volume_limit_enabled) if p.volume_limit_enabled is not None else False,
         "volume_limit_ratio": float(p.volume_limit_ratio) if p.volume_limit_ratio is not None else 0.10,
         "adaptive_slippage_enabled": bool(p.adaptive_slippage_enabled) if p.adaptive_slippage_enabled is not None else False,
@@ -103,11 +123,48 @@ def serialize_portfolio(db: Session, p: PortfolioStrategy) -> dict:
             if p.cash_enhance_position_ratio_threshold is not None else None
         ),
         "equity_cap": (float(p.equity_cap) if p.equity_cap is not None else None),
+        # 实盘单票上限 / 现金下限：NULL=不限制，原样回给前端（百分比由前端换算）
+        "max_single_position_pct": (
+            float(p.max_single_position_pct)
+            if p.max_single_position_pct is not None else None
+        ),
+        "min_cash_reserve_pct": (
+            float(p.min_cash_reserve_pct)
+            if p.min_cash_reserve_pct is not None else None
+        ),
+        # 市场多空门控（2026-11-18）：开关 + 通道 + 公式名（NULL 归一成空串给前端）
+        "market_gate_enabled": bool(p.market_gate_enabled) if p.market_gate_enabled is not None else False,
+        "market_gate_engine": p.market_gate_engine or "python",
+        "market_gate_formula_name": p.market_gate_formula_name or "",
+        # E3 门控维度扩展（默认值=旧语义）：多指数投票 / 强度门槛 / 空头减仓
+        "market_gate_indices": parse_gate_indices(
+            getattr(p, "market_gate_indices", None)),
+        "market_gate_vote_mode": getattr(p, "market_gate_vote_mode", None) or "any",
+        "market_gate_strength_threshold": int(
+            getattr(p, "market_gate_strength_threshold", 0) or 0),
+        "market_gate_bear_reduce_ratio": float(
+            getattr(p, "market_gate_bear_reduce_ratio", 0) or 0),
+        # 公司行为（2026-11-18，J1/J2）：总开关 + 再投资 + 停牌处置 + 退市强平
+        "corporate_actions_enabled": bool(p.corporate_actions_enabled),
+        "dividend_reinvest_enabled": bool(p.dividend_reinvest_enabled),
+        "suspension_dispose_days": int(p.suspension_dispose_days or 0),
+        "delist_force_close_enabled": bool(p.delist_force_close_enabled),
+        # 时点股票池（2026-11-18，J7）：按生效区间判定成分，只拦开仓/加仓
+        "pool_pit_enabled": bool(p.pool_pit_enabled),
+        "breaker_action": getattr(p, "breaker_action", None) or "halt",
+        # A2 跨组合下单优先级（数值越大越先处理；默认 0）
+        "priority": int(getattr(p, "priority", 0) or 0),
         "status": p.status,
         "created_at": p.created_at,
         "updated_at": p.updated_at,
         "strategies": [serialize_strategy(s) for s in subs],
     }
+
+
+def _field_sent(req, name: str) -> bool:
+    """请求是否显式携带该字段（pydantic v2 model_fields_set；假对象按携带处理）。"""
+    fields_set = getattr(req, "model_fields_set", None)
+    return True if fields_set is None else name in fields_set
 
 
 def _apply_portfolio_fields(p: PortfolioStrategy, req) -> None:
@@ -122,7 +179,17 @@ def _apply_portfolio_fields(p: PortfolioStrategy, req) -> None:
     p.buy_commission_rate = req.buy_commission_rate
     p.sell_commission_rate = req.sell_commission_rate
     p.stamp_duty_rate = req.stamp_duty_rate
+    # 过户费：None=请求未填 → 默认 0.001%/边；显式 0 是合法配置，必须原样落库
+    p.transfer_fee_rate = (
+        0.00001
+        if getattr(req, "transfer_fee_rate", None) is None
+        else req.transfer_fee_rate
+    )
     p.slippage = req.slippage
+    # 风控冷静期（默认 1）：None=请求未携带 → 不动已有值（新建由 ORM/server 默认兜底）；
+    # 0=显式关闭（等价改动前行为），按值落库不偷改。
+    if getattr(req, "risk_cooldown_days", None) is not None:
+        p.risk_cooldown_days = max(0, int(req.risk_cooldown_days))
     p.trading_session = req.trading_session
     p.status = req.status
     # #1 涨跌停约束：None（请求未携带）不动已有值——编辑旧组合不偷改开关；
@@ -155,8 +222,76 @@ def _apply_portfolio_fields(p: PortfolioStrategy, req) -> None:
     if getattr(req, "cash_enhance_position_ratio_threshold", None) is not None:
         p.cash_enhance_position_ratio_threshold = (
             req.cash_enhance_position_ratio_threshold)
-    # W3 容量上限（可选，None=不设上限）
-    p.equity_cap = getattr(req, "equity_cap", None)
+    # W3 容量上限（可选，None=不设上限）。前端只在「仓位模型=dynamic」时携带该字段，
+    # 切到 fixed 保存时字段缺失——此时必须保留已有值，否则再切回 dynamic 上限已被清空。
+    if _field_sent(req, "equity_cap"):
+        p.equity_cap = getattr(req, "equity_cap", None)
+    # 实盘单票上限 / 现金下限（NULL=不限制）：显式携带才落库，未携带不动；0 归一为 NULL
+    for _k in ("max_single_position_pct", "min_cash_reserve_pct"):
+        if _field_sent(req, _k):
+            _v = getattr(req, _k, None)
+            setattr(p, _k, None if not _v else _v)
+    # 市场多空门控（2026-11-18）：None=请求未携带 → 不动已有值（与相邻开关口径一致，
+    # 前端隐藏字段不 put 时不会把已有配置清掉）
+    if getattr(req, "market_gate_enabled", None) is not None:
+        p.market_gate_enabled = bool(req.market_gate_enabled)
+    if getattr(req, "market_gate_engine", None) is not None:
+        p.market_gate_engine = req.market_gate_engine
+    if getattr(req, "market_gate_formula_name", None) is not None:
+        p.market_gate_formula_name = req.market_gate_formula_name or None
+    # E3 门控维度扩展：None=请求未携带 → 不动已有值；显式空列表/0 是合法配置
+    if _field_sent(req, "market_gate_indices"):
+        codes = parse_gate_indices(getattr(req, "market_gate_indices", None))
+        if len(codes) > MAX_GATE_INDICES:
+            raise ValueError("market_gate_indices 最多 %d 个指数" % MAX_GATE_INDICES)
+        bad = [c for c in codes if not _GATE_INDEX_RE.match(c)]
+        if bad:
+            raise ValueError(
+                "market_gate_indices 代码格式需为 XXXXXX.XX：%s" % ", ".join(bad))
+        p.market_gate_indices = (
+            json.dumps(codes, ensure_ascii=False) if codes else None)
+    if getattr(req, "market_gate_vote_mode", None) is not None:
+        mode = str(req.market_gate_vote_mode).strip().lower()
+        if mode not in ("any", "majority", "all"):
+            raise ValueError("market_gate_vote_mode 需为 any/majority/all")
+        p.market_gate_vote_mode = mode
+    if getattr(req, "market_gate_strength_threshold", None) is not None:
+        threshold = int(req.market_gate_strength_threshold)
+        if not (0 <= threshold <= 100):
+            raise ValueError("market_gate_strength_threshold 需在 [0, 100]")
+        p.market_gate_strength_threshold = threshold
+    if getattr(req, "market_gate_bear_reduce_ratio", None) is not None:
+        ratio = float(req.market_gate_bear_reduce_ratio)
+        if not (0 <= ratio <= 1):
+            raise ValueError("market_gate_bear_reduce_ratio 需在 [0, 1]")
+        p.market_gate_bear_reduce_ratio = ratio
+    # 公司行为（2026-11-18，J1/J2）：None=请求未携带 → 不动已有值（前端隐藏字段
+    # 不提交时不会把已有配置清掉）；显式 False/0 是合法配置，按值落库。
+    if getattr(req, "corporate_actions_enabled", None) is not None:
+        p.corporate_actions_enabled = bool(req.corporate_actions_enabled)
+    if getattr(req, "dividend_reinvest_enabled", None) is not None:
+        p.dividend_reinvest_enabled = bool(req.dividend_reinvest_enabled)
+    if getattr(req, "suspension_dispose_days", None) is not None:
+        p.suspension_dispose_days = max(0, int(req.suspension_dispose_days))
+    if getattr(req, "delist_force_close_enabled", None) is not None:
+        p.delist_force_close_enabled = bool(req.delist_force_close_enabled)
+    # 时点股票池（2026-11-18，J7）：None=请求未携带 → 不动已有值；显式 False 合法
+    if getattr(req, "pool_pit_enabled", None) is not None:
+        p.pool_pit_enabled = bool(req.pool_pit_enabled)
+    if getattr(req, "breaker_action", None) is not None:
+        action = str(req.breaker_action).strip().lower()
+        if action not in ("notify", "halt", "half", "liquidate"):
+            raise ValueError("breaker_action 需为 notify/halt/half/liquidate")
+        p.breaker_action = action
+    # A2 跨组合下单优先级：显式值才改（-1000..1000，防脏值影响排序）
+    if getattr(req, "priority", None) is not None:
+        try:
+            prio = int(req.priority)
+        except (TypeError, ValueError):
+            raise ValueError("priority 需为整数")
+        if not (-1000 <= prio <= 1000):
+            raise ValueError("priority 需在 [-1000, 1000]")
+        p.priority = prio
 
 
 def _create_strategies_two_step(db: Session, pid: int, strategies: list) -> None:
@@ -181,12 +316,20 @@ def _create_strategies_two_step(db: Session, pid: int, strategies: list) -> None
             regime_filter_enabled=getattr(s, "regime_filter_enabled", False),
             trend_trailing_stop_ratio=getattr(s, "trend_trailing_stop_ratio", None),
             trend_max_positions=getattr(s, "trend_max_positions", None),
+            market_gate_mode=getattr(s, "market_gate_mode", "inherit") or "inherit",
             exposure_cap_enabled=getattr(s, "exposure_cap_enabled", False),
             max_order_amount=getattr(s, "max_order_amount", None),
             requote_enabled=getattr(s, "requote_enabled", False),
             requote_max_attempts=getattr(s, "requote_max_attempts", 2),
+            requote_price_mode=getattr(s, "requote_price_mode", None) or "tick",
+            requote_max_slippage_ticks=getattr(s, "requote_max_slippage_ticks", 5) or 5,
             split_order_enabled=getattr(s, "split_order_enabled", False),
             split_order_threshold=getattr(s, "split_order_threshold", 500000.0),
+            split_order_count=getattr(s, "split_order_count", None),
+            split_order_min_qty=getattr(s, "split_order_min_qty", None),
+            split_order_interval_seconds=getattr(s, "split_order_interval_seconds", None),
+            split_order_interval_jitter=getattr(s, "split_order_interval_jitter", False),
+            split_order_volume_pct=getattr(s, "split_order_volume_pct", None),
             risk_timing=getattr(s, "risk_timing", None) or "next_day",
             signal_frequency=getattr(s, "signal_frequency", None),
             signal_at=getattr(s, "signal_at", None),
@@ -314,6 +457,13 @@ def _apply_strategy_fields(s: Strategy, req, is_update: bool = False) -> None:
     _apply_opt("regime_filter_enabled", False)
     _apply_opt("trend_trailing_stop_ratio", None)
     _apply_opt("trend_max_positions", None)
+    # E3 策略级门控覆盖（inherit/off/on；缺省字段回落 inherit，旧请求行为不变）
+    _mode = getattr(req, "market_gate_mode", None)
+    if _mode is not None:
+        _mode = str(_mode).strip().lower()
+        if _mode not in ("inherit", "off", "on"):
+            raise ValueError("market_gate_mode 需为 inherit/off/on")
+    s.market_gate_mode = _mode or "inherit"
     # #3 策略级敞口上限（默认关；缺省字段回落 False，保持旧请求行为不变）
     s.exposure_cap_enabled = getattr(req, "exposure_cap_enabled", False)
     # 单笔最大买入金额（None=不限；缺省字段回落 None，保持旧请求行为不变）
@@ -323,6 +473,14 @@ def _apply_strategy_fields(s: Strategy, req, is_update: bool = False) -> None:
     s.requote_max_attempts = getattr(req, "requote_max_attempts", 2)
     s.split_order_enabled = getattr(req, "split_order_enabled", False)
     s.split_order_threshold = getattr(req, "split_order_threshold", 500000.0)
+    # H3/H4：None 表示沿用默认推导（切片笔数/最小量/间隔/量比）
+    s.split_order_count = getattr(req, "split_order_count", None)
+    s.split_order_min_qty = getattr(req, "split_order_min_qty", None)
+    s.split_order_interval_seconds = getattr(req, "split_order_interval_seconds", None)
+    s.split_order_interval_jitter = getattr(req, "split_order_interval_jitter", False)
+    s.split_order_volume_pct = getattr(req, "split_order_volume_pct", None)
+    s.requote_price_mode = getattr(req, "requote_price_mode", None) or "tick"
+    s.requote_max_slippage_ticks = getattr(req, "requote_max_slippage_ticks", 5) or 5
     s.risk_timing = getattr(req, "risk_timing", None) or "next_day"
     s.signal_frequency = getattr(req, "signal_frequency", None)
     s.signal_at = getattr(req, "signal_at", None)

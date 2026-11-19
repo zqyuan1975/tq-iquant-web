@@ -25,7 +25,7 @@ from core.engine.position import Position  # noqa: F401
 from core.engine.risk_manager import PortfolioRiskManager, StrategyRiskManager
 from core.engine.strategy_context import StrategyContext
 from core.engine.ths_ui_dispatcher import ThsUiDispatcher
-from core.models import LiveOrder
+from core.models import LiveDecisionEvent, LiveOrder
 from tq_iquant_shared.constants import SignalType, TradeType
 
 STOCK = "600000.SH"
@@ -240,11 +240,23 @@ def test_handle_bar_file_mode_order_stays_submitted(tmp_path):
 
 
 def test_handle_bar_stale_enqueue_marker_not_treated_as_enqueued(tmp_path):
-    """上一单的入队标记残留不能把本次审批失败误判成「已入队」。
+    """同一 bar 重复派发被 bar 级持久幂等拦回：残留入队标记不产生第二单、不被误读。
 
-    file 模式 last_enqueued_order_id 是 dispatcher 实例状态：若本次 execute 在前置
-    审批就失败（place_order 根本没被调用），标记仍是上一单的 oid。同一 bar 同形状
-    重下（order_id 相同）时，旧逻辑会把本次判为 submitted 留在途，实际指令没入队。
+    现行契约（`live_bar_order_marks`）：同一
+    (session/组合/策略/代码/bar_time/方向/seq) 历史上提交过一次即视为该 bar 已处理，
+    **不看订单当前终态**。因此「原单 canceled 后同一 bar 同形状重下」这个前提本身
+    已不成立：内存在途清空、DB 行改 canceled 之后再次派发同一根 bar，会在闸门链的
+    `bar_processed` 门被挡回——既不落第二行，也走不到
+    `last_enqueued_order_id` 的「本次是否入队」比对。
+
+    本用例守护三件事（而不是旧版那个已失效的「第二单 = rejected/approval failed」）：
+    1. file 模式 dispatcher 的 `last_enqueued_order_id` 残留值只是实例状态，它既
+       不会让重复派发产生单据，也不可能被当成「本次已入队」——重复派发到不了那段
+       比对，误判风险在源头被消除；
+    2. 重复派发不产生第二单、不动原单终态（不复活 canceled、不污染 DB/在途集合），
+       且完全不触达 `execute`/`place_order`（没有重下）；
+    3. 拦截原因可审计：落的是 `bar_processed` 决策事件（bar 级幂等），而非
+       approval / dup_skip。
     """
     factory, _ = _db_factory()
     port, _ = _portfolio_single()
@@ -259,20 +271,30 @@ def test_handle_bar_stale_enqueue_marker_not_treated_as_enqueued(tmp_path):
     stale_oid = disp.last_enqueued_order_id
     assert stale_oid == first.bridge_order_id
 
-    # 模拟第一单已被超时收割（canceled），内存在途集合清空；本次发单前置审批失败
+    # 模拟第一单已被超时收割（canceled），内存在途集合清空
     first.status = "canceled"
     db.commit()
     with engine._book_lock:
         engine._pending_orders.clear()
-    engine._engine.execute = lambda *a, **k: None
+    # 若重复派发真的走到发桥这一段，这里会被记录（现行契约下应当一次都不触达）
+    executed = []
+
+    def _execute(*args, **kwargs):
+        executed.append(args)
+        return None
+
+    engine._engine.execute = _execute
 
     engine._handle_bar(port, bar)
 
     rows = db.query(LiveOrder).order_by(LiveOrder.id).all()
-    assert len(rows) == 2
-    assert rows[1].status == "rejected"
-    assert rows[1].error_message == "approval failed"
-    assert disp.last_enqueued_order_id == stale_oid  # 本次未真正入队
+    assert len(rows) == 1                    # bar 级幂等：不产生第二单
+    assert rows[0].status == "canceled"      # 原单终态不被复活/改写
+    assert rows[0].error_message is None
+    assert executed == []                    # 未触达 execute/place_order（无重下）
+    assert disp.last_enqueued_order_id == stale_oid  # 残留标记未被消费、未被误读
+    gates = [e.gate for e in db.query(LiveDecisionEvent).all()]
+    assert "bar_processed" in gates          # 可审计：拦截原因是 bar 级幂等
     db.close()
     disp.close()
 
@@ -426,6 +448,93 @@ def test_tick_deals_receipt_matches_by_entry_shape_fallback(tmp_path):
     lo = db.query(LiveOrder).one()
     assert lo.status == "rejected"
     assert lo.error_message == "ths ui busy"
+    db.close()
+    disp.close()
+
+
+# ---------------- P0-1：accepted 回执按真实提交量修正账本 ----------------
+
+def _enqueue_accept(disp, entry, ref="300001", final_qty=300):
+    """模拟内置执行器成功：accepted 回执（ref + 钳量后的 final_qty）待引擎消费。"""
+    with disp._rejects_lock:
+        disp._file_accepts[str(entry["order_id"])] = {
+            "ref": ref,
+            "final_qty": final_qty,
+            "ts": now_shanghai().isoformat(timespec="seconds"),
+            "entry": dict(entry),
+        }
+
+
+def test_tick_deals_accept_receipt_applies_final_qty(tmp_path):
+    """accepted 回执 final_qty(300) ≠ 审批量(600) → 订单委托量改写为 300、
+    保持 submitted、记 risk(channel_qty_clamped)；随后成交回填按 300 判 filled
+    并更新持仓/虚拟现金（按成交成本），不再「引擎以为没买、实际已买」。"""
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single()
+    engine, disp = _ths_engine(factory, port, tmp_path)
+    engine.signal_cache = {(1, STOCK, BAR_TIME): [{"name": "open_sig", "value": 1}]}
+    engine._handle_bar(port, _bar(STOCK, "9.3", BAR_TIME))
+
+    db = factory()
+    lo = db.query(LiveOrder).one()
+    assert lo.quantity == 600
+    oid, lo_id = lo.bridge_order_id, lo.id
+    db.close()
+
+    _enqueue_accept(disp, {
+        "order_id": oid, "stock_code": STOCK, "direction": "BUY",
+        "quantity": 600, "price": 9.3,
+    }, final_qty=300)
+
+    q = _drain_order_events(engine)
+    engine._tick_deals()
+
+    db = factory()
+    lo = db.query(LiveOrder).filter(LiveOrder.id == lo_id).one()
+    assert lo.quantity == 300        # 以真实提交量为准
+    assert lo.status == "submitted"
+    assert lo.order_ref == "300001"  # 回执自带合同编号 → 免再走模糊认领
+    db.close()
+    assert engine._pending_orders[lo_id].quantity == 300  # 在途闸按真实量占用
+
+    events = []
+    while not q.empty():
+        events.append(q.get_nowait())
+    risk = [e for e in events if e.get("type") == "risk"]
+    assert len(risk) == 1
+    assert risk[0]["rule"] == "channel_qty_clamped"
+    assert risk[0]["engine_quantity"] == 600
+    assert risk[0]["final_quantity"] == 300
+    disp.close()
+
+
+def test_tick_deals_accept_receipt_matches_claimed_order(tmp_path):
+    """accepted 回执晚于认领到达（order_ref 已非空）仍能匹配并修正数量。"""
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single()
+    engine, disp = _ths_engine(factory, port, tmp_path)
+    engine.signal_cache = {(1, STOCK, BAR_TIME): [{"name": "open_sig", "value": 1}]}
+    engine._handle_bar(port, _bar(STOCK, "9.3", BAR_TIME))
+
+    db = factory()
+    lo = db.query(LiveOrder).one()
+    oid, lo_id = lo.bridge_order_id, lo.id
+    lo.order_ref = "EARLY-REF"
+    db.commit()
+    db.close()
+
+    _enqueue_accept(disp, {
+        "order_id": oid, "stock_code": STOCK, "direction": "BUY",
+        "quantity": 600, "price": 9.3,
+    }, ref="EARLY-REF", final_qty=300)
+
+    engine._tick_deals()
+
+    db = factory()
+    lo = db.query(LiveOrder).filter(LiveOrder.id == lo_id).one()
+    assert lo.quantity == 300
+    assert lo.order_ref == "EARLY-REF"   # 不覆盖既有认领结果
+    assert lo.status == "submitted"
     db.close()
     disp.close()
 

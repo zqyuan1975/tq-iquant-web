@@ -26,6 +26,7 @@ from typing import Callable, Dict, List, Optional
 
 from ..event import BarEvent
 from ..http_bridge_dispatcher import BridgeUnavailableError
+from ...tq.utils import TDXLockTimeout
 from ..bar_poller import parse_bar_time, to_ohlcv, latest_completed_bar
 from ..portfolio import Portfolio
 from .context import EngineContext
@@ -38,6 +39,13 @@ _FORMULA_META_KEYS = ("Date", "ErrorId", "Error", "Time")
 
 # C6(C)：1w/1mon 走通达信启动/日终注入（桥端 xtdata 拉不到），_fill_signal_cache 跳过不拉桥
 _STARTUP_ONLY_PERIODS = ("1w", "1mon")
+
+# 周期边界新鲜度闸覆盖的直取周期：手册（TQ 1.3.1）get_market_data 本地模式
+# 「周期数据个数=客户端盘后下载的数据个数」「分钟线需 Level2」，且 refresh_kline
+# 「盘中下载 1m/5m 只能到上个交易日」——盘中直取可能拿到上一交易日的完成 bar。
+# 1m 走快照合成（deferred 放行时钟依赖，不在此闸）；1d 由 daily_closer 同口径校验；
+# 1w/1mon 属启动注入，均不改。
+_FRESHNESS_GATED_PERIODS = ("5m", "15m", "30m", "1h")
 
 
 class MarketDataService:
@@ -52,14 +60,27 @@ class MarketDataService:
         formula_by_strategy: Optional[Dict[int, str]] = None,
         formula_count: int = 200,
         formula_count_by_name: Optional[Dict[str, int]] = None,
+        emit_risk: Optional[Callable[[dict], None]] = None,
+        snapshot_synth=None,
     ) -> None:
         self.ctx = ctx
         self._bar_poller = bar_poller
+        # 快照合成器（1m → 5m/15m/30m/1h 聚合兜底）：TQ 本地分钟线盘中只到上一交易日，
+        # 新鲜度闸会把多分钟策略整日拦死。显式传入优先；未传时从 BarPoller 的合成适配器
+        # 自动发现（tdx/ths/alert/goldminer 的 bar_poller._dispatcher 就是
+        # SnapshotQuoteDispatcher）——因此 LiveEngine 无需改动即可启用兜底。
+        if snapshot_synth is None:
+            _poller_dispatcher = getattr(bar_poller, "_dispatcher", None)
+            snapshot_synth = getattr(_poller_dispatcher, "synthesizer", None)
+        self._snapshot_synth = snapshot_synth
         # 驱动一根 bar 的 on_bar 管线（引擎传入 self._handle_bar 绑定方法）；本服务
         # 不反向 import LiveEngine，周期/日终 bar 经此回调交回引擎完成下单/风控。
         self._on_bar = on_bar
         # F5：桥可用持仓刷新后写回 T+1 检查器的窄回调（LiveT1Checker.set_available_map）。
         self._set_available_map = set_available_map
+        # risk 事件出口（引擎传入 self._emit_risk_safe）：新鲜度闸跳过时发可观测事件，
+        # 避免静默丢边界；为空（单测直连/无引擎）时只记日志。
+        self._emit_risk = emit_risk
 
         # 公式注入（0010）：tq_formula 封装内存注入链路；formula_by_strategy 预加载
         # {strategy_id: formula_name}，避免每 bar 查库；formula_count 为注入历史根数
@@ -201,7 +222,7 @@ class MarketDataService:
         stimes = [t for t in stimes if t is not None]
         return max(stimes) if stimes else None
 
-    def dispatch_period_bar(self, period: str, boundary_time: datetime) -> None:
+    def dispatch_period_bar(self, period: str, boundary_time: datetime) -> str:
         """C6(A) 边界分发：period 边界到（1m stime 判定）→ 拉该周期 bar → 注入 → 驱动该周期策略。
 
         对每 code 拉 query_quote(period, count=formula_count) 一次，既供公式注入又供 BarEvent。
@@ -209,20 +230,47 @@ class MarketDataService:
         （bar_time=boundary_time，与 1m 节拍对齐）——不用 forming 最新一根（未来函数）。
         桥拉取抛 BridgeUnavailableError → 向上传播由 _on_bar 置离线。无完成 bar 的 code 跳过。
 
+        新鲜度闸（5m/15m/30m/1h）：手册 TQ 1.3.1 允许本地模式分钟线停在上一交易日
+        （refresh_kline：盘中下载 1m/5m 只能到上个交易日），直取拿到的「最新完成 bar」
+        可能不是当日。此处校验其 stime 交易日 == boundary_time 当日（1m 边界由上海时间
+        驱动，实盘即今日），不等则**跳过该 code 不派发**（fail-safe，绝不用旧 bar 触发），
+        记 WARNING + risk 事件（gate=period_bar_freshness）；全部 code 被拦返回 "stale"，
+        由引擎登记待补偿，后续拿到当日 bar 再派发。
+        1m（快照合成）/1d（daily_closer 同口径闸）/1w·1mon（启动注入）不走此闸。
+
+        聚合兜底：被闸拦下的 code 若有当前当日快照合成的 1m bar，用
+        ``SnapshotBarSynthesizer.aggregated_bars`` 聚合出本周期 bar 派发（open=首根、
+        close=末根、high/low=极值、volume=累加，只取完整桶），并在 risk 事件
+        ``gate=period_bar_fallback`` 中标注 ``source=aggregated_1m``；仍拿不到当日
+        完整桶的 code 继续按 ``period_bar_freshness`` 告警。
+
+        返回："dispatched"（至少一只 code 派发成功）/ "stale"（全部被新鲜度闸拦下，可补偿）/
+        "empty"（有该周期策略但一只 code 都取不到可用 bar，可补偿）/ "no_strategy"
+        （实例无该周期策略，无事可做，不进补偿）。
+
         周期 guard：periods_on_boundary 是纯算术（minute%15==0 等），不查实例有无该周期策略，
         会带出实例无人用的周期（如 14:30 的 15m）。此处按 _strategy_periods 过滤——实例无该
         周期策略直接 return，避免白拉（拉完 period 过滤全跳过，不出单纯浪费）。
+
+        P1#6（2026-11-16）：旧实现把「无该周期策略」与「全部 code 取不到 bar」都返回
+        "empty"，引擎只对 "stale" 挂待补偿 → TQ 偶发返回空时该 5m/15m/30m/1h 边界当日
+        永久丢失。现在无策略返回 "no_strategy"，"empty" 只表示可补偿的「暂无数据」。
         """
         if period not in self._strategy_periods:
-            return
+            return "no_strategy"
+        gate_freshness = period in _FRESHNESS_GATED_PERIODS
+        today = boundary_time.date()
         bars_by_code: Dict[str, list] = {}
         stocks: Dict[str, dict] = {}
+        stale: List[tuple] = []  # [(code, bar_time)]：最新完成 bar 非当日，被闸拦下
+        cp_counts: Dict[str, int] = {}
         # C4(#28)：预拉 count = 该周期策略最大 formula_count（够最长公式，注入不欠历史）
         count = self._period_count.get(period, self._formula_count)
         for code in self._bar_poller.stock_codes:
             # 按 (code, period) 取该股票该周期所需根数（比全局 _period_count 更细，按需）。
             # 走预热缓存 + 增量拼接（省去每边界全量重拉 count 根）。
             cp_count = self.ctx.code_period_count.get((code, period), count)
+            cp_counts[code] = cp_count
             bars = self.get_bars_with_increment(code, period, cp_count)
             if not bars:
                 continue
@@ -230,9 +278,54 @@ class MarketDataService:
             cb = latest_completed_bar(bars)
             if cb is None:
                 continue
+            bt = parse_bar_time(cb)
+            if gate_freshness and (bt is None or bt.date() != today):
+                stale.append((code, bt))
+                continue
             stocks[code] = to_ohlcv(cb)
+        if stale:
+            # 兜底：TQ 原生分钟线只到上一交易日时，改用已合成的 1m bar 聚合出本周期
+            # 当日 bar（同一进程内存，不触 TQ）。聚合 bar 全部已闭合，不能再用
+            # latest_completed_bar（它会把最新一根当 forming 丢掉）——直接取末根。
+            recovered: List[tuple] = []  # [(code, agg_bar, bar_time)]
+            still_stale: List[tuple] = []
+            if self._snapshot_synth is not None:
+                try:
+                    agg = self._snapshot_synth.aggregated_bars(
+                        [code for code, _ in stale], period=period, count=count,
+                    )
+                except Exception:  # noqa: BLE001
+                    logger.warning(
+                        "aggregated fallback failed %s %s", period, boundary_time,
+                        exc_info=True)
+                    agg = {}
+            else:
+                agg = {}
+            for code, old_bt in stale:
+                agg_bars = agg.get(code) or []
+                if not agg_bars:
+                    still_stale.append((code, old_bt))
+                    continue
+                last = agg_bars[-1]
+                bt = parse_bar_time(last)
+                if bt is None or bt.date() != today:
+                    still_stale.append((code, old_bt))
+                    continue
+                # 原生历史（更早交易日）补足公式预热窗口；同日同 stime 以聚合为准
+                # （聚合在前 → _sort_and_cap 去重时先到先得）。
+                cp_count = cp_counts.get(code, count)
+                bars_by_code[code] = self._sort_and_cap(
+                    agg_bars + (bars_by_code.get(code) or []), cp_count)
+                stocks[code] = to_ohlcv(last)
+                recovered.append((code, last, bt))
+            if recovered:
+                self._report_aggregated_fallback(
+                    period, boundary_time, recovered, len(still_stale))
+            stale = still_stale
+            if stale:
+                self._report_stale_period_bars(period, boundary_time, stale)
         if not stocks:
-            return
+            return "stale" if stale else "empty"
         bar_event = BarEvent(stocks=stocks, bar_time=boundary_time, period=period)
         df_cache: Dict = {}
         raw_cache: Dict = {}
@@ -241,6 +334,85 @@ class MarketDataService:
                 portfolio, bar_event, bars_by_code=bars_by_code,
                 df_cache=df_cache, raw_cache=raw_cache,
             )
+        return "dispatched"
+
+    def _report_stale_period_bars(
+        self, period: str, boundary_time: datetime, stale: List[tuple],
+    ) -> None:
+        """新鲜度闸拦截告警：WARNING + risk 事件（gate=period_bar_freshness）。
+
+        每 (period, boundary) 聚合一条（codes 截断 5 只），避免整池停更时刷屏；
+        事件字段保留 gate/period/boundary_time/bar_date/codes/stale_count 供排查。
+        """
+        codes = [code for code, _ in stale]
+        sample = codes[:5]
+        dates = sorted({bt.date().isoformat() for _, bt in stale if bt is not None})
+        bar_date = dates[0] if dates else None
+        bar_dates = ",".join(dates) if dates else "未知"
+        more = " 等" if len(codes) > len(sample) else ""
+        logger.warning(
+            "周期边界新鲜度闸跳过：period=%s boundary=%s 最新完成 bar 日期=%s"
+            "（非当日 %s），code=%s%s（共 %d 只）",
+            period, boundary_time.strftime("%Y-%m-%d %H:%M"), bar_dates,
+            boundary_time.date().isoformat(), ",".join(sample), more, len(codes),
+        )
+        if self._emit_risk is None:
+            return
+        try:
+            self._emit_risk({
+                "rule": "period_bar_freshness_skip",
+                "gate": "period_bar_freshness",
+                "level": "warning",
+                "period": period,
+                "boundary_time": boundary_time.strftime("%Y-%m-%d %H:%M:%S"),
+                "bar_date": bar_date,
+                "codes": sample,
+                "stale_count": len(codes),
+                "message": "周期边界 %s 的 %s bar 停在 %s（非当日），已跳过派发，等当日数据后补偿"
+                           % (boundary_time.strftime("%H:%M"), period, bar_dates),
+            })
+        except Exception:  # noqa: BLE001
+            logger.warning("emit period_bar_freshness risk failed", exc_info=True)
+
+    def _report_aggregated_fallback(
+        self, period: str, boundary_time: datetime,
+        recovered: List[tuple], stale_count: int,
+    ) -> None:
+        """聚合兜底可观测事件：INFO + risk（gate=period_bar_fallback）。
+
+        ``source=aggregated_1m`` 明确标注这批 bar 来自快照 1m 聚合、不是 TQ 原生
+        分钟线（事后复盘/业绩对照时可判别数据来源）。每 (period, boundary) 一条。
+        """
+        codes = [code for code, _, _ in recovered]
+        sample = codes[:5]
+        bar_dates = sorted({bt.date().isoformat() for _, _, bt in recovered})
+        more = " 等" if len(codes) > len(sample) else ""
+        logger.info(
+            "周期边界聚合兜底：period=%s boundary=%s 原生数据非当日，改用合成 1m 聚合"
+            "（source=aggregated_1m），code=%s%s（%d 只，仍有 %d 只无当日数据）",
+            period, boundary_time.strftime("%Y-%m-%d %H:%M"),
+            ",".join(sample), more, len(codes), stale_count,
+        )
+        if self._emit_risk is None:
+            return
+        try:
+            self._emit_risk({
+                "rule": "period_bar_fallback_aggregated",
+                "gate": "period_bar_fallback",
+                "level": "info",
+                "period": period,
+                "boundary_time": boundary_time.strftime("%Y-%m-%d %H:%M:%S"),
+                "bar_date": bar_dates[-1] if bar_dates else None,
+                "codes": sample,
+                "recovered_count": len(codes),
+                "stale_count": stale_count,
+                "source": "aggregated_1m",
+                "message": "周期边界 %s 的 %s 原生分钟线停在上一交易日，已改用快照合成 1m "
+                           "聚合 bar 派发 %d 只（source=aggregated_1m）"
+                           % (boundary_time.strftime("%H:%M"), period, len(codes)),
+            })
+        except Exception:  # noqa: BLE001
+            logger.warning("emit period_bar_fallback risk failed", exc_info=True)
 
     # ---------------- F5：桥可用持仓（SELL 减仓上限）----------------
     def refresh_available_map(self) -> None:
@@ -251,7 +423,9 @@ class MarketDataService:
         """
         try:
             rows = self.ctx.dispatcher.query_positions()
-        except BridgeUnavailableError:
+        except (BridgeUnavailableError, TDXLockTimeout):
+            # P2-7：TQ 锁等待超时同「桥离线」处理——空表 → 全量放行（券商端
+            # T+1 兜底），绝不因取数被占用而中断本根 bar 的风控评估。
             self._set_available_map({})
             return
         m: Dict[str, int] = {}

@@ -258,25 +258,29 @@ def test_formula_name_filter(tmp_path):
 
 # ---------------- 信号去重 / 每日重置 ----------------
 
-def test_seen_codes_dedup(tmp_path):
+def test_same_code_multiple_lines_returned_for_engine_direction_dedup(tmp_path):
+    """同代码同日多行都由源返回：方向去重在引擎按「代码+方向」做。
+
+    旧实现在源层按代码去重，会让「先买后卖」的两行只留买入行、卖出行被吞。
+    源层只保证时间窗增量读取，买卖方向由策略公式配置决定，故两行都要返回。
+    """
     p = _write_lines(tmp_path, [
         _line(1, "920718", "六合高科", "2026-10-30 09:50", "9.83", "-1.90%", "1", "分时突击"),
         _line(2, "920718", "六合高科", "2026-10-30 09:55", "9.90", "-1.20%", "2", "分时突击"),
     ])
     sigs = _source(p).read_new_signals()
-    # 同代码同日只触发一次（电平信号反复预警防重复开仓）
-    assert [s["code"] for s in sigs] == ["920718"]
-    assert sigs[0]["time"] == datetime(2026, 10, 30, 9, 50)
+    assert [s["code"] for s in sigs] == ["920718", "920718"]
+    assert [s["time"] for s in sigs] == [
+        datetime(2026, 10, 30, 9, 50), datetime(2026, 10, 30, 9, 55)]
 
 
-def test_reset_daily_clears_dedup_and_cursor(tmp_path):
+def test_reset_daily_resets_cursor(tmp_path):
     p = _write_lines(tmp_path, [
         _line(1, "920718", "六合高科", "2026-10-30 09:50", "9.83", "-1.90%", "1", "分时突击"),
     ])
     src = _source(p)
     assert len(src.read_new_signals()) == 1
     src.reset_daily()
-    assert src._seen_codes == set()
     # 时间戳游标归位当前时间（新文件「启动后新信号才消费」同语义）
     assert src._last_read_time == TEST_NOW
     # 重置后重读（文件按日轮转场景）

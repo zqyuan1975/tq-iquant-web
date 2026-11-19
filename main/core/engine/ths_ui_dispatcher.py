@@ -71,6 +71,28 @@ from tq_iquant_shared.constants import SignalType, TradeType
 
 logger = logging.getLogger(__name__)
 
+#: live_orders 终态：执行器驱动 UI 之前查到这些状态 → 不再执行（单已无需落地）。
+_TERMINAL_ORDER_STATUSES = frozenset({"rejected", "canceled", "filled"})
+#: 指令入队年龄硬门默认阈值（秒），与 EngineWatchdog execution_stall 同口径。
+_DEFAULT_EXECUTOR_MAX_QUEUE_AGE_SECONDS = 180.0
+
+
+class ThsPriceNotApplied(BridgeOrderRejected):
+    """事前价格拦截：键入的审批价没有落到价格框（THS 异步跟出价覆盖）。
+
+    提交前回读价格框发现不一致 → 不按 ENTER、不提交，写 rejected 回执
+    （reason=price_not_applied + expected_price/readback_price）。
+    从事后撤单（有失败实证）提前到事前拦住。
+    """
+
+    def __init__(self, expected_price, readback_price):
+        self.expected_price = float(expected_price)
+        self.readback_price = float(readback_price)
+        super().__init__(
+            "ths 价格未生效（未提交）：键入 %s，回读 %s"
+            % (self.expected_price, self.readback_price)
+        )
+
 
 class ThsUiDispatcher(OrderDispatcher):
     """基于同花顺独立交易客户端（xiadan.exe）UI自动化的下单通道。
@@ -147,7 +169,8 @@ class ThsUiDispatcher(OrderDispatcher):
     def __init__(self, window_title: str = "网上股票交易系统5.0", client_exe_path: str = None,
                  captcha_ocr: bool = False, execute_mode: str = "file_builtin",
                  execute_interval_seconds: float = 5, work_dir: str = "data/ths",
-                 session_id: int = 0, price_mode: str = "approval", **kwargs):
+                 session_id: int = 0, price_mode: str = "approval",
+                 max_queue_age_seconds: Optional[float] = None, **kwargs):
         self._window_title = window_title
         self._client_exe_path = client_exe_path
         self._captcha_ocr = bool(captcha_ocr)
@@ -170,10 +193,28 @@ class ThsUiDispatcher(OrderDispatcher):
         # （原行为）；latest=不键价格，让 THS 代码键入后自动跟出最新价（回测继承
         # 价跨日过期，日线信号次日跳空必不成交的补救），按实际委托价记账。
         self.ths_price_mode = "latest" if str(price_mode or "") == "latest" else "approval"
+        # 盘前竞价窗口（09:15–09:20）内的单按 approval 路径键入平台算的价：判定
+        # 推迟到**执行期**（`_effective_price_mode`），构造期不再改写 ths_price_mode
+        # ——旧写法在 09:00 前启动的会话整场 latest 不键价、在 09:16 启动的会话又会
+        # 整天锁死 approval，两种都错。这里只保留「启动时处于窗口」的标记，供引擎
+        # 启动公告使用（同一判据、同一实现，不构成第二套开关）。
+        self.price_mode_forced_pre_open = (
+            self.ths_price_mode != "approval" and self._pre_open_window_now())
+        if self.price_mode_forced_pre_open:
+            logger.warning(
+                "pre-open window (09:15-09:20): THS price_mode latest -> 本次启动后"
+                "的盘前单按 approval 路径键入平台价（执行期逐单判定）")
         # ---- 文件交接层双模式（file_builtin=内置执行器 / direct=同步直呼现状）----
         self.execute_mode = "file_builtin" if str(execute_mode or "") == "file_builtin" else "direct"
         self.file_handoff_enabled = self.execute_mode == "file_builtin"
         self._execute_interval_seconds = max(float(execute_interval_seconds or 5), 0.01)
+        # P0-2：执行器入队年龄硬门（None=首次使用时按配置解析并缓存）。
+        # 配置键 ths_ui.executor_max_queue_age_seconds，缺省回退
+        # live.execution_stall_seconds（默认 180s）——积压超过它的指令不再
+        # 驱动 UI，只落 skipped 回执（引擎侧该单已按 expire 判 rejected）。
+        self._max_queue_age_seconds = (
+            None if max_queue_age_seconds is None
+            else max(float(max_queue_age_seconds), 0.0))
         self._work_dir = str(work_dir or "data/ths")
         self._session_id = int(session_id or 0)
         # 批次 A 机制（与 TdxTqDispatcher 同口径）：本进程下单 ref 基线 + 提交时间。
@@ -184,9 +225,15 @@ class ThsUiDispatcher(OrderDispatcher):
         # file 模式执行器记账：order_id -> {"error","ts","entry"}（诊断 + 引擎
         # execution_receipts 消费源——file 拒单即时可见，不必等 180s expire）。
         self._file_rejects: Dict[str, dict] = {}
+        # file 模式执行成功回执：order_id -> {"ref","final_qty","ts","entry"}。
+        # P0-1：THS 会按 UI 实时可买/可卖静默钳量，引擎账本须按真实提交量修正
+        # （否则 legacy 认领数量不等 → 180s 误判 rejected，而真实单已成交）。
+        self._file_accepts: Dict[str, dict] = {}
         self._rejects_lock = threading.Lock()
         self._last_submit_ref = ""
         self._last_submit_time: tuple = ("", "")
+        #: 最近一次真实键入的数量（钳量后）；0=未产生有效指令。
+        self._last_final_qty = 0
         self._last_enqueued_order_id: Optional[str] = None
         # 遮挡校验诊断：最近一次点击点最上层的非 THS 窗口句柄（错误文案用）
         self._last_occluder_hwnd = 0
@@ -1894,6 +1941,9 @@ class ThsUiDispatcher(OrderDispatcher):
 
         同花顺只负责交易执行，不提供行情；BarPoller 需要 stime/OHLCV 形状。
         TQ 返回 {field: DataFrame(index=时间, columns=[code])}，这里转成 bar dict。
+
+        复权口径（P2-9）：显式前复权，与 tdx 通道一致（见
+        ``TdxTqDispatcher.query_quote`` 的口径说明）；当日 bar 与不复权实时价相同。
         """
         text = str(code or "").strip()
         code6 = re.sub(r"\D", "", text)[:6]
@@ -1904,7 +1954,8 @@ class ThsUiDispatcher(OrderDispatcher):
         try:
             from core.tq.data import TQData
             raw = TQData().get_history_raw(
-                [tq_code], [period], count=max(int(count or 10), 2))
+                [tq_code], [period], dividend_type="front",
+                count=max(int(count or 10), 2))
         except Exception as e:
             self._last_error = "quote unavailable: %s" % e
             return []
@@ -1948,9 +1999,19 @@ class ThsUiDispatcher(OrderDispatcher):
         """涨跌停前置校验委托 TdxTqDispatcher（与 query_calendar/query_quote 同模式）。
 
         引擎按 price_limit_check_enabled 配置门控调用；返回拒绝原因文案，None=通过。
+        幅度推算（板块 + ST + 新股上市初期）统一走 TdxTqDispatcher 内部共用的
+        ``core.engine.price_limit.resolve_limit_rule``，本通道不另起一套逻辑。
         """
         from .tdx_tq_dispatcher import TdxTqDispatcher
         return TdxTqDispatcher().check_price_limit(stock_code, direction, price)
+
+    def price_limit_bounds(self, stock_code: str):
+        """当日涨跌停价 (prev_close, up, down) 委托 TdxTqDispatcher（盘前竞价定价用）。
+
+        与 check_price_limit 同一份推算实现（含 ST/新股 fail-open 分支）。
+        """
+        from .tdx_tq_dispatcher import TdxTqDispatcher
+        return TdxTqDispatcher().price_limit_bounds(stock_code)
 
     # ---------------- 下单（双模式） ----------------
 
@@ -2051,9 +2112,19 @@ class ThsUiDispatcher(OrderDispatcher):
                 self._execute_entry(entry)
 
     def _execute_entry(self, entry: dict) -> None:
-        """执行单条指令：成功 accepted（ref 记 _known_refs/_submit_times，批次 A
-        口径）/失败 rejected（_file_rejects + results 回执），均不抛出。"""
+        """执行单条指令：先跑两道前置闸（DB 终态 / 入队年龄），再驱动 UI。
+
+        P0-2：游标「读后推进」只保证不重复消费，不等于一定会执行——执行器
+        崩溃/积压时引擎可能已把该单判 rejected。故在 **驱动 UI 之前** 先查
+        live_orders 终态与入队年龄，命中即写 skipped 回执并从待执行集合移除；
+        执行过（accepted）/拒单（rejected）/跳过（skipped）三种结果都能在
+        results.jsonl 观察到，at-most-once 不降级。
+        成功 accepted（ref 记 _known_refs/_submit_times，批次 A 口径）/失败
+        rejected（_file_rejects + results 回执），均不抛出。
+        """
         order_id = str(entry.get("order_id") or "")
+        if self._skip_if_stale(entry, order_id):
+            return
         try:
             order = self._entry_to_order(entry)
             # 跨引擎 UI 互斥由 _execute_via_ui 内两段式持锁负责（4s 价格跟随
@@ -2061,12 +2132,12 @@ class ThsUiDispatcher(OrderDispatcher):
             self._execute_via_ui(order)
         except (BridgeOrderRejected, BridgeUnavailableError) as e:
             self._record_file_reject(order_id, entry, e)
-            self._mark_done_safe(order_id, {"status": "rejected", "error": str(e)})
+            self._mark_done_safe(order_id, self._reject_result(e))
             return
         except Exception as e:  # noqa: BLE001  UI 异常不杀执行线程
             logger.warning("ths file executor error (order %s): %s", order_id, e)
             self._record_file_reject(order_id, entry, e)
-            self._mark_done_safe(order_id, {"status": "rejected", "error": str(e)})
+            self._mark_done_safe(order_id, self._reject_result(e))
             return
 
         ref = str(self._last_submit_ref or "")
@@ -2079,7 +2150,158 @@ class ThsUiDispatcher(OrderDispatcher):
                 )
         # 回执落盘必须在「UI 已报单成功」之后单独兜底：写失败若按执行失败处理，
         # 会把真实在途单回执成 rejected → 下一根 bar 重下造成重复持仓。
-        self._mark_done_safe(order_id, {"status": "accepted", "ref": ref})
+        # P0-1：accepted 回执带 final_qty（钳量后的真实提交量），引擎据此修正
+        # 账本；results.jsonl 仍是权威落盘（写失败不影响引擎内存回执）。
+        final_qty = int(self._last_final_qty or 0)
+        self._queue_accept_receipt(order_id, entry, ref, final_qty)
+        self._mark_done_safe(order_id, {
+            "status": "accepted", "ref": ref, "final_qty": final_qty})
+
+    @staticmethod
+    def _reject_result(exc: Exception) -> dict:
+        """执行失败写 done 表/结果文件的内容（事前价格拦截带结构化字段）。"""
+        result = {"status": "rejected", "error": str(exc)}
+        if isinstance(exc, ThsPriceNotApplied):
+            result.update({
+                "reason": "price_not_applied",
+                "expected_price": exc.expected_price,
+                "readback_price": exc.readback_price,
+            })
+        return result
+
+    def _skip_if_stale(self, entry: dict, order_id: str) -> bool:
+        """执行前置闸：DB 已终态 / 入队年龄超阈值 → 写 skipped 回执并跳过。
+
+        - DB 查到 rejected/canceled/filled：订单已无需落地，不驱动 UI；
+        - DB 查不到行（历史遗留指令）或 DB 不可用：按原有行为执行，仅 WARNING；
+        - 入队年龄超阈值：不执行（引擎 expire 早已判 rejected，此时补报必成
+          「账实不符的幽灵单」）；ts 缺失/不可解析视为未知，不拦（兼容旧指令）。
+        返回 True=已跳过（skipped 回执已落盘），False=继续执行。
+        """
+        session_id = int(entry.get("session_id") or self._session_id or 0)
+        status, found = self._lookup_db_order_status(order_id, session_id)
+        if status is not None and status in _TERMINAL_ORDER_STATUSES:
+            self._mark_skipped(order_id, entry, {
+                "reason": "order_terminal",
+                "db_status": status,
+                "detail": "DB 订单已终态（%s），不再驱动 UI" % status,
+            })
+            return True
+        if found is False:
+            logger.warning(
+                "ths executor: order %s not found in live_orders "
+                "(session %s), execute as legacy instruction", order_id, session_id)
+        age = self._entry_queue_age_seconds(entry)
+        if age is None:
+            logger.warning(
+                "ths executor: order %s has no parseable enqueue ts, "
+                "queue-age gate not applied", order_id)
+            return False
+        limit = self._queue_age_limit_seconds()
+        if age > limit:
+            self._mark_skipped(order_id, entry, {
+                "reason": "queue_age_exceeded",
+                "queue_age_seconds": round(age, 1),
+                "limit_seconds": limit,
+                "detail": "指令入队 %.0fs 超过阈值 %.0fs（执行器积压/停机过久）"
+                          % (age, limit),
+            })
+            return True
+        return False
+
+    def _mark_skipped(self, order_id: str, entry: dict, result: dict) -> None:
+        """skipped 回执：results.jsonl + 游标 done 表（与 accepted/rejected 同
+        一套 mark_done 落盘，保证「推进后未执行」同样可观察）+ WARNING 告警。"""
+        logger.warning(
+            "ths executor skip order %s (%s %s qty=%s): %s",
+            order_id, entry.get("stock_code"), entry.get("direction"),
+            entry.get("quantity"), result.get("detail"))
+        payload = {"status": "skipped"}
+        payload.update(result)
+        self._mark_done_safe(order_id, payload)
+
+    def _lookup_db_order_status(self, order_id: str, session_id: int):
+        """按确定性 order_id（= live_orders.bridge_order_id）查 DB 当前状态。
+
+        返回 ``(status, found)``：
+        - ``("filled", True)`` 查到行（status 为库内值）；
+        - ``(None, False)`` 查不到行（历史遗留指令，调用方按原行为执行）；
+        - ``(None, None)`` DB 不可用/查询异常（未知，同样按原行为执行）。
+        绝不让查询异常阻断执行器线程。
+        """
+        try:
+            from core.db import SessionLocal
+            from core.models.live_order import LiveOrder
+        except Exception as e:  # noqa: BLE001
+            logger.warning("ths executor order-status lookup unavailable: %s", e)
+            return None, None
+        db = None
+        try:
+            db = SessionLocal()
+            status = (
+                db.query(LiveOrder.status)
+                .filter(
+                    LiveOrder.live_session_id == int(session_id or 0),
+                    LiveOrder.bridge_order_id == str(order_id),
+                )
+                .order_by(LiveOrder.id.desc())
+                .scalar()
+            )
+            if status is None:
+                return None, False
+            return str(status), True
+        except Exception as e:  # noqa: BLE001
+            logger.warning(
+                "ths executor order-status lookup failed (order %s): %s",
+                order_id, e)
+            return None, None
+        finally:
+            if db is not None:
+                try:
+                    db.close()
+                except Exception:  # noqa: BLE001
+                    pass
+
+    @staticmethod
+    def _entry_queue_age_seconds(entry: dict) -> Optional[float]:
+        """指令入队年龄（秒）：orders.jsonl 行内 ts（上海 naive ISO）→ 至今。"""
+        raw = entry.get("ts")
+        if not raw:
+            return None
+        try:
+            enqueued = datetime.fromisoformat(str(raw))
+        except (TypeError, ValueError):
+            return None
+        if enqueued.tzinfo is not None:
+            enqueued = enqueued.replace(tzinfo=None)
+        return (now_shanghai() - enqueued).total_seconds()
+
+    def _queue_age_limit_seconds(self) -> float:
+        """入队年龄阈值：构造参数 > ths_ui.executor_max_queue_age_seconds >
+        live.execution_stall_seconds > 默认 180s（首次解析后缓存）。"""
+        if self._max_queue_age_seconds is not None:
+            return self._max_queue_age_seconds
+        value = None
+        try:
+            from core.config import load_config
+            cfg = load_config()
+            if isinstance(cfg, dict):
+                ths = cfg.get("ths_ui")
+                ths = ths if isinstance(ths, dict) else {}
+                raw = ths.get("executor_max_queue_age_seconds")
+                if raw is None:
+                    live = cfg.get("live")
+                    live = live if isinstance(live, dict) else {}
+                    raw = live.get("execution_stall_seconds")
+                if raw is not None:
+                    value = float(raw)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("ths executor read queue-age config failed: %s", e)
+            value = None
+        if value is None or value <= 0:
+            value = _DEFAULT_EXECUTOR_MAX_QUEUE_AGE_SECONDS
+        self._max_queue_age_seconds = value
+        return value
 
     def _mark_done_safe(self, order_id: str, result: dict) -> None:
         try:
@@ -2090,36 +2312,83 @@ class ThsUiDispatcher(OrderDispatcher):
 
     def _record_file_reject(self, order_id: str, entry: dict, exc: Exception) -> None:
         """执行失败记账（带原始指令 entry 供引擎形状匹配）。"""
+        rec = {
+            "error": str(exc),
+            "ts": now_shanghai().isoformat(timespec="seconds"),
+            "entry": dict(entry or {}),
+        }
+        if isinstance(exc, ThsPriceNotApplied):
+            # 事前价格拦截：结构化原因 + 双价，供工作台/结果文件直接核对
+            rec.update({
+                "reason": "price_not_applied",
+                "expected_price": exc.expected_price,
+                "readback_price": exc.readback_price,
+            })
+            logger.warning(
+                "ths price not applied (order %s, code %s): expected=%s readback=%s "
+                "-> not submitted",
+                order_id, entry.get("stock_code"),
+                exc.expected_price, exc.readback_price)
         with self._rejects_lock:
-            self._file_rejects[str(order_id)] = {
-                "error": str(exc),
+            self._file_rejects[str(order_id)] = rec
+
+    def _queue_accept_receipt(self, order_id: str, entry: dict,
+                              ref: str, final_qty: int) -> None:
+        """执行成功回执入引擎消费队列（P0-1：带钳量后的真实提交量）。
+
+        与 ``_record_file_reject`` 同为内存单消费者队列（引擎 deals 轮询弹出），
+        与 results.jsonl 落盘互不依赖——落盘失败也不丢引擎侧数量修正。
+        """
+        with self._rejects_lock:
+            self._file_accepts[str(order_id)] = {
+                "ref": str(ref or ""),
+                "final_qty": int(final_qty or 0),
                 "ts": now_shanghai().isoformat(timespec="seconds"),
                 "entry": dict(entry or {}),
             }
 
     def execution_receipts(self) -> List[dict]:
-        """弹出执行失败回执（file_builtin 模式；单消费者=LiveEngine deals 轮询）。
+        """弹出执行回执（file_builtin 模式；单消费者=LiveEngine deals 轮询）。
 
-        引擎在记账锁内消费：按 order_id/entry 形状匹配在途单即时标 rejected
-        （工作台立即可见），不必等 180s expire。direct 模式无执行回执（恒 []）。
+        返回两类（``status`` 区分，引擎在记账锁内消费）：
+        - ``rejected``：执行失败 → 在途单即时 rejected（工作台立即可见，不等 180s）；
+        - ``accepted``：执行成功 → 带 ``ref``（合同编号）与 ``final_qty``（钳量后
+          真实提交量），引擎据此修正订单数量/账本（P0-1），不改变 submitted 状态。
+        direct 模式无执行回执（恒 []）。
         """
         if self.execute_mode != "file_builtin":
             return []
         with self._rejects_lock:
-            if not self._file_rejects:
-                return []
-            items = list(self._file_rejects.items())
+            rejects = list(self._file_rejects.items())
+            accepts = list(self._file_accepts.items())
             self._file_rejects.clear()
-        return [
+            self._file_accepts.clear()
+        receipts = [
             {
                 "order_id": oid,
                 "status": "rejected",
                 "error": str(rec.get("error") or ""),
+                # 事前价格拦截的结构化字段（普通拒单为 None）
+                "reason": rec.get("reason"),
+                "expected_price": rec.get("expected_price"),
+                "readback_price": rec.get("readback_price"),
                 "ts": rec.get("ts"),
                 "entry": dict(rec.get("entry") or {}),
             }
-            for oid, rec in items
+            for oid, rec in rejects
         ]
+        receipts.extend(
+            {
+                "order_id": oid,
+                "status": "accepted",
+                "ref": str(rec.get("ref") or ""),
+                "final_qty": int(rec.get("final_qty") or 0),
+                "ts": rec.get("ts"),
+                "entry": dict(rec.get("entry") or {}),
+            }
+            for oid, rec in accepts
+        )
+        return receipts
 
     @property
     def pending_receipt_count(self) -> int:
@@ -2132,7 +2401,7 @@ class ThsUiDispatcher(OrderDispatcher):
         if self.execute_mode != "file_builtin":
             return 0
         with self._rejects_lock:
-            return len(self._file_rejects)
+            return len(self._file_rejects) + len(self._file_accepts)
 
     @classmethod
     def _clamp_qty(cls, vol: int, auto_qty, code: str, is_buy: bool) -> Optional[int]:
@@ -2176,6 +2445,70 @@ class ThsUiDispatcher(OrderDispatcher):
         except (TypeError, ValueError):
             return None
 
+    def _effective_price_mode(self) -> str:
+        """本次下单实际使用的价格模式：盘前窗口内强制 approval（键入平台算的价）。
+
+        判定放在执行期：09:00 前启动的会话到了 09:15 必须按 approval 报（否则 THS
+        自动跟出的价报进集合竞价，价格归属脱离平台）；09:16 启动的会话过了 09:20
+        要回到配置的 latest（否则一整天都在键审批价、日线信号跨日跳空不成交）。
+        两个方向都不能靠「启动时定一次」。
+        """
+        if self.ths_price_mode == "approval":
+            return "approval"
+        if self._pre_open_window_now():
+            return "approval"
+        return "latest"
+
+    @staticmethod
+    def _pre_open_window_now() -> bool:
+        """是否处于盘前竞价执行窗口（复用 live_engine.PreOpenAuctionConfig）。
+
+        延迟 import：不只在构造期调用（执行期 `_effective_price_mode` 也会调），
+        避免 ths 通道与实盘引擎在模块加载期互相牵连。配置/日历异常一律视为
+        「不在窗口」，不阻断会话。
+        """
+        try:
+            from core.config import load_config
+            from core.engine.live_engine import PreOpenAuctionConfig
+
+            cfg = load_config().get("tq_trade") or {}
+            return PreOpenAuctionConfig.from_config(cfg).is_open(now_shanghai())
+        except Exception as e:  # noqa: BLE001
+            logger.warning("pre-open window check unavailable: %s", e)
+            return False
+
+    @staticmethod
+    def _price_matches_cent(expected, readback) -> bool:
+        """按分比对两个价格（四舍五入到 0.01）；不可解析 → True（不拦）。
+
+        分是用户口径：THS 键入/回读常见尾差（4.153 vs 4.15），按分相等即视为
+        价格已生效；真正的错价（4.415 vs 4.153）会被分位差异拦下。
+        """
+        try:
+            return round(float(expected), 2) == round(float(readback), 2)
+        except (TypeError, ValueError):
+            return True
+
+    def _readback_price(self, price_f) -> Optional[float]:
+        """回读价格框实际值（approval 事前价格拦截）。
+
+        键入价格后焦点仍在价格框内，直接 END + Shift+Home 全选 + Ctrl+C 读剪贴板，
+        **不再点击价格框**——重复点击会触发 THS 焦点事件刷新跟价，可能覆盖刚键入
+        的审批价。全选不用 ``^a``（真机不可靠）；先清空剪贴板，避免读到残留值。
+        返回 None = 读不到 → 不拦（由提交后的委托价校验 + 自动撤单兜底）。
+        """
+        try:
+            self.kb_send("{END}")
+            self.kb_send("+{HOME}")
+            time.sleep(0.1)
+        except Exception:  # noqa: BLE001
+            return None
+        try:
+            pyperclip.copy("")  # 先清空，避免 ^c 未生效时读到上一次的残留值
+        except Exception:  # noqa: BLE001
+            return None
+        return self._clipboard_copy_float()
+
     def _execute_via_ui(self, order: OrderEvent) -> TradeEvent:
         """同步 UI 自动化下单主体（direct 模式 place_order 与内置执行器共用）。
 
@@ -2189,6 +2522,11 @@ class ThsUiDispatcher(OrderDispatcher):
         """
         self._last_submit_ref = ""
         self._last_submit_time = ("", "")
+        # 本次下单的价格模式在执行期定一次（盘前窗口内强制 approval），下面键入价、
+        # 价差校验、成交价记账三处都用这一个值，避免执行中途跨 09:20 前后判据漂移。
+        price_mode = self._effective_price_mode()
+        # P0-1：每次执行先清零，钳量后写入真实键入量（accepted 回执 final_qty）。
+        self._last_final_qty = 0
         if not self._connected:
             if not self.connect():
                 raise BridgeUnavailableError("ths ui not connected")
@@ -2301,13 +2639,24 @@ class ThsUiDispatcher(OrderDispatcher):
                     logger.info(
                         "ths qty clamped: engine=%d -> final=%d", vol, clamped)
                 vol = clamped
-                if self.ths_price_mode != "latest":
-                    # approval 模式：显式键入审批价（覆盖 THS 自动跟出的最新价）
+                # P0-1：真实键入量（钳量后）——accepted 回执 final_qty 的唯一来源，
+                # 引擎据此把账本委托量改成柜台实际委托量。
+                self._last_final_qty = int(vol)
+                if price_mode != "latest":
+                    # approval 模式（含盘前窗口强制）：显式键入审批价（覆盖 THS 自动
+                    # 跟出的最新价）
                     self._click_field(price_f)
                     self.kb_send("{END}")
                     self.kb_send("{BACKSPACE}" * 12)
                     self.kb_send(str(price))
                     time.sleep(0.3)
+                    # 事前价格拦截：回读价格框，与审批价按分比对，不一致绝不提交。
+                    # 真机实证 THS 会用异步跟出价覆盖键入价（键入 4.153 实报 4.415），
+                    # 而事后撤单有失败实证 → 把错价成交拦在按 ENTER 之前。
+                    readback = self._readback_price(price_f)
+                    if (readback is not None
+                            and not self._price_matches_cent(price, readback)):
+                        raise ThsPriceNotApplied(price, readback)
                 # latest 模式：不键价格——THS 已用最新价覆盖价格框（上方等待
                 # 即为此服务），委托以实时最新价报出
                 self._click_field(vol_f)
@@ -2369,7 +2718,7 @@ class ThsUiDispatcher(OrderDispatcher):
         # 防止以非审批价格真实成交。容差 0.001（ETF 3 位小数/股票 2 位均覆盖）。
         # latest 模式豁免：委托价=实时最新价本就 ≠ 审批价，按实际委托价记账。
         found_price = float(found.get("price") or 0)
-        if (self.ths_price_mode != "latest" and found_price > 0
+        if (price_mode != "latest" and found_price > 0
                 and abs(found_price - price) > 0.001):
             if not ref:
                 raise BridgeOrderRejected(
@@ -2392,7 +2741,7 @@ class ThsUiDispatcher(OrderDispatcher):
                 "ths 委托价格 %s ≠ 审批价 %s（输入被客户端覆盖）；"
                 "自动撤单失败，请人工处理（合同号 %s）" % (found_price, price, ref))
         # latest 模式按实际委托价记账（≈最新价）；approval 按审批价
-        if self.ths_price_mode == "latest" and found_price > 0:
+        if price_mode == "latest" and found_price > 0:
             fill_price = Decimal(str(found_price))
         else:
             fill_price = order.price if order.price is not None else Decimal(str(price))

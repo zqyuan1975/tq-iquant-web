@@ -6,6 +6,7 @@ B4b：/orders、/trades、/positions 三个历史查询端点。
 """
 from datetime import datetime
 from decimal import Decimal
+import logging
 
 import httpx
 import pytest
@@ -19,6 +20,7 @@ from core.db import get_db
 from core.models import (
     Base, StockPool, StockPoolStock, Formula, FormulaSignal,
     PortfolioStrategy, Strategy, LiveOrder, LiveTrade, LiveSessionPortfolio,
+    LiveDecisionEvent, LiveSession,
 )
 from core.engine.position import Position
 import core.api.live as live_api
@@ -415,6 +417,56 @@ def test_stop_session_is_idempotent(client, mock_bridge):
     assert resp.json()["data"]["status"] == "stopped"
 
 
+def test_stop_with_missing_engine_warns_process_tag(client, caplog):
+    """DB 显示 running 但本进程无引擎（另一进程持有）→ 必须 WARNING 带 pid/port。"""
+    c, Session = client
+    db = Session()
+    ps_id = _seed(db)
+    db.close()
+
+    sid = _create_session(c, portfolio_ids=(ps_id,))
+    db = Session()
+    row = db.get(LiveSession, sid)
+    row.status = "running"  # 模拟 stop 打到了没有引擎的进程
+    db.commit()
+    db.close()
+
+    with caplog.at_level(logging.WARNING, logger="core.api.live"):
+        resp = c.post("/api/live/sessions/%d/stop" % sid)
+    assert resp.status_code == 200
+    assert resp.json()["code"] == 0
+    assert resp.json()["data"]["status"] == "stopped"
+
+    msgs = [r.getMessage() for r in caplog.records
+            if "注册表未找到" in r.getMessage()]
+    assert len(msgs) == 1
+    assert "pid=" in msgs[0] and "port=" in msgs[0]
+    assert "另一后端进程" in msgs[0]
+
+
+def test_engine_registry_diagnostic_lists_pid_and_db_status(client, mock_bridge):
+    """只读诊断接口并排返回本进程引擎与 DB 状态，便于排查进程错配。"""
+    c, Session = client
+    db = Session()
+    ps_id = _seed(db)
+    db.close()
+
+    sid = _create_session(c, portfolio_ids=(ps_id,))
+    c.post("/api/live/sessions/%d/start" % sid)
+    try:
+        data = c.get("/api/live/engine-registry").json()["data"]
+        assert data["pid"] > 0
+        assert "port" in data
+        item = next(e for e in data["engines"] if e["session_id"] == sid)
+        assert item["running"] is True
+        assert item["db_status"] == "running"
+        assert item["mismatch"] is False
+        assert all(x["session_id"] != sid
+                   for x in data["db_active_without_engine"])
+    finally:
+        c.post("/api/live/sessions/%d/stop" % sid)
+
+
 def test_create_session_rejects_duplicate_and_missing_portfolio(client, mock_bridge):
     """portfolio_ids 重复/不存在 → 400 业务错误，而不是 FK/唯一约束的 500。"""
     c, Session = client
@@ -795,6 +847,37 @@ def test_query_trades_history(client, mock_bridge):
     assert body["data"][1]["amount"] == 1050.0
 
 
+def test_query_trades_history_date_filter(client, mock_bridge):
+    """GET /trades?start_date=&end_date= 按北京自然日过滤；缺省仍全量（向后兼容）。"""
+    c, Session = client
+    sid = _create_session(c, portfolio_ids=())
+    db = Session()
+    lo = _add_order(db, sid)
+    db.add(lo)
+    db.flush()
+    db.add_all([
+        _add_trade(db, sid, order=lo, trade_time=datetime(2026, 8, 4, 14, 50)),
+        _add_trade(db, sid, order=lo, trade_time=datetime(2026, 8, 5, 10, 35)),
+        _add_trade(db, sid, order=lo, trade_type="SELL", qty=100, price="11.0",
+                   trade_time=datetime(2026, 8, 6, 9, 31)),
+    ])
+    db.commit()
+    db.close()
+
+    url = "/api/live/sessions/%d/trades" % sid
+    # 单日闭区间：只回 8 月 5 日那一笔
+    body = c.get(url + "?start_date=2026-08-05&end_date=2026-08-05").json()
+    assert body["code"] == 0
+    assert len(body["data"]) == 1
+    assert body["data"][0]["trade_time"].startswith("2026-08-05")
+    # 只给起点 → 下界过滤（8/5 起两笔）
+    assert len(c.get(url + "?start_date=2026-08-05").json()["data"]) == 2
+    # 缺省 → 全量，与旧行为一致（不删除任何成交）
+    assert len(c.get(url).json()["data"]) == 3
+    # 非法日期格式 → 400
+    assert c.get(url + "?start_date=2026/08/05").json()["code"] == 400
+
+
 def test_query_positions_when_stopped_aggregates_from_trades(client, mock_bridge):
     """未运行 → /positions 从 live_trades 重放聚合（BUY 加、SELL 减，均价加权）。
 
@@ -816,8 +899,10 @@ def test_query_positions_when_stopped_aggregates_from_trades(client, mock_bridge
     assert body["code"] == 0
     row = next(p for p in body["data"] if p["stock_code"] == "600000.SH")
     assert row["quantity"] == 700
-    assert row["avg_cost"] == 10.5
-    assert row["market_value"] == pytest.approx(700 * 10.5)
+    # 重建口径含柜台真实费用（2026-11-11 起与实盘一致）：
+    # (600*10 + 200*12 + 2×0.5 佣金) / 800 = 10.50125 → 10.501
+    assert row["avg_cost"] == pytest.approx(10.501, abs=1e-6)
+    assert row["market_value"] == pytest.approx(7350.88, abs=0.01)  # 700×10.50125 四舍五入到分
     # 归属：_add_trade 恒为 portfolio_strategy_id=1/strategy_id=1
     assert row["portfolio_id"] == 1
     assert row["strategy_id"] == 1
@@ -1019,9 +1104,11 @@ def test_create_session_rejects_non_positive_live_capital(client, mock_bridge):
         assert "实盘资金基准须大于 0" in body["message"]
 
 
-def test_build_engine_applies_live_capital_override(client, monkeypatch, caplog):
-    """build_engine 把 session.live_capital 传给 assemble_portfolio：
-    override 生效 → Account 以基准资金起账；未设置 → 组合初始资金（现行为）。"""
+def test_build_engine_keeps_per_portfolio_capital(client, monkeypatch, caplog):
+    """build_engine 的 live_capital 只作真实侧总闸，不覆盖组合起账（P1-①）。
+
+    分账不分池：每个组合虚拟起账 = 该组合配置资金；会话级 live_capital 仅作为
+    真实侧额度兜底上限（引擎 `_account_total_capital`）。"""
     import logging
     c, Session = client
     db = Session()
@@ -1042,9 +1129,12 @@ def test_build_engine_applies_live_capital_override(client, monkeypatch, caplog)
     try:
         with caplog.at_level(logging.INFO, logger="core.services.live_service"):
             engine = live_api._build_engine(sid, db2, "simulation")
-        assert engine.portfolios[0].account.initial_capital == Decimal("500000")
-        assert engine.portfolios[0].account.cash == Decimal("500000")
-        assert any("实盘资金基准" in r.getMessage() for r in caplog.records)
+        # 组合仍以自身配置资金起账（100000），不被账户总资产覆盖
+        assert engine.portfolios[0].account.initial_capital == Decimal("100000")
+        assert engine.portfolios[0].account.cash == Decimal("100000")
+        # 会话真实账户总资产作为引擎真实侧兜底上限
+        assert engine._account_total_capital == Decimal("500000")
+        assert any("虚拟起账资金" in r.getMessage() for r in caplog.records)
     finally:
         db2.close()
 
@@ -1127,13 +1217,15 @@ def test_recover_breaker_resets_running_session(client, mock_bridge):
     rm.circuit_breaker_active = True
     engine._breaker_count_written[ps_id] = 3
 
-    resp = c.post("/api/live/sessions/%d/portfolios/%d/recover" % (sid, ps_id))
+    resp = c.post("/api/live/sessions/%d/portfolios/%d/recover" % (sid, ps_id),
+                  json={"confirm": True, "reason": "人工确认恢复"})
 
     assert resp.status_code == 200
     body = resp.json()
     assert body["code"] == 0
     assert body["data"]["status"] == "active"
     assert body["data"]["circuit_breaker_count"] == 0
+    assert body["data"]["reason"] == "人工确认恢复"
     # 内存态
     assert rm.manual_recovery is False
     assert rm.circuit_breaker_active is False
@@ -1148,6 +1240,12 @@ def test_recover_breaker_resets_running_session(client, mock_bridge):
         ).first()
         assert link.status == "active"
         assert link.circuit_breaker_count == 0
+        # D5 审计：恢复原因写入决策事件
+        evt = db.query(LiveDecisionEvent).filter_by(
+            live_session_id=sid, gate="breaker_recover").first()
+        assert evt is not None
+        assert "人工确认恢复" in (evt.message or "")
+        assert "portfolio=%d" % ps_id in (evt.message or "")
     finally:
         db.close()
 
@@ -1165,7 +1263,8 @@ def test_recover_breaker_stopped_session_only_db(client, mock_bridge):
     assert sid not in live_api._ENGINES  # 未 start
     _set_breaker(Session, sid, ps_id, count=3)
 
-    resp = c.post("/api/live/sessions/%d/portfolios/%d/recover" % (sid, ps_id))
+    resp = c.post("/api/live/sessions/%d/portfolios/%d/recover" % (sid, ps_id),
+                  json={"confirm": True, "reason": "收盘后人工复核"})
 
     assert resp.status_code == 200
     assert resp.json()["code"] == 0
@@ -1178,6 +1277,37 @@ def test_recover_breaker_stopped_session_only_db(client, mock_bridge):
         ).first()
         assert link.status == "active"
         assert link.circuit_breaker_count == 0
+        evt = db.query(LiveDecisionEvent).filter_by(
+            live_session_id=sid, gate="breaker_recover").first()
+        assert evt is not None and "收盘后人工复核" in (evt.message or "")
+    finally:
+        db.close()
+
+
+def test_recover_breaker_manual_recovery_requires_confirm(client, mock_bridge):
+    """D5：count>=3 已转手动恢复时，未带 confirm 的恢复被拒（400），状态不变。"""
+    c, Session = client
+    db = Session()
+    ps_id = _seed(db)
+    db.close()
+
+    sid = _create_session(c, portfolio_ids=(ps_id,))
+    _set_breaker(Session, sid, ps_id, count=3)
+
+    resp = c.post("/api/live/sessions/%d/portfolios/%d/recover" % (sid, ps_id))
+    assert resp.status_code == 200
+    assert resp.json()["code"] == 400
+    assert "二次确认" in resp.json()["message"]
+
+    db = Session()
+    try:
+        link = db.query(LiveSessionPortfolio).filter_by(
+            session_id=sid, portfolio_strategy_id=ps_id
+        ).first()
+        assert link.status == "circuit_broken"
+        assert link.circuit_breaker_count == 3
+        assert db.query(LiveDecisionEvent).filter_by(
+            live_session_id=sid, gate="breaker_recover").first() is None
     finally:
         db.close()
 

@@ -205,6 +205,74 @@ def test_create_portfolio_with_strategies(client):
     db.close()
 
 
+def test_create_portfolio_default_benchmark_is_sse(client):
+    """未携带 benchmark_index → 新建默认上证指数；显式值原样落库（编辑回显存量）。"""
+    c, Session = client
+    db = Session()
+    _seed_pool(db); _seed_formula(db)
+    db.close()
+
+    body = c.post("/api/portfolios", json=_create_payload()).json()
+    assert body["code"] == 0
+    assert body["data"]["benchmark_index"] == "000001.SH"
+
+    body = c.post("/api/portfolios", json=_create_payload(
+        name="OLD_BENCH", benchmark_index="000985.CSI")).json()
+    assert body["code"] == 0
+    assert body["data"]["benchmark_index"] == "000985.CSI"
+
+
+def test_create_portfolio_persists_live_position_limits(client):
+    """单票上限/现金下限必须真正落库（曾因后端 schema 缺字段被 pydantic 静默丢弃）。"""
+    c, Session = client
+    db = Session()
+    _seed_pool(db); _seed_formula(db)
+    db.close()
+
+    body = c.post("/api/portfolios", json=_create_payload(
+        max_single_position_pct=0.3, min_cash_reserve_pct=0.05)).json()
+    assert body["code"] == 0
+    data = body["data"]
+    assert data["max_single_position_pct"] == pytest.approx(0.3)
+    assert data["min_cash_reserve_pct"] == pytest.approx(0.05)
+
+    db = Session()
+    row = db.query(PortfolioStrategy).first()
+    assert float(row.max_single_position_pct) == pytest.approx(0.3)
+    assert float(row.min_cash_reserve_pct) == pytest.approx(0.05)
+    db.close()
+
+
+def test_create_portfolio_position_limit_out_of_range_rejected(client):
+    c, Session = client
+    db = Session()
+    _seed_pool(db); _seed_formula(db)
+    db.close()
+
+    body = c.post("/api/portfolios", json=_create_payload(
+        max_single_position_pct=1.5)).json()
+    assert body["code"] != 0
+    assert "max_single_position_pct" in body["message"]
+
+
+def test_update_portfolio_keeps_equity_cap_when_field_omitted(client):
+    """仓位模型切 fixed 时前端不携带 equity_cap，编辑保存不得清空已有上限。"""
+    c, Session = client
+    db = Session()
+    _seed_pool(db); _seed_formula(db)
+    db.close()
+
+    created = c.post("/api/portfolios", json=_create_payload(equity_cap=200000)).json()
+    assert created["code"] == 0
+    pid = created["data"]["id"]
+
+    payload = _create_payload()
+    assert "equity_cap" not in payload  # 模拟 fixed 仓位（字段被 showIf 隐藏）
+    body = c.put(f"/api/portfolios/{pid}", json=payload).json()
+    assert body["code"] == 0
+    assert body["data"]["equity_cap"] == pytest.approx(200000)
+
+
 def test_create_portfolio_pool_not_found(client):
     c, Session = client
     db = Session()
@@ -1274,6 +1342,7 @@ def test_create_portfolio_numeric_range_rejected(client):
         {"max_holdings": 0},
         {"min_commission": -5},
         {"buy_commission_rate": -0.001},
+        {"transfer_fee_rate": -0.001},
         {"slippage": -0.01},
         {"slippage": 0.6},
         {"benchmark_index": "bad idx"},
@@ -1286,8 +1355,71 @@ def test_create_portfolio_numeric_range_rejected(client):
     ok = c.post("/api/portfolios", json=_create_payload(
         initial_capital=1, max_holdings=1, min_commission=0,
         buy_commission_rate=0, sell_commission_rate=0, stamp_duty_rate=0, slippage=0,
+        transfer_fee_rate=0,
     )).json()
     assert ok["code"] == 0
+
+    # 过户费率缺省 → 组合落库 0.000010（回测成本含费新默认）
+    created = c.post("/api/portfolios", json=_create_payload(name="TF_DEFAULT")).json()
+    assert created["code"] == 0
+    detail = c.get(f"/api/portfolios/{created['data']['id']}").json()
+    assert detail["data"]["transfer_fee_rate"] == 0.00001
+
+
+def test_portfolio_transfer_fee_rate_zero_and_none(client):
+    """过户费：显式 0 原样落库；未传/传 None 落默认 0.00001；非法值仍拒（create/update 同口径）。"""
+    c, Session = client
+    db = Session()
+    _seed_pool(db); _seed_formula(db)
+    db.close()
+
+    # create：显式 0 → 0
+    created = c.post("/api/portfolios", json=_create_payload(
+        name="TF_ZERO", transfer_fee_rate=0,
+    )).json()
+    assert created["code"] == 0
+    pid = created["data"]["id"]
+    assert c.get(f"/api/portfolios/{pid}").json()["data"]["transfer_fee_rate"] == 0
+
+    # create：显式 None → 默认 0.00001
+    created = c.post("/api/portfolios", json=_create_payload(
+        name="TF_NONE", transfer_fee_rate=None,
+    )).json()
+    assert created["code"] == 0
+    assert c.get(
+        f"/api/portfolios/{created['data']['id']}"
+    ).json()["data"]["transfer_fee_rate"] == 0.00001
+
+    # create：不传 → 默认 0.00001
+    payload = _create_payload(name="TF_OMIT")
+    payload.pop("transfer_fee_rate", None)
+    created = c.post("/api/portfolios", json=payload).json()
+    assert created["code"] == 0
+    assert c.get(
+        f"/api/portfolios/{created['data']['id']}"
+    ).json()["data"]["transfer_fee_rate"] == 0.00001
+
+    # update：显式 0 → 0；显式 None → 默认 0.00001
+    body = c.put(f"/api/portfolios/{pid}", json=_create_payload(
+        name="TF_ZERO", transfer_fee_rate=0.00005,
+    )).json()
+    assert body["code"] == 0 and body["data"]["transfer_fee_rate"] == 0.00005
+    body = c.put(f"/api/portfolios/{pid}", json=_create_payload(
+        name="TF_ZERO", transfer_fee_rate=0,
+    )).json()
+    assert body["code"] == 0 and body["data"]["transfer_fee_rate"] == 0
+    body = c.put(f"/api/portfolios/{pid}", json=_create_payload(
+        name="TF_ZERO", transfer_fee_rate=None,
+    )).json()
+    assert body["code"] == 0 and body["data"]["transfer_fee_rate"] == 0.00001
+
+    # 非法值仍被拒（create + update）
+    assert c.post("/api/portfolios", json=_create_payload(
+        name="TF_BAD", transfer_fee_rate=-0.001,
+    )).json()["code"] == 400
+    assert c.put(f"/api/portfolios/{pid}", json=_create_payload(
+        name="TF_ZERO", transfer_fee_rate=-0.001,
+    )).json()["code"] == 400
 
 
 def test_create_portfolio_batch_strategy_numeric_rejected(client):

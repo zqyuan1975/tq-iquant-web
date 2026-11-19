@@ -51,6 +51,7 @@ VALID_STATUSES = {"active", "archived"}  # draft:500
 VALID_POSITION_SIZING = {"dynamic", "fixed"}  # W2 仓位模型：动态净资产/固定名义
 VALID_DAILY_LOSS_BASIS = {"equity", "initial"}  # 日内亏损分母：昨收净值（默认）/ 初始资金
 VALID_RISK_TIMINGS = {"next_day", "immediate"}  # 实盘风控/信号执行时点（批次1）
+VALID_MARKET_GATE_ENGINES = {"python", "tdx"}  # 市场门控：内置公式 / 客户端公式库
 
 
 class StrategyItem(BaseModel):
@@ -79,6 +80,8 @@ class StrategyItem(BaseModel):
     regime_filter_enabled: bool = False
     trend_trailing_stop_ratio: float | None = None
     trend_max_positions: int | None = None
+    # E3 策略级门控覆盖（inherit=跟随组合（默认）/off=本策略不受门控/on=组合未开也强制）
+    market_gate_mode: str | None = None
     # #3 策略级敞口上限（默认关）：回测 BUY 审批卡策略总持仓市值 ≤ capital_ratio × 初始资金
     exposure_cap_enabled: bool = False
     # 策略级单笔最大买入金额（元，None=不限）：BUY 审批金额超此值缩量到整手股数
@@ -87,8 +90,17 @@ class StrategyItem(BaseModel):
     # 实盘执行配置（批次1，默认关/保守默认）
     requote_enabled: bool = False
     requote_max_attempts: int = 2
+    # H4 自适应追价：tick=固定一档（默认）/ adaptive=按最新价追
+    requote_price_mode: str = "tick"
+    requote_max_slippage_ticks: int = 5
     split_order_enabled: bool = False
     split_order_threshold: float = 500000.0
+    # H3 切片增强（None/0 = 按阈值默认推导）
+    split_order_count: int | None = None
+    split_order_min_qty: int | None = None
+    split_order_interval_seconds: float | None = None
+    split_order_interval_jitter: bool = False
+    split_order_volume_pct: float | None = None
     risk_timing: str = "next_day"
     signal_frequency: str | None = None
     signal_at: str | None = None
@@ -99,8 +111,34 @@ class StrategyItem(BaseModel):
 class PortfolioCreate(BaseModel):
     name: str
     stock_pool_id: int
-    benchmark_index: str = "000300.SH"
-    initial_capital: float = 500000
+    benchmark_index: str = "000001.SH"
+    # 市场多空门控（2026-11-18）：基准指数空头状态禁止开仓/加仓，持仓不强平。
+    # None=请求未携带（编辑不动已有值 / 新建落默认 False）。
+    market_gate_enabled: bool | None = None
+    # 计算通道：python=内置公式（默认）/ tdx=客户端公式库按名求值。None=不动。
+    market_gate_engine: str | None = None
+    # tdx 通道公式名（空串或 None = 用内核默认 TQGATE）
+    market_gate_formula_name: str | None = None
+    # E3 门控维度扩展（2026-11-18）：None=请求未携带（编辑不动已有值）。
+    # 多指数投票（空列表=仅 benchmark_index）/ 投票模式 / 强度门槛 / 空头减仓比例
+    market_gate_indices: list[str] | None = None
+    market_gate_vote_mode: str | None = None
+    market_gate_strength_threshold: int | None = None
+    market_gate_bear_reduce_ratio: float | None = None
+    # 公司行为（2026-11-18，J1/J2）：手工事件表总开关与处置档位，全部默认关。
+    # None=请求未携带（编辑不动已有值 / 新建落默认 False/0）。
+    corporate_actions_enabled: bool | None = None
+    dividend_reinvest_enabled: bool | None = None
+    suspension_dispose_days: int | None = None
+    delist_force_close_enabled: bool | None = None
+    # 时点股票池（2026-11-18，J7）：按 stock_pool_memberships 生效区间判定成分，
+    # 只拦开仓/加仓。None=请求未携带（编辑不动已有值 / 新建落默认 False）。
+    pool_pit_enabled: bool | None = None
+    # D4（2026-11-18）：熔断处置动作 notify/halt/half/liquidate（None=不改）
+    breaker_action: str | None = None
+    # A2（2026-11-18）：跨组合下单优先级，数值越大越先处理（None=不改/默认 0）
+    priority: int | None = None
+    initial_capital: float = 2000000
     max_drawdown: float = 0.2
     daily_loss_limit: float = 0.05
     max_holdings: int = 10
@@ -108,9 +146,14 @@ class PortfolioCreate(BaseModel):
     buy_commission_rate: float = 0.00025
     sell_commission_rate: float = 0.00025
     stamp_duty_rate: float = 0.0005
-    slippage: float = 0
+    # 过户费（双向，默认 A 股现行 0.001%/边）；None=请求未填 → 落默认，显式 0 原样落库
+    transfer_fee_rate: float | None = 0.00001
+    slippage: float = 0.002
+    # 风控冷静期（默认 1）：止损/止盈/移动止损成交后 N 个交易日内禁止新开仓
+    # （当日算第 1 天）；0=关闭。None=请求未携带 → 新建落默认 1 / 编辑不动已有值。
+    risk_cooldown_days: int | None = None
     trading_session: str = "full"
-    # #1 涨跌停约束（回测）：None=新建默认开启/编辑不动；显式 bool=按值设置
+    # #1 涨跌停校验（回测成交 + 实盘下单前置）：None=新建默认开启/编辑不动；显式 bool=按值设置
     price_limit_check_enabled: bool | None = None
     # #2 成交量/流动性约束（回测，默认关）：None=不动（新建落默认 False/0.10）
     volume_limit_enabled: bool | None = None
@@ -129,6 +172,10 @@ class PortfolioCreate(BaseModel):
     cash_enhance_position_ratio_threshold: float | None = None
     # W3 容量上限（可选，默认 None）：dynamic 仓位资金封顶，超净值部分闲置（撤回/封盘）
     equity_cap: float | None = None
+    # 实盘风控闸（仅实盘生效，回测不读）：None=不限制；按「买入后该票市值 ÷ 总资产」
+    # 「买入后剩余现金 ÷ 总资产」判定，实盘 LiveEngine 从列读取
+    max_single_position_pct: float | None = None
+    min_cash_reserve_pct: float | None = None
     status: str = "active"
     strategies: list[StrategyItem] = []
 
@@ -222,6 +269,31 @@ def _validate_execution_config(req, label: str = "") -> str | None:
         return f"{label}requote_max_attempts 须在 [0,10]，收到 {req.requote_max_attempts}"
     if req.split_order_threshold < 0:
         return f"{label}split_order_threshold 不能为负，收到 {req.split_order_threshold}"
+    # H3 切片参数：None/0 表示不启用；负数/比例越界会静默改变拆单结果，入口拦截
+    if req.split_order_count is not None and req.split_order_count < 0:
+        return f"{label}split_order_count 不能为负，收到 {req.split_order_count}"
+    if req.split_order_min_qty is not None and req.split_order_min_qty < 0:
+        return f"{label}split_order_min_qty 不能为负，收到 {req.split_order_min_qty}"
+    if (req.split_order_interval_seconds is not None
+            and req.split_order_interval_seconds < 0):
+        return (
+            f"{label}split_order_interval_seconds 不能为负，"
+            f"收到 {req.split_order_interval_seconds}"
+        )
+    if (req.split_order_volume_pct is not None
+            and not (0 < req.split_order_volume_pct <= 1)):
+        return (
+            f"{label}split_order_volume_pct 须在 (0,1]，"
+            f"收到 {req.split_order_volume_pct}"
+        )
+    # H4 自适应追价
+    if req.requote_price_mode not in ("tick", "adaptive"):
+        return f"{label}requote_price_mode 必须为 tick/adaptive，收到 {req.requote_price_mode}"
+    if not (0 <= req.requote_max_slippage_ticks <= 100):
+        return (
+            f"{label}requote_max_slippage_ticks 须在 [0,100]，"
+            f"收到 {req.requote_max_slippage_ticks}"
+        )
     if req.risk_timing not in VALID_RISK_TIMINGS:
         return (
             f"{label}risk_timing 必须为 {sorted(VALID_RISK_TIMINGS)}，"
@@ -238,12 +310,22 @@ def _validate_portfolio_numerics(req) -> str | None:
         return f"max_holdings 须 ≥ 1，收到 {req.max_holdings}"
     if req.min_commission < 0:
         return f"min_commission 不能为负，收到 {req.min_commission}"
-    for field in ("buy_commission_rate", "sell_commission_rate", "stamp_duty_rate", "slippage"):
+    for field in ("buy_commission_rate", "sell_commission_rate", "stamp_duty_rate",
+                  "slippage"):
         val = getattr(req, field)
         if not (0 <= val <= 0.5):
             return f"{field} 须在 [0, 0.5]，收到 {val}"
+    # 过户费：None=未填（落默认 0.00001），显式值（含 0）按值校验
+    tf = getattr(req, "transfer_fee_rate", None)
+    if tf is not None and not (0 <= tf <= 0.5):
+        return f"transfer_fee_rate 须在 [0, 0.5]，收到 {tf}"
     if req.benchmark_index and not re.fullmatch(r"\d{6}\.[A-Za-z]{2,4}", req.benchmark_index):
-        return f"benchmark_index 格式须为 6 位代码.市场（如 000300.SH），收到 {req.benchmark_index!r}"
+        return f"benchmark_index 格式须为 6 位代码.市场（如 000985.CSI），收到 {req.benchmark_index!r}"
+    # 门控通道白名单：None=未填（不动）；空串/未知值一律拒绝，防止落库脏值
+    gate_engine = getattr(req, "market_gate_engine", None)
+    if gate_engine is not None and gate_engine not in VALID_MARKET_GATE_ENGINES:
+        return (f"market_gate_engine 必须为 {sorted(VALID_MARKET_GATE_ENGINES)}，"
+                f"收到 {gate_engine!r}")
     return None
 
 
@@ -273,6 +355,16 @@ def _validate_portfolio(req: PortfolioCreate, db: Session) -> str | None:
             f"daily_loss_basis 必须为 {sorted(VALID_DAILY_LOSS_BASIS)}，"
             f"收到 {req.daily_loss_basis}"
         )
+    # D4 熔断处置动作：None=不改；显式值白名单
+    breaker_action = getattr(req, "breaker_action", None)
+    if breaker_action is not None and breaker_action not in (
+            "notify", "halt", "half", "liquidate"):
+        return ("breaker_action 必须为 notify/halt/half/liquidate，"
+                f"收到 {breaker_action!r}")
+    # A2 跨组合下单优先级：None=不改；显式值限 [-1000, 1000]
+    priority = getattr(req, "priority", None)
+    if priority is not None and not (-1000 <= int(priority) <= 1000):
+        return f"priority 需在 [-1000, 1000]，收到 {priority!r}"
     if req.cash_enhance_position_ratio_threshold is not None and not (
         0 < req.cash_enhance_position_ratio_threshold <= 1
     ):
@@ -282,6 +374,15 @@ def _validate_portfolio(req: PortfolioCreate, db: Session) -> str | None:
         )
     if req.equity_cap is not None and req.equity_cap <= 0:
         return f"equity_cap 必须 > 0（None=不设上限），收到 {req.equity_cap}"
+    # 实盘单票上限 / 现金下限：None/0=不限制；显式值须在 [0,1]
+    for _k in ("max_single_position_pct", "min_cash_reserve_pct"):
+        _v = getattr(req, _k, None)
+        if _v is not None and not (0 <= _v <= 1):
+            return f"{_k} 必须在 [0,1]（None/0=不限制），收到 {_v}"
+    # 风控冷静期：0=关闭；上限 60 交易日（约 3 个月，超长冷却意味着该 sign 永久失效）
+    if req.risk_cooldown_days is not None and not (0 <= req.risk_cooldown_days <= 60):
+        return (f"risk_cooldown_days 须在 [0,60]（0=关闭），"
+                f"收到 {req.risk_cooldown_days}")
     if not db.query(StockPool).filter(StockPool.id == req.stock_pool_id).first():
         return f"股票池 id={req.stock_pool_id} 不存在"
     # 子策略校验
@@ -452,6 +553,8 @@ class StrategyCreate(BaseModel):
     regime_filter_enabled: bool = False
     trend_trailing_stop_ratio: float | None = None
     trend_max_positions: int | None = None
+    # E3 策略级门控覆盖（inherit=跟随组合（默认）/off=本策略不受门控/on=组合未开也强制）
+    market_gate_mode: str | None = None
     # #3 策略级敞口上限（默认关）：回测 BUY 审批卡策略总持仓市值 ≤ capital_ratio × 初始资金
     exposure_cap_enabled: bool = False
     # 策略级单笔最大买入金额（元，None=不限）：BUY 审批金额超此值缩量到整手股数
@@ -460,8 +563,17 @@ class StrategyCreate(BaseModel):
     # 实盘执行配置（批次1，默认关/保守默认）
     requote_enabled: bool = False
     requote_max_attempts: int = 2
+    # H4 自适应追价：tick=固定一档（默认）/ adaptive=按最新价追
+    requote_price_mode: str = "tick"
+    requote_max_slippage_ticks: int = 5
     split_order_enabled: bool = False
     split_order_threshold: float = 500000.0
+    # H3 切片增强（None/0 = 按阈值默认推导）
+    split_order_count: int | None = None
+    split_order_min_qty: int | None = None
+    split_order_interval_seconds: float | None = None
+    split_order_interval_jitter: bool = False
+    split_order_volume_pct: float | None = None
     risk_timing: str = "next_day"
     signal_frequency: str | None = None
     signal_at: str | None = None

@@ -3,6 +3,7 @@ import { mount, flushPromises } from '@vue/test-utils'
 import { readFileSync } from 'node:fs'
 import { useTheme } from '../composables/useTheme'
 import { deriveBlockCode } from '../utils/blockCode'
+import { emitNavReselect } from '../utils/navReselect'
 
 const { CSS_VARS, SCORE_TIER_OF, stubGetComputedStyle } = vi.hoisted(() => {
   const CSS_VARS: Record<string, string> = {
@@ -57,6 +58,7 @@ vi.mock('../api', () => ({
   recomputePersistenceAnalysis: vi.fn(),
   getStockPools: vi.fn(),
   compareBacktestPools: vi.fn(),
+  compareBacktestRecords: vi.fn(),
   sendUserBlock: vi.fn(),
 }))
 
@@ -75,11 +77,12 @@ vi.mock('echarts', () => {
 })
 
 import Backtest from '../views/Backtest.vue'
+import * as echarts from 'echarts'
 import {
   getBacktestRecords, getBacktestDetail, runBacktest, getPortfolios,
   deleteBacktestRecord, recomputeCrisisAlpha, recomputeMarketRegime,
   recomputePersistenceAnalysis, getStockPools, compareBacktestPools,
-  sendUserBlock,
+  compareBacktestRecords, sendUserBlock,
 } from '../api'
 
 const scrollTargets: any[] = []
@@ -144,6 +147,56 @@ describe('Backtest.vue — 列表视图', () => {
     await flushPromises()
     expect(w.text()).toContain('已完成')
     expect(w.text()).toContain('失败')
+  })
+
+  it('对比所选：数据返回后先退出 loading 再初始化图表（容器已挂载）', async () => {
+    const completed = [
+      { ...mockRecords[0], id: 1, name: '回测A', status: 'completed' },
+      { ...mockRecords[0], id: 2, name: '回测B', status: 'completed' },
+    ]
+    ;(getBacktestRecords as any).mockResolvedValue(completed)
+    const item = (id: number) => ({
+      record: { ...completed[id - 1] },
+      metrics: {},
+      curve: [{ date: '2026-07-01', total_value: 100000, cumulative_return: 0, index_value: 1 }],
+      params: { benchmark_index: '000001.SH' },
+      trade_summary: {
+        trades_count: 0, buy_count: 0, sell_count: 0,
+        buy_amount: 0, sell_amount: 0, stocks: {},
+      },
+    })
+    ;(compareBacktestRecords as any).mockResolvedValue({
+      records: [item(1), item(2)],
+      metric_rows: [], stock_rows: [], stock_rows_truncated: false,
+      param_rows: [{
+        key: 'strategies[1].max_positions', values: [10, 20], differs: true,
+      }],
+      trade_totals: [
+        { trades_count: 0, buy_count: 0, sell_count: 0, buy_amount: 0, sell_amount: 0 },
+        { trades_count: 0, buy_count: 0, sell_count: 0, buy_amount: 0, sell_amount: 0 },
+      ],
+      warnings: [],
+    })
+
+    const w = mount(Backtest)
+    await flushPromises()
+
+    const boxes = w.findAll('tbody input[type=checkbox]')
+    await boxes[0].setValue(true)
+    await boxes[1].setValue(true)
+    const btn = w.findAll('button').find(b => b.text().startsWith('对比所选'))!
+    expect(btn.attributes('disabled')).toBeUndefined()
+    await btn.trigger('click')
+    await flushPromises()
+    await flushPromises()
+
+    expect(w.text()).toContain('归一净值曲线（首日=1）')
+    expect(w.text()).toContain('strategies[1].max_positions')
+    // 回归点：init 必须拿到已挂载的图表容器；此前 loading 未结束，ref 为 null → 永不绘图
+    const initArg = (echarts.init as any).mock.calls.at(-1)?.[0]
+    expect(initArg).toBeInstanceOf(HTMLElement)
+    expect((initArg as HTMLElement).style.height).toBe('320px')
+    w.unmount()
   })
 
   it('每行含[查看]按钮', async () => {
@@ -730,6 +783,50 @@ describe('Backtest.vue — 详情视图', () => {
 
     expect(w.text()).toContain('回测A')  // 回到列表
     expect(w.text()).not.toContain('总收益')
+  })
+
+  it('详情页收到导航「回测管理」重选事件 → 回列表（等同顶部返回）', async () => {
+    const w = mount(Backtest)
+    await flushPromises()
+    await w.findAll('button').find(b => b.text().includes('查看'))!.trigger('click')
+    await flushPromises()
+    expect(w.text()).toContain('总收益')
+
+    emitNavReselect('/backtest')
+    await flushPromises()
+
+    expect(w.text()).toContain('回测A')
+    expect(w.text()).not.toContain('总收益')
+  })
+
+  it('列表页收到重选事件 → 保持在列表（无副作用、不重复请求详情）', async () => {
+    const w = mount(Backtest)
+    await flushPromises()
+    emitNavReselect('/backtest')
+    await flushPromises()
+
+    expect(w.text()).toContain('回测A')
+    expect(getBacktestDetail).not.toHaveBeenCalled()
+  })
+
+  it('其它路由的重选事件不影响回测详情', async () => {
+    const w = mount(Backtest)
+    await flushPromises()
+    await w.findAll('button').find(b => b.text().includes('查看'))!.trigger('click')
+    await flushPromises()
+    expect(w.text()).toContain('总收益')
+
+    emitNavReselect('/live')
+    await flushPromises()
+
+    expect(w.text()).toContain('总收益')
+  })
+
+  it('卸载后重选事件不再作用于已销毁的视图', async () => {
+    const w = mount(Backtest)
+    await flushPromises()
+    w.unmount()
+    expect(() => emitNavReselect('/backtest')).not.toThrow()
   })
 
   it('评估指标百分比显示（total_return 0.05 → 5%）', async () => {
@@ -2873,6 +2970,57 @@ describe('Backtest.vue — 持续性检验 section', () => {
     await pCaret.trigger('click')
     await flushPromises()
     expect(w.find('.p-verdict').exists()).toBe(true)
+  })
+
+  it('页内切换记录（A 展开 → 返回 → B）后滚动年化图重新初始化并换用新数据', async () => {
+    // 回归点：pCollapsed 不随 openDetail 重置，详情 DOM 会重建；
+    // 若只在「展开/重算」时 init 一次，页内切记录后容器在、实例无 → 图空白。
+    const completed = [
+      { ...mockRecords[0], id: 1, name: '回测A', status: 'completed' },
+      { ...mockRecords[1], id: 2, name: '回测B', status: 'completed' },
+    ]
+    ;(getBacktestRecords as any).mockResolvedValue(completed)
+    const payloadFor = (id: number) => ({
+      status: 'completed',
+      data: {
+        status: 'completed', error: null, years: [],
+        rolling: {
+          dates: [id === 1 ? '2024-06-01' : '2025-06-01'],
+          strat_6m: [0.1], strat_12m: [id === 1 ? 0.08 : 0.09], bench_12m: [0.06],
+        },
+        benchmarks: [{ code: '000300.SH', name: '沪深300', is_main: true, available: true }],
+        verdict: { level: 'stable', reasons: [], summary: '稳定', caveat: '', signals: [], window_years: [] },
+      },
+    })
+    ;(getBacktestDetail as any).mockImplementation((id: number) => Promise.resolve({
+      ...mockDetail,
+      record: { ...mockDetail.record, id, name: id === 1 ? '回测A' : '回测B' },
+      persistence: payloadFor(id),
+    }))
+
+    const rollingInits = () => (echarts.init as any).mock.calls
+      .map((c: any[], i: number) => ({ el: c[0], inst: (echarts.init as any).mock.results[i]?.value }))
+      .filter((x: any) => x.el instanceof HTMLElement && (x.el as HTMLElement).style.height === '340px')
+
+    const w = mount(Backtest)
+    await flushPromises()
+    // 打开 A 并展开持续性检验
+    await w.findAll('button').filter(b => b.text().includes('查看'))[0].trigger('click')
+    await flushPromises()
+    await w.findAll('.section-title').find(h => h.text().includes('持续性检验'))!.trigger('click')
+    await flushPromises()
+    expect(rollingInits().length).toBe(1)
+    expect(rollingInits()[0].inst.setOption.mock.calls.at(-1)[0].xAxis.data).toEqual(['2024-06-01'])
+
+    // 页内返回列表（组件不卸载，pCollapsed 仍为展开）→ 打开 B
+    await w.findAll('button').filter(b => b.text().includes('返回'))[0].trigger('click')
+    await flushPromises()
+    await w.findAll('button').filter(b => b.text().includes('查看'))[1].trigger('click')
+    await flushPromises()
+
+    expect(rollingInits().length).toBe(2)
+    expect(rollingInits()[1].inst.setOption.mock.calls.at(-1)[0].xAxis.data).toEqual(['2025-06-01'])
+    w.unmount()
   })
 
   it('判定基准选择器：默认主基准，切换后带 benchmark_code 重算', async () => {

@@ -4,11 +4,17 @@ import * as echarts from 'echarts'
 import {
   getBacktestRecords, getBacktestDetail, runBacktest, getPortfolios,
   deleteBacktestRecord, recomputeCrisisAlpha, recomputeMarketRegime,
+  cancelBacktestRecord,
   recomputeRobustness, recomputePersistenceAnalysis, getStockPools, compareBacktestPools,
+  compareBacktestRecords,
+  replaySignals,
   sendUserBlock,
 } from '../api'
 import type {
   BacktestRecordItem, BacktestDetailItem, PortfolioItem,
+  BacktestCompareResult,
+  BacktestCompareItem,
+  SignalReplayResult,
   BacktestEvaluationItem, DecisionSummaryItem, DecisionEventItem,
   CrisisAlphaData, CrisisAlphaBenchmarkResolution,
   MarketRegimeData, MarketRegimeStateRow,
@@ -17,15 +23,18 @@ import type {
   RobustnessBlock, RobustWindow, RobustSensitivityRow,
   BacktestRobustnessItem, BacktestGateResult, AcceptanceResult,
   ValidationVerdict,
+  DataQuality, DataQualityPeriod,
 } from '../api'
 import { gateLabel, LAYER_LABEL, ACTION_LABEL } from '../utils/liveEvents'
 import { deriveBlockCode } from '../utils/blockCode'
+import { MARKET_GATE_OVERRIDES } from '../utils/marketGate'
 import PageHeader from '../components/PageHeader.vue'
 import { fmtMoney, fmtPrice, fmtQty, fmtPct, fmtSignedPct, fmtRatio } from '../utils/format'
 import { useTable } from '../composables/useTable'
 import TableToolbar from '../components/TableToolbar.vue'
 import TablePager from '../components/TablePager.vue'
 import { useTheme } from '../composables/useTheme'
+import { onNavReselect } from '../utils/navReselect'
 
 function cssVar(name: string): string {
   if (typeof document === 'undefined') return '#000000'
@@ -110,7 +119,7 @@ const showBacktestGuide = ref(false)
 const submitting = ref(false)
 // 高级选项（评估口径 / IS-OOS 采纳门槛 / 费用预留 / 自适应滑点）默认折叠：发起回测默认走增强前的基础方式
 const showAdvanced = ref(false)
-const form = ref({ portfolio_strategy_id: 0, name: '', start_date: '', end_date: '', dividend_mode: 'front', evaluation_profile: 'absolute', is_oos_gate_enabled: false, oos_gate_min_ratio: 0.5, fee_reserve_enabled: false, bond_t0_enabled: false, bond_lot_enabled: false, adaptive_slippage_enabled: undefined as boolean | undefined, slippage_impact_coef: undefined as string | undefined, volume_limit_enabled: undefined as boolean | undefined, volume_limit_ratio: undefined as string | undefined, equity_cap: undefined as string | undefined, daily_close_peak_enabled: false, daily_loss_basis: '' as '' | 'equity' | 'initial' })
+const form = ref({ portfolio_strategy_id: 0, name: '', start_date: '', end_date: '', dividend_mode: 'front', evaluation_profile: 'absolute', is_oos_gate_enabled: false, oos_gate_min_ratio: 0.5, fee_reserve_enabled: false, bond_t0_enabled: false, bond_lot_enabled: false, adaptive_slippage_enabled: undefined as boolean | undefined, slippage_impact_coef: undefined as string | undefined, volume_limit_enabled: undefined as boolean | undefined, volume_limit_ratio: undefined as string | undefined, equity_cap: undefined as string | undefined, daily_close_peak_enabled: false, daily_loss_basis: '' as '' | 'equity' | 'initial', market_gate_enabled: '' as '' | 'true' | 'false' })
 const gateBanner = ref<BacktestGateResult | null>(null)
 
 // ===== 详情视图 =====
@@ -165,6 +174,11 @@ const crisisAlpha = computed(() => detail.value?.crisis_alpha ?? null)
 const caStatus = computed(() => crisisAlpha.value?.status ?? null)
 // 验证结论（容量健康 + 危机防御 + 样本外引用），随回测完成冻结在 record.validation
 const validation = computed<ValidationVerdict | null>(() => currentRecord.value?.validation ?? null)
+// F1 数据质量（覆盖率/缺根/剔除假 bar），历史记录为 null → 整块隐藏
+const dataQuality = computed<DataQuality | null>(() => currentRecord.value?.data_quality ?? null)
+const dqPeriods = computed<[string, DataQualityPeriod][]>(() =>
+  Object.entries(dataQuality.value?.periods ?? {}) as [string, DataQualityPeriod][])
+const dqMissingStocks = computed(() => dataQuality.value?.missing_stocks ?? [])
 const caSkipped = computed(() => crisisAlpha.value?.skipped_benchmarks || [])
 const ca = computed<CrisisAlphaData | null>(() => {
   const item = crisisAlpha.value
@@ -871,6 +885,7 @@ function initCaDimChart() {
 // 信号状态标签
 const STATUS_LABEL: Record<string, string> = {
   completed: '已完成', running: '运行中', failed: '失败', pending: '待运行',
+  canceled: '已取消',
 }
 
 // 信号类型 → 中文（公式 OPEN/ADD/REDUCE/CLOSE + 风控 STOP_LOSS/TAKE_PROFIT/TRAILING_STOP）
@@ -910,6 +925,351 @@ async function load() {
   }
 }
 
+// ---- K2 多记录横向对比 ----
+const recordCompareSelected = ref<number[]>([])
+const showRecordCompare = ref(false)
+const recordCompareLoading = ref(false)
+const recordCompareError = ref('')
+const recordCompareData = ref<BacktestCompareResult | null>(null)
+const recordCompareChartEl = ref<HTMLElement | null>(null)
+let recordCompareChart: echarts.ECharts | null = null
+// 曲线点位总数：为 0 时只展示提示，不初始化空图表
+const recordCompareCurvePoints = computed(() =>
+  (recordCompareData.value?.records ?? []).reduce(
+    (n, it) => n + it.curve.filter(p => p.date && p.index_value !== null).length, 0))
+const RECORD_COMPARE_PCT_KEYS = new Set([
+  'total_return', 'annual_return', 'max_drawdown', 'volatility', 'win_rate',
+  'benchmark_return', 'excess_annual_return', 'total_cost_ratio',
+])
+
+function recordCompareMetricText(key: string, v: number | null): string {
+  if (v === null || v === undefined) return '—'
+  if (RECORD_COMPARE_PCT_KEYS.has(key)) return fmtPct(v)
+  if (key === 'annual_turnover') return `${v.toFixed(2)}×`
+  if (key === 'total_trades') return String(Math.round(v))
+  return v.toFixed(2)
+}
+
+function recordCompareParamText(v: string | number | boolean | null): string {
+  if (v === null || v === undefined) return '—'
+  if (typeof v === 'boolean') return v ? '开' : '关'
+  return String(v)
+}
+
+function recordCompareStockText(v: number): string {
+  return fmtMoney(v)
+}
+
+function recordCompareBenchmark(it: BacktestCompareItem): string {
+  const b = it.params?.benchmark_index
+  return b === null || b === undefined || b === '' ? '基准未记录' : `基准 ${String(b)}`
+}
+
+function renderRecordCompareChart() {
+  if (!recordCompareChartEl.value || !recordCompareData.value) return
+  if (recordCompareChart) { recordCompareChart.dispose(); recordCompareChart = null }
+  recordCompareChart = echarts.init(recordCompareChartEl.value)
+  recordCompareChart.setOption({
+    color: [cssVar('--blue'), cssVar('--red'), cssVar('--green'), '#f0a429',
+            '#7c3aed', '#0891b2', '#be185d', '#4d7c0f', '#a16207', '#6b7280'],
+    tooltip: { trigger: 'axis' },
+    legend: { type: 'scroll', top: 0, textStyle: { color: cssVar('--ink-soft'), fontSize: 11 } },
+    grid: { left: 56, right: 20, top: 44, bottom: 36 },
+    xAxis: {
+      type: 'time',
+      axisLabel: { color: cssVar('--ink-faint'), fontSize: 11 },
+      axisLine: { lineStyle: { color: cssVar('--line') } },
+    },
+    yAxis: {
+      type: 'value', scale: true,
+      name: '归一净值',
+      nameTextStyle: { color: cssVar('--ink-faint'), fontSize: 11 },
+      axisLabel: { color: cssVar('--ink-faint'), fontSize: 11,
+                   formatter: (v: number) => v.toFixed(2) },
+      splitLine: { lineStyle: { color: cssVar('--line') } },
+    },
+    series: recordCompareData.value.records.map(it => ({
+      name: `#${it.record.id} ${it.record.name}`,
+      type: 'line',
+      showSymbol: false,
+      lineStyle: { width: 1.5 },
+      data: it.curve.filter(p => p.date && p.index_value !== null)
+        .map(p => [p.date as string, p.index_value as number]),
+    })),
+  })
+}
+
+async function openRecordCompare() {
+  if (recordCompareSelected.value.length < 2) return
+  recordCompareError.value = ''
+  recordCompareData.value = null
+  showRecordCompare.value = true
+  recordCompareLoading.value = true
+  try {
+    recordCompareData.value = await compareBacktestRecords([...recordCompareSelected.value])
+  } catch (e) {
+    recordCompareError.value = '对比失败：' + errMsg(e)
+  } finally {
+    // 先结束 loading，让 v-else-if 的图表容器真正挂载，再初始化实例；
+    // 否则 setOption 发生在 loading 分支期间，ref 为 null，图表永久空白。
+    recordCompareLoading.value = false
+  }
+  await nextTick()
+  if (recordCompareData.value && recordCompareCurvePoints.value > 0) {
+    renderRecordCompareChart()
+  }
+}
+
+function closeRecordCompare() {
+  showRecordCompare.value = false
+  recordCompareData.value = null
+  recordCompareError.value = ''
+  if (recordCompareChart) { recordCompareChart.dispose(); recordCompareChart = null }
+}
+
+// ---- N3 信号回放校验（重算信号 + 可选与实盘委托对照）----
+const showReplay = ref(false)
+const replayLoading = ref(false)
+const replayError = ref('')
+const replayResult = ref<SignalReplayResult | null>(null)
+// 回放结果行数可能很多（逐 bar × 股票 × 策略），前端先截断展示
+const REPLAY_ROW_LIMIT = 300
+const replayForm = ref({
+  portfolio_strategy_id: 0,
+  start_date: '',
+  end_date: '',
+  dividend_mode: 'front',
+  session_id: '' as number | string,
+})
+
+/** 相对今天偏移 N 天的 ISO 日期（仅供回放默认区间）。 */
+function _isoDay(offsetDays: number): string {
+  const d = new Date()
+  d.setDate(d.getDate() + offsetDays)
+  return d.toISOString().slice(0, 10)
+}
+
+function openReplay() {
+  replayError.value = ''
+  replayResult.value = null
+  if (!replayForm.value.start_date) replayForm.value.start_date = _isoDay(-30)
+  if (!replayForm.value.end_date) replayForm.value.end_date = _isoDay(0)
+  showReplay.value = true
+}
+
+async function runReplay() {
+  const f = replayForm.value
+  if (!f.portfolio_strategy_id) { replayError.value = '请选择组合策略'; return }
+  if (!f.start_date || !f.end_date) { replayError.value = '请填写起止日期'; return }
+  if (f.start_date > f.end_date) { replayError.value = '开始日期不能晚于结束日期'; return }
+  replayError.value = ''
+  replayResult.value = null
+  replayLoading.value = true
+  try {
+    replayResult.value = await replaySignals({
+      portfolio_strategy_id: f.portfolio_strategy_id,
+      start_date: f.start_date,
+      end_date: f.end_date,
+      dividend_mode: f.dividend_mode,
+      session_id: f.session_id === '' ? null : Number(f.session_id),
+    })
+  } catch (e) {
+    replayError.value = '回放失败：' + errMsg(e)
+  } finally {
+    replayLoading.value = false
+  }
+}
+
+function closeReplay() {
+  showReplay.value = false
+  replayResult.value = null
+  replayError.value = ''
+}
+
+const replayRows = computed(() =>
+  (replayResult.value?.rows ?? []).slice(0, REPLAY_ROW_LIMIT))
+
+function replayStrategyName(id: number): string {
+  for (const p of portfolios.value) {
+    const s = (p.strategies || []).find(it => it.id === id)
+    if (s) return s.name
+  }
+  return `#${id}`
+}
+
+function replayDirectionText(d: string): string {
+  return d === 'BUY' ? '买入' : d === 'SELL' ? '卖出' : d
+}
+
+// ---- K5 成本与容量（详情接口现算块）----
+const costCapacity = computed(() => detail.value?.cost_capacity ?? null)
+const bpsText = (v: number | null | undefined) => (v === null || v === undefined ? '—' : `${v.toFixed(2)} bps`)
+const clampPct = (v: number) => Math.max(0, Math.min(100, v))
+
+/** 显性成本结构：佣金 / 印花税 / 过户费占比。 */
+const costMix = computed(() => {
+  const e = costCapacity.value?.explicit
+  if (!e) return []
+  const total = Math.max(e.total_cost ?? 0, 1e-9)
+  return [
+    { key: 'mix-1', label: '佣金', value: e.commission ?? 0, width: clampPct((e.commission ?? 0) / total * 100) },
+    { key: 'mix-2', label: '印花税', value: e.stamp_duty ?? 0, width: clampPct((e.stamp_duty ?? 0) / total * 100) },
+    { key: 'mix-3', label: '过户费', value: e.transfer_fee ?? 0, width: clampPct((e.transfer_fee ?? 0) / total * 100) },
+  ]
+})
+
+const DONUT_C = 2 * Math.PI * 52
+/** 成本拖累占比（成本/毛利）的环图：超过 100% 时按满环显示，数值仍精确展示。 */
+const dragView = computed(() => {
+  const r = costCapacity.value?.explicit.cost_drag_ratio ?? null
+  const ratio = r === null ? 0 : Math.max(0, Math.min(1, r))
+  const tone = r === null ? 'neutral' : r >= 0.5 ? 'bad' : r >= 0.25 ? 'warn' : 'ok'
+  return { ratio, tone, dash: DONUT_C * ratio, offset: DONUT_C * (1 - ratio) }
+})
+
+/** 滑点实测 vs 配置：以 0 为中点的对称刻度，负值落在左侧。 */
+const slippageView = computed(() => {
+  const s = costCapacity.value?.slippage
+  if (!s) return null
+  const cfg = s.configured_bps ?? 0
+  const real = s.realized_deviation_bps ?? 0
+  const domain = Math.max(Math.abs(cfg), Math.abs(real), 1) * 1.35
+  const pos = (v: number) => clampPct(50 + v / domain * 50)
+  const tone = real > cfg + 0.01 ? 'bad' : real < cfg - 0.01 ? 'ok' : 'neutral'
+  return { cfg, real, tone, cfgPos: pos(cfg), realPos: pos(real) }
+})
+
+/** 容量压力：以「大额阈值 ×2」与当前最大单笔占净值的较大值为刻度上限。 */
+const capacityView = computed(() => {
+  const c = costCapacity.value?.capacity
+  if (!c) return null
+  const value = c.max_trade_pct_equity ?? 0
+  const threshold = c.large_trade_threshold_pct ?? 0
+  const scaleMax = Math.max(value * 1.15, threshold * 2, 0.01)
+  const level = String(c.pressure_level ?? '')
+  const tone = /高|high/i.test(level) ? 'bad'
+    : /中|medium/i.test(level) ? 'warn'
+      : /低|low/i.test(level) ? 'ok' : 'neutral'
+  return {
+    tone,
+    barPct: clampPct(value / scaleMax * 100),
+    thresholdPos: clampPct(threshold / scaleMax * 100),
+    scaleMax,
+  }
+})
+
+/** 容量结构（规模约束）：优先用验证结论冻结的结构化指标，老记录用详情重算值。 */
+const capacityMetrics = computed(() => (
+  validation.value?.capacity_metrics ?? costCapacity.value?.capacity.structure ?? null))
+
+/** 规模约束卡：敞口上限/净值、仓位利用率、集中度、ADV 参与率。 */
+const structureView = computed(() => {
+  const m = capacityMetrics.value
+  if (!m) return null
+  const exposure = m.exposure
+  const hits = [
+    exposure?.hit === true,
+    m.concentration?.hit === true,
+    m.adv?.hit === true,
+  ].filter(Boolean).length
+  return {
+    exposure,
+    concentration: m.concentration,
+    adv: m.adv,
+    hits,
+    tone: hits > 0 ? 'bad' : 'ok',
+    ratioPct: exposure ? clampPct(exposure.ratio * 100) : 0,
+    ratioTone: exposure ? (exposure.hit ? 'bad' : 'ok') : 'neutral',
+    concentrationTone: m.concentration?.hit ? 'warn' : 'ok',
+    advTone: m.adv ? (m.adv.hit ? 'bad' : 'ok') : 'neutral',
+  }
+})
+
+/** 验证结论·容量健康：只给判断与建议，数值统一在「规模约束」卡。 */
+const capacityVerdict = computed(() => {
+  const v = validation.value
+  if (!v) return null
+  const m = capacityMetrics.value
+  const legacy = (v.capacity || []).map(w => String(w))
+  const legacyWarns = legacy.filter(w => !w.startsWith('容量建议'))
+  const conclusions: string[] = []
+  if (m) {
+    if (m.exposure?.hit) conclusions.push('敞口上限已结构性约束仓位弹性')
+    if (m.adv?.hit) conclusions.push('最大单笔成交占 ADV 过高，实盘成交可实现性存疑')
+    if (m.concentration?.hit) conclusions.push('单票权重超过 25%，集中度偏高')
+  } else {
+    for (const w of legacyWarns) {
+      if (w.includes('敞口上限预警')) conclusions.push('敞口上限已结构性约束仓位弹性')
+      else if (w.includes('容量预警')) conclusions.push('最大单笔成交占 ADV 过高，实盘成交可实现性存疑')
+      else if (w.includes('集中度预警')) conclusions.push('单票权重超过 25%，集中度偏高')
+    }
+  }
+  const advice = m?.advice?.length
+    ? m.advice.map(a => a.text)
+    : legacy
+      .filter(w => w.startsWith('容量建议'))
+      .map(w => w.replace(/^容量建议：/, ''))
+  const count = m
+    ? [m.exposure?.hit, m.adv?.hit, m.concentration?.hit].filter(Boolean).length
+    : legacyWarns.length
+  return {
+    healthy: count === 0,
+    count,
+    tone: count === 0 ? 'ok' : 'bad',
+    conclusions,
+    advice,
+  }
+})
+
+/** 验证结论·危机防御：窗口计数 + 最差窗口，明细表保留。 */
+const crisisSummary = computed(() => {
+  const rows = validation.value?.crisis || []
+  if (!rows.length) return null
+  const total = rows.length
+  const defensive = rows.filter(r => r.verdict === 'defensive').length
+  const exposed = rows.filter(r => r.verdict === 'exposed').length
+  const withReturn = rows.filter(r => r.strategy_return !== null)
+  const worst = withReturn.length
+    ? withReturn.reduce((a, b) => (a.strategy_return! <= b.strategy_return! ? a : b))
+    : null
+  const minCash = rows.reduce<number | null>((acc, r) => (
+    r.min_cash_ratio === null ? acc
+      : (acc === null ? r.min_cash_ratio : Math.min(acc, r.min_cash_ratio))), null)
+  const maxDd = rows.reduce<number | null>((acc, r) => (
+    r.max_drawdown === null ? acc
+      : (acc === null ? r.max_drawdown : Math.max(acc, r.max_drawdown))), null)
+  return {
+    total,
+    defensive,
+    exposed,
+    worst,
+    minCash,
+    maxDd,
+    label: exposed ? `暴露 ${exposed}/${total} 窗` : `防御 ${defensive}/${total} 窗`,
+    tone: exposed ? 'bad' : defensive === total ? 'ok' : 'neutral',
+    conclusion: exposed
+      ? `${exposed} 个危机窗口未能防御，需复核风控与现金管理`
+      : '已覆盖的危机窗口均通过防御判定',
+  }
+})
+
+/** 验证结论·样本外：通过状态与窗口数。 */
+const oosView = computed(() => {
+  const o = validation.value?.oos
+  if (!o) return { tone: 'neutral', label: '未执行', detail: '' }
+  return {
+    tone: o.overall_pass === true ? 'ok' : o.overall_pass === false ? 'bad' : 'neutral',
+    label: o.overall_pass === true ? '样本外通过'
+      : o.overall_pass === false ? '样本外未通过' : '结果未知',
+    detail: o.windows_passed || '',
+  }
+})
+
+function scrollToCapacityStructure() {
+  document.getElementById('capacity-structure')
+    ?.scrollIntoView({ behavior: 'smooth', block: 'center' })
+}
+
 function openForm() {
   const today = new Date()
   const fmt = (d: Date) => {
@@ -936,6 +1296,7 @@ function openForm() {
     equity_cap: undefined,
     daily_close_peak_enabled: false,
     daily_loss_basis: '',
+    market_gate_enabled: '',
   }
   showForm.value = true
 }
@@ -972,7 +1333,7 @@ async function submit() {
       name: form.value.name,
       start_date: form.value.start_date,
       end_date: form.value.end_date,
-      dividend_mode: form.value.dividend_mode as 'front' | 'back' | 'dual',
+      dividend_mode: form.value.dividend_mode as 'front' | 'back' | 'dual' | 'exact',
       evaluation_profile: form.value.evaluation_profile as 'absolute' | 'relative',
       is_oos_gate_enabled: form.value.is_oos_gate_enabled,
       oos_gate_min_ratio: Number(form.value.oos_gate_min_ratio) || 0.5,
@@ -982,6 +1343,9 @@ async function submit() {
       daily_close_peak_enabled: form.value.daily_close_peak_enabled,
       ...(form.value.daily_loss_basis
         ? { daily_loss_basis: form.value.daily_loss_basis }
+        : {}),
+      ...(form.value.market_gate_enabled
+        ? { market_gate_enabled: form.value.market_gate_enabled === 'true' }
         : {}),
           ...(form.value.adaptive_slippage_enabled !== undefined
             ? {
@@ -1043,6 +1407,11 @@ async function switchAcceptanceProfile(p: 'absolute' | 'relative') {
   } catch (e) {
     alert(`切换口径失败：${errMsg(e)}`)
   }
+  // 口径切换会替换 detail（主图/危机/持续性的数据源都变），需按当前展开状态重绘
+  await nextTick()
+  initCharts()
+  if (!mrCollapsed.value) initMrCharts()
+  if (!pCollapsed.value) renderPRolling()
 }
 
 // ===== 1.3.1 同步持仓股到通达信自选 =====
@@ -1218,8 +1587,10 @@ async function togglePSection() {
 function renderPRolling() {
   const el = pRollingEl.value
   const d = pData.value
-  if (!el || !d?.rolling?.dates?.length) return
+  // 先释放旧实例：切到「无滚动数据 / 无 payload」的记录时也不会把 canvas 留在已销毁节点上
   pRollingChart?.dispose()
+  pRollingChart = null
+  if (!el || !d?.rolling?.dates?.length) return
   pRollingChart = echarts.init(el)
   pRollingChart.setOption({
     tooltip: { trigger: 'axis', valueFormatter: (v: any) => (v == null ? '-' : (v * 100).toFixed(2) + '%') },
@@ -1234,6 +1605,17 @@ function renderPRolling() {
     ],
   })
 }
+
+// 页内切记录不会卸载 Backtest.vue，pCollapsed 保持展开；此时详情 DOM 会重建，
+// 但 canvas 只在「展开/重算」时初始化过一次。数据源变化后必须按当前可见状态重绘，
+// 否则容器在、图表实例绑在已销毁的节点上 → 空白。
+// （离开回测页再进会重新挂载组件、pCollapsed 回到折叠态，展开时重新 init，故看起来恢复了。）
+watch(
+  () => pData.value,
+  () => {
+    if (!pCollapsed.value) nextTick(renderPRolling)
+  },
+)
 
 // ===== 市场状态×绩效分析（机遇Alpha / 中性Alpha）=====
 const mrCollapsed = ref(true)
@@ -1665,6 +2047,9 @@ async function recomputeRb() {
       : `重新计算未完成：${res.error || res.status}`
     rbRecomputeWarn.value = res.status !== 'completed'
     detail.value = await getBacktestDetail(id, acceptanceProfile.value)
+    await nextTick()
+    if (!rbCollapsed.value && rbOk.value) initRbHistChart()
+    if (!pCollapsed.value) renderPRolling()
   } catch (e) {
     rbRecomputeMsg.value = `重新计算失败：${errMsg(e)}`
     rbRecomputeWarn.value = true
@@ -1731,7 +2116,7 @@ async function submitCompare() {
       pool_ids: compareForm.value.pool_ids,
       start_date: compareForm.value.start_date,
       end_date: compareForm.value.end_date,
-      dividend_mode: compareForm.value.dividend_mode as 'front' | 'back' | 'dual',
+      dividend_mode: compareForm.value.dividend_mode as 'front' | 'back' | 'dual' | 'exact',
     })
     compareResult.value = res
   } catch (e) {
@@ -1933,6 +2318,24 @@ async function onDelete(id: number) {
   }
 }
 
+// K1：协作式取消（引擎在下一根 bar 前退出，记录最终标「已取消」+ 进度）
+const canceling = ref<Record<number, boolean>>({})
+async function onCancel(id: number) {
+  if (!confirm('确定取消该回测？已跑部分不会保留（不落半截结果）。')) return
+  canceling.value = { ...canceling.value, [id]: true }
+  try {
+    await cancelBacktestRecord(id)
+    // 引擎在下一根 bar 前响应；轮询一次 promptly 看到 canceled 状态
+    await load()
+  } catch (e) {
+    alert(`取消失败：${errMsg(e)}`)
+  } finally {
+    const next = { ...canceling.value }
+    delete next[id]
+    canceling.value = next
+  }
+}
+
 function backToList() {
   currentRecord.value = null
   detail.value = null
@@ -2008,6 +2411,12 @@ function buildMetrics(m: BacktestEvaluationItem | null | undefined): MetricRow[]
     { label: '夏普比率', value: num(m.sharpe_ratio, 2), cls: 'text-blue', hint: SHARPE_HINT },
     { label: '卡玛比率', value: num(m.calmar_ratio, 2), cls: 'text-blue' },
     { label: '索提诺比率', value: num(m.sortino_ratio, 2), cls: 'text-blue' },
+    {
+      label: '年化下行波动率',
+      value: pct(m.downside_volatility),
+      cls: 'text-orange',
+      hint: '口径：仅取日收益 < 0 的样本求均方根 × √252（无风险利率不参与），与索提诺比率分母同口径；越低表示下行风险越小',
+    },
     { label: 'VaR (95%)', value: pct(m.var_95), cls: 'text-red' },
     { label: 'CVaR (95%)', value: pct(m.cvar_95), cls: 'text-red' },
     { label: '收益/波动比', value: num(retVolRatio, 2), cls: 'text-blue' },
@@ -2037,6 +2446,12 @@ function buildMetrics(m: BacktestEvaluationItem | null | undefined): MetricRow[]
       hint: '上行捕获率 ÷ Beta：每 1 份市场敞口捕获的上涨幅度倍数。>1 表示持仓个股平均强于指数（超额来自选股）；<1 表示弹性弱于指数',
     },
     { label: '超额最大回撤', value: pct(m.excess_max_drawdown), cls: valueClass(m.excess_max_drawdown) },
+    {
+      label: '超额卡玛比率',
+      value: num(m.excess_calmar_ratio, 2),
+      cls: 'text-blue',
+      hint: '口径：年化超额收益 ÷ |超额最大回撤|；超额最大回撤为 0 时无意义（显示 —）。>1 表示年化超额足以覆盖其自身回撤',
+    },
 
     _group('磨损与仓位'),
     { label: '年化换手率（双边）', value: m.annual_turnover == null ? '—' : `${num(m.annual_turnover, 2)}×/年`, cls: 'text-blue' },
@@ -2920,14 +3335,24 @@ function handleResize() {
   stQuadChart?.resize()
   iaExpChart?.resize()
   rbHistChart?.resize()
+  pRollingChart?.resize()
+  recordCompareChart?.resize()
 }
+
+let disposeNavReselect: (() => void) | null = null
 
 onMounted(() => {
   load()
   window.addEventListener('resize', handleResize)
+  // 左侧导航在当前路由重复点击「回测管理」→ 从详情回列表（顶部「返回」行为不变）
+  disposeNavReselect = onNavReselect((to) => {
+    if (to === '/backtest' && currentRecord.value) backToList()
+  })
 })
 onUnmounted(() => {
   window.removeEventListener('resize', handleResize)
+  disposeNavReselect?.()
+  disposeNavReselect = null
   disposeAllCharts()
 })
 
@@ -2964,6 +3389,8 @@ watch(theme, () => {
     nextTick(() => {
       initCharts()
       if (!mrCollapsed.value) initMrCharts()
+      if (!pCollapsed.value) renderPRolling()
+      if (showRecordCompare.value && recordCompareData.value) renderRecordCompareChart()
     })
   }, 60)
 })
@@ -2973,6 +3400,14 @@ watch(theme, () => {
   <!-- ============ 列表视图 ============ -->
   <div v-if="!currentRecord">
     <PageHeader title="回测管理">
+      <button class="btn btn-sm" :disabled="recordCompareSelected.length < 2" @click="openRecordCompare"
+              title="勾选 2~10 条已完成记录，对比净值曲线 / 指标 / 参数 / 成交差异">
+        对比所选{{ recordCompareSelected.length ? ` (${recordCompareSelected.length})` : '' }}
+      </button>
+      <button class="btn btn-sm" @click="openReplay"
+              title="重算指定组合区间的公式信号，可选与实盘委托按日期/股票/方向对照">
+        信号回放
+      </button>
       <button @click="openForm" class="btn btn-primary">+ 发起回测</button>
     </PageHeader>
 
@@ -2988,9 +3423,13 @@ watch(theme, () => {
     <div v-if="loading" class="card" style="padding:12px"><p>加载中…</p></div>
     <div v-else class="card table-wrap">
       <table>
-        <thead><tr><th>ID</th><th>名称</th><th>组合</th><th>起止</th><th>状态</th><th>门状态</th><th>操作</th></tr></thead>
+        <thead><tr><th style="width:30px"></th><th>ID</th><th>名称</th><th>组合</th><th>起止</th><th>状态</th><th>门状态</th><th>操作</th></tr></thead>
         <tbody>
           <tr v-for="r in records" :key="r.id">
+            <td>
+              <input type="checkbox" :value="r.id" v-model="recordCompareSelected"
+                     :disabled="r.status !== 'completed'" title="勾选参与横向对比" />
+            </td>
             <td style="color:var(--ink-faint)">#{{ r.id }}</td>
             <td>{{ r.name }}</td>
             <td>{{ poolName(r.portfolio_strategy_id) }}</td>
@@ -3003,7 +3442,10 @@ watch(theme, () => {
             </td>
             <td>
               <button @click="openDetail(r.id)" class="btn btn-sm btn-primary" :disabled="r.status !== 'completed'">查看</button>
-              <button @click="onDelete(r.id)" class="btn btn-sm">删除</button>
+              <button v-if="r.status === 'running'" @click="onCancel(r.id)" class="btn btn-sm" :disabled="canceling[r.id]" style="margin-left:6px">
+                {{ canceling[r.id] ? '取消中…' : '取消' }}
+              </button>
+              <button @click="onDelete(r.id)" class="btn btn-sm" style="margin-left:6px">删除</button>
             </td>
           </tr>
         </tbody>
@@ -3011,8 +3453,318 @@ watch(theme, () => {
       <div v-if="records.length === 0" class="empty-state"><p>暂无回测记录，点右上[+发起回测]</p></div>
     </div>
 
+    <!-- K2 多记录横向对比 Modal -->
+    <div v-if="showRecordCompare" class="modal-overlay modal-lg" @click.self="closeRecordCompare">
+      <div class="modal-content">
+        <div style="display:flex;align-items:center;justify-content:space-between;gap:8px">
+          <h3 style="margin:0">多记录横向对比</h3>
+          <button class="btn btn-sm" @click="closeRecordCompare">关闭</button>
+        </div>
+        <div class="modal-body">
+          <div v-if="recordCompareLoading"><p>加载中…</p></div>
+          <div v-else-if="recordCompareError" style="color:var(--red)">{{ recordCompareError }}</div>
+          <template v-else-if="recordCompareData">
+            <div v-if="recordCompareData.warnings.length" class="form-hint"
+                 style="color:var(--red);margin-bottom:8px">
+              <div v-for="(w, i) in recordCompareData.warnings" :key="i">{{ w }}</div>
+            </div>
+
+            <h4 style="margin:4px 0 8px">归一净值曲线（首日=1）</h4>
+            <p class="note" style="margin:0 0 8px">
+              各记录以自身首个净值 &gt; 0 的快照日归一为 1；x 轴为并集时间轴，
+              区间不同处不截交集、不补点，曲线只在各自区间内延伸。
+            </p>
+            <div ref="recordCompareChartEl" style="width:100%;height:320px"></div>
+            <p v-if="recordCompareData && !recordCompareCurvePoints" class="note">
+              所选记录没有可用的组合日快照净值，无法绘制曲线（指标/成交对照仍可参考）。
+            </p>
+
+            <h4 style="margin:16px 0 8px">指标对比</h4>
+            <p class="note" style="margin:0 0 8px">
+              数值取各记录回测完成时冻结的组合级评估（同一评估器），本次对比不重算；
+              各列区间/基准不同时，绝对水平不可直接横比。
+            </p>
+            <div class="table-container">
+              <table>
+                <thead>
+                  <tr>
+                    <th>指标</th>
+                    <th v-for="it in recordCompareData.records" :key="it.record.id">
+                      #{{ it.record.id }} {{ it.record.name }}
+                      <div class="note" style="font-weight:400;white-space:nowrap">
+                        {{ it.record.start_date }} ~ {{ it.record.end_date }} · {{ recordCompareBenchmark(it) }}
+                      </div>
+                    </th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr v-for="row in recordCompareData.metric_rows" :key="row.key">
+                    <td>{{ row.label }}</td>
+                    <td v-for="(v, i) in row.values" :key="i">
+                      {{ recordCompareMetricText(String(row.key), v as number | null) }}
+                    </td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+
+            <h4 style="margin:16px 0 8px">参数 diff（<span style="color:var(--red)">红点</span>=不一致）</h4>
+            <p class="note" style="margin:0 0 8px">
+              嵌套参数按路径展开（strategies[...] / price_caliber.* / execution.* 等），数组按完整内容比较；
+              旧记录缺键显示「—」，表示口径未知，不等于取值为空。
+            </p>
+            <div class="table-container" style="max-height:280px;overflow:auto">
+              <table>
+                <thead>
+                  <tr>
+                    <th>参数</th>
+                    <th v-for="it in recordCompareData.records" :key="it.record.id">#{{ it.record.id }}</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr v-for="row in recordCompareData.param_rows" :key="row.key">
+                    <td>
+                      <span v-if="row.differs" style="color:var(--red)">●</span>
+                      {{ row.key }}
+                    </td>
+                    <td v-for="(v, i) in row.values" :key="i">{{ recordCompareParamText(v) }}</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+
+            <h4 style="margin:16px 0 8px">成交对比（每股净买入额：买 + / 卖 −）</h4>
+            <p class="note" style="margin:0 0 8px">
+              金额为绝对额，未按初始资金归一；初始资金/区间不同时，规模差异不代表交易强度差异。
+              明细按每股净买入额绝对值降序（同额按代码升序），最多显示 50 只。
+            </p>
+            <div class="table-container">
+              <table>
+                <thead>
+                  <tr>
+                    <th>记录</th><th>成交笔数</th><th>买入笔数</th><th>卖出笔数</th>
+                    <th>买入金额</th><th>卖出金额</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr v-for="(t, i) in recordCompareData.trade_totals" :key="i">
+                    <td>#{{ recordCompareData.records[i].record.id }} {{ recordCompareData.records[i].record.name }}</td>
+                    <td>{{ t.trades_count }}</td>
+                    <td>{{ t.buy_count }}</td>
+                    <td>{{ t.sell_count }}</td>
+                    <td>{{ fmtMoney(t.buy_amount) }}</td>
+                    <td>{{ fmtMoney(t.sell_amount) }}</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+            <div v-if="recordCompareData.stock_rows.length" class="table-container"
+                 style="margin-top:8px;max-height:320px;overflow:auto">
+              <table>
+                <thead>
+                  <tr>
+                    <th>股票</th>
+                    <th v-for="it in recordCompareData.records" :key="it.record.id">#{{ it.record.id }}</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr v-for="row in recordCompareData.stock_rows" :key="row.stock_code">
+                    <td>{{ row.stock_code }}</td>
+                    <td v-for="(v, i) in row.values" :key="i">{{ recordCompareStockText(Number(v)) }}</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+          </template>
+        </div>
+        <div class="modal-actions">
+          <button class="btn" @click="closeRecordCompare">关闭</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- N3 信号回放校验 Modal -->
+    <div v-if="showReplay" class="modal-overlay modal-lg" @click.self="closeReplay">
+      <div class="modal-content">
+        <div style="display:flex;align-items:center;justify-content:space-between;gap:8px">
+          <h3 style="margin:0">信号回放校验</h3>
+          <button class="btn btn-sm" @click="closeReplay">关闭</button>
+        </div>
+        <div class="modal-body">
+          <p class="note" style="margin-top:0">
+            按所选组合与区间重拉行情、重算公式信号；填写实盘会话 ID 后，额外与
+            `live_orders`（按 日期/股票/方向）对照，区分「疑似漏单」与「口径/人工单」。
+          </p>
+          <div class="field-grid">
+            <div class="field-row field-span-2">
+              <span class="field-label">组合</span>
+              <select v-model="replayForm.portfolio_strategy_id">
+                <option :value="0" disabled>请选择组合</option>
+                <option v-for="p in portfolios" :key="p.id" :value="p.id">{{ p.name }}</option>
+              </select>
+            </div>
+            <div class="field-row">
+              <span class="field-label">开始日期</span>
+              <input v-model="replayForm.start_date" type="date" />
+            </div>
+            <div class="field-row">
+              <span class="field-label">结束日期</span>
+              <input v-model="replayForm.end_date" type="date" />
+            </div>
+            <div class="field-row">
+              <span class="field-label">复权模式</span>
+              <select v-model="replayForm.dividend_mode">
+                <option value="front">前复权（默认）</option>
+                <option value="back">后复权</option>
+                <option value="exact">不复权+显式公司行为（对账基准）</option>
+                <option value="dual">前复权+后复权记账</option>
+                <option value="exact">不复权+显式公司行为（对账基准）</option>
+              </select>
+            </div>
+            <div class="field-row">
+              <span class="field-label">实盘会话 ID</span>
+              <input v-model="replayForm.session_id" type="number" min="1"
+                     placeholder="可留空：只回放不对照" />
+            </div>
+          </div>
+          <div style="display:flex;gap:8px;margin:8px 0 12px">
+            <button class="btn btn-primary btn-sm" :disabled="replayLoading" @click="runReplay">
+              {{ replayLoading ? '回放中…' : '开始回放' }}
+            </button>
+          </div>
+          <div v-if="replayError" style="color:var(--red);margin-bottom:8px">{{ replayError }}</div>
+
+          <template v-if="replayResult">
+            <div v-if="replayResult.warnings.length" class="form-hint"
+                 style="color:var(--orange);margin-bottom:8px">
+              <div v-for="(w, i) in replayResult.warnings" :key="i">{{ w }}</div>
+            </div>
+
+            <h4 style="margin:8px 0">回放摘要</h4>
+            <div class="table-container">
+              <table>
+                <tbody>
+                  <tr><td>组合</td><td>{{ replayResult.portfolio_name }}（#{{ replayResult.portfolio_strategy_id }}）</td></tr>
+                  <tr><td>区间</td><td>{{ replayResult.start_date }} ~ {{ replayResult.end_date }}（{{ replayResult.dividend_mode }}）</td></tr>
+                  <tr><td>信号 bar 数</td><td>{{ replayResult.summary.signal_bars }}</td></tr>
+                  <tr><td>信号条数</td><td>{{ replayResult.summary.signals }}</td></tr>
+                  <tr>
+                    <td>按日分布</td>
+                    <td>
+                      <span v-for="(d, i) in replayResult.summary.by_date" :key="i" style="margin-right:10px">
+                        {{ d.date }}：{{ d.count }}
+                      </span>
+                      <span v-if="!replayResult.summary.by_date.length">—</span>
+                    </td>
+                  </tr>
+                  <tr>
+                    <td>按股票（前 20）</td>
+                    <td>
+                      <span v-for="(s, i) in replayResult.summary.by_stock" :key="i" style="margin-right:10px">
+                        {{ s.stock_code }}：{{ s.count }}
+                      </span>
+                      <span v-if="!replayResult.summary.by_stock.length">—</span>
+                    </td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+
+            <template v-if="replayResult.comparison">
+              <h4 style="margin:16px 0 8px">
+                与实盘委托对照（会话 #{{ replayResult.comparison.session_id }}）
+              </h4>
+              <div class="table-container">
+                <table>
+                  <thead>
+                    <tr><th>回放键</th><th>实盘委托键</th><th>一致</th><th>仅回放</th><th>仅实盘</th></tr>
+                  </thead>
+                  <tbody>
+                    <tr>
+                      <td>{{ replayResult.comparison.replay_keys }}</td>
+                      <td>{{ replayResult.comparison.live_order_keys }}</td>
+                      <td>{{ replayResult.comparison.matched }}</td>
+                      <td>{{ replayResult.comparison.only_replay_count }}</td>
+                      <td>{{ replayResult.comparison.only_live_count }}</td>
+                    </tr>
+                  </tbody>
+                </table>
+              </div>
+              <p class="note">{{ replayResult.comparison.note }}</p>
+              <div style="display:flex;gap:12px;align-items:flex-start">
+                <div class="table-container" style="flex:1;max-height:240px;overflow:auto">
+                  <table>
+                    <thead><tr><th>仅回放（疑似漏单）</th></tr></thead>
+                    <tbody>
+                      <tr v-for="(r, i) in replayResult.comparison.only_replay" :key="i">
+                        <td>{{ r.date }} {{ r.stock_code }} {{ replayDirectionText(r.trade_type) }}</td>
+                      </tr>
+                      <tr v-if="!replayResult.comparison.only_replay.length"><td>无</td></tr>
+                    </tbody>
+                  </table>
+                </div>
+                <div class="table-container" style="flex:1;max-height:240px;overflow:auto">
+                  <table>
+                    <thead><tr><th>仅实盘（口径/人工单）</th></tr></thead>
+                    <tbody>
+                      <tr v-for="(r, i) in replayResult.comparison.only_live" :key="i">
+                        <td>{{ r.date }} {{ r.stock_code }} {{ replayDirectionText(r.trade_type) }}</td>
+                      </tr>
+                      <tr v-if="!replayResult.comparison.only_live.length"><td>无</td></tr>
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+              <p v-if="replayResult.comparison.truncated" class="note">
+                差异明细超过 200 条，仅显示前 200 条。
+              </p>
+            </template>
+
+            <h4 style="margin:16px 0 8px">信号明细</h4>
+            <div class="table-container" style="max-height:360px;overflow:auto">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Bar 时间</th><th>日期</th><th>股票</th><th>策略</th>
+                    <th>信号</th><th>方向</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr v-for="(r, i) in replayRows" :key="i">
+                    <td>{{ r.bar_time }}</td>
+                    <td>{{ r.date || '—' }}</td>
+                    <td>{{ r.stock_code }}</td>
+                    <td>{{ replayStrategyName(r.strategy_id) }}</td>
+                    <td>
+                      <span v-for="(s, j) in r.signals" :key="j" style="margin-right:8px">
+                        {{ s.name }}<span v-if="s.signal_type" style="color:var(--ink-faint)">({{ s.signal_type }})</span>
+                      </span>
+                    </td>
+                    <td>
+                      <span v-for="(d, j) in r.directions" :key="j" style="margin-right:6px">
+                        {{ replayDirectionText(d) }}
+                      </span>
+                      <span v-if="!r.directions.length" style="color:var(--ink-faint)">—</span>
+                    </td>
+                  </tr>
+                  <tr v-if="!replayRows.length"><td colspan="6">区间内无触发信号</td></tr>
+                </tbody>
+              </table>
+            </div>
+            <p v-if="replayResult.rows.length > REPLAY_ROW_LIMIT" class="note">
+              共 {{ replayResult.rows.length }} 条，仅展示前 {{ REPLAY_ROW_LIMIT }} 条；
+              请缩小日期区间精确定位。
+            </p>
+          </template>
+        </div>
+        <div class="modal-actions">
+          <button class="btn" @click="closeReplay">关闭</button>
+        </div>
+      </div>
+    </div>
+
     <!-- 发起回测 Modal -->
-    <div v-if="showForm" class="modal-overlay modal-lg" @click.self="showForm = false">
+    <div v-if="showForm" class="modal-overlay modal-lg modal-dense" @click.self="showForm = false">
       <div class="modal-content">
         <div style="display:flex;align-items:center;justify-content:space-between;gap:8px">
           <h3 style="margin:0">发起回测</h3>
@@ -3048,12 +3800,15 @@ watch(theme, () => {
                   <option value="front">前复权（默认，通达信口径）</option>
                   <option value="back">后复权（长区间更真实、可复现）</option>
                   <option value="dual">前复权+后复权记账（推荐，模拟实盘）</option>
+                <option value="exact">不复权+显式公司行为（对账基准）</option>
                 </select>
               </div>
               <div class="field-row field-span-2">
                 <span class="field-label"></span>
                 <span class="form-hint" style="margin:0">
-                  长周期回测建议用后复权/dual，避免前复权加性压缩导致的近零价假收益
+                  长周期回测建议用后复权/dual，避免前复权加性压缩导致的近零价假收益。
+                  回测成本为模型口径（佣金含最低 5 元、卖出印花税、双边过户费）；实盘成本取柜台
+                  真实值（含费、含送转摊薄，可能为负或未知），<b>两者不可逐日对比</b>。
                 </span>
               </div>
             </div>
@@ -3108,6 +3863,13 @@ watch(theme, () => {
                   <option value="">跟随组合</option>
                   <option value="equity">昨日收盘净值</option>
                   <option value="initial">初始资金（旧口径）</option>
+                </select>
+                <span class="field-suffix">run 级覆盖，不改组合配置</span>
+              </div>
+              <div class="field-row">
+                <span class="field-label">市场多空门控</span>
+                <select v-model="form.market_gate_enabled" class="field-select" data-field="market_gate_enabled">
+                  <option v-for="o in MARKET_GATE_OVERRIDES" :key="o.value" :value="o.value">{{ o.label }}</option>
                 </select>
                 <span class="field-suffix">run 级覆盖，不改组合配置</span>
               </div>
@@ -3177,7 +3939,11 @@ watch(theme, () => {
             <label class="group-label">一、基本参数</label>
             <div class="guide-block">
               <p class="guide-step"><b>复权模式</b>：front=前复权（默认，历史价被压缩）；back=后复权；
-                <b>dual=前复权信号+后复权记账（推荐）</b>，信号与真实价成交口径一致。</p>
+                <b>dual=前复权信号+后复权记账（推荐）</b>，信号与真实价成交口径一致；
+                exact=不复权 + 显式公司行为（送转/分红/停牌/退市），仅作对账基准，成本与旧回测不可直接比较。</p>
+              <p class="guide-step"><b>成本口径</b>：回测按模型计费（佣金含最低 5 元 / 卖出印花税 /
+                买卖双向过户费），实盘成本取柜台真实成交成本（含费、含送转摊薄，可能为负或未知），
+                <b>两者不可逐日对比</b>；2026-11-11 前发起的历史回测需在新过户费口径下重跑才严格可比。</p>
               <p class="guide-step"><b>评估口径</b>：absolute=绝对收益（年化/回撤/卡玛）；relative=相对收益
                 （信息比率/超额/下行捕获）。仅影响验收块。</p>
             </div>
@@ -3192,6 +3958,9 @@ watch(theme, () => {
                 冲击系数留空=用组合默认。</p>
               <p class="guide-step"><b>成交量约束/容量上限（run 级覆盖）</b>：发起回测弹窗的成交量/容量选项可
                 临时覆盖组合配置做 A/B 对比，不改组合。</p>
+              <p class="guide-step"><b>K 线缓存（backtest.kline_cache）</b>：enabled 默认 false，
+                dir=data/kline_cache，today_ttl_seconds=300；关闭＝每次回测直连数据源，开启后复用历史 parquet，
+                当日数据超过 TTL 会刷新。</p>
               <p class="guide-step"><b>风控规则</b>：信号优先级 风控（止损/止盈/移动止损）&gt; 公式信号；
                 移动止损跟踪持仓最高价回撤≥阈值触发，是核心出场机制（实测贡献约 70% 利润）。</p>
             </div>
@@ -3231,6 +4000,24 @@ watch(theme, () => {
          title="下载离线 HTML 单文件报告">
         📄 导出 HTML 报告
       </a>
+      <template v-if="currentRecord.id">
+        <a :href="`/api/backtest/records/${currentRecord.id}/export/csv?kind=trades`"
+           target="_blank" class="btn btn-sm"
+           style="margin-top:8px;display:inline-block;margin-left:6px"
+           title="导出成交明细 CSV（UTF-8 BOM，Excel 可直接打开）">成交 CSV</a>
+        <a :href="`/api/backtest/records/${currentRecord.id}/export/csv?kind=snapshots`"
+           target="_blank" class="btn btn-sm"
+           style="margin-top:8px;display:inline-block;margin-left:6px"
+           title="导出组合日快照 CSV">快照 CSV</a>
+        <a :href="`/api/backtest/records/${currentRecord.id}/export/csv?kind=metrics`"
+           target="_blank" class="btn btn-sm"
+           style="margin-top:8px;display:inline-block;margin-left:6px"
+           title="导出指标汇总 CSV">指标 CSV</a>
+        <a :href="`/api/backtest/records/${currentRecord.id}/export/pdf`"
+           target="_blank" class="btn btn-sm"
+           style="margin-top:8px;display:inline-block;margin-left:6px"
+           title="导出 PDF（调用本机 Edge/Chrome 无头打印；无浏览器时提示改用 CSV/HTML）">导出 PDF</a>
+      </template>
       <button @click="syncPositionsBlock" class="btn btn-sm"
               style="margin-top:8px;display:inline-block;margin-left:6px"
               :disabled="detailStockCodes.length === 0"
@@ -3251,59 +4038,146 @@ watch(theme, () => {
       </ul>
     </div>
 
+    <!-- F1 数据质量：覆盖率 / 缺根 / 被剔除假 bar（只展示，不影响回测结果） -->
+    <div v-if="dataQuality" class="card" style="margin-top:12px;padding:14px">
+      <div style="display:flex;align-items:center;gap:8px;margin-bottom:10px">
+        <span style="font-weight:600;font-size:14px">🧹 数据质量</span>
+        <span style="font-size:12px;color:var(--ink-soft)">
+          取数覆盖率 · 缺根 · 剔除假 bar（{{ dataQuality.window.start }} ~ {{ dataQuality.window.end }}，只观测不影响回测）
+        </span>
+      </div>
+      <div style="display:flex;flex-wrap:wrap;gap:16px;font-size:13px;margin-bottom:10px">
+        <span>覆盖率 <b>{{ fmtPct(dataQuality.summary.coverage_ratio) }}</b></span>
+        <span>有数据股票 <b>{{ dataQuality.stocks_with_data }}/{{ dataQuality.requested_stocks }}</b></span>
+        <span>缺根 <b>{{ dataQuality.summary.missing_bars }}</b> 根</span>
+        <span>剔除伪影价 <b>{{ dataQuality.summary.dropped_artifact_bars }}</b> 根</span>
+        <span>剔除无成交假 bar <b>{{ dataQuality.summary.dropped_no_trade_bars }}</b> 根</span>
+      </div>
+      <table v-if="dqPeriods.length">
+        <thead><tr>
+          <th>周期</th><th>池并集</th><th>应有</th><th>实有</th><th>缺根</th>
+          <th>覆盖率</th><th>伪影剔除</th><th>假 bar 剔除</th>
+        </tr></thead>
+        <tbody>
+          <tr v-for="[p, q] in dqPeriods" :key="p">
+            <td>{{ p }}</td>
+            <td>{{ q.union_bars }}</td>
+            <td>{{ q.expected_bars }}</td>
+            <td>{{ q.kept_bars }}</td>
+            <td>{{ q.missing_bars }}</td>
+            <td>{{ fmtPct(q.coverage_ratio) }}</td>
+            <td>{{ q.dropped_artifact_bars }}</td>
+            <td>{{ q.dropped_no_trade_bars }}</td>
+          </tr>
+        </tbody>
+      </table>
+      <div v-if="dqMissingStocks.length" style="margin-top:8px;font-size:12px;color:var(--ink-soft)">
+        整只无行情（{{ dqMissingStocks.length }}）：{{ dqMissingStocks.slice(0, 20).join('、') }}
+        <template v-if="dqMissingStocks.length > 20"> 等</template>
+      </div>
+    </div>
+
     <!-- 验证结论：容量健康 + 危机防御 + 样本外引用（自动流程化） -->
     <div v-if="validation" class="card" style="margin-top:12px;padding:14px">
       <div style="display:flex;align-items:center;gap:8px;margin-bottom:10px">
         <span style="font-weight:600;font-size:14px">🧪 验证结论</span>
-        <span style="font-size:12px;color:var(--ink-soft)">容量健康 · 危机防御 · 样本外（回测完成时自动冻结）</span>
+        <span style="font-size:12px;color:var(--ink-soft)">
+          判断与建议 · 容量数值统一在「成本与容量 → 规模约束」
+        </span>
       </div>
-      <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px">
-        <!-- 容量健康 -->
-        <div>
-          <div style="font-size:12px;font-weight:600;color:var(--ink-soft);margin-bottom:6px">容量健康</div>
-          <ul v-if="validation.capacity.length" class="spb-list">
-            <li v-for="(w, i) in validation.capacity" :key="i">{{ w }}</li>
-          </ul>
-          <span v-else class="badge badge-green">健康（未命中容量/集中度阈值）</span>
-        </div>
-        <!-- 样本外引用 -->
-        <div>
-          <div style="font-size:12px;font-weight:600;color:var(--ink-soft);margin-bottom:6px">样本外验证（Walk-Forward）</div>
-          <template v-if="validation.oos">
-            <span class="badge" :class="validation.oos.overall_pass ? 'badge-green' : 'badge-red'">
-              {{ validation.oos.overall_pass ? '样本外通过' : '样本外未通过' }} {{ validation.oos.windows_passed }}
+      <div class="metric-grid">
+        <!-- 容量健康：只保留判断/建议 + 交叉引用 -->
+        <div class="metric-card metric-card--wide" v-if="capacityVerdict">
+          <span class="metric-kicker">容量健康</span>
+          <div class="metric-headline">
+            <span class="metric-pill" :class="'metric-tone--' + capacityVerdict.tone">
+              {{ capacityVerdict.healthy ? '健康' : `预警 ${capacityVerdict.count} 项` }}
             </span>
-            <span style="font-size:12px;color:var(--ink-soft);margin-left:6px">{{ validation.oos.name }}</span>
-            <RouterLink to="/backtest/analysis" class="btn btn-sm" style="margin-left:8px">查看</RouterLink>
+            <span class="metric-sub">敞口上限 · 仓位利用率 · 集中度 · ADV</span>
+          </div>
+          <ul v-if="capacityVerdict.conclusions.length" class="metric-advice">
+            <li v-for="(c, i) in capacityVerdict.conclusions" :key="'c' + i">{{ c }}</li>
+          </ul>
+          <p v-else class="metric-conclusion">未命中容量/集中度阈值。</p>
+          <template v-if="capacityVerdict.advice.length">
+            <span class="metric-kicker">建议</span>
+            <ul class="metric-advice">
+              <li v-for="(a, i) in capacityVerdict.advice" :key="'a' + i">{{ a }}</li>
+            </ul>
           </template>
-          <span v-else style="font-size:12px;color:var(--ink-soft)">
-            未执行
-            <RouterLink to="/backtest/analysis" class="btn btn-sm btn-primary" style="margin-left:8px" @click="prefillWalkForward">立即发起验证</RouterLink>
-          </span>
+          <button class="btn btn-sm" style="align-self:flex-start;margin-top:auto" @click="scrollToCapacityStructure">
+            查看成本与容量 · 规模约束 ↓
+          </button>
+        </div>
+
+        <!-- 样本外引用 -->
+        <div class="metric-card metric-card--narrow">
+          <span class="metric-kicker">样本外验证</span>
+          <div class="metric-headline">
+            <span class="metric-pill" :class="'metric-tone--' + oosView.tone">{{ oosView.label }}</span>
+            <span v-if="oosView.detail" class="metric-sub">{{ oosView.detail }}</span>
+          </div>
+          <p class="metric-conclusion">
+            <template v-if="validation.oos">{{ validation.oos.name }}</template>
+            <template v-else>尚无 Walk-Forward 运行，建议先做样本外验证再采纳。</template>
+          </p>
+          <RouterLink v-if="validation.oos" to="/backtest/analysis" class="btn btn-sm"
+                      style="align-self:flex-start;margin-top:auto">查看</RouterLink>
+          <RouterLink v-else to="/backtest/analysis" class="btn btn-sm btn-primary"
+                      style="align-self:flex-start;margin-top:auto"
+                      @click="prefillWalkForward">立即发起验证</RouterLink>
+        </div>
+
+        <!-- 危机防御：结论 + 最差窗口 + 明细 -->
+        <div class="metric-card metric-card--full">
+          <span class="metric-kicker">危机防御</span>
+          <template v-if="crisisSummary">
+            <div class="metric-headline">
+              <span class="metric-pill" :class="'metric-tone--' + crisisSummary.tone">{{ crisisSummary.label }}</span>
+              <span class="metric-sub">固定窗口 · 历史锁定 · 不随结果回填</span>
+            </div>
+            <p class="metric-conclusion">{{ crisisSummary.conclusion }}</p>
+            <div class="metric-mini-row">
+              <div v-if="crisisSummary.worst">
+                <span>最差窗口</span><b>{{ crisisSummary.worst.name }}</b>
+              </div>
+              <div v-if="crisisSummary.worst">
+                <span>策略收益</span>
+                <b :class="(crisisSummary.worst.strategy_return ?? 0) >= 0 ? 'text-red' : 'text-green'">
+                  {{ crisisSummary.worst.strategy_return === null ? '—' : fmtSignedPct(crisisSummary.worst.strategy_return) }}
+                </b>
+              </div>
+              <div>
+                <span>最低现金占比</span>
+                <b>{{ crisisSummary.minCash === null ? '—' : fmtPct(crisisSummary.minCash) }}</b>
+              </div>
+              <div>
+                <span>最大窗口回撤</span>
+                <b class="text-green">{{ crisisSummary.maxDd === null ? '—' : fmtPct(crisisSummary.maxDd) }}</b>
+              </div>
+            </div>
+            <table>
+              <thead><tr>
+                <th>危机窗口</th><th>策略收益</th><th>基准收益</th><th>窗口回撤</th><th>最低现金占比</th><th>判定</th>
+              </tr></thead>
+              <tbody>
+                <tr v-for="c in validation.crisis" :key="c.key">
+                  <td>{{ c.name }}</td>
+                  <td :class="(c.strategy_return ?? 0) >= 0 ? 'text-red' : 'text-green'">{{ c.strategy_return === null ? '—' : fmtSignedPct(c.strategy_return) }}</td>
+                  <td :class="(c.benchmark_return ?? 0) >= 0 ? 'text-red' : 'text-green'">{{ c.benchmark_return === null ? '—' : fmtSignedPct(c.benchmark_return) }}</td>
+                  <td class="text-green">{{ c.max_drawdown === null ? '—' : fmtPct(c.max_drawdown) }}</td>
+                  <td>{{ c.min_cash_ratio === null ? '—' : fmtPct(c.min_cash_ratio) }}</td>
+                  <td>
+                    <span class="badge" :class="c.verdict === 'defensive' ? 'badge-green' : c.verdict === 'exposed' ? 'badge-red' : 'badge-gray'"
+                          :title="c.reason">{{ c.verdict === 'defensive' ? '防御 ✓' : c.verdict === 'exposed' ? '暴露 ✗' : '—' }}</span>
+                  </td>
+                </tr>
+              </tbody>
+            </table>
+          </template>
+          <p v-else class="metric-conclusion">回测区间未覆盖任何固定危机窗口。</p>
         </div>
       </div>
-      <!-- 危机防御表 -->
-      <template v-if="validation.crisis.length">
-        <div style="font-size:12px;font-weight:600;color:var(--ink-soft);margin:10px 0 6px">危机防御机制（固定窗口，历史锁定）</div>
-        <table>
-          <thead><tr>
-            <th>危机窗口</th><th>策略收益</th><th>基准收益</th><th>窗口回撤</th><th>最低现金占比</th><th>判定</th>
-          </tr></thead>
-          <tbody>
-            <tr v-for="c in validation.crisis" :key="c.key">
-              <td>{{ c.name }}</td>
-              <td :class="(c.strategy_return ?? 0) >= 0 ? 'text-red' : 'text-green'">{{ c.strategy_return === null ? '—' : fmtSignedPct(c.strategy_return) }}</td>
-              <td :class="(c.benchmark_return ?? 0) >= 0 ? 'text-red' : 'text-green'">{{ c.benchmark_return === null ? '—' : fmtSignedPct(c.benchmark_return) }}</td>
-              <td class="text-green">{{ c.max_drawdown === null ? '—' : fmtPct(c.max_drawdown) }}</td>
-              <td>{{ c.min_cash_ratio === null ? '—' : fmtPct(c.min_cash_ratio) }}</td>
-              <td>
-                <span class="badge" :class="c.verdict === 'defensive' ? 'badge-green' : c.verdict === 'exposed' ? 'badge-red' : 'badge-gray'"
-                      :title="c.reason">{{ c.verdict === 'defensive' ? '防御 ✓' : c.verdict === 'exposed' ? '暴露 ✗' : '—' }}</span>
-              </td>
-            </tr>
-          </tbody>
-        </table>
-      </template>
     </div>
 
     <!-- 采纳验收 -->
@@ -3325,7 +4199,7 @@ watch(theme, () => {
           <tr v-for="c in acceptance.checks" :key="c.metric">
             <td>{{ c.label }}</td>
             <td>{{ c.op }} {{ (c.metric.includes('return') || c.metric.includes('drawdown')) ? (c.threshold * 100).toFixed(2) + '%' : c.threshold }}</td>
-            <td>{{ c.value === null ? '—' : (c.metric.includes('return') || c.metric.includes('drawdown')) ? (c.value * 100).toFixed(2) + '%' : c.value.toFixed(4) }}</td>
+            <td>{{ c.value === null ? '—' : (c.metric.includes('return') || c.metric.includes('drawdown')) ? (c.value * 100).toFixed(2) + '%' : c.value.toFixed(2) }}</td>
             <td><span class="badge" :class="c.pass === true ? 'badge-green' : c.pass === false ? 'badge-red' : 'badge-gray'">{{ c.pass === true ? '过' : c.pass === false ? '未过' : '—' }}</span></td>
           </tr>
         </tbody>
@@ -4563,6 +5437,158 @@ watch(theme, () => {
       </template>
     </div>
 
+    <!-- K5 成本与容量（详情接口现算：显性成本 / 滑点实现偏差 / 容量与冲击） -->
+    <div class="ca-section" v-if="costCapacity">
+      <div class="section-title ca-header"><span>成本与容量</span></div>
+      <div class="metric-grid">
+        <div class="metric-card metric-card--wide">
+          <div class="metric-head">
+            <span class="metric-kicker">成本规模</span>
+            <span class="metric-big">{{ fmtMoney(costCapacity.explicit.total_cost) }}</span>
+            <span class="metric-sub">交易成本合计 · 佣金+印花税+过户费</span>
+          </div>
+          <div class="metric-mix-bar">
+            <i v-for="s in costMix" :key="s.key" :class="s.key" :style="{ width: s.width + '%' }"></i>
+          </div>
+          <div class="metric-legend">
+            <span v-for="s in costMix" :key="s.key"><i :class="s.key"></i>{{ s.label }} <b>{{ fmtMoney(s.value) }}</b></span>
+          </div>
+          <div class="metric-mini-row">
+            <div><span>成交额（双边）</span><b>{{ fmtMoney(costCapacity.explicit.turnover) }}</b></div>
+            <div><span>日均净值</span><b>{{ fmtMoney(costCapacity.explicit.avg_equity) }}</b></div>
+            <div><span>成本 / 日均净值</span><b>{{ pct(costCapacity.explicit.cost_to_avg_equity) }}</b></div>
+          </div>
+        </div>
+
+        <div class="metric-card metric-card--narrow">
+          <span class="metric-kicker">成本效率</span>
+          <div class="metric-donut-wrap">
+            <svg class="metric-donut" viewBox="0 0 120 120" role="img" aria-label="成本拖累占比">
+              <circle class="track" cx="60" cy="60" r="52" />
+              <circle class="value" :class="'metric-stroke--' + dragView.tone" cx="60" cy="60" r="52"
+                      :stroke-dasharray="DONUT_C" :stroke-dashoffset="dragView.offset" />
+            </svg>
+            <div class="metric-donut-center">
+              <b>{{ pct(costCapacity.explicit.cost_drag_ratio) }}</b>
+              <span>成本拖累占比</span>
+            </div>
+          </div>
+          <p class="metric-note">成本 / 毛利（毛利=净收益+成本）</p>
+          <div class="metric-mini-row">
+            <div><span>成本 / 成交额</span><b>{{ bpsText(costCapacity.explicit.cost_bps) }}</b></div>
+            <div><span>口径</span><b>双边换手</b></div>
+          </div>
+        </div>
+
+        <div class="metric-card" v-if="slippageView">
+          <span class="metric-kicker">滑点实现偏差</span>
+          <div class="metric-headline">
+            <span class="metric-value" :class="'metric-tone--' + slippageView.tone">{{ bpsText(costCapacity.slippage.realized_deviation_bps) }}</span>
+            <span class="metric-sub">实测 · 买高/卖低为正</span>
+          </div>
+          <div class="metric-scale">
+            <div class="metric-scale-track"></div>
+            <div class="metric-scale-zero" style="left: 50%"></div>
+            <div class="metric-scale-mark metric-scale-mark--config" :style="{ left: slippageView.cfgPos + '%' }">
+              <span>配置 {{ bpsText(costCapacity.slippage.configured_bps) }}</span><i></i>
+            </div>
+            <div class="metric-scale-mark metric-scale-mark--realized" :class="'metric-tone--' + slippageView.tone"
+                 :style="{ left: slippageView.realPos + '%' }">
+              <i></i><span>实测 {{ bpsText(costCapacity.slippage.realized_deviation_bps) }}</span>
+            </div>
+          </div>
+          <div class="metric-mini-row">
+            <div><span>固定滑点无法解释</span><b>{{ bpsText(costCapacity.slippage.excess_bps) }}</b></div>
+            <div><span>对应金额</span><b>{{ fmtMoney(costCapacity.slippage.excess_cost_amount) }}</b></div>
+            <div><span>可匹配成交 / 总成交</span><b>{{ costCapacity.slippage.matched_trades }} / {{ costCapacity.slippage.trades_count }} 笔</b></div>
+          </div>
+        </div>
+
+        <div class="metric-card" v-if="capacityView">
+          <span class="metric-kicker">容量压力</span>
+          <div class="metric-headline">
+            <span class="metric-pill" :class="'metric-tone--' + capacityView.tone">{{ costCapacity.capacity.pressure_level || '—' }}</span>
+            <span class="metric-sub">最大单笔占净值 {{ fmtPct(costCapacity.capacity.max_trade_pct_equity) }}</span>
+          </div>
+          <div class="metric-bar">
+            <i :class="'metric-fill--' + capacityView.tone" :style="{ width: capacityView.barPct + '%' }"></i>
+            <span class="metric-bar-threshold" :style="{ left: capacityView.thresholdPos + '%' }"></span>
+          </div>
+          <div class="metric-bar-legend">
+            <span>0</span>
+            <span>大额阈值 {{ fmtPct(costCapacity.capacity.large_trade_threshold_pct) }}</span>
+            <span>{{ fmtPct(capacityView.scaleMax) }}</span>
+          </div>
+          <div class="metric-mini-row">
+            <div><span>最大单笔成交额</span><b>{{ fmtMoney(costCapacity.capacity.max_trade_amount) }}</b></div>
+            <div><span>平均单笔 / 当日净值</span><b>{{ fmtPct(costCapacity.capacity.avg_trade_pct_equity) }}</b></div>
+            <div><span>大额成交笔数</span><b>{{ costCapacity.capacity.large_trade_count }} 笔</b></div>
+            <div><span>大额成交额占比</span><b>{{ fmtPct(costCapacity.capacity.large_trade_amount_ratio) }}</b></div>
+            <div><span>成交笔数</span><b>{{ costCapacity.capacity.trades_count }}</b></div>
+          </div>
+        </div>
+
+        <!-- 规模约束：与容量压力并列，区分「单笔冲击」与「规模上限」 -->
+        <div class="metric-card metric-card--full" id="capacity-structure" v-if="structureView">
+          <span class="metric-kicker">规模约束</span>
+          <div class="metric-headline">
+            <span class="metric-pill" :class="'metric-tone--' + structureView.tone">
+              {{ structureView.hits ? `约束 ${structureView.hits} 项` : '未触发阈值' }}
+            </span>
+            <span class="metric-sub">敞口上限 / 期末净值 · 仓位利用率 · 单票权重 · ADV 参与率</span>
+          </div>
+          <div class="metric-subgrid">
+            <div class="metric-tile">
+              <span>敞口上限 / 期末净值</span>
+              <b v-if="structureView.exposure" :class="'metric-tone--' + structureView.ratioTone">
+                {{ fmtPct(structureView.exposure.ratio) }}
+              </b>
+              <b v-else>—</b>
+              <i v-if="structureView.exposure">
+                上限 {{ fmtMoney(structureView.exposure.ceiling) }} / 净值
+                {{ fmtMoney(structureView.exposure.final_equity) }}（阈值
+                {{ fmtPct(structureView.exposure.threshold) }}）
+              </i>
+              <i v-else>组合已删除，无法重算敞口上限</i>
+            </div>
+            <div class="metric-tile">
+              <span>仓位利用率（近 {{ structureView.exposure?.recent_days ?? 60 }} 日 / 全期）</span>
+              <b v-if="structureView.exposure">
+                {{ fmtPct(structureView.exposure.recent_utilization) }} /
+                {{ fmtPct(structureView.exposure.whole_utilization) }}
+              </b>
+              <b v-else>—</b>
+              <i>持仓市值 / 组合总资产</i>
+            </div>
+            <div class="metric-tile">
+              <span>最大单票权重</span>
+              <b :class="'metric-tone--' + structureView.concentrationTone">
+                {{ structureView.concentration?.max_single_weight === null
+                  || structureView.concentration?.max_single_weight === undefined
+                  ? '—' : fmtPct(structureView.concentration.max_single_weight) }}
+              </b>
+              <i>阈值 {{ fmtPct(structureView.concentration?.threshold ?? 0.25) }}</i>
+            </div>
+            <div class="metric-tile">
+              <span>最大单笔 / 股票 ADV</span>
+              <b :class="'metric-tone--' + structureView.advTone">
+                {{ structureView.adv ? fmtPct(structureView.adv.ratio) : '—' }}
+              </b>
+              <i v-if="structureView.adv">
+                {{ structureView.adv.stock_code || '—' }} · 阈值
+                {{ fmtPct(structureView.adv.threshold) }}
+              </i>
+              <i v-else>旧记录未冻结 ADV（需 K 线）</i>
+            </div>
+          </div>
+        </div>
+      </div>
+      <p class="ca-note">
+        口径：回测未落库行情，滑点实现偏差以「成交价 vs 同日持仓隐含收盘价（市值/数量，
+        缺失时取最近快照）」估算，买高/卖低记为正；与配置固定滑点的差额近似冲击/择时代价。
+      </p>
+    </div>
+
     <!-- 持续性检验（阿尔法衰减 vs 风格钟摆） -->
     <div ref="persistenceSectionEl" class="ca-section rb-section">
       <div class="section-title ca-header" @click="togglePSection">
@@ -4615,7 +5641,7 @@ watch(theme, () => {
               </span>
               <label class="p-bench-pick">
                 判定基准
-                <select v-model="pBenchSel" :disabled="pRecomputing" @change="recomputePersistence">
+                <select class="field-select" v-model="pBenchSel" :disabled="pRecomputing" @change="recomputePersistence">
                   <option v-for="b in pBenchOptions" :key="b.code" :value="b.code">
                     {{ b.name }}（{{ b.code }}）
                   </option>
@@ -5047,10 +6073,12 @@ watch(theme, () => {
           <div class="signal-row">
             <div style="flex:1">
               <label>复权模式</label>
-              <select v-model="compareForm.dividend_mode">
+              <select class="field-select" v-model="compareForm.dividend_mode">
                 <option value="dual">前复权+后复权记账（推荐，模拟实盘）</option>
+                <option value="exact">不复权+显式公司行为（对账基准）</option>
                 <option value="front">前复权（默认）</option>
                 <option value="back">后复权</option>
+                <option value="exact">不复权+显式公司行为（对账基准）</option>
               </select>
             </div>
           </div>
@@ -5542,18 +6570,6 @@ watch(theme, () => {
 .p-verdict-foot .p-msg { color: var(--ink-soft); }
 .p-verdict-foot .p-msg-warn { color: var(--red); }
 .p-bench-pick { display: inline-flex; align-items: center; gap: 6px; }
-.p-bench-pick select {
-  height: 24px;
-  padding: 0 6px;
-  font-size: 12px;
-  border: 1px solid var(--line, #dcdcdc);
-  border-radius: 4px;
-  /* --surface 未定义于主题变量：浅色回退 #fff 尚可，深色主题下白底配浅色 --ink
-     文字会看不清；改用 --card-bg（深色主题随主题变深，与 --ink 对比正确）。 */
-  background: var(--card-bg, #fff);
-  color: var(--ink);
-}
-.p-bench-pick select:disabled { opacity: .6; }
 @media (max-width: 720px) {
   .p-signal { flex-wrap: wrap; }
   .p-signal-detail { flex-basis: 100%; }
@@ -5675,5 +6691,21 @@ watch(theme, () => {
   .summary-section { grid-template-columns: 1fr; }
   .risk-metrics { grid-template-columns: 1fr; }
   .ca-kpi-grid { grid-template-columns: 1fr; }
+}
+/* 小尺寸笔记本（1366×768 / 1280×720，125% 缩放后可视宽约 1093px）：
+   报告页不再限宽居中留白，标题区左对齐避免「返回」按钮压住标题 */
+@media (max-width: 1180px) {
+  .report-page { max-width: 100%; }
+  .report-header { text-align: left; padding-top: 4px; }
+  .back-link { position: static; display: inline-block; margin-bottom: 8px; }
+  .ca-hit-row { grid-template-columns: 1fr; }
+  .chart-container { height: 320px; }
+}
+/* 视口高度不足时收敛图表高度，详情页首屏仍能看到指标而不是只剩一张图 */
+@media (max-height: 820px) {
+  .chart-container { height: 300px; }
+  .ca-chart { min-height: 320px; }
+  .report-header { margin-bottom: 16px; }
+  .section-title { margin: 18px 0 10px; }
 }
 </style>

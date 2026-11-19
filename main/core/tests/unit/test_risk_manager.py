@@ -113,6 +113,65 @@ def test_daily_loss_triggers_pause_next_day_recovery():
     assert pm.daily_pause_active is False
 
 
+def test_daily_pause_resume_after_extends_to_next_trading_day():
+    """P1-1：14:30 触发（resume_after=次一交易日）→ 次日整日暂停，D+2 首 bar 才恢复。
+
+    回测是「上一日收盘净值判日亏 → 暂停次日全天」；实盘 14:30 当场判，若仍按
+    「触发日次日恢复」，次日 enter_day(recovery_date=D+1) 会立即解除，只停了当日
+    尾盘 30 分钟。resume_after 把解除门槛推到 D+1（含），恢复落在 D+2 首 bar。
+    """
+    pm = _pm()
+    initial = Decimal("100000")
+    d0, d1, d2, d3 = (date(2026, 7, 1), date(2026, 7, 2),
+                      date(2026, 7, 3), date(2026, 7, 6))
+    pm.update_peak(initial, d0)                            # 建峰 + 记当日末值
+    pm.update_peak(Decimal("100000"), d1)                  # 跨日 → prev_close=100000
+
+    # D 日 14:30：-8% 触发；resume_after = 次一交易日
+    pm.update_daily(Decimal("92000"), d1, initial, resume_after=d2)
+    assert pm.daily_pause_active is True
+    assert pm.daily_pause_resume_after == d2
+
+    # 次日首 bar（enter_day）不得自动恢复
+    pm.enter_day(d2, initial)
+    assert pm.daily_pause_active is True
+    assert pm.daily_pause_resume_after == d2
+
+    # D+2 首 bar 才恢复，且门槛清空
+    pm.enter_day(d3, initial)
+    assert pm.daily_pause_active is False
+    assert pm.daily_pause_resume_after is None
+
+
+def test_daily_pause_without_resume_after_keeps_legacy_next_day_recovery():
+    """P1-1 兼容：不传 resume_after（回测/历史语义）→ 仍是触发日次日恢复。"""
+    pm = _pm()
+    initial = Decimal("100000")
+    d0, d1, d2 = date(2026, 7, 1), date(2026, 7, 2), date(2026, 7, 3)
+    pm.update_peak(initial, d0)
+    pm.update_peak(Decimal("100000"), d1)
+    pm.update_daily(Decimal("92000"), d1, initial)
+    assert pm.daily_pause_active is True
+    assert pm.daily_pause_resume_after is None
+    pm.enter_day(d2, initial)
+    assert pm.daily_pause_active is False
+
+
+def test_update_peak_allow_false_keeps_peak_and_refreshes_prev_close():
+    """P1-2：allow_peak_update=False（日线策略的盘中 1m）→ 不抬峰、不判回撤，
+    但跨日 prev_close / 当日末值仍推进（daily_loss 基准与次日恢复不受影响）。"""
+    pm = _pm()
+    d0, d1 = date(2026, 7, 1), date(2026, 7, 2)
+    pm.update_peak(Decimal("100000"), d0)
+    pm.update_peak(Decimal("120000"), d1, allow_peak_update=False)
+    assert pm.peak_value == Decimal("100000")          # 盘中不抬峰
+    assert pm.prev_close_value == Decimal("100000")    # 跨日基准仍刷新
+    assert pm._last_bar_total_value == Decimal("120000")
+    # 日线收盘轮次（allow=True）才抬峰
+    pm.update_peak(Decimal("120000"), d1)
+    assert pm.peak_value == Decimal("120000")
+
+
 def test_is_trading_halted_combines_breaker_and_daily_pause():
     """is_trading_halted = circuit_breaker_active OR daily_pause_active。"""
     pm = _pm()
@@ -368,6 +427,8 @@ def _pos_with_high(qty=1000, high="10"):
     pos = Position("000001.SZ")
     pos.quantity = qty
     pos.highest_price = Decimal(high)
+    # B5：成本未知（avg_cost<=0）时风控整体跳过，ratio 覆盖用例需给出有效成本基准
+    pos.avg_cost = Decimal("9")
     return pos
 
 
@@ -393,3 +454,27 @@ def test_trailing_stop_ratio_none_falls_back_to_instance():
     assert rm.check_trailing_stop(pos, Decimal("9.5"), ratio=Decimal("0.03")) is True
     # 覆盖 0 同样视为禁用（与实例阈值 0 语义一致）
     assert rm.check_trailing_stop(pos, Decimal("9.5"), ratio=Decimal("0")) is False
+
+
+def test_risk_skipped_when_cost_unknown():
+    """B5：柜台成本为负/未知（avg_cost<=0）时止损/止盈跳过（阈值判断无成本基准）。
+
+    移动止损例外（2026-11-10）：它只用 highest_price 这条价格序列，不需要成本
+    基准——负成本（送转/分红后已回本）与成本未知的持仓仍必须受移动止损保护，
+    否则这类持仓完全裸奔（实测 300413 cost=-475 / 300722 cost=-10.93）。
+    """
+    rm = StrategyRiskManager(
+        stop_loss_ratio=Decimal("0.05"), take_profit_ratio=Decimal("0.2"),
+        trailing_stop_ratio=Decimal("0.03"),
+    )
+    pos = Position("300413.SZ")
+    pos.quantity = 20
+    pos.avg_cost = Decimal("0")          # 柜台负成本 → 未知标记
+    pos.highest_price = Decimal("40")
+    assert rm.check_stop_loss(pos, Decimal("1")) is False
+    assert rm.check_take_profit(pos, Decimal("999")) is False
+    # 40 → 10：回撤 75% ≥ 3% → 移动止损仍生效
+    assert rm.check_trailing_stop(pos, Decimal("10")) is True
+    # 从未取到有效价（无峰值基准）→ 不判回撤
+    pos.highest_price = Decimal("0")
+    assert rm.check_trailing_stop(pos, Decimal("10")) is False

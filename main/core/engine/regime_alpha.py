@@ -239,6 +239,7 @@ class RegimeAlphaAnalyzer:
                 "amount": float(self._tget(t, "amount") or 0.0),
                 "commission": float(self._tget(t, "commission") or 0.0),
                 "stamp_duty": float(self._tget(t, "stamp_duty") or 0.0),
+                "transfer_fee": float(self._tget(t, "transfer_fee") or 0.0),
                 "stock_code": str(self._tget(t, "stock_code") or ""),
             })
         out.sort(key=lambda x: x["date"])
@@ -360,7 +361,7 @@ class RegimeAlphaAnalyzer:
         for tr in self.trades:
             if tr["date"] in day_set:
                 amount += tr["amount"]
-                cost += tr["commission"] + tr["stamp_duty"]
+                cost += tr["commission"] + tr["stamp_duty"] + tr["transfer_fee"]
         navs = [float(self.s_nav.loc[d]) for d in days]
         avg_total = _mean(navs)
         years = (days[-1] - days[0]).days / DAYS_PER_YEAR
@@ -625,7 +626,8 @@ class RegimeAlphaAnalyzer:
         day_set = set(days)
         rng_trades = [tr for tr in self.trades if tr["date"] in day_set]
         amount = sum(tr["amount"] for tr in rng_trades)
-        cost = sum(tr["commission"] + tr["stamp_duty"] for tr in rng_trades)
+        cost = sum(tr["commission"] + tr["stamp_duty"] + tr["transfer_fee"]
+                   for tr in rng_trades)
 
         navs = [float(self.s_nav.loc[d]) for d in days]
         avg_total = _mean(navs)

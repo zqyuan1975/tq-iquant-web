@@ -106,7 +106,7 @@ def test_post_backtest_end_to_end(client, monkeypatch):
 
     stock = "000001.SZ"
     # monkeypatch 数据获取层：返回 mock klines / signal_cache
-    monkeypatch.setattr(svc, "build_klines", lambda ps, start, end, db=None, dividend_mode="front": _mock_klines())
+    monkeypatch.setattr(svc, "build_klines", lambda ps, start, end, db=None, dividend_mode="front", **kw: _mock_klines())
     monkeypatch.setattr(svc, "build_signal_cache", lambda ps, klines, db=None, start=None, diagnostics=None, dividend_mode="front": {
         (1, stock, datetime(2026, 7, 29)): [{"name": "open_sig", "value": 1}],
         (1, stock, datetime(2026, 7, 30)): [{"name": "open_sig", "value": -1}],
@@ -161,7 +161,7 @@ def test_post_backtest_back_dividend_mode_threaded(client, monkeypatch):
 
     seen = {}
 
-    def _fake_klines(ps, start, end, db=None, dividend_mode="front"):
+    def _fake_klines(ps, start, end, db=None, dividend_mode="front", **kw):
         seen["klines"] = dividend_mode
         return _mock_klines()
 
@@ -194,6 +194,66 @@ def test_post_backtest_back_dividend_mode_threaded(client, monkeypatch):
     rec = db.get(BacktestRecord, record_id)
     snap = json.loads(rec.params_snapshot)
     assert snap["dividend_mode"] == "back"
+    # J3：口径显式冻结（回测后复权 vs 实盘桥不复权）
+    caliber = snap["price_caliber"]
+    assert caliber["version"] == "price_caliber_v1"
+    assert caliber["backtest_adjust"] == "back"
+    assert caliber["backtest_fetch_adjust"] == "back"
+    assert caliber["live_bridge_adjust"] == "none"
+    assert caliber["aligned_with_live"] is False
+    db.close()
+
+
+def test_post_backtest_exact_mode_forces_corporate_actions(client, monkeypatch):
+    """J4 exact 档：接受该模式、强制启用公司行为并冻结口径（默认档行为不变）。"""
+    c, Session = client
+    db = Session()
+    ps_id, _, _ = _seed(db)
+    db.close()
+
+    seen = {}
+
+    def _fake_klines(ps, start, end, db=None, dividend_mode="front", **kw):
+        seen["klines"] = dividend_mode
+        return _mock_klines()
+
+    def _fake_cache(ps, klines, db=None, start=None, diagnostics=None, dividend_mode="front"):
+        seen["cache"] = dividend_mode
+        return {}
+
+    def _fake_bench(ps, start, end, db=None, dividend_mode="front"):
+        seen["bench"] = dividend_mode
+        return {}
+
+    monkeypatch.setattr(svc, "build_klines", _fake_klines)
+    monkeypatch.setattr(svc, "build_signal_cache", _fake_cache)
+    monkeypatch.setattr(svc, "build_benchmark_data", _fake_bench)
+
+    payload = {
+        "portfolio_strategy_id": ps_id,
+        "name": "bt_exact",
+        "start_date": "2026-07-29",
+        "end_date": "2026-07-31",
+        "dividend_mode": "exact",
+    }
+    resp = c.post("/api/backtest", json=payload)
+    assert resp.status_code == 200
+    assert resp.json()["code"] == 0
+    assert seen == {"klines": "exact", "cache": "exact", "bench": "exact"}
+
+    record_id = resp.json()["data"]["record_id"]
+    db = Session()
+    rec = db.get(BacktestRecord, record_id)
+    snap = json.loads(rec.params_snapshot)
+    assert snap["dividend_mode"] == "exact"
+    assert snap["fee_threshold_basis"] == "raw_price_space_v1"
+    caliber = snap["price_caliber"]
+    assert caliber["backtest_fetch_adjust"] == "none"
+    assert caliber["aligned_with_live"] is True
+    ca = snap["corporate_actions"]
+    assert ca["enabled"] is True
+    assert ca["forced_by_exact_mode"] is True
+    assert ca["event_count"] == 0
     db.close()
 
 
@@ -224,7 +284,7 @@ def test_post_backtest_robustness_recompute(client, monkeypatch):
     db.close()
 
     stock = "000001.SZ"
-    monkeypatch.setattr(svc, "build_klines", lambda ps, start, end, db=None, dividend_mode="front": _mock_klines())
+    monkeypatch.setattr(svc, "build_klines", lambda ps, start, end, db=None, dividend_mode="front", **kw: _mock_klines())
     monkeypatch.setattr(svc, "build_signal_cache", lambda ps, klines, db=None, start=None, diagnostics=None, dividend_mode="front": {
         (1, stock, datetime(2026, 7, 29)): [{"name": "open_sig", "value": 1}],
         (1, stock, datetime(2026, 7, 30)): [{"name": "open_sig", "value": -1}],
@@ -268,7 +328,7 @@ def test_post_pool_compare_runs_and_returns_comparisons(client, monkeypatch):
     db.close()
 
     stock = "000001.SZ"
-    monkeypatch.setattr(svc, "build_klines", lambda ps, start, end, db=None, dividend_mode="front": _mock_klines())
+    monkeypatch.setattr(svc, "build_klines", lambda ps, start, end, db=None, dividend_mode="front", **kw: _mock_klines())
     monkeypatch.setattr(svc, "build_signal_cache", lambda ps, klines, db=None, start=None, diagnostics=None, dividend_mode="front": {})
 
     payload = {
@@ -307,7 +367,7 @@ def test_post_backtest_no_signal_no_trade(client, monkeypatch):
     db.close()
 
     stock = "000001.SZ"
-    monkeypatch.setattr(svc, "build_klines", lambda ps, start, end, db=None, dividend_mode="front": _mock_klines())
+    monkeypatch.setattr(svc, "build_klines", lambda ps, start, end, db=None, dividend_mode="front", **kw: _mock_klines())
     monkeypatch.setattr(svc, "build_signal_cache", lambda ps, klines, db=None, start=None, diagnostics=None, dividend_mode="front": {
         (1, stock, datetime(2026, 7, 29)): [{"name": "open_sig", "value": -1}],
         (1, stock, datetime(2026, 7, 30)): [{"name": "open_sig", "value": -1}],
@@ -341,13 +401,13 @@ def test_post_backtest_no_signal_no_trade(client, monkeypatch):
 # ===========================================================================
 def _mock_data(monkeypatch):
     """统一 mock 数据获取层，供多测试复用。"""
-    monkeypatch.setattr(svc, "build_klines", lambda ps, start, end, db=None, dividend_mode="front": _mock_klines())
+    monkeypatch.setattr(svc, "build_klines", lambda ps, start, end, db=None, dividend_mode="front", **kw: _mock_klines())
     monkeypatch.setattr(svc, "build_signal_cache", lambda ps, klines, db=None, start=None, diagnostics=None, dividend_mode="front": {
         (1, "000001.SZ", datetime(2026, 7, 29)): [{"name": "open_sig", "value": 1}],
         (1, "000001.SZ", datetime(2026, 7, 30)): [{"name": "open_sig", "value": -1}],
         (1, "000001.SZ", datetime(2026, 7, 31)): [{"name": "open_sig", "value": -1}],
     })
-    monkeypatch.setattr(svc, "build_benchmark_data", lambda ps, start, end, db=None, dividend_mode="front": {})
+    monkeypatch.setattr(svc, "build_benchmark_data", lambda ps, start, end, db=None, dividend_mode="front", **kw: {})
     monkeypatch.setattr(svc, "safe_compute_crisis_alpha", lambda *a, **kw: None)
     monkeypatch.setattr(svc, "safe_compute_market_regime", lambda *a, **kw: None)
 
@@ -661,7 +721,7 @@ def test_post_backtest_empty_klines_marks_failed_not_completed(client, monkeypat
     db.close()
 
     # mock 三层全返回空 — 模拟 TQ 拉不到行情
-    monkeypatch.setattr(svc, "build_klines", lambda ps, start, end, db=None, dividend_mode="front": {})
+    monkeypatch.setattr(svc, "build_klines", lambda ps, start, end, db=None, dividend_mode="front", **kw: {})
     monkeypatch.setattr(svc, "build_signal_cache", lambda ps, klines, db=None, start=None, diagnostics=None, dividend_mode="front": {})
 
     payload = {
@@ -690,7 +750,7 @@ def test_post_backtest_engine_exception_persists_failed(client, monkeypatch):
     db.close()
 
     # build_klines 抛异常 — 模拟 polars PanicException 等真机错误
-    def _boom(ps, start, end, db=None, dividend_mode="front"):
+    def _boom(ps, start, end, db=None, dividend_mode="front", **kw):
         raise RuntimeError("polars panic: str cannot be int")
     monkeypatch.setattr(svc, "build_klines", _boom)
 
@@ -738,7 +798,7 @@ def test_post_backtest_409_when_already_running(client, monkeypatch):
     ps_id, _, _ = _seed(db)
     db.close()
 
-    monkeypatch.setattr(svc, "build_klines", lambda ps, start, end, db=None, dividend_mode="front": _mock_klines())
+    monkeypatch.setattr(svc, "build_klines", lambda ps, start, end, db=None, dividend_mode="front", **kw: _mock_klines())
     monkeypatch.setattr(svc, "build_signal_cache", lambda ps, klines, db=None, start=None, diagnostics=None, dividend_mode="front": {})
     payload = _post_payload(ps_id, "conflict_test")
 
@@ -770,7 +830,7 @@ def test_post_backtest_lock_released_after_failure(client, monkeypatch):
     db.close()
     payload = _post_payload(ps_id, "wedge_test")
 
-    def _boom(ps, start, end, db=None):
+    def _boom(ps, start, end, db=None, dividend_mode="front", **kw):
         raise RuntimeError("polars panic: str cannot be int")
     monkeypatch.setattr(svc, "build_klines", _boom)
 
@@ -780,7 +840,7 @@ def test_post_backtest_lock_released_after_failure(client, monkeypatch):
     assert resp.json()["code"] == 500
 
     # 恢复正常数据层 → 再次 POST 应 200（锁未被异常卡死）
-    monkeypatch.setattr(svc, "build_klines", lambda ps, start, end, db=None, dividend_mode="front": _mock_klines())
+    monkeypatch.setattr(svc, "build_klines", lambda ps, start, end, db=None, dividend_mode="front", **kw: _mock_klines())
     monkeypatch.setattr(svc, "build_signal_cache", lambda ps, klines, db=None, start=None, diagnostics=None, dividend_mode="front": {})
     resp2 = c.post("/api/backtest", json=payload)
     assert resp2.status_code == 200
@@ -1478,3 +1538,62 @@ def test_persistence_recompute_rejects_unknown_benchmark(client, monkeypatch):
     r = c.post(f"/api/backtest/records/{rid}/persistence/recompute?benchmark_code=BAD.CODE")
     assert r.json()["code"] == 400
     assert "BAD.CODE" in r.json()["message"]
+
+
+# ---------------------------------------------------------------------------
+# K6 报告导出（CSV / PDF）
+# ---------------------------------------------------------------------------
+def test_export_csv_kinds_and_errors(client, monkeypatch):
+    """CSV 导出直接返回文件（text/csv + attachment），非法 kind=400、缺记录=404。"""
+    c, Session = client
+    db = Session()
+    ps_id, _, _ = _seed(db)
+    db.close()
+    _mock_data(monkeypatch)
+    rid = _post_backtest(c, ps_id).json()["data"]["record_id"]
+
+    trades = c.get(f"/api/backtest/records/{rid}/export/csv?kind=trades")
+    assert trades.status_code == 200
+    assert trades.headers["content-type"].startswith("text/csv")
+    assert "attachment" in trades.headers["content-disposition"]
+    body = trades.content.decode("utf-8-sig")
+    assert body.startswith("时间,策略,信号,代码,方向")
+    assert "000001.SZ" in body
+
+    snapshots = c.get(f"/api/backtest/records/{rid}/export/csv?kind=snapshots")
+    assert snapshots.content.decode("utf-8-sig").startswith("日期,总资产")
+
+    metrics = c.get(f"/api/backtest/records/{rid}/export/csv?kind=metrics")
+    metrics_text = metrics.content.decode("utf-8-sig")
+    assert metrics_text.startswith("指标,数值")
+    assert "总收益" in metrics_text
+
+    bad = c.get(f"/api/backtest/records/{rid}/export/csv?kind=pdf")
+    assert bad.json()["code"] == 400
+
+    missing = c.get("/api/backtest/records/999999/export/csv")
+    assert missing.json()["code"] == 404
+
+
+def test_export_pdf_returns_file_or_503(client, monkeypatch):
+    """PDF：浏览器可用时返回 application/pdf；不可用时 503 并给出明确提示。"""
+    c, Session = client
+    db = Session()
+    ps_id, _, _ = _seed(db)
+    db.close()
+    _mock_data(monkeypatch)
+    rid = _post_backtest(c, ps_id).json()["data"]["record_id"]
+
+    monkeypatch.setattr(bt_api, "html_to_pdf", lambda html: b"%PDF-1.4 stub")
+    ok = c.get(f"/api/backtest/records/{rid}/export/pdf")
+    assert ok.status_code == 200
+    assert ok.headers["content-type"] == "application/pdf"
+    assert ok.content.startswith(b"%PDF")
+
+    def _unavailable(html):
+        raise bt_api.PdfExportUnavailable("未找到 Edge/Chrome")
+
+    monkeypatch.setattr(bt_api, "html_to_pdf", _unavailable)
+    blocked = c.get(f"/api/backtest/records/{rid}/export/pdf")
+    assert blocked.json()["code"] == 503
+    assert "Edge" in blocked.json()["message"]

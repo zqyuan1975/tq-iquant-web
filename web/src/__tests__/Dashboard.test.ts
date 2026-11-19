@@ -55,7 +55,9 @@ beforeEach(() => {
   ;(getSystemStatus as any).mockResolvedValue({ core: { online: true, version: '1.0', uptime: '0h0m' } })
   ;(getLiveChannel as any).mockImplementation((engine: string) => Promise.resolve({
     engine,
-    label: engine === 'tdx' ? '通达信 TQ' : engine === 'ths' ? '同花顺' : 'QMT 通道',
+    label: engine === 'tdx' ? '通达信 TQ'
+      : engine === 'ths' ? '同花顺'
+      : engine === 'goldminer' ? '掘金量化' : 'QMT 通道',
     online: null,
   }))
 })
@@ -72,7 +74,8 @@ describe('Dashboard.vue', () => {
     expect(getLiveSessions).toHaveBeenCalled()
     expect(getSystemConfigs).toHaveBeenCalled()
     expect(getSystemStatus).toHaveBeenCalled()
-    expect(getLiveChannel).toHaveBeenCalledTimes(3)   // tdx/ths/goldminer 三通道
+    expect(getLiveChannel).toHaveBeenCalledTimes(4)   // tdx/ths/goldminer/iquant 四通道
+    expect(getLiveChannel).toHaveBeenCalledWith('iquant')
 
     // 统计卡：股票池=1、公式=1、回测=1；系统卡在线；配置路径
     expect(w.text()).toContain('股票池')
@@ -82,6 +85,92 @@ describe('Dashboard.vue', () => {
     expect(w.text()).toContain('回测A')
     expect(w.text()).toContain('D:\\new_tdx64')
     expect(w.text()).toContain('http://127.0.0.1:7801')
+    w.unmount()
+  })
+
+  it('四通道同一套版式：名称/状态/次要信息齐全，QMT 桥不可达显示离线红', async () => {
+    ;(getLiveChannel as any).mockImplementation((engine: string) => Promise.resolve({
+      engine,
+      label: engine === 'tdx' ? '通达信 TQ'
+        : engine === 'ths' ? '同花顺'
+        : engine === 'goldminer' ? '掘金量化' : 'QMT 通道',
+      online: engine === 'iquant' ? false : true,
+      detail: engine === 'iquant' ? 'HTTP 桥 http://127.0.0.1:8790' : '次要信息',
+      checked_at: '2026-11-11 10:57:32',
+    }))
+    const w = mount(Dashboard)
+    await flushPromises()
+
+    const cards = w.findAll('.channel-card')
+    expect(cards).toHaveLength(4)
+    expect(cards.map((c) => c.find('.metric-label').text())).toEqual(
+      ['通达信 TQ', '同花顺', '掘金量化', 'QMT 通道'],
+    )
+    for (const c of cards) {
+      expect(c.find('.channel-status').exists()).toBe(true)
+      expect(c.find('.channel-meta').text()).not.toBe('')
+    }
+    // 前三个通道探活在线上线：同一套「在线」绿
+    for (const c of cards.slice(0, 3)) {
+      expect(c.find('.channel-status').text()).toBe('在线')
+      expect(c.find('.channel-status').classes()).toContain('ok')
+    }
+    // QMT 桥不可达：唯一的另一套词「离线」红，不再有第三种表述
+    const qmt = cards[3]
+    expect(qmt.find('.channel-status').text()).toBe('离线')
+    expect(qmt.find('.channel-status').classes()).toContain('bad')
+    expect(qmt.find('.channel-meta').text()).toContain('127.0.0.1:8790')
+    // 协议头在 200px 最小列宽下会挤掉后半句，统一剥离（原文保留在 title 悬浮提示里）
+    expect(qmt.find('.channel-meta').text()).not.toContain('http://')
+    expect(qmt.find('.channel-meta').text()).toContain('心跳 10:57:32')
+    expect(qmt.find('.channel-meta').attributes('title')).toContain('8790')
+    expect(qmt.text()).not.toContain('8791')
+    expect(qmt.text()).not.toContain('未检测')
+    w.unmount()
+  })
+
+  it('次要信息固定两行：桥地址去协议头一行、心跳单列一行（200px 列宽不截断）', async () => {
+    ;(getLiveChannel as any).mockImplementation((engine: string) => Promise.resolve({
+      engine,
+      label: engine === 'tdx' ? '通达信 TQ'
+        : engine === 'ths' ? '同花顺'
+        : engine === 'goldminer' ? '掘金量化' : 'QMT 通道',
+      online: false,
+      detail: engine === 'goldminer' ? 'http://127.0.0.1:7801'
+        : engine === 'iquant' ? 'HTTP 桥 http://127.0.0.1:8790'
+        : engine === 'ths' ? '网上股票交易系统5.0' : 'TQ 资金账号 未配置',
+      checked_at: '2026-11-11 11:27:00',
+    }))
+    const w = mount(Dashboard)
+    await flushPromises()
+
+    const cards = w.findAll('.channel-card')
+    expect(cards).toHaveLength(4)
+    const metas = cards.map((c) => c.find('.channel-meta'))
+    // 主体行：不含协议头；掘金只留 host:port
+    expect(metas[2].findAll('.meta-line')[0].text()).toBe('127.0.0.1:7801')
+    expect(metas[2].text()).not.toContain('http://')
+    expect(metas[3].findAll('.meta-line')[0].text()).toBe('HTTP 桥 127.0.0.1:8790')
+    // 第二行固定是心跳，四卡同一口径
+    for (const m of metas) {
+      const lines = m.findAll('.meta-line')
+      expect(lines).toHaveLength(2)
+      expect(lines[1].text()).toBe('心跳 11:27:00')
+      expect(lines[1].classes()).toContain('meta-sub')
+    }
+    w.unmount()
+  })
+
+  it('旧接口 online=null/无 detail → 统一离线红，次要信息降级为「—」', async () => {
+    const w = mount(Dashboard)
+    await flushPromises()
+    const cards = w.findAll('.channel-card')
+    expect(cards).toHaveLength(4)
+    for (const c of cards) {
+      expect(c.find('.channel-meta').text()).toBe('—')
+      expect(c.find('.channel-status').text()).toBe('离线')
+      expect(c.find('.channel-status').classes()).toContain('bad')
+    }
     w.unmount()
   })
 
@@ -97,7 +186,9 @@ describe('Dashboard.vue', () => {
     expect(w.text()).toContain('加载中…')   // 通道卡片独立占位
 
     await vi.advanceTimersByTimeAsync(5000)
-    expect(w.text()).toContain('通道状态超时，稍后自动重试')
+    // 超时不再造第三种状态词：统一按「离线」展示，原因写在次要信息
+    expect(w.text()).toContain('离线')
+    expect(w.text()).toContain('探测超时，按离线显示')
 
     w.unmount()
     vi.useRealTimers()

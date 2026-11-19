@@ -343,6 +343,25 @@ class TestCapitalAndT1Gates:
         assert ev.action == "shrink"
         assert ev.requested_qty == 1000 and ev.final_qty == 100
 
+    def test_order_shrunk_message_uses_binding_cash_cap(self):
+        """文案与 actual_value 打真正 binding 的 min(账本现金, 真实可用上限)。
+
+        001311 实证：账本现金 107,164.10、binding 的 cash_cap 只有 5,155.30，
+        旧文案只打账本现金，导致「缩到 300 股」看起来和数字对不上。
+        """
+        r = DecisionRecorder()
+        acc = Account(initial_capital=Decimal("100000"))  # 账本现金 10 万
+        eng = ExecutionEngine(None, LiveT1Checker(), recorder=r)
+        out = eng.cap_quantity(
+            _order(TradeType.BUY, 1000, price="10"), acc, None,
+            available_cash_cap=Decimal("5055.30"),  # 真实可用上限 → binding
+        )
+        assert out == 500
+        ev = _find(r.drain(), "order_shrunk")
+        assert round(ev.actual_value, 2) == 5055.30  # 不是账本 100,000
+        assert "可用现金 5,055.30" in ev.message
+        assert "账本现金 100,000.00" in ev.message
+
     def test_full_buy_records_nothing(self):
         r = DecisionRecorder()
         acc = Account(initial_capital=Decimal("1000000"))
@@ -544,3 +563,105 @@ class TestOpenGateInflight:
         orders = port.on_bar(bar, signal_cache=cache, inflight_opens={1: {"000001.SZ"}})
         # 1 held（在途票已计入）+ 0 新增 → 仍有 1 个空位给 000002.SZ
         assert [o.stock_code for o in orders] == ["000002.SZ"]
+
+
+# ===========================================================================
+# 卖出范围口径（config.tq_trade.live_sell_scope）
+# full（默认）= 按整仓意图卖（旧行为）；platform_only = 只卖平台自己买入的
+# Position.platform_quantity，纯外部/手工仓不下单（记 gate=sell_scope 去重事件）。
+# 阈值判定仍按整仓成本（已知偏差，本层只收窄卖出数量）。
+# ===========================================================================
+def _mixed_pos(ctx, code="000001.SZ", platform_qty=300, total_qty=1000, price="10"):
+    """混合仓：平台买入 platform_qty，其余为外部/手工仓（mirror 覆盖总量不写平台量）。"""
+    pos = Position(code)
+    pos.buy(platform_qty, Decimal(price))
+    pos.mirror_bridge(total_qty, total_qty, Decimal(price), date(2026, 7, 29))
+    ctx.positions[code] = pos
+    return pos
+
+
+def _external_pos(ctx, code="000001.SZ", total_qty=1000, price="10"):
+    """纯外部仓：只经 mirror 覆盖，platform_quantity 恒 0。"""
+    pos = Position(code)
+    pos.mirror_bridge(total_qty, total_qty, Decimal(price), date(2026, 7, 29))
+    ctx.positions[code] = pos
+    return pos
+
+
+def _risk_bar(code="000001.SZ", close="9", t=None):
+    """止损触发 bar（成本 10、现价 9，stop_loss=0.05）。"""
+    return _bar({code: _ohlcv(close)}, t or datetime(2026, 7, 30, 15, 0))
+
+
+class TestSellScope:
+    def test_default_full_sells_whole_position(self):
+        """配置缺省（未改 sell_scope）等价 full：混合仓止损按整仓卖出。"""
+        r = DecisionRecorder()
+        port, ctx = _portfolio(recorder=r)
+        assert port.sell_scope == "full"
+        _mixed_pos(ctx)
+        orders = port.on_bar(_risk_bar(), signal_cache=None)
+        assert len(orders) == 1
+        assert orders[0].trade_type == TradeType.SELL
+        assert orders[0].quantity == 1000  # 整仓
+        assert "sell_scope" not in _gates(r.drain())
+
+    def test_platform_only_sells_only_platform_part_with_odd_lot(self):
+        """platform_only：混合仓只卖平台那部分，全平类允许剩余零股（250 不取整）。"""
+        r = DecisionRecorder()
+        port, ctx = _portfolio(recorder=r)
+        port.sell_scope = "platform_only"
+        _mixed_pos(ctx, platform_qty=250, total_qty=1000)
+        orders = port.on_bar(_risk_bar(), signal_cache=None)
+        assert len(orders) == 1
+        assert orders[0].quantity == 250  # min(1000, 250)，零股保留
+
+    def test_platform_only_pure_external_skips_with_dedup_event(self):
+        """纯外部仓 platform_only：不下单 + 一条 gate=sell_scope/skip 事件（去重）。"""
+        r = DecisionRecorder()
+        port, ctx = _portfolio(recorder=r)
+        port.sell_scope = "platform_only"
+        _external_pos(ctx)
+        assert port.on_bar(_risk_bar(), signal_cache=None) == []
+        evs = r.drain()
+        ev = _find(evs, "sell_scope")
+        assert ev.action == "skip"
+        assert ev.stock_code == "000001.SZ"
+        assert ev.requested_qty == 1000
+        assert "不代卖" in ev.message
+        # 第二根 bar 同票再次命中：不再重复记事件
+        t2 = datetime(2026, 7, 30, 15, 1)
+        assert port.on_bar(_risk_bar(t=t2), signal_cache=None) == []
+        assert "sell_scope" not in _gates(r.drain())
+
+    def test_platform_only_reduce_capped_then_lot_rounded(self):
+        """platform_only + REDUCE：意图量先夹到平台仓，再按整手向下取整。"""
+        r = DecisionRecorder()
+        port, ctx = _portfolio(recorder=r, reduce_position_ratio="0.5")
+        port.sell_scope = "platform_only"
+        _mixed_pos(ctx, platform_qty=260, total_qty=1000)
+        t = datetime(2026, 7, 30, 15, 0)
+        ctx.formula_signals = [
+            {"signal_name": "reduce_sig", "signal_type": SignalType.REDUCE, "trigger_value": 1},
+        ]
+        cache = {(1, "000001.SZ", t): [{"name": "reduce_sig", "value": 1}]}
+        orders = port.on_bar(_bar({"000001.SZ": _ohlcv("10.5")}, t), signal_cache=cache)
+        assert len(orders) == 1
+        # 意图 500 → min(500, 260)=260 → 整手向下取整 200
+        assert orders[0].quantity == 200
+
+    def test_platform_only_intent_below_platform_uses_intent(self):
+        """platform_quantity 大于意图量时按意图量（REDUCE 不超卖）。"""
+        r = DecisionRecorder()
+        port, ctx = _portfolio(recorder=r, reduce_position_ratio="0.3")
+        port.sell_scope = "platform_only"
+        _mixed_pos(ctx, platform_qty=900, total_qty=1000)
+        t = datetime(2026, 7, 30, 15, 0)
+        ctx.formula_signals = [
+            {"signal_name": "reduce_sig", "signal_type": SignalType.REDUCE, "trigger_value": 1},
+        ]
+        cache = {(1, "000001.SZ", t): [{"name": "reduce_sig", "value": 1}]}
+        orders = port.on_bar(_bar({"000001.SZ": _ohlcv("10.5")}, t), signal_cache=cache)
+        assert len(orders) == 1
+        assert orders[0].quantity == 300  # int(1000×0.3)=300 < 平台 900
+

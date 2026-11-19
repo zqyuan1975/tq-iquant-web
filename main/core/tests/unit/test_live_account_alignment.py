@@ -6,8 +6,10 @@
 - BUY 审批资金对齐：min(虚拟现金, 真实可用×0.98)（approve_order cash_override）；
 - 提交前价格刷新：order.price 用实时最新价（回测继承价为信号 bar 收盘，跨日过期）。
 """
-from datetime import datetime, timedelta
+from datetime import date, datetime, time, timedelta
 from decimal import Decimal
+import json
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -17,7 +19,8 @@ from core.engine.bar_poller import BarPoller
 from core.engine.live_engine import LiveEngine
 from core.engine.position import Position
 from core.models import (
-    LiveAccountPositionSnapshot, LiveAccountSnapshot, LiveOrder, LiveTrade,
+    LiveAccountPositionSnapshot, LiveAccountSnapshot, LiveDecisionEvent, LiveOrder,
+    LiveSessionPortfolio, LiveTrade,
 )
 from core.engine.live.timing import now_shanghai
 from tq_iquant_shared.constants import TradeType
@@ -68,6 +71,10 @@ class _AcctDispatcher:
         return list(self._quote_bars)
 
     def poll_deals(self):
+        return []
+
+    def query_deals(self, *args, **kwargs):
+        """成交轮询别名（引擎 _poll_deals 走 query_deals，缺该方法会抛异常）。"""
         return []
 
 
@@ -174,6 +181,34 @@ def test_import_without_value_keeps_cash_untouched():
     engine._tick_deals()
 
     assert port.account.cash == Decimal("100000")
+
+
+def test_mirror_share_bonus_does_not_deduct_cash():
+    """送转/拆股：数量翻倍、合并均价减半（总成本守恒）→ 不是外部买入，不扣现金。
+
+    旧实现只看「真实量 > 虚拟量」就按增量市值扣虚拟现金：送转当天虚拟净值
+    凭空少掉增量市值（一个 10 送 10 就是该仓一半的市值）→ 假回撤，可能误触
+    max_drawdown 熔断（只暂停开仓、不停损，但会整天错过信号）。
+    """
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single()
+    disp = _AcctDispatcher(positions=[
+        # 10 送 10：1000 → 2000 股，合并均价 10 → 5（总成本 10000 不变）
+        {"symbol": "600000.SH", "volume": 2000, "available": 2000,
+         "cost": 5.0, "market_value": 10000.0},
+    ])
+    engine = _mk_engine(disp, factory, port, engine_key="tdx",
+                        account_snapshot_interval=5.0)
+    ctx = engine.ctx.portfolios[0].strategies[0]
+    pos = Position("600000.SH")
+    pos.buy(1000, Decimal("10.0"), datetime(2026, 11, 3, 10, 0))
+    ctx.positions["600000.SH"] = pos
+
+    engine._tick_deals()
+
+    assert ctx.positions["600000.SH"].quantity == 2000
+    assert ctx.positions["600000.SH"].avg_cost == Decimal("5.0")
+    assert port.account.cash == Decimal("100000")   # 股本变动不动现金
 
 
 def test_mirror_increase_deducts_only_external_delta():
@@ -324,17 +359,89 @@ def _order(price):
     )
 
 
+def _today_stime(hhmmss="143000"):
+    """当日 bar 的 stime（新鲜度校验按 now_shanghai 的日期判定）。"""
+    return now_shanghai().strftime("%Y%m%d") + hhmmss
+
+
+class _FakeSynth:
+    """最小快照合成器桩：只暴露 latest_price（提交前价格刷新兜底用）。"""
+
+    def __init__(self, price, when):
+        self._price = price
+        self._when = when
+
+    def latest_price(self, code):
+        return float(self._price), self._when
+
+
 def test_submit_price_refresh_uses_latest_quote():
     factory, _ = _db_factory()
     port, _ = _portfolio_single()
     disp = _AcctDispatcher(quote_bars=[
-        {"stime": "20261103142900", "close": 10.0},
-        {"stime": "20261103143000", "close": 11.5},
+        {"stime": _today_stime("142900"), "close": 10.0},
+        {"stime": _today_stime("143000"), "close": 11.5},
     ])
     engine = _mk_engine(disp, factory, port, engine_key="tdx")
     order = _order(Decimal("10.0"))   # 回测继承价（信号 bar 收盘）
-    engine._refresh_submit_price(order)
+    source = engine._refresh_submit_price(order)
     assert order.price == Decimal("11.5")   # 已刷新为最新价
+    assert source == "quote"
+    events = engine._recorder.drain()
+    assert any(e.gate == "submit_price" and "price_source=quote" in (e.message or "")
+               for e in events)
+
+
+def test_submit_price_refresh_stale_quote_falls_back_to_snapshot():
+    """1m 行情非当日（通达信盘中本地分钟线只到上一交易日）→ 不采用，改用快照合成价。"""
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single()
+    stale_stime = (now_shanghai() - timedelta(days=1)).strftime("%Y%m%d") + "143000"
+    disp = _AcctDispatcher(quote_bars=[
+        {"stime": stale_stime, "close": 18.20},   # 昨收附近：绝不能当实时价
+    ])
+    synth = _FakeSynth(Decimal("18.46"), now_shanghai())
+    engine = _mk_engine(disp, factory, port, engine_key="tdx", snapshot_synth=synth)
+    order = _order(Decimal("18.35"))              # 信号价
+    source = engine._refresh_submit_price(order)
+    assert source == "snapshot"
+    assert order.price == Decimal("18.46")
+    events = engine._recorder.drain()
+    assert any(e.gate == "submit_price" and "price_source=snapshot" in (e.message or "")
+               for e in events)
+
+
+def test_submit_price_refresh_stale_quote_without_snapshot_keeps_signal_price(caplog):
+    """1m 非当日且快照合成无样本 → 保持信号价不刷新，并打 WARNING（含 code/bar 时间）。"""
+    caplog.set_level("WARNING")
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single()
+    stale_stime = (now_shanghai() - timedelta(days=1)).strftime("%Y%m%d") + "143000"
+    disp = _AcctDispatcher(quote_bars=[{"stime": stale_stime, "close": 18.20}])
+    engine = _mk_engine(disp, factory, port, engine_key="tdx")
+    order = _order(Decimal("18.35"))
+    source = engine._refresh_submit_price(order)
+    assert source == "quote_stale_fallback"
+    assert order.price == Decimal("18.35")        # 信号价原样保留
+    assert any("1m 行情非当日" in r.getMessage() and "600000.SH" in r.getMessage()
+               for r in caplog.records)
+    events = engine._recorder.drain()
+    assert any(e.gate == "submit_price"
+               and "price_source=quote_stale_fallback" in (e.message or "")
+               for e in events)
+
+
+def test_submit_price_refresh_snapshot_stale_not_used():
+    """快照合成样本也不是当日（跨日残留）→ 不采用，保持信号价。"""
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single()
+    disp = _AcctDispatcher(quote_bars=[])
+    synth = _FakeSynth(Decimal("18.46"), now_shanghai() - timedelta(days=1))
+    engine = _mk_engine(disp, factory, port, engine_key="tdx", snapshot_synth=synth)
+    order = _order(Decimal("18.35"))
+    source = engine._refresh_submit_price(order)
+    assert source == "signal"
+    assert order.price == Decimal("18.35")
 
 
 def test_submit_price_refresh_fail_open_keeps_old():
@@ -429,8 +536,12 @@ def test_capture_skips_zero_quantity_residual_rows(caplog):
     assert any("skipped 2 zero-quantity" in r.getMessage() for r in caplog.records)
 
 
-def test_out_of_pool_position_reported_behavior_unchanged(caplog):
-    """池外持仓：只加可见性（日志 + risk 事件），导入/风控行为不变。"""
+def test_out_of_pool_position_not_attributed(caplog):
+    """池外外部仓：不兜底归属 → 不进风控/不占槽位/不产生卖单，只上报一次。
+
+    2026-11-10 口径变更：以前会挂到首个组合策略（误卖 7 只的路径），现在
+    只留展示行（engine_external_positions）+ risk 事件；池内仓保持原逻辑。
+    """
     import logging
     from core.engine.live.timing import now_shanghai
 
@@ -452,11 +563,11 @@ def test_out_of_pool_position_reported_behavior_unchanged(caplog):
     with factory() as db, caplog.at_level(logging.WARNING):
         imported = engine._import_external_positions(db, pos, now_shanghai())
 
-    # 行为不变：池内 + 池外都兜底导入；0 股残行不导入
-    assert imported == 2
+    # 池内 600000 照常导入（参与风控）；池外 002745 不归属；0 股残行不导入
+    assert imported == 1
     ctx = engine.ctx.portfolios[0].strategies[0]
     assert ctx.positions["600000.SH"].quantity == 100
-    assert ctx.positions["002745.SZ"].quantity == 5300
+    assert "002745.SZ" not in ctx.positions
     assert "600888.SH" not in ctx.positions
 
     assert any("out-of-pool" in r.getMessage() and "002745.SZ" in r.getMessage()
@@ -466,7 +577,216 @@ def test_out_of_pool_position_reported_behavior_unchanged(caplog):
     assert len(risk) == 1
     assert risk[0]["codes"] == ["002745.SZ"]
     assert risk[0]["quantities"] == {"002745.SZ": 5300}
-    assert "风控" in risk[0]["message"]
+    assert "不参与策略风控" in risk[0]["message"]
+    assert "兜底" not in risk[0]["message"]
+
+    # 同批再采集一次：事件不重复（按代码集合去重，防 60s 刷屏）
+    events.clear()
+    with factory() as db:
+        engine._import_external_positions(db, pos, now_shanghai())
+    assert [p for p in events if p.get("rule") == "out_of_pool_position"] == []
+
+
+def test_out_of_pool_position_not_deducted_from_virtual_cash():
+    """②（2026-11-11）：池外仓不进虚拟现金/净值/回撤分母。
+
+    起账现金 = 组合配置资金；只有**池内**继承仓的市值从虚拟现金扣除（账户总资产
+    口径的继承仓），池外仓（代码不在任何组合股票池）一分钱都不动——它们只出现在
+    展示层（out_of_pool=True）与对账，不参与 total_value（回撤分母）。
+    """
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single()
+    disp = _AcctDispatcher(positions=[])
+    engine = _mk_engine(disp, factory, port,
+                        pool_codes_by_portfolio={1: {"600000.SH"}})
+    pos = [
+        # 池内继承仓：市值 1000 → 从起账现金扣除（不双计）
+        {"symbol": "600000.SH", "volume": 100, "available": 100,
+         "cost": 10.0, "market_value": 1000.0},
+        # 池外仓：市值 47700 → 不进虚拟账本、不扣现金
+        {"symbol": "002745.SZ", "volume": 5300, "available": 5300,
+         "cost": 9.0, "market_value": 47700.0},
+    ]
+    account = port.account
+    assert account.cash == Decimal("100000")
+    with factory() as db:
+        engine._import_external_positions(db, pos, now_shanghai())
+
+    ctx = engine.ctx.portfolios[0].strategies[0]
+    assert "002745.SZ" not in ctx.positions
+    assert account.cash == Decimal("99000")          # 只扣池内继承仓 1000
+    assert port._holdings_value() == Decimal("1000")  # 净值只含池内持仓
+    # 组合净值 = 99000 + 1000 = 100000（池外 47700 完全没有进入分子/分母）
+    assert account.cash + port._holdings_value() == Decimal("100000")
+
+
+def test_external_positions_snapshot_keeps_out_of_pool_rows_for_display():
+    """池外仓不进虚拟账本，但必须留在引擎外部持仓快照里（/positions 展示来源）。
+
+    iquant/goldminer 桥的 dispatcher 没有 get_positions，展示层只能读这份快照；
+    快照只读：不写虚拟账本、不产生订单。
+    """
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single()
+    disp = _AcctDispatcher(positions=[])
+    engine = _mk_engine(disp, factory, port,
+                        pool_codes_by_portfolio={1: {"600000.SH"}})
+    pos = [
+        {"symbol": "600000.SH", "volume": 100, "available": 100,
+         "cost": 10.0, "market_value": 1000.0},
+        {"symbol": "002745.SZ", "volume": 5300, "available": 5300,
+         "cost": 9.0, "market_value": 47700.0},
+        # 成本为负（送转后）：快照里记 0 → 前端「成本未知」
+        {"symbol": "300413.SZ", "volume": 20, "available": 20,
+         "cost": -475.005, "market_value": 600.0},
+        {"symbol": "600888.SH", "volume": 0, "available": 0,
+         "cost": 0, "market_value": 0},
+    ]
+    with factory() as db:
+        engine._import_external_positions(db, pos, now_shanghai())
+
+        ctx = engine.ctx.portfolios[0].strategies[0]
+        assert "002745.SZ" not in ctx.positions        # 不进虚拟账本
+        assert "300413.SZ" not in ctx.positions
+        assert db.query(LiveOrder).count() == 0        # 不产生订单
+        snap = {r["symbol"]: r for r in engine._external_positions}
+        assert set(snap) == {"002745.SZ", "300413.SZ"}  # 池内/零股行不进快照
+        assert snap["002745.SZ"]["volume"] == 5300
+        assert snap["002745.SZ"]["cost"] == 9.0
+        assert snap["002745.SZ"]["market_value"] == 47700.0
+        assert snap["300413.SZ"]["cost"] == 0.0         # 负成本 → 0（成本未知）
+
+
+def test_out_of_pool_persists_one_summary_decision_event():
+    """池外仓 → 落一条汇总型决策事件（gate=out_of_pool_position / action=notice）。
+
+    逐票明细只走日志 + SSE risk，表里只有一条汇总（不逐票落表）。
+    """
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single()
+    disp = _AcctDispatcher(positions=[])
+    engine = _mk_engine(disp, factory, port,
+                        pool_codes_by_portfolio={1: {"600000.SH"}})
+    events = []
+    engine._emit = lambda et, p: events.append((et, p))
+    pos = [
+        {"symbol": "600000.SH", "volume": 100, "available": 100,
+         "cost": 10.0, "market_value": 1000.0},
+        {"symbol": "002745.SZ", "volume": 5300, "available": 0,
+         "cost": 9.0, "market_value": 47700.0},
+        {"symbol": "300413.SZ", "volume": 20, "available": 20,
+         "cost": 30.0, "market_value": 600.0},
+    ]
+    with factory() as db:
+        engine._import_external_positions(db, pos, now_shanghai())
+        db.commit()
+        rows = (db.query(LiveDecisionEvent)
+                .filter_by(live_session_id=1, gate="out_of_pool_position").all())
+    assert len(rows) == 1
+    ev = rows[0]
+    assert ev.action == "notice"
+    assert ev.layer == "live_gate"
+    assert ev.stock_code is None          # 汇总型，不逐票
+    assert "002745.SZ×5300" in ev.message
+    assert "300413.SZ×20" in ev.message
+    assert "不参与策略风控与槽位" in ev.message
+    assert "股票池" in ev.message
+    # SSE 同步推一条 decision（工作台实时可见）
+    decisions = [p for et, p in events
+                 if et == "decision" and p.get("gate") == "out_of_pool_position"]
+    assert len(decisions) == 1
+    assert decisions[0]["action"] == "notice"
+
+
+def test_out_of_pool_decision_message_not_truncated_over_200_chars():
+    """超长池外清单完整入库，结论句不被 200 字符切片截断。
+
+    2026-11-10 实证：会话 4 的 9 只池外仓完整文案 212 字符，旧实现
+    message[:200] 把结尾切成「…请把」，工作台看不到「加入股票池」指引。
+    """
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single()
+    engine = _mk_engine(_AcctDispatcher(positions=[]), factory, port,
+                        pool_codes_by_portfolio={1: {"600000.SH"}})
+    events = []
+    engine._emit = lambda et, p: events.append((et, p))
+    rows = [("00%04d.SZ" % (2001 + i), 100 * (i + 1)) for i in range(15)]
+    detail = ", ".join("%s×%d" % r for r in rows)
+    expected = ("柜台持有但不在任何组合股票池：%s。这些为外部持仓，"
+                "不参与策略风控与槽位、平台不代卖（仅在持仓列表展示）；"
+                "如需纳入策略管理，请把代码加入对应组合股票池。" % detail)
+    assert len(expected) > 200
+
+    with factory() as db:
+        engine._report_out_of_pool(db, rows)
+        db.commit()
+        ev = (db.query(LiveDecisionEvent)
+              .filter_by(live_session_id=1, gate="out_of_pool_position").one())
+
+    assert ev.message == expected                 # 完整原文入库，未截断
+    assert len(ev.message) > 200
+    assert ev.message.endswith("代码加入对应组合股票池。")
+    decisions = [p for et, p in events
+                 if et == "decision" and p.get("gate") == "out_of_pool_position"]
+    assert decisions and decisions[0]["message"] == expected
+
+
+def test_out_of_pool_decision_event_once_per_day():
+    """同一会话同日重复上报（即使代码集合变了）也只落一条。"""
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single()
+    engine = _mk_engine(_AcctDispatcher(positions=[]), factory, port,
+                        pool_codes_by_portfolio={1: {"600000.SH"}})
+    engine._emit = lambda et, p: None
+    with factory() as db:
+        engine._report_out_of_pool(db, [("002745.SZ", 5300)])
+        engine._report_out_of_pool(db, [("300413.SZ", 20)])
+        db.commit()
+        n = (db.query(LiveDecisionEvent)
+             .filter_by(live_session_id=1, gate="out_of_pool_position").count())
+    assert n == 1
+
+
+def test_out_of_pool_decision_event_not_duplicated_after_restart():
+    """进程重启后内存去重归零 → 以当日已落库行为准，仍只有一条。
+
+    实证：2026-11-10 15:06 与 15:44 两次重启各落一条（同会话同日 2 条）。
+    """
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single()
+    engine = _mk_engine(_AcctDispatcher(positions=[]), factory, port,
+                        pool_codes_by_portfolio={1: {"600000.SH"}})
+    engine._emit = lambda et, p: None
+    with factory() as db:
+        db.add(LiveDecisionEvent(
+            live_session_id=1, gate="out_of_pool_position", layer="live_gate",
+            action="notice", param_name="out_of_pool_count", param_value=9,
+            message="重启前进程已落的一条",
+            created_at=datetime.utcnow(),
+        ))
+        db.commit()
+        # 模拟重启后的新引擎对象（内存标记为空）
+        assert engine._out_of_pool_event_day is None
+        engine._report_out_of_pool(db, [("002745.SZ", 5300)])
+        db.commit()
+        n = (db.query(LiveDecisionEvent)
+             .filter_by(live_session_id=1, gate="out_of_pool_position").count())
+    assert n == 1
+
+
+def test_no_out_of_pool_no_decision_event():
+    """无池外仓 → 不落汇总决策事件。"""
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single()
+    engine = _mk_engine(_AcctDispatcher(positions=[]), factory, port,
+                        pool_codes_by_portfolio={1: {"600000.SH"}})
+    engine._emit = lambda et, p: None
+    with factory() as db:
+        engine._report_out_of_pool(db, [])
+        db.commit()
+        n = (db.query(LiveDecisionEvent)
+             .filter_by(live_session_id=1, gate="out_of_pool_position").count())
+    assert n == 0
 
 
 def test_all_out_of_pool_does_not_raise():
@@ -486,7 +806,9 @@ def test_all_out_of_pool_does_not_raise():
     ]
     with factory() as db:
         imported = engine._import_external_positions(db, pos, now_shanghai())
-    assert imported == 2
+    # 全部池外 → 一个都不进虚拟账本（不占槽位/不参与风控/平台不代卖）
+    assert imported == 0
+    assert engine.ctx.portfolios[0].strategies[0].positions == {}
     risk = [p for et, p in events if p.get("rule") == "out_of_pool_position"]
     assert len(risk) == 1
     assert risk[0]["count"] == 2
@@ -724,6 +1046,81 @@ def test_capture_seeds_peak_and_price_from_cost_for_tdx_row():
     assert Decimal(str(row.current_price)) == Decimal("10.221")
 
 
+# ---- 逐只市值口径：现价 × 数量（不是 数量 × 成本价）----
+
+def test_snapshot_position_market_value_uses_price_not_cost():
+    """逐只市值 = 现价 × 数量；逐只合计与顶层 market_value 同口径。
+
+    2026-11-18 实证：通达信持仓明细无市值列（market_value=0）→ 旧实现回落
+    cost×volume，账户快照逐只市值恒等于数量×成本价，与顶层现价合计差 ~1.4 万。
+    """
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single()
+    # 最近已知价（行情轮询/前收种子同源）与柜台成本不同
+    port._price_snapshot["002745.SZ"] = Decimal("9.67")
+    port._price_snapshot["600888.SH"] = Decimal("7.5")
+    disp = _AcctDispatcher(
+        positions=[
+            {"symbol": "002745.SZ", "volume": 5300, "available": 5300,
+             "cost": 10.221, "market_value": 0},
+            {"symbol": "600888.SH", "volume": 900, "available": 900,
+             "cost": 10.99, "market_value": 0},
+        ],
+        # 顶层市值 = 现价合计（柜台资产口径）：9.67×5300 + 7.5×900
+        asset={"total_asset": "158001", "available": "100000",
+               "market_value": "58001"},
+    )
+    engine = _mk_engine(disp, factory, port, engine_key="tdx",
+                        account_snapshot_interval=5.0)
+    engine._tick_deals()
+
+    db = factory()
+    snap = (db.query(LiveAccountSnapshot)
+            .order_by(LiveAccountSnapshot.id.desc()).first())
+    rows = {p.stock_code: p for p in snap.positions}
+    db.close()
+    assert Decimal(str(rows["002745.SZ"].market_value)) == Decimal("51251.00")
+    assert Decimal(str(rows["600888.SH"].market_value)) == Decimal("6750.00")
+    # 旧实现（数量×成本价）合计为 64062.30 —— 必须与顶层现价合计一致
+    per_sum = sum(Decimal(str(p.market_value)) for p in rows.values())
+    assert per_sum == Decimal(str(snap.market_value)) == Decimal("58001")
+
+
+def test_out_of_pool_market_value_uses_price_not_cost():
+    """equity_check 真实侧剔除的池外市值同样走现价（成本只兜底）。"""
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single()
+    port._price_snapshot["002745.SZ"] = Decimal("9.0")
+    engine = _mk_engine(_AcctDispatcher(), factory, port, engine_key="tdx")
+    engine._pool_codes_by_portfolio = {1: {"600000.SH"}}
+    rows = [{"symbol": "002745.SZ", "volume": 1000, "available": 1000,
+             "cost": 10.0, "market_value": 0}]
+    assert engine._out_of_pool_market_value(rows) == Decimal("9000.00")
+
+
+def test_mirror_added_shares_deducted_at_market_value_not_cost():
+    """柜台真实量 > 虚拟量（外部手工增仓）：新增部分按现价扣虚拟现金。
+
+    旧实现市值恒等于数量×成本，新增 300 股会按成本扣现金、却按现价估值 →
+    建仓瞬间凭空产生 (现价−成本)×300 的假盈亏。
+    """
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single()
+    port._price_snapshot["002745.SZ"] = Decimal("9.67")
+    pos = Position("002745.SZ")
+    pos.buy(5000, Decimal("10.221"), datetime(2026, 11, 5, 10, 0))
+    port.strategies[0].positions["002745.SZ"] = pos
+    engine = _mk_engine(_AcctDispatcher(), factory, port, engine_key="tdx")
+    rows = [{"symbol": "002745.SZ", "volume": 5300, "available": 5300,
+             "cost": 10.221, "market_value": 0}]
+
+    with factory() as db:
+        engine._mirror_bridge_positions(db, rows, now_shanghai())
+
+    # 新增 300 股 × 现价 9.67 = 2901（旧口径会是 300×10.221 = 3066.3）
+    assert port.account.cash == Decimal("100000") - Decimal("2901")
+
+
 # ---- 实盘成交量约束（对齐回测 #2 volume_cap）----
 
 def _fetcher(snaps):
@@ -822,7 +1219,10 @@ def test_intraday_reconcile_emits_risk_event_on_diff():
     factory, _ = _db_factory()
     port, _ = _portfolio_single()
     # 桥已无该代码的行，虚拟账本仍挂 500 → 对账报告差异 500
-    disp = _AcctDispatcher(positions=[])
+    # 账户本身可读（现金/总资产非 0），否则会被「资产不可信 → 跳过本轮」拦掉
+    disp = _AcctDispatcher(positions=[],
+                           asset={"total_asset": 100000.0, "available": 50000.0,
+                                  "market_value": 0.0})
     engine = _mk_engine(disp, factory, port, engine_key="tdx",
                         account_snapshot_interval=5.0)
     engine._last_intraday_reconcile = 0.0
@@ -897,7 +1297,7 @@ def _mk_engine_full(disp, factory, port, **kw):
 
 
 def test_defer_persists_row_and_recover_restores_queue():
-    """B-1 defer 落库（status=deferred）；新引擎 recover 重建队列并删除行。"""
+    """B-1 defer 落库（status=deferred）；recover 重建队列并**保留**行（行 id 挂单）。"""
     from core.engine.event import OrderEvent
     from tq_iquant_shared.constants import SignalType
     factory, _ = _db_factory()
@@ -921,12 +1321,13 @@ def test_defer_persists_row_and_recover_restores_queue():
         rows = db.query(LiveOrder).filter_by(status="deferred").all()
         assert len(rows) == 1 and rows[0].stock_code == "600888.SH"
         assert rows[0].quantity == 900 and rows[0].signal_name == "stop_loss"
+        deferred_id = rows[0].id
     finally:
         db.close()
     # 队列在内存
     assert len(engine._signal_bar_deferred) == 1
 
-    # 重启：新引擎 recover → 队列重建 + deferred 行删除
+    # 重启：新引擎 recover → 队列重建；行保留（不再转移删除），行 id 挂单
     port2, _ = _portfolio_single()
     engine2 = _mk_engine_full(disp, factory, port2)
     db2 = factory()
@@ -936,9 +1337,21 @@ def test_defer_persists_row_and_recover_restores_queue():
     ro = engine2._signal_bar_deferred[0]
     assert ro.stock_code == "600888.SH" and ro.quantity == 900
     assert ro.signal_bar_date == bt.date()
+    assert getattr(ro, "_deferred_row_id", None) == deferred_id
     db2 = factory()
-    assert db2.query(LiveOrder).filter_by(status="deferred").count() == 0
+    rows = db2.query(LiveOrder).filter_by(status="deferred").all()
+    assert len(rows) == 1 and rows[0].id == deferred_id   # DB 足迹保留
     db2.close()
+
+    # 放行：内存单带行 id，bar_time 更新为放行 bar（提交后删旧行建 submitted 的
+    # 完整路径由 test_handle_bar_deferred_daily_signal_released_next_day 覆盖）
+    bar = SimpleNamespace(
+        bar_time=datetime.combine(bt.date() + timedelta(days=1), time(9, 31)),
+    )
+    released = engine2._release_signal_bar_deferred(engine2.ctx.portfolios[0], bar)
+    assert len(released) == 1
+    assert released[0]._deferred_row_id == deferred_id
+    assert released[0].bar_time == bar.bar_time
 
 
 def test_recover_daily_idempotent_marker_restored():
@@ -996,7 +1409,10 @@ def test_capture_refreshes_reconcile_after_import_to_empty():
     disp = _AcctDispatcher(positions=_real_positions())
     engine = _mk_engine(disp, factory, port, engine_key="tdx",
                         account_snapshot_interval=5.0,
-                        pool_codes_by_portfolio={1: {"600000.SH"}})
+                        # 2026-11-10：池外仓不再兜底归属，这里把两只都放进池内，
+                        # 保持本用例「导入后同轮重算归零」的前提成立
+                        pool_codes_by_portfolio={1: {"600000.SH", "002745.SZ",
+                                                     "600888.SH"}})
     engine._reconcile_mismatches = list(_STALE)
 
     engine._tick_deals()
@@ -1010,7 +1426,9 @@ def test_capture_refresh_records_mismatch_with_computed_at():
     """重算确有差异时写回新差异，并带 computed_at（前端显示「算于何时」）。"""
     factory, _ = _db_factory()
     port, _ = _portfolio_single()
-    disp = _AcctDispatcher(positions=[])
+    disp = _AcctDispatcher(positions=[],
+                           asset={"total_asset": 100000.0, "available": 50000.0,
+                                  "market_value": 0.0})
     engine = _mk_engine(disp, factory, port, engine_key="tdx",
                         account_snapshot_interval=5.0)
     # 虚拟有仓、真实无仓（柜台已卖出但账本未回填）→ 真差异
@@ -1358,5 +1776,256 @@ def test_recover_imports_bridge_shape_positions():
     assert ctx.positions["002745.SZ"].quantity == 5300
     assert ctx.positions["600888.SH"].quantity == 900
     assert engine.reconcile_mismatches == []
+
+
+# ---- ③ 外部现金流台账：虚拟现金随台账变化、净值/回撤剔除净流入 ----
+
+def test_apply_cash_flow_adds_cash_but_keeps_risk_equity():
+    """入金加虚拟现金（购买力），但风险口径净值不变（入金不是业绩）。"""
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single()
+    engine = _mk_engine(_AcctDispatcher(), factory, port)
+
+    before = port.risk_equity()
+    assert before == Decimal("100000")
+    assert engine.apply_cash_flow(1, Decimal("10000")) is True
+    assert port.account.cash == Decimal("110000")
+    assert port.external_net_inflow == Decimal("10000")
+    assert port.risk_equity() == before      # 净流入同增 → 风险净值不变
+    # 出金同理：现金减少、净流入减少，风险净值仍不变
+    assert engine.apply_cash_flow(1, Decimal("-25000")) is True
+    assert port.account.cash == Decimal("85000")
+    assert port.external_net_inflow == Decimal("-15000")
+    assert port.risk_equity() == before
+    # 不存在的组合 → 未应用（DB 台账仍会在下次 recover 重放）
+    assert engine.apply_cash_flow(999, Decimal("1")) is False
+
+
+def test_daily_loss_ignores_external_withdrawal():
+    """出金不得被当成当日亏损：日终按「现金+市值−净流入」判 daily_loss。"""
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single()
+    engine = _mk_engine(_AcctDispatcher(), factory, port)
+    rm = port.risk_manager
+    rm.prev_close_value = Decimal("100000")
+    rm.peak_value = Decimal("100000")
+
+    engine.apply_cash_flow(1, Decimal("-20000"))
+    assert port.risk_equity() == Decimal("100000")   # 剔除出金后无当日盈亏
+
+    engine._breaker.on_daily_update(port, now_shanghai().date())
+    assert rm.daily_pause_active is False
+
+
+def test_record_cash_flow_persists_and_applies_to_running_engine():
+    """登记流水：落台账 + 运行中引擎立即记账；入金/出金符号由类型决定。"""
+    from core.models import LiveSession, LiveSessionPortfolio
+    from core.services import live_service
+
+    factory, _ = _db_factory()
+    db = factory()
+    db.add(LiveSession(id=1, name="cf", mode="live", engine="tdx",
+                       status="running", execution_mode="auto"))
+    db.add(LiveSessionPortfolio(session_id=1, portfolio_strategy_id=1,
+                                circuit_breaker_count=0))
+    db.commit()
+    port, _ = _portfolio_single()
+    engine = _mk_engine(_AcctDispatcher(), factory, port)
+
+    row, error = live_service.record_cash_flow(
+        db, 1, 1, "deposit", "5000", note="追加资金", engine=engine)
+    assert error is None and row["engine_applied"] is True
+    assert row["amount"] == "5000.00"
+    assert port.account.cash == Decimal("105000.00")
+    assert port.external_net_inflow == Decimal("5000.00")
+
+    # 出金：调用方给正数，符号由类型决定
+    row2, error = live_service.record_cash_flow(
+        db, 1, 1, "withdraw", 2000, engine=engine)
+    assert error is None and row2["amount"] == "-2000.00"
+    assert port.account.cash == Decimal("103000.00")
+    assert port.external_net_inflow == Decimal("3000.00")
+
+    # 非法类型 / 0 金额 / 未关联组合 → 400 语义，不落库
+    assert live_service.record_cash_flow(db, 1, 1, "bonus", "1")[1] is not None
+    assert live_service.record_cash_flow(db, 1, 1, "deposit", "0")[1] is not None
+    assert live_service.record_cash_flow(db, 1, 99, "deposit", "1")[1] is not None
+
+    listed = live_service.list_cash_flows(db, 1)
+    assert [f["flow_type"] for f in listed["flows"]] == ["withdraw", "deposit"]
+    assert listed["total_net_inflow"] == "3000.00"
+    assert live_service.list_cash_flows(db, 999) is None
+    db.close()
+
+
+def test_recover_replays_cash_flows():
+    """重启重放：初始资金 + 成交流水 + 台账净流入，净流入进风险口径。"""
+    from core.models import LiveCashFlow
+
+    factory, _ = _db_factory()
+    db = factory()
+    db.add(LiveCashFlow(
+        live_session_id=1, portfolio_strategy_id=1, flow_type="deposit",
+        amount=Decimal("5000"), flow_date=now_shanghai().date()))
+    db.commit()
+    port, _ = _portfolio_single()
+    engine = _mk_engine(_AcctDispatcher(), factory, port)
+
+    engine.recover(db)
+    db.close()
+
+    assert port.account.cash == Decimal("105000.00")
+    assert port.external_net_inflow == Decimal("5000.00")
+    assert port.risk_equity() == Decimal("100000")
+
+
+def test_cash_diff_alerts_once_per_window_without_touching_cash():
+    """柜台现金 vs 虚拟现金偏差只告警不改账，10 分钟节流。"""
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single()
+    engine = _mk_engine(_AcctDispatcher(), factory, port)
+    events = []
+    engine._emit = lambda ev, data: events.append((ev, data))
+
+    engine._note_cash_diff(Decimal("150000"))   # 虚拟 10 万，实时 15 万 → 偏差
+    engine._note_cash_diff(Decimal("150000"))   # 节流窗口内 → 不重复
+    hits = [d for ev, d in events
+            if ev == "risk" and d.get("rule") == "cash_diff"]
+    assert len(hits) == 1
+    assert hits[0]["action"] == "notice"
+    assert hits[0]["diff"] == "50000"
+    assert port.account.cash == Decimal("100000")   # 绝不改账
+    assert port.external_net_inflow == Decimal("0")
+
+    # 窗口内大幅偏差亦不重复（节流），窗口外恢复告警
+    engine._last_cash_diff_at = 0.0
+    engine._note_cash_diff(Decimal("150000"))
+    assert len([d for ev, d in events
+                if ev == "risk" and d.get("rule") == "cash_diff"]) == 2
+    # 小偏差（< max(1000, 1%)）不告警
+    engine._last_cash_diff_at = 0.0
+    engine._note_cash_diff(Decimal("100500"))
+    assert len([d for ev, d in events
+                if ev == "risk" and d.get("rule") == "cash_diff"]) == 2
+
+
+# ---- ⑥ 真实账户总资产 vs 虚拟净值：>20% 每会话告警一次，池外仓剔除后比对 ----
+
+def test_equity_deviation_warns_once_and_only_when_over_threshold():
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single()
+    engine = _mk_engine(_AcctDispatcher(), factory, port)
+    events = []
+    engine._emit = lambda ev, data: events.append((ev, data))
+
+    # 虚拟净值 10 万；真实 10.5 万 → 5% 偏差，不告警但结果可展示
+    engine._note_equity_deviation(Decimal("105000"), [])
+    assert engine._latest_equity_check["virtual_total"] == "100000"
+    assert engine._latest_equity_check["deviation_pct"] is not None
+    assert events == []
+
+    # 真实 13 万 → 30% 偏差，告警一次；再采集不重复告警
+    engine._note_equity_deviation(Decimal("130000"), [])
+    engine._note_equity_deviation(Decimal("130000"), [])
+    hits = [d for ev, d in events
+            if ev == "risk" and d.get("rule") == "equity_deviation"]
+    assert len(hits) == 1
+    assert hits[0]["action"] == "notice"
+    assert hits[0]["virtual_total"] == "100000"
+    assert hits[0]["real_total"] == "130000"
+    # 文案自证口径：虚拟净值按配置资金起账，与柜台总资产不直接可比
+    assert "按组合配置资金起账" in hits[0]["message"]
+    assert "不直接可比" in hits[0]["message"]
+    assert "不要用现金流台账抹平" in hits[0]["message"]
+    # 只告警不改账
+    assert port.account.cash == Decimal("100000")
+
+
+def test_equity_deviation_excludes_out_of_pool_positions():
+    """池外仓按设计不进虚拟账本（②），比对真实侧须剔除，否则恒告警。"""
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single()
+    engine = _mk_engine(_AcctDispatcher(), factory, port)
+    engine._pool_codes_by_portfolio = {1: {"600000.SH"}}
+    events = []
+    engine._emit = lambda ev, data: events.append((ev, data))
+    positions = [
+        {"symbol": "999999.SH", "volume": 2000, "cost": 5.0,
+         "market_value": 10000.0},   # 池外：1 万
+    ]
+    # 真实 11 万，剔除池外 1 万 → 与虚拟 10 万一致，不告警
+    engine._note_equity_deviation(Decimal("110000"), positions)
+    check = engine._latest_equity_check
+    assert Decimal(check["out_of_pool_value"]) == Decimal("10000")
+    assert Decimal(check["expected_total"]) == Decimal("100000")
+    assert events == []
+
+
+# ---- ⑦ 重启 = 只重读账本：起账锚点（seam）不受当日总资产/当日现价影响 ----
+
+def test_recover_uses_seam_anchor_and_ignores_daily_price_drift():
+    """P0（2026-11-18）：同一会话多次重启，虚拟现金必须逐分不变。
+
+    实证缺陷：柜台可用恒 10,414.71、持仓不动，虚拟现金却 7,464.19 → 7,134.19
+    → 8,183.19 → 6,942.19。根因是每次 build_engine 都用「当前快照总资产」重新
+    截断起账基准、recover 又用「当前快照现价」重扣一遍继承仓。正确口径：
+    seam_cash（首次起账落库）+ 水位之后的成交/流水重放，存量仓从锚点恢复，
+    当日现价不参与任何现金扣减。
+    """
+    factory, _ = _db_factory()
+    stock, inherited = "600000.SH", "002745.SZ"
+
+    db = factory()
+    lo = LiveOrder(
+        live_session_id=1, portfolio_strategy_id=1, strategy_id=1, stock_code=stock,
+        trade_type="buy", order_type="limit", price=Decimal("10"), quantity=100,
+        filled_quantity=100, filled_price=Decimal("10"), status="accepted",
+        signal_name="open_sig", signal_type="OPEN",
+        bar_time=datetime(2026, 11, 18, 10, 0),
+    )
+    db.add(lo)
+    db.flush()
+    db.add(LiveTrade(
+        live_session_id=1, live_order_id=lo.id, portfolio_strategy_id=1, strategy_id=1,
+        stock_code=stock, trade_type="buy", price=Decimal("10"), quantity=100,
+        amount=Decimal("1000"), commission=Decimal("0"), stamp_duty=Decimal("0"),
+        trade_time=datetime(2026, 11, 18, 10, 0),
+    ))
+    db.add(LiveSessionPortfolio(
+        session_id=1, portfolio_strategy_id=1,
+        seam_date=date(2026, 11, 17), seam_cash=Decimal("5000"),
+        seam_trade_cursor=0,
+        seam_positions_json=json.dumps([{
+            "strategy_id": 1, "stock_code": inherited, "quantity": 300,
+            "avg_cost": 10.0, "buy_date": "2026-11-15", "highest_price": 10.0,
+        }]),
+    ))
+    db.commit()
+    db.close()
+
+    # 同样的账本、两次重启之间只有持仓市价不同 → 虚拟现金必须一致
+    for px in (Decimal("8"), Decimal("20")):
+        port, ctx = _portfolio_single()
+        disp = _AcctDispatcher(
+            positions=[{"symbol": inherited, "volume": 300, "available": 300,
+                        "cost": 10.0, "market_value": float(px * 300)}],
+            asset={"total_asset": 5000 + float(px * 300),
+                   "available": 5000.0, "market_value": float(px * 300)},
+        )
+        engine = _mk_engine(disp, factory, port, engine_key="tdx")
+        db = factory()
+        try:
+            engine.recover(db)
+        finally:
+            db.close()
+
+        # 5000 起账锚点 − 水位后 1 笔买入 1000；继承仓不得按当日现价再扣一次
+        assert port.account.cash == Decimal("4000"), f"px={px}"
+        assert ctx.positions[inherited].quantity == 300
+        assert ctx.positions[inherited].avg_cost == Decimal("10")
+        assert ctx.positions[stock].quantity == 100
+
+
+
 
 

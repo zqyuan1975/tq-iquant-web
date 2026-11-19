@@ -13,7 +13,7 @@ function onSize(e: Event) { emit('update:pageSize', Number((e.target as HTMLSele
 
 <template>
   <div class="table-pager pagination">
-    <select :value="pageSize" @change="onSize">
+    <select class="field-select" :value="pageSize" @change="onSize">
       <option v-for="s in SIZE_OPTIONS" :key="s" :value="s">{{ s === 0 ? '全部' : s + ' 条/页' }}</option>
     </select>
     <button class="tp-prev page-btn" :disabled="page <= 1" @click="emit('update:page', page - 1)">上一页</button>
@@ -24,5 +24,5 @@ function onSize(e: Event) { emit('update:pageSize', Number((e.target as HTMLSele
 
 <style scoped>
 .table-pager { display: flex; align-items: center; gap: 8px; justify-content: center; margin-top: 10px; font-size: 12px; }
-.table-pager select { padding: 3px 6px; border: 1px solid var(--line); border-radius: 6px; background: var(--card-bg); color: var(--ink); }
+.table-pager select { height: 24px; padding: 0 22px 0 8px; border: 1px solid var(--line); border-radius: 6px; background-color: var(--card-bg); color: var(--ink); font-size: 12px; }
 </style>

@@ -106,6 +106,24 @@ def test_portfolio_price_limit_check_defaults_on(db):
     assert port.price_limit_check_enabled is True
 
 
+def test_cost_params_include_transfer_fee_rate(db):
+    """回测成本含费：组合过户费率必须透传给 SimulatedDispatcher（缺键会恒用默认）。"""
+    ps, strategies = _build(db, ["000001.SZ", "600000.SH"], ["000001.SZ"])
+    db.refresh(ps)
+    assert ps.transfer_fee_rate == Decimal("0.000010")
+    port = assemble_portfolio(ps, strategies, db)
+    assert port.cost_params["transfer_fee_rate"] == Decimal("0.000010")
+
+
+def test_cost_params_transfer_fee_rate_explicit_zero(db):
+    """显式置 0（复现旧回测结果）必须透传 0，不被默认值覆盖。"""
+    ps, strategies = _build(db, ["000001.SZ", "600000.SH"], ["000001.SZ"])
+    ps.transfer_fee_rate = Decimal("0")
+    db.commit()
+    port = assemble_portfolio(ps, strategies, db)
+    assert port.cost_params["transfer_fee_rate"] == Decimal("0")
+
+
 def test_assemble_max_holdings_and_trading_session_wiring(db):
     """Fix2/Fix3：组合表 max_holdings / trading_session 装配进 Portfolio
     （历史死配置首次接线，回测/实盘共用生效）。"""

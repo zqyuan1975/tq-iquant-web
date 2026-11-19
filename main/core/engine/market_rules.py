@@ -6,23 +6,119 @@ TdxTqDispatcher 的下单前置校验共用同一函数，避免两处口径漂�
 组合交易时段（trading_session）闸同属两端口径：回测按 bar 时间、实盘按
 墙钟判定，允许窗口在此统一定义（market_rules 与涨跌停幅度同级的共享规则）。
 """
-from datetime import time as dtime
+from datetime import date, time as dtime, timedelta
 from decimal import Decimal
 from typing import Optional
+import logging
+import threading
+
+from .price_limit import (
+    BOARD_BOND,
+    BOARD_LIMIT_RATIOS,
+    LimitRule,
+    resolve_limit_rule,
+)
+
+logger = logging.getLogger(__name__)
+
+#: resolve_limit_rule 给出「无可靠幅度」（ETF/转债/未知/新股窗口）时的回测兜底幅度。
+#: 回测没有柜台兜底，必须有一个有限幅度才能判定涨跌停；保持旧口径 10%（宁宽勿错），
+#: 不引入「跳过校验」的行为反转。
+_FALLBACK_LIMIT_RATIO = Decimal("0.10")
+
+# 证券名称缺失（无法识别 ST）时按板块默认幅度推断的告警去重集合：同一 code
+# 每进程只告警一次，避免回测逐 bar / 实盘逐单刷屏。判定结果不变（fail-open
+# 方向：主板 ST 推成 10% 偏宽，仍由柜台 5% 兜底），只补可观测性。
+_name_unknown_warned: set = set()
+_name_unknown_lock = threading.Lock()
+
+
+def _warn_name_unknown(stock_code: str) -> None:
+    if stock_code in _name_unknown_warned:
+        return
+    with _name_unknown_lock:
+        if stock_code in _name_unknown_warned:
+            return
+        _name_unknown_warned.add(stock_code)
+    logger.warning(
+        "涨跌停幅度按板块默认推断：%s 证券名称缺失，无法识别 ST（主板 ST 实为 5%%），"
+        "该幅度为 fail-open 估计，超限委托仍由柜台拒绝", stock_code,
+    )
+
+
+def limit_rule_for(
+    stock_code: str,
+    *,
+    name: Optional[str] = None,
+    listed_bars: Optional[int] = None,
+    earliest_bar_date: Optional[date] = None,
+    today: Optional[date] = None,
+) -> LimitRule:
+    """回测/桥兜底用的「有限幅度」涨跌停规则：**复用实盘同一份 resolve_limit_rule**。
+
+    实盘 tdx/ths 通道用 ``resolve_limit_rule`` 推导（ETF/转债/新股窗口 fail-open）；
+    回测没有柜台兜底，``ratio=None`` 时回落到板块常规幅度（``BOARD_LIMIT_RATIOS``，
+    无档位板块回落 10%），保证「同一只票、同一份规则」——ST 5%、创业板/科创板 20%、
+    北交所 30% 与实盘逐值一致。``source`` 追加 ``_board_fallback`` 便于区分「确定档位」
+    与「兜底档位」。
+
+    回测无可靠上市日期数据，``listed_bars``/``earliest_bar_date`` 默认不传 →
+    新股窗口不生效（按板块兜底，偏保守，不会误放行）。
+    """
+    rule = resolve_limit_rule(
+        stock_code, name=name, listed_bars=listed_bars,
+        earliest_bar_date=earliest_bar_date, today=today,
+    )
+    # 名称缺失 → 无法识别 ST，resolve 走 board_default_name_unknown（偏宽）。
+    # 判定结果不变，只补一条每 code 每进程一次的可观测性告警（修复 7）。
+    if name is None and "name_unknown" in rule.source:
+        _warn_name_unknown(stock_code)
+    if rule.ratio is not None:
+        return rule
+    # 可转债（2026-11-16 B2）：沪深可转债自 2022-08-01 起统一 ±20%（旧口径回落
+    # 10% → 涨停买入/跌停卖出被误判为「未越板」而成交，等于在板上追价成交）。
+    # 代码前缀判档（price_limit.board_for 的 _BOND_PREFIXES）是确定信息，不依赖
+    # 历史数据。已知限制（不硬做，报告中标注）：
+    #   1) 转债**上市首日**的 -43.3%/+57.3% 特例未建模（按 20% 推偏窄，首日大幅
+    #      单会被延后而非误成交，fail-safe 方向）；2) 名称含 ST 的历史时点无法回溯
+    #      ——回测用「当前名称」判 ST，历史某段若为 ST 而当前不是，会按板块默认
+    #      幅度（主板 10%）推宽，属已知偏差。
+    if rule.board == BOARD_BOND:
+        return LimitRule(
+            ratio=Decimal("0.20"), unlimited=False, board=rule.board,
+            source="%s_bond_default_20pct" % rule.source, confidence="low")
+    ratio = BOARD_LIMIT_RATIOS.get(rule.board, _FALLBACK_LIMIT_RATIO)
+    return LimitRule(
+        ratio=ratio,
+        unlimited=False,
+        board=rule.board,
+        source="%s_board_fallback" % rule.source,
+        confidence="low",
+    )
+
+
+def limit_ratio_for(
+    stock_code: str,
+    *,
+    name: Optional[str] = None,
+    listed_bars: Optional[int] = None,
+    earliest_bar_date: Optional[date] = None,
+    today: Optional[date] = None,
+) -> Decimal:
+    """涨跌停幅度（Decimal）：``limit_rule_for`` 的比例部分。"""
+    return limit_rule_for(
+        stock_code, name=name, listed_bars=listed_bars,
+        earliest_bar_date=earliest_bar_date, today=today,
+    ).ratio
 
 
 def _limit_ratio_for(stock_code: str) -> Decimal:
-    """A 股涨跌停幅度：创业板(300/301)/科创板(688) 20%，北交所(4/8/92 前缀) 30%，其余 10%。
+    """兼容旧入口（无名称/上市信息）：等价于板块常规幅度。
 
-    ST 5% 不特判（v1 偏宽松可接受：对 ST 股拦截区间偏宽，少拦不错拦）。
+    保留此函数是为了不破坏既有 import（回测 re-export、HTTP 桥兜底），
+    新代码请用 ``limit_ratio_for``/``limit_rule_for`` 以便传入名称识别 ST。
     """
-    prefix = stock_code.split(".")[0]
-    if prefix.startswith(("300", "301", "688")):
-        return Decimal("0.20")
-    # 北交所：4xxxxx / 8xxxxx / 92xxxx（新股段），均 30%
-    if prefix[:1] in ("4", "8") or prefix.startswith("92"):
-        return Decimal("0.30")
-    return Decimal("0.10")
+    return limit_ratio_for(stock_code)
 
 
 def tick_size(stock_code: str) -> Decimal:
@@ -89,3 +185,28 @@ def lot_size_for_board(stock_code: str) -> int:
         if code.startswith(prefix) and code.endswith(suffix):
             return lot
     return 100
+
+
+def trading_days_between(start: Optional[date], end: Optional[date]) -> int:
+    """交易日天数差（区间 ``(start, end]``），用内置休市表而非自然日。
+
+    风控冷静期（``portfolio_strategies.risk_cooldown_days``）按交易日推进，
+    跨周末/节假日必须正确：周末硬规则 + ``BUILTIN_CLOSURES``（上交所官方休市
+    表，与 ``TradingCalendar`` 同一份数据；此处只复用数据表，不引入 live 运行时依赖）。
+    表未收录的年份按「仅周末」计（与 TradingCalendar 的 fail-open 同口径）。
+
+    ``start``/``end`` 任一缺失或 ``end <= start`` → 0（当日卖出当日 = 0 个已过
+    交易日，冷静期 N=1 时正好拦当日、次日放行）。
+    """
+    if start is None or end is None or end <= start:
+        return 0
+    # 惰性导入：BUILTIN_CLOSURES 是纯数据表，不触发 live 模块的运行时依赖。
+    from .live.calendar import BUILTIN_CLOSURES
+    n = 0
+    day = start + timedelta(days=1)
+    while day <= end:
+        if day.weekday() < 5 and day not in BUILTIN_CLOSURES.get(day.year, frozenset()):
+            n += 1
+        day += timedelta(days=1)
+    return n
+

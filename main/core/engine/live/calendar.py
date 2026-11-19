@@ -16,7 +16,13 @@
 - provider 只返回"截至今天"的部分年份数据时，超出其覆盖范围（未来日期）不按
   "不在集合=休市"判定，退回内置休市表/工作日放行——防止日历截断把未来交易日
   误判为休市。
-- ``is_trading_allowed(now)`` = 交易日 且 09:30 ≤ 时刻 < 15:00，作为下单总闸。
+- **半日市（P2-10）**：仅上午 09:30–11:30 交易、下午休市。来源优先级
+  ``half_day_provider``（可注入，按年拉取）→ 内置 ``BUILTIN_HALF_DAYS`` → 无数据时
+  fail-open（按全天交易处理）+ WARNING/risk 事件，每年最多一次。半日市当天
+  ``is_trading_allowed`` 在 11:30（含）之后判不可交易，09:15–09:20 盘前集合竞价窗口
+  不受影响（该窗口不依赖本开关的时段判定）。
+- ``is_trading_allowed(now)`` = 交易日 且 09:30 ≤ 时刻 < 收盘（常态 15:00 / 半日市
+  11:30），作为下单总闸。
 
 注意：这里只负责"是否允许下单"。引擎生命周期（start/stop）、14:30 估值、15:05 收盘
 清扫各有自己的调度判定，不被本开关替代。
@@ -39,6 +45,12 @@ logger = logging.getLogger("core.engine.live.calendar")
 # A 股连续竞价时段（下单总闸用，与 live_engine 的收盘守卫一致）
 _MARKET_OPEN = time(9, 30)
 _MARKET_CLOSE = time(15, 0)
+# 半日市收盘（P2-10）：仅上午交易，11:30 起全天收市（左闭右开，11:30 边界即不可报）
+_HALF_DAY_CLOSE = time(11, 30)
+# 午休（P2-5）：11:30–13:00 交易所不受理委托。旧实现只判 09:30–15:00，
+# 11:30 边界 bar 触发的单会报进午休（TDX 排队到 13:00、QMT 可能直接拒单）。
+_LUNCH_START = time(11, 30)
+_LUNCH_END = time(13, 0)
 
 _SHANGHAI_TZ = timezone(timedelta(hours=8))
 
@@ -70,6 +82,50 @@ BUILTIN_CLOSURES: Dict[int, frozenset] = {
         date(2026, 10, 1), date(2026, 10, 2), date(2026, 10, 5),
         date(2026, 10, 6), date(2026, 10, 7),                     # 国庆
     }),
+    # 2027 年（数据来源：《国务院办公厅关于2027年部分节假日安排的通知》
+    #   国办发明电〔2026〕10号，2026-11-05 发布，
+    #   https://www.gov.cn/zhengce/content/202611/content_7085101.htm ；本表
+    #   2026-11-11 录入）。仅收**工作日**休市；周末由硬规则覆盖。原文对照：
+    #     元旦   1/1(五)–1/3(日)              → 工作日休市 1/1
+    #     春节   2/5(五)–2/13(六)；1/31(日)、2/14(日) 上班
+    #                                        → 工作日休市 2/5、2/8–2/12
+    #     清明   4/3(六)–4/5(一)              → 工作日休市 4/5
+    #     劳动节 5/1(六)–5/5(三)；5/8(六) 上班 → 工作日休市 5/3、5/4、5/5
+    #     端午   6/9(三)                      → 工作日休市 6/9
+    #     中秋   9/15(三)                     → 工作日休市 9/15
+    #     国庆   10/1(五)–10/7(四)；9/26(日)、10/9(六) 上班
+    #                                        → 工作日休市 10/1、10/4–10/7
+    #   **调休上班日全部落在周六/周日**（1/31、2/14、5/8、9/26、10/9），按交易所
+    #   「周末休市」规则仍非交易日，故 2027 年不存在"周末调休成交易日"的日期。
+    #   台账：上交所 2027 年休市安排公告截至 2026-11-11 尚未发布，本表按国办通知 +
+    #   「周末休市」推导，公告发布后应逐日复核（不一致以交易所公告为准）。
+    2027: frozenset({
+        date(2027, 1, 1),                                         # 元旦
+        date(2027, 2, 5), date(2027, 2, 8), date(2027, 2, 9),
+        date(2027, 2, 10), date(2027, 2, 11), date(2027, 2, 12),   # 春节
+        date(2027, 4, 5),                                         # 清明
+        date(2027, 5, 3), date(2027, 5, 4), date(2027, 5, 5),     # 劳动节
+        date(2027, 6, 9),                                         # 端午
+        date(2027, 9, 15),                                        # 中秋
+        date(2027, 10, 1), date(2027, 10, 4), date(2027, 10, 5),
+        date(2027, 10, 6), date(2027, 10, 7),                     # 国庆
+    }),
+}
+
+# 内置半日市表（P2-10）：仅列**工作日**半天交易（09:30–11:30，下午休市）。
+#
+# 现状（2026-11-11 核对）：A 股现行休市安排中**已无半日市**——国办发明电〔2026〕10号
+# 覆盖的 2027 年七个节假日全部为整日休市（春节前最后一个交易日 2027-02-04 周四为
+# 全天交易），元旦前、春节前均无半天交易日。历史上（2007 年以前）曾有元旦/春节前
+# 半日市，现已取消。
+#
+# 因此本表对已核对年份录入**空集合**（语义 = "该年已知没有半日市"，不告警），
+# 机制保留以便：①交易所将来恢复半日市时按年追加；②``TradingCalendar(half_day_provider=)``
+# 由通道/配置注入半日市日期（优先于本表）。未收录年份一律 fail-open（按全天交易，
+# 绝不因半日市数据缺失而 fail-closed 拒绝交易），并告警一次/年。
+BUILTIN_HALF_DAYS: Dict[int, frozenset] = {
+    2026: frozenset(),
+    2027: frozenset(),
 }
 
 
@@ -130,6 +186,7 @@ class TradingCalendar:
         fallback_providers: Optional[List[Tuple[str, CalendarProvider]]] = None,
         retry_after_seconds: float = 900.0,
         clock: Optional[Callable[[], float]] = None,
+        half_day_provider: Optional[CalendarProvider] = None,
     ):
         # (label, fn, takes_year)
         self._sources: List[Tuple[str, CalendarProvider, bool]] = [
@@ -145,6 +202,15 @@ class TradingCalendar:
         self._degraded: Dict[int, str] = {}
         self._retry_at: Dict[int, float] = {}
         self._warned_year: Set[int] = set()
+        # 半日市（P2-10）：year -> 半日市日期集合（空集合=已确认无半日市）。
+        # 只有"确认来源"才进 _half_by_year；无数据时宁可不缓存（退避后重试）并 fail-open。
+        self._half_provider = half_day_provider
+        self._half_provider_takes_year = (
+            _accepts_year(half_day_provider) if half_day_provider is not None else False
+        )
+        self._half_by_year: Dict[int, Set[date]] = {}
+        self._half_retry_at: Dict[int, float] = {}
+        self._half_warned_year: Set[int] = set()
         # 退化告警事件回调（LiveEngine 接线后 → risk 事件；每自然年最多触发一次）
         self.on_degraded: Optional[Callable[[dict], None]] = None
 
@@ -254,6 +320,92 @@ class TradingCalendar:
                 return None
         return None
 
+    # ---------------- 半日市（P2-10）----------------
+
+    def _load_half_days(self, year: int) -> Optional[Set[date]]:
+        """某自然年的半日市日期集合；None = 无确认来源（fail-open：按全天交易）。
+
+        来源优先级：``half_day_provider``（按年拉取，可跨通道注入）→ 内置
+        ``BUILTIN_HALF_DAYS``（存在即权威，空集合 = 该年确认无半日市）→ fail-open
+        + WARNING/risk 事件（每年一次）。provider 失败不缓存，``retry_after_seconds``
+        后重试（与交易日历同一退避语义，避免慢桥拖主循环）。
+        """
+        if year in self._half_by_year:
+            return self._half_by_year[year]
+        now = self._clock()
+        if year in self._half_retry_at and now < self._half_retry_at[year]:
+            return None  # 退避窗内，不重复打源
+
+        reasons: List[str] = []
+        provider = self._half_provider
+        if provider is not None:
+            try:
+                raw = list((provider(year) if self._half_provider_takes_year else provider()) or [])
+            except Exception as exc:  # 通道不支持/离线/超时 → 退回内置表
+                reasons.append("half_day_provider: %s" % exc)
+            else:
+                days = {
+                    d for d in (self._coerce(item) for item in raw)
+                    if d is not None and d.year == year
+                }
+                if days:
+                    self._half_by_year[year] = days
+                    self._half_retry_at.pop(year, None)
+                    return days
+                reasons.append("half_day_provider: empty")
+
+        builtin = BUILTIN_HALF_DAYS.get(year)
+        if builtin is not None:
+            # 已核对年份：内置表权威（可为空集合 = 确认无半日市），不告警。
+            self._half_by_year[year] = set(builtin)
+            self._half_retry_at.pop(year, None)
+            return self._half_by_year[year]
+
+        # 无任何确认来源 → fail-open（按全天交易），每年告警一次，退避后重试。
+        self._half_retry_at[year] = now + self._retry_after
+        self._warn_half_day_once(year, reasons)
+        return None
+
+    def _warn_half_day_once(self, year: int, reasons: List[str]) -> None:
+        """半日市数据缺失告警（WARNING + risk 事件，每年最多一次，不刷屏）。"""
+        detail = "；".join(reasons) if reasons else "no half-day provider configured"
+        message = (
+            "半日市数据不可用（%s）；%d 年按全天交易处理（fail-open，不因半日市数据"
+            "缺失拒绝交易）；如该年存在半日市，下午 11:30–15:00 的单会被柜台拒单兜底"
+            % (detail, year))
+        if year in self._half_warned_year:
+            logger.debug("%s (year %s, already reported)", message, year)
+            return
+        self._half_warned_year.add(year)
+        logger.warning("%s", message)
+        cb = self.on_degraded
+        if cb is not None:
+            try:
+                cb({
+                    "rule": "half_day_calendar_degraded",
+                    "year": year,
+                    "source": "fail_open",
+                    "reasons": reasons,
+                    "message": message,
+                })
+            except Exception:  # noqa: BLE001  告警回调失败不得影响日历判定
+                logger.warning("half-day degraded callback failed", exc_info=True)
+
+    def is_half_day(self, d: date) -> bool:
+        """d 是否为半日市（仅上午 09:30–11:30 交易）。
+
+        非交易日/周末恒 False（半日市只在交易日成立）；数据不可用时 fail-open
+        （返回 False = 按全天交易），绝不因此拒绝交易。
+        """
+        if d.weekday() >= 5 or not self.is_trading_day(d):
+            return False
+        days = self._load_half_days(d.year)
+        return bool(days) and d in days
+
+    def session_close_time(self, d: date) -> time:
+        """d 当天的收盘时刻：半日市 11:30，常态 15:00（左闭右开判定用）。"""
+        return _HALF_DAY_CLOSE if self.is_half_day(d) else _MARKET_CLOSE
+
     def is_trading_day(self, d: date) -> bool:
         # 周末硬规则（weekday(): Monday=0 .. Sunday=6）
         if d.weekday() >= 5:
@@ -270,12 +422,74 @@ class TradingCalendar:
             return d not in closed  # 内置官方休市表：工作日 - 节假日
         return True  # fail-open：工作日无权威数据，放行
 
+    def is_fail_open(self, d: date) -> bool:
+        """该日所属年份是否处于 fail-open 退化（无权威数据且无内置休市表）。
+
+        fail-open 下工作日一律视为交易日：长假中的工作日会被误判为交易日，
+        ``_next_trading_day`` 因而把「节后首日」算早。调用方据此放宽 deferred 单
+        的过期窗口（见 LiveEngine._DEFERRED_RELEASE_GRACE_DAYS）。
+        """
+        if d.year in self._by_year:
+            return False
+        self._load_year(d.year)
+        return self._degraded.get(d.year) == "fail_open"
+
+    def is_last_trading_day_of_week(self, d: date) -> bool:
+        """d 是否为「本周最后一个交易日」。
+
+        从 d+1 到本周日逐日判定，全为非交易日则 d 是期末（周五休市自动落到周四，
+        长假同理）。d 本身须为交易日。
+        """
+        if not self.is_trading_day(d):
+            return False
+        for offset in range(1, 7 - d.weekday()):
+            if self.is_trading_day(d + timedelta(days=offset)):
+                return False
+        return True
+
+    def is_last_trading_day_of_month(self, d: date) -> bool:
+        """d 是否为「本月最后一个交易日」（月末休市自动前移到前一交易日）。"""
+        if not self.is_trading_day(d):
+            return False
+        if d.month == 12:
+            next_month = date(d.year + 1, 1, 1)
+        else:
+            next_month = date(d.year, d.month + 1, 1)
+        cur = d + timedelta(days=1)
+        while cur < next_month:
+            if self.is_trading_day(cur):
+                return False
+            cur += timedelta(days=1)
+        return True
+
     def is_trading_allowed(self, now: datetime) -> bool:
-        """是否允许在 ``now`` 时刻下单：交易日 且 09:30–15:00（左闭右开）。"""
+        """是否允许在 ``now`` 时刻下单：交易日 且 09:30–11:30 / 13:00–15:00（左闭右开）。
+
+        P2-5：午休 11:30–13:00 禁报（交易所不受理；11:30 边界 bar 的单不再排进
+        TDX / 被 QMT 拒）。13:00 起正常放行，不影响下午派发。
+        P2-10：半日市（仅上午交易）当天收盘时刻前移到 11:30，11:30 之后一律禁报
+        （含原下午时段）。盘前集合竞价 09:15–09:20 走独立路径，不受本开关影响。
+        """
         if not self.is_trading_day(now.date()):
             return False
         t = now.time()
-        return _MARKET_OPEN <= t < _MARKET_CLOSE
+        if not (_MARKET_OPEN <= t < self.session_close_time(now.date())):
+            return False
+        return not (_LUNCH_START <= t < _LUNCH_END)
+
+    def is_lunch_break(self, now: datetime) -> bool:
+        """是否处于午休 11:30–13:00（左闭右开）。
+
+        与下单总闸 ``is_trading_allowed`` 共用同一组午休常量（_LUNCH_START /
+        _LUNCH_END），不另造时间常量。午休交易所无新 bar，行情轮询可整段暂停；
+        11:30 收线那根由 13:00 首轮一次取回并派发（见 LiveEngine._quote_poll_active）。
+        """
+        return _LUNCH_START <= now.time() < _LUNCH_END
+
+    def lunch_end_at(self, now: datetime) -> datetime:
+        """``now`` 当日的午休结束时刻（13:00:00），供暂停状态回报「下次恢复」。"""
+        return now.replace(hour=_LUNCH_END.hour, minute=_LUNCH_END.minute,
+                           second=0, microsecond=0)
 
     # ---------------- 可观测性 ----------------
 
@@ -298,4 +512,10 @@ class TradingCalendar:
             "years": years,
             "builtin_years": sorted(BUILTIN_CLOSURES),
             "retry_after_seconds": self._retry_after,
+            # 半日市（P2-10）：已确认年份的日期数 + 内置表收录年份（未收录年份
+            # 走 fail-open，按全天交易，见 _load_half_days）。
+            "half_days": {
+                str(y): len(days) for y, days in sorted(self._half_by_year.items())
+            },
+            "builtin_half_day_years": sorted(BUILTIN_HALF_DAYS),
         }

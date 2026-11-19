@@ -14,7 +14,9 @@ class StrategyContext:
         strategy_id: int,
         period: str,
         capital_ratio: Decimal,
-        max_positions: int,
+        # 槽位上限（该组合策略自己的参数，来自 strategies.max_positions）；
+        # None = 参数缺失/未配置——实盘调用方跳过槽位闸并告警，不回落任何默认数字。
+        max_positions: Optional[int],
         *,
         single_open_ratio: Decimal = Decimal("0.1"),
         add_position_threshold: Decimal = Decimal("0.05"),
@@ -33,6 +35,9 @@ class StrategyContext:
         regime_filter_enabled: bool = False,
         trend_trailing_stop_ratio: Optional[Decimal] = None,
         trend_max_positions: Optional[int] = None,
+        # E3 策略级门控覆盖（默认 inherit=跟随组合）：off=本策略不受门控 /
+        # on=组合未开总开关时也强制对本策略生效
+        market_gate_mode: str = "inherit",
         # #3 策略级敞口上限（默认关）：BUY 审批加卡策略总持仓市值
         # ≤ capital_ratio × 组合初始资金（回测/实盘成交步传入生效）
         exposure_cap_enabled: bool = False,
@@ -42,8 +47,17 @@ class StrategyContext:
         # 实盘执行配置（批次1，全部默认关/保守默认，关闭时行为与原逻辑一致）
         requote_enabled: bool = False,
         requote_max_attempts: int = 2,
+        # H4 自适应追价：tick=固定一档（默认）/adaptive=按最新价追
+        requote_price_mode: str = "tick",
+        requote_max_slippage_ticks: int = 5,
         split_order_enabled: bool = False,
         split_order_threshold: Decimal = Decimal("500000"),
+        # H3 切片增强（None/0 = 沿用按阈值推导）
+        split_order_count: Optional[int] = None,
+        split_order_min_qty: Optional[int] = None,
+        split_order_interval_seconds: Optional[float] = None,
+        split_order_interval_jitter: bool = False,
+        split_order_volume_pct: Optional[float] = None,
         risk_timing: str = "next_day",
         signal_frequency: Optional[str] = None,
         signal_at: Optional[str] = None,
@@ -82,6 +96,8 @@ class StrategyContext:
         self.regime_filter_enabled = regime_filter_enabled
         self.trend_trailing_stop_ratio = trend_trailing_stop_ratio
         self.trend_max_positions = trend_max_positions
+        # E3 策略级门控覆盖（inherit/off/on）
+        self.market_gate_mode = market_gate_mode or "inherit"
         # #3 策略级敞口上限开关（默认关，关闭时审批行为与原逻辑一致）
         self.exposure_cap_enabled = exposure_cap_enabled
         # 单笔最大买入金额（None=不限，关闭时审批行为与原逻辑一致）
@@ -89,8 +105,15 @@ class StrategyContext:
         # 实盘执行配置（批次1）：撤单追价重下 / TDX 大额拆单（批次2接线）/ 风控时点
         self.requote_enabled = requote_enabled
         self.requote_max_attempts = requote_max_attempts
+        self.requote_price_mode = requote_price_mode
+        self.requote_max_slippage_ticks = requote_max_slippage_ticks
         self.split_order_enabled = split_order_enabled
         self.split_order_threshold = split_order_threshold
+        self.split_order_count = split_order_count
+        self.split_order_min_qty = split_order_min_qty
+        self.split_order_interval_seconds = split_order_interval_seconds
+        self.split_order_interval_jitter = split_order_interval_jitter
+        self.split_order_volume_pct = split_order_volume_pct
         self.risk_timing = risk_timing
         self.positions: Dict[str, Position] = {}
         # 策略风控（assemble_portfolio 注入；未注入 → _check_risks 跳过并告警，不静默）
@@ -131,28 +154,46 @@ class StrategyContext:
     def _match_signals(
         self, outputs: List[dict], stock_code: str, bar_time
     ) -> List[SignalEvent]:
-        """公式输出按 formula_signals 配置匹配 trigger_value，转 SignalEvent。"""
+        """公式输出按 formula_signals 配置匹配 trigger_value，转 SignalEvent。
+
+        输出条目可选带 `signal_type` 覆盖配置的动作类型（外部信号链路用：
+        预警文件不携带减仓比例，REDUCE 按清仓执行时以 CLOSE 覆盖，不另写
+        判定路径）。TQ 公式输出不带该键，行为不变。
+        """
         result: List[SignalEvent] = []
-        # 公式输出名 → 值
-        output_map = {o["name"]: o["value"] for o in outputs}
+        # 公式输出名 → 输出条目（保留可选覆盖键）
+        output_map = {o["name"]: o for o in outputs}
         for cfg in self.formula_signals:
             name = cfg["signal_name"]
-            if name not in output_map:
+            out = output_map.get(name)
+            if out is None:
                 continue
-            if output_map[name] != cfg["trigger_value"]:
+            if out["value"] != cfg["trigger_value"]:
                 continue
+            sig_type = cfg["signal_type"]
+            override = out.get("signal_type")
+            if override:
+                try:
+                    sig_type = SignalType(override)
+                except ValueError:
+                    pass  # 非法覆盖值：回落配置动作（不猜测）
             result.append(SignalEvent(
                 strategy_id=self.strategy_id,
                 stock_code=stock_code,
                 signal_name=name,
-                signal_type=cfg["signal_type"],
+                signal_type=sig_type,
                 bar_time=bar_time,
             ))
         return result
 
-    def effective_max_positions(self, regime: Optional[str]) -> int:
+    def effective_max_positions(self, regime: Optional[str]) -> Optional[int]:
         """当前市场状态下的生效槽位上限。仅在开关打开、状态为 bull 且配置了
-        trend_max_positions 时用覆盖值，其余一律回落 max_positions（默认行为不变）。"""
+        trend_max_positions 时用覆盖值，其余一律回落 max_positions（默认行为不变）。
+
+        None = 该策略自身没有配置槽位上限（参数缺失）：调用方自行决定兜底，
+        实盘按「跳过槽位闸（不限）」处理并告警——不同组合策略的 max_positions
+        各不相同（成长组合 5 只是它自己的回测值），不能拿 5 当全局默认。
+        """
         if (
             self.regime_filter_enabled
             and regime == REGIME_BULL

@@ -29,7 +29,9 @@ def signal_type_from_str(s: str) -> SignalType:
 
 def assemble_portfolio(
     ps: PortfolioStrategy, strategies: List[Strategy], db: Session,
-    initial_capital_override=None, enable_manual_recovery: bool = True,
+    initial_capital_override=None,
+    sell_scope: str = "full",
+    enable_manual_recovery: bool = True,
 ) -> Portfolio:
     """组装 Portfolio + 各 StrategyContext（信号配置 + 策略风控）。
 
@@ -54,6 +56,8 @@ def assemble_portfolio(
     pm = PortfolioRiskManager(
         max_drawdown=Decimal(str(ps.max_drawdown)),
         daily_loss_limit=Decimal(str(ps.daily_loss_limit)),
+        # D4（2026-11-18）：熔断/日亏处置动作，默认 halt（仅停开仓）
+        breaker_action=getattr(ps, "breaker_action", None) or "halt",
         enable_manual_recovery=enable_manual_recovery,
     )
     # 日内亏损熔断分母：equity（默认）=上一交易日收盘净值；initial=初始资金（旧口径）。
@@ -71,14 +75,36 @@ def assemble_portfolio(
             "buy_commission_rate": Decimal(str(ps.buy_commission_rate)),
             "sell_commission_rate": Decimal(str(ps.sell_commission_rate)),
             "stamp_duty_rate": Decimal(str(ps.stamp_duty_rate)),
+            # 过户费（双向，2026-11-11）：缺键会让 SimulatedDispatcher 恒用构造默认
+            # 0.00001，用户把组合费率置 0 不生效；资金预留 setter 也读同一键。
+            "transfer_fee_rate": Decimal(str(
+                ps.transfer_fee_rate
+                if getattr(ps, "transfer_fee_rate", None) is not None else 0.00001)),
             "slippage": Decimal(str(ps.slippage)),
         },
     )
     # #1 涨跌停约束（默认开；仅回测成交步生效）
     port.price_limit_check_enabled = bool(getattr(ps, "price_limit_check_enabled", True))
+    # 卖出范围口径（实盘读 config.tq_trade.live_sell_scope；回测调用点不传 → full，
+    # 回测持仓全部来自平台成交，两种口径结果等价，行为不变）
+    port.sell_scope = sell_scope if sell_scope in ("full", "platform_only") else "full"
     # 组合级 max_holdings / trading_session（历史死配置首次接线，回测/实盘共用生效）
     port.max_holdings = int(getattr(ps, "max_holdings", 0) or 0)
     port.trading_session = getattr(ps, "trading_session", None) or "full"
+    # A2 跨组合下单优先级（默认 0；回测/实盘共用）
+    try:
+        port.priority = int(getattr(ps, "priority", 0) or 0)
+    except (TypeError, ValueError):
+        port.priority = 0
+    # 风控冷静期（默认 1=风控卖出当日不再买回、次日恢复；0=关闭）：回测/实盘共用
+    _cooldown = getattr(ps, "risk_cooldown_days", None)
+    port.risk_cooldown_days = 1 if _cooldown is None else max(0, int(_cooldown))
+    # E3 空头减仓档（默认 0=关闭；>0 时空头连续段内每只持仓减一次）：回测/实盘共用
+    try:
+        port.gate_bear_reduce_ratio = Decimal(
+            str(getattr(ps, "market_gate_bear_reduce_ratio", 0) or 0))
+    except (TypeError, ValueError):
+        port.gate_bear_reduce_ratio = Decimal("0")
     # #2 成交量/流动性约束（可选，默认关；仅回测成交步生效）
     port.volume_limit_enabled = bool(getattr(ps, "volume_limit_enabled", False))
     _vol_ratio = getattr(ps, "volume_limit_ratio", None)
@@ -139,6 +165,8 @@ def assemble_portfolio(
                 else None
             ),
             trend_max_positions=getattr(strat, "trend_max_positions", None),
+            # E3 策略级门控覆盖（默认 inherit=跟随组合）
+            market_gate_mode=getattr(strat, "market_gate_mode", None) or "inherit",
             # #3 策略级敞口上限（可选，默认关；回测/实盘成交步生效）
             exposure_cap_enabled=bool(getattr(strat, "exposure_cap_enabled", False)),
             # 单笔最大买入金额（元，可选 None=不限；回测/实盘双端 cap_quantity 生效）
@@ -150,9 +178,19 @@ def assemble_portfolio(
             # 实盘执行配置（批次1，默认关/保守默认；关闭时行为与原逻辑一致）
             requote_enabled=bool(getattr(strat, "requote_enabled", False)),
             requote_max_attempts=getattr(strat, "requote_max_attempts", None) or 2,
+            requote_price_mode=getattr(strat, "requote_price_mode", None) or "tick",
+            requote_max_slippage_ticks=int(
+                getattr(strat, "requote_max_slippage_ticks", None) or 5),
             split_order_enabled=bool(getattr(strat, "split_order_enabled", False)),
             split_order_threshold=Decimal(str(
                 getattr(strat, "split_order_threshold", None) or "500000")),
+            split_order_count=getattr(strat, "split_order_count", None),
+            split_order_min_qty=getattr(strat, "split_order_min_qty", None),
+            split_order_interval_seconds=getattr(
+                strat, "split_order_interval_seconds", None),
+            split_order_interval_jitter=bool(
+                getattr(strat, "split_order_interval_jitter", False)),
+            split_order_volume_pct=getattr(strat, "split_order_volume_pct", None),
             risk_timing=getattr(strat, "risk_timing", None) or "next_day",
             signal_frequency=strat.signal_frequency,
             signal_at=strat.signal_at,

@@ -1,5 +1,40 @@
 import { describe, it, expect } from 'vitest'
-import { formatEvent, gateLabel, GATE_LABEL, LAYER_LABEL, ACTION_LABEL, EVENT_TYPE_LABEL, EVENT_TYPE_COLOR } from '../utils/liveEvents'
+import { formatEvent, gateLabel, GATE_LABEL, LAYER_LABEL, ACTION_LABEL, RISK_RULE_LABEL, RECOVERY_EVENT_TYPES, EVENT_TYPE_LABEL, EVENT_TYPE_COLOR, channelStateLabel, channelBadgeState } from '../utils/liveEvents'
+
+describe('channelStateLabel', () => {
+  it('maps online state to Chinese label', () => {
+    expect(channelStateLabel(true)).toBe('在线')
+    expect(channelStateLabel(false)).toBe('离线')
+    expect(channelStateLabel(null)).toBe('未知')
+    expect(channelStateLabel(undefined)).toBe('未知')
+  })
+
+  it('labels channel offline/recovered gates', () => {
+    expect(gateLabel('channel_offline')).toBe('通道离线')
+    expect(gateLabel('channel_recovered')).toBe('通道恢复')
+  })
+})
+
+describe('channelBadgeState', () => {
+  it('channel alarm wins over lagging heartbeat', () => {
+    // 心跳仍 true（最长 60–90s 才翻），但 watchdog 已判客户端离线 → 立即红
+    expect(channelBadgeState(true, [{ session_id: 5, rule: 'client_offline' }], 5)).toBe(false)
+    expect(channelBadgeState(true, [{ session_id: 5, rule: 'market_data_stalled' }], 5)).toBe(false)
+    expect(channelBadgeState(null, [{ session_id: 5, rule: 'bridge_unreachable' }], 5)).toBe(false)
+  })
+
+  it('ignores engine_stale and other sessions', () => {
+    expect(channelBadgeState(true, [{ session_id: 5, rule: 'engine_stale' }], 5)).toBe(true)
+    expect(channelBadgeState(null, [{ session_id: 9, rule: 'client_offline' }], 5)).toBe(null)
+  })
+
+  it('falls back to heartbeat and unknown', () => {
+    expect(channelBadgeState(false, [], 5)).toBe(false)
+    expect(channelBadgeState(true, [], 5)).toBe(true)
+    expect(channelBadgeState(null, [], 5)).toBe(null)
+    expect(channelBadgeState(null, [], null)).toBe(null)
+  })
+})
 
 describe('formatEvent', () => {
   it('formats signal', () => {
@@ -165,5 +200,103 @@ describe('formatEvent decision', () => {
     })
     expect(text).toContain('持股数达上限 600000.SH')
     expect(text).toContain('阈值5 实际5')
+  })
+
+  it('formats manual_intervention (人工干预) as backend message, not blocked qty', () => {
+    const message = '人工干预：600000.SH 虚拟=1000 真实=600 差额=-400 方向=减少'
+      + ' 原因=柜台少于虚拟台账（人工卖出/转出）（bridge_mirror）'
+    expect(gateLabel('manual_intervention')).toBe('人工干预')
+    const text = formatEvent('decision', {
+      gate: 'manual_intervention', layer: 'live_gate', action: 'notice',
+      stock_code: '600000.SH', requested_qty: 1000, final_qty: 600, message,
+    })
+    // 不得渲染成「需1000股/实发600股」（那不是被拦的委托量）
+    expect(text).toBe(message)
+    expect(text).not.toContain('股被拦')
+  })
+})
+
+// ===== 契约守护：后端实际会发的 token 必须在前端有中文标签 =====
+// 后端新增 token 却没补标签 → 工作台会直接露英文 key。新增后端 token 时同步补这里。
+const BACKEND_RISK_RULES = [
+  'max_drawdown', 'daily_loss', 'reconcile_mismatch', 'manual_intervention',
+  'quote_polling_paused', 'quote_polling_resumed',
+  'bar_gap', 'period_bar_fallback_aggregated', 'daily_bar_freshness',
+  'tick_too_slow', 'formula_injection',
+  'price_unavailable', 'equity_deviation', 'cash_diff', 'external_cash_flow',
+  'fill_price_deviation', 'out_of_pool_position',
+  'pre_open_price_capability', 'real_account_insufficient',
+  'engine_stale', 'client_offline', 'market_data_stalled',
+  'bridge_unreachable', 'execution_stalled', 'stop_inflight_orders',
+]
+// 后端 gate 字面量（"gate": "x" / gate="x"）与 _rec("x", ...) 口径的并集
+const BACKEND_GATES = [
+  'stop_loss', 'take_profit', 'trailing_stop', 'risk_recover', 'halted_buy_strip',
+  'halted_bar_no_price', 'slave_master_block', 'open_already_holding', 'max_positions_full',
+  'max_holdings', 'reduce_qty_too_small', 'add_threshold_not_met', 'add_count_exceeded',
+  'add_cost_unknown', 'risk_cooldown', 'missing_strategy_risk',
+  'open_qty_too_small', 'add_qty_too_small', 'insufficient_funds', 'order_shrunk',
+  'after_close_block', 'non_trading_block', 'dup_skip', 'inflight_skip',
+  'bridge_unavailable', 'bridge_rejected', 'approval_failed',
+  'slave_master_selling', 'cash_enhance_trigger', 'follow_master_sell',
+  'manual_intervention',
+  'pre_open_auction', 'pre_open_price_mode', 'deferred_release', 'submit_price',
+  'period_bar_freshness', 'period_bar_fallback', 'daily_bar_freshness',
+  'signal_bar_date', 'bar_gap', 'out_of_pool_position', 'inflight_sell', 'sell_scope',
+  'valuation_missing_price', 'tq_lock_timeout', 'loop_saturation',
+  'equity_deviation', 'cash_share_scale', 'cash_diff', 'cash_flow',
+  'fill_price_deviation', 'claim_price_mismatch', 'channel_offline', 'channel_recovered',
+  'signal', 'trading_session', 'price_limit', 'no_market_data',
+  'volume_cap_shrink', 'volume_cap_defer',
+  'params_drift', 'exposure_cap', 'max_single_position', 'min_cash_reserve',
+  'order_amount_cap', 'risk_sell_residual', 'requote', 'insufficient_cash',
+  'after_close_defer', 'keyboard_exclusive', 'peak_seed', 'split_children_lost',
+]
+const BACKEND_ACTIONS = [
+  'alert', 'apply', 'approve', 'block', 'cancel', 'cancel_requeue', 'error',
+  'fallback', 'forced', 'reject', 'requeue', 'retry', 'scale', 'skip', 'trigger',
+  'ack', 'allow', 'carry', 'defer', 'halt', 'refresh', 'release', 'replay',
+  'shrink', 'strip', 'unrecoverable', 'recompute', 'bias', 'recover', 'partial',
+  'timeout', 'clamp', 'notice', 'drop',
+]
+
+describe('后端 token 的中文标签契约', () => {
+  it('RISK_RULE_LABEL 覆盖后端全部 risk rule', () => {
+    for (const rule of BACKEND_RISK_RULES) {
+      expect(RISK_RULE_LABEL[rule], `缺 risk rule 标签: ${rule}`).toBeTruthy()
+    }
+  })
+
+  it('GATE_LABEL 覆盖后端全部 gate', () => {
+    for (const gate of BACKEND_GATES) {
+      expect(GATE_LABEL[gate], `缺 gate 标签: ${gate}`).toBeTruthy()
+    }
+  })
+
+  it('ACTION_LABEL 覆盖后端全部 action', () => {
+    for (const action of BACKEND_ACTIONS) {
+      expect(ACTION_LABEL[action], `缺 action 标签: ${action}`).toBeTruthy()
+    }
+  })
+})
+
+describe('watchdog 恢复事件', () => {
+  it('5 类恢复事件都注册为独立 recovered 日志类型', () => {
+    expect(RECOVERY_EVENT_TYPES).toEqual([
+      'engine_recovered', 'execution_recovered', 'bridge_recovered',
+      'market_data_recovered', 'client_recovered',
+    ])
+    expect(EVENT_TYPE_LABEL.recovered).toBe('恢复')
+    expect(EVENT_TYPE_COLOR.recovered).toBe('green')
+  })
+
+  it('formatEvent 把恢复事件翻译成中文（无 message 只出标签）', () => {
+    expect(formatEvent('recovered', { rule: 'engine_recovered', message: '主循环恢复' }))
+      .toBe('引擎恢复: 主循环恢复')
+    expect(formatEvent('recovered', { rule: 'bridge_recovered' })).toBe('交易桥恢复')
+    expect(formatEvent('recovered', { rule: 'market_data_recovered' })).toBe('行情恢复')
+    expect(formatEvent('recovered', { rule: 'client_recovered' })).toBe('客户端恢复')
+    expect(formatEvent('recovered', { rule: 'execution_recovered' })).toBe('执行恢复')
+    expect(formatEvent('recovered', { rule: 'unknown_recovered' })).toBe('恢复')
   })
 })

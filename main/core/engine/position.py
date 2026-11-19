@@ -50,6 +50,11 @@ class Position:
         # 实盘风控基准一律用桥返回的券商合并均价 avg_cost。
         self.strategy_quantity = 0
         self.strategy_cost = Decimal("0")
+        # 平台自己买入且尚未平掉的股数（实盘槽位闸口径，见 LiveEngine.
+        # _platform_held_count）：只由平台成交（apply_trade）增删，外部/手工仓
+        # （快照 import / mirror 新建）与外部成交补记（note_strategy_trade）都不写，
+        # 故它恒为 0。全平或桥镜面数量归 0 时清零 → 外部仓卖出后平台再买入能重新占位。
+        self.platform_quantity = 0
         # 按买入日期分桶的份额，用于 T+1 可卖判断
         self._lots: Dict[date, int] = {}
         # 已加仓次数（首次建仓清零，全平清零），受 max_add_count 约束
@@ -63,14 +68,24 @@ class Position:
     def market_value(self) -> Decimal:
         return self.avg_cost * self.quantity
 
-    def buy(self, quantity: int, price: Decimal, trade_time: Optional[datetime] = None, is_add: bool = False) -> None:
+    def buy(self, quantity: int, price: Decimal, trade_time: Optional[datetime] = None,
+            is_add: bool = False, fees: Decimal = Decimal("0")) -> None:
+        """买入建/加仓。
+
+        fees（2026-11-11）：本次买入的佣金+过户费，**摊入持仓成本**——回测成本
+        因此与实盘柜台合并均价（含费）同口径，止损/止盈阈值对比不再系统性偏低。
+        """
+        # 平台自己买入的股数（槽位闸口径）：只有平台成交（apply_trade）走到这里，
+        # 外部/手工导入仓由 mirror_bridge 直接覆盖数量，不经过 buy → 保持 0。
+        self.platform_quantity += quantity
         # 新开仓（原无持仓）重置加仓计数；加仓（原有持仓）累加
         is_new = self.quantity == 0
         if is_add and self.quantity > 0:
             self.add_count += 1
         elif self.quantity == 0:
             self.add_count = 0
-        total_cost = self.avg_cost * self.quantity + price * quantity
+        total_cost = (self.avg_cost * self.quantity + price * quantity
+                      + (fees or Decimal("0")))
         self.quantity += quantity
         self.avg_cost = total_cost / self.quantity
         # 新开仓重置最高价（避免沿用上一笔持仓的旧高点）；加仓时只升不降
@@ -86,13 +101,20 @@ class Position:
         if price > self.highest_price:
             self.highest_price = price
 
-    def sell(self, quantity: int, price: Decimal, trade_time: Optional[datetime] = None) -> tuple:
+    def sell(self, quantity: int, price: Decimal, trade_time: Optional[datetime] = None,
+             fees: Decimal = Decimal("0")) -> tuple:
+        """卖出减仓，返回 (已实现盈亏, 卖出金额)。
+
+        fees（2026-11-11）：本次卖出的佣金+印花税+过户费，从盈亏中扣除。
+        """
         if quantity > self.quantity:
             quantity = self.quantity
         sell_amount = price * quantity
         cost_amount = self.avg_cost * quantity
-        pnl = sell_amount - cost_amount
+        pnl = sell_amount - cost_amount - (fees or Decimal("0"))
         self.quantity -= quantity
+        # 平台自己买入的股数同步扣减（卖出可能包含外部仓份额，按上限夹到 0）
+        self.platform_quantity = max(0, self.platform_quantity - quantity)
         # 全平清零加仓计数与买入时间：否则同日全平后再建仓，buy_time 仍是首笔买入日，
         # can_sell_on(当日) 会误判为可卖（T+1 语义错误）。buy() 见 buy_time 为 None 会重新赋值。
         if self.quantity == 0:
@@ -111,14 +133,29 @@ class Position:
             self._lots = {d: q for d, q in self._lots.items() if q > 0}
         return pnl, sell_amount
 
-    def apply_trade(self, trade: TradeEvent) -> None:
-        """成交后统一更新持仓（买入加权均价+最高价，卖出减仓）。"""
+    def apply_trade(self, trade: TradeEvent) -> int:
+        """成交后统一更新持仓（买入加权均价+最高价，卖出减仓）。返回**实际入账数量**。
+
+        费用（佣金/印花税/过户费）摊入买入成本、并从卖出盈亏中扣除。
+
+        返回值（P0-1）：卖出会把数量夹到当前虚拟持仓（``sell`` 内 clamp），调用方
+        **必须**按本返回值推算现金变动（``TradeEvent.scaled_to`` + ``Account.
+        apply_trade``），不能直接用原始 ``trade.amount``。否则「持仓不足却全额入账」
+        会让虚拟现金凭空增加：① 继承仓重启重放只有 SELL 没有 BUY；② 人工先减仓
+        （镜面已按成本回补现金）后在途卖单成交 → 同一批股票补偿两次；③ 缺虚拟仓
+        卖出。买入恒返回 ``trade.quantity``。
+        """
+        fees = ((trade.commission or Decimal("0"))
+                + (trade.stamp_duty or Decimal("0"))
+                + (getattr(trade, "transfer_fee", Decimal("0")) or Decimal("0")))
         self.note_strategy_trade(trade)
         if trade.trade_type == TradeType.BUY:
-            is_add = trade.signal_type == SignalType.ADD
-            self.buy(trade.quantity, trade.price, trade.trade_time, is_add=is_add)
-        else:
-            self.sell(trade.quantity, trade.price, trade.trade_time)
+            self.buy(trade.quantity, trade.price, trade.trade_time,
+                     is_add=trade.signal_type == SignalType.ADD, fees=fees)
+            return int(trade.quantity)
+        before = self.quantity
+        self.sell(trade.quantity, trade.price, trade.trade_time, fees=fees)
+        return before - self.quantity
 
     def note_strategy_trade(self, trade: TradeEvent) -> None:
         """归因专用：只更新策略自身成交的加权成本，不改数量与风控基准成本。
@@ -128,7 +165,11 @@ class Position:
         """
         if trade.trade_type == TradeType.BUY:
             # 策略自身成交成本（含分摊费用）单独累计，仅归因展示，不做风控基准
-            added_cost = (trade.amount or Decimal("0")) + (trade.commission or Decimal("0"))
+            added_cost = ((trade.amount or Decimal("0"))
+                          + (trade.commission or Decimal("0"))
+                          + (trade.stamp_duty or Decimal("0"))
+                          + (getattr(trade, "transfer_fee", Decimal("0"))
+                             or Decimal("0")))
             total = self.strategy_cost * self.strategy_quantity + added_cost
             self.strategy_quantity += trade.quantity
             if self.strategy_quantity > 0:
@@ -160,10 +201,17 @@ class Position:
             self.add_count = 0
             self.strategy_quantity = 0
             self.strategy_cost = Decimal("0")
+            # 柜台已无此仓（含外部全卖）：平台占位随之清零，下次平台买入重新占位
+            self.platform_quantity = 0
             return
         self.quantity = quantity
-        if avg_cost is not None and avg_cost > 0:
-            self.avg_cost = Decimal(str(avg_cost))
+        if avg_cost is not None:
+            # B5（2026-11-10）：柜台成本 <= 0（送转/分红后为负，或字段无效）=
+            # 成本未知 → 显式置 0 并保留「未知」标记（不清洗成上一轮的旧值，
+            # 更不用现价冒充）；该票止损/止盈/移动止损整体跳过。
+            self.avg_cost = (
+                Decimal(str(avg_cost)) if Decimal(str(avg_cost)) > 0
+                else Decimal("0"))
         try:
             avail = quantity if available is None else int(available)
         except (TypeError, ValueError, OverflowError):
@@ -197,11 +245,14 @@ class Position:
         """
         if trade.trade_type == TradeType.BUY:
             self.quantity -= trade.quantity
+            self.platform_quantity = max(
+                0, self.platform_quantity - trade.quantity)
             if self.quantity <= 0:
                 self.quantity = 0
                 self.avg_cost = Decimal("0")
         else:
             self.quantity += trade.quantity
+            self.platform_quantity += trade.quantity
 
     def can_sell_on(self, query_date: date) -> bool:
         """T+1：买入当日不可卖，下一交易日及之后可卖。无持仓或当日买入返回 False。

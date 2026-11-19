@@ -185,6 +185,8 @@ def test_ping_returns_200_and_status_fields(bridge):
     assert status == 200
     assert data["ok"] is True
     assert data["service"].startswith("iquant-bridge")
+    # 版本自证：/ping 的 build 必须与文件常量一致（排查"跑的是哪一版"用）
+    assert data["build"] == mod.BRIDGE_BUILD
     assert data["port"] == mod.PORT
     assert data["account"] == mod.ACCOUNT
     assert data["account_type"] == mod.ACCOUNT_TYPE
@@ -325,7 +327,7 @@ def _quote_frame(labels, closes):
 
 
 def test_quote_uses_contextinfo_when_globals_lacks_it(bridge, monkeypatch, capsys):
-    """ContextInfo 取数：显式字段 + subscribe=True + dividend_type=follow。"""
+    """ContextInfo 取数：显式字段 + subscribe=True + dividend_type=none（不复权）。"""
     mod, _ctx = bridge
     seen = []
 
@@ -346,7 +348,7 @@ def test_quote_uses_contextinfo_when_globals_lacks_it(bridge, monkeypatch, capsy
     assert bar["close"] == 1.5 and bar["amount"] == 150.0
     assert seen[0][0] == mod.CTX_FIELDS
     assert seen[0][1]["subscribe"] is True
-    assert seen[0][1]["dividend_type"] == "follow"
+    assert seen[0][1]["dividend_type"] == "none"
     out = capsys.readouterr().out
     assert "quote via ContextInfo ok" in out
     assert "rows_before=1 rows_after=1" in out     # 取数 → 序列化 行数自证
@@ -670,7 +672,112 @@ def test_handler_exception_is_logged_then_throttled(bridge, monkeypatch, capsys)
     assert "EXC handle" not in capsys.readouterr().out
 
 
+# ---------------- price_limit / cancel（2026-11-09 新增端点） ----------------
+def _post(mod, path, payload):
+    body = json.dumps(payload).encode("utf-8")
+    raw = (b"POST " + path.encode() + b" HTTP/1.1\r\nHost: x\r\n"
+           b"Content-Type: application/json\r\nContent-Length: "
+           + str(len(body)).encode() + b"\r\n\r\n" + body)
+    return _call(mod, raw)
+
+
+class _FakeOrder(object):
+    def __init__(self, ref, status):
+        self.m_strOrderRef = ref
+        self.m_nOrderStatus = status
+
+
+def test_price_limit_reads_instrument_detail(bridge, monkeypatch):
+    """GET /price_limit：取 get_instrument_detail 的 前收/涨停/跌停，缺字段回 null。"""
+    mod, _ctx = bridge
+    monkeypatch.setattr(mod, "_price_limit_cache", {})
+    monkeypatch.setattr(mod, "get_instrument_detail",
+                        lambda code: {"PreClose": 10.0, "UpStopPrice": 11.0,
+                                      "DownStopPrice": 9.0}, raising=False)
+    status, data = _call(mod, b"GET /price_limit?code=600000.SH HTTP/1.1\r\n\r\n")
+    assert status == 200 and data["ok"] is True
+    assert data["data"] == {"code": "600000.SH", "pre_close": 10.0,
+                            "up_limit": 11.0, "down_limit": 9.0}
+    assert data["source"] == "instrument_detail"
+
+
+def test_price_limit_unknown_fields_are_null(bridge, monkeypatch):
+    """取不到合约信息 → 字段全 null（平台侧据此 fail-open，绝不猜涨跌幅）。"""
+    mod, _ctx = bridge
+    monkeypatch.setattr(mod, "_price_limit_cache", {})
+    monkeypatch.setattr(mod, "get_instrument_detail", lambda code: None,
+                        raising=False)
+    status, data = _call(mod, b"GET /price_limit?code=600000.SH HTTP/1.1\r\n\r\n")
+    assert status == 200 and data["ok"] is True
+    assert data["data"]["pre_close"] is None
+    assert data["data"]["up_limit"] is None
+    assert data["data"]["down_limit"] is None
+    assert data["source"] == "unavailable"
+
+
+def test_cancel_confirms_canceled(bridge, monkeypatch):
+    """POST /cancel：撤单后委托表回读到 54（已撤）→ ok:true + result=canceled。"""
+    mod, _ctx = bridge
+    rows = [_FakeOrder("ref-1", 50)]
+    monkeypatch.setattr(mod, "get_trade_detail_data",
+                        lambda acc, typ, kind: rows, raising=False)
+    calls = []
+
+    def fake_cancel(*args):
+        calls.append(args)
+        rows[0] = _FakeOrder("ref-1", 54)
+
+    monkeypatch.setattr(mod, "cancel", fake_cancel, raising=False)
+    monkeypatch.setattr(mod, "CANCEL_VERIFY_INTERVAL", 0.0)
+    status, data = _post(mod, "/cancel", {"order_ref": "ref-1"})
+    assert status == 200 and data["ok"] is True
+    assert data["data"]["result"] == "canceled"
+    assert data["data"]["status"] == 54
+    assert calls and calls[0][0] == "ref-1"
+
+
+def test_cancel_pending_when_status_not_observed(bridge, monkeypatch):
+    """撤单已发出但复查窗口内未观测到终态 → result=pending（ok:true，不误报已撤）。"""
+    mod, _ctx = bridge
+    rows = [_FakeOrder("ref-2", 50)]
+    monkeypatch.setattr(mod, "get_trade_detail_data",
+                        lambda acc, typ, kind: rows, raising=False)
+    monkeypatch.setattr(mod, "cancel", lambda *a: None, raising=False)
+    monkeypatch.setattr(mod, "CANCEL_VERIFY_INTERVAL", 0.0)
+    status, data = _post(mod, "/cancel", {"order_ref": "ref-2"})
+    assert status == 200 and data["ok"] is True
+    assert data["data"]["result"] == "pending"
+    assert data["data"]["verified"] is False
+
+
+def test_cancel_not_found_and_rejected_are_failures(bridge, monkeypatch):
+    """柜台查不到 → not_found；已成交 → rejected；两者 ok 必须为 false。"""
+    mod, _ctx = bridge
+    monkeypatch.setattr(mod, "get_trade_detail_data",
+                        lambda acc, typ, kind: [], raising=False)
+    called = []
+    monkeypatch.setattr(mod, "cancel", lambda *a: called.append(a), raising=False)
+    status, data = _post(mod, "/cancel", {"order_ref": "ref-missing"})
+    assert data["ok"] is False and data["data"]["result"] == "not_found"
+    assert called == []       # 查不到就不发撤单请求
+
+    monkeypatch.setattr(mod, "get_trade_detail_data",
+                        lambda acc, typ, kind: [_FakeOrder("ref-3", 56)],
+                        raising=False)
+    status, data = _post(mod, "/cancel", {"order_ref": "ref-3"})
+    assert data["ok"] is False and data["data"]["result"] == "rejected"
+    assert called == []
+
+
+def test_cancel_requires_order_ref(bridge):
+    mod, _ctx = bridge
+    status, data = _post(mod, "/cancel", {})
+    assert status == 200 and data["ok"] is False
+    assert data["data"]["result"] == "failed"
+
+
 # ---------------- 双桥同步护栏 ----------------
+
 def _body_after_config(filename):
     """取 config 区之后的全部代码，并把日志/服务名/标签归一化到仿真桥口径。"""
     with open(os.path.join(BRIDGE_DIR, filename), "r", encoding="utf-8") as fh:

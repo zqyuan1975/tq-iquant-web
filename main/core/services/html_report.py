@@ -175,8 +175,8 @@ def _nav_chart(snapshots: List[dict]) -> Optional[Tuple[str, dict]]:
             {"type": "value", "scale": True, "gridIndex": 0, "name": "策略净值",
              "nameLocation": "middle", "nameRotate": 90, "nameGap": 54,
              "nameTextStyle": {"fontSize": 12}},
-            # 网格1 的左轴：回撤（%）
-            {"type": "value", "gridIndex": 1, "max": 0,
+            # 网格1 的左轴：回撤（%）；子图只有 16% 高度，刻度限 3 段避免文字叠成一团
+            {"type": "value", "gridIndex": 1, "max": 0, "splitNumber": 3,
              "axisLabel": {"formatter": "{value}%"}},
             # 右轴：基准净值（独立刻度，避免与策略净值量级不同被压平）
             {"type": "value", "scale": True, "gridIndex": 0, "position": "right",
@@ -237,8 +237,10 @@ def _industry_chart(ia: dict) -> Optional[Tuple[str, dict]]:
     })
     option = {
         "tooltip": {"trigger": "axis"},
-        "legend": {"bottom": 0, "type": "scroll"},
-        "grid": {"left": 24, "right": 20, "bottom": 44, "top": 24, "containLabel": True},
+        # 图例平铺换行（不用 scroll）：打印/PDF 里翻页箭头不可点，会丢掉一半行业
+        "legend": {"bottom": 0, "type": "plain", "itemGap": 8,
+                   "textStyle": {"fontSize": 10}, "width": "96%"},
+        "grid": {"left": 24, "right": 20, "bottom": 96, "top": 24, "containLabel": True},
         "xAxis": {"type": "category", "data": exp.get("dates", []),
                   "boundaryGap": False, "axisLabel": {"formatter": "__DATEFMT__"}},
         # 竖排居中，避免「仓位(%)」在左上角与 100% 刻度重叠
@@ -283,6 +285,85 @@ def _robustness_chart(rb: dict) -> Optional[Tuple[str, dict]]:
 # ---------------------------------------------------------------------------
 def _section(title: str, body: str) -> str:
     return f'<section><h2>{esc(title)}</h2>{body}</section>'
+
+
+def _cost_capacity_section(detail: dict) -> str:
+    """二、成本与容量：显性成本拖累 / 滑点实现偏差 / 容量与冲击成本。
+
+    数据来自详情序列化时的 cost_capacity 块（按 trades + snapshots 现算，
+    不新增落库列），因此历史记录同样可直接出报告。
+    """
+    title = "二、成本与容量"
+    cc = detail.get("cost_capacity")
+    if not cc:
+        return _section(title, _empty("本次回测无成交与快照，无法计算成本与容量"))
+    ex = cc.get("explicit") or {}
+    sl = cc.get("slippage") or {}
+    cap = cc.get("capacity") or {}
+
+    cards = [
+        _kpi("交易成本合计", money(ex.get("total_cost")), sub="佣金+印花税+过户费"),
+        _kpi("成本拖累占比", pct(ex.get("cost_drag_ratio")),
+             sub="成本 / 毛利（毛利=净收益+成本）"),
+        _kpi("成本 / 成交额", f"{num(ex.get('cost_bps'))} bps", sub="双边换手口径"),
+        _kpi("滑点实现偏差", f"{num(sl.get('realized_deviation_bps'))} bps",
+             sub=f"配置 {num(sl.get('configured_bps'))} bps"),
+        _kpi("容量压力", esc(cap.get("pressure_level") or "—"),
+             sub=f"最大单笔占净值 {pct(cap.get('max_trade_pct_equity'))}"),
+    ]
+
+    cost_tbl = _table(
+        ["项目", "金额 / 数值"],
+        [
+            ["佣金", money(ex.get("commission"))],
+            ["印花税", money(ex.get("stamp_duty"))],
+            ["过户费", money(ex.get("transfer_fee"))],
+            ["合计", money(ex.get("total_cost"))],
+            ["成交额（双边）", money(ex.get("turnover"))],
+            ["日均净值", money(ex.get("avg_equity"))],
+            ["成本 / 日均净值", pct(ex.get("cost_to_avg_equity"))],
+        ],
+    )
+    slip_tbl = _table(
+        ["项目", "数值"],
+        [
+            ["配置固定滑点", f"{num(sl.get('configured_bps'))} bps"],
+            ["实测实现偏差（买高/卖低为正）", f"{num(sl.get('realized_deviation_bps'))} bps"],
+            ["固定滑点无法解释的部分", f"{num(sl.get('excess_bps'))} bps"],
+            ["对应金额", money(sl.get("excess_cost_amount"))],
+            ["可匹配成交 / 总成交",
+             f"{sl.get('matched_trades') or 0} / {sl.get('trades_count') or 0} 笔"],
+        ],
+    )
+    cap_tbl = _table(
+        ["项目", "数值"],
+        [
+            ["成交笔数", str(cap.get("trades_count") or 0)],
+            ["最大单笔成交额", money(cap.get("max_trade_amount"))],
+            ["最大单笔 / 当日净值", pct(cap.get("max_trade_pct_equity"))],
+            ["平均单笔 / 当日净值", pct(cap.get("avg_trade_pct_equity"))],
+            [f"大额成交笔数（≥{pct(cap.get('large_trade_threshold_pct'))} 净值）",
+             str(cap.get("large_trade_count") or 0)],
+            ["大额成交额占比", pct(cap.get("large_trade_amount_ratio"))],
+            ["容量压力等级", esc(cap.get("pressure_level") or "—")],
+        ],
+    )
+    note = (
+        '<div class="meta"><div class="gen">'
+        "口径说明：回测未落库行情，滑点实现偏差以「成交价 vs 同日持仓隐含收盘价"
+        "（市值/数量，缺失时取最近快照）」估算，买高/卖低记为正；它与配置固定滑点的"
+        "差额近似市场冲击与择时代价。容量按单笔成交额占当日净值比例衡量，"
+        f"≥{pct(cap.get('large_trade_threshold_pct'))} 记为大额。"
+        "</div></div>"
+    )
+    body = (
+        '<div class="kpi-grid">' + "".join(cards) + "</div>"
+        + "<h3>2.1 显性成本</h3>" + cost_tbl
+        + "<h3>2.2 滑点实现偏差</h3>" + slip_tbl
+        + "<h3>2.3 容量与冲击成本</h3>" + cap_tbl
+        + note
+    )
+    return _section(title, body)
 
 
 def _overview(detail: dict) -> str:
@@ -445,7 +526,8 @@ def _ca_multi_chart(d: dict) -> Optional[Tuple[str, dict]]:
         return None
     option = {
         "tooltip": {"trigger": "axis", "axisPointer": {"type": "shadow"}},
-        "grid": {"left": 24, "right": 24, "top": 24, "bottom": 40, "containLabel": True},
+        # left 需让出竖排轴名（nameGap 46）：containLabel 只兜轴刻度，不兜轴名
+        "grid": {"left": 56, "right": 24, "top": 24, "bottom": 40, "containLabel": True},
         "xAxis": {"type": "category",
                   "data": [r["name"] + ("（主）" if r.get("is_main") else "") for r in rows]},
         # 竖排居中：默认 'end' 会把「危机Alpha占比」挤在左上角被裁切
@@ -467,7 +549,8 @@ def _ca_annual_bar(d: dict) -> Optional[Tuple[str, dict]]:
         return None
     option = {
         "tooltip": {"trigger": "axis", "axisPointer": {"type": "shadow"}},
-        "grid": {"left": 24, "right": 24, "top": 24, "bottom": 40, "containLabel": True},
+        # left 需让出竖排轴名（nameGap 42），否则打印时左侧轴名被画布裁掉
+        "grid": {"left": 56, "right": 24, "top": 24, "bottom": 40, "containLabel": True},
         "xAxis": {"type": "category",
                   "data": [f"{r['年份']}{'*' if not r.get('完整') else ''}" for r in rows]},
         # 竖排居中，避免「危机Alpha」轴名与顶部刻度重叠
@@ -896,7 +979,7 @@ def _industry_block(d: dict, charts: List[Tuple[str, dict]]) -> str:
     chart = _industry_chart(ia)
     if chart:
         charts.append(chart)
-        out += _chart("chart-ia", 300)
+        out += _chart("chart-ia", 360)
     unmapped = ia.get("unmapped_codes") or []
     if unmapped:
         out += f'<p class="note">未匹配行业（计入未分类）：{esc("、".join(unmapped))}</p>'
@@ -1005,34 +1088,34 @@ def _market_regime_section(detail: dict,
                            charts: List[Tuple[str, dict]]) -> str:
     mr = detail.get("market_regime")
     if mr is None:
-        return _section("二、市场状态×绩效（机遇/中性Alpha · 风格 · 行业 · 稳健性）",
+        return _section("三、市场状态×绩效（机遇/中性Alpha · 风格 · 行业 · 稳健性）",
                         _empty("本次回测未计算市场状态分析"))
     if mr.get("status") != "completed":
-        return _section("二、市场状态×绩效（机遇/中性Alpha · 风格 · 行业 · 稳健性）",
+        return _section("三、市场状态×绩效（机遇/中性Alpha · 风格 · 行业 · 稳健性）",
                         _empty(f"分析状态：{esc(mr.get('status'))}；{esc(mr.get('error') or '')}"))
     d = mr.get("data") or {}
-    body = ["<h3>2.1 市场状态×绩效总表</h3>", _regime_states(d),
-            "<h3>2.2 机遇 Alpha（上涨捕获）</h3>", _opportunity(d),
-            "<h3>2.3 反弹弹性（下跌后反弹段）</h3>", _rebound(d),
-            "<h3>2.4 中性 Alpha（震荡磨损）</h3>", _neutral(d),
-            "<h3>2.5 风格×绩效矩阵（结构性行情）</h3>", _style_block(d),
-            "<h3>2.6 市场分化度（宽基截面标准差）</h3>",
+    body = ["<h3>3.1 市场状态×绩效总表</h3>", _regime_states(d),
+            "<h3>3.2 机遇 Alpha（上涨捕获）</h3>", _opportunity(d),
+            "<h3>3.3 反弹弹性（下跌后反弹段）</h3>", _rebound(d),
+            "<h3>3.4 中性 Alpha（震荡磨损）</h3>", _neutral(d),
+            "<h3>3.5 风格×绩效矩阵（结构性行情）</h3>", _style_block(d),
+            "<h3>3.6 市场分化度（宽基截面标准差）</h3>",
             _dispersion_block(d, charts),
-            "<h3>2.7 隐含风格暴露（滚动相关 / OLS Beta）</h3>",
+            "<h3>3.7 隐含风格暴露（滚动相关 / OLS Beta）</h3>",
             _exposure_block(d),
-            "<h3>2.7-B 巨潮四象限·纯风格暴露（规模×成长/价值）</h3>",
+            "<h3>3.7-B 巨潮四象限·纯风格暴露（规模×成长/价值）</h3>",
             _quadrant_block(d),
-            f"<h3>2.8 行业归因（{esc((d.get('industry_attribution') or {}).get('taxonomy') or '通达信二级行业')}）</h3>",
+            f"<h3>3.8 行业归因（{esc((d.get('industry_attribution') or {}).get('taxonomy') or '通达信二级行业')}）</h3>",
             _industry_block(d, charts),
-            "<h3>2.9 稳健性体检 🔬（只读快照计算，不重跑回测）</h3>",
+            "<h3>3.9 稳健性体检 🔬（只读快照计算，不重跑回测）</h3>",
             _robustness_block(d, charts)]
-    return _section("二、市场状态×绩效（机遇/中性Alpha · 风格 · 行业 · 稳健性）",
+    return _section("三、市场状态×绩效（机遇/中性Alpha · 风格 · 行业 · 稳健性）",
                     "".join(body))
 
 
 def _robustness_section(detail: dict) -> str:
-    """三、稳健性检验：年度/3年滚动/个股集中度/样本内外（纯后处理）。"""
-    title = "三、稳健性检验（年度 / 3年滚动 / 集中度 / 样本内外）"
+    """四、稳健性检验：年度/3年滚动/个股集中度/样本内外（纯后处理）。"""
+    title = "四、稳健性检验（年度 / 3年滚动 / 集中度 / 样本内外）"
     rb = detail.get("robustness")
     if rb is None:
         return _section(title, _empty("本次回测未计算稳健性检验"))
@@ -1055,7 +1138,7 @@ def _robustness_section(detail: dict) -> str:
         ann_rows.append([esc(a.get("year")), pct_signed(a.get("return")),
                          pct(a.get("max_drawdown"))])
         ann_cls.append([None, cls(a.get("return")), "neg"])
-    body.append("<h3>3.1 年度收益与年内最大回撤</h3>")
+    body.append("<h3>4.1 年度收益与年内最大回撤</h3>")
     body.append(_table(["年度", "收益", "年内最大回撤"], ann_rows, ann_cls)
                 if ann_rows else _empty("无年度数据"))
 
@@ -1065,7 +1148,7 @@ def _robustness_section(detail: dict) -> str:
         r3_rows.append([f"{esc(w.get('start'))} ~ {esc(w.get('end'))}",
                         pct_signed(w.get("cagr")), pct(w.get("max_drawdown"))])
         r3_cls.append([None, cls(w.get("cagr")), "neg"])
-    body.append("<h3>3.2 3年滚动窗口（CAGR / 窗口内最大回撤）</h3>")
+    body.append("<h3>4.2 3年滚动窗口（CAGR / 窗口内最大回撤）</h3>")
     body.append(_table(["窗口", "CAGR", "窗口内最大回撤"], r3_rows, r3_cls)
                 if r3_rows else _empty("区间不足 3 年，无滚动窗口"))
 
@@ -1092,7 +1175,7 @@ def _robustness_section(detail: dict) -> str:
                     f" ／ 占净利 {pct(conc.get('top20_share'))}")
     else:
         summary += f"　前20只占总净利 {pct(conc.get('top20_share'))}"
-    body.append("<h3>3.3 盈利贡献分布（已实现 / 未实现 / 单笔）</h3>")
+    body.append("<h3>4.3 盈利贡献分布（已实现 / 未实现 / 单笔）</h3>")
     body.append(f'<p class="note">{esc(summary)}</p>')
     body.append(_table(["#", "代码", "已实现净 P&L", "占毛利", "占净利"],
                        conc_rows, conc_cls)
@@ -1146,7 +1229,7 @@ def _robustness_section(detail: dict) -> str:
             body.append(_table(["#", "代码", "买入 → 卖出", "股数", "盈亏", "占毛利", "占净利"],
                                lot_rows, lot_cls))
 
-    body.append("<h3>3.4 样本内 / 样本外对比（默认 75/25 自动切分）</h3>")
+    body.append("<h3>4.4 样本内 / 样本外对比（默认 75/25 自动切分）</h3>")
     oos = d.get("oos")
     if not oos:
         body.append(_empty("区间不足 2 年，无法切分样本内/样本外"))
@@ -1304,7 +1387,7 @@ def _box_chart(rb: dict, key: str, name: str) -> Optional[Tuple[str, dict]]:
                 "最小值：{c1}%"
             ),
         },
-        "grid": {"left": 24, "right": 24, "top": 30, "bottom": 30, "containLabel": True},
+        "grid": {"left": 56, "right": 24, "top": 30, "bottom": 30, "containLabel": True},
         "xAxis": {"type": "category", "data": categories},
         # 竖排居中：默认 'end' 会把「日收益率(%)」等轴名挤到左上角被裁切
         "yAxis": {"type": "value", "name": f"{name}收益率(%)",
@@ -1375,7 +1458,7 @@ def _annual_bar_chart(rb: dict) -> Optional[Tuple[str, dict]]:
         return None
     option = {
         "tooltip": {"trigger": "axis", "axisPointer": {"type": "shadow"}},
-        "grid": {"left": 24, "right": 24, "top": 30, "bottom": 30, "containLabel": True},
+        "grid": {"left": 56, "right": 24, "top": 30, "bottom": 30, "containLabel": True},
         "xAxis": {"type": "category", "data": [str(y.get("year")) for y in yearly]},
         # 竖排居中，避免「年收益(%)」与顶部刻度挤在一起
         "yAxis": {"type": "value", "name": "年收益(%)",
@@ -1399,8 +1482,9 @@ def _persistence_rolling_chart(d: dict) -> Optional[Tuple[str, dict]]:
 
     return "chart-p-rolling", {
         "tooltip": {"trigger": "axis"},
-        "legend": {"itemGap": 20, "textStyle": {"fontSize": 12}},
-        "grid": {"left": 70, "right": 24, "bottom": 46, "top": 46},
+        "legend": {"bottom": 0, "itemGap": 20, "textStyle": {"fontSize": 12}},
+        # bottom 46→72：底部图例独占一行，避免窄版式（A4 正文宽）压住日期刻度
+        "grid": {"left": 70, "right": 24, "bottom": 72, "top": 46},
         "xAxis": {"type": "category", "data": dates,
                   "axisLabel": {"formatter": "__DATEFMT__", "fontSize": 11}},
         # 竖排居中：默认 'end' 会把「滚动年化(%)」挤在左上角被裁切
@@ -1421,8 +1505,8 @@ def _persistence_rolling_chart(d: dict) -> Optional[Tuple[str, dict]]:
 
 
 def _persistence_section(detail: dict, charts: List[Tuple[str, dict]]) -> str:
-    """四、持续性检验（阿尔法衰减 vs 风格钟摆）：分年度超额/风险/交易结构 + 滚动年化。"""
-    title = "四、持续性检验（阿尔法衰减 vs 风格钟摆）"
+    """五、持续性检验（阿尔法衰减 vs 风格钟摆）：分年度超额/风险/交易结构 + 滚动年化。"""
+    title = "五、持续性检验（阿尔法衰减 vs 风格钟摆）"
     pp = detail.get("persistence")
     if pp is None:
         return _section(title, _empty("本次回测未计算持续性检验"))
@@ -1465,7 +1549,7 @@ def _persistence_section(detail: dict, charts: List[Tuple[str, dict]]) -> str:
                 else f'<span>{esc(s.get("word") or "")}</span>',
             ])
             s_cls.append([None, None, None])
-        body.append("<h3>4.0 判定信号（判定窗口实测 → 结论）</h3>")
+        body.append("<h3>5.0 判定信号（判定窗口实测 → 结论）</h3>")
         body.append(_table(["维度", "实测", "判定"], s_rows, s_cls))
     elif v.get("reasons"):
         body.append('<ul class="note">')
@@ -1485,7 +1569,7 @@ def _persistence_section(detail: dict, charts: List[Tuple[str, dict]]) -> str:
             pct(y.get("cost_ratio")),
         ])
         m_cls.append([None, cls(y.get("nav_return")), "neg", None, None, None, None, None, None])
-    body.append("<h3>4.1 分年度指标矩阵（* 未满 200 交易日，不参与判定）</h3>")
+    body.append("<h3>5.1 分年度指标矩阵（* 未满 200 交易日，不参与判定）</h3>")
     body.append(_table(["年份", "收益", "最大回撤", "夏普", "卡玛", "胜率", "盈亏比", "换手×（双边）", "成本/日均净值"],
                        m_rows, m_cls) if m_rows else _empty("无年度数据"))
 
@@ -1502,13 +1586,13 @@ def _persistence_section(detail: dict, charts: List[Tuple[str, dict]]) -> str:
             rc.append(cls(val) if val is not None else None)
         e_rows.append(row)
         e_cls.append(rc)
-    body.append("<h3>4.2 分年度超额收益（vs 组合基准 + 宽基）</h3>")
+    body.append("<h3>5.2 分年度超额收益（vs 组合基准 + 宽基）</h3>")
     body.append(_table(head, e_rows, e_cls) if e_rows else _empty("无超额数据"))
 
     roll_opt = _persistence_rolling_chart(d)
     if roll_opt:
         charts.append(roll_opt)
-        body.append("<h3>4.3 滚动年化收益（策略 6M/12M vs 基准 12M）</h3>")
+        body.append("<h3>5.3 滚动年化收益（策略 6M/12M vs 基准 12M）</h3>")
         body.append(_chart(roll_opt[0], 340))
         body.append('<p class="note">解读：策略 12M 与基准 12M 同步回落→风格钟摆；策略 12M 单独下坠而基准平稳→疑似阿尔法衰减；6M 波动大于 12M 属正常，连续下行段才是关注点。</p>')
     return _section(title, "".join(body))
@@ -1535,7 +1619,7 @@ def _returns_bucket_section(detail: dict, charts: List[Tuple[str, dict]]) -> str
             body.append(_box_stats_table(rb, stat_key))
     if not body:
         return ""
-    return _section("五、收益分布",
+    return _section("七、收益分布",
                     "".join(body) + '<p class="note">月度热力图红涨绿跌、数值常驻显示；'
                     "箱线图方块为 Q1~Q3 四分位区间、中线为中位数、金色菱形◆为均值、"
                     "灰色虚线为零轴；下方统计表与图表同口径，正红负绿（A股口径）。"
@@ -1574,7 +1658,7 @@ def _gate_val(v) -> str:
 def _decision_section(detail: dict) -> str:
     summary = detail.get("decision_summary") or []
     decisions = detail.get("decisions") or []
-    title = "六、风控与拦截统计（调参可观测性）"
+    title = "八、风控与拦截统计（调参可观测性）"
     if not summary and not decisions:
         return _section(title, _empty("本次回测无闸门拦截/触发记录"))
     rows, row_cls = [], []
@@ -1619,7 +1703,7 @@ def _decision_section(detail: dict) -> str:
 # ---------------------------------------------------------------------------
 def _trades_section(detail: dict) -> str:
     trades = detail.get("trades") or []
-    title = "七、交易明细"
+    title = "九、交易明细"
     if not trades:
         return _section(title, _empty("本次回测无成交记录"))
     rows, row_cls = [], []
@@ -1649,6 +1733,7 @@ _EVAL_ROWS = [
     ("total_return", "总收益", "pct"), ("annual_return", "年化收益", "pct"),
     ("max_drawdown", "最大回撤", "pct"), ("volatility", "年化波动率", "pct"),
     ("sharpe_ratio", "夏普比率", "num"), ("sortino_ratio", "索提诺比率", "num"),
+    ("downside_volatility", "年化下行波动率", "pct"),
     ("calmar_ratio", "卡玛比率", "num"), ("win_rate", "胜率", "pct"),
     ("profit_factor", "盈亏比", "num"), ("total_trades", "交易次数", "int"),
     ("benchmark_return", "基准收益", "pct"), ("avg_holding_days", "平均持仓天数", "num"),
@@ -1656,6 +1741,7 @@ _EVAL_ROWS = [
     ("excess_annual_return", "年化超额", "pct"), ("tracking_error", "跟踪误差", "pct"),
     ("information_ratio", "信息比率", "num"), ("up_capture_ratio", "上行捕获", "pct"),
     ("down_capture_ratio", "下行捕获", "pct"), ("excess_max_drawdown", "超额回撤", "pct"),
+    ("excess_calmar_ratio", "超额卡玛", "num"),
     ("annual_turnover", "年化换手（双边）", "turnover"), ("total_cost_ratio", "交易成本/日均净值", "pct"),
     ("avg_position_utilization", "平均仓位利用率", "pct"), ("empty_days_ratio", "空仓日占比", "pct"),
     ("max_single_weight", "最大单票权重", "pct"), ("hhi", "持仓集中度 HHI", "num"),
@@ -1688,7 +1774,7 @@ def _strategy_eval_section(detail: dict) -> str:
     sevs = detail.get("strategy_evaluations") or []
     if not ev and not sevs:
         return ""
-    title = "四、策略绩效评估"
+    title = "六、策略绩效评估"
     body = []
     if ev:
         cards = "".join([
@@ -1778,7 +1864,78 @@ details{margin:8px 0}summary{cursor:pointer;font-size:13px;color:#4b5563}
 .scroll-tbl{max-height:520px;overflow:auto}
 .gate-code{color:#9ca3af;font-size:10px;margin-left:4px}
 pre.json-dump{background:#0f172a;color:#e2e8f0;border-radius:6px;padding:12px;font-size:11px;line-height:1.5;max-height:480px;overflow:auto;white-space:pre-wrap;word-break:break-all}
+
+/* ===== 打印版式（A4）：仅作用于 @media print，不影响屏幕预览 ===== */
+@media print{
+  html,body{background:#fff}
+  body{font-size:10pt;line-height:1.5;color:#111827;
+       -webkit-print-color-adjust:exact;print-color-adjust:exact}
+  .wrap{max-width:none;margin:0;padding:0}
+  h1{font-size:18pt;line-height:1.3;margin:0 0 8pt;padding-bottom:6pt;
+     border-bottom:1.5pt solid #4a7ec4;break-after:avoid}
+  h2{font-size:13pt;line-height:1.35;margin:0 0 8pt;padding-left:8pt;
+     border-left:3pt solid #4a7ec4;break-after:avoid}
+  h3{font-size:10.5pt;line-height:1.4;margin:8pt 0 4pt;break-after:avoid}
+  /* 章节强制分页：封面（标题/概览/净值图）之后每章新起一页 */
+  section{background:none;border:0;border-radius:0;padding:0;margin:0;
+          break-inside:auto;break-before:page}
+  section:first-of-type{break-before:auto}
+  .meta{font-size:9pt;line-height:1.7;margin:0 0 8pt}
+  .gen{font-size:8pt}
+  .kpi-grid{grid-template-columns:repeat(3,1fr);gap:6pt;margin:6pt 0 10pt;
+            break-inside:avoid}
+  .kpi{padding:6pt 8pt}
+  .kpi-label{font-size:8pt}.kpi-value{font-size:13pt}.kpi-sub{font-size:7.5pt}
+  /* 表格：正文宽度内自适应换行，禁止横向溢出；跨页重复表头，行不拆断 */
+  table{font-size:8.5pt;margin:4pt 0 8pt;width:100%;table-layout:auto}
+  th,td{padding:3pt 4pt;white-space:normal;overflow-wrap:break-word}
+  th{background:#f3f4f6!important;color:#374151;white-space:nowrap}
+  thead{display:table-header-group;break-after:avoid}
+  tfoot{display:table-footer-group}
+  tr{break-inside:avoid}
+  /* 屏幕上的滚动容器在打印时展开，避免只打出可视区（成交明细被截断） */
+  .scroll-tbl{max-height:none;overflow:visible}
+  .chart-box{overflow:visible;break-inside:avoid}
+  .chart{min-width:0;width:100%;margin:4pt 0}
+  /* ECharts 画布按屏幕宽度初始化，打印时等比缩进正文宽度，不横向溢出 */
+  .chart canvas{max-width:100%!important;height:auto!important}
+  .spb,.empty{break-inside:avoid}
+  /* details 下钻明细：导出/PDF 直接展开铺出，不再只留一行「点击展开」
+     （::details-content 是 Chromium 131+ 的 details 内容槽，仅在打印媒体下可见） */
+  details{break-inside:auto;margin:4pt 0}
+  details::details-content{content-visibility:visible;display:block}
+  details:not([open])>*:not(summary){display:block!important}
+  details>summary{list-style:none;font-size:9pt;font-weight:600;
+                  color:#374151;break-after:avoid}
+  details>summary::-webkit-details-marker{display:none}
+  .spb ul{font-size:9pt}
+  .note{font-size:8pt;margin:4pt 0;break-before:avoid}
+  pre.json-dump{max-height:none;overflow:visible}
+}
 """
+
+
+def _css_string(value: Any) -> str:
+    """把任意文本转成可安全放进 CSS 字符串（@page 页眉/页脚）的形式。"""
+    text = " ".join(str(value or "").split())
+    return text.replace("\\", "\\\\").replace('"', '\\"')
+
+
+def _print_page_css(rec: dict) -> str:
+    """按报告生成 A4 页面规则：纸张/页边距 + 页眉（报告名）+ 页脚（页码）。
+
+    Chromium(≥131) 支持 @page 外边距盒，由 PDF 打印时直接渲染页眉页脚；
+    旧版浏览器不支持时静默忽略，不影响正文排版。
+    """
+    name = _css_string(rec.get("name")) or "未命名"
+    return (
+        "@page{size:A4 portrait;margin:16mm 14mm 16mm 14mm;"
+        '@top-left{content:"回测分析报告";font-size:8pt;color:#6b7280}'
+        f'@top-right{{content:"{name}";font-size:8pt;color:#6b7280}}'
+        '@bottom-right{content:"第 " counter(page) " 页 / 共 " '
+        'counter(pages) " 页";font-size:8pt;color:#6b7280}'
+        "}"
+    )
 
 
 def build_html_report(detail: dict) -> str:
@@ -1793,6 +1950,7 @@ def build_html_report(detail: dict) -> str:
         _overview(detail)
         + nav_html
         + _crisis_section(detail, charts)
+        + _cost_capacity_section(detail)
         + _market_regime_section(detail, charts)
         + _robustness_section(detail)
         + _persistence_section(detail, charts)
@@ -1812,17 +1970,26 @@ var __INSTANCES__ = [];
 document.querySelectorAll('.chart').forEach(function(el){
   var opt = __CHARTS__[el.id];
   if(!opt) return;
+  // 离线报告是静态快照：关闭入场动画，避免打印瞬间截到画到一半的图表
+  opt.animation = false;
   [opt.xAxis].flat().forEach(function(ax){
     if(ax && ax.axisLabel && ax.axisLabel.formatter === '__DATEFMT__'){
       ax.axisLabel.formatter = __datefmt;
     }
   });
-  var ch = echarts.init(el, null, {renderer:'canvas'});
+  var ch = echarts.init(el, null, {renderer:'canvas', devicePixelRatio: 2});
   ch.setOption(opt);
   __INSTANCES__.push(ch);
 });
 // 窗口尺寸变化/缩放后重算布局，避免 canvas 停在初始化时的宽度导致文字挤压
 window.addEventListener('resize', function(){
+  __INSTANCES__.forEach(function(ch){ ch.resize(); });
+});
+// 打印/导出 PDF 前后按版式宽度重排一次，保证 canvas 不被拉伸模糊
+window.addEventListener('beforeprint', function(){
+  __INSTANCES__.forEach(function(ch){ ch.resize(); });
+});
+window.addEventListener('afterprint', function(){
   __INSTANCES__.forEach(function(ch){ ch.resize(); });
 });
 </script>
@@ -1832,7 +1999,7 @@ window.addEventListener('resize', function(){
         "<!DOCTYPE html>\n<html lang=\"zh-CN\"><head><meta charset=\"utf-8\">"
         '<meta name="viewport" content="width=device-width,initial-scale=1">'
         f"<title>回测分析报告 - {esc(rec.get('name'))}</title>"
-        f"<style>{_CSS}</style></head><body><div class=\"wrap\">"
+        f"<style>{_CSS}{_print_page_css(rec)}</style></head><body><div class=\"wrap\">"
         f"<h1>回测分析报告：{esc(rec.get('name'))}</h1>"
         f"<script>{_echarts_source()}</script>"
         f"{body}{boot}</div></body></html>"

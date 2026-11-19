@@ -347,3 +347,39 @@ def test_get_history_strips_phantom_30m(monkeypatch):
     res = td.get_history(["000001.SZ"], ["30m"],
                          start="20260101", end="20260201", count=-1)
     assert res["000001.SZ"]["30m"].height == 8
+
+# ---------------------------------------------------------------------------
+# no_trade_bar_mask（2026-11-16 P0）：fill_data 补出的无成交假 bar 识别
+# ---------------------------------------------------------------------------
+def _no_trade_mask(o, h, l, c, v):
+    from core.tq.data import no_trade_bar_mask
+    return no_trade_bar_mask(o, h, l, c, v)
+
+
+def test_no_trade_mask_flags_halted_carry_forward_bar():
+    """停牌中段：四价全等于前收、Volume=0 → 剔除；两侧真实 bar 保留。"""
+    mask = _no_trade_mask(
+        [10, 10, 11], [10, 10, 11], [10, 10, 11], [10, 10, 11], [1000, 0, 2000])
+    assert mask == [False, True, False]
+
+
+def test_no_trade_mask_flags_leading_prelisting_bars():
+    """上市前回填：四价全等于下一根有效收盘、Volume=0 → 剔除。"""
+    mask = _no_trade_mask(
+        [10, 10, 10], [10, 10, 10], [10, 10, 10], [10, 10, 10], [0, 0, 5000])
+    assert mask == [True, True, False]
+
+
+def test_no_trade_mask_keeps_real_one_word_board_and_low_volume():
+    """真实一字板（Volume>0）与低成交日（Volume=5）不误伤。"""
+    mask = _no_trade_mask(
+        [10, 11, 11.2], [10.5, 11, 11.5], [9.8, 11, 11.0], [10, 11, 11.3],
+        [1000, 800, 5])
+    assert mask == [False, False, False]
+
+
+def test_no_trade_mask_ignores_zero_volume_price_move():
+    """Volume=0 但价格与前收不同（保守口径）：不判无成交，交给其它规则处理。"""
+    mask = _no_trade_mask([10, 10.5], [10, 10.5], [10, 10.5], [10, 10.5], [1000, 0])
+    assert mask == [False, False]
+

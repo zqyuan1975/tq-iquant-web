@@ -38,7 +38,7 @@ from .event import OrderEvent, TradeEvent
 from .execution_engine import OrderDispatcher
 from .http_bridge_dispatcher import BridgeOrderRejected, BridgeUnavailableError
 from .live.timing import now_shanghai
-from .market_rules import _limit_ratio_for
+from .price_limit import extract_name, resolve_limit_rule
 
 logger = logging.getLogger(__name__)
 
@@ -60,6 +60,9 @@ PRICE_MODE_MAP = {
 #   0 无效单/废单(57) 1 未成交(50) 2 部分成交(55, 非终态) 3 全部成交(56)
 #   4 部分撤单(53, 终态) 5 全部撤单(54, 终态)
 _STATUS_MAP = {0: 57, 1: 50, 2: 55, 3: 56, 4: 53, 5: 54}
+#: 认领超时（秒）：与 live/order_machine._ORDER_REF_MATCH_TIMEOUT 同口径（180s）。
+#: 仅用于「认领价差不符」风险事件的倒计时说明，不参与任何判定。
+_CLAIM_EXPIRE_SECONDS = 180
 
 # 手册 query_stock_positions 字段：Code / Cbj(成本价) / TotalVol / CanUseVol
 _POS_VOL_KEYS = ("TotalVol", "Amount", "Volume", "Cjsl")
@@ -167,7 +170,7 @@ class TdxTqDispatcher(OrderDispatcher):
     def __init__(self, account: str = "", account_type: str = "stock",
                  price_mode: str = "my", client_path: str = "",
                  auto_confirm_dialog: bool = True, confirm_timeout: float = 12.0,
-                 confirmer=None, **_kwargs):
+                 confirmer=None, on_claim_anomaly=None, **_kwargs):
         self._account = str(account or "")
         self._account_type = str(account_type or "stock")
         self._price_mode = str(price_mode or "my")
@@ -201,12 +204,32 @@ class TdxTqDispatcher(OrderDispatcher):
         #: place_order 返回 None。引擎据此把订单**保持 submitted**（不判拒单），
         #: 由后续 /deals 轮询认领或 180s 超时收口——避免真实在途单脱离跟踪。
         self.last_unconfirmed_order_id: Optional[str] = None
+        #: 与 last_unconfirmed_order_id 配套的可读原因（2026-11-18）：引擎把它写进
+        #: live_orders.error_message，工作台直接看到「已点击但行仍待发送」等真实
+        #: 原因，而不是通用文案。非本通道语义时为空串。
+        self._last_unconfirmed_message: str = ""
+        #: 认领异常回调（引擎注入 → 转 risk 事件）：PRICE_MY 下同码同向同量候选
+        #: 的 WtPrice 与审批价不符时调用，让「静默等 180s expire」在工作台可见。
+        self.on_claim_anomaly = on_claim_anomaly
+        #: 证券名称缓存 symbol -> (YYYY-MM-DD, name)：ST 判定用（名称按日失效，
+        #: 摘帽/戴帽次日重取）。取不到记 None，避免每单重复打 TQ。
+        self._name_cache: Dict[str, tuple] = {}
+        #: B8（2026-11-10）：成交方向兜底用——上一次 query_deals 时的持仓数量快照
+        #: （6 位代码 → 数量）。委托表/成交行查不到方向时，用「本次 - 上次」的
+        #: 持仓增量推断方向（增=买、减=卖，低置信，仅兜底并打 WARNING）。
+        self._last_pos_snapshot: Dict[str, int] = {}
+        self._pos_snapshot_lock = threading.Lock()
 
     # ---- 连接 ----
 
     @property
     def last_error(self) -> str:
         return self._last_error
+
+    @property
+    def last_unconfirmed_message(self) -> str:
+        """最近一次「已受理未认领」的具体原因（引擎写进 live_orders.error_message）。"""
+        return self._last_unconfirmed_message
 
     @staticmethod
     def order_id(order: OrderEvent) -> str:
@@ -397,6 +420,16 @@ class TdxTqDispatcher(OrderDispatcher):
                 "order_id": str(r.get("Wtbh") or r.get("OrderId") or ""),
                 "symbol": str(r.get("Code") or r.get("StockCode") or ""),
                 "direction": "buy" if flag == 0 else "sell",
+                # B8：方向是否来自柜台真实字段（BSFlag/Type/BsFlag 且取值 0/1）。
+                # query_deals 只在该值为真时直接透出 side，避免「字段缺失→按买处理」
+                # 的兜底把成交方向猜成买入（卖单记成加仓是血亏路径）。
+                "direction_known": raw_flag is not None and flag in (0, 1),
+                # 合同编号（各 TQ 版本字段名不一，缺失为空串）：成交行缺方向时
+                # 用它回查同一委托（分笔成交共用同一合同编号）。
+                "contract_id": str(
+                    r.get("Htbh") or r.get("ContractNo") or r.get("ContractID")
+                    or r.get("ContractId") or r.get("Cjbh") or r.get("MatchNo")
+                    or "").strip(),
                 "price": float(_num(r, _ORD_PRICE_KEYS, 0) or 0),
                 "fill_price": float(_num(r, _ORD_FILL_PRICE_KEYS, 0) or 0),
                 "volume": int(_num(r, _ORD_VOL_KEYS, 0) or 0),
@@ -482,11 +515,59 @@ class TdxTqDispatcher(OrderDispatcher):
             })
         return out
 
+    def _position_delta_map(self) -> Dict[str, int]:
+        """持仓数量增量（本次 - 上次 query_deals 快照）：正=买、负=卖（低置信兜底）。
+
+        只用于「委托表/成交行都查不到方向」的成交（B8）。读失败返回空 dict 且
+        **不覆盖**上次快照——把一次查询故障当成「持仓清零」会制造巨额假增量。
+        首次调用（无基线）返回空 dict，绝不凭空推断。
+        """
+        try:
+            # 保存并还原 _last_error：这里是兜底推断，不能把委托查询的健康状态
+            # 改写成持仓查询的瞬时错误（会污染会话健康展示）。
+            prev_err = self._last_error
+            try:
+                rows = self.get_positions()
+            finally:
+                self._last_error = prev_err
+        except Exception:  # noqa: BLE001
+            return {}
+        cur: Dict[str, int] = {}
+        for r in rows or []:
+            code = re.sub(r"\D", "", str(r.get("symbol") or ""))[:6]
+            if len(code) != 6:
+                continue
+            try:
+                cur[code] = int(r.get("volume") or 0)
+            except (TypeError, ValueError, OverflowError):
+                continue
+        with self._pos_snapshot_lock:
+            prev = self._last_pos_snapshot
+            self._last_pos_snapshot = cur
+        if not prev:
+            return {}
+        out: Dict[str, int] = {}
+        for code, vol in cur.items():
+            before = prev.get(code, 0)
+            if vol != before:
+                out[code] = vol - before
+        return out
+
     def query_deals(self, order_id: Optional[str] = None) -> list:
         """由委托表「CjVol(成交量) + 成交价」合成成交回报（当日累计值）。
 
         Core 的 backfill_order 按 order_ref 聚合、用累计量覆盖 filled_quantity，
         因此直接返回累计成交行即可；佣金/印花税不在委托表暴露，按 0 记。
+
+        方向判定（B8 2026-11-10，优先级从高到低）：
+        1) 本委托行自带 BSFlag/Type/BsFlag（``direction_known``）→ 直接透出
+           ``side``（order_machine._deal_trade_type 优先读 side）；
+        2) 委托行缺方向字段时，用委托号/合同编号在**同一次** get_orders 结果里
+           回查（分笔成交共用同一委托号，可归回同一委托），命中即用其方向；
+        3) 仍无方向 → 用「本次 vs 上次」持仓增量推断（增=买、减=卖），打 WARNING
+           标明低置信，行内 ``side_source=position_delta``；
+        4) 两条都判不出（当日买卖对冲/数量不变等）→ 不输出 side，交由
+           order_machine 记 external_deal_unknown_direction（绝不猜方向）。
         """
         out = []
         orders = self.get_orders()
@@ -494,6 +575,18 @@ class TdxTqDispatcher(OrderDispatcher):
             # 读失败 ≠ 无成交：抛出让调用方跳过本轮，避免误判为「已全部无成交」。
             raise BridgeUnavailableError(
                 "通达信委托查询失败：%s" % self._last_error)
+        by_ref: Dict[str, dict] = {}
+        by_contract: Dict[str, dict] = {}
+        for o in orders:
+            ref0 = str(o.get("order_id") or "").strip()
+            if ref0:
+                by_ref[ref0] = o
+            cid0 = str(o.get("contract_id") or "").strip()
+            if cid0:
+                by_contract[cid0] = o
+        # 持仓增量在循环前取一次（快照随每次轮询推进，增量窗口≈一个轮询周期）
+        delta = self._position_delta_map()
+        pending: list = []
         for o in orders:
             ref = str(o.get("order_id") or "").strip()
             filled = int(o.get("filled_volume") or 0)
@@ -505,7 +598,7 @@ class TdxTqDispatcher(OrderDispatcher):
                 continue
             trade_date, trade_time = self._submit_times.get(
                 ref, (now_shanghai().strftime("%Y%m%d"), now_shanghai().strftime("%H%M%S")))
-            out.append({
+            row = {
                 "order_ref": ref,
                 "remark": "",
                 "instrument": code,
@@ -518,7 +611,46 @@ class TdxTqDispatcher(OrderDispatcher):
                 "stamp_duty": 0,
                 "trade_date": trade_date,
                 "trade_time": trade_time,
-            })
+            }
+            # ① 本行自带方向字段
+            if o.get("direction_known"):
+                row["side"] = o.get("direction")
+                row["side_source"] = "order_lookup"
+                out.append(row)
+                continue
+            # ② 委托号/合同编号回查同一批委托列表（分笔共用同一编号）
+            other = None
+            cid = str(o.get("contract_id") or "").strip()
+            if cid:
+                other = by_contract.get(cid)
+            if other is None:
+                other = by_ref.get(ref)
+            if other is not None and other is not o and other.get("direction_known"):
+                row["side"] = other.get("direction")
+                row["side_source"] = "order_lookup"
+                out.append(row)
+                continue
+            # ③ 降级：持仓增量（待整批收集后再判，避免同代码多笔歧义）
+            pending.append(row)
+            out.append(row)
+        if pending:
+            counts: Dict[str, int] = {}
+            for r in pending:
+                counts[r["instrument"]] = counts.get(r["instrument"], 0) + 1
+            for r in pending:
+                code = r["instrument"]
+                if counts.get(code, 0) != 1:
+                    # 同代码多笔都无法判向 → 增量归属有歧义，保持未知
+                    continue
+                d = delta.get(code)
+                if not d:
+                    continue
+                r["side"] = "buy" if d > 0 else "sell"
+                r["side_source"] = "position_delta"
+                logger.warning(
+                    "deal direction inferred from position delta (low confidence): "
+                    "%s ref=%s qty=%d delta=%+d — 成交量 %d，按持仓增量判为 %s",
+                    code, r["order_ref"], r["volume"], d, r["volume"], r["side"])
         return out
 
     def query_calendar(self) -> list:
@@ -614,7 +746,13 @@ class TdxTqDispatcher(OrderDispatcher):
         return out
 
     def query_quote(self, code: str, period: str = "1m", count: int = 10) -> list:
-        """行情复用 Core 同进程内嵌的 TQ 模块（与回测取数口径一致）。"""
+        """行情复用 Core 同进程内嵌的 TQ 模块（与回测取数口径一致）。
+
+        复权口径（P2-9）：显式取**前复权**（TQ 默认值，写死防止默认值变更后静默漂移）。
+        当日分钟 bar 的前复权值与不复权实时价相同（前复权锚定最新价），故下单价、
+        涨跌停夹取、风控阈值均不受影响；历史段连续无除权缺口，与回测
+        ``dividend_mode=front`` / ``dual`` 的信号口径一致。
+        """
         tq_code = normalize_symbol(code)
         code6 = re.sub(r"\D", "", str(code or ""))[:6]
         if len(code6) != 6:
@@ -622,7 +760,8 @@ class TdxTqDispatcher(OrderDispatcher):
         try:
             from core.tq.data import TQData
             raw = TQData().get_history_raw(
-                [tq_code], [period], count=max(int(count or 10), 2))
+                [tq_code], [period], dividend_type="front",
+                count=max(int(count or 10), 2))
         except Exception as e:
             self._last_error = "quote unavailable: %s" % e
             return []
@@ -654,7 +793,8 @@ class TdxTqDispatcher(OrderDispatcher):
                 return {}
             from core.tq.data import TQData
             raw = TQData().get_history_raw(
-                [tq for _, tq in pairs], [period], count=max(int(count or 10), 2))
+                [tq for _, tq in pairs], [period], dividend_type="front",
+                count=max(int(count or 10), 2))
             converted = self._raw_to_bars(raw, period)
             return {orig: converted.get(tq, []) for orig, tq in pairs}
         except Exception as e:
@@ -694,6 +834,8 @@ class TdxTqDispatcher(OrderDispatcher):
         skip_price = PRICE_MODE_MAP.get(self._price_mode, "PRICE_MY") != "PRICE_MY"
         fallback = ""
         fallback_fabricated = ""
+        # PRICE_MY 价差候选（ref -> 柜台 WtPrice）：只做观测，不参与认领判定。
+        price_mismatches: Dict[str, float] = {}
         for i in range(max(attempts, 1)):
             pre = set(self._known_refs)
             for o in reversed(self.get_orders()):
@@ -704,8 +846,13 @@ class TdxTqDispatcher(OrderDispatcher):
                     continue
                 if o["direction"] != direction or int(o["volume"]) != int(volume):
                     continue
-                if not skip_price and price > 0 and abs(float(o["price"]) - price) > 1e-6:
-                    continue
+                if not skip_price and price > 0:
+                    cand_price = float(o["price"] or 0)
+                    # 按分比对（用户口径）：柜台价与审批价四舍五入到 0.01 后不等
+                    # 才算价差，避免浮点尾差（10.500000001）误报。
+                    if round(cand_price, 2) != round(price, 2):
+                        price_mismatches[ref] = cand_price
+                        continue
                 if ref not in pre:
                     self._claimed_refs.add(ref)
                     return ref
@@ -721,7 +868,52 @@ class TdxTqDispatcher(OrderDispatcher):
             fallback = fallback_fabricated
         if fallback:
             self._claimed_refs.add(fallback)
+        elif price_mismatches:
+            # 认领彻底失败且存在「同码同向同量、仅价格不符」的委托 → 让静默的
+            # 180s expire 在工作台可见（不改认领判定：绝不按价差绑单）。
+            self._report_claim_price_mismatch(
+                symbol, direction, price, volume, price_mismatches)
         return fallback
+
+    def _report_claim_price_mismatch(self, symbol: str, direction: str,
+                                     price: float, volume: int,
+                                     mismatches: Dict[str, float]) -> None:
+        """PRICE_MY 认领价差风险事件（observe-only，不影响认领结果）。
+
+        场景：本单已报出，但柜台委托表里同码同向同量的候选 WtPrice 与审批价
+        不符（价控/客户端改写/他人手单），认领因此失败并静默等 180s expire。
+        这里只把事实推到工作台（含倒计时），认领判定保持原样。
+        """
+        items = [
+            {"order_ref": ref,
+             "counter_price": float(cand),
+             "diff": round(float(cand) - float(price), 4)}
+            for ref, cand in list(mismatches.items())[:5]
+        ]
+        msg = ("通达信认领价差不符：%s %s %s 股期望价 %s，柜台候选 %s；"
+               "不按价差绑单，%d 秒后按超时失效" % (
+                   symbol, direction, int(volume), price,
+                   ", ".join("%s=%s" % (it["order_ref"], it["counter_price"])
+                             for it in items),
+                   int(_CLAIM_EXPIRE_SECONDS)))
+        logger.warning("%s", msg)
+        cb = self.on_claim_anomaly
+        if cb is None:
+            return
+        try:
+            cb({
+                "gate": "claim_price_mismatch",
+                "rule": "claim_price_mismatch",
+                "stock_code": symbol,
+                "direction": direction,
+                "volume": int(volume),
+                "expected_price": float(price),
+                "candidates": items,
+                "expire_in_seconds": int(_CLAIM_EXPIRE_SECONDS),
+                "message": msg,
+            })
+        except Exception:  # noqa: BLE001 观测回调失败不影响下单主流程
+            logger.warning("claim anomaly callback failed", exc_info=True)
 
     def cancel_order(self, order_ref: str, stock_code: str) -> bool:
         """撤单（A-1）：受理成功返回 True；失败/拒单返回 False 并记 last_error。
@@ -756,37 +948,101 @@ class TdxTqDispatcher(OrderDispatcher):
                 return False
         return True
 
-    def _prev_close_for_limit_check(self, symbol: str) -> Optional[Decimal]:
-        """取前收盘价（1d 最近 2 根里最早的一根），无有效数据返回 None。
+    def _daily_close_series(self, symbol: str, count: int = 10):
+        """最近 ``count`` 根日线收盘（升序 pandas Series）；无有效数据返回 None。
 
-        取最早一根：count=2 时首根即前一交易日；两根日期相同取该值（同值）；
-        仅 1 根用其自身。最新一根 bar 日期必须 == 今天（上海时区）——数据滞后
-        （客户端未启动/离线缓存/停牌补数）时前收与当前价基期脱节，视为无效
-        → None 跳过校验（fail-open 不变）。校验自身异常一并吞为 None（宁宽勿错）。
+        多取几根是为了同时拿到「上市交易日序」（新股判定）与最早 bar 日期，
+        供 ``core.engine.price_limit.resolve_limit_rule`` 判板块/ST/新股。
+
+        复权口径（P2-9）：显式取**前复权**日线。除权日的前复权收盘即交易所的
+        「除权后参考价」（涨跌停基准），若改用不复权原始前收，除权日会把
+        ±10%/±20% 带算偏 → 夹价错误。此序列只用于前收/板块/ST/上市日序判定，
+        不做持仓或净值口径用途。
         """
         try:
             from core.tq.data import TQData
-            raw = TQData().get_history_raw([symbol], ["1d"], count=2)
+            raw = TQData().get_history_raw(
+                [symbol], ["1d"], dividend_type="front", count=count)
             close = (raw.get("1d") or {}).get("Close")
             if close is None or getattr(close, "empty", True):
                 return None
             if symbol not in getattr(close, "columns", []):
                 return None
             series = close[symbol].dropna().sort_index()
-            if series.empty:
-                return None
-            if series.index[-1].date() != now_shanghai().date():
-                logger.warning(
-                    "涨跌停校验跳过：%s 日线最新 bar %s 非今日（数据滞后）",
-                    symbol, series.index[-1].date())
-                return None
-            value = float(series.iloc[0])
-            if value != value:  # NaN 防御
-                return None
-            return Decimal(str(value))
-        except Exception as e:
+            return series if not series.empty else None
+        except Exception as e:  # noqa: BLE001 校验取数故障一律 fail-open
+            logger.warning("涨跌停校验取日线失败，跳过检查：%s", e)
+            return None
+
+    def _stock_name(self, symbol: str) -> Optional[str]:
+        """证券名称（ST 判定用，取不到返回 None）。按日缓存，best-effort。
+
+        TQ 批量信息接口的字段名跨版本不统一（Name / StockName / 证券名称 …），
+        ``extract_name`` 深度遍历匹配；接口缺失或抛错一律视为取不到名称——
+        由 ``resolve_limit_rule`` 降级为板块默认幅度（``confidence=medium``）。
+        """
+        today = now_shanghai().date().isoformat()
+        cached = self._name_cache.get(symbol)
+        if cached is not None and cached[0] == today:
+            return cached[1]
+        name = None
+        try:
+            from core.tq.data import TQData
+            data = TQData()
+            for fn_name in ("get_market_snapshot_batch", "get_stock_info_batch"):
+                fn = getattr(data, fn_name, None)
+                if fn is None:
+                    continue
+                name = extract_name(fn([symbol], ["Name"]), symbol)
+                if name:
+                    break
+        except Exception as e:  # noqa: BLE001 名称只是 ST 判定的加分项
+            logger.debug("取证券名称失败（ST 判定降级为板块默认）：%s %s", symbol, e)
+        self._name_cache[symbol] = (today, name)
+        return name
+
+    def _prev_close_and_listing(self, symbol: str, pre_open: bool):
+        """取 ``(前收, 上市已交易日数, 最早日线日期)``；无有效数据返回 None。
+
+        盘中（pre_open=False）：最新日线必须 == 今天（上海时区），前收取倒数第二
+        根；数据滞后（客户端未启动/离线缓存/停牌补数）视为无效 → None（fail-open）。
+        盘前（pre_open=True）：当日 bar 尚不存在，前收取最新一根。
+        "上市已交易日数" = 前收那根之前的日线条数（含前收当根之前的所有）。
+        """
+        series = self._daily_close_series(symbol, 10)
+        if series is None:
+            return None
+        try:
+            earliest = series.index[0].date()
+            if pre_open:
+                value = float(series.iloc[-1])
+                listed_bars = len(series)
+            else:
+                if len(series) < 2:
+                    return None
+                if series.index[-1].date() != now_shanghai().date():
+                    logger.warning(
+                        "涨跌停校验跳过：%s 日线最新 bar %s 非今日（数据滞后）",
+                        symbol, series.index[-1].date())
+                    return None
+                value = float(series.iloc[-2])
+                listed_bars = len(series) - 1
+        except Exception as e:  # noqa: BLE001 索引不是日期等异常形态
             logger.warning("涨跌停校验取前收失败，跳过检查：%s", e)
             return None
+        if value != value or value < 1:  # NaN / 前复权早期失真
+            return None
+        return Decimal(str(value)), listed_bars, earliest
+
+    @staticmethod
+    def _limit_prices(prev_close: Decimal, ratio: Decimal):
+        """前收 × (1 ± ratio)，四舍五入到分 → ``(涨停价, 跌停价)``。"""
+        cent = Decimal("0.01")
+        limit_up = (prev_close * (1 + ratio)).quantize(
+            cent, rounding=ROUND_HALF_UP)
+        limit_down = (prev_close * (1 - ratio)).quantize(
+            cent, rounding=ROUND_HALF_UP)
+        return limit_up, limit_down
 
     def check_price_limit(
         self, stock_code: str, direction: str, price
@@ -795,33 +1051,72 @@ class TdxTqDispatcher(OrderDispatcher):
         返回拒绝原因文案；通过/跳过返回 None。
 
         引擎按组合 price_limit_check_enabled 配置门控调用（与回测同门控），
-        place_order 不再内联校验（防双查）。口径与回测一致（_limit_ratio_for +
-        前收四舍五入到分）。get_zdt_data 只有涨跌停状态无价格，不采用。
+        place_order 不再内联校验（防双查）。幅度不按「板块固定比例」，改由
+        ``core.engine.price_limit.resolve_limit_rule`` 按「板块 + ST + 新股上市
+        初期」判定（get_zdt_data 只有涨跌停状态无价格，不采用）。
         市价单（price 空/非正，成交价由交易所决定）与取不到有效前收（无数据 /
-        前复权早期失真 <1 元）跳过；整个校验块 fail-open——校验自身故障
-        绝不阻断下单，异常吞为 None。
+        前复权早期失真 <1 元）跳过；新股/ETF/转债等无可靠幅度也跳过——整个
+        校验块 fail-open：校验自身故障绝不阻断下单，超限价由柜台复核。
         """
         if price is None or price <= 0:
             return None
         try:
             symbol = normalize_symbol(stock_code)
-            prev_close = self._prev_close_for_limit_check(symbol)
-            if prev_close is None or prev_close < Decimal("1"):
+            basis = self._prev_close_and_listing(symbol, pre_open=False)
+            if basis is None:
                 return None
-            ratio = _limit_ratio_for(symbol)
-            cent = Decimal("0.01")
-            limit_up = (prev_close * (1 + ratio)).quantize(cent, rounding=ROUND_HALF_UP)
-            limit_down = (prev_close * (1 - ratio)).quantize(cent, rounding=ROUND_HALF_UP)
+            prev_close, listed_bars, earliest = basis
+            rule = resolve_limit_rule(
+                symbol, name=self._stock_name(symbol),
+                listed_bars=listed_bars, earliest_bar_date=earliest,
+                today=now_shanghai().date())
+            if rule.ratio is None:
+                logger.info(
+                    "涨跌停校验跳过（%s 无可靠幅度，fail-open 交柜台）：%s",
+                    symbol, rule.label)
+                return None
+            limit_up, limit_down = self._limit_prices(prev_close, rule.ratio)
             order_price = Decimal(str(price))
             if direction == "buy" and order_price >= limit_up:
-                return ("委托买价 %s ≥ 涨停价 %s（前收 %s ×%s），已拦截"
-                        % (price, limit_up, prev_close, ratio))
+                return ("委托买价 %s ≥ 涨停价 %s（前收 %s，%s），已拦截"
+                        % (price, limit_up, prev_close, rule.label))
             if direction == "sell" and order_price <= limit_down:
-                return ("委托卖价 %s ≤ 跌停价 %s（前收 %s ×%s），已拦截"
-                        % (price, limit_down, prev_close, ratio))
+                return ("委托卖价 %s ≤ 跌停价 %s（前收 %s，%s），已拦截"
+                        % (price, limit_down, prev_close, rule.label))
             return None
         except Exception as e:
             logger.warning("涨跌停前置校验异常，跳过检查继续下单：%s", e)
+            return None
+
+    def price_limit_bounds(self, stock_code: str):
+        """当日涨跌停价 ``(prev_close, up, down)``（盘前集合竞价定价用）。
+
+        盘前前收取「最近一根已完成日线收盘」（此刻当日 bar 尚不存在，所以与
+        ``check_price_limit`` 的「最新 bar 必须今日」口径不同），幅度由
+        ``resolve_limit_rule`` 按板块/ST/新股判定。无可靠幅度（新股无限制、
+        ETF、转债、未知代码）或无数据/异常 → None（调用方按不夹价 fail-open）。
+        """
+        try:
+            symbol = normalize_symbol(stock_code)
+            basis = self._prev_close_and_listing(symbol, pre_open=True)
+            if basis is None:
+                return None
+            prev_close, listed_bars, earliest = basis
+            rule = resolve_limit_rule(
+                symbol, name=self._stock_name(symbol),
+                listed_bars=listed_bars, earliest_bar_date=earliest,
+                today=now_shanghai().date())
+            if rule.ratio is None:
+                logger.info(
+                    "盘前涨跌停无可靠幅度，跳过夹价（%s）：%s",
+                    symbol, rule.label)
+                return None
+            limit_up, limit_down = self._limit_prices(prev_close, rule.ratio)
+            logger.debug("盘前涨跌停推算 %s prev=%s %s",
+                         symbol, prev_close, rule.label)
+            return float(prev_close), float(limit_up), float(limit_down)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("盘前涨跌停取价失败，跳过夹价：%s", e)
             return None
 
     @staticmethod
@@ -960,13 +1255,27 @@ class TdxTqDispatcher(OrderDispatcher):
                         logger.warning("tdx 确认面板无 chrome host，无法注入键盘")
                         return False
                     for h in hosts:
+                        focused = False
                         try:
                             h.set_focus()
                             time.sleep(0.25)
+                            # 焦点真落到了目标 host 上？（注入失败多半是焦点没进去）
+                            try:
+                                focused = bool(h.has_focus())
+                            except Exception:  # noqa: BLE001
+                                focused = False
                             h.type_keys(key)
                             time.sleep(0.7)
-                        except Exception as e:
-                            logger.warning("tdx 确认键盘注入失败: %s", e)
+                        except Exception as e:  # noqa: BLE001
+                            # 异常消息可能为空（如 pywinauto 的 TargetNotExist 无文案），
+                            # 只打 %s 会留下「tdx 确认键盘注入失败: 」空日志——补记
+                            # 类型/repr/焦点/剩余时间，便于下次定位（2026-11-10 实证）。
+                            logger.warning(
+                                "tdx 确认键盘注入失败: %s: %r（host=%s 焦点=%s "
+                                "key=%s 剩余 %.1fs）",
+                                type(e).__name__, e,
+                                getattr(h, "handle", None), focused, key,
+                                max(0.0, deadline - time.time()))
                     time.sleep(0.6)
                     frame2, _c2, _cn2 = self._find_confirm_panel()
                     if frame2 is None:
@@ -1057,7 +1366,10 @@ class TdxTqDispatcher(OrderDispatcher):
                 raise BridgeOrderRejected(
                     "通达信下单待人工确认，自动确认未成功（%s）。请检查客户端"
                     "「交易信号」窗口是否已打开、本单行是否可点『发送』，"
-                    "或关闭下单确认后重试" % (confirm_detail or msg))
+                    "或关闭下单确认后重试；若窗口内残留本单未发送行"
+                    "（未点『发送』即未报出），请人工点该行『取消』——"
+                    "系统不会自动取消，以免误撤其它待发委托"
+                    % (confirm_detail or msg))
             # 柜台已受理（ErrorId=0）但回查窗口（~1.05s）内委托表未见该单：
             # 委托表刷新延迟/连续竞价高峰都会命中。**不能当拒单**——拒单会让引擎
             # 把订单标 rejected 并移出在途集合，真实在途单从此无 ref、无成交回填、
@@ -1066,9 +1378,9 @@ class TdxTqDispatcher(OrderDispatcher):
             # 返回 None + 标记 last_unconfirmed_order_id：引擎保持 submitted，
             # 后续 poll_deals 继续 legacy 模糊认领，最坏 180s expire 收口。
             self.last_unconfirmed_order_id = self.order_id(order)
-            self._last_error = (
-                "已受理未认领：委托列表暂未见该单（%s）"
-                % (confirm_detail or msg or res))
+            self._last_unconfirmed_message = (
+                "已受理未认领：%s" % (confirm_detail or msg or res))[:500]
+            self._last_error = self._last_unconfirmed_message
             logger.warning(
                 "tdx order accepted but unclaimed: %s %s x%s @%s (%s)",
                 direction, symbol, vol, price, confirm_detail or msg or res,
@@ -1125,6 +1437,44 @@ class TdxTqDispatcher(OrderDispatcher):
             self._confirmer = TdxSignalConfirmer(timeout=self._confirm_timeout)
         return self._confirmer
 
+    def pending_row_state(self, live_order) -> Optional[str]:
+        """180s 到期前复核：本单在「交易信号」窗口里是否仍停在『待发送』。
+
+        返回 ``"pending"``（点击未生效/未报出）/ ``"absent"``（行已消失或已转
+        『已发送』，视为已报出）/ ``"unknown"``（无窗口/OCR 不可判）。
+        ``None`` = 本通道不支持（自动确认关闭或 LiveOrder 字段不全），调用方
+        直接跳过、保持既有 expire 行为。只读截图 + OCR，不点击、不取消。
+        """
+        if not self._auto_confirm_dialog:
+            return None
+        try:
+            code6 = re.sub(
+                r"\D", "", str(getattr(live_order, "stock_code", "") or ""))[:6]
+            if len(code6) != 6:
+                return None
+            trade_type = str(getattr(live_order, "trade_type", "") or "").lower()
+            direction = "buy" if "buy" in trade_type else "sell"
+            volume = int(getattr(live_order, "quantity", 0) or 0)
+            if volume <= 0:
+                return None
+            created_at = getattr(live_order, "created_at", None)
+            # DB created_at 为 UTC naive（SQLite CURRENT_TIMESTAMP），行时间按
+            # 上海时间显示 → +8h 对齐再看秒数。
+            sent_at = (created_at + timedelta(hours=8)
+                       if isinstance(created_at, datetime) else None)
+            from .live.tdx_signal_confirm import SignalSpec
+            spec = SignalSpec(
+                code6=code6,
+                direction=direction,
+                volume=volume,
+                price=float(getattr(live_order, "price", 0) or 0),
+                sent_at=sent_at,
+            )
+            return self._get_confirmer().pending_row_state(spec)
+        except Exception:  # noqa: BLE001
+            logger.exception("tdx pending_row_state 异常，按不支持（None）处理")
+            return None
+
     def _confirm_pending_order(self, symbol: str, direction: str, price: float,
                                vol: int, code6: str, sent_at, dialog_before,
                                msg: str, baseline=()):
@@ -1137,8 +1487,22 @@ class TdxTqDispatcher(OrderDispatcher):
         """
         from .live.tdx_signal_confirm import SignalSpec
 
+        # 当日涨跌停（确认器「价格列 ROI 识别价」约束用）：复用本通道既有的
+        # price_limit_bounds（最近一根已完成日线收盘 + 板块/ST/新股幅度推算，
+        # 不新增取数路径），只在确认这条路径上取一次。取不到 → 0（确认器按
+        # 「未知」跳过该条约束，fail-open，不因缺涨跌停价拒单）。
+        limit_up = limit_down = 0.0
+        try:
+            bounds = self.price_limit_bounds(symbol)
+        except Exception as e:  # noqa: BLE001
+            logger.debug("tdx 自动确认：涨跌停取价异常，按未知处理：%s", e)
+            bounds = None
+        if bounds:
+            _prev, limit_up, limit_down = bounds
         spec = SignalSpec(code6=code6, direction=direction, volume=int(vol),
-                          price=float(price), sent_at=sent_at)
+                          price=float(price), sent_at=sent_at,
+                          limit_up=float(limit_up),
+                          limit_down=float(limit_down))
         state = {"ref": ""}
 
         def _submitted() -> bool:

@@ -18,6 +18,10 @@ class BacktestDailySnapshot(Base):
     daily_return = Column(Numeric(10, 6), nullable=True)
     cumulative_return = Column(Numeric(10, 6), nullable=True)
     benchmark_value = Column(Numeric(15, 2), nullable=True)
+    # 市场门控当日状态（右移一日的生效值）：-1 空头 / 0 未定 / 1 多头 / 2 多头（强势形态）。
+    # 仅在组合开启 market_gate_enabled 时有值；NULL = 该 run 未启用门控。
+    gate_state = Column(Integer, nullable=True)
+    gate_strength = Column(Integer, nullable=True)
     positions_json = Column(Text, nullable=True)
     created_at = Column(DateTime, server_default=func.now())
 

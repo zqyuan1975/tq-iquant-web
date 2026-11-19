@@ -163,6 +163,78 @@ def test_dry_run_returns_pr_type():
     assert data["params"]["pr_type"] == 14
 
 
+# ---------------- price_type（P0-3） ----------------
+def test_resolve_price_type_defaults_and_values():
+    """缺省/opponent → 14；limit → 11(用价)；market_best5 → 42 沪 / 47 深。"""
+    assert br._resolve_price_type(None, "600000.SH") == (14, False, None)
+    assert br._resolve_price_type("", "600000.SH") == (14, False, None)
+    assert br._resolve_price_type("opponent", "600000.SH") == (14, False, None)
+    assert br._resolve_price_type("LIMIT", "600000.SH") == (11, True, None)
+    assert br._resolve_price_type("market_best5", "600000.SH") == (42, False, None)
+    assert br._resolve_price_type("market_best5", "000001.SZ") == (47, False, None)
+
+
+def test_resolve_price_type_rejects_unknown_and_bad_suffix():
+    """显式未知值/无有效交易所后缀一律拒单（fail-closed，不猜价）。"""
+    _t, _u, err = br._resolve_price_type("oppsoite", "600000.SH")
+    assert err and "unknown price_type" in err
+    _t, _u, err = br._resolve_price_type("market_best5", "600000")
+    assert err and "SH or .SZ" in err
+
+
+def test_order_price_type_limit_passes_approval_price_verbatim():
+    """limit → passorder prType=11 且第 6 参 = 请求价（桥内不改写/不跟价）。"""
+    br.DRY_RUN = False
+    calls = []
+    br.passorder = lambda *a, **k: calls.append(a) or 0
+    body = json.dumps({"order_id": "oid-limit", "code": "600000.SH", "op": "buy",
+                       "volume": 100, "price": 9.87,
+                       "price_type": "limit"}).encode()
+    status, data = _resp("POST", "/order", {}, body)
+    assert status == 200
+    assert data["ok"] is True
+    assert calls[0][4] == 11
+    assert calls[0][5] == 9.87
+    assert data["pr_type"] == 11
+    assert data["price_type"] == "limit"
+
+
+def test_order_price_type_limit_without_price_rejected():
+    br.DRY_RUN = False
+    br.passorder = lambda *a, **k: pytest.fail("limit 无价不得下单")
+    body = json.dumps({"order_id": "oid-limit0", "code": "600000.SH", "op": "buy",
+                       "volume": 100, "price": 0,
+                       "price_type": "limit"}).encode()
+    status, data = _resp("POST", "/order", {}, body)
+    assert status == 200
+    assert data["ok"] is False
+    assert "limit" in data["error"]
+
+
+def test_order_unknown_price_type_rejected():
+    br.DRY_RUN = False
+    br.passorder = lambda *a, **k: pytest.fail("未知 price_type 不得下单")
+    body = json.dumps({"order_id": "oid-pt-bad", "code": "600000.SH", "op": "buy",
+                       "volume": 100, "price": 9.0,
+                       "price_type": "oppsoite"}).encode()
+    status, data = _resp("POST", "/order", {}, body)
+    assert status == 200
+    assert data["ok"] is False
+    assert "unknown price_type" in data["error"]
+
+
+def test_order_without_price_type_keeps_legacy_and_echoes_opponent():
+    """老 Core 不带字段 → prType 仍 14、price 实参 0，响应回报实际使用的类型。"""
+    br.DRY_RUN = False
+    calls = []
+    br.passorder = lambda *a, **k: calls.append(a) or 0
+    body = json.dumps({"order_id": "oid-legacy", "code": "600000.SH", "op": "buy",
+                       "volume": 100, "price": 9.0}).encode()
+    _resp("POST", "/order", {}, body)
+    assert calls[0][4] == 14
+    assert calls[0][5] == 0.0
+
+
 def test_order_missing_code():
     br.DRY_RUN = True
     body = json.dumps({"order_id": "oid1", "op": "buy", "volume": 100}).encode()

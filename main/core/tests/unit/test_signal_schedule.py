@@ -12,7 +12,8 @@ def test_effective_and_defaults():
     assert effective_signal_data_end("1w", None) == "completed"
     assert effective_signal_data_end("1d", None) == "current"
     assert parse_signal_at(None, "1w") == time(9, 0)
-    assert parse_signal_at(None, "1d") == time(14, 30)
+    # 1d 默认 15:05：等收盘价落定后用完整日线（默认 data_end=current 此时已是完成 bar）
+    assert parse_signal_at(None, "1d") == time(15, 5)
 
 
 def test_frequency_cannot_be_finer_than_period():

@@ -67,7 +67,50 @@ def test_single_trading_day_does_not_divide_by_zero():
     ])
     assert result
     assert result["volatility"] == Decimal("0")
-    assert result["sharpe_ratio"] == Decimal("0")
+    # W5-L1（2026-11-16）：无有效波动样本时 sharpe/sortino 与 calmar 统一 None
+    # （「无样本/无波动」≠「极差」，避免筛选把两者混成同一个 0）。
+    assert result["sharpe_ratio"] is None
+    assert result["sortino_ratio"] is None
+    assert result["calmar_ratio"] is None
+
+
+def test_total_return_guards_zero_start_value():
+    """首日净值为 0 时分母保护生效：total_return=0 而非 Decimal DivisionByZero。"""
+    result = Evaluator().evaluate([
+        _snap(0, date(2024, 1, 2)),
+        _snap(100000, date(2024, 1, 3)),
+    ])
+    assert result["total_return"] == Decimal("0")
+    assert result["max_drawdown"] == Decimal("0")
+
+
+def test_infer_periods_per_year_by_snapshot_frequency():
+    """评估层按快照实际频率推断年化因子：日 252 / 周 52 / 月 12 / 样本<3 默认 252。"""
+    from datetime import timedelta
+    from core.engine.evaluator import infer_periods_per_year
+
+    base = date(2024, 1, 2)
+    assert infer_periods_per_year([base + timedelta(days=i) for i in range(10)]) == 252.0
+    assert infer_periods_per_year([base + timedelta(days=7 * i) for i in range(10)]) == 52.0
+    assert infer_periods_per_year([base + timedelta(days=30 * i) for i in range(10)]) == 12.0
+    assert infer_periods_per_year([base]) == 252.0
+    assert infer_periods_per_year([]) == 252.0
+
+
+def test_weekly_snapshot_volatility_annualized_with_52_factor():
+    """纯周粒度快照：volatility 用 √52 年化（修复前按 √252 放大 √5 倍）。"""
+    import math
+    from datetime import timedelta
+    base = date(2024, 1, 2)
+    values = [100000, 102000, 99000, 103000, 98000, 104000]
+    snaps = [_snap(v, base + timedelta(days=7 * i)) for i, v in enumerate(values)]
+    result = Evaluator().evaluate(snaps)
+
+    returns = [values[i + 1] / values[i] - 1 for i in range(len(values) - 1)]
+    mean = sum(returns) / len(returns)
+    var = sum((r - mean) ** 2 for r in returns) / len(returns)
+    expected = math.sqrt(var * 52)
+    assert abs(float(result["volatility"]) - expected) < 1e-4
 
 
 def test_max_drawdown():
@@ -389,6 +432,33 @@ def test_relative_metrics_linear_series():
     # rb=-2% 日 active return = -0.97% → 超额曲线有回撤
     assert result["excess_max_drawdown"] is not None
     assert result["excess_max_drawdown"] > 0
+    # 超额卡玛 = 年化超额 / |超额最大回撤|
+    assert result["excess_calmar_ratio"] is not None
+    assert abs(
+        float(result["excess_calmar_ratio"])
+        - 0.0756 / float(result["excess_max_drawdown"])
+    ) < 0.01
+
+
+def test_downside_volatility_matches_sortino_denominator():
+    """年化下行波动率 = 负收益日均方根 × √252（与索提诺分母同口径）。"""
+    import math
+    snaps = [
+        _snap(100000, date(2024, 1, 2)),
+        _snap(110000, date(2024, 1, 3)),   # +10%
+        _snap(99000, date(2024, 1, 4)),    # -10%
+        _snap(108900, date(2024, 1, 5)),   # +10%
+    ]
+    result = Evaluator().evaluate(snaps)
+    expected = Decimal(str(math.sqrt(0.01 * 252))).quantize(Decimal("0.0001"))
+    assert result["downside_volatility"] == expected
+    # 无负收益日 → 0（与索提诺分母的 0 保护一致）
+    up_only = Evaluator().evaluate([
+        _snap(100000, date(2024, 1, 2)),
+        _snap(101000, date(2024, 1, 3)),
+        _snap(102000, date(2024, 1, 4)),
+    ])
+    assert up_only["downside_volatility"] == Decimal("0")
 
 
 def test_relative_metrics_short_sample_is_none():
@@ -397,6 +467,7 @@ def test_relative_metrics_short_sample_is_none():
     result = Evaluator().evaluate(snaps)
     for k in REL_KEYS:
         assert result[k] is None, k
+    assert result["excess_calmar_ratio"] is None
 
 
 def test_relative_metrics_without_benchmark_values_is_none():
@@ -444,6 +515,7 @@ def test_relative_metrics_flat_benchmark_guards():
     assert result["tracking_error"] == Decimal("0.0000")
     assert result["excess_annual_return"] == Decimal("0.2520")
     assert result["excess_max_drawdown"] == Decimal("0.0000")
+    assert result["excess_calmar_ratio"] is None   # 超额回撤 0 → 无意义，不出数
 
 
 # ===========================================================================

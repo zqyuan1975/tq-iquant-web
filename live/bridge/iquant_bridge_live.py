@@ -43,8 +43,10 @@
 #       DRY_RUN     (dev print switch, keep False for real trading)
 # 4. Start the strategy and watch the client console. Expected, in order:
 #       [BRIDGE-LIVE] 2026-11-06 09:30:00 bind ok 127.0.0.1:8791 account=... type=CREDIT dry_run=False
-#       [BRIDGE-LIVE] 2026-11-06 09:30:00 init done: tick scheduled every 1.0s (tag=...)
+#       [BRIDGE-LIVE] 2026-11-06 09:30:00 init done: build=2026-11-13c
+#                 dividend=none bindwait=60s; tick scheduled every 1.0s (tag=...)
 #       [BRIDGE-LIVE] 2026-11-06 09:30:01 tick#1 alive listen=127.0.0.1:8791 served_total=0 conns=0
+#    /ping also echoes "build", so you never have to guess which code is live.
 #    The tick#N line (with timestamp) must keep advancing -- it is printed on the
 #    FIRST tick and then at most once per HEARTBEAT_INTERVAL (60s) while idle.
 #    If tick#N never appears, the scheduled timer is not firing (see RUN MODEL)
@@ -54,9 +56,15 @@
 #    the running strategy keeps the old code until restarted.
 #    PORT EXCLUSIVITY: on Windows the bridge binds with SO_EXCLUSIVEADDRUSE, so
 #    a second instance on the same port FAILS LOUDLY (FATAL line) instead of
-#    "binding ok" and silently swallowing requests. If you see that FATAL line:
-#    stop the strategy first, then start it; if it persists, restart the client
-#    (a stopped instance can leave a socket handle behind inside the process).
+#    "binding ok" and silently swallowing requests. A new instance tries bind
+#    FIRST (a normal stop+start binds on the first try and opens no connection);
+#    only if bind fails does it ask a live old instance to /shutdown, at most 4
+#    times with 1/2/4/8s backoff, up to 60s total. If nothing is listening yet
+#    bind still fails, the port is held by half-dead CLOSE_WAIT/TIME_WAIT
+#    sockets: it prints FATAL immediately instead of waiting (waiting never
+#    clears those). Then: stop the strategy, then RESTART the QMT client.
+#    A stopped instance can leave a socket handle behind inside the process --
+#    that is the half-dead case above, and only a client restart clears it.
 #
 # THIS LEG = CREDIT ACCOUNT: this bridge is bound to the margin/credit account
 # 410009993017 (QMT account type "CREDIT", ACCOUNT_TYPE below). In the client's
@@ -116,12 +124,23 @@
 # Endpoints (all JSON, unchanged -- Core's HttpBridgeDispatcher depends on them):
 #   GET  /ping                 heartbeat + bridge status
 #   POST /order                place order (idempotent order_id + whitelist + rate limit)
+#                              optional body field price_type:
+#                                "opponent" (default, prType 14 -- legacy),
+#                                "limit"    (prType 11 -- Core's price used VERBATIM),
+#                                "market_best5" (prType 42 SH / 47 SZ, by code suffix).
+#                              Missing field = old behaviour. Explicit unknown value
+#                              is rejected (ok:false). Every reply echoes pr_type +
+#                              price_type actually used, so Core can reconcile the
+#                              backfilled fill price against the approval price.
 #   GET  /positions            positions
 #   GET  /account              account funds
 #   GET  /orders?order_id=     order query
 #   GET  /deals?order_id=      deal query
 #   GET  /quote?code=&period=&count=   1m/5m/1d bars (cached, ContextInfo; xtdata fallback)
 #   GET  /calendar?market=SH    trading dates ["YYYYMMDD", ...] (cached, ContextInfo; xtdata fallback)
+#   GET  /price_limit?code=     pre close + up/down limit (null when unknown)
+#   POST /cancel               cancel one order (order_ref; result distinguishes
+#                              canceled / pending / not_found / rejected / failed)
 #   GET  /shutdown             release the port (used by the next instance's init
 #                              to take over after a strategy restart)
 #
@@ -163,6 +182,23 @@ RATE_LIMIT = 1000                 # max RATE_LIMIT orders per RATE_WINDOW second
 RATE_WINDOW = 10                  # rate-limit window (seconds)
 QUOTE_CACHE_TTL = 1               # quote cache refresh interval (seconds)
 QUOTE_COUNT = 10                  # default bar count for /quote
+# ---- /quote dividend (adjust) mode ----------------------------------------
+# Optional query params: ?dividend_type=front|back|none -- the same vocabulary
+# the platform TQ layer uses (main/core/tq/data.py: front / back / none).
+# ABSENT (and an unknown value) means UNADJUSTED bars, which is passed to
+# ContextInfo explicitly as "none" -- the SDK's documented unadjusted value.
+# The old value was "follow", which obeys whatever adjust mode the CLIENT is
+# configured with: if the client defaults to front adjustment, QMT would answer
+# adjusted bars while the goldminer bridge answers unadjusted ones (gm adjust=0)
+# -- a silent cross-channel price mismatch on the same request. "none" pins both
+# bridges to the same baseline (2026-11-13).
+DIVIDEND_TYPES = ("front", "back", "none")
+DEFAULT_DIVIDEND_TYPE = "none"     # explicit unadjusted; never "follow" (see above)
+# Build stamp: printed in the init log and echoed by /ping, so "which code is
+# actually running" is self-evident instead of being guessed from behaviour.
+# Bump it on every behavioural change to this file.
+#   2026-11-13c = bind-first + fast-fail on half-dead sockets (no probe storm)
+BRIDGE_BUILD = "2026-11-13c"
 HISTORY_DAYS = 30                 # history depth floor (calendar days) for downloads
 CTX_DAILY_DAYS = 90               # interval window for 1d reads (count is unreliable)
 # Fields requested from ContextInfo.get_market_data_ex. MUST be explicit: with
@@ -196,7 +232,8 @@ MAX_REQUEST_BYTES = 1048576       # drop a connection whose request buffer excee
 CONN_IDLE_TIMEOUT = 30            # drop a half-open/idle connection after N seconds
 SEND_TIMEOUT = 5.0                # per-response send timeout (seconds)
 ENDPOINTS = ("/ping", "/order", "/positions", "/account",
-             "/orders", "/deals", "/quote", "/calendar", "/shutdown")
+             "/orders", "/deals", "/quote", "/calendar",
+             "/price_limit", "/cancel", "/shutdown")
 # ==========================================
 
 _CTX = None
@@ -387,8 +424,9 @@ def _log_order(oid, op, code, volume, result, dup=False):
 
     Replaces the old two-line output (a pre-passorder [BRIDGE-LIVE] order line plus a
     raw [AUDIT-LIVE] JSON dump) with a single line: oid + direction + code + size +
-    result. prType/price/account are omitted: prType is fixed at 14, price is
-    ignored for opposite-best orders, account is fixed at startup.
+    result. prType is NOT printed here: it comes from the optional price_type
+    field (default 14 = opponent, which ignores price) and every /order reply
+    already echoes the price type actually used; account is fixed at startup.
     """
     if result.get("ok"):
         if result.get("dry_run"):
@@ -422,7 +460,7 @@ def _confirm_order_arrival(remark, account):
     concurrency issue (same as query_orders).
 
     *** DUAL-BRIDGE MIRROR *** -- identical logic must exist in
-    iquant_bridge.py _confirm_order_arrival. Hand-sync on any change.
+    iquant_bridge_live.py _confirm_order_arrival. Hand-sync on any change.
     """
     fn = _iq("get_trade_detail_data")
     if fn is None:
@@ -440,11 +478,77 @@ def _confirm_order_arrival(remark, account):
     return False
 
 
+# ---------------- price type (passorder prType) ----------------
+# Values taken from the QMT client itself:
+#   D:\iquant\bin.x64\Lib\site-packages\xtquant\xtconstant.py
+#     FIX_PRICE                    = 11  (fixed/limit price -- the price arg is used)
+#     MARKET_SH_CONVERT_5_CANCEL   = 42  (best-5 immediate-or-cancel, SH)
+#     MARKET_SZ_CONVERT_5_CANCEL   = 47  (best-5 immediate-or-cancel, SZ)
+# 14 is NOT a stock quote type in xtconstant (14 = FUTURE_OPEN there), but this
+# bridge has used 14 since slice 4 and on the real client it behaves as
+# "opposite best price" (BUY takes sell1, SELL takes buy1, price is ignored).
+# It stays the DEFAULT so a request WITHOUT price_type is byte-for-byte the old
+# behaviour. 44 (MARKET_PEER_PRICE_FIRST) is the exchange-side peer-best type;
+# it is NOT used here because it has not been verified on this client.
+#
+# SCOPE: price_type=limit exists to make THIS channel price-controlled by the
+# platform too (TDX already sends PRICE_MY with a pre-submit OCR price check;
+# the goldminer bridge already passes the limit price verbatim; THS in the
+# current `latest` mode does not type any price at all, so its +/- bias is a
+# no-op). It is NOT a generic slippage guard. When limit is selected the price
+# from Core (the approval price) is passed to passorder VERBATIM -- this bridge
+# never re-prices, never chases the order book and never rounds.
+PRICE_TYPE_DEFAULT = 14
+PRICE_TYPE_FIX = 11
+PRICE_TYPE_SH_MARKET_BEST5 = 42
+PRICE_TYPE_SZ_MARKET_BEST5 = 47
+
+
+def _price_type_name(pr_type):
+    """prType -> canonical request name (echoed back in every /order reply)."""
+    if pr_type == PRICE_TYPE_FIX:
+        return "limit"
+    if pr_type in (PRICE_TYPE_SH_MARKET_BEST5, PRICE_TYPE_SZ_MARKET_BEST5):
+        return "market_best5"
+    return "opponent"
+
+
+def _resolve_price_type(raw, code):
+    """Map the optional request field price_type -> (prType, price_is_used, err).
+
+    Missing/empty -> legacy default (14): an old Core payload is unchanged, and
+    that default is echoed back as price_type="opponent" so Core can reconcile
+    the fill price afterwards.
+    An EXPLICIT unknown value is rejected instead of silently falling back --
+    on a typo the order must not trade at a price nobody selected.
+    """
+    name = str(raw or "").strip().lower()
+    if not name:
+        return PRICE_TYPE_DEFAULT, False, None
+    if name in ("opponent", "opposite"):
+        return PRICE_TYPE_DEFAULT, False, None
+    if name in ("limit", "fix", "fixed"):
+        return PRICE_TYPE_FIX, True, None
+    if name in ("market_best5", "best5"):
+        suffix = str(code or "").rsplit(".", 1)[-1].upper()
+        if suffix == "SH":
+            return PRICE_TYPE_SH_MARKET_BEST5, False, None
+        if suffix == "SZ":
+            return PRICE_TYPE_SZ_MARKET_BEST5, False, None
+        return 0, False, "market_best5 requires a .SH or .SZ code suffix"
+    return 0, False, "unknown price_type: %s" % name
+
+
 def _do_place(params):
     code = params.get("code")
     op = params.get("op", "buy")                  # buy / sell
     volume = params.get("volume", 100)
-    price = params.get("price", 0)                # 0=latest price, >0=limit price
+    # price meaning depends on price_type: used verbatim only for limit (11),
+    # ignored (0 placeholder) for opponent / market_best5.
+    try:
+        price = float(params.get("price") or 0)
+    except (TypeError, ValueError):
+        price = 0.0
     account = params.get("account", ACCOUNT)
     # userOrderId -> m_strRemark: Core's deterministic order_id prefix (ASCII hex).
     # Lets Core match the returned order/deal back to exactly this order (precise
@@ -454,17 +558,26 @@ def _do_place(params):
     remark = str(params.get("remark") or "")[:20]
 
     op_type = 23 if op == "buy" else 24           # passorder opType: 23 buy, 24 sell
-    # prType=14 = opposite best price (client-side orderbook-price limit order):
-    #   BUY takes sell1 price, SELL takes buy1 price -> immediate fill.
-    #   NOT an exchange market order, so no market-order symbol/session limits.
-    #   price param has no effect for prType!=11; pass 0 as placeholder.
-    #   Real fill price is backfilled from /deals in a later slice.
-    pr_type = 14
-
+    # prType comes from the optional price_type field; missing -> 14 (opponent),
+    # i.e. exactly the behaviour this bridge had before the field existed.
+    # Every reply echoes the price type actually used so Core can reconcile the
+    # backfilled fill price against the approval price.
+    pr_type, use_price, pt_err = _resolve_price_type(params.get("price_type"), code)
+    if pt_err:
+        return {"ok": False, "error": pt_err}
+    if pr_type == PRICE_TYPE_FIX and (price != price or price <= 0):
+        # limit without a usable price is a Core bug: reject instead of silently
+        # trading opponent-best at a price nobody approved.
+        return {"ok": False, "error": "price_type=limit requires price > 0"}
+    price_type_name = _price_type_name(pr_type)
+    price_arg = price if use_price else 0.0
     if DRY_RUN:
         return {"ok": True, "dry_run": True,
+                "pr_type": pr_type, "price_type": price_type_name,
                 "params": {"code": code, "op": op, "volume": volume,
-                           "price": price, "pr_type": pr_type, "remark": remark}}
+                           "price": price, "price_arg": price_arg,
+                           "pr_type": pr_type, "price_type": price_type_name,
+                           "remark": remark}}
 
     fn = _iq("passorder")
     if fn is None:
@@ -481,13 +594,17 @@ def _do_place(params):
         # it from the strategy's trade properties. A CREDIT account (the 8791
         # leg) therefore needs "account type = credit" selected there, otherwise
         # the counter rejects the order. No code change, only the client setting.
-        result = fn(op_type, 1101, account, code, pr_type, float(price), float(volume),
+        result = fn(op_type, 1101, account, code, pr_type, price_arg, float(volume),
                     "iquant_bridge_live", 2, remark, _CTX)
-        # 0 = accepted (verified on real client). Any other value means the
-        # broker/client rejected the order -- must report ok=False so Core marks
-        # it rejected instead of holding a submitted order whose order_ref never
-        # appears.
-        if result != 0:
+        # Official API doc (P90, passorder entry) states: "return: none". The
+        # documented contract therefore has NO return value; older builds happen
+        # to return 0. Treating None as a rejection was a real bug: the counter
+        # had already accepted the order, the bridge said ok=false, Core marked
+        # it rejected, and a live order was left orphaned at the counter.
+        # Reject ONLY on an explicit non-zero numeric code; None (and any
+        # non-numeric value) means "no error reported" and falls through to the
+        # arrival check below, which is the real evidence that an order exists.
+        if isinstance(result, (int, float)) and int(result) != 0:
             return {"ok": False, "error": "passorder rejected (code=%s)" % result}
         # Arrival check: passorder accepted does NOT guarantee an order record was
         # created (accept-then-drop, real-machine 2026-08-14 id36-39). Re-query the
@@ -495,10 +612,14 @@ def _do_place(params):
         # immediately instead of waiting 180s for order_ref that will never appear.
         if not _confirm_order_arrival(remark, account):
             return {"ok": False,
-                    "error": "passorder accepted but no order record (dropped)"}
-        return {"ok": True, "passorder_result": str(result)}
+                    "error": "passorder accepted but no order record (dropped)",
+                    "pr_type": pr_type, "price_type": price_type_name}
+        return {"ok": True, "passorder_result": str(result),
+                "pr_type": pr_type, "price_type": price_type_name,
+                "price": price_arg}
     except Exception as e:
-        return {"ok": False, "error": "passorder raised: %s" % e}
+        return {"ok": False, "error": "passorder raised: %s" % e,
+                "pr_type": pr_type, "price_type": price_type_name}
 
 
 # ---------------- query endpoints ----------------
@@ -807,6 +928,401 @@ def query_deals(params):
         return {"ok": False, "error": "query_deals: %s" % e}
 
 
+# ---------------- price limit (pre close / up / down) ----------------
+# GET /price_limit?code=600000.SH ->
+#   {"ok": true, "data": {"code": .., "pre_close": f|null,
+#                         "up_limit": f|null, "down_limit": f|null}}
+# Source: get_instrument_detail (globals first, then ContextInfo, then the
+# client-bundled xtdata), which carries PreClose / UpStopPrice / DownStopPrice.
+# A missing field is emitted as null; Core then either derives the limits from
+# pre_close or fails open (no check). Never guess a limit ratio here (ST 5% vs
+# main board 10% vs STAR/ChiNext 20% vs BSE 30%) -- a wrong guess would block
+# legitimate orders.
+# Standard library only: xtdata ships with the QMT client and is imported
+# lazily, exactly like the calendar fallback above (never a pip dependency).
+PRICE_LIMIT_CACHE_TTL = 30        # seconds; limits are static within a trading day
+CANCEL_VERIFY_ATTEMPTS = 3        # post-cancel re-reads of the ORDER table
+CANCEL_VERIFY_INTERVAL = 0.3      # seconds between those re-reads
+# m_nOrderStatus (doc P192 enum_EEntrustStatus): 48 not reported / 49 pending
+# report / 50 reported / 51 pending cancel / 52 partial-filled pending cancel
+# / 53 partial canceled / 54 canceled / 55 partially filled / 56 filled
+# / 57 rejected (invalid order) / 86 confirmed. 86 is IN FLIGHT -- the order
+# exists at the counter and stays cancellable, NEVER a terminal state.
+_ORDER_FINAL_CANCELED = (53, 54)
+_ORDER_FINAL_OTHER = (56, 57)
+_CAN_CANCEL_STATUS = (48, 49)     # not reported / pending report: not at the counter
+_price_limit_cache = {}           # code -> (ts, payload)
+
+
+def _pick_num(source, names):
+    """First positive finite number among attribute/dict keys, else None."""
+    for name in names:
+        try:
+            if isinstance(source, dict):
+                value = source.get(name)
+            else:
+                value = getattr(source, name, None)
+        except Exception:
+            continue
+        value = _safe_num(value)
+        if value is None:
+            continue
+        try:
+            value = float(value)
+        except (TypeError, ValueError):
+            continue
+        if value > 0:
+            return value
+    return None
+
+
+def _instrument_detail(code):
+    """Instrument detail dict/object, or None when no data source has it."""
+    fn = _iq("get_instrument_detail")
+    if fn is not None:
+        try:
+            detail = fn(code)
+            if detail:
+                return detail
+        except Exception:
+            pass
+    try:
+        from xtquant import xtdata
+        detail = xtdata.get_instrument_detail(code)
+        if detail:
+            return detail
+    except Exception:
+        pass
+    return None
+
+
+def _daily_close_pair(code):
+    """(unadjusted close, front-adjusted close) of the newest 1d bar.
+
+    Both reads use ContextInfo (the client's in-process store, the source the
+    quote path already relies on). The two values differ exactly when the newest
+    daily bar was rewritten for a dividend / ex-rights event taking effect today
+    -- i.e. today is an ex-rights day -- and then the front-adjusted close IS the
+    exchange ex-rights reference price. Pure inference, deliberately labelled as
+    such by the caller: it cannot tell a cash dividend from a stock bonus, and a
+    thin/empty daily store returns (None, None) so the caller keeps the raw
+    previous close WITH an explicit label instead of a silent wrong value.
+    """
+    fn = _iq("get_market_data_ex")
+    if fn is None:
+        return None, None
+
+    def last_close(dividend_type):
+        try:
+            res = _ctx_read(fn, code, "1d", 2, dividend_type)
+        except Exception:                 # annotation path only, never fatal
+            return None
+        frame = (res or {}).get(code)
+        if frame is None:
+            return None
+        for bar in reversed(_df_to_bars(frame) or []):
+            try:
+                close = float(bar.get("close"))
+            except (TypeError, ValueError):
+                continue
+            if close == close and close > 0:   # finite and positive
+                return close
+        return None
+
+    return last_close("none"), last_close("front")
+
+
+def get_price_limit(params):
+    """Pre close + exchange price limits for one instrument (null when unknown).
+
+    Ex-rights handling (2026-11-12): the exchange limit prices carried by the
+    instrument detail are authoritative and used as-is. When they are MISSING the
+    previous close is cross-checked against the front-adjusted daily close -- a
+    difference means today is an ex-rights day, and the front-adjusted close (the
+    ex-rights reference price) replaces the raw previous close. When
+    that check is impossible the raw value is kept and LABELLED via
+    ``pre_close_source`` / ``notice``; a value is never emitted silently.
+    """
+    code = params.get("code")
+    if not code:
+        return {"ok": False, "error": "missing code"}
+    now = time.time()
+    cached = _price_limit_cache.get(code)
+    if cached is not None and now - cached[0] <= PRICE_LIMIT_CACHE_TTL:
+        return cached[1]
+    detail = _instrument_detail(code)
+    pre_close = _pick_num(detail, ("PreClose", "PreClosePrice", "LastClose"))
+    up_limit = _pick_num(detail, ("UpStopPrice", "LimitUpPrice"))
+    down_limit = _pick_num(detail, ("DownStopPrice", "LimitDownPrice"))
+    source = "unavailable" if detail is None else "instrument_detail"
+    pre_close_source = "unavailable" if pre_close is None else source
+    ex_rights = None
+    notice = None
+    if up_limit is not None and down_limit is not None:
+        # Exchange limits already carry the ex-rights adjustment and the platform
+        # derives nothing from pre_close when both are present.
+        pre_close_source = "exchange_limit"
+    else:
+        plain, front = _daily_close_pair(code)
+        if plain is None or front is None:
+            ex_rights = None
+            notice = ("ex-rights info unavailable; pre_close may be the unadjusted"
+                      " previous close (can deviate on ex-rights days)")
+        elif abs(front - plain) >= 0.005:
+            pre_close = front
+            pre_close_source = "front_adjusted_daily_close"
+            ex_rights = True
+            notice = ("ex-rights day inferred: front-adjusted close %.4f != "
+                      "unadjusted %.4f; pre_close switched to the ex-rights "
+                      "reference price" % (front, plain))
+        else:
+            ex_rights = False
+            if pre_close is None:
+                pre_close = plain
+                pre_close_source = "daily_close"
+    payload = {
+        "code": code,
+        "pre_close": pre_close,
+        "up_limit": up_limit,
+        "down_limit": down_limit,
+    }
+    result = {"ok": True, "data": payload, "source": source,
+              "pre_close_source": pre_close_source, "ex_rights": ex_rights}
+    if notice:
+        result["notice"] = notice
+    _price_limit_cache[code] = (now, result)
+    return result
+
+
+# ---------------- cancel ----------------
+# POST /cancel {"order_ref": "..."} (bridge order ref = m_strOrderRef; the
+# cl_ord_id / order_id aliases are accepted too). The ref only LOCATES the order
+# row; the cancel itself is issued with that row's m_strOrderSysID. Official API
+# doc P179: m_strOrderSysID = contract/order number, m_strOrderRef = internal
+# order ref; P99: "the order number in the order list and the deal list is the
+# same m_strOrderSysID value". Passing the ref to cancel() canceled nothing
+# whenever the two differ, so sys id is used first and the ref is only a
+# fallback (unreported rows / old clients may have no sys id yet).
+# Answer data.result:
+#   "canceled"  already canceled, or cancel confirmed by the ORDER table
+#               (53/54, or the row disappeared after a SUCCESSFUL re-read)
+#   "pending"   cancel request sent, terminal state not observed within ~0.9s;
+#               also used when the order has not reached the counter yet
+#   "not_found" no such order in today's ORDER table
+#   "rejected"  order already filled / rejected, nothing to cancel
+#   "failed"    local failure (no cancel API, call raised, query failed,
+#               cancel() returned False = request never issued)
+# ok is true only for "canceled"/"pending": a failure is NEVER reported as
+# success. Core only needs ok; data.result keeps the outcome unambiguous.
+def _order_row_by_ref(account, ref):
+    """(row, ok); ok=False means the query failed -- NOT "no such order"."""
+    fn = _iq("get_trade_detail_data")
+    if fn is None:
+        return None, False
+    try:
+        rows = fn(account, ACCOUNT_TYPE, "ORDER") or []
+    except Exception:
+        return None, False
+    for o in rows:
+        if str(getattr(o, "m_strOrderRef", "") or "").strip() == ref:
+            return o, True
+    return None, True
+
+
+def _order_sys_id(order_obj):
+    """m_strOrderSysID (contract / order number) as str, "" when absent.
+
+    This is the id the counter's cancel API expects (doc P99 + P179), not
+    m_strOrderRef. Rows that never reached the counter, and old clients, may
+    have no sys id yet -- callers fall back to the ref.
+    """
+    try:
+        return str(getattr(order_obj, "m_strOrderSysID", "") or "").strip()
+    except Exception:
+        return ""
+
+
+def _row_status(order_obj):
+    """m_nOrderStatus as int, or None when absent/unparseable."""
+    value = _safe_num(getattr(order_obj, "m_nOrderStatus", None))
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _cancel_log(msg):
+    """One audit line per cancel step.
+
+    cancel_order used to be completely silent, so after the fact there was no
+    way to tell who canceled which order, with which id, through which branch.
+    Fixed few lines per request (entry / branch / call / close), never per poll.
+    """
+    print("[BRIDGE] %s CANCEL %s" % (_ts(), msg))
+
+
+def cancel_order(params):
+    ref = str(params.get("order_ref") or params.get("cl_ord_id")
+              or params.get("order_id") or "").strip()
+    if not ref:
+        _cancel_log("ref=<empty> -> failed reason=missing order_ref")
+        return {"ok": False,
+                "error": "cancel requires order_ref (bridge order ref)",
+                "data": {"result": "failed"}}
+    account = params.get("account", ACCOUNT)
+    row, query_ok = _order_row_by_ref(account, ref)
+    if not query_ok:
+        _cancel_log("ref=%s -> failed reason=order query failed" % ref)
+        return {"ok": False, "error": "cancel: order query failed",
+                "data": {"order_ref": ref, "result": "failed"}}
+    if row is None:
+        _cancel_log("ref=%s -> failed reason=order not found" % ref)
+        return {"ok": False, "error": "order not found: %s" % ref,
+                "data": {"order_ref": ref, "result": "not_found"}}
+    status = _row_status(row)
+    sys_id = _order_sys_id(row)
+    order_id = sys_id or ref        # cancel() wants the contract/order number
+    ins = str(getattr(row, "m_strInstrumentID", "") or "")
+    _cancel_log("%s ref=%s sysid=%s status=%s"
+                % (ins, ref, sys_id or "none", status))
+    if status in _ORDER_FINAL_CANCELED:
+        _cancel_log("branch=already-final status=%s -> %s status=%s"
+                    % (status, "partial_canceled" if status == 53 else "canceled",
+                       status))
+        return {"ok": True, "data": {"order_ref": ref, "order_sys_id": sys_id or None,
+                                     "result": "canceled",
+                                     "status": status, "verified": True}}
+    if status in _ORDER_FINAL_OTHER:
+        _cancel_log("branch=final-not-cancelable status=%s -> failed status=%s"
+                    % (status, status))
+        return {"ok": False,
+                "error": "cannot cancel: order already final (status=%s)" % status,
+                "data": {"order_ref": ref, "order_sys_id": sys_id or None,
+                         "result": "rejected",
+                         "status": status, "verified": True}}
+    # Pre-check (doc P98-99): can_cancel_order(orderId, accountId, accountType,
+    # ContextInfo) -> bool. For "not reported"/"pending report" rows nothing has
+    # reached the counter yet, so it answers False -- skip the doomed cancel
+    # round-trip and report pending. Guarded lookup: older clients do not ship
+    # this API, in which case the pre-check is skipped and behaviour is
+    # unchanged.
+    if status in _CAN_CANCEL_STATUS:
+        can_fn = _iq("can_cancel_order")
+        if can_fn is None:
+            _cancel_log("branch=not-reported precheck=unavailable status=%s"
+                        % status)
+        else:
+            try:
+                verdict = can_fn(order_id, account, ACCOUNT_TYPE, _CTX)
+            except Exception:
+                verdict = None
+            _cancel_log("branch=not-reported precheck=can_cancel_order(%s)=%s status=%s"
+                        % (order_id, verdict, status))
+            if verdict is False:
+                _cancel_log("precheck says no -> pending status=%s" % status)
+                return {"ok": True,
+                        "data": {"order_ref": ref, "order_sys_id": sys_id or None,
+                                 "result": "pending", "status": status,
+                                 "verified": False,
+                                 "note": "not yet reported to the counter, "
+                                         "nothing to cancel"}}
+    else:
+        _cancel_log("branch=normal status=%s sending cancel(%s)"
+                    % (status, order_id))
+    fn = _iq("cancel")
+    if fn is None:
+        _cancel_log("call cancel(%s) -> failed reason=cancel API missing"
+                    % order_id)
+        return {"ok": False, "error": "cancel not found in strategy namespace",
+                "data": {"order_ref": ref, "order_sys_id": sys_id or None,
+                         "result": "failed", "status": status}}
+    # QMT reference signature: cancel(orderId, accountId, accountType, ContextInfo).
+    # orderId is an int on some builds and a str on others, so try both; shorter
+    # signatures are a last resort. A TypeError means the call never happened, so
+    # walking down the list is safe (cancel is idempotent).
+    variants = [int(order_id)] if order_id.isdigit() else []
+    variants.append(order_id)
+    called = False
+    cancel_ret = None
+    last_exc = None
+    call_sig = "none"
+    for oid in variants:
+        for args in ((oid, account, ACCOUNT_TYPE, _CTX),
+                     (oid, account, ACCOUNT_TYPE),
+                     (oid,)):
+            try:
+                cancel_ret = fn(*args)
+                called = True
+                call_sig = "%s/%darg" % (type(oid).__name__, len(args))
+                break
+            except TypeError as e:
+                last_exc = e
+                continue
+            except Exception as e:
+                _cancel_log("call cancel(%s) raised %s: %s -> failed status=%s"
+                            % (order_id, type(e).__name__, e, status))
+                return {"ok": False, "error": "cancel raised: %s" % e,
+                        "data": {"order_ref": ref, "order_sys_id": sys_id or None,
+                                 "result": "failed", "status": status}}
+        if called:
+            break
+    if not called:
+        _cancel_log("call cancel(%s) sig=none ret=none (%s) -> failed status=%s"
+                    % (order_id, last_exc, status))
+        return {"ok": False,
+                "error": "cancel signature mismatch: %s" % last_exc,
+                "data": {"order_ref": ref, "order_sys_id": sys_id or None,
+                         "result": "failed", "status": status}}
+    _cancel_log("call cancel(%s) sig=%s ret=%s"
+                % (order_id, call_sig, cancel_ret))
+    # Doc P99: cancel() returns a bool meaning "cancel request issued", not the
+    # cancel result -- terminal state still has to be read back from the ORDER
+    # table below. False = the request never went out, so report failure instead
+    # of polling for a state change that cannot happen. True / None = issued.
+    if cancel_ret is False:
+        _cancel_log("cancel returned False -> failed status=%s" % status)
+        return {"ok": False, "error": "cancel returned False",
+                "data": {"order_ref": ref, "order_sys_id": sys_id or None,
+                         "result": "failed", "status": status,
+                         "reason": "cancel returned False"}}
+    for _ in range(CANCEL_VERIFY_ATTEMPTS):
+        time.sleep(CANCEL_VERIFY_INTERVAL)
+        row2, query_ok2 = _order_row_by_ref(account, ref)
+        if not query_ok2:
+            continue
+        if row2 is None:
+            _cancel_log("verify row gone -> canceled status=none")
+            return {"ok": True, "data": {"order_ref": ref,
+                                         "order_sys_id": sys_id or None,
+                                         "result": "canceled",
+                                         "status": None, "verified": True}}
+        status2 = _row_status(row2)
+        if status2 in _ORDER_FINAL_CANCELED:
+            _cancel_log("verify -> %s status=%s"
+                        % ("partial_canceled" if status2 == 53 else "canceled",
+                           status2))
+            return {"ok": True, "data": {"order_ref": ref,
+                                         "order_sys_id": sys_id or None,
+                                         "result": "canceled",
+                                         "status": status2, "verified": True}}
+        if status2 in _ORDER_FINAL_OTHER:
+            _cancel_log("verify -> failed status=%s (became final)" % status2)
+            return {"ok": False,
+                    "error": "cannot cancel: order became final (status=%s)"
+                             % status2,
+                    "data": {"order_ref": ref, "order_sys_id": sys_id or None,
+                             "result": "rejected",
+                             "status": status2, "verified": True}}
+        if status2 is not None:
+            status = status2
+    _cancel_log("verify timeout -> pending status=%s" % status)
+    return {"ok": True, "data": {"order_ref": ref, "order_sys_id": sys_id or None,
+                                 "result": "pending",
+                                 "status": status, "verified": False}}
+
+
 # ---------------- quotes (get_market_data_ex pull + cache) ----------------
 def _history_start(days=HISTORY_DAYS):
     return (dt.date.today() - dt.timedelta(days=days)).strftime("%Y%m%d")
@@ -951,7 +1467,7 @@ def _synth_from_base(df, period):
         return None
 
 
-def _ctx_read(fn, code, period, count):
+def _ctx_read(fn, code, period, count, dividend_type=None):
     """One ContextInfo.get_market_data_ex read -> {code: DataFrame} (or None).
 
     The return shape is normalized to xtdata's before any further processing so
@@ -962,9 +1478,14 @@ def _ctx_read(fn, code, period, count):
     returns whatever history exists. `1w/1mon` reuse this through their 1d base,
     so they inherit the window. Other periods keep the count form (1m/5m stores
     are populated).
+
+    dividend_type: None = the caller did not ask for an adjust mode -> the
+    DEFAULT_DIVIDEND_TYPE value ("none", i.e. explicitly unadjusted) is passed.
+    front/back/none are forwarded verbatim to the client.
     """
     kwargs = {"start_time": "", "count": count,
-              "dividend_type": "follow", "subscribe": True}
+              "dividend_type": dividend_type or DEFAULT_DIVIDEND_TYPE,
+              "subscribe": True}
     if period == "1d":
         kwargs["start_time"] = _history_start(
             max(CTX_DAILY_DAYS, _history_days("1d", max(count, 1))))
@@ -993,7 +1514,7 @@ def _note_thin_daily(code, count, rows):
                        % (_ts(), code, count))
 
 
-def _quote_via_context(fn, code, period, count):
+def _quote_via_context(fn, code, period, count, dividend_type=None):
     """Read bars through ContextInfo.get_market_data_ex.
 
     One call usually suffices (the client synthesizes 30m/1h/1w/1mon itself).
@@ -1001,11 +1522,15 @@ def _quote_via_context(fn, code, period, count):
     locally so the period contract still holds. Both paths return the same
     {code: DataFrame} shape before aggregation. Failures walk _throttled_log
     -- silently returning None is what hid the dead fallback before.
+
+    dividend_type is forwarded to every read (including the base period) so the
+    synthesized bars are adjusted in the same mode as the requested ones.
     """
     global _ctx_quote_logged
 
     def read(p, n):
-        return _read_bars_with_retry(lambda: _ctx_read(fn, code, p, n), code, p)
+        return _read_bars_with_retry(
+            lambda: _ctx_read(fn, code, p, n, dividend_type), code, p)
 
     try:
         df = read(period, count)
@@ -1042,7 +1567,7 @@ def _quote_via_context(fn, code, period, count):
     return None
 
 
-def _fetch_quote(code, period, count):
+def _fetch_quote(code, period, count, dividend_type=None):
     # 1) ContextInfo.get_market_data_ex FIRST: the client's own in-process quote
     #    interface, no local data service required. On this machine ports
     #    58610-58620 are not listening, so every xtdata call fails with the
@@ -1050,7 +1575,7 @@ def _fetch_quote(code, period, count):
     #    fallback only.
     fn = _iq("get_market_data_ex")
     if fn is not None:
-        df = _quote_via_context(fn, code, period, count)
+        df = _quote_via_context(fn, code, period, count, dividend_type)
         if df is not None:
             return df
     else:
@@ -1074,9 +1599,14 @@ def _fetch_quote(code, period, count):
             xtdata.download_history_data(code, period,
                                          _history_start(_history_days(period, count)), "")
             _last_download[(code, period)] = now
+        # dividend_type is only added when an adjust mode was explicitly asked
+        # for; the default call keeps today's exact kwarg set (xtdata default).
+        xt_kwargs = {}
+        if dividend_type:
+            xt_kwargs["dividend_type"] = dividend_type
         df = _read_bars_with_retry(
             lambda: xtdata.get_market_data_ex(CTX_FIELDS, [code], period=period,
-                                              count=count),
+                                              count=count, **xt_kwargs),
             code, period)
         if df is not None:
             # success: counted into the rolling 60s summary, not printed per-fetch
@@ -1273,6 +1803,22 @@ def get_calendar(params):
     return {"ok": True, "data": dates, "cached": False}
 
 
+def _parse_dividend_type(params):
+    """?dividend_type= -> (mode|None, note|None).
+
+    None = the parameter was absent (keep the historical unadjusted behaviour).
+    An unknown value is IGNORED (never rejected: a bad optional param must not
+    break quote polling) and reported back in ``dividend_note``.
+    """
+    raw = str(params.get("dividend_type") or "").strip().lower()
+    if not raw:
+        return None, None
+    if raw in DIVIDEND_TYPES:
+        return raw, None
+    return None, ("unknown dividend_type %r ignored (expect %s), using %r"
+                  % (raw, "/".join(DIVIDEND_TYPES), DEFAULT_DIVIDEND_TYPE))
+
+
 def get_quote(params):
     code = params.get("code")
     period = params.get("period", "1m")
@@ -1282,24 +1828,64 @@ def get_quote(params):
         count = int(params.get("count", QUOTE_COUNT))
     except ValueError:
         count = QUOTE_COUNT
+    dividend, div_note = _parse_dividend_type(params)
 
     now = time.time()
-    cache_key = (code, period, count)
+    # dividend participates in the cache key: adjusted and unadjusted bars for
+    # the same (code, period, count) are different data sets.
+    cache_key = (code, period, count, dividend)
     cached = _quote_cache.get(cache_key)
     if cached is not None and now - cached[0] <= QUOTE_CACHE_TTL:
-        return {"ok": True, "data": {code: cached[1]}, "cached": True}
+        body = {"ok": True, "data": {code: cached[1]}, "cached": True}
+        body.update(cached[2])
+        body["meta"] = dict(cached[2])
+        return body
 
-    df = _fetch_quote(code, period, count)
+    df = _fetch_quote(code, period, count, dividend)
+    fallback = False
+    applied = dividend or DEFAULT_DIVIDEND_TYPE
+    if df is None and dividend is not None:
+        # The SDK frequently returns an empty table for an adjust mode it cannot
+        # serve (thin local store / unsupported mode). Degrade to the historical
+        # default ONCE and say so -- never answer with an unmarked empty list.
+        df = _fetch_quote(code, period, count, None)
+        if df is not None:
+            fallback = True
+            applied = DEFAULT_DIVIDEND_TYPE
+            _throttled_log(("div-fallback", code, period, dividend),
+                           "[BRIDGE-LIVE] %s quote dividend_type=%s empty for %s %s,"
+                           " fell back to %s (unadjusted)"
+                           % (_ts(), dividend, code, period,
+                              DEFAULT_DIVIDEND_TYPE))
     if df is None:
-        return {"ok": False, "error": "no data for %s %s" % (code, period)}
+        div_meta = {"dividend_type": applied}
+        if dividend is not None:
+            div_meta["dividend_type_requested"] = dividend
+        if div_note:
+            div_meta["dividend_note"] = div_note
+        body = {"ok": False, "error": "no data for %s %s" % (code, period)}
+        body.update(div_meta)           # top-level: legacy callers
+        body["meta"] = dict(div_meta)   # nested: same shape as goldminer bridge
+        return body
     bars = _df_to_bars(df)
     # Self-evidencing line for "fetched N rows but HTTP returned []": throttled,
     # prints once per code/period, so a probe right after restart shows both.
     _throttled_log(("bars", code, period),
                    "[BRIDGE-LIVE] %s quote rows code=%s period=%s rows_before=%d rows_after=%d"
                    % (_ts(), code, period, len(df), len(bars)))
-    _quote_cache[cache_key] = (now, bars)
-    return {"ok": True, "data": {code: bars}, "cached": False}
+    # dividend_type is the mode ACTUALLY APPLIED (front/back/none) -- never a
+    # vague "default": Core compares this string against the goldminer bridge.
+    meta = {"dividend_type": applied}
+    if fallback:
+        meta["dividend_type_requested"] = dividend
+        meta["dividend_fallback"] = True
+    if div_note:
+        meta["dividend_note"] = div_note
+    _quote_cache[cache_key] = (now, bars, meta)
+    body = {"ok": True, "data": {code: bars}, "cached": False}
+    body.update(meta)
+    body["meta"] = dict(meta)
+    return body
 
 
 # ---------------- HTTP ----------------
@@ -1360,6 +1946,7 @@ def _handle(method, path, headers, body):
 
     if method == "GET" and path == "/ping":
         return _json({"ok": True, "service": "iquant-bridge-live",
+                      "build": BRIDGE_BUILD,
                       "port": PORT, "account": ACCOUNT,
                       "account_type": ACCOUNT_TYPE, "dry_run": DRY_RUN,
                       "ctx_ok": bool(_CTX is not None and callable(
@@ -1388,6 +1975,14 @@ def _handle(method, path, headers, body):
         return _json(get_quote(params))
     if method == "GET" and path == "/calendar":
         return _json(get_calendar(params))
+    if method == "GET" and path == "/price_limit":
+        return _json(get_price_limit(params))
+    if method == "POST" and path == "/cancel":
+        try:
+            p = json.loads(body.decode("utf-8"))
+        except Exception as e:
+            return _json({"ok": False, "error": "bad body: %s" % e}, 400)
+        return _json(cancel_order(p))
     if method == "GET" and path == "/shutdown":
         # Ack first, release later: the answer below is sent by _serve_once and
         # only after that does tick() close the listening socket, so this
@@ -1430,8 +2025,18 @@ def _port_in_use():
 # socket when a strategy is stopped -- the handle survives inside the same QMT
 # process, so the next instance can never bind. Instead of forcing a full client
 # restart, the new instance asks the old one to release the port via /shutdown.
-KICK_ATTEMPTS = 3                 # how many polite shutdown requests before FATAL
-KICK_INTERVAL = 0.7               # seconds between attempts
+# 2026-11-13b: wait up to 60s instead of giving up after ~2s.
+# 2026-11-13c: BIND FIRST, probe only after a failure. Probing every second built
+# one throw-away connection per second; an old listener that accepted but never
+# served left each one in CLOSE_WAIT, and those sockets keep the port bound, so
+# waiting could never succeed (self-inflicted). Now: one bind attempt first (the
+# normal stop+start case never opens a connection), at most BIND_SHUTDOWN_MAX
+# /shutdown kicks per init, exponential backoff between retries, and an
+# immediate FATAL when NOTHING is listening yet bind keeps failing -- that is
+# the CLOSE_WAIT/TIME_WAIT case, which never clears by itself.
+BIND_WAIT_SECONDS = 60            # total patience before FATAL
+BIND_BACKOFF = (1, 2, 4, 8)       # seconds slept before each retry (last repeats)
+BIND_SHUTDOWN_MAX = 4             # max /shutdown kicks per init (each = 1 connection)
 KICK_TIMEOUT = 0.5                # connect/read timeout of one shutdown request
 
 
@@ -1450,6 +2055,95 @@ def _request_shutdown():
     finally:
         if conn is not None:
             _close_quietly(conn)
+
+
+class _BindTimeout(Exception):
+    """Raised when HOST:PORT cannot be acquired.
+
+    last_error  = the last bind() exception (None if bind never failed).
+    dead_sockets = True when bind kept failing while NOTHING was listening,
+    i.e. CLOSE_WAIT/TIME_WAIT leftovers; waiting can never clear those.
+    """
+
+    def __init__(self, last_error=None, dead_sockets=False):
+        Exception.__init__(self, "port acquisition timed out")
+        self.last_error = last_error
+        self.dead_sockets = dead_sockets
+
+
+def _bind_listener():
+    """Create+bind+listen the bridge socket. Raises on failure (retried by caller)."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        if os.name == "nt" and hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+            # Windows: SO_REUSEADDR lets a SECOND bind succeed on a port that is
+            # already bound, and the old (possibly leaked) socket keeps receiving
+            # the connections -- the 2026-11 "bind ok but /ping times out" bug.
+            # EXCLUSIVEADDRUSE makes the second bind FAIL instead of silently
+            # stealing half the traffic. Verified available on Python 3.6.
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        else:
+            # POSIX: SO_REUSEADDR only skips TIME_WAIT, it does not allow two
+            # live listeners -- safe as-is.
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        s.bind((HOST, PORT))
+        s.listen(32)
+        s.settimeout(0)               # non-blocking accept; tick() polls via select
+        return s
+    except Exception:
+        _close_quietly(s)
+        raise
+
+
+def _acquire_listen_socket():
+    """Return (listening_socket, seconds_waited); raise _BindTimeout on give-up.
+
+    Bind FIRST. Probing before bind cost us: every probe is a connection, and an
+    old listener that accepts but never serves leaves each probe in CLOSE_WAIT,
+    which keeps the port bound and turns the wait into a self-inflicted deadlock.
+    So we only look at the port after a bind failure, and we kick at most
+    BIND_SHUTDOWN_MAX times. When nothing is listening but bind still fails, the
+    port is held by half-dead sockets -> fail fast instead of waiting 60s.
+    """
+    waited = 0
+    kicks = 0
+    dead_rounds = 0
+    step = 0
+    last_err = None
+    while True:
+        try:
+            return _bind_listener(), waited
+        except Exception as e:            # noqa: BLE001 -- inspected below
+            last_err = e
+        if _port_in_use():
+            dead_rounds = 0
+            if kicks < BIND_SHUTDOWN_MAX:
+                kicks += 1
+                print("[BRIDGE-LIVE] %s port busy: live listener holds %s:%d, asking it to"
+                      " shutdown [kick %d/%d] (%ds/%ds)"
+                      % (_ts(), HOST, PORT, kicks, BIND_SHUTDOWN_MAX,
+                         waited, BIND_WAIT_SECONDS))
+                _request_shutdown()
+            else:
+                print("[BRIDGE-LIVE] %s port busy: live listener still holds %s:%d,"
+                      " no more shutdown kicks (%ds/%ds)"
+                      % (_ts(), HOST, PORT, waited, BIND_WAIT_SECONDS))
+        else:
+            dead_rounds += 1
+            if dead_rounds >= 2:
+                raise _BindTimeout(last_err, dead_sockets=True)
+            print("[BRIDGE-LIVE] %s bind failed but NOTHING is listening on %s:%d"
+                  " (%s: %s) -- likely CLOSE_WAIT/TIME_WAIT sockets (%ds/%ds)"
+                  % (_ts(), HOST, PORT, type(last_err).__name__, last_err,
+                     waited, BIND_WAIT_SECONDS))
+        if waited >= BIND_WAIT_SECONDS:
+            raise _BindTimeout(last_err)
+        delay = BIND_BACKOFF[min(step, len(BIND_BACKOFF) - 1)]
+        step += 1
+        print("[BRIDGE-LIVE] %s waiting %ds for port release (%ds/%ds)"
+              % (_ts(), delay, waited, BIND_WAIT_SECONDS))
+        time.sleep(delay)
+        waited += delay
 
 
 def _release_port(message):
@@ -1666,54 +2360,42 @@ def init(ContextInfo):
         _close_quietly(_listen_sock)
         _listen_sock = None
 
-    # Pre-bind probe: a leftover listener (previous strategy instance whose
-    # socket handle leaked inside the QMT process) keeps completing TCP
-    # handshakes and stealing every connection, so our bind can still "succeed"
-    # while every request is swallowed. Ask it to release the port first; only
-    # if that fails do we give up loudly.
-    if _port_in_use():
-        for attempt in range(1, KICK_ATTEMPTS + 1):
-            print("[BRIDGE-LIVE] %s port busy, asking old instance to shutdown (attempt %d)"
-                  % (_ts(), attempt))
-            _request_shutdown()
-            time.sleep(KICK_INTERVAL)
-            if not _port_in_use():
-                print("[BRIDGE-LIVE] %s old instance released the port" % _ts())
-                break
-
-    if _port_in_use():
-        print("[BRIDGE-LIVE] %s FATAL: %s:%d already in use -- an old bridge/listener is "
-              "still there and would swallow every request (bind-ok-but-no-response). "
-              "Stop this strategy in QMT, then start it again; if it still fails, "
-              "restart the QMT client. tick NOT scheduled, nothing will answer."
-              % (_ts(), HOST, PORT))
-        return
-
+    # Bind first, ask questions later (2026-11-13c): the normal stop+start case
+    # binds on the first try and never opens a probe connection. Only a failed
+    # bind triggers /shutdown kicks, and half-dead sockets (nothing listening yet
+    # bind fails) abort immediately instead of burning the full wait.
     try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        if os.name == "nt" and hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
-            # Windows: SO_REUSEADDR lets a SECOND bind succeed on a port that is
-            # already bound, and the old (possibly leaked) socket keeps receiving
-            # the connections -- the 2026-11 "bind ok but /ping times out" bug.
-            # EXCLUSIVEADDRUSE makes the second bind FAIL instead of silently
-            # stealing half the traffic. Verified available on Python 3.6.
-            s.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        _listen_sock, _waited = _acquire_listen_socket()
+    except _BindTimeout as e:
+        if e.dead_sockets:
+            _log_exception("bind", e.last_error)
+            print("[BRIDGE-LIVE] %s FATAL: %s:%d is held by HALF-DEAD sockets "
+                  "(CLOSE_WAIT/TIME_WAIT) -- NOTHING is listening, so waiting cannot "
+                  "help (%s: %s). STOP this strategy in QMT, then RESTART the QMT "
+                  "client. Find the owner with: netstat -ano | findstr :%d "
+                  "then: tasklist /FI \"PID eq <pid>\". "
+                  "tick NOT scheduled, nothing will answer."
+                  % (_ts(), HOST, PORT, type(e.last_error).__name__, e.last_error, PORT))
+        elif e.last_error is not None:
+            _log_exception("bind", e.last_error)
+            print("[BRIDGE-LIVE] %s FATAL: bind/listen failed on %s:%d (%s: %s) while the "
+                  "port is still LISTENING by another process. Stop this strategy in "
+                  "QMT, then start it again; if it still fails, restart the QMT client. "
+                  "Find the owner with: netstat -ano | findstr :%d "
+                  "then: tasklist /FI \"PID eq <pid>\". "
+                  "tick NOT scheduled, nothing will answer."
+                  % (_ts(), HOST, PORT, type(e.last_error).__name__, e.last_error, PORT))
         else:
-            # POSIX: SO_REUSEADDR only skips TIME_WAIT, it does not allow two
-            # live listeners -- safe as-is.
-            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        s.bind((HOST, PORT))
-        s.listen(32)
-        s.settimeout(0)               # non-blocking accept; tick() polls via select
-        _listen_sock = s
-    except Exception as e:
-        _log_exception("bind", e)
-        print("[BRIDGE-LIVE] %s FATAL: bind/listen failed on %s:%d (%s: %s). "
-              "Old instance not exited? Stop this strategy in QMT and start it "
-              "again; if it still fails, restart the QMT client. "
-              "tick NOT scheduled, nothing will answer."
-              % (_ts(), HOST, PORT, type(e).__name__, e))
+            print("[BRIDGE-LIVE] %s FATAL: %s:%d already in use -- a live listener is "
+                  "still there and would swallow every request (bind-ok-but-no-response). "
+                  "Stop this strategy in QMT, then start it again; if it still fails, "
+                  "restart the QMT client. Find the owner with: "
+                  "netstat -ano | findstr :%d then: tasklist /FI \"PID eq <pid>\". "
+                  "tick NOT scheduled, nothing will answer."
+                  % (_ts(), HOST, PORT, PORT))
         return
+    if _waited:
+        print("[BRIDGE-LIVE] %s port acquired after %ds, binding done" % (_ts(), _waited))
 
     _last_heartbeat = 0.0             # let the very first tick print the heartbeat
     print("[BRIDGE-LIVE] %s bind ok %s:%d account=%s type=%s dry_run=%s"
@@ -1735,8 +2417,10 @@ def init(ContextInfo):
               "Check the signature/interval support (minute fallback: TICK_INTERVAL="
               "timedelta(minutes=1), TICK_BUDGET_SECONDS=55)." % _ts())
         return
-    print("[BRIDGE-LIVE] %s init done: tick scheduled every %.1fs (tag=%s); init returns now"
-          % (_ts(), TICK_INTERVAL.total_seconds(), TICK_TAG))
+    print("[BRIDGE-LIVE] %s init done: build=%s dividend=%s bindwait=%ds; "
+          "tick scheduled every %.1fs (tag=%s); init returns now"
+          % (_ts(), BRIDGE_BUILD, DEFAULT_DIVIDEND_TYPE, BIND_WAIT_SECONDS,
+             TICK_INTERVAL.total_seconds(), TICK_TAG))
 
 
 def handlebar(ContextInfo):

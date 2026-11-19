@@ -1,4 +1,4 @@
-﻿import axios from 'axios'
+import axios from 'axios'
 
 export const api = axios.create({ baseURL: '/api' })
 
@@ -82,13 +82,16 @@ export interface PortfolioItem {
   max_drawdown: number | null
   daily_loss_limit: number | null
   max_holdings: number | null
+  priority?: number | null  // A2 跨组合下单优先级（数值越大越先处理，默认 0）
   min_commission: number | null
   buy_commission_rate: number | null
   sell_commission_rate: number | null
   stamp_duty_rate: number | null
+  transfer_fee_rate: number | null  // 过户费率（买卖双向，默认 0.00001=0.001%）
   slippage: number | null
+  risk_cooldown_days: number | null  // 风控冷静期（交易日，默认 1；0=关闭）
   trading_session: string  // full|am|pm
-  price_limit_check_enabled: boolean  // #1 涨跌停约束（回测）
+  price_limit_check_enabled: boolean  // #1 涨跌停校验（回测成交 + 实盘下单前置，默认开）
   volume_limit_enabled: boolean       // #2 成交量/流动性约束（回测，默认关）
   volume_limit_ratio: number          // 单 bar 成交量占比上限（默认 0.10）
   adaptive_slippage_enabled: boolean  // #4 自适应滑点（回测，默认关）：冲击随订单量占成交量比例上浮
@@ -99,6 +102,17 @@ export interface PortfolioItem {
   cash_enhance_equity_threshold: number | null
   cash_enhance_position_ratio_threshold: number | null
   equity_cap: number | null            // W3 容量上限（dynamic 仓位资金封顶，None=不设上限）
+  max_single_position_pct: number | null  // 单票上限（0~1 比例，null=不限制；仅实盘生效）
+  min_cash_reserve_pct: number | null     // 现金下限（0~1 比例，null=不限制；仅实盘生效）
+  // 市场多空门控（默认关）：基准指数空头时禁止开仓/加仓，持仓不强平
+  market_gate_enabled: boolean
+  market_gate_engine: string  // python（默认）| tdx
+  market_gate_formula_name: string  // 空串=默认公式名 TQGATE
+  // E3 门控维度扩展（默认值=旧语义）
+  market_gate_indices: string[]        // 多指数投票；空=仅 benchmark_index
+  market_gate_vote_mode: string        // any（默认）| majority | all
+  market_gate_strength_threshold: number  // 空头强度门槛 0-100；0=不设门槛
+  market_gate_bear_reduce_ratio: number   // 空头减仓比例 0-1；0=关闭
   status: string  // active|archived
   created_at: string | null
   updated_at: string | null
@@ -124,11 +138,100 @@ export interface BacktestRecordItem {
   completed_at: string | null
   // 验证结论（容量健康 + 危机防御 + 样本外引用），回测完成时冻结；老记录为 null
   validation: ValidationVerdict | null
+  // F1 数据质量（覆盖率/缺根/被剔除假 bar），老记录为 null
+  data_quality: DataQuality | null
+}
+
+// K2 多记录横向对比（对齐 backtest_service.compare_records）
+export interface BacktestCompareCurvePoint {
+  date: string | null
+  total_value: number | null
+  cumulative_return: number | null
+  index_value: number | null  // 首日归一净值（各记录可叠加）
+}
+
+export interface BacktestCompareItem {
+  record: BacktestRecordItem
+  metrics: Record<string, number | null>
+  curve: BacktestCompareCurvePoint[]
+  params: Record<string, string | number | boolean | null>
+  trade_summary: {
+    trades_count: number
+    buy_count: number
+    sell_count: number
+    buy_amount: number
+    sell_amount: number
+    stocks: Record<string, number>
+  }
+}
+
+export interface BacktestCompareRow {
+  key?: string
+  label?: string
+  stock_code?: string
+  values: (number | string | null)[]
+  differs: boolean
+}
+
+export interface BacktestCompareResult {
+  records: BacktestCompareItem[]
+  metric_rows: BacktestCompareRow[]
+  param_rows: BacktestCompareRow[]
+  stock_rows: BacktestCompareRow[]
+  stock_rows_truncated: boolean
+  trade_totals: Array<{
+    trades_count: number; buy_count: number; sell_count: number
+    buy_amount: number; sell_amount: number
+  }>
+  warnings: string[]
+}
+
+// F1 回测数据质量（对齐 backtest_service.summarize_data_quality）
+export interface DataQualityPeriod {
+  union_bars: number
+  expected_bars: number
+  kept_bars: number
+  raw_bars: number
+  missing_bars: number
+  coverage_ratio: number
+  dropped_artifact_bars: number
+  dropped_no_trade_bars: number
+}
+
+export interface DataQuality {
+  version: string
+  window: { start: string; end: string }
+  requested_stocks: number
+  stocks_with_data: number
+  missing_stocks: string[]
+  periods: Record<string, DataQualityPeriod>
+  summary: {
+    coverage_ratio: number
+    kept_bars: number
+    missing_bars: number
+    dropped_artifact_bars: number
+    dropped_no_trade_bars: number
+  }
 }
 
 // 回测"验证结论"（对齐 backtest_service.build_validation_verdict）
+export interface CapacityMetrics {
+  adv: {
+    stock_code: string | null; amount: number; adv: number; ratio: number
+    threshold: number; hit: boolean
+  } | null
+  concentration: { max_single_weight: number | null; threshold: number; hit: boolean }
+  exposure: {
+    ceiling: number; final_equity: number; ratio: number; threshold: number
+    recent_days: number; recent_utilization: number; whole_utilization: number
+    hit: boolean
+  } | null
+  advice: { key: string; text: string }[]
+}
+
 export interface ValidationVerdict {
   capacity: string[]
+  capacity_metrics?: CapacityMetrics | null  // K7 结构化容量画像（老记录可能缺）
   crisis: { key: string; name: string; start: string; end: string;
     strategy_return: number | null; benchmark_return: number | null;
     max_drawdown: number | null; min_cash_ratio: number | null;
@@ -173,6 +276,7 @@ export interface BacktestEvaluationItem {
   volatility: number | null
   sharpe_ratio: number | null
   sortino_ratio: number | null
+  downside_volatility: number | null
   calmar_ratio: number | null
   win_rate: number | null
   profit_factor: number | null
@@ -195,6 +299,7 @@ export interface BacktestEvaluationItem {
   up_capture_ratio: number | null
   down_capture_ratio: number | null
   excess_max_drawdown: number | null
+  excess_calmar_ratio: number | null
   // 磨损/仓位/结构 6 指标
   annual_turnover: number | null
   total_cost_ratio: number | null
@@ -242,6 +347,10 @@ export interface DecisionEventItem {
   final_qty: number | null
   message: string | null
   created_at?: string | null
+  // M4 确认/关闭：open 未处理 / acked 已确认（日终清零等同 acked）
+  ack_status?: 'open' | 'acked' | null
+  ack_note?: string | null
+  ack_at?: string | null
 }
 
 // 决策闸门聚合统计（summarize_decisions，按 gate+param_name 分组）
@@ -262,7 +371,35 @@ export interface DecisionSummaryItem {
 // 决策事件查询响应（实盘 /decisions；回测详情内嵌同构字段）
 export interface DecisionData {
   summary: DecisionSummaryItem[]
+  // M4：未处理/已确认计数（后端全量口径，不随 ack_status 过滤变化）
+  ack_summary?: { open: number; acked: number }
   events: DecisionEventItem[]
+}
+
+// L4 关键事件检索（GET /live/decision-events，跨会话只读）
+export interface DecisionEventSearchItem extends DecisionEventItem {
+  session_id: number
+  session_name: string | null
+}
+
+export interface DecisionEventSearchFilters {
+  session_id?: number
+  gate?: string
+  layer?: string
+  action?: string
+  ack_status?: 'open' | 'acked'
+  keyword?: string
+  start?: string  // YYYY-MM-DD
+  end?: string    // YYYY-MM-DD
+  limit?: number
+  offset?: number
+}
+
+export interface DecisionEventSearchResult {
+  items: DecisionEventSearchItem[]
+  total: number
+  limit: number
+  offset: number
 }
 
 // 月度收益热力图矩阵（年度×12月）
@@ -465,6 +602,44 @@ export interface BacktestDetailItem {
   robustness: BacktestRobustnessItem | null  // 稳健性检验（年度/3年滚动/集中度/样本内外）
   persistence: PersistenceAnalysis | null  // 持续性检验（阿尔法衰减 vs 风格钟摆）
   acceptance: AcceptanceResult              // B6 考核口径验收（absolute/relative）
+  cost_capacity: BacktestCostCapacity | null  // K5 成本与容量（详情现算，不落库）
+}
+
+// K5 成本与容量（对齐 backtest_service.build_cost_capacity）
+export interface BacktestCostCapacity {
+  explicit: {
+    total_cost: number | null
+    commission: number | null
+    stamp_duty: number | null
+    transfer_fee: number | null
+    turnover: number | null
+    cost_bps: number | null
+    avg_equity: number | null
+    cost_to_avg_equity: number | null
+    net_profit: number | null
+    gross_profit: number | null
+    cost_drag_ratio: number | null
+  }
+  slippage: {
+    configured_bps: number | null
+    realized_deviation_bps: number | null
+    excess_bps: number | null
+    excess_cost_amount: number | null
+    matched_trades: number
+    trades_count: number
+    matched_amount: number | null
+  }
+  capacity: {
+    trades_count: number
+    max_trade_amount: number | null
+    max_trade_pct_equity: number | null
+    avg_trade_pct_equity: number | null
+    large_trade_threshold_pct: number
+    large_trade_count: number
+    large_trade_amount_ratio: number | null
+    pressure_level: string
+    structure?: CapacityMetrics | null  // K7 规模约束结构指标（老记录为读取时重算）
+  }
 }
 
 // B6 考核口径验收（对齐 acceptance.compute_acceptance）
@@ -602,6 +777,85 @@ export interface OosSegment {
   cagr: number | null
   max_drawdown: number | null
   benchmark_return: number | null
+}
+
+// 市场多空状态卡（GET /market-gate/status）— 对齐 market_gate_service.fetch_gate_status
+export interface MarketGateTransition {
+  date: string
+  state: number  // -1 空头 / 0 未定 / 1 多头 / 2 多头强势
+}
+
+export interface MarketGateStatusItem {
+  code: string
+  benchmark_name: string
+  period: string
+  as_of: string              // 最新一根 K 线日期（YYYY-MM-DD）
+  direction: number          // -1 空头 / 0 未定 / 1 多头 / 2 多头强势
+  direction_label: string
+  strength: number           // 0–100
+  since: string              // 当前状态起始日
+  duration_bars: number      // 持续交易日数（含起始日与 as_of）
+  transitions: MarketGateTransition[]  // 最近 N 次转折（新→旧）
+  bars: number               // 参与计算的 K 线根数
+  // E4 数据新鲜度：预期最新交易日 / 落后交易日数 / 是否超阈值（标黄提示）
+  latest_trading_day?: string
+  stale_days?: number
+  stale?: boolean
+  cached: boolean
+}
+
+export async function getMarketGateStatus(params: {
+  code?: string
+  period?: string
+  count?: number
+  history?: number
+  refresh?: boolean
+} = {}) {
+  const res = await api.get<ApiResponse<MarketGateStatusItem>>('/market-gate/status', { params })
+  return res.data.data
+}
+
+// E5 统一市场状态面板（GET /market-gate/overview）— 只读，聚合两套机制配置
+export interface MarketGateScopeNote {
+  key: string
+  name: string
+  scope: string
+  effect: string
+  timing: string
+}
+
+export interface MarketGateOverviewStrategy {
+  id: number
+  name: string
+  regime_filter_enabled: boolean
+  trend_trailing_stop_ratio: number | null
+  trend_max_positions: number | null
+  market_gate_mode: string
+}
+
+export interface MarketGateOverviewPortfolio {
+  id: number
+  name: string
+  market_gate_enabled: boolean
+  effective_enabled: boolean
+  benchmark_index: string
+  indices: string[]
+  vote_mode: string
+  strength_threshold: number
+  bear_reduce_ratio: number
+  engine: string
+  formula_name: string
+  strategies: MarketGateOverviewStrategy[]
+}
+
+export interface MarketGateOverview {
+  scopes: MarketGateScopeNote[]
+  portfolios: MarketGateOverviewPortfolio[]
+}
+
+export async function getMarketGateOverview() {
+  const res = await api.get<ApiResponse<MarketGateOverview>>('/market-gate/overview')
+  return res.data.data
 }
 
 export async function getStockPools() {
@@ -838,6 +1092,8 @@ export interface StrategyItem {
   regime_filter_enabled: boolean
   trend_trailing_stop_ratio: number | null
   trend_max_positions: number | null
+  // E3 策略级门控覆盖（inherit=跟随组合（默认）/off=不受门控/on=强制启用）
+  market_gate_mode: string
   exposure_cap_enabled: boolean
 }
 
@@ -849,13 +1105,15 @@ export interface PortfolioRequest {
   max_drawdown: number
   daily_loss_limit: number
   max_holdings: number
+  priority?: number  // A2 跨组合下单优先级（数值越大越先处理，默认 0）
   min_commission: number
   buy_commission_rate: number
   sell_commission_rate: number
   stamp_duty_rate: number
+  transfer_fee_rate?: number  // 过户费率（买卖双向，默认 0.00001=0.001%）
   slippage: number
   trading_session: string  // full|am|pm
-  price_limit_check_enabled?: boolean  // None=新建默认开启/编辑不动
+  price_limit_check_enabled?: boolean  // #1 涨跌停校验；None=新建默认开启（实盘仅 TDX/THS 生效，QMT/掘金桥恒放行）/编辑不动
   volume_limit_enabled?: boolean
   volume_limit_ratio?: number  // (0,1]
   adaptive_slippage_enabled?: boolean  // #4 自适应滑点（默认关）
@@ -866,6 +1124,16 @@ export interface PortfolioRequest {
   cash_enhance_equity_threshold?: number | null
   cash_enhance_position_ratio_threshold?: number | null
   equity_cap?: number | null  // W3 容量上限（dynamic 仓位资金封顶，None=不设上限）
+  max_single_position_pct?: number | null  // 单票上限（0~1 比例，null=不限制；仅实盘生效）
+  min_cash_reserve_pct?: number | null     // 现金下限（0~1 比例，null=不限制；仅实盘生效）
+  market_gate_enabled?: boolean | null         // 市场多空门控开关（null=请求未携带，编辑不动）
+  market_gate_engine?: string | null           // python（默认）| tdx
+  market_gate_formula_name?: string | null     // 通达信公式名，空=默认 TQGATE
+  // E3 门控维度扩展（null=请求未携带，编辑不动）
+  market_gate_indices?: string[] | null        // 多指数投票；空数组=仅 benchmark_index
+  market_gate_vote_mode?: string | null        // any（默认）| majority | all
+  market_gate_strength_threshold?: number | null // 空头强度门槛 0-100；0=不设门槛
+  market_gate_bear_reduce_ratio?: number | null  // 空头减仓比例 0-1；0=关闭
   status: string  // active|archived
   strategies?: StrategyItem[]  // 创建时携带；更新组合时后端忽略（策略单独 CRUD）
 }
@@ -916,12 +1184,22 @@ export interface StrategyDetail {
   regime_filter_enabled: boolean
   trend_trailing_stop_ratio: number | null
   trend_max_positions: number | null
+  // E3 策略级门控覆盖（inherit=跟随组合（默认）/off=不受门控/on=强制启用）
+  market_gate_mode: string
   exposure_cap_enabled: boolean
   max_order_amount?: number | null  // 单笔最大买入金额（元），null=不限
   requote_enabled: boolean
   requote_max_attempts: number
+  requote_price_mode: string  // tick|adaptive（H4）
+  requote_max_slippage_ticks: number  // H4 最大追价档数
   split_order_enabled: boolean
   split_order_threshold: number
+  // H3 切片增强（null/0 = 按阈值默认推导）
+  split_order_count: number | null
+  split_order_min_qty: number | null
+  split_order_interval_seconds: number | null
+  split_order_interval_jitter: boolean
+  split_order_volume_pct: number | null
   risk_timing: string  // next_day|immediate
   signal_frequency?: string | null
   signal_at?: string | null
@@ -953,12 +1231,21 @@ export interface StrategyRequest {
   regime_filter_enabled?: boolean
   trend_trailing_stop_ratio?: number | null
   trend_max_positions?: number | null
+  // E3 策略级门控覆盖（inherit/off/on；null=请求未携带）
+  market_gate_mode?: string | null
   exposure_cap_enabled?: boolean
   max_order_amount?: number | null  // 单笔最大买入金额（元），null=不限
   requote_enabled?: boolean
   requote_max_attempts?: number
+  requote_price_mode?: string  // tick|adaptive（H4）
+  requote_max_slippage_ticks?: number
   split_order_enabled?: boolean
   split_order_threshold?: number
+  split_order_count?: number | null
+  split_order_min_qty?: number | null
+  split_order_interval_seconds?: number | null
+  split_order_interval_jitter?: boolean
+  split_order_volume_pct?: number | null
   risk_timing?: string  // next_day|immediate
   signal_frequency?: string | null
   signal_at?: string | null
@@ -997,7 +1284,7 @@ export interface BacktestRequest {
   name: string
   start_date: string  // YYYY-MM-DD
   end_date: string    // YYYY-MM-DD
-  dividend_mode?: 'front' | 'back' | 'dual'  // 复权模式：前复权(默认)/后复权/前复权信号+后复权记账
+  dividend_mode?: 'front' | 'back' | 'dual' | 'exact'  // 复权模式：前复权(默认)/后复权/前复权信号+后复权记账
   evaluation_profile?: 'absolute' | 'relative'  // B6 考核口径（默认 absolute）
   is_oos_gate_enabled?: boolean                 // C7 IS/OOS 采纳门槛（默认关）
   oos_gate_min_ratio?: number                   // (0,2]，默认 0.5
@@ -1011,6 +1298,7 @@ export interface BacktestRequest {
   equity_cap?: number                           // 容量上限 run 级覆盖，>0（undefined=用组合默认）
   daily_close_peak_enabled?: boolean            // 日末 peak 保护（默认关）：仅当日最后一根 bar 更新峰值/回撤
   daily_loss_basis?: 'equity' | 'initial' | null   // 日内亏损分母 run 级覆盖（null/undefined=跟随组合）
+  market_gate_enabled?: boolean | null             // 市场多空门控 run 级三态覆盖（null/undefined=跟随组合）
 }
 
 // C7 IS/OOS 采纳门槛评估结果（回测完成时返回；未启用为 null）
@@ -1043,6 +1331,13 @@ export async function deleteBacktestRecord(id: number) {
   return res.data.data
 }
 
+// K1 协作式取消：请求中止运行中的回测（引擎下一根 bar 前退出，记录标 canceled）
+export async function cancelBacktestRecord(id: number) {
+  const res = await api.post<ApiResponse<{ record_id: number; cancel_requested: boolean }>>(
+    `/backtest/records/${id}/cancel`)
+  return res.data.data
+}
+
 // ===== C8 walk-forward 滚动验证 =====
 export interface WalkForwardRequest {
   portfolio_strategy_id: number
@@ -1052,7 +1347,7 @@ export interface WalkForwardRequest {
   train_years: number
   test_years: number
   oos_gate_min_ratio: number
-  dividend_mode: 'front' | 'back' | 'dual'
+  dividend_mode: 'front' | 'back' | 'dual' | 'exact'
   evaluation_profile: 'absolute' | 'relative'
 }
 export interface WalkForwardWindow {
@@ -1119,7 +1414,7 @@ export interface ParamPerturbRequest {
   start_date: string
   end_date: string
   perturb_pct: number  // (0,0.5]
-  dividend_mode: 'front' | 'back' | 'dual'
+  dividend_mode: 'front' | 'back' | 'dual' | 'exact'
   evaluation_profile: 'absolute' | 'relative'
 }
 export interface PerturbRoundMetrics {
@@ -1527,7 +1822,7 @@ export interface PoolCompareRequest {
   start_date: string
   end_date: string
   name_prefix?: string
-  dividend_mode?: 'front' | 'back' | 'dual'
+  dividend_mode?: 'front' | 'back' | 'dual' | 'exact'
 }
 
 export interface PoolCompareItem {
@@ -1556,6 +1851,12 @@ export async function compareBacktestPools(req: PoolCompareRequest) {
   return res.data.data
 }
 
+export async function compareBacktestRecords(record_ids: number[]) {
+  const res = await api.post<ApiResponse<BacktestCompareResult>>(
+    '/backtest/records/compare', { record_ids })
+  return res.data.data
+}
+
 // ---- B4b: 实盘历史查询（订单/成交/持仓）----
 
 export interface LiveOrderItem {
@@ -1573,6 +1874,16 @@ export interface LiveOrderItem {
   signal_type: string | null
   bar_time: string | null
   created_at: string | null
+  // H5 进度：拆单分组/序号/总数、追价次数、组级汇总（普通委托为 null）
+  split_group?: string | null
+  split_seq?: number | null
+  split_total?: number | null
+  split_summary?: {
+    total: number
+    filled_children: number
+    remaining_quantity: number
+  } | null
+  requote_attempt?: number | null
 }
 
 export interface LiveTradeItem {
@@ -1600,6 +1911,15 @@ export interface LivePositionItem {
   // 归属：pool=在组合股票池内 / fallback=不在池内、按兜底规则挂到首个组合；
   // 旧数据/旧接口缺省时按 pool 降级（不显示徽标）
   attribution?: 'pool' | 'fallback'
+  // 池外外部仓（代码不在任何组合股票池）：true 时前端显示「池外·不参与风控」徽章；
+  // 旧接口缺省/池信息未知时按 false 降级（不显示徽章）
+  out_of_pool?: boolean
+  // D6 峰值（移动止损基准）：峰值价格 / 峰值日期 / 来源（bar/table/period/daily/
+  // snapshot/cost/import）与中文标签；旧接口缺省时前端显示「—」
+  highest_price?: number
+  peak_bar_time?: string | null
+  peak_source?: string | null
+  peak_source_label?: string | null
 }
 
 export async function getLiveOrders(sessionId: number, status?: string) {
@@ -1608,8 +1928,84 @@ export async function getLiveOrders(sessionId: number, status?: string) {
   return res.data.data
 }
 
-export async function getLiveTrades(sessionId: number) {
-  const res = await api.get<ApiResponse<LiveTradeItem[]>>(`/live/sessions/${sessionId}/trades`)
+/** G1：待放行的顺延委托（DB 权威 + 运行中内存可达性标记）。 */
+export interface LiveDeferredOrderItem {
+  id: number
+  portfolio_strategy_id: number | null
+  strategy_id: number | null
+  stock_code: string
+  trade_type: string
+  price: number | null
+  quantity: number
+  signal_type?: string | null
+  signal_name?: string | null
+  period?: string | null
+  bar_time?: string | null
+  signal_bar_date?: string | null
+  status: string
+  retry_count: number
+  error_message?: string | null
+  in_memory: boolean
+}
+
+export async function getLiveDeferredOrders(sessionId: number) {
+  const res = await api.get<ApiResponse<{ running: boolean; items: LiveDeferredOrderItem[] }>>(
+    `/live/sessions/${sessionId}/deferred-orders`)
+  return res.data.data
+}
+
+/** G1：人工放行（仅 auto，需 confirm）。 */
+export async function releaseLiveDeferredOrder(sessionId: number, orderId: number) {
+  const res = await api.post<ApiResponse<{ status: string; order_id: number; live_order_id?: number | null }>>(
+    `/live/sessions/${sessionId}/deferred-orders/${orderId}/release`, { confirm: true })
+  return res.data.data
+}
+
+/** G1：人工放弃（终态 canceled，需 confirm，可选原因）。 */
+export async function abandonLiveDeferredOrder(
+  sessionId: number, orderId: number, reason?: string,
+) {
+  const res = await api.post<ApiResponse<{ status: string; order_id: number; reason: string }>>(
+    `/live/sessions/${sessionId}/deferred-orders/${orderId}/abandon`,
+    { confirm: true, ...(reason ? { reason } : {}) })
+  return res.data.data
+}
+
+/** G4：盘前效果统计（只读，按日/周）。 */
+export interface LivePreOpenBucket {
+  bucket: string
+  reported: number
+  filled: number
+  cancel_crossed: number
+  requeued: number
+  blocked: number
+  deferred: number
+}
+
+export async function getLivePreOpenStats(
+  sessionId: number,
+  params: { start?: string; end?: string; group_by?: 'day' | 'week' } = {},
+) {
+  const res = await api.get<ApiResponse<{
+    session_id: number
+    start: string
+    end: string
+    group_by: string
+    items: LivePreOpenBucket[]
+    totals: Omit<LivePreOpenBucket, 'bucket'>
+  }>>(`/live/sessions/${sessionId}/pre-open-stats`, { params })
+  return res.data.data
+}
+
+/** 成交历史。可选 start_date/end_date（YYYY-MM-DD，北京自然日闭区间）服务端预筛；
+ *  不传=全量（与旧行为一致，向后兼容）。 */
+export async function getLiveTrades(
+  sessionId: number,
+  range?: { start_date?: string; end_date?: string },
+) {
+  const params = range && (range.start_date || range.end_date) ? range : {}
+  const res = await api.get<ApiResponse<LiveTradeItem[]>>(
+    `/live/sessions/${sessionId}/trades`, { params })
   return res.data.data
 }
 
@@ -1619,8 +2015,38 @@ export async function getLivePositions(sessionId: number) {
 }
 
 // 决策闸门事件（调参可观测性）：聚合统计 + 逐事件，对齐 live.session_decisions
-export async function getLiveDecisions(sessionId: number) {
-  const res = await api.get<ApiResponse<DecisionData>>(`/live/sessions/${sessionId}/decisions`)
+export async function getLiveDecisions(sessionId: number, ackStatus?: 'open' | 'acked') {
+  const res = await api.get<ApiResponse<DecisionData>>(
+    `/live/sessions/${sessionId}/decisions`,
+    { params: ackStatus ? { ack_status: ackStatus } : undefined },
+  )
+  return res.data.data
+}
+
+/** M4：确认/关闭单条决策事件（幂等，可附处理备注）。 */
+export async function ackLiveDecision(sessionId: number, eventId: number, note?: string) {
+  const res = await api.post<ApiResponse<DecisionEventItem>>(
+    `/live/sessions/${sessionId}/decisions/${eventId}/ack`,
+    note ? { note } : {},
+  )
+  return res.data.data
+}
+
+/** M4：批量确认未处理事件；day_end=true 时备注默认「日终清零」。 */
+export async function ackAllLiveDecisions(
+  sessionId: number, opts?: { note?: string; day_end?: boolean },
+) {
+  const res = await api.post<ApiResponse<{ acked: number; ack_status: string; note: string | null }>>(
+    `/live/sessions/${sessionId}/decisions/ack-all`,
+    opts || {},
+  )
+  return res.data.data
+}
+
+/** L4：关键事件检索（跨会话只读，按 created_at 倒序，limit 上限 1000）。 */
+export async function searchDecisionEvents(filters: DecisionEventSearchFilters = {}) {
+  const res = await api.get<ApiResponse<DecisionEventSearchResult>>(
+    '/live/decision-events', { params: filters })
   return res.data.data
 }
 
@@ -1681,14 +2107,92 @@ export interface LiveSessionItem {
   mode: string  // simulation|live
   engine?: LiveEngineKey  // 交易引擎（旧数据缺省视作 iquant）
   execution_mode?: LiveExecutionMode  // 执行模式（旧数据缺省视作 auto）
-  status: string  // stopped|running
+  status: string  // stopped|running|stopping（stopping=引擎真正退出中，仍占用引擎/账户）
   engine_running?: boolean  // 该会话引擎是否真的在注册表中运行（status=running 但 false=重启后未启动）
-  live_capital?: number | null  // 会话级实盘资金基准（账户总资产，元）；null=各组合用自身 initial_capital
+  // 账户身份键（launch 成功后由后端解析写入）：qmt:<account>:<type> / gm:<id> /
+  // tdx:<account> / ths:<account> / engine:<engine>（取不到账号时降级）
+  account_key?: string | null
+  // 账户键来源：bridge_ping|config|engine_fallback；engine_fallback 表示仅同引擎互斥
+  account_key_source?: string | null
+  // 占用起始时间（直接取 started_at，供引擎下拉置灰/多账户横幅展示）
+  occupied_since?: string | null
+  // 通道在线态（会话详情接口返回；列表接口通常不返回 → undefined=未知）
+  bridge_online?: boolean | null
+  live_capital?: number | null  // 实盘资金基准（元）；null=以真实通道总资产为基准（只缩不放）
   started_at: string | null
   stopped_at: string | null
   portfolio_ids: number[]
+  // 理论 vs 实盘面板绑定的回测记录（null=未显式绑定，面板按组合自动关联）
+  backtest_record_id?: number | null
   portfolios?: { portfolio_id: number; status: string }[]  // 组合级状态(active|circuit_broken)
   reconcile_mismatches?: ReconcileMismatch[]  // 最近一次虚拟持仓 vs 桥实际对账差异（未运行 []）
+  advance_close_enabled?: boolean  // 14:50 提前收盘价（B 可选增强，仅 1d）是否开启
+  advance_close_time?: string      // 提前收盘价轮次时点（默认 14:51，实际不早于 14:52）
+  advance_close_done_date?: string | null  // 提前收盘价轮次已执行日期（幂等标记）
+  // 错周期风控三态（原始值）：null=跟随全局 / true=强制开启 / false=强制关闭
+  intraday_mismatched_risk_enabled?: boolean | null
+  // A1 资金池（列表/详情回显）
+  capital_pool_mode?: 'off' | 'equal' | 'risk_budget' | 'priority'
+  capital_pool_rebalance_enabled?: boolean
+  // 外部信号文件注入：null/空 = 走 TQ 公式计算
+  signal_file_path?: string | null
+  // B2 主备通道（后续批次使用；旧数据缺省）
+  backup_engine?: LiveEngineKey | null
+  failover_enabled?: boolean
+  // H2 待补发拆单剩余笔数（>0 显示「补发拆单剩余」入口）
+  split_remainder_count?: number
+  // E1 执行前重判门控（默认关）：顺延次日单/盘前竞价单提交前再判一次
+  gate_recheck_on_execute?: boolean
+  // G2 盘前参数会话级覆盖（原始三态，null=跟随全局）
+  pre_open_auction_enabled?: boolean | null
+  pre_open_auction_end_time?: string | null
+  pre_open_auction_price_bias_pct?: number | null
+  // 生效值（含来源 source=session|global 与被覆盖字段清单）
+  pre_open_auction_effective?: {
+    enabled: boolean
+    end_time: string
+    price_bias_pct: number
+    source: 'session' | 'global'
+    overrides: string[]
+  }
+  // 存量/外部持仓是否纳入风控（代卖）会话级开关：
+  //   platform_only=关闭（默认，存量/外部仓不代卖）/ full=开启（按整仓卖）
+  // sell_scope_source=session 表示本会话显式设置；global 表示未设置、跟随全局默认
+  sell_scope?: 'full' | 'platform_only'
+  sell_scope_source?: 'session' | 'global'
+  sell_scope_global?: 'full' | 'platform_only'
+}
+
+// H2 拆单剩余量（停会话时未提交的子单快照）
+export interface LiveSplitRemainderItem {
+  id: number
+  portfolio_strategy_id: number | null
+  strategy_id: number | null
+  stock_code: string
+  trade_type: string
+  quantity: number
+  price: number | null
+  signal_type: string
+  period: string
+  signal_name: string
+  created_at: string | null
+}
+
+export interface LiveSplitRemainderList {
+  items: LiveSplitRemainderItem[]
+  count: number
+}
+
+// E2 每日市场门控快照（每组合每日一条；direction 1/0/-1）
+export interface LiveGateSnapshotItem {
+  id: number
+  snap_date: string | null
+  portfolio_id: number
+  benchmark_index: string | null
+  gate_engine: string | null
+  direction: number | null
+  strength: number | null
+  as_of: string | null
 }
 
 // I-7（audit）：对账差异摘要（LiveEngine._reconcile_positions 产出）
@@ -1705,7 +2209,8 @@ export interface ReconcileMismatch {
 export type LiveEngineKey = 'iquant' | 'tdx' | 'ths' | 'goldminer'
 
 // 执行模式：alert(半自动预警,仅 TQ 行情+send_warn,不下单) / auto(全自动,走所选引擎下单)
-export type LiveExecutionMode = 'alert' | 'auto'
+// / manual(人工审批) / shadow(影子：真实行情+心跳,委托本地模拟成交,不触真实柜台)
+export type LiveExecutionMode = 'alert' | 'auto' | 'manual' | 'shadow'
 
 export interface LiveSessionCreate {
   name: string
@@ -1713,12 +2218,42 @@ export interface LiveSessionCreate {
   engine?: LiveEngineKey
   execution_mode?: LiveExecutionMode
   portfolio_ids: number[]
-  live_capital?: number | null  // 实盘资金基准（账户总资产，元）；空=null=用组合初始资金
+  live_capital?: number | null  // 实盘资金基准（元）；空=null=以真实通道总资产为基准（只缩不放）
+  // 基准口径（文档 §7/§6）：total_asset=以真实总资产为基准 / manual=显式填写 / initial_capital=旧行为
+  baseline_mode?: 'total_asset' | 'manual' | 'initial_capital'
+  baseline_value?: number | null
   signal_file_path?: string | null  // 外部信号文件路径；空=null=走 TQ 公式计算
+  advance_close_enabled?: boolean  // B 可选增强，仅 1d：14:50 定信号、14:52 bar 开盘价报单、当日尾盘成交；默认 false（1d/1w/1mon 均 15:05 收盘落定后算、次日执行）
+  advance_close_time?: string      // 执行时点 HH:MM；默认 14:51，限定 14:51–14:59，实际轮次不早于 14:52
+  // 错周期风控三态：null=跟随全局（tq_trade.intraday_mismatched_risk_enabled，默认 False=对齐回测）/
+  // true=强制开启（任意 bar 都跑风控，旧行为）/ false=强制关闭
+  intraday_mismatched_risk_enabled?: boolean | null
+  // E1 执行前重判门控（默认关）
+  gate_recheck_on_execute?: boolean
+  // G2 盘前参数会话级覆盖：null=跟随全局；显式值=本会话覆盖
+  pre_open_auction_enabled?: boolean | null
+  pre_open_auction_end_time?: string | null
+  pre_open_auction_price_bias_pct?: number | null
+}
+
+/** 真实总资产预览（GET /live/account-preview）：只读；通道未就绪时后端 503。 */
+export interface LiveAccountPreview {
+  total_asset: number | null
+  available: number | null
+  captured_at: string | null
 }
 
 export async function getLiveSession(sessionId: number) {
   const res = await api.get<ApiResponse<Record<string, any>>>(`/live/sessions/${sessionId}`)
+  return res.data.data
+}
+
+/** F2 数据体检 + 非盘中自动补齐（GET /live/sessions/{id}/data-health，只读）。 */
+export async function getLiveDataHealth(sessionId: number, autoFill = true) {
+  const res = await api.get<ApiResponse<Record<string, any>>>(
+    `/live/sessions/${sessionId}/data-health`,
+    { params: { auto_fill: autoFill } },
+  )
   return res.data.data
 }
 
@@ -1727,18 +2262,383 @@ export async function getLiveSessions() {
   return res.data.data
 }
 
-export async function createLiveSession(req: LiveSessionCreate) {
-  const res = await api.post<ApiResponse<{ id: number; status: string }>>('/live/sessions', req)
+// ---- 存量/外部仓是否纳入风控（代卖）：会话级开关 ----
+export interface SellScopePositionDiff {
+  stock_code: string
+  counter_qty: number
+  virtual_qty: number
+}
+
+export interface SellScopeGate {
+  passed: boolean
+  source: string
+  reasons: string[]
+  snapshot_at?: string | null
+  cash?: Record<string, string | null>
+  equity?: Record<string, string | null>
+  position_diffs?: SellScopePositionDiff[]
+}
+
+export interface SellScopeSwitchResult {
+  session_id: number
+  old: 'full' | 'platform_only'
+  new: 'full' | 'platform_only'
+  changed: boolean
+  running: boolean
+  effective_at: 'now' | 'next_start'
+  message: string
+  gate: SellScopeGate | null
+}
+
+/**
+ * 切换会话级卖出范围（存量/外部仓是否代卖）。
+ *
+ * - 切到 full 会先在后端做全量对账，账不齐返回 409（错误 message 里带差异明细）；
+ * - 运行中立即生效（下一轮 tick），不重启会话；已提交未成交委托不撤销。
+ */
+export async function setLiveSessionSellScope(
+  sessionId: number,
+  scope: 'full' | 'platform_only',
+  reason = '',
+) {
+  const res = await api.post<ApiResponse<SellScopeSwitchResult>>(
+    `/live/sessions/${sessionId}/sell-scope`,
+    { scope, reason, confirm: scope === 'full' },
+  )
   return res.data.data
 }
 
-export async function startLiveSession(id: number) {
-  const res = await api.post<ApiResponse<{ id: number; status: string }>>(`/live/sessions/${id}/start`)
+/** H2 参数漂移（绑定回测记录时）：当前组合参数 vs params_snapshot 的差异。 */
+export interface ParamsDriftField {
+  field: string
+  snapshot: string | null
+  current: string | null
+}
+
+export interface ParamsDrift {
+  backtest_record_id: number | null
+  portfolio_strategy_id?: number
+  checked: boolean
+  drifted: boolean
+  fields: ParamsDriftField[]
+  block_enabled: boolean
+  reason?: string | null
+}
+
+export async function getLiveParamsDrift(sessionId: number) {
+  const res = await api.get<ApiResponse<ParamsDrift>>(`/live/sessions/${sessionId}/params-drift`)
+  return res.data.data
+}
+
+// ---- N2/K7 理论 vs 实际对照 ----
+export interface TheoryVsLiveCurvePoint {
+  date: string
+  total_value: number | null
+  index_value: number | null
+}
+
+export interface TheoryVsLiveSide {
+  curve: TheoryVsLiveCurvePoint[]
+  metrics: Record<string, number | null>
+}
+
+export interface TheoryVsLiveSlippagePair {
+  stock_code: string
+  date: string
+  trade_type: string
+  theory_price: number
+  live_price: number
+  deviation_bps: number
+}
+
+export interface TheoryVsLiveResult {
+  bound: boolean
+  backtest_record_id: number | null
+  backtest_name: string | null
+  // manual=会话显式绑定；auto=按会话组合自动关联最近一次已完成回测
+  binding_source: 'manual' | 'auto' | null
+  binding_note: string | null
+  live_series_status: 'missing' | 'ok'
+  theory_series_status: 'no_binding' | 'record_missing' | 'empty' | 'insufficient' | 'ok'
+  window: { start: string | null; end: string | null }
+  theory: TheoryVsLiveSide
+  live: TheoryVsLiveSide
+  deviation: null | {
+    return_gap: number | null
+    max_drawdown_gap: number | null
+    trades_gap: number
+    slippage: {
+      matched_pairs: number
+      weighted_deviation_bps: number | null
+      details: TheoryVsLiveSlippagePair[]
+    }
+  }
+  warnings: string[]
+}
+
+export async function getTheoryVsLive(
+  sessionId: number, params: { portfolio_id?: number; start?: string; end?: string } = {},
+) {
+  const res = await api.get<ApiResponse<TheoryVsLiveResult>>(
+    `/live/sessions/${sessionId}/theory-vs-live`, { params })
+  return res.data.data
+}
+
+// ---- N3 信号回放校验 ----
+export interface SignalReplayRow {
+  bar_time: string
+  date: string | null
+  strategy_id: number
+  stock_code: string
+  signals: Array<{ name: string; signal_type: string | null; value: number }>
+  directions: string[]
+}
+
+export interface SignalReplayResult {
+  portfolio_strategy_id: number
+  portfolio_name: string
+  start_date: string
+  end_date: string
+  dividend_mode: string
+  session_id: number | null
+  rows: SignalReplayRow[]
+  summary: {
+    signal_bars: number
+    signals: number
+    by_date: Array<{ date: string; count: number }>
+    by_strategy: Record<string, number>
+    by_stock: Array<{ stock_code: string; count: number }>
+  }
+  comparison: null | {
+    session_id: number
+    replay_keys: number
+    live_order_keys: number
+    matched: number
+    only_replay_count: number
+    only_live_count: number
+    only_replay: Array<{ date: string; stock_code: string; trade_type: string }>
+    only_live: Array<{ date: string; stock_code: string; trade_type: string }>
+    truncated: boolean
+    note: string
+  }
+  warnings: string[]
+}
+
+export async function replaySignals(payload: {
+  portfolio_strategy_id: number
+  start_date: string
+  end_date: string
+  dividend_mode?: string
+  session_id?: number | null
+}) {
+  const res = await api.post<ApiResponse<SignalReplayResult>>(
+    '/backtest/signal-replay', payload)
+  return res.data.data
+}
+
+// ---- 外部现金流台账（入金/出金/分红/其他）----
+export type LiveCashFlowType = 'deposit' | 'withdraw' | 'dividend' | 'other'
+
+export interface LiveCashFlowItem {
+  id: number
+  portfolio_id: number
+  flow_type: LiveCashFlowType
+  amount: string          // 有符号：>0 流入，<0 流出
+  flow_date: string | null
+  note: string | null
+  created_at: string | null
+}
+
+export interface LiveCashFlowList {
+  flows: LiveCashFlowItem[]
+  net_inflow: { portfolio_id: number; net_inflow: string }[]
+  total_net_inflow: string
+}
+
+export async function getLiveCashFlows(sessionId: number, portfolioId?: number) {
+  const res = await api.get<ApiResponse<LiveCashFlowList>>(
+    `/live/sessions/${sessionId}/cash-flows`,
+    { params: portfolioId !== undefined ? { portfolio_id: portfolioId } : {} })
+  return res.data.data
+}
+
+/** 登记一笔外部现金流。deposit/withdraw/dividend 传正数（符号由类型决定）；other 按符号判方向。 */
+export async function createLiveCashFlow(
+  sessionId: number,
+  req: {
+    portfolio_id: number
+    flow_type: LiveCashFlowType
+    amount: number
+    flow_date?: string | null
+    note?: string | null
+  },
+) {
+  const res = await api.post<ApiResponse<{
+    id: number; session_id: number; portfolio_id: number; flow_type: string
+    amount: string; flow_date: string | null; note: string | null
+    net_inflow: string; engine_applied: boolean
+  }>>(`/live/sessions/${sessionId}/cash-flows`, req)
+  return res.data.data
+}
+
+export async function getLiveAccountPreview(engine?: LiveEngineKey) {
+  const res = await api.get<ApiResponse<LiveAccountPreview>>('/live/account-preview', {
+    params: engine ? { engine } : {},
+  })
+  return res.data.data
+}
+
+export async function createLiveSession(req: LiveSessionCreate) {
+  const res = await api.post<ApiResponse<{
+    id: number
+    status: string
+    warnings?: string[]   // A1 软校验：目标引擎已被其它 running/stopping 会话占用（不阻断）
+  }>>('/live/sessions', req)
+  return res.data.data
+}
+
+/** B1 + A4：编辑会话配置。运行中除 name 外进入待生效队列，下次启动生效。 */
+export async function updateLiveSession(id: number, req: Record<string, unknown>) {
+  const res = await api.put<ApiResponse<{
+    session: LiveSessionItem
+    applied: string[]
+    pending: string[]
+    effective_at: 'now' | 'next_start'
+    message: string
+  }>>(`/live/sessions/${id}`, req)
+  return res.data.data
+}
+
+/** H2：停会话时未提交的拆单剩余量（待一键补发）。 */
+export async function getLiveSplitRemainders(id: number) {
+  const res = await api.get<ApiResponse<LiveSplitRemainderList>>(
+    `/live/sessions/${id}/split-remainders`)
+  return res.data.data
+}
+
+/** E2：每日市场门控快照（按日倒序）。 */
+export async function getLiveGateSnapshots(id: number, days = 30) {
+  const res = await api.get<ApiResponse<LiveGateSnapshotItem[]>>(
+    `/live/sessions/${id}/gate-snapshots`, { params: { days } })
+  return res.data.data
+}
+
+/** H2：一键补发拆单剩余量（需 confirm=true + 会话运行中）。 */
+export async function reorderLiveSplitRemainders(id: number, changeIds?: number[]) {
+  const res = await api.post<ApiResponse<{
+    results: { id: number | null; status: string; reason?: string }[]
+    accepted: number
+    remaining: number
+  }>>(`/live/sessions/${id}/split-remainders/reorder`,
+    { confirm: true, change_ids: changeIds })
+  return res.data.data
+}
+
+/** B2：主/备通道健康探活（只读）。 */
+export interface LiveChannelHealth {
+  engine: string
+  label: string
+  online: boolean | null
+  online_source?: string
+  engine_running?: boolean
+  configured?: boolean
+  detail?: string
+  stale?: boolean
+  checked_at?: string | null
+}
+
+export interface LiveSessionChannelHealth {
+  session_id: number
+  primary: LiveChannelHealth | null
+  backup: LiveChannelHealth | null
+  failover_enabled: boolean
+  advice: string
+}
+
+export async function getLiveSessionChannelHealth(id: number) {
+  const res = await api.get<ApiResponse<LiveSessionChannelHealth>>(
+    `/live/sessions/${id}/channel-health`)
+  return res.data.data
+}
+
+/** B3：通道级守护检查清单（只读提示，不自动拉起终端）。 */
+export interface LiveChannelGuardCheck {
+  key: string
+  ok: boolean
+  label: string
+  detail: string
+}
+
+export interface LiveChannelGuard {
+  session_id: number
+  status: string
+  engine: string
+  checks: LiveChannelGuardCheck[]
+  ready_to_switch: boolean
+  actions: string[]
+  guard_mode: string
+  checked_at: string
+}
+
+export async function getLiveChannelGuard(id: number) {
+  const res = await api.get<ApiResponse<LiveChannelGuard>>(
+    `/live/sessions/${id}/channel-guard`)
+  return res.data.data
+}
+
+/** B3：一键重新探活（清 30s 缓存强制探一次）。 */
+export async function reconnectLiveChannel(id: number) {
+  const res = await api.post<ApiResponse<{
+    session_id: number
+    engine: string
+    online: boolean | null
+    stale: boolean
+    message: string
+    manual_action: string
+  }>>(`/live/sessions/${id}/channel-guard/reconnect`)
+  return res.data.data
+}
+
+/** B2：人工确认后切换主备通道（confirm 必填；运行中下次启动生效）。 */
+export async function failoverLiveSession(id: number, targetEngine?: string) {
+  const res = await api.post<ApiResponse<{
+    session_id: number
+    from_engine: string
+    to_engine: string
+    effective_at: 'now' | 'next_start'
+    message: string
+  }>>(`/live/sessions/${id}/failover`, {
+    confirm: true,
+    ...(targetEngine ? { target_engine: targetEngine } : {}),
+  })
+  return res.data.data
+}
+
+/** 启动实盘会话；键鼠冲突（C3）软拦时带 ack_keyboard_risk=true 二次确认。 */
+export async function startLiveSession(id: number, opts?: { ack_keyboard_risk?: boolean }) {
+  const res = await api.post<ApiResponse<{
+    id: number
+    status: string
+    account_key?: string | null
+    account_key_source?: string | null
+    warnings?: string[]   // 通道建议类告警（如推荐通道与所选引擎不一致）
+  }>>(`/live/sessions/${id}/start`, opts?.ack_keyboard_risk ? { ack_keyboard_risk: true } : undefined)
   return res.data.data
 }
 
 export async function stopLiveSession(id: number) {
   const res = await api.post<ApiResponse<{ id: number; status: string }>>(`/live/sessions/${id}/stop`)
+  return res.data.data
+}
+
+/** 重置资金基准（收盘后）：value=null → 当日收盘总资产；仅缩不放。 */
+export async function resetLiveBaseline(
+  sessionId: number,
+  portfolioId: number,
+  req: { value: number | null; note?: string },
+) {
+  const res = await api.post<ApiResponse<{ portfolio_id: number; baseline: number | null }>>(
+    `/live/sessions/${sessionId}/portfolios/${portfolioId}/reset-baseline`, req)
   return res.data.data
 }
 
@@ -1761,7 +2661,8 @@ export interface ThsUiConfig {
   enabled: boolean
   window_title: string
   client_exe_path: string
-  driver: string
+  /** @deprecated 引擎不使用该配置（UI 自动化固定走键盘/控件读表），界面已移除该项。 */
+  driver?: string
   captcha_ocr: boolean
   execute_mode: string             // file_builtin=文件内置执行器 | direct=直接执行
   execute_interval_seconds: number // 内置执行器轮询指令文件间隔（秒）
@@ -1776,6 +2677,18 @@ export interface TqTradeConfig {
   client_path: string
   default_engine: string       // tdx|iquant|ths：新建实盘会话未显式选引擎时使用
   cancel_unfilled_minutes: number  // >0：在途单超时未成交自动撤单；0=禁用
+  pre_open_auction_enabled: boolean       // 次日盘前（集合竞价）执行日线信号单，默认 false
+  pre_open_auction_end_time: string       // 盘前执行窗口结束时间（默认 09:20，左闭右开）
+  pre_open_auction_price_bias_pct: number // 盘前委托价相对信号价的让价幅度（%）
+}
+
+export interface BackupConfig {
+  enabled: boolean      // 每日自动备份开关
+  daily_at: string      // 执行时点 HH:MM（Asia/Shanghai，默认 15:10）
+  keep: number          // 自动备份保留份数（手动备份不参与自动清理）
+  min_free_mb: number   // 磁盘保护阈值：剩余空间低于该值跳过备份
+  dir: string           // 备份目录（相对 main/ 解析，默认 data/backup）
+  restore_enabled?: boolean  // 批次21 L2：从备份恢复（破坏性，默认关闭）
 }
 
 export interface SystemConfig {
@@ -1783,6 +2696,7 @@ export interface SystemConfig {
   iquant_path: string
   max_concurrent_backtest: number
   database: { sqlite_path: string }
+  backup: BackupConfig
   iquant_bridge: {
     simulation: { base_url: string }
     live: { base_url: string }
@@ -1794,23 +2708,93 @@ export interface SystemConfig {
   }
   ths_ui: ThsUiConfig
   tq_trade: TqTradeConfig
+  incremental_backtest?: IncrementalBacktestConfig
 }
+
+export interface BackupRecord {
+  id: number | null
+  kind: 'auto' | 'manual'
+  status: 'success' | 'skipped' | 'failed'
+  filename: string | null
+  path: string | null
+  size_bytes: number | null
+  message: string | null
+  started_at: string | null   // Asia/Shanghai naive ISO
+  finished_at: string | null
+}
+
+export interface BackupStatus {
+  enabled: boolean
+  daily_at: string
+  keep: number
+  min_free_mb: number
+  backup_dir: string
+  restore_enabled: boolean   // 恢复功能开关（config.backup.restore_enabled，默认 false）
+  last_auto: BackupRecord | null
+  last_manual: BackupRecord | null
+  auto_done_today: boolean
+}
+
+/** 备份文件只读校验结果（POST /system/backup/verify）。 */
+export interface BackupVerifyResult {
+  ok: boolean
+  path: string
+  exists: boolean
+  size_bytes: number | null
+  integrity: string
+  table_count: number
+  tables: string[]
+  row_counts: Record<string, number>
+  latest_record: string | null
+  message: string
+}
+
+/** 恢复结果（POST /system/backup/restore）。 */
+export interface BackupRestoreResult {
+  ok: boolean
+  message: string
+  restored_from: string | null
+  safety_backup: {
+    id: number | null
+    filename: string | null
+    path: string | null
+    status: string | null
+  } | null
+  verify: BackupVerifyResult | null
+  matched: boolean
+}
+
+// 下单通道类型：ths_ui / iquant_bridge / tdx_tq 为老三类；goldminer_bridge 为掘金桥，
+// alert 为预警模式（只推送不下单）。后端会返回全部取值，类型不得窄化。
+export type LiveChannelKind =
+  | 'ths_ui' | 'iquant_bridge' | 'tdx_tq' | 'goldminer_bridge' | 'alert'
 
 export interface LiveChannelEngine {
   key: LiveEngineKey
-  channel: 'ths_ui' | 'iquant_bridge' | 'tdx_tq'
+  channel: LiveChannelKind
   label: string
   configured: boolean
   detail: string
+  // B4 能力矩阵（下单/撤单/行情/限价/备注认领/拆单/盘前限价）
+  capabilities?: Record<string, boolean>
+  capability_limits?: string[]
 }
 
 export interface LiveChannelInfo {
   engine: LiveEngineKey
-  active: 'ths_ui' | 'iquant_bridge' | 'tdx_tq'
+  active: LiveChannelKind
   label: string
   online: boolean | null
   engine_running?: boolean  // 无运行引擎时为 false（此时 online=null，不做在线判定）
+  online_source?: 'engine' | 'probe' | 'none'
+  checked_at?: string | null
+  stale?: boolean
+  configured?: boolean
+  detail?: string
   engines: LiveChannelEngine[]
+  // B4 当前引擎能力矩阵与中文标签
+  capabilities?: Record<string, boolean>
+  capability_labels?: Record<string, string>
   ths_ui: ThsUiConfig
   bridge: { simulation: string; live: string }
   tq_trade?: { available: boolean; account: string; account_type: string; price_mode: string; client_path: string }
@@ -1818,7 +2802,7 @@ export interface LiveChannelInfo {
 
 export interface ChannelTestResult {
   ok: boolean
-  channel: 'ths_ui' | 'iquant_bridge' | 'tdx_tq'
+  channel: LiveChannelKind
   error?: string | null
   window_title?: string
   positions?: number
@@ -1830,8 +2814,28 @@ export async function getLiveChannel(engine?: LiveEngineKey) {
   return res.data.data
 }
 
+/** watchdog 活跃告警（通道级在线态；engine_stale 属引擎层，不算通道离线）。 */
+export interface WatchdogAlarm {
+  session_id: number
+  rule: string
+  channel?: string | null
+}
+
+export interface WatchdogStatus {
+  running: boolean
+  last_scan_at: string | null
+  scan_count: number
+  last_scan_duration_ms: number | null
+  active_alarms: WatchdogAlarm[]
+}
+
+export async function getWatchdogStatus() {
+  const res = await api.get<ApiResponse<WatchdogStatus>>('/live/watchdog-status')
+  return res.data.data
+}
+
 export async function testLiveChannel(
-  channel: 'ths_ui' | 'iquant_bridge' | 'tdx_tq', mode = 'simulation',
+  channel: LiveChannelKind, mode = 'simulation',
 ) {
   const res = await api.post<ApiResponse<ChannelTestResult>>('/live/channel/test', { channel, mode })
   return res.data.data
@@ -1846,6 +2850,76 @@ export async function getSystemStatus() {
   return res.data.data
 }
 
+// ---------------------------------------------------------------------------
+// 统一健康总览（批次21 L3，GET /system/health-overview）
+// ---------------------------------------------------------------------------
+export interface HealthChannelInfo {
+  configured?: boolean
+  online?: boolean | null
+  engine?: string
+  detail?: string
+}
+
+export interface HealthSessionItem {
+  id: number
+  name: string
+  mode: string
+  status: string
+  engine: string | null
+  backup_engine: string | null
+  registered: boolean
+  bridge: { online: boolean | null; status: string }
+  channel: { primary: HealthChannelInfo | null; backup: HealthChannelInfo | null }
+  channel_ok: boolean
+  channel_guard: { available: boolean; ok: boolean; failed: string[] }
+  data: {
+    available: boolean
+    healthy?: boolean
+    unavailable?: boolean
+    reason?: string | null
+    codes_total?: number | null
+    periods?: Record<string, { stale: number; empty: number; total: number }>
+    bad_total?: number
+  }
+  today: { orders: number; trades: number }
+  alerts: { open_decisions: number; deferred_orders: number; pending_approvals: number }
+}
+
+export interface HealthProblem {
+  level: 'warn' | 'error'
+  text: string
+}
+
+export interface HealthOverview {
+  generated_at: string
+  level: 'ok' | 'warn' | 'error'
+  problems: HealthProblem[]
+  core: { online: boolean; version: string | null; uptime: string | null }
+  watchdog: {
+    running: boolean
+    last_scan_at: string | null
+    active_alarms: unknown[]
+  }
+  channels: Record<string, unknown>
+  sessions: HealthSessionItem[]
+  tasks: {
+    trade_date: string
+    running_sessions: number
+    backup_at: string | null
+    backup_done_today: boolean
+  }
+  backup: Partial<BackupStatus>
+  disk: { free_mb: number | null; min_free_mb: number; ok: boolean; path: string }
+  notify: { enabled: boolean; usable: boolean; channels: string[]; min_level: string }
+  alert_totals: { open_decisions: number; deferred_orders: number; pending_approvals: number }
+}
+
+/** 统一健康总览：Core / 通道 / 数据新鲜度 / 当日任务 / 磁盘 / 待处理告警（只读）。 */
+export async function getHealthOverview() {
+  const res = await api.get<ApiResponse<HealthOverview>>('/system/health-overview')
+  return res.data.data
+}
+
 export async function getSystemConfigs() {
   const res = await api.get<ApiResponse<SystemConfig>>('/system/configs')
   return res.data.data
@@ -1853,5 +2927,212 @@ export async function getSystemConfigs() {
 
 export async function updateSystemConfigs(cfg: SystemConfig) {
   const res = await api.put<ApiResponse<null>>('/system/configs', cfg)
+  return res.data.data
+}
+
+export async function getBackupStatus() {
+  const res = await api.get<ApiResponse<BackupStatus>>('/system/backup')
+  return res.data.data
+}
+
+/** 立即备份（手动）。失败时后端返回非 0 code，前端拦截器会 reject。 */
+export async function createBackup() {
+  const res = await api.post<ApiResponse<BackupRecord>>('/system/backup')
+  return res.data.data
+}
+
+/** 最近备份记录（恢复入口的选择列表）。 */
+export async function listBackupRecords(limit = 20) {
+  const res = await api.get<ApiResponse<BackupRecord[]>>('/system/backup/records', {
+    params: { limit },
+  })
+  return res.data.data
+}
+
+/** 只读校验备份文件（完整性 + 表数 + 行数），不触碰当前库。 */
+export async function verifyBackup(payload: { record_id?: number; path?: string }) {
+  const res = await api.post<ApiResponse<BackupVerifyResult>>('/system/backup/verify', payload)
+  return res.data.data
+}
+
+/** 从备份恢复当前库：需 confirm=true 且后端 backup.restore_enabled=true。 */
+export async function restoreBackup(payload: { record_id?: number; path?: string; confirm: boolean }) {
+  const res = await api.post<ApiResponse<BackupRestoreResult>>('/system/backup/restore', payload)
+  return res.data.data
+}
+
+// ---------------------------------------------------------------------------
+// 升级 / 回滚路径（批次22 L5）
+// ---------------------------------------------------------------------------
+
+export interface UpgradeMigrationPending {
+  revision: string
+  doc: string | null
+  down_revision: string | string[] | null
+}
+
+export interface UpgradeCheckResult {
+  enabled: boolean
+  checked_at: string
+  migrations: {
+    available: boolean
+    error: string | null
+    current: string[]
+    heads: string[]
+    pending: UpgradeMigrationPending[]
+    pending_count: number
+    single_head: boolean | null
+    at_head: boolean | null
+  }
+  backup: {
+    latest: BackupRecord | null
+    age_hours: number | null
+    max_age_hours: number
+    fresh: boolean
+    required: boolean
+    dir: string
+  }
+  disk: { free_mb: number; min_free_mb: number; ok: boolean }
+  steps: string[]
+  rollback: string[]
+}
+
+/** L5 升级前只读检查：版本差异 / 备份新鲜度 / 回滚提示（不执行迁移）。 */
+export async function getUpgradeCheck() {
+  const res = await api.get<ApiResponse<UpgradeCheckResult>>('/system/upgrade-check')
+  return res.data.data
+}
+
+/** L5 升级前强制备份：需后端 upgrade.enabled=true 且显式 confirm=true。 */
+export async function upgradeBackup(confirm: boolean) {
+  const res = await api.post<ApiResponse<{
+    ok: boolean; status: string; message?: string | null; record: BackupRecord
+  }>>('/system/upgrade/backup', { confirm })
+  return res.data.data
+}
+
+// ---------------------------------------------------------------------------
+// 接缝续跑式增量回测（GET /incremental/summary、POST /incremental/validate）
+// ---------------------------------------------------------------------------
+
+export interface IncrementalBacktestConfig {
+  enabled: boolean
+  daily_at: string              // 每日续跑时点（Asia/Shanghai），默认 15:10
+  max_catchup_days: number      // 补跑上限（交易日），超过标「断档」
+  anchor_on_live_start: boolean // 接缝锚定：用实盘起账状态重锚回测
+  validate_weekday: number      // 双跑校验星期（0=周一 … 5=周六）
+  validate_at: string           // 双跑校验时点
+  dividend_mode: string         // front|back|dual
+  tolerances: {
+    max_net_dev_pct: number
+    mean_net_dev_pct: number
+    trade_count_match_ratio: number
+    direction_match_ratio: number
+    max_drawdown_dev_pct: number
+  }
+}
+
+export interface IncrementalDayRow {
+  trade_date: string
+  inc_total_value: string | null
+  inc_cash: string | null
+  inc_market_value: string | null
+  live_total_value: string | null
+  live_cash: string | null
+  live_market_value: string | null
+  net_dev_pct: number | null
+  inc_trades_count: number | null
+  live_trades_count: number | null
+  direction_match: boolean | null
+  status: 'ok' | 'warn' | 'gap'
+  tags: string[]
+}
+
+export interface IncrementalCheckpointInfo {
+  seam_date: string
+  as_of_date: string
+  params_hash: string
+  schema_version: number
+  updated_at: string | null
+}
+
+export interface IncrementalValidationInfo {
+  id: number
+  from_date: string
+  to_date: string
+  status: 'pass' | 'fail' | 'error'
+  max_net_dev_pct: number | null
+  mean_net_dev_pct: number | null
+  trade_count_match_ratio: number | null
+  direction_match_ratio: number | null
+  max_drawdown_dev_pct: number | null
+  first_divergence_date: string | null
+  criteria: Record<string, any>
+  created_at: string | null
+}
+
+export interface IncrementalSummary {
+  supported: boolean
+  reason: string
+  seam_date: string | null
+  seam_cash: string | null
+  checkpoint: IncrementalCheckpointInfo | null
+  // K3：最近一次接缝判废（null=从未判废）
+  last_invalidation: { at: string | null; message: string } | null
+  days: IncrementalDayRow[]
+  latest_validation: IncrementalValidationInfo | null
+  config: {
+    enabled: boolean
+    daily_at: string
+    max_catchup_days: number
+    tolerances: IncrementalBacktestConfig['tolerances']
+  }
+}
+
+export async function getIncrementalSummary(sessionId: number, portfolioStrategyId: number) {
+  const res = await api.get<ApiResponse<IncrementalSummary>>('/incremental/summary', {
+    params: { session_id: sessionId, portfolio_strategy_id: portfolioStrategyId },
+  })
+  return res.data.data
+}
+
+export async function runIncrementalValidation(
+  sessionId: number, portfolioStrategyId: number,
+  fromDate?: string | null, toDate?: string | null,
+) {
+  const res = await api.post<ApiResponse<{
+    status: 'pass' | 'fail' | 'error'
+    max_net_dev_pct: number | null
+    mean_net_dev_pct: number | null
+    trade_count_match_ratio: number | null
+    direction_match_ratio: number | null
+    max_drawdown_dev_pct: number | null
+    first_divergence_date: string | null
+    dates_count: number
+    from_date: string
+    to_date: string
+  }>>('/incremental/validate', {
+    session_id: sessionId,
+    portfolio_strategy_id: portfolioStrategyId,
+    from_date: fromDate ?? null,
+    to_date: toDate ?? null,
+  })
+  return res.data.data
+}
+
+// K3：一键重建接缝（丢弃 checkpoint 后从接缝日全量重建）
+export async function rebuildIncremental(
+  sessionId: number, portfolioStrategyId: number,
+) {
+  const res = await api.post<ApiResponse<{
+    status: string
+    as_of_date?: string | null
+    days?: number
+    reason?: string
+    checkpoint_invalidated?: { categories: string[]; from_as_of: string | null } | null
+  }>>('/incremental/rebuild', {
+    session_id: sessionId,
+    portfolio_strategy_id: portfolioStrategyId,
+  })
   return res.data.data
 }

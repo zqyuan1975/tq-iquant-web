@@ -54,3 +54,18 @@ export function fmtRatio(v: Num, digits = 2): string {
   if (n === null) return DASH
   return n.toFixed(digits)
 }
+
+/** 字节数 → 人类可读（B/KB/MB/GB/TB）。 */
+export function fmtBytes(v: Num): string {
+  const n = toNum(v)
+  if (n === null || n < 0) return DASH
+  if (n < 1024) return `${Math.round(n)} B`
+  const units = ['KB', 'MB', 'GB', 'TB']
+  let val = n / 1024
+  let i = 0
+  while (val >= 1024 && i < units.length - 1) {
+    val /= 1024
+    i += 1
+  }
+  return `${val.toFixed(val >= 100 ? 0 : 1)} ${units[i]}`
+}

@@ -488,7 +488,7 @@ HAVING net_quantity > 0
 | id | INTEGER PK | | |
 | name | VARCHAR(100) | | |
 | stock_pool_id | INTEGER FK | | 对应股票池 |
-| benchmark_index | VARCHAR(20) | 000300.SH | 参考的指数代码（如 000300.SH=沪深300、000905.SH=中证500），用于计算 benchmark_return |
+| benchmark_index | VARCHAR(20) | 000001.SH | 参考的指数代码（如 000001.SH=上证指数、000300.SH=沪深300），用于计算 benchmark_return |
 | initial_capital | DECIMAL(15,2) | 500000 | |
 | max_drawdown | DECIMAL(5,4) | 0.2000 | 20% |
 | daily_loss_limit | DECIMAL(5,4) | 0.0500 | 5% |

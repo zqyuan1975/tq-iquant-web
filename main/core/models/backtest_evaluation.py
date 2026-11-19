@@ -17,6 +17,8 @@ class BacktestEvaluation(Base):
     volatility = Column(Numeric(10, 4), nullable=True)
     sharpe_ratio = Column(Numeric(10, 4), nullable=True)
     sortino_ratio = Column(Numeric(10, 4), nullable=True)
+    # 年化下行波动率（索提诺分母同口径：负收益日均方根 × √252）
+    downside_volatility = Column(Numeric(10, 4), nullable=True)
     calmar_ratio = Column(Numeric(10, 4), nullable=True)
     win_rate = Column(Numeric(10, 4), nullable=True)
     profit_factor = Column(Numeric(10, 4), nullable=True)
@@ -40,6 +42,8 @@ class BacktestEvaluation(Base):
     up_capture_ratio = Column(Numeric(10, 4), nullable=True)
     down_capture_ratio = Column(Numeric(10, 4), nullable=True)
     excess_max_drawdown = Column(Numeric(10, 4), nullable=True)
+    # 超额卡玛 = 年化超额收益 / |超额最大回撤|（超额回撤 0 → NULL）
+    excess_calmar_ratio = Column(Numeric(10, 4), nullable=True)
     # ---- 交易磨损 / 仓位 / 结构（FR-2）----
     annual_turnover = Column(Numeric(10, 4), nullable=True)
     total_cost_ratio = Column(Numeric(10, 6), nullable=True)

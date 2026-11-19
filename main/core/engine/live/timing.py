@@ -41,11 +41,22 @@ def now_shanghai() -> datetime:
     return datetime.now(tz=_CST).replace(tzinfo=None)
 
 
+# 1h bar 的终点（时, 分）：上午从 09:30 起算 → 10:30 / 11:30；下午从 13:00
+# 起算 → 14:00 / 15:00。与 `live/snapshot_bars._bucket_end` 的 1h 聚合桶终点
+# 逐项一致（该函数注释亦标明「1h→10:30/11:30/14:00/15:00，与 TDX 原生分钟线
+# 一致」），亦是 TDX 60m 原生 bar 的标签口径。取并集后两者同一集合，无需分支。
+_1H_BAR_ENDS = {(10, 30), (11, 30), (14, 0), (15, 0)}
+
+
 def periods_on_boundary(bar_time: Optional[datetime]) -> List[str]:
     """1m bar 结束时刻 → 命中的边界周期列表（可累积，只读 bar stime，不引入本机时钟）。
 
-    minute%5==0→5m、%15→15m、%30→30m、minute==0→1h。可累积：10:30 → [5m,15m,30m]，
-    11:00 → [5m,15m,30m,1h]。非边界时刻（如 10:03）→ []。
+    minute%5==0→5m、%15→15m、%30→30m；1h 取「原生 60m bar 与 1m 聚合桶的终点」
+    并集：10:30 / 11:30 / 14:00 / 15:00（上午 09:30 起算、下午 13:00 起算，与
+    `snapshot_bars._bucket_end` 的 1h 桶终点逐项一致；11:30 那根属上午时段，
+    不因 13:00 才开始而漏派）。可累积：10:30 → [5m,15m,30m,1h]，
+    11:30 → [5m,15m,30m,1h]，14:00 → [5m,15m,30m,1h]。非边界时刻（如 10:03）→ []。
+    同一分钟至多给出一次 1h（集合成员判定，无重复分支）。
     """
     if bar_time is None:
         return []
@@ -57,7 +68,7 @@ def periods_on_boundary(bar_time: Optional[datetime]) -> List[str]:
         result.append("15m")
     if minute % 30 == 0:
         result.append("30m")
-    if minute == 0:
+    if (bar_time.hour, minute) in _1H_BAR_ENDS:
         result.append("1h")
     return result
 

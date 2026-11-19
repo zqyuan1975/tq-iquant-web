@@ -1,14 +1,25 @@
 #!/usr/bin/env python
 """Nuitka standalone(onedir) 构建 + 产物整理。
 
+三种模式（避免每次小改动都走完整 Nuitka 构建）：
+- 默认：保留并复用 Nuitka 的导入分析缓存（省依赖扫描几分钟）；注意 Nuitka 4.2.2
+  **没有真正的增量 C 编译**，改后端仍需完整构建，后端出包集中在稳定节点/夜间。
+- --clean：清空模块缓存与上次编译中间目录后全量重编；正式出包/缓存可疑时用。
+- --web-only：不跑 Nuitka，只把 web/dist 刷新进已有 dist/tq-iquant；只改前端用这条（秒级）。
+
 产物：<仓库根>/dist/tq-iquant/（含 exe、_internal/、web/dist、alembic、config 模板）
-安装器由 packaging/installer.iss（Inno Setup 6）基于该目录生成。
+安装器：packaging/installer.iss（全量包）/ packaging/installer_web.iss（前端补丁包，约 3 MB）
 
 注意：
-- 旧版打包产物 main/dist/tq-iquant 由历史流程维护，本脚本不读写、不删除。
+- 旧版打包产物 main/dist/tq-iquant 已废弃并删除，不再维护。
 - 桥脚本（live/bridge/*.py）**不编译进 exe**，由安装器以明文放到 <安装目录>\\bridge\\。
+- 版本号单一来源：packaging/app-version.iss（本脚本与两个 Inno 脚本共用）。
 """
+import argparse
+import datetime
+import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -23,7 +34,22 @@ NIGHT_BUILD_DIR = REPO / "dist" / "build" / "nuitka-build"
 ENTRY = ROOT / "desktop.py"
 ICON = REPO / "packaging" / "icon" / "app.ico"
 CONFIG_TEMPLATE = REPO / "packaging" / "config.template.yaml"
-VERSION = "1.0.0"
+VERSION_FILE = REPO / "packaging" / "app-version.iss"
+CORE_VERSION_FILE = ROOT / "core" / "version.py"
+
+
+def read_version() -> str:
+    """从 packaging/app-version.iss 读取版本号（唯一来源，避免两处写死不一致）。"""
+    if not VERSION_FILE.exists():
+        sys.exit(f"缺少版本号文件：{VERSION_FILE}")
+    text = VERSION_FILE.read_text(encoding="utf-8-sig")
+    match = re.search(r'#define\s+AppVersion\s+"([^"]+)"', text)
+    if not match:
+        sys.exit(f"无法从 {VERSION_FILE} 解析 AppVersion（期望格式：#define AppVersion \"1.0.6\"）")
+    return match.group(1)
+
+
+VERSION = read_version()
 
 
 def run(cmd, cwd=None, env=None):
@@ -34,16 +60,35 @@ def run(cmd, cwd=None, env=None):
         sys.exit(1)
 
 
-def purge_nuitka_cache():
-    """缓存重定向到项目内：本机 %LOCALAPPDATA%\\Nuitka 写入不稳定（PermissionError）。"""
-    if not NIGHT_BUILD_DIR.exists():
-        NIGHT_BUILD_DIR.mkdir(parents=True, exist_ok=True)
+def prepare_cache_dir():
+    """缓存重定向到项目内：本机 %LOCALAPPDATA%\\Nuitka 写入不稳定（PermissionError）。
+
+    只做重定向，不清理——清理会让模块缓存归零，下一次必然全量重编。
+    """
+    NIGHT_BUILD_DIR.mkdir(parents=True, exist_ok=True)
     os.environ["NUITKA_CACHE_DIR"] = str(NIGHT_BUILD_DIR)
-    os.environ["NUITKA_BUILD_DIR"] = str(NIGHT_BUILD_DIR)
+
+
+def purge_nuitka_cache():
+    """--clean 模式：清空模块缓存 + 上次编译中间目录，恢复全量重编。"""
+    prepare_cache_dir()
     module_cache = NIGHT_BUILD_DIR / "module-cache"
     if module_cache.exists():
         shutil.rmtree(module_cache, ignore_errors=True)
         print(f"已清空 Nuitka 模块缓存：{module_cache}")
+    build_dir = BUILD_OUT / "desktop.build"
+    if build_dir.exists():
+        shutil.rmtree(build_dir, ignore_errors=True)
+        print(f"已清空 Nuitka 中间目录：{build_dir}")
+
+
+def cache_stats() -> str:
+    module_cache = NIGHT_BUILD_DIR / "module-cache"
+    if not module_cache.exists():
+        return "模块缓存为空（本次为全量编译）"
+    files = [f for f in module_cache.rglob("*") if f.is_file()]
+    size_mb = sum(f.stat().st_size for f in files) / 1024 / 1024
+    return f"Nuitka 模块缓存：{len(files)} 个文件 / {size_mb:.1f} MB（命中即跳过重编）"
 
 
 def nuitka_cmd(python_exe: str):
@@ -105,15 +150,27 @@ def nuitka_cmd(python_exe: str):
     return cmd
 
 
-def copy_assets(dist_dir: Path):
-    print("\n=== 复制运行期资源 ===")
+def copy_web(dist_dir: Path):
+    """把最新 web/dist 刷进分发目录（先清旧目录，避免旧 hash chunk 残留）。"""
     if not WEB_DIST.exists():
         sys.exit(f"缺少前端构建产物：{WEB_DIST}（先在 web/ 下执行 npm run build）")
 
     dest_web = dist_dir / "_internal" / "web" / "dist"
+    if dest_web.exists():
+        shutil.rmtree(dest_web)
     dest_web.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copytree(WEB_DIST, dest_web, dirs_exist_ok=True)
+    shutil.copytree(WEB_DIST, dest_web)
+
+    # 证据：前端产物时间 + 文件数，确认打进包的是最新构建
+    web_mtime = datetime.datetime.fromtimestamp((WEB_DIST / "index.html").stat().st_mtime)
+    web_count = sum(1 for _ in WEB_DIST.rglob("*") if _.is_file())
     print(f"  web/dist -> {dest_web}")
+    print(f"  web/dist 构建时间：{web_mtime:%Y-%m-%d %H:%M:%S}（{web_count} 个文件）")
+
+
+def copy_assets(dist_dir: Path):
+    print("\n=== 复制运行期资源 ===")
+    copy_web(dist_dir)
 
     # core/main.py 打包版按 <exe>/_internal/web/dist 定位静态资源，此处不再额外复制。
 
@@ -131,21 +188,201 @@ def copy_assets(dist_dir: Path):
     alembic_src = ROOT / "alembic"
     if not alembic_src.exists():
         sys.exit("缺少 main/alembic，无法在目标机自动建库/升级")
-    shutil.copytree(alembic_src, dist_dir / "alembic", dirs_exist_ok=True)
-    print("  alembic/（首次启动自动迁移）")
+    # 排除 __pycache__/*.pyc：构建机的字节码缓存与目标机解释器/时间戳无关，
+    # 打进包只会残留过期副本（曾是 alembic\versions\__pycache__\*.cpython-313.pyc）。
+    shutil.copytree(
+        alembic_src,
+        dist_dir / "alembic",
+        dirs_exist_ok=True,
+        ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
+    )
+    print("  alembic/（首次启动自动迁移，已排除 __pycache__/*.pyc）")
 
     (dist_dir / "data").mkdir(parents=True, exist_ok=True)
     (dist_dir / "logs").mkdir(parents=True, exist_ok=True)
     # 数据目录只占位，安装器不覆盖用户已有 data/
 
+    # 桥脚本明文随包：QMT(8790 股票账户) + 掘金(7801) 两个生产桥 + 部署说明。
+    # 信用账户腿 iquant_bridge_live.py（8791）不进安装包。
+    bridge_dir = dist_dir / "bridge"
+    bridge_dir.mkdir(parents=True, exist_ok=True)
+    for name in ("iquant_bridge.py", "goldminer_bridge.py"):
+        src = REPO / "live" / "bridge" / name
+        if not src.exists():
+            sys.exit(f"缺少桥脚本：{src}")
+        shutil.copy2(src, bridge_dir / name)
+    deploy = REPO / "packaging" / "bridge-deploy.txt"
+    if deploy.exists():
+        shutil.copy2(deploy, bridge_dir / "bridge-deploy.txt")
+    print("  bridge/（两个生产桥明文 + 部署说明）")
+
+    # VC++ 运行库：Nuitka 只搬它找到的几个，msvcp140_1.dll 常在构建机被漏掉，
+    # 目标机若无 VC++ 2015-2022 Redistributable 会直接启动失败 → 从 System32 补齐。
+    system32 = Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32"
+    for dll in ("msvcp140.dll", "msvcp140_1.dll", "vcruntime140.dll", "vcruntime140_1.dll"):
+        if (dist_dir / dll).exists() or not (system32 / dll).exists():
+            continue
+        shutil.copy2(system32 / dll, dist_dir / dll)
+        print(f"  {dll}（VC++ 运行库补齐）")
+
+
+def _git_info():
+    try:
+        commit = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=str(REPO), capture_output=True, text=True, timeout=10,
+        ).stdout.strip()
+        dirty = bool(subprocess.run(
+            ["git", "status", "--porcelain"],
+            cwd=str(REPO), capture_output=True, text=True, timeout=30,
+        ).stdout.strip())
+        return commit, dirty
+    except Exception:
+        return "", False
+
+
+def read_core_version() -> str:
+    """读取 main/core/version.py 的 APP_VERSION（文本解析，不 import core 依赖）。"""
+    if not CORE_VERSION_FILE.exists():
+        sys.exit(f"缺少版本号文件：{CORE_VERSION_FILE}")
+    text = CORE_VERSION_FILE.read_text(encoding="utf-8")
+    match = re.search(r'APP_VERSION\s*=\s*"([^"]+)"', text)
+    if not match:
+        sys.exit(f"无法从 {CORE_VERSION_FILE} 解析 APP_VERSION")
+    return match.group(1)
+
+
+def preflight_release_check(require_dist_info: bool):
+    """出包前强校验：版本单一来源一致 + 工作区干净（+ 复用已有产物时校验 build-info）。
+
+    防「新版本号 + 旧代码」：
+    - 全量构建会重建 dist，只校验源码侧（app-version.iss == core.version.APP_VERSION、git 干净）；
+    - --web-only 复用已有二进制，额外要求 dist/tq-iquant/build-info.json 的
+      app_version 等于当前代码版本、且 git_dirty=false，不符直接中止。
+    """
+    core_version = read_core_version()
+    if core_version != VERSION:
+        sys.exit(
+            "出包中止：版本号两处不一致——packaging/app-version.iss=%s，"
+            "main/core/version.py APP_VERSION=%s。请同步两处后再出包。"
+            % (VERSION, core_version)
+        )
+    commit, dirty = _git_info()
+    if dirty:
+        sys.exit(
+            "出包中止：工作区有未提交改动（git_dirty=true，HEAD=%s）。"
+            "只允许从干净工作区出包，请先提交或还原。" % (commit or "no-git")
+        )
+    if not require_dist_info:
+        print(f"出包前校验通过：版本 {core_version}，工作区干净")
+        return
+    info_path = DIST_OUT / "build-info.json"
+    if not info_path.exists():
+        sys.exit(
+            "出包中止：缺少 %s。请先跑一次完整构建（python main\\build_package.py）。" % info_path
+        )
+    try:
+        info = json.loads(info_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        sys.exit("出包中止：无法解析 %s：%s" % (info_path, exc))
+    dist_version = str(info.get("app_version") or "")
+    if dist_version != core_version:
+        sys.exit(
+            "出包中止：dist/tq-iquant 的 build-info.json 记录 app_version=%s，"
+            "当前代码版本=%s——典型「新版本号 + 旧代码」。请先完整构建再出补丁包。"
+            % (dist_version or "<缺失>", core_version)
+        )
+    if info.get("git_dirty") is not False:
+        sys.exit(
+            "出包中止：build-info.json 记录 git_dirty=%s，现有产物来自脏工作区，"
+            "请重新完整构建。" % info.get("git_dirty")
+        )
+    print(f"出包前校验通过：版本 {core_version}，工作区干净，dist build-info 匹配")
+
+
+def write_build_info(dist_dir: Path, mode: str):
+    """分发目录内留一份构建档案：装到目标机后可直接看版本/来源，便于核对与回滚。
+
+    --web-only 复用已有二进制：app_version / build_time / git 来源必须保留原值
+    （否则旧版 exe 会配上一份写着当前版本号的档案），只追加 frontend_patch_time，
+    并刷新 frontend_dist_mtime 指向本次前端产物。
+    """
+    index = WEB_DIST / "index.html"
+    commit, dirty = _git_info()
+    now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    info = {
+        "app_version": VERSION,
+        "build_mode": mode,
+        "build_time": now,
+        "git_commit": commit,
+        "git_dirty": dirty,
+        "frontend_dist_mtime": (
+            datetime.datetime.fromtimestamp(index.stat().st_mtime).strftime("%Y-%m-%d %H:%M:%S")
+            if index.exists() else ""
+        ),
+    }
+    if mode == "web-only":
+        info_path = dist_dir / "build-info.json"
+        prev = {}
+        if info_path.exists():
+            try:
+                prev = json.loads(info_path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                prev = {}
+        for key in ("app_version", "build_time", "git_commit", "git_dirty"):
+            if prev.get(key) is not None:
+                info[key] = prev[key]
+        info["frontend_patch_time"] = now
+    (dist_dir / "build-info.json").write_text(
+        json.dumps(info, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+    )
+    print(f"  build-info.json（{info['build_mode']} / {info['app_version']} / {commit or 'no-git'}）")
+
+
+def web_only():
+    """只刷新前端产物：不跑 Nuitka，几秒完成；随后用 installer_web.iss 出几 MB 补丁包。"""
+    preflight_release_check(require_dist_info=True)
+    if not (DIST_OUT / "tq-iquant.exe").exists():
+        sys.exit(f"未找到已有分发目录：{DIST_OUT}（先跑一次完整构建：python main\\build_package.py）")
+    print("=== 仅刷新前端（--web-only） ===")
+    copy_web(DIST_OUT)
+    write_build_info(DIST_OUT, "web-only")
+    print(f"\n=== 完成：{DIST_OUT}（仅前端已更新） ===")
+
 
 def main():
+    parser = argparse.ArgumentParser(description="Nuitka onedir 构建（默认保留导入分析缓存）")
+    parser.add_argument(
+        "--clean", action="store_true",
+        help="清空 Nuitka 模块缓存与中间目录后全量重编（正式出包/缓存可疑时用）",
+    )
+    parser.add_argument(
+        "--web-only", action="store_true",
+        help="不跑 Nuitka，只把 web/dist 刷新进已有 dist/tq-iquant（只改前端时用）",
+    )
+    args = parser.parse_args()
+
+    if args.web_only:
+        web_only()
+        return
+
+    preflight_release_check(require_dist_info=False)
+
     if not ENTRY.exists():
         sys.exit(f"缺少桌面入口：{ENTRY}")
     if not ICON.exists():
         sys.exit(f"缺少图标：{ICON}（先运行 packaging/icon/build_icon.py）")
 
-    purge_nuitka_cache()
+    if args.clean:
+        purge_nuitka_cache()
+        mode = "full-clean"
+    else:
+        prepare_cache_dir()
+        mode = "full-incremental"
+
+    print(f"版本：{VERSION}　模式：{mode}")
+    print(f"缓存：{cache_stats()}")
+
     venv_python = ROOT / ".venv" / "Scripts" / "python.exe"
     python_exe = str(venv_python) if venv_python.exists() else sys.executable
     print(f"Python: {python_exe}")
@@ -167,9 +404,10 @@ def main():
     print(f"\n=== Nuitka 产物 -> {DIST_OUT} ===")
 
     copy_assets(DIST_OUT)
+    write_build_info(DIST_OUT, mode)
 
     size_mb = sum(f.stat().st_size for f in DIST_OUT.rglob("*") if f.is_file()) / 1024 / 1024
-    print(f"\n=== 完成：{DIST_OUT}（{size_mb:.1f} MB）===")
+    print(f"\n=== 完成：{DIST_OUT}（{size_mb:.1f} MB） ===")
 
 
 if __name__ == "__main__":

@@ -125,19 +125,79 @@ def _defaults() -> dict:
         "tdx_path": "D:\\zd_zyb",
         "iquant_path": "",
         "max_concurrent_backtest": 1,
+        # P2-7：TQ 全局锁（_tdx_lock）获取超时（秒）。通达信卡住/长任务占用时，
+        # 拿不到锁的调用方不再无限等待，超时抛 TDXLockTimeout 并跳过本轮 TQ 操作；
+        # <=0 表示退回旧行为（无限阻塞）。改动需重启生效（进程内缓存）。
+        "tq_lock_timeout_seconds": 30,
         "database": {
             "sqlite_path": "data/dev.db",
+        },
+        # 内嵌数据备份（core/services/backup_service.py，进程内 daemon 调度）。
+        # 每日 daily_at（Asia/Shanghai，默认 15:10 收盘后）用 VACUUM INTO 生成
+        # 一致性副本并执行一次 wal_checkpoint(TRUNCATE)；自动备份只保留最近 keep 份，
+        # 手动备份不参与自动清理；剩余空间低于 min_free_mb 跳过（不写坏库）。
+        "backup": {
+            "enabled": True,
+            "daily_at": "15:10",
+            "keep": 10,
+            "min_free_mb": 500,
+            "dir": "data/backup",
+            # 批次21 L2：从备份恢复当前库（破坏性操作）。默认关闭；开启后仍要求
+            # 前端显式确认、无 running/stopping 实盘会话、备份校验通过，
+            # 并在替换前自动备份当前库（备份失败即中止）。
+            "restore_enabled": False,
+        },
+        # 告警外发（core/services/notify_service.py）：默认关闭，未配置时行为与
+        # 接入前逐字一致（不建线程、不发请求）。只做「既有事件旁路再发一条」，
+        # 不参与任何交易闸门、不改落库。发送在独立 daemon 线程内、超时 ≤5 秒，
+        # 失败只写日志（按 600 秒节流），绝不阻塞或回滚交易主链路。
+        #   channel          feishu（既有飞书渠道；企微/邮件/提示音为可选附加渠道）
+        #   webhook_url      飞书自定义机器人地址（**不要提交进 git**）
+        #   secret           机器人开启「签名校验」时填写；无签名机器人留空
+        #   min_level        info|warn|error|critical，低于该级别全部丢弃
+        #   silence_seconds  同类事件静默期（秒），键=(闸门, 代码, 交易日)
+        #   timeout_seconds  HTTP 超时（秒），强制夹在 1~5 秒
+        #   wecom.webhook_url  企微群机器人地址（可选，留空＝不发）
+        #   email.smtp_host/smtp_port/username/from/to/use_ssl  邮件（可选，
+        #                     password 建议用环境变量 TQ_NOTIFY_EMAIL_PASSWORD）
+        #   sound.enabled/path 本地提示音（可选，默认关闭；path 留空＝系统提示音）
+        "notify": {
+            "enabled": False,
+            "channel": "feishu",
+            "webhook_url": "",
+            "secret": "",
+            "min_level": "warn",
+            "silence_seconds": 300,
+            "timeout_seconds": 5,
+            "wecom": {"webhook_url": ""},
+            "email": {
+                "smtp_host": "",
+                "smtp_port": 465,
+                "username": "",
+                "password": "",
+                "from": "",
+                "to": [],
+                "use_ssl": True,
+            },
+            "sound": {"enabled": False, "path": ""},
         },
         "iquant_bridge": {
             "simulation": {"base_url": "http://127.0.0.1:8790"},
             "live": {"base_url": "http://127.0.0.1:8791"},
-            # 桥请求超时（秒）：桥在本机 loopback，正常毫秒~秒级；超时按在途处理，
-            # 不判拒单。缺省/非法回退该值（live_service.iquant_config）。
-            "request_timeout_seconds": 10.0,
+            # 桥请求超时（秒，= 读/写/池超时）：桥内全局锁/GIL 排队下 /ping 也要
+            # 5~8s，15s 留足余量；超时按在途处理，不判拒单。缺省/非法回退该值
+            # （live_service.iquant_config）。建连超时见 live.bridge_connect_timeout_seconds。
+            "request_timeout_seconds": 15.0,
             # 慢响应告警阈值（秒）：须明显小于请求超时；超阈值记 WARNING + risk/bridge_slow。
             "slow_response_seconds": 5.0,
             # 同一会话慢告警冷却窗（秒），避免轮询刷屏。
             "slow_warn_interval_seconds": 300.0,
+            # 委托价格类型（下发给桥的 /order.price_type）：
+            #   opponent（默认，桥侧 prType=14 对手价——与改动前逐字一致）
+            #   limit    （prType=11，Core 审批价原样进 passorder，桥内不改写/不跟价）
+            #   market_best5（prType=42 沪 / 47 深，五档即时成交剩余撤销）
+            # 默认值刻意保持旧行为；切真实资金前改 limit 即可，无需改代码。
+            "price_type": "opponent",
         },
         # 掘金量化桥（2026-11-04 替代 QMT 桥）：桥策略跑在掘金终端内
         # （live/bridge/goldminer_bridge.py），base_url 指向其本地 HTTP 服务。
@@ -145,9 +205,11 @@ def _defaults() -> dict:
             "base_url": "http://127.0.0.1:7801",
             "token": "",
             "account_id": "",
-            # 桥请求超时（秒）：桥内全局锁串行，实测单次 4~10s；下单超时须
-            # ≥30s 且小于主循环周期 60s（超时后按在途处理，不判拒单）。
-            "request_timeout_seconds": 30.0,
+            # 桥请求超时（秒）：桥内全局锁 + gm C SDK 持 GIL 串行，实测单发
+            # 8~13s、多请求叠加可到 20s+；45s 既覆盖并发叠加又小于主循环 60s
+            # （超时后按在途处理，不判拒单）。旧的 30s 贴着实测上界，易误超时
+            # 导致客户端提前断连（桥侧 WinError 10054 刷屏）。
+            "request_timeout_seconds": 45.0,
             # 慢响应告警阈值（秒）：须明显小于请求超时；超阈值记 WARNING +
             # risk/bridge_slow 事件（按 endpoint 冷却去重）。
             "slow_response_seconds": 15.0,
@@ -181,6 +243,15 @@ def _defaults() -> dict:
             "execution_stall_seconds": 180,
             "bridge_timeout_seconds": 90,
             "market_data_stall_seconds": 180,
+            # HTTP 桥客户端超时（秒；通道未显式配 request_timeout_seconds 时生效）：
+            # 读/写/池默认 15（掘金桥 /ping 实测 5~8s，10s 贴太近会误判断链）；
+            # 建连默认 3（本机 loopback，无需等满读超时）。/order /orders /deals
+            # /positions /account /price_limit /cancel /quote 共用同一 client。
+            "bridge_read_timeout_seconds": 15.0,
+            "bridge_connect_timeout_seconds": 3.0,
+            # 成交价偏离监控：桥通道回填成交价相对审批价的绝对偏离超过该百分比（%）
+            # 记 risk 事件（gate/rule=fill_price_deviation）；<=0 关闭监控。
+            "fill_price_deviation_pct": 1.0,
             # 行情轮询窗口（Asia/Shanghai，左闭右开）：窗口外（交易日 15:05 之后 /
             # 次日 09:15 之前 / 非交易日）完全停 BarPoller 行情拉取，消除收盘后对
             # 掘金桥 /quote 与通达信 TQ 的无谓持续压力；账户快照/成交回填/收盘清扫
@@ -190,6 +261,23 @@ def _defaults() -> dict:
                 "enabled": True,
                 "resume_time": "09:15",
                 "pause_time": "15:05",
+            },
+            # J5（2026-11-18）：行情取数降级链（默认关闭）。开启后 1m 轮询按 chain
+            # 顺序尝试行情源，前一个源异常/返回空即切下一个，返回 bar 带 source 标记。
+            # 取值：tq（通达信 K 线）/ iquant（QMT 桥）/ goldminer（掘金桥）。
+            # 默认值刻意关闭，行为与接入前逐字一致；快照合成源（tdx/ths/alert）
+            # 不参与降级（本地采样不存在"源不可用"语义）。
+            "quote_fallback": {
+                "enabled": False,
+                "chain": ["tq", "iquant", "goldminer"],
+            },
+            # F4（2026-11-18）：收盘后抽样交叉校验（默认关闭）。15:05 收盘清扫后
+            # 抽样若干代码，比较两路日线收盘价，偏差超 max_dev_pct 记 risk 事件
+            # （gate=data_cross_check）。只观测，不影响交易判定。
+            "cross_check": {
+                "enabled": False,
+                "sample_size": 5,
+                "max_dev_pct": 1.0,
             },
         },
         "tq_trade": {
@@ -201,6 +289,97 @@ def _defaults() -> dict:
             "default_engine": "tdx",
             # A-2：在途单超时未成交自动撤单（分钟）；<=0 = 禁用。
             "cancel_unfilled_minutes": 3,
+            # 次日盘前（集合竞价）执行日线级信号单：默认开启（对齐回测「次日开盘
+            # 执行」口径）。关闭 → 行为与旧版一致（deferred 单等次一交易日首根完成
+            # 1m bar——约 09:31——放行，用首根 bar 价格报单）。
+            # 开启 → 交易日 09:15–09:20（end_time 可配，左闭右开）把「当日 due 的
+            # deferred 日线信号单」直接报进集合竞价（柜台接受竞价期委托，实测
+            # 竞价期可成交/可撤单）。不依赖任何 1 分钟 bar，不需要快照合成。
+            # 价位规则见 live_engine.pre_open_auction_price_bias_pct 注释。
+            "pre_open_auction_enabled": True,
+            "pre_open_auction_end_time": "09:20",
+            # 盘前委托价相对「信号价（前一日 deferred 单记录的 price，即信号 bar
+            # 收盘价）」的让价幅度（%）：买 +bias / 卖 −bias，再夹到当日涨跌停
+            # 之内（涨停价−1 跳 / 跌停价+1 跳，避免被本地涨跌停校验直接拦下）。
+            # 不推到涨停价/跌停价：集合竞价按统一开盘价成交，限价只作上限；
+            # 但未成交的余量会以该限价挂在连续竞价簿上，推到涨跌停等于全天追价。
+            "pre_open_auction_price_bias_pct": 2.0,
+            # G3（2026-11-18）顺延单积压告警：待放行委托数量达到该值即告警，
+            # 0=关闭（默认）。每交易日最多一条 risk 事件 + 一次外发通知。
+            "deferred_backlog_warn_count": 0,
+            # G3：最早一笔顺延单的「交易日年龄」超过该值即告警，0=关闭（默认）。
+            # 与数量阈值相互独立，可同时开启（各自去重）。
+            "deferred_backlog_warn_days": 0,
+            # 卖出范围口径（止损/止盈/移动止损与 SELL/REDUCE/CLOSE 公式卖单）：
+            #   platform_only（默认）只卖平台自己买入的股数（Position.platform_quantity）；
+            #                 纯外部/手工仓（platform_quantity=0）不下单，只记一条
+            #                 gate=sell_scope 决策事件。买入侧不受影响。
+            #   full          按整仓卖出（含存量/外部仓），与旧版 full 行为一致。
+            # 2026-11-19 起本键**只作新建会话的初始档位来源**：会话级
+            # live_sessions.sell_scope 优先，运行中可在界面切换（不重启会话），
+            # 且切换不会反向改写本配置。历史会话（列为 NULL）解析时回退本值。
+            # 阈值判定（止损/止盈/回撤）仍按整仓成本，本项只收窄卖出数量。
+            "live_sell_scope": "platform_only",
+            # 错周期 bar 是否跑风控（全局默认，会话可用
+            # live_sessions.intraday_mismatched_risk_enabled 三态覆盖）：
+            # False（默认，对齐回测）→ 风控只在策略自身周期 bar 上评估：1m/5m 等
+            # 错周期 bar 不再触发止损/止盈/移动止损（周线/月线同样只在自身边界）。
+            # True → 旧行为：任何 bar 都按收盘价评估持仓风险。
+            "intraday_mismatched_risk_enabled": False,
+            # 09:31 deferred 兜底放行的「保证成交」开关：False（默认，可复现优先）
+            # → 限价 = 当日首根 1m bar 开盘价（夹涨跌停、quantize 到分）；True →
+            # 不按首根 open 定价，改用通道默认对手价，优先成交而非价格可复现。
+            "deferred_release_ensure_fill": False,
+            # 键鼠类通道（tdx/ths）互斥：False（默认）＝软拦，未带
+            # ack_keyboard_risk 的启动请求返回 409 要求确认，带 ack 放行并留痕；
+            # True ＝ 硬拦，检测到冲突一律 409（ack 也不放行）。
+            "keyboard_conflict_hard_block": False,
+            # H2 参数绑定漂移：False（默认）＝绑定了回测记录的会话启动时若组合参数
+            # 与 params_snapshot 不一致，只 WARNING + 决策事件（gate=params_drift）；
+            # True ＝ 升级为 409 阻断启动（需先对齐参数）。
+            "params_drift_block": False,
+        },
+        # 接缝续跑式增量回测：组合策略从接缝日（进入实盘那天）接着往后延，
+        # 每天只跑新交易日，与实盘逐日对照；结果按特征级容差与全量重跑对齐。
+        "incremental_backtest": {
+            "enabled": True,
+            # 每日续跑触发时刻（Asia/Shanghai）：晚于 DailyCloser 的 15:05 日线取数，
+            # 直接复用那轮已取到的日线，不再额外卡通达信行情。
+            "daily_at": "15:10",
+            # 后端某天没开/续跑失败时，下次启动从最后 checkpoint 逐日补齐的上限
+            # （交易日）。超过上限标「断档」并在对照表标红，同时从接缝日重建。
+            "max_catchup_days": 5,
+            # 接缝锚定（默认开）：回测用实盘该组合的起账状态重锚——现金=虚拟起账
+            # 现金、存量仓按成本注入、highest_price 按成本种下，两边同起点同分母。
+            # 关闭 → 用回测自身在接缝日的状态（空账户从接缝日起跑）。
+            "anchor_on_live_start": True,
+            # 每周双跑校验：0=周一 … 5=周六（默认）。到点后从接缝日全量重算对账。
+            "validate_weekday": 5,
+            "validate_at": "18:00",
+            # 续跑复权口径（front/back/dual），默认 dual（前复权信号 + 后复权记账）。
+            # 该值参与参数快照哈希，变更即作废 checkpoint 并从接缝日重跑。
+            "dividend_mode": "dual",
+            # 双跑校验的特征级容差（判据依据见 incremental_backtest 服务注释）。
+            "tolerances": {
+                # 逐日净值相对偏差（%）上限：取整/费用/过户费/T+1 边界噪声远小于此
+                "max_net_dev_pct": 0.5,
+                "mean_net_dev_pct": 0.2,
+                # 逐日成交笔数一致率 / 方向一致率下限（允许极少数边界单跨日漂移）
+                "trade_count_match_ratio": 0.9,
+                "direction_match_ratio": 0.9,
+                # 最大回撤偏差（百分点）：回撤是路径极值，对单日噪声更敏感
+                "max_drawdown_dev_pct": 1.0,
+            },
+        },
+        # J6（2026-11-18）：回测 K 线本地 parquet 缓存（默认关闭）。按
+        # (code, period, 复权, 区间) 缓存原始行情；闭区间长期有效，含当日按
+        # today_ttl_seconds 按 mtime 失效。开启后回测结果与不开缓存一致。
+        "backtest": {
+            "kline_cache": {
+                "enabled": False,
+                "dir": "data/kline_cache",
+                "today_ttl_seconds": 300,
+            },
         },
     }
 

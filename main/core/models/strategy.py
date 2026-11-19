@@ -49,6 +49,10 @@ class Strategy(Base):
     regime_filter_enabled = Column(Boolean, default=False, server_default=text("0"), nullable=False)
     trend_trailing_stop_ratio = Column(Numeric(5, 4), nullable=True)
     trend_max_positions = Column(Integer, nullable=True)
+    # E3 策略级门控覆盖（2026-11-18，默认 inherit=跟随组合）：
+    # inherit=跟随组合 market_gate_enabled / off=本策略不受门控 / on=组合未开也强制
+    market_gate_mode = Column(String(10), default="inherit",
+                              server_default="inherit", nullable=False)
     # #3 策略级敞口上限（默认关）：回测 BUY 审批加卡策略总持仓市值
     # ≤ capital_ratio × 组合初始资金（仅回测成交步生效；实盘不接）
     exposure_cap_enabled = Column(Boolean, default=False, server_default=text("0"), nullable=False)
@@ -58,9 +62,19 @@ class Strategy(Base):
     # 撤单后有限追价重下：超时撤单成功且未超次数 → 剩余量按 tick 追价重下
     requote_enabled = Column(Boolean, default=False, server_default=text("0"), nullable=False)
     requote_max_attempts = Column(Integer, default=2, server_default="2", nullable=False)
+    # H4 追价挂单价源：tick=固定 ±1 tick（默认，原行为）/ adaptive=按最新价追、
+    # 受 requote_max_slippage_ticks 限制（无行情回退 tick）
+    requote_price_mode = Column(String(16), default="tick", server_default="tick", nullable=False)
+    requote_max_slippage_ticks = Column(Integer, default=5, server_default="5", nullable=False)
     # TDX 大额拆单（本批次仅落配置管线，拆单逻辑批次 2 实现）
     split_order_enabled = Column(Boolean, default=False, server_default=text("0"), nullable=False)
     split_order_threshold = Column(Float, default=500000.0, server_default="500000.0", nullable=False)
+    # H3 切片增强（None/0 = 沿用按阈值的默认推导）
+    split_order_count = Column(Integer, nullable=True)          # 指定子单笔数
+    split_order_min_qty = Column(Integer, nullable=True)        # 子单最小股数
+    split_order_interval_seconds = Column(Float, nullable=True)  # 子单最小间隔（成交后额外等待）
+    split_order_interval_jitter = Column(Boolean, default=False, server_default=text("0"), nullable=False)
+    split_order_volume_pct = Column(Float, nullable=True)       # 单笔 ≤ 最近完成 bar 成交量 × 比例
     # 风控/信号执行时点：next_day=当日信号次日执行（回测对齐，默认）/ immediate=当日确认立即执行
     risk_timing = Column(String(15), default="next_day", server_default="next_day", nullable=False)
     created_at = Column(DateTime, server_default=func.now())

@@ -532,10 +532,10 @@ onMounted(load)
         </datalist>
         <div v-for="(sig, idx) in form.signals" :key="idx" class="signal-row">
           <input v-model="sig.signal_name" list="tdx-line-names" placeholder="信号名称（可从通达信线名中选）" />
-          <select v-model="sig.signal_type">
+          <select class="field-select" v-model="sig.signal_type">
             <option v-for="t in SIGNAL_TYPES" :key="t.value" :value="t.value">{{ t.label }}（{{ t.value }}）</option>
           </select>
-          <select v-model="sig.trigger_value" title="触发值：公式输出线等于该值时产生信号。0 是无信号常态值，不可用">
+          <select class="field-select" v-model="sig.trigger_value" title="触发值：公式输出线等于该值时产生信号。0 是无信号常态值，不可用">
             <option :value="-2">-2</option>
             <option :value="-1">-1</option>
             <option :value="1">1</option>
@@ -579,13 +579,13 @@ onMounted(load)
           <h4 style="margin:10px 0 4px"><code>{{ sel.line }}</code></h4>
           <div class="norm-param-row">
             <span class="field-label">规则</span>
-            <select v-model="sel.rule">
+            <select class="field-select" v-model="sel.rule">
               <option v-for="r in NORM_RULES" :key="r.value" :value="r.value">{{ r.label }}</option>
             </select>
           </div>
           <div v-if="sel.rule === 'cross_zero'" class="norm-param-row">
             <span class="field-label">方向</span>
-            <select v-model="sel.direction">
+            <select class="field-select" v-model="sel.direction">
               <option value="both">双向（上穿 XG + 下穿 XD）</option>
               <option value="up">仅上穿 0</option>
               <option value="down">仅下穿 0</option>
@@ -594,7 +594,7 @@ onMounted(load)
           <div v-if="sel.rule === 'above_threshold'" class="norm-param-row">
             <span class="field-label">阈值</span>
             <input v-model="sel.threshold" type="number" step="any" style="width:120px" />
-            <select v-model="sel.direction" style="margin-left:8px">
+            <select class="field-select" v-model="sel.direction" style="margin-left:8px">
               <option value="gt">线 &gt; 阈值 → 1</option>
               <option value="lt">线 &lt; 阈值 → 1</option>
             </select>
@@ -604,7 +604,7 @@ onMounted(load)
               <span style="font-size:13px">原值</span>
               <input v-model="m.from" type="number" step="any" style="width:100px" />
               <span style="font-size:13px">→</span>
-              <select v-model.number="m.to" style="width:70px">
+              <select class="field-select" v-model.number="m.to" style="width:84px">
                 <option v-for="t in NORM_TARGETS" :key="t" :value="t">{{ t }}</option>
               </select>
               <button class="btn btn-sm btn-danger" @click="sel.mappings.splice(mi, 1)">×</button>
@@ -640,10 +640,10 @@ onMounted(load)
         </table>
         <div v-for="(sig, idx) in normForm.signals" :key="idx" class="signal-row" style="margin-top:6px">
           <input v-model="sig.signal_name" placeholder="信号名称（生成线名）" />
-          <select v-model="sig.signal_type">
+          <select class="field-select" v-model="sig.signal_type">
             <option v-for="t in SIGNAL_TYPES" :key="t.value" :value="t.value">{{ t.label }}（{{ t.value }}）</option>
           </select>
-          <select v-model="sig.trigger_value" title="触发值：生成线等于该值时产生信号。0 是无信号常态值，不可用">
+          <select class="field-select" v-model="sig.trigger_value" title="触发值：生成线等于该值时产生信号。0 是无信号常态值，不可用">
             <option :value="-2">-2</option>
             <option :value="-1">-1</option>
             <option :value="1">1</option>

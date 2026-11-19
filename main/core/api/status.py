@@ -2,6 +2,7 @@ from fastapi import APIRouter
 import time
 
 from core.api.response import ok
+from core.version import APP_VERSION
 
 _start_time = time.time()
 
@@ -16,7 +17,7 @@ def get_status():
     return ok({
         "core": {
             "online": True,
-            "version": "1.0",
+            "version": APP_VERSION,
             "uptime": f"{hours}h{minutes}m",
         },
     })

@@ -95,7 +95,7 @@ Core 按 `session.mode` 选桥：当前 `simulation` 与 `live` 都指向 8790 �
 
 | 端点 | 说明 |
 |---|---|
-| `GET /ping` | 心跳 + 桥状态（含 `port`/`account`/`dry_run`，可核对账号归属） |
+| `GET /ping` | 心跳 + 桥状态（含 `port`/`account`/`dry_run`/`price_type` 能力声明；平台盘前单据此判定是否支持按单 `limit`） |
 | `POST /order` | 下单（幂等 `order_id` + 白名单 + 限额 + 频率限制 + 审计） |
 | `GET /positions` | 持仓（`instrument`/`exchange`/`volume`/`available`/`yesterday`/`on_road`/`market_value`） |
 | `GET /account` | 资金 |
@@ -103,7 +103,38 @@ Core 按 `session.mode` 选桥：当前 `simulation` 与 `live` 都指向 8790 �
 | `GET /deals?order_id=` | 成交回报（回填用 `m_strOrderRef`） |
 | `GET /quote?code=&period=&count=` | 1m/5m/1d bar（缓存） |
 | `GET /calendar?market=SH` | 交易日列表 `["YYYYMMDD", ...]`（缓存） |
+| `GET /price_limit?code=` | 前收 + 交易所涨跌停价（取不到回 `null`，平台 fail-open 放行） |
+| `POST /cancel` | 撤单（入参 `order_ref` = 柜台 `m_strOrderSysID` 合同号，兼容 `cl_ord_id`/`order_id`）；`data.result` 区分 `canceled` / `pending` / `not_found` / `rejected` / `failed` |
 | `GET /shutdown` | 释放端口自行退出（供下一次策略启动时接管） |
+
+> **QMT 桥实测约定**：`passorder` 返回值实测为字符串 `"0"`（不是「返回：无」）；撤单必须传 `m_strOrderSysID`（合同号，不是 `m_strOrderRef`），客户端 `cancel()` 的 `orderId` 只接受字符串；`prType=11`（limit）时才带 `price`，其余价型 `price` 传 0。
+
+> **委托备注与认领键**：柜台 `m_strRemark` **上限 20 字符**。Core 的 `bridge_order_id` 是 32 位 MD5 落库，写进柜台的只是**前 20 位**认领键；认领键生成失败或同会话撞键一律**拒单**（`BridgeOrderIdError`），不静默截断。
+
+### 委托价格类型 `price_type`（可选，`POST /order`）
+
+`passorder` 的 `prType` 不再写死，由请求体可选字段 `price_type` 决定：
+
+| 取值 | prType | `price` 实参 | 说明 |
+|---|---|---|---|
+| 缺字段 / `opponent` | 14 | 0 | **缺省，与改造前逐字一致**：对手价（BUY 取卖1、SELL 取买1） |
+| `limit` | 11 | Core 下发的审批价**原样** | 真实限价单；桥内**不改写、不跟价、不四舍五入** |
+| `market_best5` | 42（`.SH`）/ 47（`.SZ`） | 0 | 最优五档即时成交剩余撤销 |
+
+- 常量来源：QMT 客户端自带 `D:\iquant\bin.x64\Lib\site-packages\xtquant\xtconstant.py`
+  （`FIX_PRICE=11`、`MARKET_SH_CONVERT_5_CANCEL=42`、`MARKET_SZ_CONVERT_5_CANCEL=47`）。
+  `14` 在 xtconstant 里不是股票报价类型（`14=FUTURE_OPEN`），但本桥自 0009 起一直用它、
+  真机表现为对手价，故保留为缺省值。`44`（`MARKET_PEER_PRICE_FIRST`）语义不同且未验证，不启用。
+- **缺省兼容**：老 Core 不带该字段 → prType 仍 14，行为零变化。
+- **fail-closed**：显式未知取值、`market_best5` 缺 `.SH`/`.SZ` 后缀、`limit` 而 `price<=0`
+  一律 `ok:false`，绝不静默退回对手价（宁可这一笔报不出去，也不按没人选过的价格成交）。
+- **回执回报实际类型**：成功应答含 `pr_type` 与 `price_type`（实际生效值），Core 据此
+  在成交回填时核对偏离，不靠猜。
+- **平台侧配置**：`config.yaml` 的 `iquant_bridge.price_type`（默认 `opponent`）只是盘中普通单的缺省价型；**盘前集合竞价单不依赖该配置**——Core 按单显式下发 `price_type=limit`。
+  只要桥 `/ping` 自述支持 `limit`（或提供 `/price_limit`）即可，**无需把会话级价型改成 `limit`**；若本会话盘前单 `/order` 回执的 `price_type` 不是 `limit`，平台直接拦下该单。改配置只影响 Core 下发的字段，桥代码须重新粘贴才生效。
+- 定位说明（不是通用滑点保护）：通达信侧价格本就由平台决定（`PRICE_MY`）且提交前有
+  OCR 价格比对；掘金桥限价原样下发；同花顺现网 `latest` 模式**根本不键入价格**，其
+  ±让价参数是空转。QMT 盘前单按单 `limit` 时与它们同口径——**审批价即委托价**。
 
 ## 环境约束（已真机验证）
 
@@ -124,9 +155,10 @@ Core 按 `session.mode` 选桥：当前 `simulation` 与 `live` 都指向 8790 �
 
 - 策略格式：标准掘金策略（`init` + `run()` 事件循环 + 后台线程跑 `ThreadingHTTPServer`）。
 - 端点与 QMT 桥一致（`/ping` `/positions` `/account` `/orders` `/deals` `/quote`
-  `/calendar` `POST /order`），另有 `POST /cancel`（撤单）与 `POST /shutdown`（自退）。
-  注意：平台侧 `HttpBridgeDispatcher` 未实现 `cancel_order`，掘金桥虽有 `/cancel` 端点，
-  超时在途单仍按 expire 处理，不会自动撤销（需人工撤）。
+  `/calendar` `/price_limit` `POST /order` `POST /cancel`），另有 `POST /shutdown`（自退）。
+  平台侧 `HttpBridgeDispatcher` 已接 `cancel_order`（按 `order_ref` = 掘金 `cl_ord_id` 撤单）
+  与 `/price_limit` 涨跌停校验；老版本桥缺端点时平台自动降级（撤单退回 expire、
+  涨跌停 fail-open）。
 - 状态码/字段向平台口径映射：委托状态转 QMT `m_nOrderStatus` 数值（平台
   `order_machine` 直接消费）；`/orders` 与 `/deals` 的 `direction` 由 gm `side`
   推导（买 48 / 卖 49）。行为注意：`side` 缺失/无法识别时 `_side_of` 返回空串，
@@ -143,7 +175,7 @@ Core 按 `session.mode` 选桥：当前 `simulation` 与 `live` 都指向 8790 �
   平台 venv 无 gm 不影响桥）。
 - **禁止**把 gm SDK 装进 `main/.venv`：PyPI 版 gm 的 C SDK（NATS 协议）与
   goldminer3 终端的服务协议不匹配（实测 `get_cash` 无限挂起），且依赖链会污染平台环境。
-- 终端关闭 = 桥停 = 平台报单 `rejected`（超时 expire 兜底）。
+- `/quote` 回包新增 `cached` 布尔值：空结果（停牌/错码）缓存 10s，非空结果缓存 55s；**耗时不能用来判断是否命中缓存**（gm SDK 持 GIL，快慢无参考意义）。
 
 ### 配置（文件顶部）
 

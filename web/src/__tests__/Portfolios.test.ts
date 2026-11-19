@@ -146,6 +146,7 @@ describe('Portfolios.vue — 组合列表（树状）', () => {
     expect(w.text()).toContain('买佣金率')
     expect(w.text()).toContain('卖佣金率')
     expect(w.text()).toContain('印花税率')
+    expect(w.text()).toContain('过户费率')
     expect(w.text()).toContain('滑点')
   })
 
@@ -154,6 +155,10 @@ describe('Portfolios.vue — 组合列表（树状）', () => {
     const w = mount(Portfolios)
     await flushPromises()
     await w.find('button.btn-primary').trigger('click')  // 新建组合（取默认值）
+
+    // 新建默认基准 = 上证指数（000001.SH），编辑/切换不影响该默认
+    const benchSelect = w.find('select[data-field="benchmark_index"]')
+    expect((benchSelect.element as HTMLSelectElement).value).toBe('000001.SH')
 
     // 默认 max_drawdown=0.2 → 显示 20（百分比）
     const drawdownInput = w.find('input[data-field="max_drawdown"]')
@@ -164,6 +169,9 @@ describe('Portfolios.vue — 组合列表（树状）', () => {
     // min_commission 是金额 → 显示 5，不转百分比
     const minCommInput = w.find('input[data-field="min_commission"]')
     expect(Number((minCommInput.element as HTMLInputElement).value)).toBe(5)
+    // transfer_fee_rate=0.00001 → 显示 0.001（百分比）
+    const transferInput = w.find('input[data-field="transfer_fee_rate"]')
+    expect(Number((transferInput.element as HTMLInputElement).value)).toBeCloseTo(0.001, 6)
 
     await w.find('input[data-field="name"]').setValue('ROUND_TRIP')
     await w.find('select[data-field="stock_pool_id"]').setValue('1')
@@ -175,12 +183,16 @@ describe('Portfolios.vue — 组合列表（树状）', () => {
     expect(arg.max_drawdown).toBeCloseTo(0.2)
     expect(arg.buy_commission_rate).toBeCloseTo(0.00025, 6)
     expect(arg.stamp_duty_rate).toBeCloseTo(0.0005, 6)
+    expect(arg.transfer_fee_rate).toBeCloseTo(0.00001, 8)
     // 金额不转
     expect(arg.min_commission).toBe(5)
-    expect(arg.initial_capital).toBe(500000)
+    expect(arg.initial_capital).toBe(2000000)
+    // 新建默认滑点 0.2%（落库为比例 0.002）
+    expect(arg.slippage).toBeCloseTo(0.002, 6)
     // select 字段保持字符串/原值，不被 Number() 转成 NaN
     expect(arg.trading_session).toBe('full')
     expect(arg.stock_pool_id).toBe(1)
+    expect(arg.benchmark_index).toBe('000001.SH')
   })
 
   it('填组合表 + 提交 → 调 createPortfolio，strategies 为空数组', async () => {
@@ -277,6 +289,9 @@ describe('Portfolios.vue — 组合列表（树状）', () => {
     await flushPromises()
 
     expect(w.text()).toContain('编辑组合')
+    // 编辑回显组合自身保存的基准（000300.SH），不被新建默认覆盖
+    const benchSelect = w.find('select[data-field="benchmark_index"]')
+    expect((benchSelect.element as HTMLSelectElement).value).toBe('000300.SH')
     // 回填后 max_drawdown 显示百分比 20
     const drawdownInput = w.find('input[data-field="max_drawdown"]')
     expect(Number((drawdownInput.element as HTMLInputElement).value)).toBe(20)
@@ -289,6 +304,7 @@ describe('Portfolios.vue — 组合列表（树状）', () => {
     const arg = (updatePortfolio as any).mock.calls[0][1]
     expect(arg.max_drawdown).toBeCloseTo(0.2)
     expect(arg.min_commission).toBe(5)
+    expect(arg.benchmark_index).toBe('000300.SH')
   })
 
   it('点某行[删除] → 调 deletePortfolio(id)', async () => {
@@ -476,7 +492,8 @@ describe('Portfolios.vue — 执行真实感与策略增强', () => {
     await w.find('button.btn-primary').trigger('click')  // +新建组合
 
     expect(w.text()).toContain('执行真实感')
-    expect(w.text()).toContain('涨跌停')
+    expect(w.text()).toContain('涨跌停校验')
+    expect(w.text()).toContain('默认开启')  // 说明文案同步
     // 默认 price_limit_check_enabled=true
     const plInput = w.find('input[data-field="price_limit_check_enabled"]')
     expect((plInput.element as HTMLInputElement).checked).toBe(true)
@@ -804,7 +821,7 @@ describe('Portfolios.vue — 实盘执行（批次1 配置分组）', () => {
 
     expect(w.text()).toContain('执行控制')
     expect(w.text()).toContain('撤单追价重下')
-    expect(w.text()).toContain('重试次数')
+    expect(w.text()).toContain('追价重下次数')
     expect(w.text()).toContain('大额拆单')
     expect(w.text()).toContain('拆单阈值')
     expect(w.text()).toContain('风控执行时点')
@@ -1095,5 +1112,177 @@ describe('Portfolios.vue — 子策略列表行预警调度摘要', () => {
     await flushPromises()
     expect(w.text()).toContain('信号 5m')
     expect(w.text()).not.toContain('信号 5m@')
+  })
+})
+
+describe('Portfolios.vue — 单票上限 / 现金下限（仅实盘，默认不限制）', () => {
+  it('新建弹窗默认不限制：输入留空、说明文案可见、提交两字段为 null', async () => {
+    ;(createPortfolio as any).mockResolvedValue({ id: 99 })
+    const w = mount(Portfolios)
+    await flushPromises()
+    await w.find('button.btn-primary').trigger('click')
+
+    const sp = w.find('input[data-field="max_single_position_pct"]')
+    const mc = w.find('input[data-field="min_cash_reserve_pct"]')
+    expect(sp.exists()).toBe(true)
+    expect(mc.exists()).toBe(true)
+    // 默认态：不预填任何值（非 0 默认值会改变次日实际报单结果）
+    expect((sp.element as HTMLInputElement).value).toBe('')
+    expect((mc.element as HTMLInputElement).value).toBe('')
+    expect((sp.element as HTMLInputElement).placeholder).toBe('留空=不限制')
+    // 说明：判定口径 + 仅实盘生效
+    expect(w.text()).toContain('买入后该票市值 ÷ 组合总资产')
+    expect(w.text()).toContain('买入后剩余现金 ÷ 组合总资产')
+    expect(w.text()).toContain('仅实盘生效，回测不读')
+
+    await w.find('input[data-field="name"]').setValue('PS_NOLIMIT')
+    await w.find('select[data-field="stock_pool_id"]').setValue('1')
+    await w.find('.modal-actions button.btn-primary').trigger('click')
+    await flushPromises()
+
+    expect(createPortfolio).toHaveBeenCalledTimes(1)
+    const arg = (createPortfolio as any).mock.calls[0][0]
+    expect(arg.max_single_position_pct).toBeNull()
+    expect(arg.min_cash_reserve_pct).toBeNull()
+  })
+
+  it('填 30% → payload 小数 0.3；填 0 → 归一 null', async () => {
+    ;(createPortfolio as any).mockResolvedValue({ id: 99 })
+    const w = mount(Portfolios)
+    await flushPromises()
+    await w.find('button.btn-primary').trigger('click')
+
+    await w.find('input[data-field="name"]').setValue('PS_LIMIT')
+    await w.find('select[data-field="stock_pool_id"]').setValue('1')
+    await w.find('input[data-field="max_single_position_pct"]').setValue('30')
+    await w.find('input[data-field="min_cash_reserve_pct"]').setValue('0')
+    await w.find('.modal-actions button.btn-primary').trigger('click')
+    await flushPromises()
+
+    const arg = (createPortfolio as any).mock.calls[0][0]
+    expect(arg.max_single_position_pct).toBeCloseTo(0.3)
+    expect(arg.min_cash_reserve_pct).toBeNull()
+  })
+
+  it('非法值（101 / -1）→ 行内提示，不弹 alert 且不发请求', async () => {
+    ;(createPortfolio as any).mockClear()
+    const alertMock = vi.fn()
+    vi.stubGlobal('alert', alertMock)
+    const w = mount(Portfolios)
+    await flushPromises()
+    await w.find('button.btn-primary').trigger('click')
+
+    await w.find('input[data-field="name"]').setValue('PS_BAD')
+    await w.find('select[data-field="stock_pool_id"]').setValue('1')
+    await w.find('input[data-field="max_single_position_pct"]').setValue('101')
+    await w.find('input[data-field="min_cash_reserve_pct"]').setValue('-1')
+    await w.find('.modal-actions button.btn-primary').trigger('click')
+    await flushPromises()
+
+    const errs = w.findAll('[data-test="portfolio-field-error"]')
+    expect(errs.length).toBe(2)
+    expect(errs[0].text()).toContain('单票上限')
+    expect(errs[1].text()).toContain('现金下限')
+    expect(alertMock).not.toHaveBeenCalled()
+    expect(createPortfolio).not.toHaveBeenCalled()
+    vi.unstubAllGlobals()
+  })
+
+  it('编辑回填：0.25 / 0.1 → 显示 25 / 10，提交仍为小数', async () => {
+    ;(updatePortfolio as any).mockResolvedValue({ id: 1 })
+    ;(getPortfolioDetail as any).mockResolvedValue({
+      ...mockPortfolios[0], max_single_position_pct: 0.25, min_cash_reserve_pct: 0.1,
+    })
+    const w = mount(Portfolios)
+    await flushPromises()
+
+    const editBtn = w.findAll('button').find(b => b.text() === '编辑')!
+    await editBtn.trigger('click')
+    await flushPromises()
+
+    expect(Number((w.find('input[data-field="max_single_position_pct"]').element as HTMLInputElement).value)).toBe(25)
+    expect(Number((w.find('input[data-field="min_cash_reserve_pct"]').element as HTMLInputElement).value)).toBe(10)
+
+    await w.find('.modal-actions button.btn-primary').trigger('click')
+    await flushPromises()
+
+    const arg = (updatePortfolio as any).mock.calls[0][1]
+    expect(arg.max_single_position_pct).toBeCloseTo(0.25)
+    expect(arg.min_cash_reserve_pct).toBeCloseTo(0.1)
+  })
+})
+
+// 回归：组合数量超过一屏时，最后几行（用户实测序号 11/12）的[编辑]仍能触发编辑动作。
+// 现象曾报「条目少时正常，排到 11、12 号后点[编辑]无反应」；此处用 12 个组合 + 每个组合
+// 展开 1 条子策略，覆盖「列表远超一屏」+「末尾行」两个条件，分别校验子策略行与组合行。
+describe('Portfolios.vue — 长列表（超过一屏）末尾行[编辑]仍可触发', () => {
+  function makePortfolios() {
+    return Array.from({ length: 12 }, (_, i) => ({
+      ...mockPortfolios[0],
+      id: i + 1,
+      name: `组合${i + 1}`,
+      strategies: [{ id: 100 + i, name: `子策略${i + 1}`, role: 'master' }],
+    }))
+  }
+  function makeStrategies(pid: number) {
+    return [{
+      ...mockStrategies[0],
+      id: 99 + pid,
+      name: `子策略${pid}`,
+    }]
+  }
+  function setup() {
+    const list = makePortfolios()
+    ;(getPortfolios as any).mockResolvedValue(list)
+    ;(getStrategies as any).mockImplementation((pid: number) => Promise.resolve(makeStrategies(pid)))
+    ;(getPortfolioDetail as any).mockImplementation(
+      (id: number) => Promise.resolve(list.find(p => p.id === id)),
+    )
+    return list
+  }
+
+  it('12 个组合全部展开后，最后一条子策略的[编辑]打开「编辑子策略」', async () => {
+    setup()
+    const w = mount(Portfolios)
+    await flushPromises()
+
+    const toggles = w.findAll('button.toggle-expand')
+    expect(toggles.length).toBe(12)
+    for (const t of toggles) await t.trigger('click')
+    await flushPromises()
+
+    const subRows = w.findAll('.strategy-sub-row')
+    expect(subRows.length).toBe(12)
+
+    const lastSubRow = subRows[subRows.length - 1]
+    expect(lastSubRow.text()).toContain('子策略12')
+    const lastEdit = lastSubRow.findAll('button').find(b => b.text() === '编辑')!
+    expect(lastEdit.exists()).toBe(true)
+    await lastEdit.trigger('click')
+    await flushPromises()
+
+    expect(w.text()).toContain('编辑子策略')
+    expect((w.find('input[data-field="name"]').element as HTMLInputElement).value).toBe('子策略12')
+  })
+
+  it('12 个组合时，最后一个组合行（#12）的[编辑]打开「编辑组合」', async () => {
+    setup()
+    const w = mount(Portfolios)
+    await flushPromises()
+
+    const mainRows = w.findAll('tbody tr').filter(
+      r => !r.classes('strategy-sub-row') && !r.classes('strategy-add-row'),
+    )
+    expect(mainRows.length).toBe(12)
+
+    const lastRow = mainRows[mainRows.length - 1]
+    expect(lastRow.text()).toContain('#12')
+    const lastEdit = lastRow.findAll('button').find(b => b.text() === '编辑')!
+    await lastEdit.trigger('click')
+    await flushPromises()
+
+    expect(getPortfolioDetail).toHaveBeenCalledWith(12)
+    expect(w.text()).toContain('编辑组合')
+    expect((w.find('input[data-field="name"]').element as HTMLInputElement).value).toBe('组合12')
   })
 })
