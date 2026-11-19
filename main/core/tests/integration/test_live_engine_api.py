@@ -7,6 +7,7 @@ B4b：/orders、/trades、/positions 三个历史查询端点。
 from datetime import datetime
 from decimal import Decimal
 import logging
+import time
 
 import httpx
 import pytest
@@ -344,8 +345,17 @@ def test_ths_second_session_rejected_channel_exclusive(client, mock_bridge, monk
     c.post("/api/live/sessions/%d/stop" % sid1)
 
 
-def test_ths_running_tdx_session_start_allowed(client, mock_bridge, monkeypatch):
-    """M1：ths 运行中 + tdx 会话启动 → 成功（互斥仅限 THS 通道自身）。"""
+def test_ths_running_tdx_session_start_requires_keyboard_ack(client, mock_bridge, monkeypatch):
+    """1.0.5 键鼠软拦：ths 运行中启动 tdx 先 409，带 ack 才放行。
+
+    C1 引擎类型独占不拦（ths/tdx 不同引擎）、C2 账户键不同也不拦；真正触发的是
+    C3 键鼠 UI 自动化互斥（两者都操作交易窗口，同时启动有误点风险）。1.0.5 起
+    默认软拦：未带 ``ack_keyboard_risk`` → 409 rule=keyboard_exclusive，
+    带 ack → 放行并留 WARNING + 决策事件。旧断言「直接 code=0」已作废。
+
+    一句话新口径：ths 与 tdx 同属键鼠通道，同时运行默认软拦（409），
+    必须带 ack_keyboard_risk=true 显式确认才放行。
+    """
     c, Session = client
     db = Session()
     ps_id = _seed(db)
@@ -353,14 +363,33 @@ def test_ths_running_tdx_session_start_allowed(client, mock_bridge, monkeypatch)
     monkeypatch.setattr(live_svc, "ThsUiDispatcher", _FakeThsDispatcher)
     monkeypatch.setattr(live_svc, "TdxTqDispatcher", _FakeTdxDispatcher)
 
+    # 本机配置若开 keyboard_conflict_hard_block=true，ack 也会 409；测试钉住软拦口径。
+    real_load_config = live_svc.load_config
+
+    def _soft_block_config():
+        cfg = dict(real_load_config())
+        tq = dict(cfg.get("tq_trade") or {})
+        tq["keyboard_conflict_hard_block"] = False
+        cfg["tq_trade"] = tq
+        return cfg
+
+    monkeypatch.setattr(live_svc, "load_config", _soft_block_config)
+
     sid1 = _create_session(c, portfolio_ids=(ps_id,), engine="ths")
     sid2 = _create_session(c, portfolio_ids=(ps_id,), engine="tdx")
 
     assert c.post("/api/live/sessions/%d/start" % sid1).json()["code"] == 0
-    resp = c.post("/api/live/sessions/%d/start" % sid2)
-    assert resp.json()["code"] == 0
-    assert resp.json()["data"]["status"] == "running"
-    assert sid1 in live_api._ENGINES
+    body = c.post("/api/live/sessions/%d/start" % sid2).json()
+    assert body["code"] == 409
+    assert body["data"]["rule"] == "keyboard_exclusive"
+    assert body["data"]["requires_ack"] is True
+    assert sid2 not in live_api._ENGINES
+    assert sid1 in live_api._ENGINES  # 原会话不受影响
+
+    acked = c.post("/api/live/sessions/%d/start" % sid2,
+                   json={"ack_keyboard_risk": True}).json()
+    assert acked["code"] == 0
+    assert acked["data"]["status"] == "running"
     assert sid2 in live_api._ENGINES
 
     c.post("/api/live/sessions/%d/stop" % sid1)
@@ -383,9 +412,23 @@ def test_restart_same_running_session_is_idempotent(client, mock_bridge):
     c.post("/api/live/sessions/%d/stop" % sid)
 
 
-def test_stop_session_stops_engine(client, mock_bridge):
-    """/stop → status=stopped，registry 清空引擎。"""
+def test_stop_session_stops_engine(client, mock_bridge, monkeypatch):
+    """/stop → 先 returning stopping，异步收敛后落 stopped，registry 清空引擎。
+
+    1.0.5 起 stop 为「同步置 stopping（仍占用 C1/C2）→ engine.stop() 协程收敛 →
+    finalize_stopped 置 stopped」。因此响应里是中间态 stopping，只有后台收尾完成
+    才变 stopped——不再同步返回 stopped。
+
+    一句话新口径：/stop 先返回 stopping，后台 engine.stop() 收敛完成后才落 stopped；
+    stopping 期间仍占用引擎/账户，只有 stopped 才释放。
+    """
     c, Session = client
+    # finalize_stopped 的工厂默认参数在定义时绑定（core.db.SessionLocal），测试覆盖
+    # 不到；显式注入测试 Session，否则后台收尾会写回真实 dev.db、测试库永远 stopping。
+    real_finalize = live_svc.finalize_stopped
+    monkeypatch.setattr(
+        live_svc, "finalize_stopped",
+        lambda sid: real_finalize(sid, db_session_factory=Session))
     db = Session()
     ps_id = _seed(db)
     db.close()
@@ -396,8 +439,19 @@ def test_stop_session_stops_engine(client, mock_bridge):
 
     resp = c.post("/api/live/sessions/%d/stop" % sid)
     assert resp.status_code == 200
-    assert resp.json()["data"]["status"] == "stopped"
+    assert resp.json()["data"]["status"] == "stopping"
+    # 注册表同步弹出（不再持有引擎），DB 状态由后台协程收尾
     assert sid not in live_api._ENGINES
+
+    # engine.stop() 可能在收尾前拉一次账户快照（桥/TDX 超时约 5s），留足收敛时间
+    deadline = time.monotonic() + 20.0
+    status = None
+    while time.monotonic() < deadline:
+        status = c.get("/api/live/sessions/%d" % sid).json()["data"]["status"]
+        if status == "stopped":
+            break
+        time.sleep(0.1)
+    assert status == "stopped"
 
 
 def test_stop_session_is_idempotent(client, mock_bridge):
@@ -1105,10 +1159,22 @@ def test_create_session_rejects_non_positive_live_capital(client, mock_bridge):
 
 
 def test_build_engine_keeps_per_portfolio_capital(client, monkeypatch, caplog):
-    """build_engine 的 live_capital 只作真实侧总闸，不覆盖组合起账（P1-①）。
+    """build_engine 的资金基准口径（1.0.5 起）：按组合占比切分，同时作真实侧总闸。
 
-    分账不分池：每个组合虚拟起账 = 该组合配置资金；会话级 live_capital 仅作为
-    真实侧额度兜底上限（引擎 `_account_total_capital`）。"""
+    新口径（2026-11-16/1.0.5 引入，`41c25b4`）：
+    - ``live_capital`` 是**会话级真实账户总资产基准**（起账时 min(填写值, 真实总资产)，
+      只缩不放）；
+    - 起账时按各组合 ``initial_capital`` 占比切分虚拟现金（单组合 = 整额）；
+    - 同一基准继续作为真实侧兜底总闸（引擎 ``_account_total_capital``，桥快照不可用
+      时 ×0.98 − 在途预留）。
+
+    旧口径「分账不分池、live_capital 只作真实侧总闸、组合恒按自身配置 10 万起账」
+    自 1.0.5 起作废：live_capital 语义已改为会话真实资金基准，多组合必须共享同一
+    基准并按配置占比切分，否则虚拟账本总和会超过真实资金（多组合超买）。
+
+    一句话新口径：资金按各组合 initial_capital 权重从会话整仓基准切分，
+    单组合场景等于整仓，故 500000 全部计入该组合。
+    """
     import logging
     c, Session = client
     db = Session()
@@ -1129,16 +1195,36 @@ def test_build_engine_keeps_per_portfolio_capital(client, monkeypatch, caplog):
     try:
         with caplog.at_level(logging.INFO, logger="core.services.live_service"):
             engine = live_api._build_engine(sid, db2, "simulation")
-        # 组合仍以自身配置资金起账（100000），不被账户总资产覆盖
-        assert engine.portfolios[0].account.initial_capital == Decimal("100000")
-        assert engine.portfolios[0].account.cash == Decimal("100000")
-        # 会话真实账户总资产作为引擎真实侧兜底上限
+        # 单组合 = 整额：会话基准 500000 全部作为该组合起账
+        assert engine.portfolios[0].account.initial_capital == Decimal("500000.00")
+        assert engine.portfolios[0].account.cash == Decimal("500000.00")
+        # 同一基准仍是真实侧兜底总闸
         assert engine._account_total_capital == Decimal("500000")
-        assert any("虚拟起账资金" in r.getMessage() for r in caplog.records)
+        assert any("资金基准切分" in r.getMessage() for r in caplog.records)
+        assert any("起账权重" in r.getMessage() for r in caplog.records)
     finally:
         db2.close()
 
-    # 未设置 live_capital → 组合配置初始资金 100000（现行为不变）
+    # 多组合：按 initial_capital 占比切分（100000:200000 → 1/3 : 2/3）
+    db_extra = Session()
+    try:
+        ps2_id = _seed_extra_portfolio(db_extra)
+    finally:
+        db_extra.close()
+    sid_multi = _create_session(c, portfolio_ids=(ps_id, ps2_id), live_capital=300000)
+    db_multi = Session()
+    try:
+        engine_multi = live_api._build_engine(sid_multi, db_multi, "simulation")
+        allocated = sorted(
+            p.account.initial_capital for p in engine_multi.portfolios)
+        assert allocated == [Decimal("100000.00"), Decimal("200000.00")]
+        # 切分不得丢分：各组合起账之和严格等于会话基准
+        assert sum(allocated) == Decimal("300000.00")
+        assert engine_multi._account_total_capital == Decimal("300000")
+    finally:
+        db_multi.close()
+
+    # 未设置 live_capital → 组合配置初始资金 100000（旧行为不变）
     sid2 = _create_session(c, portfolio_ids=(ps_id,))
     db3 = Session()
     try:
@@ -1408,13 +1494,19 @@ def test_concurrent_start_same_session_registers_single_engine(
     async def call_start(session_factory):
         db_req = session_factory()
         try:
-            return await live_api.start_session(sid, db_req)
+            # 路由签名 1.0.5 起为 (session_id, data=None, db=Depends)；必须用关键字
+            # 传 db，否则 Session 会被当成 data（data.get → TypeError）。
+            return await live_api.start_session(sid, data=None, db=db_req)
         finally:
             db_req.close()
 
     async def drive():
         t1 = asyncio.create_task(call_start(ConcSession))
         while not entered.is_set():
+            if t1.done():
+                # 启动协程提前失败（如线程池/锁不可用）时，直接抛出原因，
+                # 避免 while 空转把整个测试挂死。
+                t1.result()
             await asyncio.sleep(0.01)
         # 第一个 start 仍在 threadpool 窗口内（未注册）→ 并发发起第二个
         t2 = asyncio.create_task(call_start(ConcSession))
