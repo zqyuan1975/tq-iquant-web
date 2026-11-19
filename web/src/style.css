@@ -390,3 +390,102 @@ tbody tr:last-child td{border-bottom:none}
   .modal-content { padding: 16px; }
   .modal-lg .modal-content { max-width: 100%; }
 }
+
+/* ---- 详情指标面板（成本/容量等）：指标卡 + 环图/对照刻度/进度条，可复用于其它详情指标区 ---- */
+.metric-grid { display: grid; grid-template-columns: repeat(12, minmax(0, 1fr)); gap: 12px; }
+.metric-card {
+  grid-column: span 6; display: flex; flex-direction: column; gap: 8px;
+  padding: 14px 16px; background: var(--card-bg); border: 1px solid var(--border);
+  border-radius: var(--radius); box-shadow: var(--shadow-card); min-width: 0;
+}
+.metric-card--wide { grid-column: span 7; }
+.metric-card--narrow { grid-column: span 5; }
+.metric-card--full { grid-column: 1 / -1; }
+.metric-kicker { font-size: 11px; font-weight: 600; letter-spacing: .1em; color: var(--ink-faint); }
+.metric-head { display: flex; flex-direction: column; gap: 2px; }
+.metric-big { font-size: 26px; font-weight: 800; line-height: 1.15; color: var(--ink); }
+.metric-value { font-size: 22px; font-weight: 800; line-height: 1.2; }
+.metric-sub { font-size: 11px; color: var(--ink-soft); }
+.metric-note { margin: 0; font-size: 11px; color: var(--ink-faint); }
+.metric-conclusion { margin: 0; font-size: 12px; line-height: 1.5; color: var(--ink-soft); }
+.metric-advice { margin: 0; padding-left: 16px; display: flex; flex-direction: column; gap: 4px; font-size: 12px; line-height: 1.5; color: var(--ink-soft); }
+.metric-advice li::marker { color: var(--accent); }
+.metric-subgrid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; }
+.metric-tile {
+  display: flex; flex-direction: column; gap: 3px; min-width: 0;
+  padding: 9px 11px; background: var(--bg); border: 1px solid var(--border);
+  border-radius: var(--radius);
+}
+.metric-tile > span { font-size: 11px; color: var(--ink-soft); }
+.metric-tile > b { font-size: 17px; font-weight: 800; line-height: 1.2; color: var(--ink); font-variant-numeric: tabular-nums; }
+.metric-tile > i { font-style: normal; font-size: 10px; color: var(--ink-faint); }
+.metric-headline { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; }
+.metric-mini-row { display: flex; flex-wrap: wrap; gap: 6px 18px; margin-top: auto; }
+.metric-mini-row > div { display: flex; flex-direction: column; gap: 2px; min-width: 96px; }
+.metric-mini-row span { font-size: 11px; color: var(--ink-soft); }
+.metric-mini-row b { font-size: 13px; font-weight: 700; color: var(--ink); }
+
+.metric-mix-bar { display: flex; height: 10px; border-radius: 6px; overflow: hidden; background: var(--accent-light); }
+.metric-mix-bar i { display: block; height: 100%; min-width: 0; }
+.metric-mix-bar i.mix-1 { background: var(--accent); }
+.metric-mix-bar i.mix-2 { background: var(--gold); }
+.metric-mix-bar i.mix-3 { background: var(--ink-faint); }
+.metric-legend { display: flex; flex-wrap: wrap; gap: 4px 14px; font-size: 11px; color: var(--ink-soft); }
+.metric-legend > span { display: inline-flex; align-items: center; gap: 5px; }
+.metric-legend i { width: 8px; height: 8px; border-radius: 2px; display: inline-block; }
+.metric-legend i.mix-1 { background: var(--accent); }
+.metric-legend i.mix-2 { background: var(--gold); }
+.metric-legend i.mix-3 { background: var(--ink-faint); }
+.metric-legend b { color: var(--ink); font-weight: 600; }
+
+.metric-donut-wrap { position: relative; display: flex; align-items: center; justify-content: center; padding: 2px 0; }
+.metric-donut { width: 124px; height: 124px; }
+.metric-donut circle { fill: none; stroke-width: 12; }
+.metric-donut .track { stroke: var(--accent-light); }
+.metric-donut .value { stroke-linecap: round; transform: rotate(-90deg); transform-origin: 60px 60px; transition: stroke-dashoffset .4s ease; }
+.metric-stroke--ok { stroke: var(--green); }
+.metric-stroke--warn { stroke: var(--warn); }
+.metric-stroke--bad { stroke: var(--red); }
+.metric-stroke--neutral { stroke: var(--accent); }
+.metric-donut-center { position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 2px; }
+.metric-donut-center b { font-size: 20px; font-weight: 800; color: var(--ink); }
+.metric-donut-center span { font-size: 10px; color: var(--ink-soft); }
+
+.metric-scale { position: relative; height: 50px; margin-top: 2px; }
+.metric-scale-track { position: absolute; left: 0; right: 0; top: 23px; height: 3px; border-radius: 2px; background: var(--line); }
+.metric-scale-zero { position: absolute; top: 18px; width: 1px; height: 13px; background: var(--ink-faint); }
+.metric-scale-mark { position: absolute; display: flex; flex-direction: column; align-items: center; gap: 2px; transform: translateX(-50%); }
+.metric-scale-mark i { width: 2px; height: 13px; background: var(--ink-soft); border-radius: 1px; }
+.metric-scale-mark span { font-size: 10px; color: var(--ink-soft); white-space: nowrap; }
+.metric-scale-mark--config { top: 0; }
+.metric-scale-mark--realized { top: 27px; }
+.metric-scale-mark--realized i { background: currentColor; }
+.metric-scale-mark--realized span { color: var(--ink-soft); }
+
+.metric-tone--ok { color: var(--green); }
+.metric-tone--warn { color: var(--warn); }
+.metric-tone--bad { color: var(--red); }
+.metric-tone--neutral { color: var(--accent); }
+.metric-pill {
+  display: inline-flex; align-items: center; padding: 2px 10px; border: 1px solid currentColor;
+  border-radius: 999px; font-size: 12px; font-weight: 700;
+}
+.metric-bar { position: relative; height: 10px; border-radius: 6px; background: var(--accent-light); }
+.metric-bar > i { display: block; height: 100%; border-radius: 6px; }
+.metric-fill--ok { background: var(--green); }
+.metric-fill--warn { background: var(--warn); }
+.metric-fill--bad { background: var(--red); }
+.metric-fill--neutral { background: var(--accent); }
+.metric-bar-threshold { position: absolute; top: -3px; width: 2px; height: 16px; background: var(--ink-soft); border-radius: 1px; }
+.metric-bar-legend { display: flex; justify-content: space-between; gap: 8px; font-size: 10px; color: var(--ink-faint); }
+
+@media (max-width: 1100px) {
+  .metric-card--wide, .metric-card--narrow { grid-column: span 6; }
+  .metric-subgrid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+@media (max-width: 760px) {
+  .metric-grid { grid-template-columns: minmax(0, 1fr); }
+  .metric-card, .metric-card--wide, .metric-card--narrow, .metric-card--full { grid-column: 1 / -1; }
+  .metric-subgrid { grid-template-columns: minmax(0, 1fr); }
+  .field-label { align-items: flex-start; }
+}
