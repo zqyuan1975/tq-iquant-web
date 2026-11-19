@@ -105,7 +105,7 @@ onMounted(async () => {
     <div class="filter-grid">
       <label class="field">
         <span>会话</span>
-        <select v-model="sessionId">
+        <select class="field-select field-select--compact" v-model="sessionId">
           <option value="">全部</option>
           <option v-for="s in sessions" :key="s.id" :value="String(s.id)">{{ s.name }}</option>
         </select>
@@ -124,7 +124,7 @@ onMounted(async () => {
       </label>
       <label class="field">
         <span>处理状态</span>
-        <select v-model="ackStatus">
+        <select class="field-select field-select--compact" v-model="ackStatus">
           <option value="">全部</option>
           <option value="open">未处理</option>
           <option value="acked">已确认</option>
@@ -195,14 +195,16 @@ onMounted(async () => {
 <style scoped>
 .filter-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
   gap: 10px;
 }
-.field { display: flex; flex-direction: column; gap: 4px; font-size: 12px; color: var(--ink-soft); }
+.field { display: flex; flex-direction: column; gap: 4px; min-width: 0; font-size: 12px; color: var(--ink-soft); }
 .field input, .field select {
-  padding: 5px 8px; border: 1px solid var(--line); border-radius: 6px;
-  background: var(--card-bg); color: var(--ink);
+  width: 100%; min-width: 0; height: 30px; box-sizing: border-box;
+  padding: 5px 8px; border: 1px solid var(--border); border-radius: var(--radius);
+  background-color: var(--card-bg); color: var(--ink);
 }
+.field select { padding-right: 22px; background-position: right 7px center; }
 .filter-actions { display: flex; align-items: center; gap: 8px; margin-top: 10px; }
 .filter-total { margin-left: auto; font-size: 12px; color: var(--ink-soft); }
 .msg { max-width: 420px; overflow-wrap: anywhere; }

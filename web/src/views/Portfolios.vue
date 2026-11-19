@@ -8,6 +8,7 @@ import {
   type PortfolioItem, type StockPoolItem, type FormulaItem,
 } from '../api'
 import PageHeader from '../components/PageHeader.vue'
+import FieldLabel from '../components/FieldLabel.vue'
 import { BENCHMARKS, DEFAULT_BENCHMARK } from '../utils/benchmarks'
 import { MARKET_GATE_ENGINES, MARKET_GATE_MODES, MARKET_GATE_VOTE_MODES } from '../utils/marketGate'
 
@@ -101,6 +102,9 @@ const NULLABLE_NUMERIC_FIELDS = new Set([
   'equity_cap',
   'max_single_position_pct', 'min_cash_reserve_pct',
   'max_order_amount',
+  // H3 切片增强：笔数/子单最小量/间隔/量占比均可留空，由后端按阈值或成交量推导
+  'split_order_count', 'split_order_min_qty',
+  'split_order_interval_seconds', 'split_order_volume_pct',
   'cash_enhance_equity_threshold', 'cash_enhance_position_ratio_threshold',
   'trend_trailing_stop_ratio', 'trend_max_positions',
   'signal_weekday', 'risk_cooldown_days',
@@ -123,14 +127,15 @@ const PORTFOLIO_GROUPS: { title: string; hint?: string; fields: FieldMeta[] }[] 
   { title: '基本信息', fields: [
     { key: 'name', label: '名称', span: 2, type: 'text', placeholder: '例如：稳健组合' },
     { key: 'stock_pool_id', label: '股票池', span: 1, type: 'select', options: 'pools' },
-    { key: 'benchmark_index', label: '基准指数', span: 1, type: 'select', options: 'benchmarks', hint: '用于回测超额与 crisis alpha 对比，同时作为市场多空门控判别基准；默认上证指数（000001.SH），通达信可自动下载日线' },
-    { key: 'initial_capital', label: '初始资金（元）', span: 2, type: 'number' },
+    { key: 'benchmark_index', label: '基准指数', span: 2, type: 'select', options: 'benchmarks', hint: '用于回测超额与 crisis alpha 对比，同时作为市场多空门控判别基准；默认上证指数（000001.SH），通达信可自动下载日线' },
+    { key: 'initial_capital', label: '初始资金（元）', span: 1, type: 'number' },
     { key: 'priority', label: '下单优先级', span: 1, type: 'number', placeholder: '0', hint: '同一 bar 多组合并发时数值越大越先分配资金并下单；0=默认顺序' },
+    { key: 'trading_session', label: '交易时段', span: 2, type: 'select', options: 'sessions' },
   ]},
   { title: '风控参数', fields: [
     { key: 'max_drawdown', label: '最大回撤', span: 1, type: 'percent', placeholder: '20' },
     { key: 'daily_loss_limit', label: '日亏损限', span: 1, type: 'percent', placeholder: '5' },
-    { key: 'max_holdings', label: '最大持仓数', span: 2, type: 'number', placeholder: '10' },
+    { key: 'max_holdings', label: '最大持仓数', span: 1, type: 'number', placeholder: '10' },
     { key: 'risk_cooldown_days', label: '风控冷静期（交易日）', span: 2, type: 'number', placeholder: '1', hint: '止损/止盈/移动止损卖出成交后，同一策略同一股票在该天数内禁止新开仓（当日算第 1 天）；0=关闭' },
   ]},
   { title: '交易成本', fields: [
@@ -141,14 +146,11 @@ const PORTFOLIO_GROUPS: { title: string; hint?: string; fields: FieldMeta[] }[] 
     { key: 'transfer_fee_rate', label: '过户费率', span: 1, type: 'percent', placeholder: '0.001', hint: '买卖双向按成交额计收，A 股现行 0.001%' },
     { key: 'slippage', label: '滑点', span: 1, type: 'percent', placeholder: '0', hint: '按成交额比例的单边滑点成本，0 表示不模拟' },
   ]},
-  { title: '交易时段', fields: [
-    { key: 'trading_session', label: '交易时段', span: 2, type: 'select', options: 'sessions' },
-  ]},
   { title: '执行真实感', fields: [
     { key: 'price_limit_check_enabled', label: '涨跌停校验', span: 1, type: 'switch', hint: '默认开启。回测：涨停买不进/跌停卖不出，延后重试；实盘：下单前拦截并落拒单事件（通达信 TQ / 同花顺生效，QMT/掘金桥无前收数据恒放行）' },
     { key: 'volume_limit_enabled', label: '成交量约束', span: 1, type: 'switch', hint: '按 bar 成交量占比封顶' },
-    { key: 'volume_limit_ratio', label: '成交量占比上限', span: 2, type: 'percent', placeholder: '10', showIf: { key: 'volume_limit_enabled', equals: true } },
     { key: 'adaptive_slippage_enabled', label: '自适应滑点', span: 1, type: 'switch', hint: '滑点随订单量占 bar 成交量比例上浮（市场冲击成本）' },
+    { key: 'volume_limit_ratio', label: '成交量占比上限', span: 2, type: 'percent', placeholder: '10', showIf: { key: 'volume_limit_enabled', equals: true } },
     { key: 'slippage_impact_coef', label: '滑点冲击系数', span: 1, type: 'percent', placeholder: '10', showIf: { key: 'adaptive_slippage_enabled', equals: true }, hint: '订单吞掉整根 bar 成交量时冲击 10%，封顶' },
   ]},
   { title: '仓位与现金管理', fields: [
@@ -865,7 +867,7 @@ onMounted(loadPortfolios)
     </div>
 
     <!-- ============ 组合编辑 Modal ============ -->
-    <div v-if="showPortfolioForm" class="modal-overlay modal-lg" @click.self="showPortfolioForm = false">
+    <div v-if="showPortfolioForm" class="modal-overlay modal-lg modal-dense modal-dense--3col" @click.self="showPortfolioForm = false">
       <div class="modal-content">
         <div style="display:flex;align-items:center;justify-content:space-between;gap:8px">
           <h3 style="margin:0">{{ editingPortfolioId === null ? '新建组合' : '编辑组合' }}</h3>
@@ -882,7 +884,7 @@ onMounted(loadPortfolios)
                 class="field-row"
                 :class="[fld.span === 2 ? 'field-span-2' : '', ((fld.type === 'percent' && fld.hint) || portfolioFieldErrors[fld.key]) ? 'field-row--hinted' : '']"
               >
-                <span class="field-label">{{ fld.label }}</span>
+                <FieldLabel :text="fld.label" />
                 <label v-if="fld.type === 'switch'" class="switch-row">
                   <input type="checkbox" :data-field="fld.key" v-model="portfolioForm[fld.key]" />
                   <span v-if="fld.hint" class="field-hint">{{ fld.hint }}</span>
@@ -1022,7 +1024,7 @@ onMounted(loadPortfolios)
     </div>
 
     <!-- ============ 子策略编辑 Modal ============ -->
-    <div v-if="showStrategyForm" class="modal-overlay modal-lg" @click.self="showStrategyForm = false">
+    <div v-if="showStrategyForm" class="modal-overlay modal-lg modal-dense" @click.self="showStrategyForm = false">
       <div class="modal-content">
         <div style="display:flex;align-items:center;justify-content:space-between;gap:8px">
           <h3 style="margin:0">{{ editingStrategyId === null ? '新建子策略' : '编辑子策略' }}</h3>
@@ -1038,7 +1040,7 @@ onMounted(loadPortfolios)
                 v-show="fieldVisible(fld, strategyForm)"
                 class="field-row" :class="fld.span === 2 ? 'field-span-2' : ''"
               >
-                <span class="field-label">{{ fld.label }}</span>
+                <FieldLabel :text="fld.label" />
                 <label v-if="fld.type === 'switch'" class="switch-row">
                   <input type="checkbox" :data-field="fld.key" v-model="strategyForm[fld.key]" />
                   <span v-if="fld.hint" class="field-hint">{{ fld.hint }}</span>

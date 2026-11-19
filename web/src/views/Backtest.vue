@@ -3764,7 +3764,7 @@ watch(theme, () => {
     </div>
 
     <!-- 发起回测 Modal -->
-    <div v-if="showForm" class="modal-overlay modal-lg" @click.self="showForm = false">
+    <div v-if="showForm" class="modal-overlay modal-lg modal-dense" @click.self="showForm = false">
       <div class="modal-content">
         <div style="display:flex;align-items:center;justify-content:space-between;gap:8px">
           <h3 style="margin:0">发起回测</h3>
@@ -5641,7 +5641,7 @@ watch(theme, () => {
               </span>
               <label class="p-bench-pick">
                 判定基准
-                <select v-model="pBenchSel" :disabled="pRecomputing" @change="recomputePersistence">
+                <select class="field-select" v-model="pBenchSel" :disabled="pRecomputing" @change="recomputePersistence">
                   <option v-for="b in pBenchOptions" :key="b.code" :value="b.code">
                     {{ b.name }}（{{ b.code }}）
                   </option>
@@ -6073,7 +6073,7 @@ watch(theme, () => {
           <div class="signal-row">
             <div style="flex:1">
               <label>复权模式</label>
-              <select v-model="compareForm.dividend_mode">
+              <select class="field-select" v-model="compareForm.dividend_mode">
                 <option value="dual">前复权+后复权记账（推荐，模拟实盘）</option>
                 <option value="exact">不复权+显式公司行为（对账基准）</option>
                 <option value="front">前复权（默认）</option>
@@ -6570,18 +6570,6 @@ watch(theme, () => {
 .p-verdict-foot .p-msg { color: var(--ink-soft); }
 .p-verdict-foot .p-msg-warn { color: var(--red); }
 .p-bench-pick { display: inline-flex; align-items: center; gap: 6px; }
-.p-bench-pick select {
-  height: 24px;
-  padding: 0 6px;
-  font-size: 12px;
-  border: 1px solid var(--line, #dcdcdc);
-  border-radius: 4px;
-  /* --surface 未定义于主题变量：浅色回退 #fff 尚可，深色主题下白底配浅色 --ink
-     文字会看不清；改用 --card-bg（深色主题随主题变深，与 --ink 对比正确）。 */
-  background: var(--card-bg, #fff);
-  color: var(--ink);
-}
-.p-bench-pick select:disabled { opacity: .6; }
 @media (max-width: 720px) {
   .p-signal { flex-wrap: wrap; }
   .p-signal-detail { flex-basis: 100%; }

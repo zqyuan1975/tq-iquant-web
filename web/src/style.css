@@ -182,7 +182,7 @@ tbody tr:last-child td{border-bottom:none}
 .adv-toggle:hover{color:var(--accent)}
 .empty-state{text-align:center;padding:40px 20px;color:var(--ink-soft)}
 .field{margin-bottom:16px}.field label{display:block;font-size:13px;font-weight:500;color:var(--ink-soft);margin-bottom:4px}
-.field input{width:100%;padding:8px 10px;border:1px solid var(--border);border-radius:var(--radius)}
+.field input,.field select{width:100%;padding:8px 10px;border:1px solid var(--border);border-radius:var(--radius)}
 .strategy-card{border:1px solid var(--border);border-radius:var(--radius);padding:12px;margin-bottom:10px;background:var(--hover-bg)}
 .strategy-card-head{display:flex;justify-content:space-between;align-items:center;margin-bottom:8px}
 .strategy-card-title{font-size:13px;font-weight:600;color:var(--ink)}
@@ -195,20 +195,38 @@ tbody tr:last-child td{border-bottom:none}
 .field-grid .field-row{margin-bottom:0}
 .field-span-2{grid-column:1 / -1}
 .field-row{display:flex;align-items:center;gap:8px;margin-bottom:8px}
-.field-label{flex:0 0 130px;min-width:130px;font-size:12px;color:var(--ink-soft);text-align:right;line-height:1.35}
+.field-label{flex:0 0 130px;min-width:130px;font-size:12px;color:var(--ink-soft);text-align:right;line-height:1.35;
+  display:flex;flex-direction:column;align-items:flex-end;justify-content:center}
+/* 标签括号注释统一换到第二行：主标题保持常规色，注释弱化一档，避免在窄标签列里被硬折行 */
+.field-label-main{display:block}
+.label-note{display:block;font-size:11px;font-weight:400;line-height:1.25;color:var(--ink-faint)}
 .field-row input,.field-row select{flex:1;margin-bottom:0;padding:7px 10px;border:1px solid var(--border);border-radius:var(--radius)}
-/* 下拉框美化：仅作用于字段行下拉与显式 .field-select（不动全局 select）。
-   原生箭头替换为内联 SVG，右侧留出箭头区；颜色沿用主题变量。 */
-.field-row select,.field-select{
+/* 下拉框统一规格：字段行 / 弹窗 / `.field` 内下拉与显式 `.field-select` 共用一套外观。
+   原生箭头统一替换为内联 SVG（9×6，距右 9px），右侧留出箭头区；颜色沿用主题变量。
+   独立控件（.field-select）固定 25px 高；弹窗/字段行内下拉与旁边输入框同高（height:auto）。 */
+.field-row select,.modal-content select,.field select,.field-select{
   appearance:none;-webkit-appearance:none;-moz-appearance:none;
-  padding-right:30px;
-  background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 12 8'%3E%3Cpath d='M1 1l5 5 5-5' fill='none' stroke='%238a8a8a' stroke-width='1.6' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
-  background-repeat:no-repeat;background-position:right 10px center;background-size:10px 7px;
+  padding-right:28px;
+  background-color:var(--bg);
+  background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 9 6'%3E%3Cpath d='M1 1l3.5 3.5L8 1' fill='none' stroke='%238a8a8a' stroke-width='1.4' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+  background-repeat:no-repeat;background-position:right 9px center;background-size:9px 6px;
+  color:var(--ink);text-overflow:ellipsis;
   cursor:pointer;transition:border-color .15s,box-shadow .15s,background-color .15s;
 }
-.field-row select:hover,.field-select:hover{border-color:var(--line-strong)}
-.field-row select:focus,.field-select:focus{outline:none;border-color:var(--accent);box-shadow:0 0 0 2px var(--accent-light)}
-.field-row select:disabled,.field-select:disabled{opacity:.55;cursor:not-allowed;background-color:var(--hover-bg)}
+.field-select{
+  height:25px;padding:0 28px 0 10px;
+  border:1px solid var(--border);border-radius:var(--radius);
+  font-size:12px;line-height:normal;
+}
+/* 窄格/与输入框同排的第二档：高度随内边距自适应，箭头区缩到 22px，避免挤压文字 */
+.field-select--compact{
+  height:auto;padding:4px 22px 4px 8px;
+  background-position:right 7px center;
+}
+.field-row select,.modal-content select{height:auto;line-height:normal}
+.field-row select:hover,.modal-content select:hover,.field select:hover,.field-select:hover{border-color:var(--line-strong)}
+.field-row select:focus,.modal-content select:focus,.field select:focus,.field-select:focus{outline:none;border-color:var(--accent);box-shadow:0 0 0 2px var(--accent-light)}
+.field-row select:disabled,.modal-content select:disabled,.field select:disabled,.field-select:disabled{opacity:.55;cursor:not-allowed;background-color:var(--hover-bg)}
 .field-suffix{flex:0 0 auto;font-size:13px;color:var(--ink-soft)}
 /* 开关行：勾选框 + 说明并排（双列网格下半格也紧凑） */
 .field-row .switch-row{display:inline-flex;align-items:center;gap:6px;flex:1;min-width:0;margin:0;font-size:12px}
@@ -217,6 +235,31 @@ tbody tr:last-child td{border-bottom:none}
 /* 基础信息单行小表单（发起回测/对比回测等弹窗）与 field-grid 对齐 */
 .modal-lg .form-body{display:flex;flex-direction:column;gap:4px}
 .modal-lg .form-group{margin-bottom:6px}
+
+/* 紧凑表单弹窗：字段较多的编辑弹窗统一收紧行距、标签宽度与分组标题；
+   `--3col` 变体用于短字段较多的表单（长文本/带说明字段仍由 span-2 占两列）。 */
+.modal-dense.modal-lg .modal-content{width:960px;padding:20px}
+.modal-dense--3col.modal-lg .modal-content{width:1020px}
+.modal-dense .modal-body{padding-right:2px}
+.modal-dense .group-label{margin:8px 0 4px;padding-bottom:3px;font-size:12px}
+.modal-dense .field-grid{column-gap:14px;row-gap:1px}
+.modal-dense .field-row{gap:6px}
+.modal-dense .field-label{flex:0 0 108px;min-width:108px;line-height:1.25}
+.modal-dense .field-row input,.modal-dense .field-row select{padding:5px 8px}
+.modal-dense .modal-actions{margin-top:10px;padding-top:10px}
+.modal-dense--3col .field-grid{grid-template-columns:repeat(3,minmax(0,1fr))}
+.modal-dense--3col .field-span-2{grid-column:span 2}
+/* 单列表单弹窗（新建/编辑实盘等）：直接子级标签与控件的间距 */
+.modal-dense .modal-body > label{margin-top:8px;margin-bottom:3px}
+.modal-dense .modal-body > input,.modal-dense .modal-body > select{margin-bottom:8px}
+@media (max-width:1100px){
+  .modal-dense--3col .field-grid{grid-template-columns:repeat(2,minmax(0,1fr))}
+}
+@media (max-width:760px){
+  .modal-dense .field-grid{grid-template-columns:minmax(0,1fr)}
+  .modal-dense .field-label{flex-basis:92px;min-width:92px}
+  .modal-dense--3col .field-span-2{grid-column:1 / -1}
+}
 
 /* 配置指南（组合/子策略/发起回测 弹窗共用） */
 .guide-block { padding: 2px 4px 6px; }

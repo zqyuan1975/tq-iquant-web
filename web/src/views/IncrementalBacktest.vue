@@ -137,13 +137,13 @@ onMounted(async () => {
     <div class="card" style="padding:12px; margin-bottom:12px; display:flex; gap:16px; flex-wrap:wrap; align-items:center">
       <label>
         实盘会话：
-        <select v-model.number="sessionId" @change="onSessionChange">
+        <select class="field-select" v-model.number="sessionId" @change="onSessionChange">
           <option v-for="s in sessions" :key="s.id" :value="s.id">{{ s.name }}（{{ s.status }}）</option>
         </select>
       </label>
       <label>
         组合策略：
-        <select v-model.number="portfolioId" @change="onPortfolioChange">
+        <select class="field-select" v-model.number="portfolioId" @change="onPortfolioChange">
           <option v-for="id in availablePortfolioIds" :key="id" :value="id">{{ portfolioName(id) }}</option>
         </select>
       </label>
@@ -154,14 +154,14 @@ onMounted(async () => {
       </span>
     </div>
 
-    <div v-if="errorMsg" class="card" style="padding:12px; color:#e5484d">{{ errorMsg }}</div>
+    <div v-if="errorMsg" class="card" style="padding:12px; color:var(--red)">{{ errorMsg }}</div>
 
-    <div v-if="summary && !summary.supported" class="card" style="padding:12px; color:#b45309">
+    <div v-if="summary && !summary.supported" class="card" style="padding:12px; color:var(--warn)">
       {{ summary.reason || '该组合策略暂不支持续跑' }}
     </div>
 
     <div v-if="summary?.last_invalidation" class="card" data-test="invalidation-banner"
-         style="padding:12px; margin-bottom:12px; border-left:4px solid #e5484d; color:#b42318">
+         style="padding:12px; margin-bottom:12px; border-left:4px solid var(--red); color:var(--red)">
       <strong>接缝判废：</strong>
       <span>{{ summary.last_invalidation.message || '参数/口径变化，checkpoint 已作废' }}</span>
       <span v-if="summary.last_invalidation.at" class="muted" style="margin-left:8px">
@@ -229,6 +229,13 @@ onMounted(async () => {
 </template>
 
 <style scoped>
+/* 顶部会话/组合下拉：与站点其它下拉同一规格，标签与控件垂直居中 */
+.card > label { display: inline-flex; align-items: center; gap: 6px; }
+.card > label .field-select { min-width: 200px; }
+@media (max-width: 640px) {
+  .card > label { flex: 1 1 100%; }
+  .card > label .field-select { min-width: 0; flex: 1; }
+}
 .table-wrap { padding: 0; overflow-x: auto; }
 table { width: 100%; border-collapse: collapse; }
 th, td { padding: 8px 10px; text-align: left; border-bottom: 1px solid var(--border-color, #eee); white-space: nowrap; }
@@ -236,5 +243,5 @@ th { font-weight: 600; }
 .muted { color: var(--text-muted, #888); }
 .row-gap { background: rgba(229, 72, 77, 0.10); }
 .row-warn { background: rgba(229, 72, 77, 0.05); }
-.tag { display: inline-block; padding: 1px 6px; margin-right: 4px; border-radius: 4px; background: rgba(229, 72, 77, 0.12); color: #b42318; font-size: 12px; }
+.tag { display: inline-block; padding: 1px 6px; margin-right: 4px; border-radius: 4px; background: var(--red-wash); color: var(--red); font-size: 12px; }
 </style>

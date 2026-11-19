@@ -40,7 +40,7 @@ const hasAny = computed(() => !!props.keyword || (props.filters?.length ?? 0) > 
       :placeholder="keyword.placeholder || keyword.label"
       :value="searchText" @input="emit('update:searchText', ($event.target as HTMLInputElement).value)" />
     <template v-for="f in filters" :key="f.key">
-      <select v-if="f.kind === 'select'" class="tb-control" :value="filterState[f.key] ?? ''"
+      <select v-if="f.kind === 'select'" class="tb-control field-select" :value="filterState[f.key] ?? ''"
         @change="setFilter(f.key, ($event.target as HTMLSelectElement).value)">
         <option value="">{{ f.label }}：全部</option>
         <option v-for="o in optionsOf(f)" :key="o.value" :value="o.value">{{ o.label }}</option>
@@ -65,7 +65,8 @@ const hasAny = computed(() => !!props.keyword || (props.filters?.length ?? 0) > 
 
 <style scoped>
 .table-toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-bottom: 8px; font-size: 12px; }
-.tb-keyword, .tb-control, .tb-range input { padding: 4px 8px; border: 1px solid var(--line); border-radius: 6px; background: var(--card-bg); color: var(--ink); font-size: 12px; }
+.tb-keyword, .tb-range input { padding: 4px 8px; border: 1px solid var(--line); border-radius: 6px; background-color: var(--card-bg); color: var(--ink); font-size: 12px; }
+.tb-control { padding: 4px 22px 4px 8px; border: 1px solid var(--line); border-radius: 6px; background-color: var(--card-bg); color: var(--ink); font-size: 12px; }
 .tb-range { display: inline-flex; align-items: center; gap: 4px; color: var(--ink-soft); }
 .tb-reset { padding: 4px 10px; border: 1px solid var(--line); border-radius: 6px; background: transparent; color: var(--ink-soft); cursor: pointer; }
 .tb-reset:hover { color: var(--accent); border-color: var(--accent); }

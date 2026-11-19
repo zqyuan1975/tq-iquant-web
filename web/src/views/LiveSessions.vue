@@ -19,6 +19,7 @@ import {
   getLiveOrders, getLiveTrades, getLivePositions, getLiveDecisions, getLiveSignals, getPortfolios,
   ackLiveDecision, ackAllLiveDecisions,
   getLiveSessions, getLiveSession, createLiveSession, updateLiveSession, startLiveSession, stopLiveSession, deleteLiveSession,
+  setLiveSessionSellScope,
   getLiveSessionChannelHealth, failoverLiveSession,
   getLiveDataHealth,
   getLiveChannelGuard, reconnectLiveChannel,
@@ -916,6 +917,12 @@ const tvlRecordsLoading = ref(false)
 const tvlBindingValue = ref<string>('auto')
 const tvlBindingSaving = ref(false)
 const tvlBindingMsg = ref('')
+// 当前面板对应的会话（用于标注「实盘已纳入存量仓 → 理论对照解释力下降」）
+const tvlSessionId = ref<number | null>(null)
+const tvlSellScopeFull = computed(() => {
+  const s = sessions.value.find((x) => x.id === tvlSessionId.value)
+  return (s?.sell_scope || 'platform_only') === 'full'
+})
 
 const _tvlPct = (v: number | null) => (v === null ? '—' : `${(v * 100).toFixed(2)}%`)
 
@@ -949,6 +956,7 @@ function recordStatusLabel(status: string): string {
 async function openTheoryVsLive() {
   const sid = watchedSessionId.value ?? activeSessionId
   if (sid === null) return
+  tvlSessionId.value = sid
   showTvl.value = true
   tvlLoading.value = true
   tvlError.value = ''
@@ -1330,6 +1338,47 @@ async function stopSession(id: number) {
   }
 }
 
+// ---- 存量/外部仓是否纳入风控（代卖）：会话级开关（运行中可切，不重启）----
+const sellScopeBusy = ref<number | null>(null)
+function sellScopeOf(s: LiveSessionItem): 'full' | 'platform_only' {
+  return s.sell_scope === 'full' ? 'full' : 'platform_only'
+}
+function sellScopeTitle(s: LiveSessionItem): string {
+  const cur = sellScopeOf(s)
+  const src = s.sell_scope_source === 'session'
+    ? '本会话已显式设置' : `本会话未设置，跟随全局默认（${s.sell_scope_global || 'platform_only'}）`
+  return cur === 'full'
+    ? `存量/外部持仓已纳入风控代卖：风控卖出按整仓口径（${src}）`
+    : `仅代卖平台自建仓，存量/外部持仓不纳入风控（${src}）`
+}
+async function toggleSellScope(s: LiveSessionItem) {
+  if (sellScopeBusy.value === s.id) return
+  const next: 'full' | 'platform_only' = sellScopeOf(s) === 'full' ? 'platform_only' : 'full'
+  if (next === 'full') {
+    const ok = window.confirm(
+      `即将把「${s.name}」的存量/外部持仓纳入风控代卖。\n\n` +
+      '⚠ 开启后会扩大代卖范围，可能立刻对存量仓产生止损单。\n' +
+      '• 系统会先做全量对账（真实现金 / 持仓市值 / 逐只持仓），账不齐会拒绝开启；\n' +
+      '• 运行中立即生效（下一轮 tick），无需重启会话；\n' +
+      '• 已提交未成交的委托不会撤销，只是后续新卖单按整仓口径。\n\n' +
+      '确认开启？',
+    )
+    if (!ok) return
+  }
+  sellScopeBusy.value = s.id
+  try {
+    const res = await setLiveSessionSellScope(s.id, next, next === 'full' ? '界面开启存量仓纳入风控' : '界面关闭存量仓纳入风控')
+    // 就地更新（列表对象与工作台同源）
+    s.sell_scope = res.new
+    s.sell_scope_source = 'session'
+    alert(res.message)
+  } catch (e: any) {
+    alert(e?.response?.data?.message || e?.message || '切换失败')
+  } finally {
+    sellScopeBusy.value = null
+  }
+}
+
 // ---- B3 通道守护（只读检查清单 + 一键重新探活）----
 const guardModal = ref<LiveSessionItem | null>(null)
 const guard = ref<LiveChannelGuard | null>(null)
@@ -1677,7 +1726,7 @@ onUnmounted(() => {
   <div v-if="loading" class="card" style="padding:12px"><p>加载中…</p></div>
   <div v-else class="card table-wrap">
     <table>
-      <thead><tr><th>ID</th><th>名称</th><th>组合策略</th><th>执行模式</th><th>引擎</th><th>模式</th><th>资金基准</th><th>状态</th><th>操作</th></tr></thead>
+      <thead><tr><th>ID</th><th>名称</th><th>组合策略</th><th>执行模式</th><th>引擎</th><th>模式</th><th>资金基准</th><th>状态</th><th>存量仓风控</th><th>操作</th></tr></thead>
       <tbody>
         <tr v-for="s in sessions" :key="s.id">
           <td style="color:var(--ink-soft)">#{{ s.id }}</td>
@@ -1734,6 +1783,21 @@ onUnmounted(() => {
               title="监控正常：引擎在册，轮询与风控在线">监控正常</span>
           </td>
           <td>
+            <!-- 存量/外部持仓是否纳入风控（代卖）：会话级开关，默认关闭 -->
+            <span
+              class="badge"
+              :class="sellScopeOf(s) === 'full' ? 'badge-orange' : 'badge-gray'"
+              :title="sellScopeTitle(s)"
+              data-test="sell-scope-badge"
+            >{{ sellScopeOf(s) === 'full' ? '存量仓已纳入' : '仅平台自建仓' }}</span>
+            <button
+              class="btn btn-sm" style="margin-left:6px" data-test="sell-scope-toggle"
+              :disabled="s.status === 'stopping' || sellScopeBusy === s.id"
+              :title="sellScopeOf(s) === 'full' ? '关闭后不再对存量/外部仓下新卖单（已提交未成交委托不撤销）' : '开启前会先做全量对账，账不齐会拒绝'"
+              @click="toggleSellScope(s)"
+            >{{ sellScopeBusy === s.id ? '切换中…' : (sellScopeOf(s) === 'full' ? '关闭' : '开启') }}</button>
+          </td>
+          <td>
             <button v-if="s.status === 'stopped'" @click="startSession(s.id)" class="btn btn-sm btn-primary">启动</button>
             <button v-if="s.status === 'running'" @click="stopSession(s.id)" class="btn btn-sm btn-danger">停止</button>
             <button v-if="s.status === 'stopping'" class="btn btn-sm" disabled
@@ -1786,7 +1850,7 @@ onUnmounted(() => {
       <div class="wb-tabs">
         <select
           v-if="runningSessions.length > 1"
-          class="input" style="width:auto;margin-right:8px;padding:4px 8px"
+          class="field-select" style="width:auto;margin-right:8px"
           :value="watchedSessionId ?? ''"
           @change="watchSession(Number(($event.target as HTMLSelectElement).value))"
         >
@@ -2022,7 +2086,8 @@ onUnmounted(() => {
           <strong style="font-size:13px">盘前效果</strong>
           <span style="font-size:12px;color:var(--ink-faint)">最近 7 天（北京时间；只读聚合，口径与决策/委托一致）</span>
           <select
-            v-model="preOpenGroupBy" style="font-size:12px;padding:2px 6px;margin-left:auto"
+            class="field-select" style="margin-left:auto"
+            v-model="preOpenGroupBy"
             aria-label="盘前效果聚合粒度" @change="onPreOpenGroupChange"
           >
             <option value="day">按日</option>
@@ -2059,7 +2124,7 @@ onUnmounted(() => {
       </div>
       <div style="display:flex;align-items:center;gap:8px;margin:0 0 8px">
         <span style="font-size:12px;color:var(--ink-soft)">时间范围</span>
-        <select v-model="orderRange" style="font-size:12px;padding:2px 6px" aria-label="委托时间范围">
+        <select class="field-select field-select--compact" v-model="orderRange" aria-label="委托时间范围">
           <option v-for="opt in TIME_RANGE_OPTIONS" :key="opt.value" :value="opt.value">{{ opt.label }}</option>
         </select>
         <span style="font-size:12px;color:var(--ink-faint)">按北京时间自然日 · 共 {{ filteredOrders.length }} 条</span>
@@ -2105,7 +2170,7 @@ onUnmounted(() => {
     <div v-if="wbTab === 'trades'" class="table-wrap">
       <div style="display:flex;align-items:center;gap:8px;margin:0 0 8px">
         <span style="font-size:12px;color:var(--ink-soft)">时间范围</span>
-        <select v-model="tradeRange" style="font-size:12px;padding:2px 6px"
+        <select class="field-select field-select--compact" v-model="tradeRange"
                 aria-label="成交时间范围" @change="reloadTrades">
           <option v-for="opt in TIME_RANGE_OPTIONS" :key="opt.value" :value="opt.value">{{ opt.label }}</option>
         </select>
@@ -2135,7 +2200,7 @@ onUnmounted(() => {
     <div v-if="wbTab === 'decisions'" class="table-wrap">
       <div style="display:flex;align-items:center;gap:8px;margin:0 0 8px">
         <span style="font-size:12px;color:var(--ink-soft)">时间范围</span>
-        <select v-model="decRange" style="font-size:12px;padding:2px 6px" aria-label="决策时间范围">
+        <select class="field-select field-select--compact" v-model="decRange" aria-label="决策时间范围">
           <option v-for="opt in TIME_RANGE_OPTIONS" :key="opt.value" :value="opt.value">{{ opt.label }}</option>
         </select>
         <span style="font-size:12px;color:var(--ink-faint)">按北京时间自然日 · 聚合与统计随筛选重算 · 共 {{ filteredDecisions.length }} 条事件</span>
@@ -2309,7 +2374,7 @@ onUnmounted(() => {
       <div style="display:flex;align-items:center;gap:8px">
         <select
           v-if="runningSessions.length > 1"
-          class="input" style="width:auto;padding:4px 8px"
+          class="field-select" style="width:auto"
           v-model="eventFilter"
         >
           <option value="all">全部会话</option>
@@ -2353,6 +2418,10 @@ onUnmounted(() => {
             </button>
             <span v-if="tvlBindingMsg" class="note">{{ tvlBindingMsg }}</span>
           </div>
+          <p v-if="tvlSellScopeFull" class="note" style="color:var(--orange)">
+            实盘已纳入存量/外部仓代卖：理论对照仍按平台自建仓口径计算，
+            解释力下降，仅作趋势参考，不可据此判定策略失效。
+          </p>
           <p v-if="!theoryVsLive.bound" class="note" style="color:var(--red)">
             未绑定回测记录，且未找到该会话组合的已完成回测：理论侧无法生成
             （实盘侧不受影响）。可在上方选择回测记录并保存。
@@ -2484,7 +2553,7 @@ onUnmounted(() => {
     </div>
   </div>
 
-  <div v-if="showCreate" class="modal-overlay modal-lg" @click.self="showCreate = false">
+  <div v-if="showCreate" class="modal-overlay modal-lg modal-dense" @click.self="showCreate = false">
     <div class="modal-content">
       <h3>新建实盘</h3>
       <div class="modal-body">
@@ -2497,7 +2566,7 @@ onUnmounted(() => {
         <option value="manual">人工审批（信号入队，人工确认后下单）</option>
         <option value="shadow">影子（真实行情 + 本地模拟成交，不发真实委托）</option>
       </select>
-      <label>交易引擎（决定信号计算的数据源）</label>
+      <label>交易引擎<span class="label-note">（决定信号计算的数据源）</span></label>
       <select v-model="form.engine" data-field="create-engine" @change="onEngineChange">
         <option v-for="e in channel?.engines || []" :key="e.key" :value="e.key" :disabled="engineOptionDisabled(e)">
           {{ engineOptionText(e) }}
@@ -2517,7 +2586,7 @@ onUnmounted(() => {
       >
         该通道不支持大额拆单：组合策略里的「拆单」开关在此通道不会生效（仅通达信 TQ 支持）。
       </p>
-      <label>资金池模式（可选增强，默认关闭）</label>
+      <label>资金池模式<span class="label-note">（可选增强，默认关闭）</span></label>
       <select v-model="form.capital_pool_mode" data-field="create-capital-pool">
         <option value="off">关闭（分账不分池）</option>
         <option value="equal">等权池（各组合均分现金）</option>
@@ -2542,7 +2611,7 @@ onUnmounted(() => {
           自动模式：下单由所选引擎执行——通达信 TQ 直连客户端（确认面板可自动处置）；同花顺走 UI 自动化（file_builtin 文件交接）；掘金量化桥/QMT 桥须在对应终端内运行桥策略。引擎未就绪时启动直接 503 报错，不会静默换通道。
         </span>
       </p>
-      <label>实盘资金基准（元）</label>
+      <label>实盘资金基准<span class="label-note">（元）</span></label>
       <input v-model="form.live_capital" type="number" min="0" placeholder="留空 = 以真实通道总资产为基准" data-field="live-capital" />
       <p style="font-size:12px;color:var(--ink-faint);margin:2px 0 12px">
         默认取真实通道总资产，<b>只缩不放</b>：填写值只能小于当前真实总资产（超过会被拒绝保存）；留空 = 直接以真实总资产为基准。
@@ -2558,7 +2627,7 @@ onUnmounted(() => {
         通道未就绪，无法读取真实总资产；可先用固定金额起账，通道就绪后手动重置。
       </div>
       <p v-if="createError" class="form-error" data-test="baseline-error">{{ createError }}</p>
-      <label>外部信号文件路径（通达信条件预警输出，可选）</label>
+      <label>外部信号文件路径<span class="label-note">（通达信条件预警输出，可选）</span></label>
       <input v-model="form.signal_file_path" placeholder="留空 = 走 TQ 公式计算信号；填写完整文件路径" />
       <p style="font-size:12px;color:var(--ink-faint);margin:2px 0 12px">
         填写后（如 D:\project\分时突击.txt）引擎定时读取该文件的新增信号行并注入交易链路——绕过 TQ 公式引擎的周期限制（如 1m 级别）。文件由通达信「条件预警」功能动态输出（GBK 追加写入）。所有级别公式均可走此链路。填写即<strong>替换信号来源</strong>：该会话不再跑 TQ 公式计算（风控/仓位/资金等限制条件仍沿用回测口径）；仅自动模式生效，预警模式不读取该文件。
@@ -2603,7 +2672,7 @@ onUnmounted(() => {
       <p style="font-size:12px;color:var(--ink-faint);margin:2px 0 12px">
         默认关闭：信号日门控通过即按原决策执行。开启后，顺延次日单与盘前集合竞价单在真正提交前用「执行日前一收盘」的门控状态再判一次；若为空头则直接取消并落决策事件（gate=market_gate_recheck），不拿旧决策硬执行。仅对启用市场门控的组合生效。
       </p>
-      <label>盘前集合竞价参数（会话级覆盖）</label>
+      <label>盘前集合竞价参数<span class="label-note">（会话级覆盖）</span></label>
       <select v-model="form.pre_open_auction_enabled" data-field="pre_open_auction_enabled">
         <option :value="null">跟随全局（默认开启，09:15–09:20 / 让价 2%）</option>
         <option :value="true">本会话开启</option>
@@ -2612,11 +2681,11 @@ onUnmounted(() => {
       <p style="font-size:12px;color:var(--ink-faint);margin:2px 0 8px">
         仅覆盖本会话，不改全局 config.yaml。关闭后该会话日线级信号不再报集合竞价，统一等次一交易日首根完成 1m bar（约 09:31）放行。
       </p>
-      <label>盘前窗口结束时间（HH:MM，留空跟随全局 09:20）</label>
+      <label>盘前窗口结束时间<span class="label-note">（HH:MM，留空跟随全局 09:20）</span></label>
       <input v-model="form.pre_open_auction_end_time" placeholder="09:20（可选 09:15–09:30）" data-field="pre_open_auction_end_time" />
-      <label>盘前让价 %（留空跟随全局 2%）</label>
+      <label>盘前让价 %<span class="label-note">（留空跟随全局 2%）</span></label>
       <input v-model="form.pre_open_auction_price_bias_pct" type="number" step="0.1" min="0" max="10" placeholder="2（0–10）" data-field="pre_open_auction_price_bias_pct" />
-      <label>组合策略（可多选）</label>
+      <label>组合策略<span class="label-note">（可多选）</span></label>
       <div class="portfolio-check-list">
         <label v-for="p in portfolios" :key="p.id" class="portfolio-check">
           <input v-model="form.portfolio_ids" type="checkbox" :value="p.id" data-portfolio-check />
@@ -2707,7 +2776,7 @@ onUnmounted(() => {
   </div>
 
   <!-- B1 + A4 编辑会话：未运行立即生效；运行中除名称外入待生效队列 -->
-  <div v-if="editModal" class="modal-overlay modal-lg" data-test="session-edit-modal" @click.self="editModal = null">
+  <div v-if="editModal" class="modal-overlay modal-lg modal-dense" data-test="session-edit-modal" @click.self="editModal = null">
     <div class="modal-content">
       <h3>编辑会话 #{{ editModal.id }}「{{ editModal.name }}」</h3>
       <div class="modal-body">
@@ -2730,7 +2799,7 @@ onUnmounted(() => {
           <option value="manual">人工审批（信号入队，人工确认后下单）</option>
           <option value="shadow">影子（真实行情 + 本地模拟成交）</option>
         </select>
-        <label>备用通道（主备切换，可选）</label>
+        <label>备用通道<span class="label-note">（主备切换，可选）</span></label>
         <select v-model="editForm.backup_engine" data-field="edit-backup-engine">
           <option value="">未配置</option>
           <option v-for="e in channel?.engines || []" :key="e.key" :value="e.key" :disabled="e.key === editForm.engine">
@@ -2771,23 +2840,23 @@ onUnmounted(() => {
           <input v-model="editForm.capital_pool_rebalance_enabled" type="checkbox" style="width:auto" />
           每交易日首 bar 再平衡（只挪虚拟现金，不强制卖出）
         </label>
-        <label>外部信号文件路径（可选）</label>
+        <label>外部信号文件路径<span class="label-note">（可选）</span></label>
         <input v-model="editForm.signal_file_path" placeholder="留空 = 走 TQ 公式计算信号" data-field="edit-signal-path" />
         <label style="display:flex;align-items:center;gap:8px">
           <input v-model="editForm.gate_recheck_on_execute" type="checkbox" style="width:auto" data-field="edit-gate-recheck" />
           执行前重判门控（顺延次日单 / 盘前竞价单提交前再判一次，默认关）
         </label>
-        <label>盘前集合竞价参数（会话级覆盖）</label>
+        <label>盘前集合竞价参数<span class="label-note">（会话级覆盖）</span></label>
         <select v-model="editForm.pre_open_auction_enabled" data-field="edit-pre-open-enabled">
           <option :value="null">跟随全局（默认开启，09:15–09:20 / 让价 2%）</option>
           <option :value="true">本会话开启</option>
           <option :value="false">本会话关闭（走次日首根 1m bar 放行）</option>
         </select>
-        <label>盘前窗口结束时间（HH:MM，留空跟随全局）</label>
+        <label>盘前窗口结束时间<span class="label-note">（HH:MM，留空跟随全局）</span></label>
         <input v-model="editForm.pre_open_auction_end_time" placeholder="09:20（可选 09:15–09:30）" data-field="edit-pre-open-end-time" />
-        <label>盘前让价 %（留空跟随全局）</label>
+        <label>盘前让价 %<span class="label-note">（留空跟随全局）</span></label>
         <input v-model="editForm.pre_open_auction_price_bias_pct" type="number" step="0.1" min="0" max="10" placeholder="2（0–10）" data-field="edit-pre-open-bias" />
-        <label>组合策略（可多选，运行中下次启动生效）</label>
+        <label>组合策略<span class="label-note">（可多选，运行中下次启动生效）</span></label>
         <div class="portfolio-check-list">
           <label v-for="p in portfolios" :key="p.id" class="portfolio-check">
             <input v-model="editForm.portfolio_ids" type="checkbox" :value="p.id" data-edit-portfolio-check />
@@ -2843,7 +2912,7 @@ onUnmounted(() => {
       <h3>重置资金基准</h3>
       <div class="modal-body">
         <p>会话 #{{ baselineModal.session.id }}「{{ baselineModal.session.name }}」</p>
-        <label>实盘资金基准（元）</label>
+        <label>实盘资金基准<span class="label-note">（元）</span></label>
         <input v-model="baselineValue" type="number" min="0" placeholder="留空 = 当日收盘总资产" data-field="baseline-reset-value" />
         <p style="font-size:12px;color:var(--ink-faint);margin:2px 0 12px">
           默认取当日收盘总资产，只缩不放：填写值只能小于真实总资产；重置不解除熔断、不清零熔断次数。
