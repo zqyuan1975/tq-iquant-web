@@ -131,46 +131,44 @@ onUnmounted(() => {
         <span class="frame-title">核心 / 当日任务 / 磁盘</span>
       </div>
       <div class="frame-body">
-        <div class="metric-grid" style="gap:12px;margin-bottom:0">
-          <div class="metric-card">
-            <span class="metric-label">Core</span>
-            <span class="metric-value">{{ data.core.online ? '在线' : '离线' }}</span>
-            <span class="metric-sub">v{{ data.core.version || '—' }} · {{ data.core.uptime || '—' }}</span>
+        <div class="health-stats">
+          <div class="health-stat">
+            <span>Core</span>
+            <b :style="{ color: data.core.online ? 'var(--green)' : 'var(--red)' }">{{ data.core.online ? '在线' : '离线' }}</b>
+            <i>v{{ data.core.version || '—' }} · {{ data.core.uptime || '—' }}</i>
           </div>
-          <div class="metric-card">
-            <span class="metric-label">引擎 watchdog</span>
-            <span class="metric-value">{{ data.watchdog.running ? '运行中' : '未运行' }}</span>
-            <span class="metric-sub">
-              告警 {{ data.watchdog.active_alarms.length }} 条 · 扫描 {{ fmtTime(data.watchdog.last_scan_at) }}
-            </span>
+          <div class="health-stat">
+            <span>引擎 watchdog</span>
+            <b>{{ data.watchdog.running ? '运行中' : '未运行' }}</b>
+            <i>告警 {{ data.watchdog.active_alarms.length }} 条 · 扫描 {{ fmtTime(data.watchdog.last_scan_at) }}</i>
           </div>
-          <div class="metric-card">
-            <span class="metric-label">自动备份</span>
-            <span class="metric-value">{{ data.tasks.backup_done_today ? '今日已完成' : '今日未完成' }}</span>
-            <span class="metric-sub">计划 {{ data.tasks.backup_at || '—' }}</span>
+          <div class="health-stat">
+            <span>自动备份</span>
+            <b>{{ data.tasks.backup_done_today ? '今日已完成' : '今日未完成' }}</b>
+            <i>计划 {{ data.tasks.backup_at || '—' }}</i>
           </div>
-          <div class="metric-card">
-            <span class="metric-label">磁盘剩余</span>
-            <span class="metric-value" :style="{ color: data.disk.ok ? 'var(--green)' : 'var(--red)' }">
+          <div class="health-stat">
+            <span>磁盘剩余</span>
+            <b :style="{ color: data.disk.ok ? 'var(--green)' : 'var(--red)' }">
               {{ data.disk.free_mb === null ? '—' : `${data.disk.free_mb} MB` }}
-            </span>
-            <span class="metric-sub">保护阈值 {{ data.disk.min_free_mb }} MB</span>
+            </b>
+            <i>保护阈值 {{ data.disk.min_free_mb }} MB</i>
           </div>
-          <div class="metric-card">
-            <span class="metric-label">待处理告警</span>
-            <span class="metric-value" :style="{ color: alertTotal ? 'var(--red)' : 'var(--ink)' }">{{ alertTotal }}</span>
-            <span class="metric-sub">
+          <div class="health-stat">
+            <span>待处理告警</span>
+            <b :style="{ color: alertTotal ? 'var(--red)' : 'var(--ink)' }">{{ alertTotal }}</b>
+            <i>
               未处理告警 {{ data.alert_totals.open_decisions }} · 顺延 {{ data.alert_totals.deferred_orders }} ·
               <RouterLink to="/live?tab=approvals" class="alert-link">待审批 {{ data.alert_totals.pending_approvals }}</RouterLink>
-            </span>
+            </i>
           </div>
-          <div class="metric-card">
-            <span class="metric-label">告警外发</span>
-            <span class="metric-value">{{ data.notify.usable ? '已配置' : (data.notify.enabled ? '未就绪' : '关闭') }}</span>
-            <span class="metric-sub">
+          <div class="health-stat">
+            <span>告警外发</span>
+            <b>{{ data.notify.usable ? '已配置' : (data.notify.enabled ? '未就绪' : '关闭') }}</b>
+            <i>
               {{ data.notify.channels.map((c) => NOTIFY_LABEL[c] || c).join(' / ') || '未配置渠道' }}
               · 最低 {{ data.notify.min_level }}
-            </span>
+            </i>
           </div>
         </div>
       </div>
@@ -200,7 +198,7 @@ onUnmounted(() => {
       </div>
       <div class="frame-body">
         <div class="table-wrap">
-          <table>
+          <table class="health-table">
             <thead>
               <tr>
                 <th>名称</th><th>状态</th><th>引擎</th><th>通道</th><th>桥</th>
@@ -292,17 +290,27 @@ onUnmounted(() => {
 .dash-hero-stats b { font-family: var(--font-serif); font-size: 18px; font-weight: 800; color: var(--ink); margin-right: 5px; font-variant-numeric: tabular-nums }
 .dash-hero-stats .db-accent { color: var(--red) }
 .dash-hero-actions { flex-shrink: 0 }
-.metric-sub { font-size: 11px; color: var(--ink-soft); line-height: 1.4; overflow-wrap: anywhere }
-.problem-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 8px }
-.problem-list li { display: flex; align-items: flex-start; gap: 8px; font-size: 13px; line-height: 1.5 }
+/* 本页密度：frame 区块与状态条整体收紧，不依赖全局 style.css */
+.frame { margin-bottom: 10px }
+.frame-head { padding: 6px 12px }
+.frame-body { padding: 8px 12px }
+.health-stats { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 24px }
+.health-stat { display: flex; align-items: baseline; gap: 6px; min-width: 0; font-size: 12px; color: var(--ink-soft) }
+.health-stat > b { font-size: 16px; font-weight: 800; color: var(--ink); white-space: nowrap; font-variant-numeric: tabular-nums }
+.health-stat > i { font-style: normal; font-size: 11px; color: var(--ink-faint); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 168px }
+.health-table { font-size: 13px }
+.health-table th, .health-table td { padding: 4px 10px }
+.health-table td { vertical-align: top }
+.problem-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 4px }
+.problem-list li { display: flex; align-items: flex-start; gap: 8px; font-size: 13px; line-height: 1.4 }
 .num { font-variant-numeric: tabular-nums; text-align: right }
 .data-cell { min-width: 150px }
 .period-line { font-size: 11px; color: var(--ink-soft); line-height: 1.5; margin-top: 3px; font-variant-numeric: tabular-nums }
-.guard-block { padding: 8px 0; border-top: 1px dashed var(--line) }
+.guard-block { padding: 6px 0; border-top: 1px dashed var(--line) }
 .guard-block:first-child { padding-top: 0; border-top: none }
-.guard-head { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; font-size: 13px }
-.guard-list { list-style: none; margin: 0; padding: 0; display: grid; gap: 5px }
-.guard-list li { display: flex; align-items: baseline; gap: 8px; font-size: 12px }
+.guard-head { display: flex; align-items: center; gap: 8px; margin-bottom: 4px; font-size: 13px }
+.guard-list { list-style: none; margin: 0; padding: 0; display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 3px 14px }
+.guard-list li { display: flex; align-items: baseline; gap: 8px; font-size: 12px; line-height: 1.4 }
 .guard-list li.bad .guard-label { color: var(--red) }
 .guard-label { font-weight: 600; flex-shrink: 0 }
 .guard-detail { color: var(--ink-soft); overflow-wrap: anywhere }
