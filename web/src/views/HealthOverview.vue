@@ -160,7 +160,7 @@ onUnmounted(() => {
             <span class="metric-label">待处理告警</span>
             <span class="metric-value" :style="{ color: alertTotal ? 'var(--red)' : 'var(--ink)' }">{{ alertTotal }}</span>
             <span class="metric-sub">
-              未确认 {{ data.alert_totals.open_decisions }} · 顺延 {{ data.alert_totals.deferred_orders }} ·
+              未处理告警 {{ data.alert_totals.open_decisions }} · 顺延 {{ data.alert_totals.deferred_orders }} ·
               <RouterLink to="/live?tab=approvals" class="alert-link">待审批 {{ data.alert_totals.pending_approvals }}</RouterLink>
             </span>
           </div>
@@ -205,7 +205,7 @@ onUnmounted(() => {
               <tr>
                 <th>名称</th><th>状态</th><th>引擎</th><th>通道</th><th>桥</th>
                 <th>数据新鲜度</th><th>今日委托/成交</th>
-                <th>未确认</th><th>顺延</th><th>待审批</th>
+                <th>未处理告警</th><th>顺延</th><th>待审批</th>
               </tr>
             </thead>
             <tbody>

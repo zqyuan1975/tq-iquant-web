@@ -400,8 +400,14 @@ async def start_session(session_id: int, data: Optional[dict] = None,
         # 注册先于 commit，闭合 B6 窗口（与重构前顺序一致）；注册仍在 _START_LOCK
         # 临界区内，check-then-act 窗口已闭合（C1）。
         _ENGINES[session_id] = engine
-        session.status = "running"
+        seq = svc.next_start_seq(session_id)
+        svc.set_session_status(
+            session, "running", caller="api.start_session",
+            reason="启动成功（本进程内第 %d 次）" % seq)
         session.started_at = datetime.now()
+        # 启动即清上一轮 stopped_at：running 行仍挂着旧 stopped_at 会让界面/
+        # 健康总览误读为「已停止过」；本轮停止时由 stop_session 重新写入。
+        session.stopped_at = None
         db.commit()
         return ok({
             "id": session.id,

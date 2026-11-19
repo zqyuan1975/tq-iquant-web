@@ -34,6 +34,7 @@ from sqlalchemy.orm import Session
 
 from core.config import load_config
 from core.db import SessionLocal
+from core.runtime import process_tag
 from core.models import (
     LiveSession, LiveSessionPortfolio, PortfolioStrategy, Strategy,
     StockPoolStock, StockPoolMembership, Formula, FormulaSignal, LiveOrder, LiveTrade, LiveDecisionEvent,
@@ -1623,6 +1624,44 @@ def list_sessions(db: Session, engines: Optional[Dict[int, LiveEngine]] = None) 
     ]
 
 
+def _status_change_log(session: LiveSession, old: Optional[str], new_status: str,
+                       caller: str, reason: str = "") -> None:
+    """``live_sessions.status`` 每次变化的统一留痕（old→new + 调用方 + 进程）。"""
+    logger.warning(
+        "实盘会话状态变更 #%s「%s」: %s → %s（调用方=%s，%s，原因=%s）",
+        getattr(session, "id", "?"), getattr(session, "name", ""),
+        old, new_status, caller, process_tag(), reason or "-")
+
+
+def set_session_status(session: LiveSession, new_status: str, *,
+                       caller: str, reason: str = "") -> bool:
+    """统一写 ``live_sessions.status``：所有写入点必须走这里。
+
+    2026-11-19 事故：会话启动 0.38 秒后被写成 ``stopped``，但四处写入点各写
+    各的、``finalize_stopped`` 不留痕，查不到是谁写的。本函数把 old→new、
+    调用方标识、进程 tag（pid/port）一并打进日志（``logs/core.log`` 可查），
+    并返回是否真的发生了变化（相同状态不写日志、不触发 updated_at）。
+    """
+    old = getattr(session, "status", None)
+    if old == new_status:
+        return False
+    session.status = new_status
+    _status_change_log(session, old, new_status, caller, reason)
+    return True
+
+
+#: 本进程内各会话的启动序号（不落库：跨进程代际以 ``started_at`` 判定，
+#: 仅有排查价值，如需持久化需新增列——先报批再加）。
+_START_SEQ: Dict[int, int] = {}
+
+
+def next_start_seq(session_id: int) -> int:
+    """本进程内该会话的第几次启动（1 起）；仅用于日志/排障。"""
+    seq = _START_SEQ.get(int(session_id), 0) + 1
+    _START_SEQ[int(session_id)] = seq
+    return seq
+
+
 def recover_stale_running_live_sessions(
     db: Session, engines: Optional[Dict[int, LiveEngine]] = None,
 ) -> int:
@@ -1650,7 +1689,9 @@ def recover_stale_running_live_sessions(
         return 0
     now = datetime.now()
     for session in stale:
-        session.status = "stopped"
+        set_session_status(
+            session, "stopped", caller="recover_stale_running_live_sessions",
+            reason="冷启动：进程内注册表为空")
         session.stopped_at = now
     db.commit()
     for session in stale:
@@ -3573,7 +3614,9 @@ def _occupied_sessions(
         if (getattr(row, "execution_mode", None) or "auto") == "shadow":
             continue
         if row.id not in engines and _is_stale_stopping(row):
-            row.status = "stopped"
+            set_session_status(
+                row, "stopped", caller="_occupied_sessions",
+                reason="stopping 超 %ss 未收敛，释放占用" % STOPPING_STALE_SECONDS)
             row.stopped_at = row.stopped_at or datetime.now()
             db.commit()
             logger.warning(
@@ -4201,7 +4244,9 @@ def stop_session(
     # stopping 中间态（2026-11-16）：有引擎时先置 stopping（仍算占用，防「刚停就
     # 启另一会话」双开），等路由 asyncio 任务里 engine.stop() 收敛后再置 stopped；
     # 无引擎（已在停止/未运行）直接 stopped。只有 stopped 才释放 C1/C2 占用。
-    session.status = "stopping" if engine is not None else "stopped"
+    set_session_status(
+        session, "stopping" if engine is not None else "stopped",
+        caller="stop_session", reason="有引擎→stopping；无引擎→stopped")
     session.stopped_at = datetime.now()
     db.commit()
     # 会话离开 ENGINES 后 watchdog 再也扫不到它：显式清监控态，否则停止前的
@@ -4226,7 +4271,9 @@ def finalize_stopped(session_id: int, db_session_factory=SessionLocal) -> None:
     try:
         session = db.query(LiveSession).filter(LiveSession.id == session_id).first()
         if session is not None and session.status == "stopping":
-            session.status = "stopped"
+            set_session_status(
+                session, "stopped", caller="finalize_stopped",
+                reason="engine.stop() 已收敛")
             session.stopped_at = session.stopped_at or datetime.now()
             db.commit()
     except Exception:  # noqa: BLE001 — 收尾失败不得抛给调用方（下次启动会兜底）
