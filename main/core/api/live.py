@@ -244,6 +244,32 @@ def update_session(session_id: int, data: dict, db: Session = Depends(get_db)):
     return ok(result)
 
 
+@router.post("/sessions/{session_id}/sell-scope")
+def set_session_sell_scope(session_id: int, data: dict,
+                           db: Session = Depends(get_db)):
+    """会话级卖出范围开关：存量/外部持仓是否纳入风控代卖。
+
+    - body: ``{"scope": "full"|"platform_only", "reason": "...", "confirm": true}``
+    - 切到 ``full``（扩大代卖范围）必须显式 ``confirm=true``（前端弹二次确认）；
+    - 运行中立即生效（不重启会话），已提交未成交委托不撤销；
+    - 只写会话列，不反向改写全局 ``config.tq_trade.live_sell_scope``。
+    """
+    scope = str(data.get("scope") or "").strip()
+    if scope == "full" and not data.get("confirm"):
+        return err(400, "切换为 full 会扩大代卖范围，可能立刻对存量仓产生止损单，"
+                        "需显式确认（confirm=true）")
+    ok_flag, result = svc.set_session_sell_scope(
+        db, session_id, scope,
+        reason=str(data.get("reason") or ""),
+        caller="api.set_session_sell_scope",
+        engines=_ENGINES,
+    )
+    if not ok_flag:
+        payload = result[2] if len(result) > 2 else None
+        return err(result[0], result[1], payload)
+    return ok(result)
+
+
 @router.get("/sessions/{session_id}/channel-health")
 def session_channel_health(session_id: int, db: Session = Depends(get_db)):
     """B2：主/备通道健康探活（只读；运行中优先读引擎在线态）。"""

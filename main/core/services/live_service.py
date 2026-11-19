@@ -212,24 +212,224 @@ def tq_trade_config() -> dict:
     }
 
 
-def live_sell_scope() -> str:
-    """卖出范围口径（config.tq_trade.live_sell_scope）。
+#: 卖出范围合法取值：platform_only=关闭（存量/外部仓不代卖）/ full=开启。
+SELL_SCOPE_VALUES = ("full", "platform_only")
 
-    full（默认，缺键/非法值回退）= 风控与公式卖单按整仓卖出，行为与旧版一致；
-    platform_only = 只卖平台自己买入的部分（Position.platform_quantity），纯外部/
-    手工仓不代卖。回测不走本函数（assemble_portfolio 默认 full）。
+
+def live_sell_scope() -> str:
+    """全局卖出范围默认口径（config.tq_trade.live_sell_scope）。
+
+    2026-11-19 起该值 **只作新建会话的初始档位来源**，会话级
+    ``live_sessions.sell_scope`` 优先；运行中切换不反向改写配置。
+    platform_only（默认，缺键/非法值回退）= 只卖平台自己买入的部分
+    （Position.platform_quantity），纯外部/手工仓不代卖；full = 按整仓卖。
+    回测不走本函数（assemble_portfolio 默认 full）。
     """
     cfg = load_config()
     tq = cfg.get("tq_trade", {}) if isinstance(cfg, dict) else {}
     value = str((tq.get("live_sell_scope") if isinstance(tq, dict) else "") or "").strip()
-    if value in ("full", "platform_only"):
+    if value in SELL_SCOPE_VALUES:
         return value
     if value:
         logger.warning(
-            "config.tq_trade.live_sell_scope=%r 非法（仅支持 full/platform_only），回退 full",
+            "config.tq_trade.live_sell_scope=%r 非法（仅支持 full/platform_only），"
+            "回退 platform_only",
             value,
         )
-    return "full"
+    return "platform_only"
+
+
+def resolve_session_sell_scope(session,
+                               global_scope: Optional[str] = None) -> str:
+    """会话生效的卖出范围：会话列优先，NULL/非法回退全局（再回退默认关闭）。
+
+    - ``live_sessions.sell_scope`` ∈ {full, platform_only} → 直接使用（会话级优先）；
+    - NULL/非法 → 用 ``global_scope``（调用方预读，避免重复读配置），非法则再调
+      ``live_sell_scope()``。
+    """
+    raw = str(getattr(session, "sell_scope", None) or "").strip()
+    if raw in SELL_SCOPE_VALUES:
+        return raw
+    scope = str(global_scope or "").strip()
+    if scope in SELL_SCOPE_VALUES:
+        return scope
+    return live_sell_scope()
+
+
+# ---------------------------------------------------------------------------
+# 开启「存量/外部仓纳入风控」前的全量对账闸（2026-11-19）
+#
+# 目的：切到 full 后风控会按整仓卖出，若虚拟账本与柜台已经不一致，会直接把
+# 差异变成真实卖单（错卖/漏卖）。因此开启前必须逐项比对：
+#   真实现金 ↔ 虚拟现金、真实市值 ↔ 虚拟净值、逐只持仓数量。
+#
+# 阈值：金额沿用既有口径 max(1000 元, 1%)；逐只持仓**不设容差**（股数是离散
+# 整数，任何不一致都意味着重复/漏记，不能靠金额容差掩盖）。盘中还要求柜台
+# 快照足够新鲜（≤15 分钟），否则视为证据不足、拒绝开启。
+# ---------------------------------------------------------------------------
+
+#: 金额绝对容差（元）与相对容差（1%），沿用现有对账口径。
+SELL_SCOPE_GATE_AMOUNT_TOLERANCE = Decimal("1000")
+SELL_SCOPE_GATE_PCT_TOLERANCE = Decimal("0.01")
+#: 盘中柜台快照最大可接受陈旧时长（秒）：超过即「证据不足」。
+SELL_SCOPE_GATE_SNAPSHOT_MAX_AGE_SECONDS = 900
+
+
+def _gate_dec(value) -> Optional[Decimal]:
+    if value is None or value == "":
+        return None
+    try:
+        return Decimal(str(value))
+    except (TypeError, ValueError, ArithmeticError):
+        return None
+
+
+def _gate_tolerance(base: Optional[Decimal]) -> Decimal:
+    """金额容差 = max(1000 元, |基准| × 1%)。基准缺失时取绝对容差。"""
+    if base is None:
+        return SELL_SCOPE_GATE_AMOUNT_TOLERANCE
+    return max(SELL_SCOPE_GATE_AMOUNT_TOLERANCE,
+               abs(base) * SELL_SCOPE_GATE_PCT_TOLERANCE)
+
+
+def _gate_in_trading_window(now: datetime) -> bool:
+    """交易日 09:15–15:05 视为盘中（仅用于要求快照新鲜；不含节假日日历）。"""
+    if now.weekday() >= 5:
+        return False
+    hm = now.hour * 60 + now.minute
+    return 9 * 60 + 15 <= hm <= 15 * 60 + 5
+
+
+def _gate_from_payload(payload: dict, source: str,
+                       require_fresh_snapshot: bool = False) -> dict:
+    """把对账日报 payload 折算成闸门结论（纯函数，便于聚焦测试）。"""
+    reasons: List[str] = []
+    detail = payload.get("detail") or {}
+    if not isinstance(detail, dict):
+        detail = {}
+
+    # 1) 现金：柜台可用 vs 虚拟现金
+    cash_expected = _gate_dec(payload.get("cash_expected"))
+    cash_actual = _gate_dec(payload.get("cash_actual"))
+    cash_diff = _gate_dec(payload.get("cash_diff"))
+    cash_tol = _gate_tolerance(cash_actual)
+    if cash_actual is None:
+        reasons.append("缺少柜台现金（无账户快照），无法验证现金口径")
+    elif cash_diff is None:
+        reasons.append("现金差额无法计算，证据不足")
+    elif abs(cash_diff) > cash_tol:
+        reasons.append(
+            "现金偏差 %s 元超过容差 %s 元（柜台 %s / 虚拟 %s）" % (
+                cash_diff, cash_tol, cash_actual, cash_expected))
+
+    # 2) 市值/净值：柜台总资产（已剔除池外）vs 虚拟净值
+    equity_expected = _gate_dec(payload.get("equity_expected"))
+    equity_actual = _gate_dec(payload.get("equity_actual"))
+    equity_diff = None
+    if equity_expected is not None and equity_actual is not None:
+        equity_diff = equity_actual - equity_expected
+    equity_tol = _gate_tolerance(equity_expected)
+    if equity_expected is None or equity_actual is None:
+        reasons.append("缺少虚拟净值或柜台总资产，无法验证持仓市值")
+    elif abs(equity_diff) > equity_tol:
+        reasons.append(
+            "持仓市值/净值偏差 %s 元超过容差 %s 元（柜台 %s / 虚拟 %s）" % (
+                equity_diff, equity_tol, equity_actual, equity_expected))
+
+    # 3) 逐只持仓：只校验虚拟账本里存在的代码（池外仓按设计不归属，不影响开关）
+    pos_diffs = []
+    for item in (detail.get("position_diffs") or []):
+        try:
+            virtual_qty = int(item.get("virtual_qty") or 0)
+            counter_qty = int(item.get("counter_qty") or 0)
+        except (TypeError, ValueError):
+            continue
+        if virtual_qty <= 0:
+            continue
+        code = str(item.get("stock_code") or "")
+        pos_diffs.append({"stock_code": code, "counter_qty": counter_qty,
+                          "virtual_qty": virtual_qty})
+        if counter_qty != virtual_qty:
+            reasons.append("%s 柜台 %d 股 ≠ 虚拟 %d 股" % (
+                code, counter_qty, virtual_qty))
+
+    # 4) 盘中要求快照新鲜
+    snap_at = detail.get("snapshot_at")
+    if require_fresh_snapshot:
+        fresh = False
+        if snap_at:
+            try:
+                ts = datetime.strptime(str(snap_at), "%Y-%m-%d %H:%M:%S")
+                fresh = (now_shanghai() - ts).total_seconds() <= \
+                    SELL_SCOPE_GATE_SNAPSHOT_MAX_AGE_SECONDS
+            except (TypeError, ValueError):
+                fresh = False
+        if not fresh:
+            reasons.append(
+                "柜台快照过期或缺失（%s，要求 %d 分钟内），证据不足" % (
+                    snap_at or "无", SELL_SCOPE_GATE_SNAPSHOT_MAX_AGE_SECONDS // 60))
+
+    return {
+        "passed": not reasons,
+        "source": source,
+        "reasons": reasons,
+        "snapshot_at": snap_at,
+        "cash": {
+            "expected": str(cash_expected) if cash_expected is not None else None,
+            "actual": str(cash_actual) if cash_actual is not None else None,
+            "diff": str(cash_diff) if cash_diff is not None else None,
+            "tolerance": str(cash_tol),
+        },
+        "equity": {
+            "expected": (str(equity_expected)
+                         if equity_expected is not None else None),
+            "actual": str(equity_actual) if equity_actual is not None else None,
+            "diff": str(equity_diff) if equity_diff is not None else None,
+            "tolerance": str(equity_tol),
+        },
+        "position_diffs": pos_diffs,
+    }
+
+
+def evaluate_sell_scope_gate(db: Session, session_id: int,
+                             engine=None) -> dict:
+    """开启 full 前的全量对账闸（只读，不触发任何柜台请求/改账）。
+
+    - 会话运行中：用引擎内存态 + 最新柜台快照即时比对（要求快照 ≤15 分钟）；
+    - 会话未运行：用最近一份对账日报；从未启动过的会话无仓可代卖，直接放行；
+    - 证据不足或偏差超阈值 → passed=False，并给出具体差在哪。
+    """
+    if engine is not None and hasattr(engine, "_build_reconciliation_report"):
+        try:
+            payload = engine._build_reconciliation_report(db)
+        except Exception as exc:  # noqa: BLE001 — 闸门失败按拒绝处理
+            return {"passed": False, "source": "engine_error",
+                    "reasons": ["对账计算失败：%s" % exc],
+                    "snapshot_at": None, "cash": {}, "equity": {},
+                    "position_diffs": []}
+        return _gate_from_payload(
+            payload, "engine",
+            require_fresh_snapshot=_gate_in_trading_window(now_shanghai()))
+
+    row = (db.query(LiveReconciliationReport)
+           .filter(LiveReconciliationReport.live_session_id == session_id)
+           .order_by(LiveReconciliationReport.report_date.desc(),
+                     LiveReconciliationReport.id.desc())
+           .first())
+    if row is not None:
+        return _gate_from_payload(serialize_reconciliation_report(row),
+                                  "daily_report")
+    session = (db.query(LiveSession)
+               .filter(LiveSession.id == session_id).first())
+    if session is not None and getattr(session, "started_at", None) is None:
+        return {"passed": True, "source": "never_started", "reasons": [],
+                "snapshot_at": None, "cash": {}, "equity": {},
+                "position_diffs": []}
+    return {"passed": False, "source": "no_evidence",
+            "reasons": ["会话未运行且没有对账日报，无法验证账本一致性；"
+                        "请先启动会话生成快照/日报后再开启"],
+            "snapshot_at": None, "cash": {}, "equity": {},
+            "position_diffs": []}
 
 
 def _pct_or_none(value) -> Optional[Decimal]:
@@ -1149,9 +1349,9 @@ def build_engine(
     # 简化：先记 (code, period) -> [formula_id...]，formula_map 就绪后取 max(formula_count)。
     code_period_formula_ids: Dict[tuple, set] = {}
     pool_codes_by_portfolio: Dict[int, set] = {}
-    # 卖出范围口径（config.tq_trade.live_sell_scope）：full=整仓卖（默认，旧行为），
-    # platform_only=只卖平台自己买入的部分（外部手工仓不代卖）
-    sell_scope = live_sell_scope()
+    # 卖出范围口径：会话级 live_sessions.sell_scope 优先（NULL/非法回退全局），
+    # 运行中由引擎每轮 tick 重读并同步到各 Portfolio（无需重启会话）。
+    sell_scope = resolve_session_sell_scope(session_row)
     # (port, 尽分权重=该组合 initial_capital)：会话基准按此占比切分
     baseline_weights: list = []
     for link in links:
@@ -1550,6 +1750,7 @@ def list_sessions(db: Session, engines: Optional[Dict[int, LiveEngine]] = None) 
     # G2：全局盘前配置只读一次（避免每个会话重复读文件）
     _tq_raw = load_config().get("tq_trade") or {}
     _tq_cfg = _tq_raw if isinstance(_tq_raw, dict) else {}
+    _global_sell_scope = live_sell_scope()
     return [
         {
             "id": s.id,
@@ -1580,6 +1781,13 @@ def list_sessions(db: Session, engines: Optional[Dict[int, LiveEngine]] = None) 
                 None if getattr(s, "pre_open_auction_price_bias_pct", None) is None
                 else float(s.pre_open_auction_price_bias_pct)),
             "pre_open_auction_effective": pre_open_auction_effective(s, _tq_cfg),
+            # 卖出范围（存量/外部仓是否代卖）：会话级优先，NULL 回退全局。
+            "sell_scope": resolve_session_sell_scope(s, _global_sell_scope),
+            "sell_scope_source": (
+                "session"
+                if str(getattr(s, "sell_scope", None) or "").strip()
+                in SELL_SCOPE_VALUES else "global"),
+            "sell_scope_global": _global_sell_scope,
             # A1 资金池：列表回显，编辑弹窗据此预填
             "capital_pool_mode": getattr(s, "capital_pool_mode", None) or "off",
             "capital_pool_rebalance_enabled": bool(
@@ -1626,13 +1834,29 @@ def list_sessions(db: Session, engines: Optional[Dict[int, LiveEngine]] = None) 
     ]
 
 
+def _session_audit_log(session, kind: str, old, new, caller: str,
+                       reason: str = "") -> None:
+    """会话级配置变更的统一留痕（old→new + 调用方 + 进程 tag + 原因）。
+
+    与 ``set_session_status`` 共用同一条审计通道（``logs/core.log``），
+    ``process_tag()`` 会带上 pid/实际端口，便于排查是谁在哪个进程改的。
+    """
+    logger.warning(
+        "实盘会话%s变更 #%s「%s」: %s → %s（调用方=%s，%s，原因=%s）",
+        kind, getattr(session, "id", "?"), getattr(session, "name", ""),
+        old, new, caller, process_tag(), reason or "-")
+
+
 def _status_change_log(session: LiveSession, old: Optional[str], new_status: str,
                        caller: str, reason: str = "") -> None:
     """``live_sessions.status`` 每次变化的统一留痕（old→new + 调用方 + 进程）。"""
-    logger.warning(
-        "实盘会话状态变更 #%s「%s」: %s → %s（调用方=%s，%s，原因=%s）",
-        getattr(session, "id", "?"), getattr(session, "name", ""),
-        old, new_status, caller, process_tag(), reason or "-")
+    _session_audit_log(session, "状态", old, new_status, caller, reason)
+
+
+def _sell_scope_audit_log(session, old: str, new: str, caller: str,
+                          reason: str = "") -> None:
+    """卖出范围（存量/外部仓是否代卖）切换留痕，复用状态变更审计通道。"""
+    _session_audit_log(session, "卖出范围", old, new, caller, reason)
 
 
 def set_session_status(session: LiveSession, new_status: str, *,
@@ -1652,6 +1876,78 @@ def set_session_status(session: LiveSession, new_status: str, *,
     return True
 
 
+def set_session_sell_scope(
+    db: Session, session_id: int, scope: str, *,
+    reason: str = "", caller: str = "api.set_sell_scope",
+    engines: Optional[Dict[int, LiveEngine]] = None,
+) -> Tuple[bool, dict]:
+    """切换会话级卖出范围（存量/外部仓是否代卖）。
+
+    返回 ``(ok, data_or_(status, message))``。语义：
+
+    - 只写 ``live_sessions.sell_scope``，**不触碰**全局
+      ``config.tq_trade.live_sell_scope``；
+    - 会话运行中：立即调 ``engine.apply_sell_scope`` 生效（不重启会话），
+      且引擎每轮 tick 也会重读本列（双保险）；
+    - 每次真实切换记录 old→new / 调用方 / pid+port / 原因（复用状态变更审计通道）；
+    - 已提交未成交的委托**不撤销**，仅后续新卖单按新口径。
+    """
+    scope = str(scope or "").strip()
+    if scope not in SELL_SCOPE_VALUES:
+        return False, (400, "scope 非法，仅支持 full / platform_only", None)
+    session = db.query(LiveSession).filter(LiveSession.id == session_id).first()
+    if session is None:
+        return False, (404, "资源不存在", None)
+    old = resolve_session_sell_scope(session)
+    raw = str(getattr(session, "sell_scope", None) or "").strip()
+    engine = (engines or {}).get(session_id)
+    running = engine is not None or session.status in ("running", "stopping")
+    if raw == scope:
+        return True, {
+            "session_id": session_id,
+            "old": old, "new": old, "changed": False,
+            "running": running,
+            "effective_at": "now" if engine is not None else "next_start",
+            "message": "当前已是该档位，无需切换",
+            "gate": None,
+        }
+    # 开启（扩大代卖范围）前强制全量对账闸：账不齐一律拒绝，指出差在哪。
+    gate = None
+    if scope == "full":
+        gate = evaluate_sell_scope_gate(db, session_id, engine=engine)
+        if not gate.get("passed"):
+            detail = "；".join(gate.get("reasons") or ["对账闸未通过"])
+            _session_audit_log(
+                session, "卖出范围（拒绝开启）", old, scope, caller,
+                "%s；对账闸：%s" % (reason or "手动切换", detail))
+            return False, (409, "对账闸未通过，拒绝开启：" + detail, gate)
+    session.sell_scope = scope
+    _sell_scope_audit_log(session, old, scope, caller, reason or "手动切换")
+    db.commit()
+    applied_now = False
+    if engine is not None and hasattr(engine, "apply_sell_scope"):
+        engine.apply_sell_scope(scope)
+        applied_now = True
+        # 开启后武装「首笔存量/外部仓成交」前后对账（内存态，一次性）。
+        if scope == "full" and hasattr(engine, "arm_sell_scope_first_check"):
+            try:
+                engine.arm_sell_scope_first_check(db)
+            except Exception:  # noqa: BLE001 — 武装失败不影响开关生效
+                logger.warning("arm sell_scope first-trade check failed "
+                               "(session %s)", session_id, exc_info=True)
+    return True, {
+        "session_id": session_id,
+        "old": old, "new": scope, "changed": True,
+        "running": running,
+        "effective_at": "now" if applied_now else "next_start",
+        "message": (
+            "已立即生效（下一轮 tick 起新卖单按新口径；已提交未成交委托不撤销）"
+            if applied_now else
+            "会话未运行：已保存本会话档位，下次启动生效"),
+        "gate": gate,
+    }
+
+
 #: 本进程内各会话的启动序号（不落库：跨进程代际以 ``started_at`` 判定，
 #: 仅有排查价值，如需持久化需新增列——先报批再加）。
 _START_SEQ: Dict[int, int] = {}
@@ -1662,7 +1958,6 @@ def next_start_seq(session_id: int) -> int:
     seq = _START_SEQ.get(int(session_id), 0) + 1
     _START_SEQ[int(session_id)] = seq
     return seq
-
 
 
 def mark_session_started(session: LiveSession, *,
@@ -1943,6 +2238,9 @@ def create_session(db: Session, data: dict, mode: str) -> dict:
             "pre_open_auction_end_time"),
         pre_open_auction_price_bias_pct=pre_open_patch.get(
             "pre_open_auction_price_bias_pct"),
+        # 卖出范围：创建时把全局值固化为本会话初始档位（默认 platform_only=关闭）。
+        # 之后全局配置变化不影响本会话，会话内切换也不反向改写全局。
+        sell_scope=live_sell_scope(),
         backtest_record_id=backtest_record_id,
     )
     db.add(session)
@@ -1968,6 +2266,7 @@ def create_session(db: Session, data: dict, mode: str) -> dict:
                 None if session.pre_open_auction_price_bias_pct is None
                 else float(session.pre_open_auction_price_bias_pct)),
             "pre_open_auction_effective": pre_open_auction_effective(session),
+            "sell_scope": resolve_session_sell_scope(session),
             "warnings": _engine_occupancy_warnings(db, session)}
 
 
@@ -2038,6 +2337,13 @@ def get_session(db: Session, session_id: int, engine: Optional[LiveEngine] = Non
             None if getattr(session, "pre_open_auction_price_bias_pct", None)
             is None else float(session.pre_open_auction_price_bias_pct)),
         "pre_open_auction_effective": pre_open_auction_effective(session),
+        # 卖出范围（存量/外部仓是否代卖）：会话级优先，NULL/非法回退全局。
+        "sell_scope": resolve_session_sell_scope(session),
+        "sell_scope_source": (
+            "session"
+            if str(getattr(session, "sell_scope", None) or "").strip()
+            in SELL_SCOPE_VALUES else "global"),
+        "sell_scope_global": live_sell_scope(),
         "status": session.status,
         "started_at": session.started_at,
         "stopped_at": session.stopped_at,

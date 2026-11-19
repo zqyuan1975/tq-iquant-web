@@ -851,6 +851,17 @@ class LiveEngine:
             code_period_count=code_period_count,
             clock=now_shanghai,
         )
+        # 卖出范围（存量/外部仓是否代卖）：初始取 build_engine 已解析的会话档位，
+        # 之后由 _refresh_sell_scope 每轮 tick 重读会话列（运行中可切，无需重启）。
+        _initial_scope = "platform_only"
+        for _p in portfolios:
+            _s = str(getattr(_p, "sell_scope", "") or "")
+            if _s in ("full", "platform_only"):
+                _initial_scope = _s
+                break
+        self._sell_scope = _initial_scope
+        # 开启 full 后一次性「首笔存量/外部仓成交」前后对账的基线（内存态）。
+        self._sell_scope_first_check: Optional[dict] = None
         # alert/auto mode
         self.execution_mode = execution_mode
         # M1 半自动审批队列（2026-11-18）：manual 模式下开仓类新单不直接下发，
@@ -2271,6 +2282,283 @@ class LiveEngine:
                        % (total, self._poll_interval, detail or "-"),
         })
 
+    @staticmethod
+    def _global_sell_scope() -> str:
+        """全局默认卖出范围（缺键/非法回退 platform_only，即默认不代卖存量仓）。"""
+        try:
+            tq = load_config().get("tq_trade") or {}
+            raw = str((tq.get("live_sell_scope")
+                       if isinstance(tq, dict) else "") or "").strip()
+        except Exception:  # noqa: BLE001 — 配置读取失败按默认关闭
+            raw = ""
+        return raw if raw in ("full", "platform_only") else "platform_only"
+
+    def apply_sell_scope(self, value: str) -> None:
+        """把卖出范围同步到各 Portfolio（供即时切换与每轮 tick 刷新共用）。
+
+        只影响后续新卖单的收窄口径；不撤已提交未成交委托、不改风控阈值。
+        """
+        value = str(value or "").strip()
+        if value not in ("full", "platform_only"):
+            return
+        old = getattr(self, "_sell_scope", "platform_only")
+        if value == old:
+            return
+        self._sell_scope = value
+        for port in getattr(self.ctx, "portfolios", None) or []:
+            port.sell_scope = value
+        if value != "full":
+            # 退出代卖范围 → 取消未执行的首笔对账武装
+            self._sell_scope_first_check = None
+        logger.warning(
+            "实盘会话卖出范围生效 #%s: %s → %s（%s；已提交未成交委托不撤销）",
+            self.session_id, old, value, process_tag())
+
+    def _refresh_sell_scope(self) -> None:
+        """每轮 tick 重读 ``live_sessions.sell_scope``（运行中可切，下一轮生效）。
+
+        DB 读失败/列缺失时保持当前值（fail-safe：不因读取失败而扩大代卖范围）。
+        """
+        if self._db_session_factory is None:
+            return
+        try:
+            db = self._db_session_factory()
+            try:
+                row = db.query(LiveSession).filter(
+                    LiveSession.id == self.session_id).first()
+                raw = (str(getattr(row, "sell_scope", None) or "").strip()
+                       if row is not None else "")
+                value = (raw if raw in ("full", "platform_only")
+                         else self._global_sell_scope())
+                old_scope = getattr(self, "_sell_scope", "platform_only")
+                self.apply_sell_scope(value)
+                # 由 platform_only → full 且尚未武装：开启后首笔成交对账
+                if (value == "full" and old_scope != "full"
+                        and self._sell_scope_first_check is None):
+                    self.arm_sell_scope_first_check(db)
+            finally:
+                db.close()
+        except Exception:  # noqa: BLE001 — 读取失败保持当前档位
+            logger.warning("refresh sell_scope failed (session %s)",
+                           self.session_id, exc_info=True)
+            return
+
+    def arm_sell_scope_first_check(self, db: Optional[Session] = None) -> None:
+        """开启 full 后武装「首笔存量/外部仓成交」前后对账（一次性，内存态）。
+
+        基线 = 切换瞬间的虚拟现金 / 逐只数量 / 柜台快照 / 成交 id 水位；
+        等第一笔涉及存量/外部仓的成交落库、且柜台快照更新后，由
+        ``_maybe_sell_scope_first_check`` 比对增量，确认现金与持仓未变形。
+        武装失败只告警，不影响开关本身生效。
+        """
+        own = None
+        try:
+            if db is None:
+                if self._db_session_factory is None:
+                    return
+                own = self._db_session_factory()
+                db = own
+            trade_cursor = (db.query(func.max(LiveTrade.id))
+                            .filter(LiveTrade.live_session_id == self.session_id)
+                            .scalar() or 0)
+            snap = (db.query(LiveAccountSnapshot)
+                    .filter(LiveAccountSnapshot.live_session_id == self.session_id)
+                    .order_by(LiveAccountSnapshot.captured_at.desc(),
+                              LiveAccountSnapshot.id.desc())
+                    .first())
+            external: Set[str] = set()
+            virtual: Dict[str, int] = {}
+            for port in self.ctx.portfolios:
+                for strat in (getattr(port, "strategies", None) or []):
+                    for code, pos in (getattr(strat, "positions", None) or {}).items():
+                        qty = int(getattr(pos, "quantity", 0) or 0)
+                        if qty <= 0:
+                            continue
+                        virtual[code] = virtual.get(code, 0) + qty
+                        try:
+                            plat = int(getattr(pos, "platform_quantity", 0) or 0)
+                        except (TypeError, ValueError):
+                            plat = 0
+                        if qty > plat:
+                            external.add(code)
+            counter: Dict[str, int] = {}
+            counter_cash = None
+            snap_id = 0
+            if snap is not None:
+                snap_id = int(snap.id or 0)
+                if snap.available_cash is not None:
+                    counter_cash = Decimal(str(snap.available_cash))
+                for row in (snap.positions or []):
+                    code = str(getattr(row, "stock_code", "") or "")
+                    if not code:
+                        continue
+                    try:
+                        vol = int(getattr(row, "quantity", 0) or 0)
+                    except (TypeError, ValueError, OverflowError):
+                        continue
+                    if vol:
+                        counter[code] = counter.get(code, 0) + vol
+            cash = sum((Decimal(str(p.account.cash or 0))
+                        for p in self.ctx.portfolios), Decimal("0"))
+            self._sell_scope_first_check = {
+                "armed_at": now_shanghai().strftime("%Y-%m-%d %H:%M:%S"),
+                "trade_cursor": int(trade_cursor or 0),
+                "snapshot_id": snap_id,
+                "cash": cash,
+                "counter_cash": counter_cash,
+                "virtual": virtual,
+                "counter": counter,
+                "external_codes": external,
+            }
+            logger.warning(
+                "卖出范围首笔对账已武装 #%s：外部/存量代码 %d 只（%s），"
+                "成交水位 %s，虚拟现金 %s，柜台现金 %s",
+                self.session_id, len(external),
+                ",".join(sorted(external)) or "-",
+                trade_cursor, cash, counter_cash)
+        except Exception:  # noqa: BLE001 — 武装失败不影响开关
+            logger.warning("arm sell_scope first check failed (session %s)",
+                           self.session_id, exc_info=True)
+        finally:
+            if own is not None:
+                own.close()
+
+    def _maybe_sell_scope_first_check(self) -> None:
+        """首笔涉及存量/外部仓成交后，比对切换前后的现金与逐只持仓增量。
+
+        只在 ``arm_sell_scope_first_check`` 武装后执行一次：等到（a）有新的
+        该代码成交、（b）柜台快照比基线更新，才做前后差额比对；缺口超容差
+        记 alert 决策事件（不改账、不撤单）。无新成交则保持武装等待。
+        """
+        check = getattr(self, "_sell_scope_first_check", None)
+        if not check or self._db_session_factory is None:
+            return
+        db = None
+        try:
+            db = self._db_session_factory()
+            hits = [
+                t for t in db.query(LiveTrade).filter(
+                    LiveTrade.live_session_id == self.session_id,
+                    LiveTrade.id > check["trade_cursor"],
+                ).all()
+                if str(t.stock_code) in check["external_codes"]
+            ]
+            if not hits:
+                return
+            snap = (db.query(LiveAccountSnapshot)
+                    .filter(LiveAccountSnapshot.live_session_id == self.session_id)
+                    .order_by(LiveAccountSnapshot.captured_at.desc(),
+                              LiveAccountSnapshot.id.desc())
+                    .first())
+            if snap is None or int(snap.id or 0) <= check["snapshot_id"]:
+                return  # 等下一张柜台快照，避免用旧快照误判
+            virtual_after: Dict[str, int] = {}
+            for port in self.ctx.portfolios:
+                for strat in (getattr(port, "strategies", None) or []):
+                    for code, pos in (getattr(strat, "positions", None) or {}).items():
+                        qty = int(getattr(pos, "quantity", 0) or 0)
+                        if qty > 0:
+                            virtual_after[code] = virtual_after.get(code, 0) + qty
+            counter_after: Dict[str, int] = {}
+            counter_cash_after = (Decimal(str(snap.available_cash))
+                                  if snap.available_cash is not None else None)
+            for row in (snap.positions or []):
+                code = str(getattr(row, "stock_code", "") or "")
+                if not code:
+                    continue
+                try:
+                    vol = int(getattr(row, "quantity", 0) or 0)
+                except (TypeError, ValueError, OverflowError):
+                    continue
+                if vol:
+                    counter_after[code] = counter_after.get(code, 0) + vol
+            cash_after = sum((Decimal(str(p.account.cash or 0))
+                              for p in self.ctx.portfolios), Decimal("0"))
+            inflight = {
+                row[0] for row in db.query(LiveOrder.stock_code).filter(
+                    LiveOrder.live_session_id == self.session_id,
+                    LiveOrder.status.in_(["submitted", "partial"]),
+                ).all()
+            }
+            findings: List[str] = []
+            codes = set(check["virtual"]) | set(check["counter"])
+            for code in sorted(codes):
+                before_v = int(check["virtual"].get(code, 0))
+                after_v = int(virtual_after.get(code, 0))
+                before_c = int(check["counter"].get(code, 0))
+                after_c = int(counter_after.get(code, 0))
+                if (after_v - before_v) != (after_c - before_c):
+                    findings.append(
+                        "%s 增量不一致：虚拟 %+d 股 / 柜台 %+d 股" % (
+                            code, after_v - before_v, after_c - before_c))
+                elif code not in inflight and after_v != after_c:
+                    findings.append(
+                        "%s 存量未对齐：虚拟 %d 股 / 柜台 %d 股" % (
+                            code, after_v, after_c))
+            cash_finding = None
+            if check["counter_cash"] is None or counter_cash_after is None:
+                cash_finding = "柜台现金缺失，无法校验现金增量"
+            else:
+                delta_v = cash_after - Decimal(str(check["cash"]))
+                delta_c = counter_cash_after - Decimal(str(check["counter_cash"]))
+                cash_tol = max(Decimal("1.00"),
+                               abs(delta_c) * Decimal("0.001"))
+                if abs(delta_v - delta_c) > cash_tol:
+                    cash_finding = (
+                        "现金增量不一致：虚拟 %s / 柜台 %s（容差 %s）" % (
+                            delta_v, delta_c, cash_tol))
+            ok = not findings and not cash_finding
+            payload = {
+                "session_id": self.session_id,
+                "engine": self._engine_key,
+                "gate": "sell_scope",
+                "rule": "first_trade_check",
+                "action": "notice" if ok else "alert",
+                "message": (
+                    "开启存量仓代卖后首笔成交对账通过：现金与持仓增量一致"
+                    if ok else
+                    "开启存量仓代卖后首笔成交对账异常（账本可能变形，"
+                    "已保留原委托、未做任何改账）："
+                    + "；".join(([cash_finding] if cash_finding else []) + findings)),
+                "armed_at": check["armed_at"],
+                "trades": [
+                    {"id": getattr(t, "id", None),
+                     "code": getattr(t, "stock_code", None)}
+                    for t in hits
+                ],
+                "cash_before": str(check["cash"]),
+                "cash_after": str(cash_after),
+                "counter_cash_before": (
+                    str(check["counter_cash"])
+                    if check["counter_cash"] is not None else None),
+                "counter_cash_after": (
+                    str(counter_cash_after)
+                    if counter_cash_after is not None else None),
+                "findings": findings + ([cash_finding] if cash_finding else []),
+                "snapshot_at": snap.captured_at.strftime("%Y-%m-%d %H:%M:%S")
+                               if snap.captured_at else None,
+            }
+            self._emit_risk_safe(payload, persist=True)
+            if ok:
+                logger.warning(
+                    "卖出范围首笔成交对账通过 #%s：虚拟现金 %s→%s，"
+                    "柜台现金 %s→%s（成交 %s）",
+                    self.session_id, check["cash"], cash_after,
+                    check["counter_cash"], counter_cash_after,
+                    ",".join(str(getattr(t, "id", "")) for t in hits))
+            else:
+                logger.warning(
+                    "卖出范围首笔成交对账异常 #%s：%s（已保留原委托、未改账）",
+                    self.session_id,
+                    "；".join(([cash_finding] if cash_finding else []) + findings))
+            self._sell_scope_first_check = None
+        except Exception:  # noqa: BLE001 — 校验失败只告警，不阻断交易
+            logger.warning("sell_scope first trade check failed (session %s)",
+                           self.session_id, exc_info=True)
+        finally:
+            if db is not None:
+                db.close()
+
     def _tick_main(self) -> None:
         """_loop 单轮同步体（在 worker 线程执行）：心跳 → poll → 日终。
 
@@ -2279,6 +2567,8 @@ class LiveEngine:
         """
         now = now_shanghai()
         self._last_tick_at = now  # 存活心跳（进程内 watchdog 读）
+        # 卖出范围会话级开关：每轮重读一次（只读一列），运行中切换下一轮即生效。
+        self._refresh_sell_scope()
         # P2-8：分段耗时画像（ms）。只观测不改执行顺序——风控/对账/清扫一律保留。
         t_round = time.monotonic()
         prof: Dict[str, int] = {}
@@ -2404,6 +2694,8 @@ class LiveEngine:
             # I-7（audit）：收盘流程完成后每交易日一次对账复查（虚拟 vs 桥实际）——
             # 此时在途单已终态收敛、成交已回填，差异最可信。
             _seg("reconcile_after_close", self._maybe_reconcile_after_close)
+            # 卖出范围开关：开启后首笔存量/外部仓成交的前后对账（一次性）
+            _seg("sell_scope_first_check", self._maybe_sell_scope_first_check)
             # C4：收盘收口后落当日对账日报（只读聚合，同日报覆盖更新）。
             _seg("daily_report", self._maybe_daily_report)
         except BridgeUnavailableError as e:

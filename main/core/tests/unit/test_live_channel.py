@@ -816,20 +816,46 @@ def test_bridge_probe_message_three_tiers():
     assert url in svc.bridge_probe_message("goldminer_bridge", "unreachable", url)
 
 
-def test_live_sell_scope_default_full_and_invalid_fallback(monkeypatch):
-    """卖出范围口径：缺键/非法 → full（旧行为）；platform_only 透传。"""
+def test_live_sell_scope_default_platform_only_and_invalid_fallback(monkeypatch):
+    """卖出范围默认口径：缺键/非法 → platform_only（默认关闭，不代卖存量仓）。"""
     monkeypatch.setattr(svc, "load_config", lambda: _cfg(False))
-    assert svc.live_sell_scope() == "full"
+    assert svc.live_sell_scope() == "platform_only"
     monkeypatch.setattr(
         svc, "load_config", lambda: _cfg(False, tq_trade={"live_sell_scope": ""}))
-    assert svc.live_sell_scope() == "full"
+    assert svc.live_sell_scope() == "platform_only"
     monkeypatch.setattr(
         svc, "load_config", lambda: _cfg(False, tq_trade={"live_sell_scope": "xyz"}))
+    assert svc.live_sell_scope() == "platform_only"
+    monkeypatch.setattr(
+        svc, "load_config",
+        lambda: _cfg(False, tq_trade={"live_sell_scope": "full"}))
     assert svc.live_sell_scope() == "full"
     monkeypatch.setattr(
         svc, "load_config",
         lambda: _cfg(False, tq_trade={"live_sell_scope": "platform_only"}))
     assert svc.live_sell_scope() == "platform_only"
+
+
+def test_resolve_session_sell_scope_prefers_session_then_global(monkeypatch):
+    """会话级档位优先：NULL/非法回退全局；会话列有效时不读全局。"""
+    monkeypatch.setattr(
+        svc, "load_config", lambda: _cfg(False, tq_trade={"live_sell_scope": "full"}))
+    # 会话显式 platform_only → 压过全局 full
+    assert svc.resolve_session_sell_scope(
+        SimpleNamespace(sell_scope="platform_only")) == "platform_only"
+    # 会话显式 full → 保持
+    assert svc.resolve_session_sell_scope(
+        SimpleNamespace(sell_scope="full")) == "full"
+    # NULL/空/非法 → 回退全局 full
+    assert svc.resolve_session_sell_scope(
+        SimpleNamespace(sell_scope=None)) == "full"
+    assert svc.resolve_session_sell_scope(
+        SimpleNamespace(sell_scope="xyz")) == "full"
+    # 全局也非法 → 再回退默认 platform_only
+    monkeypatch.setattr(
+        svc, "load_config", lambda: _cfg(False, tq_trade={"live_sell_scope": "bad"}))
+    assert svc.resolve_session_sell_scope(
+        SimpleNamespace(sell_scope=None)) == "platform_only"
 
 
 def test_default_engine_empty_or_invalid_falls_back_to_legacy(monkeypatch):

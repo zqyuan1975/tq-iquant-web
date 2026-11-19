@@ -3053,9 +3053,11 @@ onUnmounted(() => {
               slow_warn_interval_seconds=300）、tq_trade.*、ths_ui.work_dir/execute_mode/price_mode。
               本机当前实际：simulation=8790；live=8790（两位都指向 QMT 仿真账户 410038214257，不使用 8791 信用腿）；
               goldminer=7801；ths execute_mode=file_builtin、price_mode=latest、work_dir=data/ths。</p>
-            <p class="guide-note">· <b>卖出范围</b>（tq_trade.live_sell_scope）：full＝按整仓卖（默认，含外部仓）；
-              platform_only＝只卖平台自建仓，纯外部仓不代卖并记一条 gate=sell_scope / action=skip。
-              本机 platform_only；买入侧不受影响。</p>
+            <p class="guide-note">· <b>卖出范围</b>（tq_trade.live_sell_scope）：仅作<b>新建会话的初始档位</b>，
+              会话级开关优先且运行中可切（不重启会话、不反向改写本配置）：
+              platform_only＝只卖平台自建仓（默认关闭，纯外部仓不代卖并记一条 gate=sell_scope / action=skip）；
+              full＝按整仓卖（含存量/外部仓）。开启 full 前会先做全量对账，账不齐拒绝开启；
+              已提交未成交委托不撤销。买入侧不受影响。</p>
             <p class="guide-note">· <b>次日盘前集合竞价</b>（tq_trade.pre_open_auction_*）：enabled 默认 <b>true</b>、
               end_time 默认 09:20、price_bias_pct 默认 2.0。窗口 09:15 ≤ now &lt; end_time；当日 due 的
               <b>1d/1w/1mon</b> deferred 单统一生效（due 判定 = signal_bar_date 的下一交易日）；价＝信号价×(1±bias%)

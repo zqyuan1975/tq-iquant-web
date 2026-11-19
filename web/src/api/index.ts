@@ -2155,6 +2155,12 @@ export interface LiveSessionItem {
     source: 'session' | 'global'
     overrides: string[]
   }
+  // 存量/外部持仓是否纳入风控（代卖）会话级开关：
+  //   platform_only=关闭（默认，存量/外部仓不代卖）/ full=开启（按整仓卖）
+  // sell_scope_source=session 表示本会话显式设置；global 表示未设置、跟随全局默认
+  sell_scope?: 'full' | 'platform_only'
+  sell_scope_source?: 'session' | 'global'
+  sell_scope_global?: 'full' | 'platform_only'
 }
 
 // H2 拆单剩余量（停会话时未提交的子单快照）
@@ -2253,6 +2259,52 @@ export async function getLiveDataHealth(sessionId: number, autoFill = true) {
 
 export async function getLiveSessions() {
   const res = await api.get<ApiResponse<LiveSessionItem[]>>('/live/sessions')
+  return res.data.data
+}
+
+// ---- 存量/外部仓是否纳入风控（代卖）：会话级开关 ----
+export interface SellScopePositionDiff {
+  stock_code: string
+  counter_qty: number
+  virtual_qty: number
+}
+
+export interface SellScopeGate {
+  passed: boolean
+  source: string
+  reasons: string[]
+  snapshot_at?: string | null
+  cash?: Record<string, string | null>
+  equity?: Record<string, string | null>
+  position_diffs?: SellScopePositionDiff[]
+}
+
+export interface SellScopeSwitchResult {
+  session_id: number
+  old: 'full' | 'platform_only'
+  new: 'full' | 'platform_only'
+  changed: boolean
+  running: boolean
+  effective_at: 'now' | 'next_start'
+  message: string
+  gate: SellScopeGate | null
+}
+
+/**
+ * 切换会话级卖出范围（存量/外部仓是否代卖）。
+ *
+ * - 切到 full 会先在后端做全量对账，账不齐返回 409（错误 message 里带差异明细）；
+ * - 运行中立即生效（下一轮 tick），不重启会话；已提交未成交委托不撤销。
+ */
+export async function setLiveSessionSellScope(
+  sessionId: number,
+  scope: 'full' | 'platform_only',
+  reason = '',
+) {
+  const res = await api.post<ApiResponse<SellScopeSwitchResult>>(
+    `/live/sessions/${sessionId}/sell-scope`,
+    { scope, reason, confirm: scope === 'full' },
+  )
   return res.data.data
 }
 

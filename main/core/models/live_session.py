@@ -100,6 +100,13 @@ class LiveSession(Base):
     pre_open_auction_enabled = Column(Boolean, nullable=True)
     pre_open_auction_end_time = Column(String(5), nullable=True)
     pre_open_auction_price_bias_pct = Column(Numeric(9, 6), nullable=True)
+    # ---- 存量/外部持仓是否纳入风控（代卖）会话级开关（2026-11-19）----
+    # NULL = 历史会话未显式设置 → 解析时回退全局 config.tq_trade.live_sell_scope
+    # platform_only = 关闭（默认档位）：只卖平台自建仓，存量/外部仓不代卖
+    # full = 开启：按整仓卖（含存量/外部仓）
+    # 运行中可切换，引擎每轮 tick 重读本列并同步到各 Portfolio.sell_scope；
+    # 全局配置只作新建会话的初始档位来源，本列优先且不反向改写全局配置。
+    sell_scope = Column(String(16), nullable=True)
     # B2 主备通道（默认关闭）：NULL=未配置备用引擎；failover_enabled=1 时主通道
     # 心跳失败逐日写 channel_failover 建议事件，实际切换仍需人工确认。
     backup_engine = Column(String(16), nullable=True)

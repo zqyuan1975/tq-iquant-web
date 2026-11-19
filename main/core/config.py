@@ -311,12 +311,15 @@ def _defaults() -> dict:
             # 与数量阈值相互独立，可同时开启（各自去重）。
             "deferred_backlog_warn_days": 0,
             # 卖出范围口径（止损/止盈/移动止损与 SELL/REDUCE/CLOSE 公式卖单）：
-            #   full          （默认）按整仓卖出——与改动前逐字一致，行为零变化
-            #   platform_only 只卖平台自己买入的股数（Position.platform_quantity）；
+            #   platform_only（默认）只卖平台自己买入的股数（Position.platform_quantity）；
             #                 纯外部/手工仓（platform_quantity=0）不下单，只记一条
             #                 gate=sell_scope 决策事件。买入侧不受影响。
+            #   full          按整仓卖出（含存量/外部仓），与旧版 full 行为一致。
+            # 2026-11-19 起本键**只作新建会话的初始档位来源**：会话级
+            # live_sessions.sell_scope 优先，运行中可在界面切换（不重启会话），
+            # 且切换不会反向改写本配置。历史会话（列为 NULL）解析时回退本值。
             # 阈值判定（止损/止盈/回撤）仍按整仓成本，本项只收窄卖出数量。
-            "live_sell_scope": "full",
+            "live_sell_scope": "platform_only",
             # 错周期 bar 是否跑风控（全局默认，会话可用
             # live_sessions.intraday_mismatched_risk_enabled 三态覆盖）：
             # False（默认，对齐回测）→ 风控只在策略自身周期 bar 上评估：1m/5m 等
