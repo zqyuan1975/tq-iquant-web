@@ -202,6 +202,6 @@ onUnmounted(() => {
 .ts-checks li { font-size: 13px; line-height: 1.6; }
 .ts-check-label { font-weight: 600; }
 .ts-check-detail { color: var(--ink-soft); }
-.ts-link { font-size: 12px; color: var(--accent); text-decoration: none; }
-.ts-link:hover { text-decoration: underline; }
+.ts-link { font-size: 12px; color: var(--link); text-decoration: none; }
+.ts-link:hover { color: var(--link-hover); text-decoration: underline; }
 </style>

@@ -191,7 +191,7 @@ onMounted(() => {
 
       <!-- E4：状态数据陈旧提示（超过 N 个交易日未见新 bar → 标黄，提示可能不准） -->
       <div v-if="gateStatus.stale" class="gate-error" data-test="gate-stale"
-           style="background:#fff7e6;color:#ad6800;border-color:#ffd591">
+           style="background:var(--warn-wash);color:var(--warn);border-color:var(--warn)">
         门控数据截至 <span class="num">{{ gateStatus.as_of }}</span>，已落后
         <b>{{ gateStatus.stale_days }}</b> 个交易日（预期最新
         <span class="num">{{ gateStatus.latest_trading_day }}</span>）。
