@@ -185,6 +185,8 @@ class PortfolioCreate(BaseModel):
     # 「买入后剩余现金 ÷ 总资产」判定，实盘 LiveEngine 从列读取
     max_single_position_pct: float | None = None
     min_cash_reserve_pct: float | None = None
+    # 资金池目标仓位上限（组合级，0~1）：None=默认 0.95，编辑时未携带则不改
+    target_utilization: float | None = None
     status: str = "active"
     strategies: list[StrategyItem] = []
 
@@ -397,6 +399,10 @@ def _validate_portfolio(req: PortfolioCreate, db: Session) -> str | None:
         _v = getattr(req, _k, None)
         if _v is not None and not (0 <= _v <= 1):
             return f"{_k} 必须在 [0,1]（None/0=不限制），收到 {_v}"
+    # 资金池目标仓位上限：None=默认 0.95；显式值须在 (0,1]
+    if req.target_utilization is not None and not (0 < req.target_utilization <= 1):
+        return (f"target_utilization 必须在 (0,1]（None=默认 0.95），"
+                f"收到 {req.target_utilization}")
     # 风控冷静期：0=关闭；上限 60 交易日（约 3 个月，超长冷却意味着该 sign 永久失效）
     if req.risk_cooldown_days is not None and not (0 <= req.risk_cooldown_days <= 60):
         return (f"risk_cooldown_days 须在 [0,60]（0=关闭），"

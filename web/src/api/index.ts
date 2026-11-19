@@ -106,6 +106,7 @@ export interface PortfolioItem {
   equity_cap_mode: string              // 上限处理模式：cap（默认，只封顶定量）| distribute（回测日终出金）
   max_single_position_pct: number | null  // 单票上限（0~1 比例，null=不限制；仅实盘生效）
   min_cash_reserve_pct: number | null     // 现金下限（0~1 比例，null=不限制；仅实盘生效）
+  target_utilization: number | null       // 资金池目标仓位上限（0~1 比例，null=默认 0.95；仅额度推导用）
   // 市场多空门控（默认关）：基准指数空头时禁止开仓/加仓，持仓不强平
   market_gate_enabled: boolean
   market_gate_engine: string  // python（默认）| tdx
@@ -1138,6 +1139,7 @@ export interface PortfolioRequest {
   equity_cap?: number | null  // W3 容量上限（dynamic 仓位资金封顶，None=不设上限）
   max_single_position_pct?: number | null  // 单票上限（0~1 比例，null=不限制；仅实盘生效）
   min_cash_reserve_pct?: number | null     // 现金下限（0~1 比例，null=不限制；仅实盘生效）
+  target_utilization?: number | null       // 资金池目标仓位上限（0~1 比例，null=默认 0.95）
   market_gate_enabled?: boolean | null         // 市场多空门控开关（null=请求未携带，编辑不动）
   market_gate_engine?: string | null           // python（默认）| tdx
   market_gate_formula_name?: string | null     // 通达信公式名，空=默认 TQGATE

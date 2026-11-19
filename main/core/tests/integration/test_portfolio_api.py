@@ -559,6 +559,30 @@ def test_update_portfolio_preserves_strategies(client):
     assert names == {"S1", "S2"}
 
 
+def test_update_portfolio_target_utilization(client):
+    """组合级目标仓位上限：可改、未携带不清空、越界 400。"""
+    c, Session = client
+    db = Session()
+    pid = _seed_portfolio(db)
+    db.close()
+
+    body = c.put(f"/api/portfolios/{pid}", json=_create_payload(
+        stock_pool_id=1, target_utilization=0.8)).json()
+    assert body["code"] == 0
+    assert body["data"]["target_utilization"] == 0.8
+
+    # 未携带 target_utilization 的编辑不得清空已有配置
+    body2 = c.put(f"/api/portfolios/{pid}", json=_create_payload(
+        stock_pool_id=1)).json()
+    assert body2["code"] == 0
+    assert body2["data"]["target_utilization"] == 0.8
+
+    # 越界拒绝
+    body3 = c.put(f"/api/portfolios/{pid}", json=_create_payload(
+        stock_pool_id=1, target_utilization=1.2)).json()
+    assert body3["code"] == 400
+
+
 def test_update_portfolio_not_found(client):
     c, Session = client
     db = Session()

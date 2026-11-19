@@ -140,6 +140,11 @@ def serialize_portfolio(db: Session, p: PortfolioStrategy) -> dict:
             float(p.min_cash_reserve_pct)
             if p.min_cash_reserve_pct is not None else None
         ),
+        # 资金池目标仓位上限（组合级，NULL=默认 0.95）
+        "target_utilization": (
+            float(p.target_utilization)
+            if getattr(p, "target_utilization", None) is not None else None
+        ),
         # 市场多空门控（2026-11-18）：开关 + 通道 + 公式名（NULL 归一成空串给前端）
         "market_gate_enabled": bool(p.market_gate_enabled) if p.market_gate_enabled is not None else False,
         "market_gate_engine": p.market_gate_engine or "python",
@@ -242,6 +247,10 @@ def _apply_portfolio_fields(p: PortfolioStrategy, req) -> None:
         if _field_sent(req, _k):
             _v = getattr(req, _k, None)
             setattr(p, _k, None if not _v else _v)
+    # 资金池目标仓位上限（组合级）：显式携带才落库；0/None 归一为 NULL（=默认 0.95）
+    if _field_sent(req, "target_utilization"):
+        _v = getattr(req, "target_utilization", None)
+        p.target_utilization = None if not _v else _v
     # 市场多空门控（2026-11-18）：None=请求未携带 → 不动已有值（与相邻开关口径一致，
     # 前端隐藏字段不 put 时不会把已有配置清掉）
     if getattr(req, "market_gate_enabled", None) is not None:

@@ -1233,6 +1233,81 @@ describe('Portfolios.vue — 单票上限 / 现金下限（仅实盘，默认不
   })
 })
 
+describe('Portfolios.vue — 目标仓位上限（target_utilization）', () => {
+  it('填 80 → 提交小数 0.8', async () => {
+    ;(createPortfolio as any).mockResolvedValue({ id: 99 })
+    const w = mount(Portfolios)
+    await flushPromises()
+    await w.find('button.btn-primary').trigger('click')
+
+    const input = w.find('input[data-field="target_utilization"]')
+    expect(input.exists()).toBe(true)
+    expect((input.element as HTMLInputElement).value).toBe('')
+
+    await w.find('input[data-field="name"]').setValue('TARGET_80')
+    await w.find('select[data-field="stock_pool_id"]').setValue('1')
+    await input.setValue('80')
+    await w.find('.modal-actions button.btn-primary').trigger('click')
+    await flushPromises()
+
+    expect(createPortfolio).toHaveBeenCalledTimes(1)
+    expect((createPortfolio as any).mock.calls[0][0].target_utilization).toBeCloseTo(0.8)
+  })
+
+  it('留空 → 提交 null 且不报错', async () => {
+    ;(createPortfolio as any).mockResolvedValue({ id: 99 })
+    const alertMock = vi.fn()
+    vi.stubGlobal('alert', alertMock)
+    const w = mount(Portfolios)
+    await flushPromises()
+    await w.find('button.btn-primary').trigger('click')
+
+    await w.find('input[data-field="name"]').setValue('TARGET_BLANK')
+    await w.find('select[data-field="stock_pool_id"]').setValue('1')
+    await w.find('.modal-actions button.btn-primary').trigger('click')
+    await flushPromises()
+
+    expect(alertMock).not.toHaveBeenCalled()
+    expect(createPortfolio).toHaveBeenCalledTimes(1)
+    expect((createPortfolio as any).mock.calls[0][0].target_utilization).toBeNull()
+    vi.unstubAllGlobals()
+  })
+
+  it('编辑回填 0.9 → 显示 90，提交仍为小数', async () => {
+    ;(updatePortfolio as any).mockResolvedValue({ id: 1 })
+    ;(getPortfolioDetail as any).mockResolvedValue({ ...mockPortfolios[0], target_utilization: 0.9 })
+    const w = mount(Portfolios)
+    await flushPromises()
+
+    const editBtn = w.findAll('button').find(b => b.text() === '编辑')!
+    await editBtn.trigger('click')
+    await flushPromises()
+
+    const input = w.find('input[data-field="target_utilization"]')
+    expect(Number((input.element as HTMLInputElement).value)).toBe(90)
+
+    await w.find('.modal-actions button.btn-primary').trigger('click')
+    await flushPromises()
+    expect((updatePortfolio as any).mock.calls[0][1].target_utilization).toBeCloseTo(0.9)
+  })
+
+  it('越界（0 / 101）→ 行内提示，不发请求', async () => {
+    ;(createPortfolio as any).mockClear()
+    const w = mount(Portfolios)
+    await flushPromises()
+    await w.find('button.btn-primary').trigger('click')
+
+    await w.find('input[data-field="name"]').setValue('TARGET_BAD')
+    await w.find('select[data-field="stock_pool_id"]').setValue('1')
+    await w.find('input[data-field="target_utilization"]').setValue('101')
+    await w.find('.modal-actions button.btn-primary').trigger('click')
+    await flushPromises()
+
+    expect(w.findAll('[data-test="portfolio-field-error"]').length).toBe(1)
+    expect(createPortfolio).not.toHaveBeenCalled()
+  })
+})
+
 // 回归：组合数量超过一屏时，最后几行（用户实测序号 11/12）的[编辑]仍能触发编辑动作。
 // 现象曾报「条目少时正常，排到 11、12 号后点[编辑]无反应」；此处用 12 个组合 + 每个组合
 // 展开 1 条子策略，覆盖「列表远超一屏」+「末尾行」两个条件，分别校验子策略行与组合行。

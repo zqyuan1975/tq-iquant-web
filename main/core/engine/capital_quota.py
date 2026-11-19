@@ -11,8 +11,8 @@
 - ``max_positions`` 缺失 → 组合 ``max_holdings``，再缺 1；
 - ``max_holdings`` 缺失 → 策略槽位之和，再缺 10；
 - ``single_open_ratio`` 缺失 → ``1 / S_j``；
-- ``target_utilization`` 缺失 → **0.95**（0019 §1.7；0021 A3 写 1.0，
-  按权威声明「额度与风控以 0019 为准」取更保守的 0.95）；
+- ``target_utilization`` 未配置 → **0.95**（0019 §1.7；组合级可配置，
+  NULL 视为默认值，不记为降级；0021 A3 写 1.0，按权威声明取更保守的 0.95）；
 - ``capital_ratio`` 缺失/合计≠1 → 等分或归一，并标记降级。
 任何缺失都不会推出「无上限」；无法确定（如权益缺失）直接返回
 ``not_derivable``。
@@ -404,11 +404,14 @@ def derive_portfolio_quota(
     max_holdings = _resolve_max_holdings(cfg, strategy_slots, degraded, reasons)
 
     target = to_decimal(cfg.target_utilization)
+    target_source = "portfolio_strategies.target_utilization"
     if target is None:
-        # 0019 §1.7 定为 0.95；0021 A3 写 1.0，按权威声明以 0019 为准。
+        # 组合级可配置项；未配置时取默认 0.95（0019 §1.7）。这是配置缺省，
+        # 不是降级：不写 degraded，只在 reasons 说明口径，避免三个组合常态降级。
         target = DEFAULT_TARGET_UTILIZATION
-        degraded.append("target_utilization_defaulted")
-        reasons.append("target_utilization 缺失，按 0019 §1.7 的保守上限 %s 计算"
+        target_source = ("portfolio_strategies.target_utilization 未配置，"
+                         "取默认 %s" % dec_str(DEFAULT_TARGET_UTILIZATION))
+        reasons.append("target_utilization 未配置，按默认上限 %s 计算"
                        % dec_str(DEFAULT_TARGET_UTILIZATION))
     if target < 0:
         degraded.append("target_utilization_negative")
@@ -439,11 +442,12 @@ def derive_portfolio_quota(
             key="target_utilization",
             label="目标仓位上限 × 组合权益",
             amount=target * equity,
-            source="portfolio_strategies.target_utilization",
+            source=target_source,
             formula="%s × %s = %s" % (
                 dec_str(target), dec_str(equity),
                 dec_str(target * equity)),
-            degraded="target_utilization" in degraded,
+            degraded=("target_utilization_negative" in degraded
+                      or "target_utilization_above_one" in degraded),
         ),
     ]
     if cap is not None:

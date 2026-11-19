@@ -49,6 +49,9 @@ class PortfolioStrategy(Base):
     # 现金留存下限（占比，0~1）：NULL 或 0 = 不设限（与接线前逐字一致）。
     # 按「买入后剩余现金 ÷ 组合总资产」截断买入额；同样只接实盘。
     min_cash_reserve_pct = Column(Numeric(5, 4), nullable=True)
+    # 资金池目标仓位上限（占比，0~1）：组合级可配置；NULL = 用默认 0.95
+    # （0019 §1.7）。只在额度推导里参与组合上限计算，不改变下单/回测默认行为。
+    target_utilization = Column(Numeric(5, 4), nullable=True)
     min_commission = Column(Numeric(10, 2), default=5, server_default="5", nullable=False)
     buy_commission_rate = Column(Numeric(8, 6), default=0.000250, server_default="0.000250", nullable=False)
     sell_commission_rate = Column(Numeric(8, 6), default=0.000250, server_default="0.000250", nullable=False)

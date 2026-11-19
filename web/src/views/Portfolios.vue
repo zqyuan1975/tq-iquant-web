@@ -91,6 +91,7 @@ const PORTFOLIO_RATIO_FIELDS = new Set([
   'volume_limit_ratio', 'cash_enhance_position_ratio_threshold',
   'slippage_impact_coef', 'minute_volume_limit_ratio',
   'max_single_position_pct', 'min_cash_reserve_pct',
+  'target_utilization',
   'market_gate_bear_reduce_ratio',
 ])
 const STRATEGY_RATIO_FIELDS = new Set([
@@ -106,6 +107,7 @@ const STRATEGY_RATIO_FIELDS = new Set([
 const NULLABLE_NUMERIC_FIELDS = new Set([
   'equity_cap',
   'max_single_position_pct', 'min_cash_reserve_pct',
+  'target_utilization',
   'max_order_amount',
   // H3 切片增强：笔数/子单最小量/间隔/量占比均可留空，由后端按阈值或成交量推导
   'split_order_count', 'split_order_min_qty',
@@ -167,6 +169,7 @@ const PORTFOLIO_GROUPS: { title: string; hint?: string; fields: FieldMeta[] }[] 
     { key: 'equity_cap_mode', label: '上限处理模式', span: 2, type: 'select', options: 'equityCapModes', hintBelow: true, showIf: { key: 'position_sizing', equals: 'dynamic' }, hint: '封顶=只限制新开仓定量（默认，与旧行为一致）；日终出金=回测每天收盘把「总资产−上限」作为外部流出扣出现金（仅回测模拟，不卖存量持仓）。同样只影响新开仓定量、不会强制减仓；实盘会话启动时读取一次，改完需重启会话才生效（与 sell_scope 的即时切换不同）。' },
     { key: 'max_single_position_pct', label: '单票上限', span: 1, type: 'percent', placeholder: '留空=不限制', hint: '按「买入后该票市值 ÷ 组合总资产」判定，留空或 0 表示不限制。仅实盘生效，回测不读。' },
     { key: 'min_cash_reserve_pct', label: '现金下限', span: 1, type: 'percent', placeholder: '留空=不限制', hint: '按「买入后剩余现金 ÷ 组合总资产」判定，留空或 0 表示不限制。仅实盘生效，回测不读。' },
+    { key: 'target_utilization', label: '目标仓位上限', span: 1, type: 'percent', placeholder: '留空=默认 95', hint: '资金池额度推导的目标仓位上限（0–100%，留空=默认 95%）。只用于额度推导上限，不影响下单/回测。' },
     { key: 'daily_loss_basis', label: '日内亏损熔断口径', span: 2, type: 'select', options: 'dailyLossBases', hint: '分母：净值=上一交易日收盘净值（默认，5% 阈值随净值滚动）；初始资金=按 initial_capital 固定阈值（旧口径，净值增长后相对变严）' },
     { key: 'cash_enhance_enabled', label: '现金管理增强（预留）', span: 2, type: 'switch', hint: '命中阈值仅记录决策事件，暂不自动下单' },
     { key: 'cash_enhance_equity_threshold', label: '净资产阈值（元）', span: 1, type: 'number', showIf: { key: 'cash_enhance_enabled', equals: true } },
@@ -287,6 +290,8 @@ function emptyPortfolioForm(): Record<string, any> {
     // 单票上限 / 现金下限：默认不限制（null → 输入框留空，提交 null，后端 NULL=不设限）。
     // 绝不能预填非 0 值——会立刻改变次日实际报单结果。
     max_single_position_pct: null, min_cash_reserve_pct: null,
+    // 目标仓位上限：留空 = 默认 95%（提交 null，界面不预填）
+    target_utilization: null,
     // 市场多空门控默认关（回测/实盘同口径）
     market_gate_enabled: false, market_gate_engine: 'python', market_gate_formula_name: '',
     // E3 门控维度扩展：默认值 = 单指数 / any / 不设门槛 / 不减仓（旧语义）
@@ -434,6 +439,14 @@ function validateOptionalPctLimits(): boolean {
     const n = Number(raw)
     if (!Number.isFinite(n) || n < 0 || n > 100) {
       errs[key] = `${label}需在 0–100 之间（留空或 0 表示不限制）`
+    }
+  }
+  // 目标仓位上限：留空=默认 95%，填写时须在 (0,100]
+  const tu = portfolioForm.value.target_utilization
+  if (!(tu === '' || tu === null || tu === undefined)) {
+    const n = Number(tu)
+    if (!Number.isFinite(n) || n <= 0 || n > 100) {
+      errs.target_utilization = '目标仓位上限需在 (0,100] 之间（留空=默认 95%）'
     }
   }
   portfolioFieldErrors.value = errs
@@ -601,6 +614,7 @@ async function openEditPortfolio(p: PortfolioItem) {
     equity_cap_mode: detail.equity_cap_mode || 'cap',
     max_single_position_pct: detail.max_single_position_pct ?? null,
     min_cash_reserve_pct: detail.min_cash_reserve_pct ?? null,
+    target_utilization: detail.target_utilization ?? null,
     market_gate_enabled: detail.market_gate_enabled ?? false,
     market_gate_engine: detail.market_gate_engine || 'python',
     market_gate_formula_name: detail.market_gate_formula_name || '',

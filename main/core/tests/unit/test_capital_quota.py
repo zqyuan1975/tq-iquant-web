@@ -189,8 +189,10 @@ def test_missing_fields_degrade_but_never_infinite():
 
     assert r.entitlement == D("950000")  # 1 槽 × 100% 资金，再被 95% 目标压顶
     for key in ("max_positions_defaulted", "single_open_ratio_defaulted",
-                "max_holdings_defaulted", "target_utilization_defaulted"):
+                "max_holdings_defaulted"):
         assert key in r.degraded
+    # 目标仓位上限是组合级可配置项，未配置取默认 0.95，属配置缺省而非降级
+    assert "target_utilization_defaulted" not in r.degraded
 
 
 def test_missing_target_utilization_uses_0019_conservative_default():
@@ -202,8 +204,20 @@ def test_missing_target_utilization_uses_0019_conservative_default():
     )
     r = derive_portfolio_quota(cfg, enabled=True)
     assert r.entitlement == D("36936000")
-    assert "target_utilization_defaulted" in r.degraded
+    assert "target_utilization_defaulted" not in r.degraded
+    assert r.status == STATUS_OK
     assert any("0.95" in x for x in r.reasons)
+
+
+def test_configured_target_utilization_overrides_default():
+    cfg = _portfolio(
+        target_utilization=D("0.80"),
+        strategies=(_strategy(max_positions=20, single_open_ratio=D("0.05")),),
+        max_holdings=20,
+    )
+    r = derive_portfolio_quota(cfg, enabled=True)
+    assert r.entitlement == D("31104000")  # 0.80 × 3888 万
+    assert r.binding == ["target_utilization"]
 
 
 def test_missing_risk_factor_does_not_relax_constraints():
@@ -279,7 +293,7 @@ def test_orm_adapter_reads_optional_fields_only():
     cfg = portfolio_quota_input_from_orm(_PS(), [_S()])
     r = derive_portfolio_quota(cfg, enabled=True)
 
-    assert r.status == STATUS_DEGRADED
+    assert r.status == STATUS_OK  # 目标仓位缺省=0.95，不再算降级
     assert r.strategies[0].single_position_limit == D("100000")
     assert r.entitlement == D("1900000")  # 95% × 200 万
     assert r.binding == ["target_utilization"]
