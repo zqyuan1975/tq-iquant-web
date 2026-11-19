@@ -1309,6 +1309,7 @@ export interface BacktestRequest {
   volume_limit_ratio?: number                   // (0,1]，run 级覆盖占比（undefined=用组合默认）
   capacity_model?: 'linear' | 'sqrt'            // 容量模型 run 级覆盖（undefined=linear 旧口径）
   capacity_impact_k?: number                    // sqrt 冲击系数（0,1]，0.05/0.10/0.20 敏感性对照
+  liquidity_caliber?: 'same_day_bar' | 'prev5d_avg'  // 成交量闸门分母（undefined=same_day_bar 旧口径）
   equity_cap?: number                           // 容量上限 run 级覆盖，>0（undefined=用组合默认）
   daily_close_peak_enabled?: boolean            // 日末 peak 保护（默认关）：仅当日最后一根 bar 更新峰值/回撤
   daily_loss_basis?: 'equity' | 'initial' | null   // 日内亏损分母 run 级覆盖（null/undefined=跟随组合）

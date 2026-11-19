@@ -237,12 +237,16 @@ _MIN_TRADE_PRICE = Decimal("0.01")
 # 收盘的「停牌/上市前」补行整行剔除，不参与成交/估值/日快照。写入 params_snapshot，
 # 旧结果（含假 bar）不与新结果混比。
 NO_TRADE_BAR_POLICY = "drop_volume0_carryforward_v1"
-# 成交量闸门流动性口径版本（2026-11-19）：旧口径 same_day_bar = 成交当根 bar 的
+# 成交量闸门流动性口径（2026-11-19）：旧口径 same_day_bar = 成交当根 bar 的
 # Volume × ratio（含当日未来信息，日线回测里等价于「当日全天量」）；新口径
 # prev5d_avg = 成交日之前 5 个有效交易日日均量 × ratio（严格不含当日、无前视，
 # 与实盘 _daily_reference_volume 同口径）。改口径会改变缩量后的成交量与收益，
 # 旧记录（缺该键）一律按 same_day_bar 解释，禁止与新结果混看。
-LIQUIDITY_CALIBER_VERSION = "prev5d_avg"
+# 默认值为 same_day_bar：不显式选新口径时与改动前逐字一致。
+LIQUIDITY_CALIBER_DEFAULT = "same_day_bar"
+LIQUIDITY_CALIBER_PREV5D = "prev5d_avg"
+LIQUIDITY_CALIBERS = (LIQUIDITY_CALIBER_DEFAULT, LIQUIDITY_CALIBER_PREV5D)
+LIQUIDITY_CALIBER_VERSION = LIQUIDITY_CALIBER_PREV5D
 # N1 多组合回测口径版本：共用「资金审批内核」（cash_allocator，80% 门槛、不做等比
 # 缩量），各组合虚拟现金独立、不跨组合划转。分配语义一变必须改版本号并判废旧结果。
 MULTI_PORTFOLIO_VERSION = "shared_cash_allocator_v1"
@@ -937,6 +941,7 @@ def build_params_snapshot(ps, dividend_mode: str = "front",
                           equity_cap=None,
                           equity_cap_mode: str = "cap",
                           capacity_model_version: str | None = None,
+                          liquidity_caliber: str = "same_day_bar",
                           daily_close_peak_enabled: bool = False,
                           daily_loss_basis: str = "equity",
                           data_start: str | None = None,
@@ -961,9 +966,13 @@ def build_params_snapshot(ps, dividend_mode: str = "front",
     # 两者都会改变历史回测的成本/成交结果，旧快照缺这两项即不可与新结果混比。
     payload["no_trade_bar_policy"] = NO_TRADE_BAR_POLICY
     payload["stamp_duty_segments"] = STAMP_DUTY_SEGMENTS_VERSION
-    # 成交量闸门流动性口径（2026-11-19）：新记录写 prev5d_avg；旧记录缺该键
-    # 即 same_day_bar（成交当根 bar 量），详情页据此显示口径标记、禁止混看。
-    payload["liquidity_caliber"] = LIQUIDITY_CALIBER_VERSION
+    # 成交量闸门流动性口径（2026-11-19，默认关闭不改历史结果）：
+    #   same_day_bar=成交当根 bar 量（旧口径，缺省/不选新选项即此值）；
+    #   prev5d_avg=前 5 个交易日日均量（显式选择才生效）。
+    # 详情页据此显示口径标记、禁止两批结果混看；旧记录缺该键视为 same_day_bar。
+    payload["liquidity_caliber"] = (
+        liquidity_caliber if liquidity_caliber in LIQUIDITY_CALIBERS
+        else "same_day_bar")
     # 费用阈值币种口径（2026-11-16 B3，已知限制）：min_commission（最低 5 元）/
     # max_order_amount / equity_cap 都以「元」为单位，而成交额 = 价格×数量；back/
     # dual 模式下记账价是**后复权价**，长区间可把价格放大数倍 → 按缩放后的金额
@@ -4697,6 +4706,13 @@ def run_backtest(db: Session, ps: PortfolioStrategy, req,
     }
     exec_flags = expand_profile(
         getattr(req, "execution_profile", None), _exec_overrides)
+    # 流动性口径（2026-11-19）：默认 same_day_bar=改动前行为；只有显式选择
+    # prev5d_avg 才启用「前 5 日日均量」分母。展开进 run_options 与快照同口径。
+    liquidity_caliber = (
+        getattr(req, "liquidity_caliber", None) or LIQUIDITY_CALIBER_DEFAULT)
+    if liquidity_caliber not in LIQUIDITY_CALIBERS:
+        liquidity_caliber = LIQUIDITY_CALIBER_DEFAULT
+    exec_flags["liquidity_caliber"] = liquidity_caliber
     exec_snapshot = snapshot_payload(exec_flags)
     _exec_realistic = exec_flags["profile"] == PROFILE_REALISTIC
     if _exec_realistic:
@@ -4725,6 +4741,7 @@ def run_backtest(db: Session, ps: PortfolioStrategy, req,
             equity_cap=equity_cap,
             equity_cap_mode=equity_cap_mode,
             capacity_model_version=capacity_version,
+            liquidity_caliber=liquidity_caliber,
             daily_close_peak_enabled=daily_close_peak_enabled,
             daily_loss_basis=daily_loss_basis,
             data_start=req.start_date,
@@ -5178,6 +5195,12 @@ def run_multi_backtest(db: Session, portfolios: list, req) -> dict:
     }
     exec_flags = expand_profile(
         getattr(req, "execution_profile", None), _exec_overrides)
+    # 流动性口径（2026-11-19）：默认 same_day_bar=改动前行为；显式选择才启用新口径
+    liquidity_caliber = (
+        getattr(req, "liquidity_caliber", None) or LIQUIDITY_CALIBER_DEFAULT)
+    if liquidity_caliber not in LIQUIDITY_CALIBERS:
+        liquidity_caliber = LIQUIDITY_CALIBER_DEFAULT
+    exec_flags["liquidity_caliber"] = liquidity_caliber
     exec_snapshot = snapshot_payload(exec_flags)
     _exec_realistic = exec_flags["profile"] == PROFILE_REALISTIC
     # 层 1 容量模型 run 级覆盖（None/非法 → linear=旧口径）
@@ -5324,7 +5347,7 @@ def run_multi_backtest(db: Session, portfolios: list, req) -> dict:
             "multi_portfolio": True,
             "multi_portfolio_version": MULTI_PORTFOLIO_VERSION,
             # 流动性口径（2026-11-19）：组内各记录同口径，缺键=旧口径 same_day_bar。
-            "liquidity_caliber": LIQUIDITY_CALIBER_VERSION,
+            "liquidity_caliber": liquidity_caliber,
         }, ensure_ascii=False, sort_keys=True),
     )
     db.add(group)

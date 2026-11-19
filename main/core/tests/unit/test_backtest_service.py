@@ -109,7 +109,7 @@ class _Req:
                  dividend_mode="front", fee_reserve_enabled=False,
                  adaptive_slippage_enabled=None, slippage_impact_coef=None,
                  bond_t0_enabled=False, bond_lot_enabled=False,
-                 daily_close_peak_enabled=False):
+                 daily_close_peak_enabled=False, liquidity_caliber=None):
         self.name = name
         self.start_date = start
         self.end_date = end
@@ -120,6 +120,7 @@ class _Req:
         self.bond_t0_enabled = bond_t0_enabled
         self.bond_lot_enabled = bond_lot_enabled
         self.daily_close_peak_enabled = daily_close_peak_enabled
+        self.liquidity_caliber = liquidity_caliber
 
 
 def _req(**kw):
@@ -2031,6 +2032,8 @@ def test_params_snapshot_round_trips_source_attributes(db_session, monkeypatch):
     rid = svc.run_backtest(db_session, ps, _req(name="snap_rt"))["record_id"]
     data = json.loads(db_session.get(BacktestRecord, rid).params_snapshot)
     assert set(data) == _SNAPSHOT_KEYS
+    # 默认不选新口径：写入 same_day_bar（与改动前一致，禁止默认走 prev5d）
+    assert data["liquidity_caliber"] == "same_day_bar"
     assert data["benchmark_index"] == ps.benchmark_index
     assert data["trading_session"] == ps.trading_session
     assert int(data["max_holdings"]) == ps.max_holdings
@@ -2057,6 +2060,38 @@ def test_params_snapshot_round_trips_source_attributes(db_session, monkeypatch):
     assert (data["equity_cap"]
             == (str(ps.equity_cap) if ps.equity_cap is not None else None))
     assert json.dumps(data, allow_nan=False)
+
+
+def test_liquidity_caliber_opt_in_prev5d_reaches_engine_and_snapshot(
+        db_session, monkeypatch):
+    """显式选择 prev5d_avg：run_options 下传引擎，快照写新口径（默认路径不变）。"""
+    ps, _ = _seed(db_session)
+    captured = {}
+
+    def _fake_run(self, portfolio, **kw):
+        captured.update(kw)
+        return _NO_TRADES_RESULT
+
+    _patch_data_layer(monkeypatch)
+    monkeypatch.setattr(svc.BacktestEngine, "run", _fake_run)
+    rid = svc.run_backtest(
+        db_session, ps, _req(name="snap_prev5d", liquidity_caliber="prev5d_avg")
+    )["record_id"]
+    data = json.loads(db_session.get(BacktestRecord, rid).params_snapshot)
+    assert data["liquidity_caliber"] == "prev5d_avg"
+    assert (captured.get("run_options") or {}).get("liquidity_caliber") == "prev5d_avg"
+
+
+def test_liquidity_caliber_invalid_value_falls_back_to_default(
+        db_session, monkeypatch):
+    """非法口径值不改变默认行为：按 same_day_bar 处理并写快照。"""
+    ps, _ = _seed(db_session)
+    _patch_data_layer(monkeypatch, _NO_TRADES_RESULT)
+    rid = svc.run_backtest(
+        db_session, ps, _req(name="snap_bad_caliber", liquidity_caliber="bogus")
+    )["record_id"]
+    data = json.loads(db_session.get(BacktestRecord, rid).params_snapshot)
+    assert data["liquidity_caliber"] == "same_day_bar"
 
 
 def test_run_backtest_fee_reserve_and_adaptive_slippage_run_level_wiring(db_session, monkeypatch):

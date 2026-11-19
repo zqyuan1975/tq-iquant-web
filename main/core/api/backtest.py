@@ -92,6 +92,10 @@ class BacktestRequest(BaseModel):
     # 残量顺延切片（v2）。k 为 sqrt 冲击系数（0.05/0.10/0.20 做敏感性对照）。
     capacity_model: str | None = None
     capacity_impact_k: float | None = None
+    # 成交量闸门流动性口径（2026-11-19，默认 None=same_day_bar 旧口径）：
+    # same_day_bar=成交当根 bar 量（改动前行为）；prev5d_avg=前 5 个交易日
+    # 日均量（显式选择才启用，与实盘同口径、无前视）。
+    liquidity_caliber: str | None = None
     # 日末 peak 保护（默认关）：开启后 peak/max_drawdown 只在当日最后一根 bar 更新，
     # 避免混合周期粗 bar 的周期末 close 污染峰值；纯 1d 行为不变
     daily_close_peak_enabled: bool = False
@@ -131,6 +135,8 @@ class MultiBacktestRequest(BaseModel):
     # 层 1 容量模型 run 级覆盖（None=linear 旧口径）
     capacity_model: str | None = None
     capacity_impact_k: float | None = None
+    # 成交量闸门流动性口径（None=same_day_bar 旧口径；prev5d_avg 需显式选择）
+    liquidity_caliber: str | None = None
 
 
 class PoolCompareRequest(BaseModel):
@@ -546,6 +552,9 @@ def _validate_backtest_request(req: BacktestRequest) -> Optional[str]:
     if (req.capacity_impact_k is not None
             and not (0 < req.capacity_impact_k <= 1)):
         return f"capacity_impact_k 须在 (0,1]，收到 {req.capacity_impact_k}"
+    if req.liquidity_caliber not in (None, "", "same_day_bar", "prev5d_avg"):
+        return (f"liquidity_caliber 仅支持 same_day_bar/prev5d_avg"
+                f"（None=same_day_bar），收到 {req.liquidity_caliber!r}")
     return None
 
 
@@ -615,6 +624,9 @@ def _validate_multi_request(req: MultiBacktestRequest) -> Optional[str]:
     if (req.capacity_impact_k is not None
             and not (0 < req.capacity_impact_k <= 1)):
         return f"capacity_impact_k 须在 (0,1]，收到 {req.capacity_impact_k}"
+    if req.liquidity_caliber not in (None, "", "same_day_bar", "prev5d_avg"):
+        return (f"liquidity_caliber 仅支持 same_day_bar/prev5d_avg"
+                f"（None=same_day_bar），收到 {req.liquidity_caliber!r}")
     return None
 
 

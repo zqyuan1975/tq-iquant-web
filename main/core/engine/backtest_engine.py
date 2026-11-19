@@ -211,13 +211,19 @@ class BacktestEngine:
         无限顺延后在几个月后按恢复日开盘价「补做」早已过期的决策。依据见常量注释。
         run_options：执行档位展开后的开关（N1，2026-11-18，默认 None=旧行为）：
         ``first_bar_no_fill``（每交易日首根 bar 不生成 BUY）/
-        ``partial_fill_enabled``（成交量上限缩量后残量回队续成交）。
+        ``partial_fill_enabled``（成交量上限缩量后残量回队续成交）/
+        ``liquidity_caliber``（成交量闸门分母：默认/缺失=``same_day_bar``
+        成交当根 bar 量，``prev5d_avg``=前 5 个交易日日均量，显式选择才生效）。
         cancel_check：K1 协作式取消（默认 None=不检查）。每根 bar 处理前调用，
         返回 True 即中止循环并返回 ``canceled=True`` + ``progress``，不产出部分结果。
         """
         run_options = run_options or {}
         _first_bar_no_fill = bool(run_options.get("first_bar_no_fill", False))
         _partial_fill = bool(run_options.get("partial_fill_enabled", False))
+        # 流动性口径（默认 same_day_bar=改动前行为，逐字不变）：只有显式选择
+        # prev5d_avg 才启用「前 5 日日均量」分母并预计算索引。
+        _liquidity_caliber = (
+            run_options.get("liquidity_caliber") or "same_day_bar")
         klines = klines or {}
         signal_cache = signal_cache if signal_cache is not None else {}
 
@@ -233,8 +239,11 @@ class BacktestEngine:
         total_bars = len(times)
         report_every = max(1, total_bars // 100)
         price_index = self._build_price_index(klines)
-        # #2 成交量闸门分母：成交日之前 5 个交易日日均量（与实盘同口径，无前视）
-        volume_ref_by_day = build_volume_ref_by_day(klines)
+        # #2 成交量闸门分母（可选新口径）：成交日之前 5 个交易日日均量
+        # （与实盘同口径，无前视）。默认口径不预计算，保持旧行为与耗时。
+        volume_ref_by_day = (
+            build_volume_ref_by_day(klines)
+            if _liquidity_caliber == "prev5d_avg" else {})
         pending_orders: List[OrderEvent] = list(initial_pending_orders or [])
         # 续跑带入的在途单：checkpoint 序列化了 pending_since 时沿用（跨段累计
         # 交易日，寿命上限不被分段重置）；旧 checkpoint 无该字段 → 以本段首根
@@ -637,13 +646,18 @@ class BacktestEngine:
                                 capacity_residual = _requested - _allowed
                             order.quantity = _allowed
                     elif portfolio.volume_limit_enabled:
-                        # 2026-11-19 口径统一：分母 = 成交日之前 5 个有效交易日
-                        # 日均成交量（股），与实盘同口径；严格不含当日（旧实现用
-                        # 成交当根 bar 量，含当日未来信息）。无历史 → fail-open。
-                        ref_volume = volume_ref_by_day.get(
-                            (order.stock_code, t.date()))
+                        if _liquidity_caliber == "prev5d_avg":
+                            # 显式选择的新口径：分母 = 成交日之前 5 个有效交易日
+                            # 日均成交量（股），与实盘同口径；严格不含当日（旧实现
+                            # 用成交当根 bar 量，含当日未来信息）。无历史 → fail-open。
+                            ref_volume = volume_ref_by_day.get(
+                                (order.stock_code, t.date()))
+                        else:
+                            # 默认口径（与改动前逐字一致）：成交当根 bar 的成交量
+                            ref_volume = price_index.get((t, period), {}).get(
+                                order.stock_code, {}).get("volume")
                         if ref_volume:
-                            # TQ Volume 单位=股（非手），cap = 占比 × 近5日均量
+                            # TQ Volume 单位=股（非手），cap = 占比 × 分母
                             cap_shares = int(
                                 portfolio.volume_limit_ratio * Decimal(int(ref_volume))
                             )
@@ -660,6 +674,18 @@ class BacktestEngine:
                                     if is_buy else cap_shares
                                 )
                                 if final_qty >= vol_lot or (not is_buy and final_qty > 0):
+                                    if _liquidity_caliber == "prev5d_avg":
+                                        _msg = (
+                                            "成交量约束：订单 %d 股 > 近5日均量口径上限 %d 股"
+                                            "（近5日均量 %s 股 ×%s），缩量至 %d 股成交"
+                                            % (order.quantity, cap_shares, ref_volume,
+                                               portfolio.volume_limit_ratio, final_qty))
+                                    else:
+                                        _msg = (
+                                            "成交量约束：订单 %d 股 > 本 bar 上限 %d 股"
+                                            "（当日成交 %s 股 ×%s），缩量至 %d 股成交"
+                                            % (order.quantity, cap_shares, ref_volume,
+                                               portfolio.volume_limit_ratio, final_qty))
                                     recorder.record(
                                         gate="volume_cap_shrink", layer="execution",
                                         action="shrink",
@@ -669,10 +695,7 @@ class BacktestEngine:
                                         bar_time=t,
                                         requested_qty=order.quantity,
                                         final_qty=final_qty,
-                                        message="成交量约束：订单 %d 股 > 近5日均量口径上限 %d 股"
-                                                "（近5日均量 %s 股 ×%s），缩量至 %d 股成交"
-                                                % (order.quantity, cap_shares, ref_volume,
-                                                   portfolio.volume_limit_ratio, final_qty),
+                                        message=_msg,
                                     )
                                     if (not is_buy
                                             and order.signal_type in _RISK_SELL_TYPES):
@@ -683,6 +706,18 @@ class BacktestEngine:
                                 else:
                                     if id(order) not in volume_defer_recorded:
                                         volume_defer_recorded.add(id(order))
+                                        if _liquidity_caliber == "prev5d_avg":
+                                            _msg = (
+                                                "成交量约束：近5日均量口径上限 %d 股不足一手"
+                                                "（近5日均量 %s 股 ×%s），订单延后至量足 bar"
+                                                % (cap_shares, ref_volume,
+                                                   portfolio.volume_limit_ratio))
+                                        else:
+                                            _msg = (
+                                                "成交量约束：本 bar 上限 %d 股不足一手"
+                                                "（当日成交 %s 股 ×%s），订单延后至量足 bar"
+                                                % (cap_shares, ref_volume,
+                                                   portfolio.volume_limit_ratio))
                                         recorder.record(
                                             gate="volume_cap_defer", layer="execution",
                                             action="defer",
@@ -691,10 +726,7 @@ class BacktestEngine:
                                             stock_code=order.stock_code,
                                             bar_time=t,
                                             requested_qty=order.quantity,
-                                            message="成交量约束：近5日均量口径上限 %d 股不足一手"
-                                                    "（近5日均量 %s 股 ×%s），订单延后至量足 bar"
-                                                    % (cap_shares, ref_volume,
-                                                       portfolio.volume_limit_ratio),
+                                            message=_msg,
                                         )
                                     deferred.append(order)
                                     continue
@@ -1033,6 +1065,9 @@ class BacktestEngine:
         run_options = run_options or {}
         _first_bar_no_fill = bool(run_options.get("first_bar_no_fill", False))
         _partial_fill = bool(run_options.get("partial_fill_enabled", False))
+        # 流动性口径：默认 same_day_bar（改动前行为），prev5d_avg 需显式选择
+        _liquidity_caliber = (
+            run_options.get("liquidity_caliber") or "same_day_bar")
         if not portfolios:
             return {}
         klines = klines or {}
@@ -1045,8 +1080,11 @@ class BacktestEngine:
         times = self._build_timeline(klines)
         price_index = self._build_price_index(klines)
         prev_close_by_day = build_prev_close_by_day(klines)
-        # #2 成交量闸门分母：成交日之前 5 个交易日日均量（与实盘同口径，无前视）
-        volume_ref_by_day = build_volume_ref_by_day(klines)
+        # #2 成交量闸门分母（可选新口径）：成交日之前 5 个交易日日均量
+        # （与实盘同口径，无前视）。默认口径不预计算，保持旧行为与耗时。
+        volume_ref_by_day = (
+            build_volume_ref_by_day(klines)
+            if _liquidity_caliber == "prev5d_avg" else {})
         first_bar_date: Dict[str, date] = {}
         for _code, _periods in klines.items():
             _dates = [
@@ -1369,10 +1407,14 @@ class BacktestEngine:
                                 capacity_residual = _requested - _allowed
                             order.quantity = _allowed
                     elif portfolio.volume_limit_enabled:
-                        # 2026-11-19 口径统一：成交日之前 5 个交易日日均量（股），
-                        # 不含当日、无前视；无历史 → fail-open。
-                        ref_volume = volume_ref_by_day.get(
-                            (order.stock_code, t.date()))
+                        if _liquidity_caliber == "prev5d_avg":
+                            # 显式选择的新口径：成交日之前 5 个交易日日均量（股），
+                            # 不含当日、无前视；无历史 → fail-open。
+                            ref_volume = volume_ref_by_day.get(
+                                (order.stock_code, t.date()))
+                        else:
+                            # 默认口径（与改动前逐字一致）：成交当根 bar 的成交量
+                            ref_volume = bar_volumes.get(order.stock_code)
                         if ref_volume:
                             cap_shares = int(
                                 portfolio.volume_limit_ratio
@@ -1395,6 +1437,15 @@ class BacktestEngine:
                                 else:
                                     if id(order) not in volume_defer_recorded:
                                         volume_defer_recorded.add(id(order))
+                                        if _liquidity_caliber == "prev5d_avg":
+                                            _msg = (
+                                                "成交量约束：近5日均量口径上限不足一手，"
+                                                "订单延后至量足 bar（近5日均量 %s 股 ×%s）"
+                                                % (ref_volume,
+                                                   portfolio.volume_limit_ratio))
+                                        else:
+                                            _msg = ("成交量约束：本 bar 上限不足一手，"
+                                                    "订单延后至量足 bar")
                                         recorder.record(
                                             gate="volume_cap_defer",
                                             layer="execution", action="defer",
@@ -1402,10 +1453,7 @@ class BacktestEngine:
                                             strategy_id=order.strategy_id,
                                             stock_code=order.stock_code,
                                             bar_time=t,
-                                            message="成交量约束：近5日均量口径上限不足一手，"
-                                                    "订单延后至量足 bar（近5日均量 %s 股 ×%s）"
-                                                    % (ref_volume,
-                                                       portfolio.volume_limit_ratio))
+                                            message=_msg)
                                     deferred.append(order)
                                     continue
                     order.bar_time = t

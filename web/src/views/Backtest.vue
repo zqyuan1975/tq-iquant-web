@@ -1293,6 +1293,7 @@ function openForm() {
     volume_limit_ratio: undefined,
     capacity_model: '',
     capacity_impact_k: '0.1',
+    liquidity_caliber: '',
     equity_cap: undefined,
     daily_close_peak_enabled: false,
     daily_loss_basis: '',
@@ -1376,6 +1377,12 @@ async function submit() {
                 ...(form.value.capacity_model === 'sqrt'
                   ? { capacity_impact_k: Number(form.value.capacity_impact_k) }
                   : {}),
+              }
+            : {}),
+          ...(form.value.liquidity_caliber
+            ? {
+                liquidity_caliber: form.value.liquidity_caliber as
+                  'same_day_bar' | 'prev5d_avg',
               }
             : {}),
     })
@@ -3945,6 +3952,14 @@ watch(theme, () => {
                   <option value="0.2">0.20（高敏感）</option>
                 </select>
                 <span class="field-suffix">冲击 = 20bps + k×√参与率（>5% 判不可成交）</span>
+              </div>
+              <div class="field-row">
+                <span class="field-label">流动性口径</span>
+                <select v-model="form.liquidity_caliber" data-field="liquidity_caliber">
+                  <option value="">默认（当日 bar 量，旧口径）</option>
+                  <option value="prev5d_avg">前 5 日均量（新口径，需显式选择）</option>
+                </select>
+                <span class="field-suffix">仅成交量闸门生效；口径写入快照，新旧结果不可混比</span>
               </div>
             </div>
           </div>
