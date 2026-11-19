@@ -63,7 +63,7 @@ const PLAYBOOK: PlaybookItem[] = [
     symptom: '委托长期处于 deferred 或审批队列 pending，未成交也未撤销。',
     checks: [
       { label: '待放行委托', detail: '健康总览 alerts.deferred_orders 按会话计数；点进实盘工作台查看具体委托。', to: '/live', linkText: '处理委托' },
-      { label: '待审批单', detail: 'alerts.pending_approvals 非 0 时需人工审批；当前工作台暂无审批界面，需调用 POST /api/live/sessions/{id}/approvals/{approval_id}/approve|reject 处理。超时过期只在会话运行中的引擎 tick 内执行。', to: '/live', linkText: '进入实盘工作台' },
+      { label: '待审批单', detail: 'alerts.pending_approvals 非 0 时到实盘工作台「待审批」页签处理：可查看标的/方向/数量/金额/策略与组合/剩余有效期，支持通过或填写原因拒绝；过期单会标记并禁用操作。超时过期只在会话运行中的引擎 tick 内执行。', to: '/live?tab=approvals', linkText: '前往审批' },
       { label: '执行为停滞', detail: '检索 gate=channel_offline，关键字填 execution_stalled（message 含「判据=execution_stalled」，ths 积压/回执未消费会触发）。', to: '/events', linkText: '检索执行事件' },
     ],
   },

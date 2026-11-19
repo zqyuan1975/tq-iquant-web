@@ -40,6 +40,7 @@ import {
   type FormulaItem, type WatchdogAlarm, type ParamsDrift, type LiveCashFlowList, type LiveCashFlowType,
 } from '../api'
 import PageHeader from '../components/PageHeader.vue'
+import ApprovalPanel from '../components/ApprovalPanel.vue'
 import { deriveBlockCode } from '../utils/blockCode'
 
 const sessions = ref<LiveSessionItem[]>([])
@@ -400,10 +401,11 @@ function snapshotHint(engine: string | null | undefined): string {
   }
   return '后台每 60s 采集一次，无需打开下单窗口'
 }
-type WbTab = 'positions' | 'orders' | 'trades' | 'decisions' | 'signals' | 'gate'
+type WbTab = 'positions' | 'orders' | 'approvals' | 'trades' | 'decisions' | 'signals' | 'gate'
 const wbTab = ref<WbTab>('positions')
+let initialTabFromQuery = false
 const TAB_LABEL: Record<WbTab, string> = {
-  positions: '持仓', orders: '委托', trades: '成交', decisions: '决策/拦截',
+  positions: '持仓', orders: '委托', approvals: '待审批', trades: '成交', decisions: '决策/拦截',
   signals: '预警信号', gate: '门控快照',
 }
 
@@ -1008,6 +1010,14 @@ async function load() {
   const running = sessions.value.filter((s) => s.status === 'running')
   const target = running.find((s) => s.id === watchedSessionId.value) || running[0] || null
   watchedSessionId.value = target ? target.id : null
+  // 健康总览「待审批」计数深链到本工作台审批页签（仅首次进入时生效，
+  // 之后用户手动切换页签不会被定时刷新抢回）。
+  if (!initialTabFromQuery) {
+    initialTabFromQuery = true
+    if (new URLSearchParams(window.location.search).get('tab') === 'approvals') {
+      wbTab.value = 'approvals'
+    }
+  }
   runningEngine.value = (target?.engine as LiveEngineKey) || null
   startEventStreams()
   if (target) {
@@ -2021,6 +2031,13 @@ onUnmounted(() => {
         <p>{{ orderRange === 'today' ? '今日暂无委托' : '该时间范围暂无委托' }}</p>
       </div>
     </div>
+
+    <!-- 待审批（人工审批队列） -->
+    <ApprovalPanel
+      v-if="wbTab === 'approvals'"
+      :session-id="watchedSessionId"
+      :running="runningSessions.some((s) => s.id === watchedSessionId)"
+    />
 
     <!-- 成交 -->
     <div v-if="wbTab === 'trades'" class="table-wrap">

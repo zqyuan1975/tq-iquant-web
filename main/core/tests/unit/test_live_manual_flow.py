@@ -190,6 +190,44 @@ def test_manual_mode_queues_buy_and_approve_submits():
     assert _query(factory, LiveApprovalQueue)[0].status == "approved"
 
 
+def test_list_approvals_includes_display_fields_and_expired_flag():
+    """列表字段（策略/组合/金额）与过期标识齐备，供工作台审批界面直接渲染。"""
+    factory, _ = _db_factory()
+    port, _ctx = _portfolio()
+    engine, _disp = _engine(factory, port, mode="manual")
+
+    db = factory()
+    try:
+        db.add(StockPool(id=1, code="POOL1", name="池"))
+        db.add(PortfolioStrategy(id=1, name="组合A", stock_pool_id=1))
+        db.add(Strategy(id=1, portfolio_id=1, name="策略A",
+                        formula_id=1, period="1m", role="independent"))
+        db.commit()
+    finally:
+        db.close()
+
+    _submit(engine, port, _order())
+
+    items = engine.list_approvals()
+    assert len(items) == 1
+    item = items[0]
+    assert item["strategy_name"] == "策略A"
+    assert item["portfolio_name"] == "组合A"
+    assert item["amount"] == float(item["price"]) * item["quantity"]
+    assert item["expired"] is False
+    assert item["created_at"] and item["expires_at"]
+
+    db = factory()
+    try:
+        row = db.query(LiveApprovalQueue).one()
+        row.expires_at = CLOCK - timedelta(seconds=1)
+        db.commit()
+    finally:
+        db.close()
+
+    assert engine.list_approvals()[0]["expired"] is True
+
+
 def test_reject_marks_rejected_and_does_not_submit():
     factory, _ = _db_factory()
     port, _ctx = _portfolio()

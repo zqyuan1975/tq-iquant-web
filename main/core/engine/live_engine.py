@@ -135,6 +135,7 @@ from core.models import (
     LiveApprovalQueue, LiveManualAction, LiveOutOfPoolDecision,
     LivePortfolioDaily,
     LiveSessionPendingChange,
+    PortfolioStrategy, Strategy,
 )
 from core.tq.formula import TQFormula
 from core.tq.utils import TDXLockTimeout
@@ -7454,7 +7455,12 @@ class LiveEngine:
                     order.quantity)
 
     def list_approvals(self) -> list:
-        """当前会话待批队列（按创建时间升序）。"""
+        """当前会话待批队列（按创建时间升序）。
+
+        2026-11-19：补列表展示所需字段（策略名/组合名/金额/是否已过期），
+        仅查询补序列化，不动表结构；队列仍只返回 pending，过期未清理的行
+        以 ``expired=true`` 标出，避免「点了通过才发现过期」。
+        """
         db = self._db_session_factory()
         try:
             rows = (
@@ -7463,7 +7469,29 @@ class LiveEngine:
                 .order_by(LiveApprovalQueue.id)
                 .all()
             )
-            return [self.serialize_approval(r) for r in rows]
+            if not rows:
+                return []
+            ps_ids = {r.portfolio_strategy_id for r in rows}
+            st_ids = {r.strategy_id for r in rows}
+            ps_names = dict(
+                db.query(PortfolioStrategy.id, PortfolioStrategy.name)
+                .filter(PortfolioStrategy.id.in_(ps_ids)).all())
+            st_names = dict(
+                db.query(Strategy.id, Strategy.name)
+                .filter(Strategy.id.in_(st_ids)).all())
+            now = self.ctx.clock()
+            items = []
+            for r in rows:
+                item = self.serialize_approval(r)
+                item["portfolio_name"] = ps_names.get(r.portfolio_strategy_id)
+                item["strategy_name"] = st_names.get(r.strategy_id)
+                item["amount"] = (
+                    float(r.price) * int(r.quantity)
+                    if r.price is not None else None)
+                item["expired"] = bool(
+                    r.expires_at is not None and now > r.expires_at)
+                items.append(item)
+            return items
         finally:
             db.close()
 

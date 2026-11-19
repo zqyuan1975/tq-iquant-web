@@ -161,7 +161,7 @@ onUnmounted(() => {
             <span class="metric-value" :style="{ color: alertTotal ? 'var(--red)' : 'var(--ink)' }">{{ alertTotal }}</span>
             <span class="metric-sub">
               未确认 {{ data.alert_totals.open_decisions }} · 顺延 {{ data.alert_totals.deferred_orders }} ·
-              待审批 {{ data.alert_totals.pending_approvals }}
+              <RouterLink to="/live?tab=approvals" class="alert-link">待审批 {{ data.alert_totals.pending_approvals }}</RouterLink>
             </span>
           </div>
           <div class="metric-card">
@@ -229,7 +229,15 @@ onUnmounted(() => {
                 <td class="num">{{ s.today.orders }} / {{ s.today.trades }}</td>
                 <td class="num">{{ s.alerts.open_decisions }}</td>
                 <td class="num">{{ s.alerts.deferred_orders }}</td>
-                <td class="num">{{ s.alerts.pending_approvals }}</td>
+                <td class="num">
+                  <RouterLink
+                    v-if="s.alerts.pending_approvals"
+                    to="/live?tab=approvals"
+                    class="alert-link"
+                    title="前往实盘工作台处理审批"
+                  >{{ s.alerts.pending_approvals }}</RouterLink>
+                  <span v-else>0</span>
+                </td>
               </tr>
             </tbody>
           </table>
@@ -298,6 +306,8 @@ onUnmounted(() => {
 .guard-list li.bad .guard-label { color: var(--red) }
 .guard-label { font-weight: 600; flex-shrink: 0 }
 .guard-detail { color: var(--ink-soft); overflow-wrap: anywhere }
+.alert-link { color: var(--accent); text-decoration: underline dotted; text-underline-offset: 2px }
+.alert-link:hover { text-decoration: underline }
 @media (max-width: 1100px) {
   .dash-hero { flex-wrap: wrap; align-items: center; row-gap: 10px; padding-bottom: 12px; margin-bottom: 14px; }
 }
