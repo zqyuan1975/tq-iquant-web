@@ -2972,6 +2972,57 @@ describe('Backtest.vue — 持续性检验 section', () => {
     expect(w.find('.p-verdict').exists()).toBe(true)
   })
 
+  it('页内切换记录（A 展开 → 返回 → B）后滚动年化图重新初始化并换用新数据', async () => {
+    // 回归点：pCollapsed 不随 openDetail 重置，详情 DOM 会重建；
+    // 若只在「展开/重算」时 init 一次，页内切记录后容器在、实例无 → 图空白。
+    const completed = [
+      { ...mockRecords[0], id: 1, name: '回测A', status: 'completed' },
+      { ...mockRecords[1], id: 2, name: '回测B', status: 'completed' },
+    ]
+    ;(getBacktestRecords as any).mockResolvedValue(completed)
+    const payloadFor = (id: number) => ({
+      status: 'completed',
+      data: {
+        status: 'completed', error: null, years: [],
+        rolling: {
+          dates: [id === 1 ? '2024-06-01' : '2025-06-01'],
+          strat_6m: [0.1], strat_12m: [id === 1 ? 0.08 : 0.09], bench_12m: [0.06],
+        },
+        benchmarks: [{ code: '000300.SH', name: '沪深300', is_main: true, available: true }],
+        verdict: { level: 'stable', reasons: [], summary: '稳定', caveat: '', signals: [], window_years: [] },
+      },
+    })
+    ;(getBacktestDetail as any).mockImplementation((id: number) => Promise.resolve({
+      ...mockDetail,
+      record: { ...mockDetail.record, id, name: id === 1 ? '回测A' : '回测B' },
+      persistence: payloadFor(id),
+    }))
+
+    const rollingInits = () => (echarts.init as any).mock.calls
+      .map((c: any[], i: number) => ({ el: c[0], inst: (echarts.init as any).mock.results[i]?.value }))
+      .filter((x: any) => x.el instanceof HTMLElement && (x.el as HTMLElement).style.height === '340px')
+
+    const w = mount(Backtest)
+    await flushPromises()
+    // 打开 A 并展开持续性检验
+    await w.findAll('button').filter(b => b.text().includes('查看'))[0].trigger('click')
+    await flushPromises()
+    await w.findAll('.section-title').find(h => h.text().includes('持续性检验'))!.trigger('click')
+    await flushPromises()
+    expect(rollingInits().length).toBe(1)
+    expect(rollingInits()[0].inst.setOption.mock.calls.at(-1)[0].xAxis.data).toEqual(['2024-06-01'])
+
+    // 页内返回列表（组件不卸载，pCollapsed 仍为展开）→ 打开 B
+    await w.findAll('button').filter(b => b.text().includes('返回'))[0].trigger('click')
+    await flushPromises()
+    await w.findAll('button').filter(b => b.text().includes('查看'))[1].trigger('click')
+    await flushPromises()
+
+    expect(rollingInits().length).toBe(2)
+    expect(rollingInits()[1].inst.setOption.mock.calls.at(-1)[0].xAxis.data).toEqual(['2025-06-01'])
+    w.unmount()
+  })
+
   it('判定基准选择器：默认主基准，切换后带 benchmark_code 重算', async () => {
     const payload = {
       status: 'completed',

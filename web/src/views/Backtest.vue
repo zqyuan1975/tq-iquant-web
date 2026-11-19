@@ -1253,6 +1253,11 @@ async function switchAcceptanceProfile(p: 'absolute' | 'relative') {
   } catch (e) {
     alert(`切换口径失败：${errMsg(e)}`)
   }
+  // 口径切换会替换 detail（主图/危机/持续性的数据源都变），需按当前展开状态重绘
+  await nextTick()
+  initCharts()
+  if (!mrCollapsed.value) initMrCharts()
+  if (!pCollapsed.value) renderPRolling()
 }
 
 // ===== 1.3.1 同步持仓股到通达信自选 =====
@@ -1428,8 +1433,10 @@ async function togglePSection() {
 function renderPRolling() {
   const el = pRollingEl.value
   const d = pData.value
-  if (!el || !d?.rolling?.dates?.length) return
+  // 先释放旧实例：切到「无滚动数据 / 无 payload」的记录时也不会把 canvas 留在已销毁节点上
   pRollingChart?.dispose()
+  pRollingChart = null
+  if (!el || !d?.rolling?.dates?.length) return
   pRollingChart = echarts.init(el)
   pRollingChart.setOption({
     tooltip: { trigger: 'axis', valueFormatter: (v: any) => (v == null ? '-' : (v * 100).toFixed(2) + '%') },
@@ -1444,6 +1451,17 @@ function renderPRolling() {
     ],
   })
 }
+
+// 页内切记录不会卸载 Backtest.vue，pCollapsed 保持展开；此时详情 DOM 会重建，
+// 但 canvas 只在「展开/重算」时初始化过一次。数据源变化后必须按当前可见状态重绘，
+// 否则容器在、图表实例绑在已销毁的节点上 → 空白。
+// （离开回测页再进会重新挂载组件、pCollapsed 回到折叠态，展开时重新 init，故看起来恢复了。）
+watch(
+  () => pData.value,
+  () => {
+    if (!pCollapsed.value) nextTick(renderPRolling)
+  },
+)
 
 // ===== 市场状态×绩效分析（机遇Alpha / 中性Alpha）=====
 const mrCollapsed = ref(true)
@@ -1875,6 +1893,9 @@ async function recomputeRb() {
       : `重新计算未完成：${res.error || res.status}`
     rbRecomputeWarn.value = res.status !== 'completed'
     detail.value = await getBacktestDetail(id, acceptanceProfile.value)
+    await nextTick()
+    if (!rbCollapsed.value && rbOk.value) initRbHistChart()
+    if (!pCollapsed.value) renderPRolling()
   } catch (e) {
     rbRecomputeMsg.value = `重新计算失败：${errMsg(e)}`
     rbRecomputeWarn.value = true
@@ -3160,6 +3181,8 @@ function handleResize() {
   stQuadChart?.resize()
   iaExpChart?.resize()
   rbHistChart?.resize()
+  pRollingChart?.resize()
+  recordCompareChart?.resize()
 }
 
 let disposeNavReselect: (() => void) | null = null
@@ -3212,6 +3235,7 @@ watch(theme, () => {
     nextTick(() => {
       initCharts()
       if (!mrCollapsed.value) initMrCharts()
+      if (!pCollapsed.value) renderPRolling()
       if (showRecordCompare.value && recordCompareData.value) renderRecordCompareChart()
     })
   }, 60)
