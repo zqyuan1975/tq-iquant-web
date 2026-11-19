@@ -1949,6 +1949,8 @@ _SNAPSHOT_KEYS = {
     "corporate_actions",
     # 时点股票池（J7）+ 执行档位（N1，2026-11-18）：未启用/legacy 时同样写块
     "pool_timeline", "execution",
+    # 回测/实盘桥复权口径冻结（J3，21c011d）：始终写块，含版本与 aligned_with_live
+    "price_caliber",
 }
 
 _NO_TRADES_RESULT = {
