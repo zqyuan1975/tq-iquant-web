@@ -23,6 +23,10 @@ class BacktestDailySnapshot(Base):
     gate_state = Column(Integer, nullable=True)
     gate_strength = Column(Integer, nullable=True)
     positions_json = Column(Text, nullable=True)
+    # 资金池（0021 A5）：仅 capital_pool.enabled=true 的 run 才写入；
+    # 默认关闭/旧记录为 NULL，读侧按 NULL 兜底，不影响任何既有口径。
+    capital_pool_version = Column(String(40), nullable=True)
+    entitlement_json = Column(Text, nullable=True)
     created_at = Column(DateTime, server_default=func.now())
 
     __table_args__ = (

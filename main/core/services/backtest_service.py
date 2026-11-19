@@ -77,6 +77,10 @@ from core.engine.industry_attribution import (
 )
 from core.engine.robustness import compute_robustness
 from core.engine.decision import summarize_decisions, summarize_decisions_yearly
+from core.engine.capital_contracts import (
+    CapitalPoolSwitches,
+    build_capital_pool_version,
+)
 from core.services.oos_gate import evaluate_oos_gate
 from core.engine.portfolio_builder import (
     assemble_portfolio as _assemble_portfolio,
@@ -1078,6 +1082,10 @@ def build_params_snapshot(ps, dividend_mode: str = "front",
         "adaptive_slippage_enabled": False,
         "daily_close_peak_enabled": False,
     }
+    # 资金池（0021 A5）：开关开启才冻结版本口径；关闭（默认）不写该键，
+    # 保证旧快照逐位一致。额度快照 entitlement_json 由 B3 接入后随快照写入。
+    if CapitalPoolSwitches.from_config(load_config() or {}).capital_pool_enabled:
+        payload["capital_pool"] = build_capital_pool_version()
     return json.dumps(payload, ensure_ascii=False, sort_keys=True)
 
 
@@ -2955,6 +2963,9 @@ def _persist_result(
                 json.dumps(snap["positions"], default=str)
                 if snap.get("positions") is not None else None
             ),
+            # 资金池（0021 A5）：引擎未接入时为 None（列可空），默认路径不变
+            capital_pool_version=snap.get("capital_pool_version"),
+            entitlement_json=snap.get("entitlement_json"),
         ))
     ev = result.get("evaluations") or {}
     db.add(BacktestEvaluation(
@@ -3015,6 +3026,9 @@ def _persist_result(
             requested_qty=d.get("requested_qty"),
             final_qty=d.get("final_qty"),
             message=msg if len(msg) <= 200 else msg[:199] + "…",
+            # 资金池（0021 A5）：引擎未接入时为 None（列可空）
+            capital_pool_version=d.get("capital_pool_version"),
+            entitlement_json=d.get("entitlement_json"),
         ))
 
     # params_snapshot 落策略级参数（2026-11-16 P1）：此前本函数收了 strategies 却未落库，

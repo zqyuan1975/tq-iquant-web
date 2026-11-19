@@ -44,6 +44,10 @@ class BacktestDecisionEvent(_DecisionEventColumns, Base):
     backtest_record_id = Column(
         Integer, ForeignKey("backtest_records.id", ondelete="CASCADE"), nullable=False
     )
+    # 资金池（0021 A5）：仅回测事件带版本与额度快照，可空；默认关闭恒为 NULL。
+    # 不放进共享 Mixin——live_decision_events 在本期不增列（阶段 A 不碰实盘）。
+    capital_pool_version = Column(String(40), nullable=True)
+    entitlement_json = Column(String(4000), nullable=True)
 
     __table_args__ = (
         Index("ix_bt_decisions_rec_gate", "backtest_record_id", "gate"),

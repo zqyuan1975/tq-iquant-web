@@ -3226,3 +3226,65 @@ export async function rebuildIncremental(
   })
   return res.data.data
 }
+
+// ---------------------------------------------------------------------------
+// 资金池额度推导（0021 A4，GET /capital/derive）— 只读，默认关闭
+// ---------------------------------------------------------------------------
+export interface CapitalVersionInfo {
+  capital_pool_version: string
+  quota_algo_version: string
+  defaults: Record<string, unknown>
+}
+
+// 单条额度约束：金额为 Decimal 序列化字符串（可能为 null）
+export interface CapitalLimitItem {
+  key: string
+  label: string
+  amount: string | null
+  source: string
+  formula: string
+  degraded: boolean
+}
+
+export interface CapitalStrategyQuota {
+  strategy_id: number | null
+  status: string  // ok|degraded|not_derivable|disabled
+  fund: string | null
+  single_position_limit: string | null
+  gross_quota: string | null
+  entitlement: string | null
+  risk_factor: string | null
+  limits: CapitalLimitItem[]
+  binding: string[]
+  degraded: string[]
+  warnings: string[]
+  reasons: string[]
+}
+
+export interface CapitalQuotaDerivation {
+  enabled: boolean
+  status: string  // disabled|ok|degraded|not_derivable
+  portfolio_id?: number
+  equity?: string | null
+  effective_equity?: string | null
+  gross_limit?: string | null
+  entitlement?: string | null
+  headroom?: string | null
+  risk_factor?: string | null
+  utilization_cap?: string | null
+  binding?: string[]
+  limits?: CapitalLimitItem[]
+  strategies?: CapitalStrategyQuota[]
+  warnings?: string[]
+  reasons: string[]
+  version: CapitalVersionInfo
+}
+
+export async function getCapitalDerive(params: {
+  portfolio_id: number
+  equity?: number
+  gross_exposure?: number
+}) {
+  const res = await api.get<ApiResponse<CapitalQuotaDerivation>>('/capital/derive', { params })
+  return res.data.data
+}

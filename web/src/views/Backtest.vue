@@ -9,6 +9,7 @@ import {
   compareBacktestRecords,
   replaySignals,
   sendUserBlock,
+  getCapitalDerive,
 } from '../api'
 import type {
   BacktestRecordItem, BacktestDetailItem, PortfolioItem,
@@ -24,6 +25,7 @@ import type {
   BacktestRobustnessItem, BacktestGateResult, AcceptanceResult,
   ValidationVerdict,
   DataQuality, DataQualityPeriod,
+  CapitalQuotaDerivation,
 } from '../api'
 import { gateLabel, LAYER_LABEL, ACTION_LABEL } from '../utils/liveEvents'
 import { deriveBlockCode } from '../utils/blockCode'
@@ -129,6 +131,49 @@ const errorMsg = ref('')
 const acceptanceProfile = ref<'absolute' | 'relative'>('absolute')
 const acceptance = computed<AcceptanceResult | null>(() => detail.value?.acceptance ?? null)
 const showAcceptance = ref(false)
+
+// ===== 资金池额度推导（0021 A4，只读；按钮触发，避免进详情即发请求）=====
+const capitalDerive = ref<CapitalQuotaDerivation | null>(null)
+const capitalDeriveLoading = ref(false)
+const capitalDeriveError = ref('')
+const capitalDeriveNotDerivable = ref('')
+const CAPITAL_BINDING_LABEL: Record<string, string> = {
+  sum_strategy_gross: '策略毛额度之和',
+  max_holdings: '持仓数量上限',
+  target_utilization: '目标仓位上限',
+  equity_cap: '权益上限',
+  single_open_ratio: '单仓目标',
+  max_order_amount: '单笔绝对上限',
+  max_order_pct_equity: '单笔权益比例上限',
+  max_single_position_pct: '单票集中度上限',
+}
+function capitalBindingLabel(key: string): string {
+  return CAPITAL_BINDING_LABEL[key] || key
+}
+
+async function loadCapitalDerive() {
+  const pid = currentRecord.value?.portfolio_strategy_id
+  if (!pid) {
+    capitalDeriveError.value = '当前记录缺少组合信息，无法查询额度推导'
+    return
+  }
+  capitalDeriveLoading.value = true
+  capitalDeriveError.value = ''
+  capitalDeriveNotDerivable.value = ''
+  try {
+    capitalDerive.value = await getCapitalDerive({ portfolio_id: pid })
+  } catch (e) {
+    capitalDerive.value = null
+    const body = (e as any)?.response?.data
+    if (body?.code === 422) {
+      capitalDeriveNotDerivable.value = body.message || '当前配置下不可推导'
+    } else {
+      capitalDeriveError.value = errMsg(e)
+    }
+  } finally {
+    capitalDeriveLoading.value = false
+  }
+}
 
 // echarts 实例（净值 + 回撤）
 const equityChartEl = ref<HTMLDivElement | null>(null)
@@ -1409,6 +1454,9 @@ async function openDetail(id: number) {
     detail.value = await getBacktestDetail(id, 'relative')
   }
   currentRecord.value = detail.value?.record || null
+  capitalDerive.value = null
+  capitalDeriveError.value = ''
+  capitalDeriveNotDerivable.value = ''
   selectedKey.value = null
   caCollapsed.value = true
   mrCollapsed.value = true
@@ -2358,6 +2406,9 @@ async function onCancel(id: number) {
 function backToList() {
   currentRecord.value = null
   detail.value = null
+  capitalDerive.value = null
+  capitalDeriveError.value = ''
+  capitalDeriveNotDerivable.value = ''
   // 详情页共 20+ 个图表实例，全部随详情销毁——只 dispose 两个会残留
   // 其余实例（模块级变量仍持有），反复进出详情会累积泄漏。
   disposeAllCharts()
@@ -4081,6 +4132,93 @@ watch(theme, () => {
               title="口径：本次回测交易明细涉及的股票（去重）——详情无最终持仓快照；写入通达信自选板块；覆盖写入板块">
         🔗 同步持仓股到通达信自选
       </button>
+    </div>
+
+    <!-- 资金池额度推导（0021 A4）：只读，默认关闭，仅展示不参与交易 -->
+    <div class="card" style="margin-top:12px;padding:14px">
+      <div style="display:flex;align-items:center;gap:8px;margin-bottom:10px;flex-wrap:wrap">
+        <span style="font-weight:600;font-size:14px">💰 资金池额度推导（只读）</span>
+        <span style="font-size:12px;color:var(--ink-soft)">默认关闭；仅展示，不参与交易</span>
+        <button class="btn btn-sm" style="margin-left:auto"
+                :disabled="capitalDeriveLoading || !currentRecord.portfolio_strategy_id"
+                @click="loadCapitalDerive">
+          {{ capitalDeriveLoading ? '查询中…' : (capitalDerive ? '刷新' : '查询额度') }}
+        </button>
+      </div>
+
+      <p v-if="capitalDeriveError" class="ca-msg ca-warn">{{ capitalDeriveError }}</p>
+
+      <div v-if="capitalDeriveNotDerivable"
+           style="padding:10px 12px;border-radius:6px;border:1px solid var(--red);font-size:13px;color:var(--red)">
+        不可推导：{{ capitalDeriveNotDerivable }}
+      </div>
+
+      <p v-else-if="!capitalDerive" style="font-size:12px;color:var(--ink-soft);margin:0">
+        按当前回测记录的组合展示额度推导结果（只读）。资金池开关默认关闭。
+      </p>
+
+      <p v-else-if="capitalDerive.enabled === false" style="font-size:13px;color:var(--ink-soft);margin:0">
+        <b>未启用</b>：资金池开关关闭（capital_pool.enabled=false），不计算额度。
+        <span v-if="capitalDerive.reasons.length">原因：{{ capitalDerive.reasons.join('；') }}</span>
+      </p>
+
+      <template v-else>
+        <div style="display:flex;flex-wrap:wrap;gap:18px;font-size:13px;margin-bottom:10px">
+          <span>组合额度 <b>{{ fmtMoney(capitalDerive.entitlement) }}</b></span>
+          <span>目标利用率上限 <b>{{ fmtPct(capitalDerive.utilization_cap) }}</b></span>
+          <span v-if="capitalDerive.headroom !== null && capitalDerive.headroom !== undefined">
+            当前缺口 <b>{{ fmtMoney(capitalDerive.headroom) }}</b>
+          </span>
+          <span v-if="capitalDerive.binding && capitalDerive.binding.length">
+            被约束卡住 <b>{{ capitalDerive.binding.map(capitalBindingLabel).join('、') }}</b>
+          </span>
+          <span style="color:var(--ink-soft)">状态 {{ capitalDerive.status }}</span>
+        </div>
+
+        <div class="section-title" style="font-size:13px">约束项</div>
+        <table v-if="capitalDerive.limits && capitalDerive.limits.length">
+          <thead><tr>
+            <th>约束</th><th>金额</th><th>来源</th><th>计算过程</th><th>降级</th>
+          </tr></thead>
+          <tbody>
+            <tr v-for="l in capitalDerive.limits" :key="l.key">
+              <td>{{ l.label }}<span style="color:var(--ink-soft)">（{{ l.key }}）</span></td>
+              <td>{{ fmtMoney(l.amount) }}</td>
+              <td>{{ l.source }}</td>
+              <td>{{ l.formula }}</td>
+              <td>{{ l.degraded ? '是' : '—' }}</td>
+            </tr>
+          </tbody>
+        </table>
+        <p v-else style="font-size:12px;color:var(--ink-soft)">无约束项</p>
+
+        <div class="section-title" style="font-size:13px">策略额度</div>
+        <table v-if="capitalDerive.strategies && capitalDerive.strategies.length">
+          <thead><tr>
+            <th>策略</th><th>状态</th><th>策略资金</th><th>单仓上限</th><th>毛额度</th><th>被约束卡住</th>
+          </tr></thead>
+          <tbody>
+            <tr v-for="s in capitalDerive.strategies" :key="String(s.strategy_id)">
+              <td>#{{ s.strategy_id }}</td>
+              <td>{{ s.status }}</td>
+              <td>{{ fmtMoney(s.fund) }}</td>
+              <td>{{ fmtMoney(s.single_position_limit) }}</td>
+              <td>{{ fmtMoney(s.gross_quota) }}</td>
+              <td>{{ (s.binding || []).map(capitalBindingLabel).join('、') || '—' }}</td>
+            </tr>
+          </tbody>
+        </table>
+        <p v-else style="font-size:12px;color:var(--ink-soft)">无策略额度</p>
+
+        <p v-if="capitalDerive.warnings && capitalDerive.warnings.length"
+           style="font-size:12px;color:var(--ink-soft);margin:8px 0 0">
+          降级：{{ capitalDerive.warnings.join('、') }}
+        </p>
+        <p v-if="capitalDerive.reasons && capitalDerive.reasons.length"
+           style="font-size:12px;color:var(--ink-soft);margin:4px 0 0">
+          说明：{{ capitalDerive.reasons.join('；') }}
+        </p>
+      </template>
     </div>
 
     <!-- 回测告警：completed 但存在行情跳过/公式报错/输出线缺失/区间零信号 -->
