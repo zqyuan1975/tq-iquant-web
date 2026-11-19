@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import date
 from decimal import Decimal
 from typing import Any, Dict, List, Optional, Sequence
 
@@ -64,6 +65,7 @@ class UtilizationPoint:
     equity: Optional[Decimal] = None
     drawdown: Optional[Decimal] = None
     gate_closed: bool = False
+    snap_date: Optional[date] = None
 
 
 @dataclass(frozen=True)
@@ -125,6 +127,7 @@ def _filter_points(
             equity=_to_decimal(p.equity),
             drawdown=_to_decimal(p.drawdown),
             gate_closed=bool(p.gate_closed),
+            snap_date=p.snap_date,
         ))
 
     if exclude_first_days > 0 and len(valid) > exclude_first_days:
@@ -412,4 +415,148 @@ def derive_lendable(
         cash=cash_d, equity=equity_d, own_need_cash=need, cash_floor=floor,
         in_flight_buy=in_flight, protect=protect, lendable=lendable,
         threshold=threshold, degraded=degraded, reasons=reasons,
+    )
+
+
+# ---------------------------------------------------------------------------
+# C2：历史利用率统计（只读、可复算）
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class UtilizationStats:
+    """利用率序列的分位统计（C2，不参与外借决策，仅供评估展示）。"""
+
+    status: str
+    samples: int
+    window: int
+    u_mean: Optional[Decimal]
+    u_p50: Optional[Decimal]
+    u_p90: Optional[Decimal]
+    u_p95: Optional[Decimal]
+    u_max: Optional[Decimal]
+    u_min: Optional[Decimal]
+    u_current: Optional[Decimal]
+    excluded: Dict[str, int] = field(default_factory=dict)
+    degraded: List[str] = field(default_factory=list)
+    reasons: List[str] = field(default_factory=list)
+    series: List[Dict[str, Any]] = field(default_factory=list)
+
+    def to_dict(self) -> Dict[str, Any]:
+        data = {
+            "status": self.status,
+            "samples": self.samples,
+            "window": self.window,
+            "u_mean": _dec_str(self.u_mean),
+            "u_p50": _dec_str(self.u_p50),
+            "u_p90": _dec_str(self.u_p90),
+            "u_p95": _dec_str(self.u_p95),
+            "u_max": _dec_str(self.u_max),
+            "u_min": _dec_str(self.u_min),
+            "u_current": _dec_str(self.u_current),
+            "excluded": dict(self.excluded),
+            "degraded": list(self.degraded),
+            "reasons": list(self.reasons),
+        }
+        if self.series:
+            data["series"] = list(self.series)
+        return data
+
+
+def build_utilization_points(
+    rows: Sequence[Dict[str, Any]],
+    *,
+    gate_closed_states: Sequence[int] = (-1,),
+) -> List[UtilizationPoint]:
+    """把日序列行装成 ``UtilizationPoint``（C2）。
+
+    行键：``total_value`` / ``market_value`` 必填；``snap_date`` 与
+    ``gate_state`` 可选。市值缺失或总资产 ≤0 的行记 ``invalid``（由
+    ``summarize_utilization`` 计入 excluded），不臆造 0 利用率。
+
+    回撤按「行内总资产的滚动峰值」现算，不用外部前视字段；门控状态取
+    右移后的生效值（``gate_state`` 为 -1 视为关闭）。
+    """
+    points: List[UtilizationPoint] = []
+    peak: Optional[Decimal] = None
+    closed = set(gate_closed_states)
+    for row in rows:
+        total = _to_decimal(row.get("total_value"))
+        market = _to_decimal(row.get("market_value"))
+        if total is None or market is None or total <= 0:
+            points.append(UtilizationPoint(
+                utilization=Decimal("-1"),
+                equity=total,
+                snap_date=row.get("snap_date"),
+            ))
+            continue
+        peak = total if peak is None or total > peak else peak
+        drawdown = (peak - total) / peak if peak and peak > 0 else Decimal(0)
+        points.append(UtilizationPoint(
+            utilization=max(Decimal(0), market / total),
+            equity=total,
+            drawdown=drawdown,
+            gate_closed=row.get("gate_state") in closed,
+            snap_date=row.get("snap_date"),
+        ))
+    return points
+
+
+def summarize_utilization(
+    points: Sequence[UtilizationPoint],
+    *,
+    window: int = DEFAULT_WINDOW,
+    min_samples: int = DEFAULT_MIN_SAMPLES,
+    exclude_first_days: int = DEFAULT_EXCLUDE_FIRST_DAYS,
+    equity_jump_threshold: Any = DEFAULT_EQUITY_JUMP_THRESHOLD,
+    include_gate_closed: bool = False,
+    include_series: bool = False,
+) -> UtilizationStats:
+    """历史利用率分位（C2）：与 C1 预留共用同一套过滤口径，保证可复算。
+
+    样本不足只降级（``no_history``），不返回 422——评估侧要能展示「数据不够」，
+    而不是让整页失败。
+    """
+    kept, excluded = _filter_points(
+        points,
+        window=window,
+        include_gate_closed=include_gate_closed,
+        exclude_first_days=exclude_first_days,
+        equity_jump_threshold=_to_decimal(equity_jump_threshold)
+        or DEFAULT_EQUITY_JUMP_THRESHOLD,
+    )
+    us = [p.utilization for p in kept]
+    n = len(us)
+    if n == 0:
+        return UtilizationStats(
+            status=STATUS_NO_HISTORY, samples=0, window=window,
+            u_mean=None, u_p50=None, u_p90=None, u_p95=None, u_max=None,
+            u_min=None, u_current=None, excluded=excluded,
+            degraded=["no_history"],
+            reasons=["无可用的总资产/持仓市值样本，无法计算利用率分位"],
+        )
+
+    mean = sum(us) / Decimal(n)
+    degraded: List[str] = []
+    reasons: List[str] = ["分位口径与 C1 一致（线性插值），可用原始序列复算"]
+    if n < min_samples:
+        degraded.append("no_history")
+        reasons.append("有效样本 %d < 最小样本 %d，分位仅供参考，不用于外借"
+                       % (n, min_samples))
+
+    return UtilizationStats(
+        status=STATUS_DEGRADED if degraded else STATUS_OK,
+        samples=n, window=window,
+        u_mean=mean,
+        u_p50=_percentile(us, Decimal("0.5")),
+        u_p90=_percentile(us, Decimal("0.9")),
+        u_p95=_percentile(us, Decimal("0.95")),
+        u_max=max(us), u_min=min(us), u_current=us[-1],
+        excluded=excluded, degraded=degraded, reasons=reasons,
+        series=([
+            {"date": p.snap_date.isoformat() if p.snap_date else None,
+             "utilization": _dec_str(p.utilization),
+             "equity": _dec_str(p.equity),
+             "drawdown": _dec_str(p.drawdown)}
+            for p in kept
+        ] if include_series else []),
     )
