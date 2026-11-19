@@ -186,6 +186,19 @@ function cashFlowDirection(f: { flow_type: string; amount: string | number }): s
 
 // C1：当前被占用的引擎（running/stopping）→ 建会话下拉置灰 + 显示占用方
 const occupants = computed(() => engineOccupants(sessions.value))
+// 分钟级策略提示：组合含日线以下周期时，实盘 1m 由快照合成，与回测 TQ 原生 1m 不等价。
+const MINUTE_LIVE_PERIODS = ['1m', '5m', '15m', '30m', '1h']
+const minuteLivePeriods = computed(() => {
+  const hit = new Set<string>()
+  for (const p of portfolios.value as any[]) {
+    for (const s of ((p as any)?.strategies || [])) {
+      const period = String(s?.period || '')
+      if (MINUTE_LIVE_PERIODS.includes(period)) hit.add(period)
+    }
+  }
+  return Array.from(hit).sort()
+})
+const minuteNoticeDismissed = ref(false)
 // C4：多账户并行横幅文案（<2 个 running 或同账户 → null）
 const multiAccountBanner = computed(() => multiAccountBannerText(sessions.value))
 // 重置窗口：交易日 15:00 前禁用（后端 403 兜底半日市/临时休市）
@@ -1810,6 +1823,22 @@ onUnmounted(() => {
   <div v-if="createWarnings.length" class="card create-warning-banner" data-test="create-warnings">
     <div v-for="w in createWarnings" :key="w">{{ w }}</div>
     <button class="btn btn-sm" @click="createWarnings = []">关闭</button>
+  </div>
+
+  <!-- 分钟级口径提示：不阻断任何操作，可关闭；只提示不改装配 -->
+  <div v-if="minuteLivePeriods.length && !minuteNoticeDismissed" class="card minute-live-banner"
+       data-test="minute-live-banner">
+    <div>
+      <strong>分钟级策略：实盘用快照合成 bar，与回测 TQ 原生 1m 不等价</strong>
+      <div class="minute-live-body">
+        当前组合含 {{ minuteLivePeriods.join(' / ') }} 周期。实盘 1m 由行情快照合成
+        （约 5–30s 采样、60s 发布、只发已完成 bar）：缺采样会整根丢 bar，恢复后首根可能是半根，
+        成交量按日累计差分、跨分钟边界会串位。成交按信号 bar 收盘价挂限价且默认不追价，
+        实测约 7.2% 买单 / 7.9% 卖单在信号价无成交，成交均价系统性劣于回测（回测按下一根开盘必成交）。
+        回测绑定只是绑定关系，不继承策略 / 周期 / 风控执行时点 / 追价 / 单笔上限 / 复权口径。
+      </div>
+    </div>
+    <button class="btn btn-sm" @click="minuteNoticeDismissed = true">关闭</button>
   </div>
 
   <!-- C4 多账户并行提示：不阻断任何操作，可关闭 -->
@@ -3486,6 +3515,21 @@ onUnmounted(() => {
   border-left: 4px solid var(--orange, #e67e22);
   background: rgba(230, 126, 34, 0.08);
 }
+/* 分钟级实盘口径提示：与回测不等价（只提示，不改装配） */
+.minute-live-banner {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 14px;
+  margin-bottom: 12px;
+  font-size: 12px;
+  line-height: 1.6;
+  border-left: 4px solid var(--amber, #d48806);
+  background: rgba(212, 136, 6, 0.08);
+}
+.minute-live-banner strong { display: block; margin-bottom: 4px; }
+.minute-live-body { color: var(--ink-soft); }
 /* 引擎下拉占用引导（C1） */
 .engine-occupied-hint {
   display: flex;

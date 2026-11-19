@@ -41,6 +41,8 @@ const strategyForm = ref<Record<string, any>>(emptyStrategyForm())
 // 14:50 定信号 + 14:52 bar 开盘价报单）；1w/1mon 走通达信注入（仅周期末）。
 // 60m 两端都不认。
 const PERIODS = ['1m', '5m', '15m', '30m', '1h', '1d', '1w', '1mon']
+// 日线以下周期：实盘 1m 由快照合成、回测用 TQ 原生 1m，两端不等价（见配置指南第四节）
+const MINUTE_PERIODS = ['1m', '5m', '15m', '30m', '1h']
 // 基准指数可选集（TQ 指数日线可取，与回测页基准 guard 同集合；默认上证指数）
 const BENCHMARK_OPTIONS = BENCHMARKS
 const ROLES = [
@@ -1061,6 +1063,16 @@ onMounted(loadPortfolios)
         </div>
 
         <div class="modal-body">
+          <div v-if="MINUTE_PERIODS.includes(strategyForm.period)" class="minute-live-notice"
+               data-test="minute-live-notice">
+            <strong>分钟级周期：实盘与回测口径不等价</strong>
+            <p>回测用 TQ 原生 1 分钟线；实盘（tdx/ths/alert/goldminer）的 1m 由行情快照合成
+              （约 5–30s 采样、60s 发布、只发已完成 bar）。因此：缺采样会整根丢 bar；
+              恢复后首根可能是半根但仍标为 1m；成交量按快照日累计差分，边界可能串到下一分钟。</p>
+            <p>成交口径也不同：回测按下一根 bar 开盘价必成交；实盘按信号 bar 收盘价挂限价、
+              默认不追价，实测约 7.2% 买单 / 7.9% 卖单当根无成交，成交均价系统性劣于回测。
+              详见「配置指南 → 四、分钟级周期与实盘口径」。</p>
+          </div>
           <div v-for="g in STRATEGY_GROUPS" :key="g.title">
             <label class="group-label">{{ g.title }}<span v-if="g.hint" class="group-hint">{{ g.hint }}</span></label>
             <div class="field-grid">
@@ -1141,6 +1153,28 @@ onMounted(loadPortfolios)
                 independent=按自身信号。</p>
             </div>
           </div>
+          <div class="form-group">
+            <label class="group-label">四、分钟级周期与实盘口径</label>
+            <div class="guide-block">
+              <p class="guide-step"><b>数据源不同源</b>：回测 1m 直接取 TQ 历史 1 分钟线（本地 vipdoc 文件）；
+                实盘 tdx/ths/alert/goldminer 通道的 1m 由行情快照按约 5–30s 采样合成、60s 发布，
+                只发布已完成 bar。同一分钟的开高低收为采样首末价/极值，不是真实分钟 OHLC。</p>
+              <p class="guide-step"><b>缺口与半根 bar</b>：取数失败或采样停摆会让整分钟无 bar
+                （日志 <code>[bar-gap] … unrecoverable</code>），不会回补；恢复后第一根可能只有
+                十几秒数据，但仍按完整 1m bar 发布。多分钟周期只输出完整桶，缺一分钟整桶丢弃。</p>
+              <p class="guide-step"><b>成交量口径</b>：合成 bar 的 volume = 快照日累计成交量差分，
+                跨分钟边界时相邻 bar 的量会串位；回测为真实分钟成交量。两者总量一致、单根分布不同。</p>
+              <p class="guide-step"><b>成交时点与价格</b>：回测在信号 bar 的下一根 bar 开盘价成交（必成交）；
+                实盘以信号 bar 收盘价挂限价，默认不追价，未成交走 180s 超时撤单（追价需显式开启）。
+                实测同一分钟内约 7.2% 买单 / 7.9% 卖单在信号价上无成交，成交均价系统性劣于回测。</p>
+              <p class="guide-step"><b>回测绑定 ≠ 参数继承</b>：实盘会话绑定回测记录只是绑定关系，
+                启动时按当前组合/策略行重建；<b>不继承</b>策略、周期、风控执行时点（risk_timing）、
+                追价开关、单笔金额上限、复权口径。分钟策略的「次日执行」在实盘对分钟 bar 不生效
+                （该分支只认日线 00:00 的 signal_bar_date）。</p>
+              <p class="guide-step"><b>结论</b>：分钟级实盘结果仅可作方向性参考，不能按回测收益/回撤
+                线性外推；同参数下实盘成交率更低、成交均价更差、bar 更稀疏。</p>
+            </div>
+          </div>
         </div>
         <div class="modal-actions">
           <button @click="showStrategyGuide = false" class="btn btn-primary">知道了</button>
@@ -1152,6 +1186,13 @@ onMounted(loadPortfolios)
 
 <style scoped>
 .group-hint { margin-left: 8px; font-size: 11px; font-weight: 400; color: var(--ink-faint); }
+.minute-live-notice {
+  margin-bottom: 12px; padding: 10px 12px; border-radius: 6px;
+  border: 1px solid var(--amber, #d48806); background: rgba(212, 136, 6, 0.08);
+  font-size: 12px; line-height: 1.6; color: var(--ink-soft);
+}
+.minute-live-notice strong { display: block; margin-bottom: 4px; color: var(--ink); }
+.minute-live-notice p { margin: 4px 0 0; }
 /* 带说明/行内错误的字段：说明与错误各占一行，避免挤占输入框宽度 */
 .field-row--hinted { flex-wrap: wrap; }
 .field-hint--below { flex: 1 0 100%; margin-top: -2px; }

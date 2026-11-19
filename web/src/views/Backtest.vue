@@ -3728,6 +3728,19 @@ watch(theme, () => {
       {{ errorMsg }}
     </div>
 
+    <!-- 分钟级口径提示：回测用 TQ 原生 1m，实盘用快照合成；绑定不继承参数 -->
+    <div class="card minute-parity-note" data-test="minute-parity-note">
+      <strong>分钟级（日线以下周期）回测结果不能直接等同于实盘</strong>
+      <div>
+        回测 1m 直接取 TQ 历史分钟线；实盘（tdx/ths/alert/goldminer）的 1m 由行情快照合成
+        （约 5–30s 采样、60s 发布）：缺采样会整根丢 bar、恢复后首根可能是半根、成交量按日累计差分
+        且跨分钟边界会串位。成交口径：回测按下一根 bar 开盘价必成交，实盘按信号 bar 收盘价挂限价、
+        默认不追价，实测约 7.2% 买单 / 7.9% 卖单当根无成交，成交均价系统性劣于回测。
+        另外，把回测结果部署到实盘只是建立绑定关系，不继承策略 / 周期 / 风控执行时点（risk_timing）/
+        追价开关 / 单笔上限 / 复权口径。
+      </div>
+    </div>
+
     <div v-if="gateBanner" class="card" :style="{ padding: '12px', marginBottom: '12px', color: gateBanner.status === 'rejected' ? 'var(--red)' : gateBanner.status === 'passed' ? 'var(--green)' : 'var(--ink-soft)' }">
       IS/OOS 门槛：{{ gateBanner.status === 'passed' ? '通过' : gateBanner.status === 'rejected' ? '未通过' : '数据不足未评估' }}
       <span v-if="gateBanner.reasons.length">（{{ gateBanner.reasons.join('；') }}）</span>
@@ -6757,6 +6770,17 @@ watch(theme, () => {
 </template>
 
 <style scoped>
+/* 分钟级口径提示：标注回测与实盘不等价、绑定不继承 */
+.minute-parity-note {
+  padding: 10px 14px;
+  margin-bottom: 12px;
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--ink-soft);
+  border-left: 4px solid var(--amber, #d48806);
+  background: rgba(212, 136, 6, 0.08);
+}
+.minute-parity-note strong { display: block; margin-bottom: 4px; color: var(--ink); }
 .report-page {
   max-width: 1400px;
   margin: 0 auto;
