@@ -300,14 +300,23 @@ def _cost_capacity_section(detail: dict) -> str:
     ex = cc.get("explicit") or {}
     sl = cc.get("slippage") or {}
     cap = cc.get("capacity") or {}
+    # 有 ref_price = 实现滑点（买卖同源，可与配置滑点直接相减）；
+    # 无 = 历史兜底的「相对收盘偏离」，标记不可比。
+    is_realized = sl.get("comparable_to_configured") is True
+    slip_value = (
+        sl.get("realized_slippage_bps") if is_realized
+        else sl.get("realized_deviation_bps"))
+    ref_missing = sl.get("ref_price_missing") or 0
 
     cards = [
         _kpi("交易成本合计", money(ex.get("total_cost")), sub="佣金+印花税+过户费"),
         _kpi("成本拖累占比", pct(ex.get("cost_drag_ratio")),
              sub="成本 / 毛利（毛利=净收益+成本）"),
         _kpi("成本 / 成交额", f"{num(ex.get('cost_bps'))} bps", sub="双边换手口径"),
-        _kpi("相对收盘偏离", f"{num(sl.get('realized_deviation_bps'))} bps",
-             sub="成交价 vs 持仓快照隐含收盘价"),
+        _kpi("实现滑点" if is_realized else "相对收盘偏离",
+             f"{num(slip_value)} bps",
+             sub=("成交价 vs 滑点前开盘价（买卖同源）" if is_realized
+                  else "成交价 vs 持仓快照隐含收盘价")),
         _kpi("容量压力", esc(cap.get("pressure_level") or "—"),
              sub=f"最大单笔占净值 {pct(cap.get('max_trade_pct_equity'))}"),
     ]
@@ -324,16 +333,24 @@ def _cost_capacity_section(detail: dict) -> str:
             ["成本 / 日均净值", pct(ex.get("cost_to_avg_equity"))],
         ],
     )
-    slip_tbl = _table(
-        ["项目", "数值"],
-        [
-            ["配置固定滑点（已在成交价内扣除）", f"{num(sl.get('configured_bps'))} bps"],
-            ["相对收盘偏离（负=成交价低于参考价）",
-             f"{num(sl.get('realized_deviation_bps'))} bps"],
-            ["可匹配成交 / 总成交",
-             f"{sl.get('matched_trades') or 0} / {sl.get('trades_count') or 0} 笔"],
-        ],
-    )
+    slip_rows = [["配置固定滑点（已在成交价内扣除）",
+                  f"{num(sl.get('configured_bps'))} bps"]]
+    if is_realized:
+        slip_rows.append(["实现滑点（成交价 vs 滑点前开盘价）",
+                          f"{num(sl.get('realized_slippage_bps'))} bps"])
+        slip_rows.append(["与配置滑点差值（正=多付 / 少收）",
+                          f"{num(sl.get('excess_bps'))} bps"])
+    else:
+        slip_rows.append(["相对收盘偏离（负=成交价低于参考价）",
+                          f"{num(sl.get('realized_deviation_bps'))} bps"])
+    slip_rows.append(["可匹配成交 / 总成交",
+                      f"{sl.get('matched_trades') or 0} / "
+                      f"{sl.get('trades_count') or 0} 笔"])
+    if ref_missing > 0:
+        slip_rows.append(["无参考价成交（未计入，不与有参考价样本混算）",
+                          f"{ref_missing} 笔"])
+    slip_tbl = _table(["项目", "数值"], slip_rows)
+    slip_title = "2.2 实现滑点" if is_realized else "2.2 相对收盘偏离"
     cap_tbl = _table(
         ["项目", "数值"],
         [
@@ -347,18 +364,32 @@ def _cost_capacity_section(detail: dict) -> str:
             ["容量压力等级", esc(cap.get("pressure_level") or "—")],
         ],
     )
+    if is_realized:
+        slip_note = (
+            "口径说明：实现滑点 = 成交价相对「滑点前开盘价」（成交写入时落库，"
+            "买卖同一来源）的偏离，已包含配置的固定滑点与规模冲击，可与配置滑点"
+            f"直接相减；参考价覆盖 {sl.get('matched_trades') or 0} / "
+            f"{sl.get('trades_count') or 0} 笔"
+            + (f"，其余 {ref_missing} 笔无参考价未计入（不混算）。"
+               if ref_missing > 0 else "。")
+        )
+    else:
+        slip_note = (
+            "口径说明：相对收盘偏离是成交价相对「持仓快照隐含收盘价（市值/数量）」的偏离——"
+            "买入比当日收盘，卖出因当日已清仓回退到前一交易日收盘；负值只表示成交价低于该参考价，"
+            "不代表真实成交质量，配置的滑点仍已在成交价里扣过。"
+            "历史记录无参考价，不可与配置滑点比较。"
+        )
     note = (
-        '<div class="meta"><div class="gen">'
-        "口径说明：相对收盘偏离是成交价相对「持仓快照隐含收盘价（市值/数量）」的偏离——"
-        "买入比当日收盘，卖出因当日已清仓回退到前一交易日收盘；负值只表示成交价低于该参考价，"
-        "不代表真实成交质量，配置的滑点仍已在成交价里扣过。容量按单笔成交额占当日净值比例衡量，"
+        '<div class="meta"><div class="gen">' + slip_note
+        + "容量按单笔成交额占当日净值比例衡量，"
         f"≥{pct(cap.get('large_trade_threshold_pct'))} 记为大额。"
         "</div></div>"
     )
     body = (
         '<div class="kpi-grid">' + "".join(cards) + "</div>"
         + "<h3>2.1 显性成本</h3>" + cost_tbl
-        + "<h3>2.2 相对收盘偏离</h3>" + slip_tbl
+        + f"<h3>{slip_title}</h3>" + slip_tbl
         + "<h3>2.3 容量与冲击成本</h3>" + cap_tbl
         + note
     )

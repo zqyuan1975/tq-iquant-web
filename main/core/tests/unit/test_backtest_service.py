@@ -3404,12 +3404,13 @@ def _cc_snap(day, value, positions=None):
     )
 
 
-def _cc_trade(ttype, price, qty, *, cost=5.0, day=date(2026, 7, 29)):
+def _cc_trade(ttype, price, qty, *, cost=5.0, day=date(2026, 7, 29), ref_price=None):
     return SimpleNamespace(
         stock_code="000001.SZ", trade_type=ttype, price=Decimal(str(price)),
         quantity=qty, amount=Decimal(str(price)) * qty,
         commission=Decimal(str(cost)), stamp_duty=Decimal("0"),
         transfer_fee=Decimal("0"), bar_time=datetime.combine(day, datetime.min.time()),
+        ref_price=None if ref_price is None else Decimal(str(ref_price)),
     )
 
 
@@ -3464,4 +3465,73 @@ def test_cost_capacity_without_slippage_param_and_empty():
     assert out["capacity"]["max_trade_pct_equity"] == pytest.approx(0.1)
 
     assert svc.build_cost_capacity([], [], {}) is None
+
+
+def test_cost_capacity_ref_price_buy_sell_same_source():
+    """有 ref_price：买卖同源（滑点前开盘价），实现滑点可与配置滑点直接相减。"""
+    snaps = [
+        _cc_snap(date(2026, 7, 29), 100000),
+        _cc_snap(date(2026, 7, 30), 100000),
+    ]
+    trades = [
+        _cc_trade("BUY", 10.1, 1000, ref_price=10.0),
+        # 卖出 9.9：对己不利方向与买入相反 → sign 取反后同样记 +100bps
+        _cc_trade("SELL", 9.9, 1000, ref_price=10.0),
+    ]
+
+    sl = svc.build_cost_capacity(snaps, trades, {"slippage": 0.001})["slippage"]
+
+    assert sl["source"] == "ref_price"
+    assert sl["comparable_to_configured"] is True
+    assert sl["realized_slippage_bps"] == pytest.approx(100.0)
+    assert sl["configured_bps"] == pytest.approx(10.0)
+    assert sl["excess_bps"] == pytest.approx(90.0)
+    assert sl["matched_trades"] == 2
+    assert sl["coverage_ratio"] == pytest.approx(1.0)
+    assert sl["ref_price_missing"] == 0
+    # 兼容字段仍与实现滑点同值（老前端兜底不改变数值）
+    assert sl["realized_deviation_bps"] == pytest.approx(100.0)
+
+
+def test_cost_capacity_without_ref_price_falls_back_and_flags():
+    """ref_price 全缺失：回退快照隐含收盘价，标记不可与配置滑点比较。"""
+    snaps = [
+        _cc_snap(date(2026, 7, 29), 100000,
+                 [{"stock_code": "000001.SZ", "quantity": 1000, "market_value": "10000"}]),
+        _cc_snap(date(2026, 7, 30), 100000),
+    ]
+    out = svc.build_cost_capacity(
+        snaps, [_cc_trade("BUY", 10.1, 1000)], {"slippage": 0.001})
+
+    sl = out["slippage"]
+    assert sl["source"] == "implied_close"
+    assert sl["comparable_to_configured"] is False
+    # 真实滑点字段为空，只有偏离口径可读
+    assert sl["realized_slippage_bps"] is None
+    assert sl["realized_deviation_bps"] == pytest.approx(100.0)
+    assert sl["matched_trades"] == 1
+
+
+def test_cost_capacity_mixed_records_exclude_missing_ref():
+    """混合记录不混算：只用有 ref_price 的样本，缺失笔数单列并给覆盖率。"""
+    snaps = [
+        _cc_snap(date(2026, 7, 29), 100000,
+                 [{"stock_code": "000001.SZ", "quantity": 1000, "market_value": "10000"}]),
+        _cc_snap(date(2026, 7, 30), 100000),
+    ]
+    trades = [
+        _cc_trade("BUY", 10.1, 1000, ref_price=10.0),
+        # 无参考价且隐含收盘价明显不同（10.2）：若混算会把 100bps 稀释成 -49bps
+        _cc_trade("BUY", 10.2, 1000),
+    ]
+
+    sl = svc.build_cost_capacity(snaps, trades, {"slippage": 0.001})["slippage"]
+
+    assert sl["source"] == "ref_price"
+    assert sl["matched_trades"] == 1
+    assert sl["ref_price_missing"] == 1
+    assert sl["coverage_ratio"] == pytest.approx(0.5)
+    assert sl["matched_amount"] == pytest.approx(10100.0)
+    # 只算有参考价的那笔：+1% = 100bps，未被无参考价样本稀释
+    assert sl["realized_slippage_bps"] == pytest.approx(100.0)
 

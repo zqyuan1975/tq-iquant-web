@@ -1507,7 +1507,7 @@ class BacktestEngine:
             portfolio_id=portfolio.portfolio_id,
             stock_code=act.code, trade_type=TradeType.SELL, price=price,
             quantity=qty, amount=amount, commission=commission,
-            stamp_duty=stamp, transfer_fee=transfer, trade_time=t,
+            stamp_duty=stamp, transfer_fee=transfer, ref_price=price, trade_time=t,
             signal_type=SignalType.CLOSE, signal_name="corporate_action",
         )
         applied = pos.apply_trade(trade)
@@ -1571,7 +1571,8 @@ class BacktestEngine:
                 portfolio_id=portfolio.portfolio_id,
                 stock_code=act.code, trade_type=TradeType.BUY, price=price,
                 quantity=qty, amount=amount, commission=commission,
-                stamp_duty=Decimal("0"), transfer_fee=transfer, trade_time=t,
+                stamp_duty=Decimal("0"), transfer_fee=transfer, ref_price=price,
+                trade_time=t,
                 signal_type=SignalType.OPEN, signal_name="corporate_action_reinvest",
             )
             pos.apply_trade(trade)

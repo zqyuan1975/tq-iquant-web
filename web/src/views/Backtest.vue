@@ -1127,13 +1127,14 @@ const dragView = computed(() => {
   return { ratio, tone, dash: DONUT_C * ratio, offset: DONUT_C * (1 - ratio) }
 })
 
-/** 相对收盘偏离：负值只表示成交价低于参考价，不代表真实滑点。 */
+/** 实现滑点（有 ref_price，可与配置滑点比较）/ 相对收盘偏离（历史兜底，不可比）。 */
 const slippageView = computed(() => {
   const s = costCapacity.value?.slippage
   if (!s) return null
-  const real = s.realized_deviation_bps ?? 0
+  const isRealized = s.comparable_to_configured === true
+  const real = (isRealized ? s.realized_slippage_bps : s.realized_deviation_bps) ?? 0
   const tone = real > 0.01 ? 'bad' : real < -0.01 ? 'ok' : 'neutral'
-  return { tone }
+  return { tone, isRealized, missing: s.ref_price_missing ?? 0 }
 })
 
 /** 容量压力：以「大额阈值 ×2」与当前最大单笔占净值的较大值为刻度上限。 */
@@ -5478,16 +5479,20 @@ watch(theme, () => {
         </div>
 
         <div class="metric-card" v-if="slippageView">
-          <span class="metric-kicker">相对收盘偏离</span>
+          <span class="metric-kicker">{{ slippageView.isRealized ? '实现滑点' : '相对收盘偏离' }}</span>
           <div class="metric-headline">
-            <span class="metric-value" :class="'metric-tone--' + slippageView.tone">{{ bpsText(costCapacity.slippage.realized_deviation_bps) }}</span>
-            <span class="metric-sub">成交价 vs 持仓快照隐含收盘价</span>
+            <span class="metric-value" :class="'metric-tone--' + slippageView.tone">{{ bpsText(slippageView.isRealized ? costCapacity.slippage.realized_slippage_bps : costCapacity.slippage.realized_deviation_bps) }}</span>
+            <span class="metric-sub">{{ slippageView.isRealized ? '成交价 vs 滑点前开盘价（买卖同源）' : '成交价 vs 持仓快照隐含收盘价' }}</span>
           </div>
-          <p class="metric-note">负值=成交价低于该参考价，不代表真实成交质量</p>
+          <p class="metric-note">{{ slippageView.isRealized ? '已与配置滑点同口径，可直接比较' : '负值=成交价低于该参考价，不代表真实成交质量' }}</p>
           <div class="metric-mini-row">
             <div><span>配置滑点（已含在成交价）</span><b>{{ bpsText(costCapacity.slippage.configured_bps) }}</b></div>
-            <div><span>可匹配成交 / 总成交</span><b>{{ costCapacity.slippage.matched_trades }} / {{ costCapacity.slippage.trades_count }} 笔</b></div>
+            <div v-if="slippageView.isRealized"><span>与配置差值</span><b>{{ bpsText(costCapacity.slippage.excess_bps) }}</b></div>
+            <div><span>参考价覆盖</span><b>{{ costCapacity.slippage.matched_trades }} / {{ costCapacity.slippage.trades_count }} 笔</b></div>
           </div>
+          <p v-if="slippageView.missing > 0" class="metric-note">
+            其余 {{ slippageView.missing }} 笔无参考价，未计入（不与有参考价样本混算）
+          </p>
         </div>
 
         <div class="metric-card" v-if="capacityView">
@@ -5569,10 +5574,14 @@ watch(theme, () => {
           </div>
         </div>
       </div>
-      <p class="ca-note">
+      <p class="ca-note" v-if="slippageView?.isRealized">
+        口径：实现滑点 = 成交价相对<b>滑点前开盘价</b>（买卖同一来源，New 回测成交时落库）的偏离，
+        已包含配置的固定滑点与规模冲击，可与「配置滑点」直接相减；覆盖率见上方笔数。
+      </p>
+      <p class="ca-note" v-else>
         口径：相对收盘偏离是成交价相对「持仓快照隐含收盘价（市值/数量）」的偏离——买入比当日收盘，
-        卖出因当日已清仓回退到前一交易日收盘；负值只表示成交价低于该参考价，不代表真实成交质量，
-        配置的滑点仍已在成交价里扣过、不影响净值。
+        卖出因当日已清仓回退到前一交易日收盘；负值只表示成交价低于该参考价，不代表真实成交质量。
+        <b>历史记录无参考价，不可与配置滑点比较。</b>
       </p>
     </div>
 

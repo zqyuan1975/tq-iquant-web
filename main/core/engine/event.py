@@ -96,6 +96,9 @@ class TradeEvent:
     # 过户费（双向，2026-11-11）：回测由 SimulatedDispatcher 按组合
     # transfer_fee_rate 计算；实盘柜台已并入真实费用，缺省 0。
     transfer_fee: Decimal = Decimal("0")
+    # 滑点前参考价（回测成交：应用 1±滑点 之前的开盘价；买卖同源）。
+    # 非回测撮合路径无此概念，保持 None；scaled_to 按 replace 自动保留。
+    ref_price: Optional[Decimal] = None
 
     def scaled_to(self, quantity: int) -> "TradeEvent":
         """按**实际入账数量**重算金额与费用，供现金入账与持仓扣减同口径（P0-1）。

@@ -3157,3 +3157,65 @@ describe('Backtest.vue — 详情页同步自选（1.3.1）', () => {
     expect((btn.element as HTMLButtonElement).disabled).toBe(true)
   })
 })
+
+describe('Backtest.vue — 成本与容量滑点口径', () => {
+  const ccBase = {
+    explicit: {
+      total_cost: 1234.5, commission: 1000, stamp_duty: 200, transfer_fee: 34.5,
+      turnover: 2_000_000, cost_bps: 6.17, avg_equity: 1_000_000,
+      cost_to_avg_equity: 0.001234, net_profit: 50_000, gross_profit: 51_234.5,
+      cost_drag_ratio: 0.0241,
+    },
+    capacity: {
+      trades_count: 50, max_trade_amount: 120_000, max_trade_pct_equity: 0.12,
+      avg_trade_pct_equity: 0.02, large_trade_threshold_pct: 0.02,
+      large_trade_count: 12, large_trade_amount_ratio: 0.45, pressure_level: '高',
+    },
+  }
+
+  it('有参考价：展示「实现滑点」、与配置差值、覆盖率与缺失说明', async () => {
+    const w = await mountDetail({
+      ...mockDetail,
+      cost_capacity: {
+        ...ccBase,
+        slippage: {
+          source: 'ref_price', comparable_to_configured: true,
+          configured_bps: 10, realized_slippage_bps: 12.5,
+          realized_deviation_bps: 12.5, excess_bps: 2.5,
+          matched_trades: 40, trades_count: 50, ref_price_missing: 10,
+        },
+      },
+    })
+    const text = w.text()
+    expect(text).toContain('实现滑点')
+    expect(text).toContain('成交价 vs 滑点前开盘价')
+    expect(text).toContain('与配置差值')
+    expect(text).toContain('12.50 bps')
+    expect(text).toContain('2.50 bps')
+    expect(text).toContain('40 / 50 笔')
+    expect(text).toContain('其余 10 笔无参考价')
+    expect(text).not.toContain('历史记录无参考价')
+    w.unmount()
+  })
+
+  it('无参考价：保持「相对收盘偏离」并提示不可与配置滑点比较', async () => {
+    const w = await mountDetail({
+      ...mockDetail,
+      cost_capacity: {
+        ...ccBase,
+        slippage: {
+          source: 'implied_close', comparable_to_configured: false,
+          configured_bps: 10, realized_slippage_bps: null,
+          realized_deviation_bps: -26.12, matched_trades: 8,
+          trades_count: 8, ref_price_missing: 0,
+        },
+      },
+    })
+    const text = w.text()
+    expect(text).toContain('相对收盘偏离')
+    expect(text).not.toContain('成交价 vs 滑点前开盘价')
+    expect(text).toContain('-26.12 bps')
+    expect(text).toContain('历史记录无参考价，不可与配置滑点比较')
+    w.unmount()
+  })
+})

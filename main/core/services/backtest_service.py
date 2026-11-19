@@ -2896,6 +2896,7 @@ def _persist_result(
             stock_code=trade.stock_code,
             trade_type=trade.trade_type.value,
             price=trade.price,
+            ref_price=getattr(trade, "ref_price", None),
             quantity=trade.quantity,
             amount=trade.amount,
             commission=trade.commission,
@@ -3596,10 +3597,13 @@ def build_cost_capacity(
 
     - 显性成本：佣金 + 印花税 + 过户费（成本拖累占比 = 成本 / 毛利，
       毛利 = 净收益 + 成本；毛利 ≤ 0 时占比无意义，返回 None）
-    - 相对收盘偏离：成交价 vs「持仓快照隐含收盘价」（市值/数量，缺失时取最近快照）。
-      买卖两侧参考日不同（买入=当日收盘；卖出当日已清仓→回退前一交易日收盘），
-      负值只表示成交价低于参考价，**不是真实滑点**；固定滑点已在成交价里扣过。
-      该口径保留历史字段名 realized_deviation_bps，展示层按「相对收盘偏离」呈现。
+    - 实现滑点（新回测）：成交价 vs 写入 `backtest_trades.ref_price` 的
+      「滑点前开盘价」（买卖同源），可与配置滑点直接相减。
+    - 相对收盘偏离（历史兜底）：ref_price 全为 NULL 时回退「持仓快照隐含收盘价」
+      （市值/数量，缺失时取最近快照）。买卖两侧参考日不同（买入=当日收盘；
+      卖出当日已清仓→回退前一交易日收盘），负值只表示成交价低于参考价，
+      **不是真实滑点**。该形态标记 comparable_to_configured=false。
+    - 混合记录（部分有 ref_price）不混算：只用有参考价的样本，缺失笔数单列。
     - 容量：单笔成交额占当日净值比例的分位数/大额占比，给出压力等级
 
     无 trades 且无 snapshots 时返回 None（前端/报告整块隐藏）。
@@ -3632,21 +3636,45 @@ def build_cost_capacity(
         total_cost / gross_profit
         if gross_profit is not None and gross_profit > 0 else None)
 
-    # ---- 相对收盘偏离（展示口径；excess_* 字段仅为兼容保留，不再展示） ----
+    # ---- 实现滑点（新回测，有 ref_price）/ 相对收盘偏离（历史兜底） ----
+    # 新回测成交写入「滑点前开盘价」ref_price，买卖同源，可与配置滑点直接比较；
+    # 历史记录该列为 NULL → 回退持仓快照隐含收盘价，标记不可比。
+    # 混合记录不混算：只用有 ref_price 的样本，缺失笔数单列并给出覆盖率。
     implied = _implied_close_prices(snaps)
+
+    def _ref_price_of(t) -> float:
+        try:
+            return float(getattr(t, "ref_price", None) or 0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    ref_available = sum(1 for t in trades if _ref_price_of(t) > 0)
+    use_ref = ref_available > 0
+
     deviation_amount = 0.0      # 正 = 对己不利
     matched_amount = 0.0
     matched = 0
+    ref_missing = 0
     for t in trades:
-        series = implied.get(t.stock_code) or []
         price = float(t.price or 0)
         amt = abs(float(t.amount or 0))
-        if not series or price <= 0 or amt <= 0:
+        if price <= 0 or amt <= 0:
             continue
-        trade_date = t.bar_time.date() if t.bar_time else None
-        ref_date, ref_price = (
-            min(series, key=lambda x: abs((x[0] - trade_date).days))
-            if trade_date else series[-1])
+        if use_ref:
+            ref_price = _ref_price_of(t)
+            if ref_price <= 0:
+                # 混合记录：无参考价的成交不参与加权，只计数（不混算）
+                if t.trade_type in ("BUY", "SELL"):
+                    ref_missing += 1
+                continue
+        else:
+            series = implied.get(t.stock_code) or []
+            if not series:
+                continue
+            trade_date = t.bar_time.date() if t.bar_time else None
+            ref_date, ref_price = (
+                min(series, key=lambda x: abs((x[0] - trade_date).days))
+                if trade_date else series[-1])
         if ref_price <= 0:
             continue
         dev = (price - ref_price) / ref_price
@@ -3716,12 +3744,20 @@ def build_cost_capacity(
             "cost_drag_ratio": _r(cost_drag_ratio, 4),
         },
         "slippage": {
+            "source": "ref_price" if use_ref else "implied_close",
+            "comparable_to_configured": use_ref,
             "configured_bps": _r(configured_bps),
+            # 有 ref_price = 实现滑点（真滑点）；无 = 相对收盘偏离
+            "realized_slippage_bps": _r(realized_bps) if use_ref else None,
             "realized_deviation_bps": _r(realized_bps),
             "excess_bps": _r(excess_bps),
             "excess_cost_amount": _r(excess_cost_amount),
             "matched_trades": matched,
             "trades_count": len(trades),
+            # 覆盖率：混合记录里无 ref_price 的成交不参与加权（不混算）
+            "coverage_ratio": (
+                _r(matched / len(trades), 4) if trades else None),
+            "ref_price_missing": ref_missing,
             "matched_amount": _r(matched_amount),
         },
         "capacity": {

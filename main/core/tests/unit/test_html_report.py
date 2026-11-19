@@ -597,6 +597,67 @@ def test_cost_capacity_section_renders_numbers():
     assert "容量压力等级" in html
 
 
+def test_cost_capacity_section_renders_realized_slippage_form():
+    """有 ref_price：报告第二节切「实现滑点」并展示与配置差值 / 覆盖率。"""
+    detail = _detail()
+    detail["trades"] = []
+    detail["cost_capacity"] = {
+        "explicit": {
+            "total_cost": 1234.5, "commission": 1000.0, "stamp_duty": 200.0,
+            "transfer_fee": 34.5, "turnover": 2_000_000.0, "cost_bps": 6.17,
+            "avg_equity": 1_000_000.0, "cost_to_avg_equity": 0.001234,
+            "net_profit": 50_000.0, "gross_profit": 51_234.5,
+            "cost_drag_ratio": 0.0241,
+        },
+        "slippage": {
+            "source": "ref_price", "comparable_to_configured": True,
+            "configured_bps": 10.0,
+            "realized_slippage_bps": 12.5, "realized_deviation_bps": 12.5,
+            "excess_bps": 2.5, "matched_trades": 40, "trades_count": 50,
+            "ref_price_missing": 10, "coverage_ratio": 0.8,
+            "matched_amount": 2_000_000.0,
+        },
+        "capacity": {
+            "trades_count": 50, "max_trade_amount": 120_000.0,
+            "max_trade_pct_equity": 0.12, "avg_trade_pct_equity": 0.02,
+            "large_trade_threshold_pct": 0.02, "large_trade_count": 12,
+            "large_trade_amount_ratio": 0.45, "pressure_level": "高",
+        },
+    }
+    html = build_html_report(detail)
+    assert "实现滑点" in html
+    assert "2.2 实现滑点" in html
+    assert "2.2 相对收盘偏离" not in html
+    # KPI 与明细表都使用 realzied_slippage_bps
+    assert "12.50 bps" in html
+    assert "与配置滑点差值" in html
+    assert "2.50 bps" in html
+    assert "40 / 50" in html
+    assert "其余 10 笔无参考价未计入" in html
+    assert "历史记录无参考价" not in html
+
+
+def test_cost_capacity_section_marks_legacy_as_incomparable():
+    """无 ref_price：保持「相对收盘偏离」，并明示不可与配置滑点比较。"""
+    detail = _detail()
+    detail["trades"] = []
+    detail["cost_capacity"] = {
+        "explicit": {"total_cost": 0.0},
+        "slippage": {
+            "source": "implied_close", "comparable_to_configured": False,
+            "configured_bps": 10.0, "realized_slippage_bps": None,
+            "realized_deviation_bps": -26.12, "matched_trades": 8,
+            "trades_count": 8, "ref_price_missing": 0,
+        },
+        "capacity": {"large_trade_threshold_pct": 0.02, "pressure_level": "低"},
+    }
+    html = build_html_report(detail)
+    assert "2.2 相对收盘偏离" in html
+    assert "2.2 实现滑点" not in html
+    assert "-26.12 bps" in html
+    assert "历史记录无参考价，不可与配置滑点比较" in html
+
+
 def test_cost_capacity_section_empty_when_absent():
     """K5：无 cost_capacity（无成交/快照）时给出空态而不是报错。"""
     detail = _detail()

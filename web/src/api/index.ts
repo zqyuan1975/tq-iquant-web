@@ -624,12 +624,17 @@ export interface BacktestCostCapacity {
     cost_drag_ratio: number | null
   }
   slippage: {
+    source: 'ref_price' | 'implied_close'
+    comparable_to_configured: boolean
     configured_bps: number | null
+    realized_slippage_bps: number | null
     realized_deviation_bps: number | null
     excess_bps: number | null
     excess_cost_amount: number | null
     matched_trades: number
     trades_count: number
+    coverage_ratio: number | null
+    ref_price_missing: number
     matched_amount: number | null
   }
   capacity: {

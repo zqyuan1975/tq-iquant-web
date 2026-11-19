@@ -16,6 +16,9 @@ class BacktestTrade(Base):
     stock_code = Column(String(20), nullable=False)
     trade_type = Column(String(4), nullable=False)
     price = Column(Numeric(10, 3), nullable=False)
+    # 滑点前参考价（应用 1±滑点 之前的开盘价，买卖同源）；历史行为 NULL。
+    # 仅用于成本容量「实现滑点」口径，不参与净值/成交计算。
+    ref_price = Column(Numeric(10, 3), nullable=True)
     quantity = Column(Integer, nullable=False)
     amount = Column(Numeric(15, 2), nullable=False)
     commission = Column(Numeric(10, 2), nullable=False)
