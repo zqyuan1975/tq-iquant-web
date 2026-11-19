@@ -4989,6 +4989,10 @@ def run_backtest(db: Session, ps: PortfolioStrategy, req,
         _log_timing(f"[回测#{record_id}] 总耗时: {(t8-t0).total_seconds():.1f}s")
 
         rec.status = "completed"
+        # 清掉可能残留的失败原因：长回测跨进程运行时，应用启动恢复
+        # （recover_stale_running_backtests）会把仍在 running 的记录先标 failed，
+        # 本进程随后成功完成 → 不清空就会留下「已完成但带失败原因」的矛盾记录。
+        rec.error_message = None
         # 告警：行情跳过 + 信号预检（公式报错/输出线缺失/区间零信号）：非致命，回测仍 completed
         rec.warnings_json = (
             json.dumps(warnings, ensure_ascii=False) if warnings else None
@@ -5428,6 +5432,8 @@ def run_multi_backtest(db: Session, portfolios: list, req) -> dict:
             rec = db.get(BacktestRecord, records[ps.id])
             if rec is not None:
                 rec.status = "completed"
+                # 同上：成功完成即清空启动恢复可能写入的失败原因
+                rec.error_message = None
                 # F1 数据质量冻结（只观测）：成员记录各自保存自己的取数质量。
                 rec.data_quality_json = json.dumps(
                     dq_by_ps.get(ps.id), ensure_ascii=False, default=str)
@@ -5443,6 +5449,7 @@ def run_multi_backtest(db: Session, portfolios: list, req) -> dict:
 
         aggregate = aggregate_run_group(per_portfolio, initial_total)
         group.status = "completed"
+        group.error_message = None
         group.aggregate_json = json.dumps(aggregate, ensure_ascii=False, default=str)
         group.finished_at = datetime.now(timezone.utc).replace(tzinfo=None)
         db.commit()
