@@ -2237,6 +2237,56 @@ describe('LiveSessions — warnings 与恢复事件（P2/P3）', () => {
     w.unmount()
   })
 
+  it('启动告警 45s 后自动收起，原文留存事件日志（不随提示消失而丢失）', async () => {
+    // 只假造 setTimeout，避免影响组件里的 15s 轮询与 Date
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+    try {
+      ;(getLiveSessions as any).mockResolvedValue([stoppedSession])
+      ;(startLiveSession as any).mockResolvedValue({
+        id: 8, status: 'running',
+        warnings: ['数据体检未完成：仅抽查 30/251 只（已到启动等待预算，未阻塞启动）；未抽查部分未校验'],
+      })
+      const w = mount(LiveSessions)
+      await flushPromises()
+
+      await w.findAll('button').find((b) => b.text() === '启动')!.trigger('click')
+      await flushPromises()
+
+      const msg = '数据体检未完成：仅抽查 30/251 只'
+      expect(w.find('[data-test="start-warning"]').text()).toContain(msg)
+      // 留档：同一段原文进实时事件日志
+      expect(w.find('.event-log').text()).toContain(msg)
+
+      vi.advanceTimersByTime(45_000)
+      await flushPromises()
+
+      expect(w.find('[data-test="start-warning"]').exists()).toBe(false)
+      expect(w.find('.event-log').text()).toContain(msg)
+      w.unmount()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('启动告警可手动收起，收起后事件日志仍保留原文', async () => {
+    ;(getLiveSessions as any).mockResolvedValue([stoppedSession])
+    ;(startLiveSession as any).mockResolvedValue({
+      id: 8, status: 'running', warnings: ['当前引擎非推荐通道，请确认下单账户'],
+    })
+    const w = mount(LiveSessions)
+    await flushPromises()
+
+    await w.findAll('button').find((b) => b.text() === '启动')!.trigger('click')
+    await flushPromises()
+
+    await w.find('[data-test="start-warning-close"]').trigger('click')
+    await flushPromises()
+
+    expect(w.find('[data-test="start-warning"]').exists()).toBe(false)
+    expect(w.find('.event-log').text()).toContain('当前引擎非推荐通道')
+    w.unmount()
+  })
+
   it('watchdog 恢复事件进「恢复」日志（独立于 risk 流）', async () => {
     ;(getLiveSessions as any).mockResolvedValue([runningSession])
     const w = mount(LiveSessions)

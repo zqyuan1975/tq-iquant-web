@@ -144,8 +144,12 @@ const driftBanners = computed(() =>
     // 只有真漂移才出横幅（未绑定回测/未完成比对不打扰）
     .filter((b) => b.lines.length > 0),
 )
-// start 返回的通道建议告警（按会话展示，非阻断）
+// start 返回的通道建议 / 启动体检告警（按会话展示，非阻断）。
+// 提示类行为：展示 START_WARNING_TTL_MS 后自动收起；原文同时写入「实时事件日志」
+// 长期留存，收起后仍可回看（此前只存在这个 ref 里，不切页面重建组件就永远常驻）。
 const startWarnings = ref<Record<number, string[]>>({})
+const START_WARNING_TTL_MS = 45_000
+const startWarningTimers = new Map<number, ReturnType<typeof setTimeout>>()
 // 新建会话返回的占用类软告警（A1，非阻断）
 const createWarnings = ref<string[]>([])
 
@@ -1276,14 +1280,15 @@ function startSession(id: number, ack = false) {
 async function doStart(id: number, ack: boolean) {
   if (startingIds.value.has(id)) return
   clearStartError(id)
+  dismissStartWarnings(id)
   startingIds.value = new Set(startingIds.value).add(id)
   try {
     const r = ack
       ? await startLiveSession(id, { ack_keyboard_risk: true })
       : await startLiveSession(id)
-    // 通道建议类告警（非阻断）：如所选引擎与推荐通道不一致，展示在行内
+    // 通道建议类告警（非阻断）：如所选引擎与推荐通道不一致，展示在行内并留档事件日志
     if (Array.isArray(r?.warnings) && r.warnings.length > 0) {
-      startWarnings.value = { ...startWarnings.value, [id]: r.warnings }
+      showStartWarnings(id, r.warnings)
     }
     load() // load 内自动连接新运行 session 的流
   } catch (e: any) {
@@ -1303,6 +1308,30 @@ function clearStartError(id: number) {
   const next = { ...startErrors.value }
   delete next[id]
   startErrors.value = next
+}
+
+/** 展示启动告警：原文写事件日志留档，并在 TTL 后自动收起（同会话再次启动会重置计时）。 */
+function showStartWarnings(id: number, list: string[]) {
+  const session = sessions.value.find((s) => s.id === id)
+  const label = session ? `#${session.id} ${session.name}` : `#${id}`
+  const prev = startWarningTimers.get(id)
+  if (prev) clearTimeout(prev)
+  startWarnings.value = { ...startWarnings.value, [id]: list }
+  startWarningTimers.set(id, setTimeout(() => dismissStartWarnings(id), START_WARNING_TTL_MS))
+  for (const w of list) pushLog('notice', { message: w }, nowTime(), label, id)
+}
+
+/** 收起某会话的启动告警（自动 TTL 到期或用户点 × 均走这里）。 */
+function dismissStartWarnings(id: number) {
+  const timer = startWarningTimers.get(id)
+  if (timer) {
+    clearTimeout(timer)
+    startWarningTimers.delete(id)
+  }
+  if (startWarnings.value[id] === undefined) return
+  const next = { ...startWarnings.value }
+  delete next[id]
+  startWarnings.value = next
 }
 
 function confirmKeyboardRisk() {
@@ -1748,6 +1777,9 @@ onUnmounted(() => {
     clearInterval(bridgeTimer)
     bridgeTimer = null
   }
+  // 启动告警自动收起计时器：组件销毁时清掉，避免定时器悬挂
+  startWarningTimers.forEach((t) => clearTimeout(t))
+  startWarningTimers.clear()
 })
 </script>
 
@@ -1963,6 +1995,11 @@ onUnmounted(() => {
               <!-- start 返回的通道建议类告警（非阻断）：如所选引擎与推荐通道不一致 -->
               <div v-if="startWarnings[s.id]?.length" class="start-warning" data-test="start-warning">
                 <div v-for="w in startWarnings[s.id]" :key="w">{{ w }}</div>
+                <button
+                  class="start-warning-close" data-test="start-warning-close"
+                  title="收起提示（原文已记录到下方实时事件日志）"
+                  @click="dismissStartWarnings(s.id)"
+                >×</button>
               </div>
             </div>
           </td>
@@ -3474,13 +3511,29 @@ onUnmounted(() => {
 }
 /* start 返回的通道建议类告警（非阻断） */
 .start-warning {
+  position: relative;
   margin-top: 6px;
   max-width: 320px;
+  padding-right: 18px;
   font-size: 12px;
   line-height: 1.5;
   color: var(--orange, #e67e22);
   white-space: normal;
 }
+/* 提示可手动收起（TTL 到期也会自动收起，原文已留档事件日志） */
+.start-warning-close {
+  position: absolute;
+  top: -2px;
+  right: -4px;
+  padding: 2px 4px;
+  border: none;
+  background: transparent;
+  color: var(--ink-faint);
+  font-size: 14px;
+  line-height: 1;
+  cursor: pointer;
+}
+.start-warning-close:hover { color: var(--ink); }
 /* A1 新建会话软告警横幅 */
 .create-warning-banner {
   display: flex;

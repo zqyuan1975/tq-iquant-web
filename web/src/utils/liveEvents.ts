@@ -8,7 +8,7 @@
 
 export type LiveEventType =
   | 'signal' | 'order' | 'trade' | 'position' | 'risk' | 'decision' | 'ping'
-  | 'recovered'
+  | 'recovered' | 'notice'
 
 export interface LiveEvent {
   id: number
@@ -27,6 +27,7 @@ export const EVENT_TYPE_LABEL: Record<string, string> = {
   risk: '风控',
   decision: '拦截',
   recovered: '恢复',
+  notice: '提示',
 }
 
 export const EVENT_TYPE_COLOR: Record<string, string> = {
@@ -37,6 +38,7 @@ export const EVENT_TYPE_COLOR: Record<string, string> = {
   risk: 'red',
   decision: 'purple',
   recovered: 'green',
+  notice: 'blue',
 }
 
 /**
@@ -431,6 +433,9 @@ export function formatEvent(type: string, data: Record<string, unknown>): string
     }
     case 'ping':
       return ''
+    case 'notice':
+      // 前端本地提示（如启动返回的非阻断告警）：原文进事件日志留档
+      return fmt(data.message)
     default:
       return `${type}: ${JSON.stringify(data)}`
   }
