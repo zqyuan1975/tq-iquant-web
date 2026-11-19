@@ -209,6 +209,24 @@ class ExternalSignalFileSource:
         self._last_stat = None
 
     # ------------------------------------------------------------------
+    # 只读状态（GET 会话详情的 signal_source 用；不暴露可变内部状态）
+    @property
+    def path(self) -> str:
+        return self._path
+
+    @property
+    def formula_names(self) -> Set[str]:
+        return set(self._formula_names)
+
+    @property
+    def last_read_time(self) -> datetime:
+        return self._last_read_time
+
+    @property
+    def cursor_rows(self) -> int:
+        return self._cursor_count
+
+    # ------------------------------------------------------------------
     def _read_complete_lines(self) -> Optional[List[str]]:
         """读文件并按 \\n 切行。编码 GBK；末段无换行符视为通达信正在写半行，
         不消费（待补全后下一轮读出）。文件不存在/读失败 → 空列表（fail-closed：

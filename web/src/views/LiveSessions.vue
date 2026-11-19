@@ -2852,16 +2852,17 @@ onUnmounted(() => {
       </div>
       <p v-if="createError" class="form-error" data-test="baseline-error">{{ createError }}</p>
       <label>外部信号文件路径<span class="label-note">（通达信条件预警输出，可选）</span></label>
-      <input v-model="form.signal_file_path" placeholder="留空 = 走 TQ 公式计算信号；填写完整文件路径" />
+      <input v-model="form.signal_file_path" placeholder="留空 = 走 TQ 公式计算信号；示例 D:\TDX\T0002\export\BDXH.txt" />
       <p style="font-size:12px;color:var(--ink-faint);margin:2px 0 12px">
-        填写后（如 D:\project\分时突击.txt）引擎定时读取该文件的新增信号行并注入交易链路——绕过 TQ 公式引擎的周期限制（如 1m 级别）。文件由通达信「条件预警」功能动态输出（GBK 追加写入）。所有级别公式均可走此链路。填写即<strong>替换信号来源</strong>：该会话不再跑 TQ 公式计算（风控/仓位/资金等限制条件仍沿用回测口径）；仅自动模式生效，预警模式不读取该文件。
+        填写后（如 D:\project\分时突击.txt）引擎每 5 秒（<code>tq_trade.external_signal_poll_interval_seconds</code>，1–60s）检查该文件是否有新增行并注入交易链路——绕过 TQ 公式引擎的周期限制（如 1m 级别）。文件由通达信「条件预警」动态输出（<strong>GBK + CRLF + Tab 分隔，追加写入</strong>），每行形如 <code>300456	赛微电子	2026-09-08 23:08	37.61	-2.77%	5387	波段加仓</code>（行尾多余 Tab 可容忍；旧版带行号列的文件也兼容）。公式名必须与该会话组合策略里的公式名一致，否则该行被忽略。填写即<strong>替换信号来源</strong>：该会话不再跑 TQ 公式计算（风控/仓位/资金等限制条件仍沿用回测口径）；仅自动模式生效，预警模式不读取该文件。路径不存在不会静默失效——启动日志会报错并持续轮询等待文件出现。
       </p>
       <p style="font-size:12px;color:var(--ink-faint);margin:2px 0 12px">
         <strong>买卖方向</strong>：信号动作分买入类（OPEN / ADD）与卖出类（REDUCE / CLOSE），方向由该策略公式信号配置的 <code>signal_type</code> 决定（预警文件本身不含方向列）。<br />
         ① <strong>买入类</strong>：沿用原有开仓闸门（资金占比 / 最大持仓数 / 单仓金额 / 敞口上限 / 可用现金），满槽或已持仓跳过；槽位上限取各组合自己的 <code>strategies.max_positions</code>（缺失则跳过槽位闸并告警，不写死 5）。<br />
         ② <strong>卖出类</strong>：不做仓位与资金检查，但受两条硬约束——<strong>无持仓不卖</strong>（不得卖空）、<strong>T+1 实际可用为 0 时拒绝</strong>（沿用实盘 T+1 可用股数校验，不绕过）。<br />
-        ③ <strong>减仓比例</strong>：预警文件 8 列没有数量/比例列，<strong>REDUCE 未给出比例时按清仓执行</strong>（日志与风控事件明确标注「未给出比例，按清仓执行」，不静默猜测百分比）；CLOSE 恒清仓。<br />
-        ④ <strong>去重</strong>：同代码 + 同日 + 同方向各认第一条（买卖互不吞并；同方向重复推送不重复下单）。未知/不可解析的动作一律忽略并节流告警，绝不猜测方向或默认成买入。
+        ③ <strong>归属过滤</strong>：代码不在该会话任何目标策略的股票池内且无持仓 → 不产生委托，留 <code>external signal out of scope</code> 日志。<br />
+        ④ <strong>减仓比例</strong>：预警文件没有数量/比例列，<strong>REDUCE 未给出比例时按清仓执行</strong>（日志与风控事件明确标注「未给出比例，按清仓执行」，不静默猜测百分比）；CLOSE 恒清仓。<br />
+        ⑤ <strong>去重</strong>：同代码 + 同日 + 同方向各认第一条（买卖互不吞并；同方向重复推送不重复下单）。去重键 = 代码 + 交易日 + 方向（会话内生效，跨会话不共享）。未知/不可解析的动作一律忽略并节流告警，绝不猜测方向或默认成买入。
       </p>
       <label style="display:flex;align-items:center;gap:8px;margin-top:4px">
         <input v-model="form.advance_close_enabled" type="checkbox" style="width:auto" />
@@ -3065,7 +3066,7 @@ onUnmounted(() => {
           每交易日首 bar 再平衡（只挪虚拟现金，不强制卖出）
         </label>
         <label>外部信号文件路径<span class="label-note">（可选）</span></label>
-        <input v-model="editForm.signal_file_path" placeholder="留空 = 走 TQ 公式计算信号" data-field="edit-signal-path" />
+        <input v-model="editForm.signal_file_path" placeholder="留空 = 走 TQ 公式计算信号；示例 D:\TDX\T0002\export\BDXH.txt" data-field="edit-signal-path" />
         <label style="display:flex;align-items:center;gap:8px">
           <input v-model="editForm.gate_recheck_on_execute" type="checkbox" style="width:auto" data-field="edit-gate-recheck" />
           执行前重判门控（顺延次日单 / 盘前竞价单提交前再判一次，默认关）

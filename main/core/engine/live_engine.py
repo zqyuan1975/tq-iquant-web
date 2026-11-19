@@ -15,6 +15,7 @@ import functools
 import json
 import logging
 import math
+import os
 import random
 import threading
 import time
@@ -927,6 +928,19 @@ class LiveEngine:
             formula_names = {
                 name for name in (formula_by_strategy or {}).values() if name
             }
+            # 接线校验（不阻断启动，明确报错而不是静默不生效）：
+            # ① 无公式名 → 文件里每一行都匹配不上，等于永不出信号；
+            # ② 路径不存在 → 通达信可能尚未输出，持续轮询并在出现后自动恢复。
+            if not formula_names:
+                logger.error(
+                    "external signal file configured but no strategy formula "
+                    "names — every row will be ignored: %s (session %s)",
+                    signal_file_path, session_id)
+            if not os.path.isfile(signal_file_path):
+                logger.error(
+                    "external signal file not found at startup: %s (session %s); "
+                    "will keep polling and pick it up when it appears — check the "
+                    "通达信 条件预警 output path", signal_file_path, session_id)
             self._signal_source = ExternalSignalFileSource(
                 signal_file_path, formula_names)
             logger.info(
@@ -946,6 +960,11 @@ class LiveEngine:
         self._ext_seen: Set[Tuple[str, str]] = set()
         # 不可解析动作（未知 signal_type）计数：每 50 条 warning 一次。
         self._ext_unparseable_count = 0
+        # 可观测计数（GET 会话详情的 signal_source 字段）：已消费信号行数 +
+        # 最近一次消费的墙钟时间。cursor_time 只反映通达信时间戳，二者配合可
+        # 判断「文件在长、引擎在收」。
+        self._ext_consumed_count = 0
+        self._ext_last_consumed_at: Optional[datetime] = None
         # 决策闸门采集（调参可观测性）：引擎级单例，注入执行引擎与各组合（set_recorder
         # 顺带透传到 risk_manager）。_handle_bar 每组合末尾 drain 落 LiveDecisionEvent + SSE。
         self._recorder = DecisionRecorder()
@@ -3682,11 +3701,38 @@ class LiveEngine:
                 price = max(price, Decimal(str(limit_down)) + tick)
         return price if price > 0 else None
 
-    def _tick_external_signals(self) -> None:
-        """外部信号注入轮（_tick_main 在 bar_poller.poll() 后调用）。
+    def external_signal_status(self) -> Dict:
+        """外部信号链路运行态（只读，随 GET 会话详情返回 signal_source）。
 
-        ExternalSignalFileSource 时间窗口增量读取预警文件（时间戳游标 + lookback
-        窗口——通达信启动补齐的历史信号在源内过滤，见 external_signal_source），
+        接线生效判据（三项同时满足）：enabled=true、path_exists=true、
+        formula_names 非空；运行判据：consumed_count 增长 / cursor_time 前移
+        （文件在长但 consumed_count 不动 = 行未匹配公式名或被 lookback 挡住）。
+        """
+        src = self._signal_source
+        if src is None:
+            return {"enabled": False}
+        return {
+            "enabled": True,
+            "path": src.path,
+            "path_exists": os.path.isfile(src.path),
+            "formula_names": sorted(src.formula_names),
+            "poll_interval_seconds": self._signal_poll_interval,
+            "daily_dedup": self._ext_daily_dedup,
+            "cursor_time": (
+                src.last_read_time.strftime("%Y-%m-%d %H:%M")
+                if src.last_read_time else None),
+            "cursor_rows": src.cursor_rows,
+            "consumed_count": self._ext_consumed_count,
+            "last_consumed_at": (
+                self._ext_last_consumed_at.strftime("%Y-%m-%d %H:%M:%S")
+                if self._ext_last_consumed_at else None),
+        }
+
+    def _tick_external_signals(self) -> None:
+        """外部信号注入轮（由独立 _signal_loop 调用，默认 5s 一拍）。
+
+        ExternalSignalFileSource 时间窗口增量读取预警文件（时间戳游标 +
+        已消费行数 + lookback 窗口——通达信启动补齐的历史信号在源内过滤），
         逐条 _process_external_signal 注入；单条失败不阻断其余信号与主循环。
         源未启用（None）直接返回，行为不变。
         """
@@ -3711,6 +3757,8 @@ class LiveEngine:
         for sig in signals:
             try:
                 self._process_external_signal(sig)
+                self._ext_consumed_count += 1
+                self._ext_last_consumed_at = now_shanghai()
             except Exception:  # noqa: BLE001 — 单条信号失败不阻断其余信号
                 logger.exception(
                     "external signal process error (session %s)", self.session_id)

@@ -22,6 +22,7 @@ start_session 只返回构造好、heartbeat 通过、recover 已执行但尚未
 import json
 import logging
 import math
+import os
 import re
 import threading
 import time
@@ -2286,13 +2287,29 @@ def normalize_mismatched_risk(value) -> Optional[bool]:
     return None
 
 
+def normalize_signal_file_path(raw) -> Optional[str]:
+    """外部信号文件路径规范化（接线降本）：去首尾空白 + 去掉 Windows「复制文件
+    地址」带上的成对引号 + 展开 %VAR% / ~；空串 → None（不启用）。
+
+    路径存在性不在这里校验——通达信可能尚未产生文件，引擎启动时会明确告警并
+    持续轮询（见 LiveEngine 初始化 / ExternalSignalFileSource._read_complete_lines）。
+    """
+    if raw is None:
+        return None
+    text = str(raw).strip()
+    if len(text) >= 2 and text[0] == text[-1] and text[0] in ("'", '"'):
+        text = text[1:-1].strip()
+    if not text:
+        return None
+    text = os.path.expandvars(os.path.expanduser(text))
+    return text or None
+
+
 def create_session(db: Session, data: dict, mode: str) -> dict:
     """创建 session。新会话默认 alert；老会话由迁移保持 auto。"""
     execution_mode = data.get("execution_mode") or "alert"
-    # 外部信号注入（0011）：空串/纯空白 → None（不启用）；非空原样存储（API 层同规则）
-    signal_file_path = data.get("signal_file_path")
-    if signal_file_path is not None:
-        signal_file_path = str(signal_file_path).strip() or None
+    # 外部信号注入（0011）：空串/纯空白 → None（不启用）；去引号 + 展开变量
+    signal_file_path = normalize_signal_file_path(data.get("signal_file_path"))
     advance_close_enabled, advance_close_time = normalize_advance_close(data)
     # G2：盘前参数会话级覆盖（非法值由 API 层 400；服务层只取合法键）
     pre_open_patch, _ = normalize_pre_open_overrides(data)
@@ -2484,6 +2501,12 @@ def get_session(db: Session, session_id: int, engine: Optional[LiveEngine] = Non
             if engine.last_backfill_time is not None else None
         )
         data["reconcile_mismatches"] = list(engine.reconcile_mismatches)
+        # 外部信号链路运行态（接线判据：enabled/path_exists/formula_names +
+        # 消费计数/游标时间；未启用 {"enabled": False}）
+        try:
+            data["signal_source"] = engine.external_signal_status()
+        except Exception:  # noqa: BLE001 — 观测字段异常不影响会话详情
+            data["signal_source"] = None
         # 交易日历来源/退化状态（"是否在用退化日历"必须可见；未加载年份为空）
         cal = getattr(engine, "_calendar", None)
         data["trading_calendar"] = (
@@ -2493,6 +2516,10 @@ def get_session(db: Session, session_id: int, engine: Optional[LiveEngine] = Non
         data["pending_orders"] = 0
         data["last_backfill_time"] = None
         data["reconcile_mismatches"] = []
+        data["signal_source"] = (
+            {"enabled": False, "path": session.signal_file_path,
+             "note": "会话未运行：信号链路状态需启动后可见"}
+            if session.signal_file_path else {"enabled": False})
         data["trading_calendar"] = None
     # 账户全貌对齐：最新真实账户快照（总资产/可用资金/市值/持仓明细）。
     # 运行中优先取引擎内存最近一次快照组装（与采集同源），否则查表最近一行。
