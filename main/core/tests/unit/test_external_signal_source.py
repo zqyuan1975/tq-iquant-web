@@ -274,6 +274,79 @@ def test_same_code_multiple_lines_returned_for_engine_direction_dedup(tmp_path):
         datetime(2026, 10, 30, 9, 50), datetime(2026, 10, 30, 9, 55)]
 
 
+def test_same_minute_late_row_not_dropped(tmp_path):
+    """同一分钟内晚到的第二/第 N 行：不被 <= 游标判定静默丢弃，且只消费一次。
+
+    旧实现游标 = 最晚信号时间，判定 `<=` 游标直接 continue——10:02 第一行消费后，
+    同分钟再触发的第二行在下轮被丢弃（实盘漏信号）。
+    """
+    clock = _Clock(datetime(2026, 10, 30, 10, 0, 30))
+    p = _write_lines(tmp_path, [])
+    src = ExternalSignalFileSource(str(p), NAMES, lookback_seconds=300, clock=clock)
+    assert src.read_new_signals() == []
+    _write_lines(tmp_path, [
+        _line(1, "920718", "六合高科", "2026-10-30 10:02", "9.83", "0.1%", "1", "分时突击"),
+    ], append=True)
+    clock.now = datetime(2026, 10, 30, 10, 2, 10)
+    assert [s["code"] for s in src.read_new_signals()] == ["920718"]
+    # 同一分钟（10:02）晚到第二行 → 必须消费
+    _write_lines(tmp_path, [
+        _line(2, "605377", "科兴科技", "2026-10-30 10:02", "7.74", "0.91%", "12", "分时突击"),
+    ], append=True)
+    clock.now = datetime(2026, 10, 30, 10, 2, 20)
+    assert [s["code"] for s in src.read_new_signals()] == ["605377"]
+    # 全量重读不重放已消费行
+    clock.now = datetime(2026, 10, 30, 10, 2, 30)
+    assert src.read_new_signals() == []
+    # 同分钟第三行仍能消费
+    _write_lines(tmp_path, [
+        _line(3, "600000", "浦发银行", "2026-10-30 10:02", "9.80", "0.1%", "2", "分时突击"),
+    ], append=True)
+    clock.now = datetime(2026, 10, 30, 10, 2, 40)
+    assert [s["code"] for s in src.read_new_signals()] == ["600000"]
+    assert src.read_new_signals() == []
+    # 游标行数 = 该时间戳在文件中的总行数
+    assert src._last_read_time == datetime(2026, 10, 30, 10, 2)
+    assert src._cursor_count == 3
+
+
+def test_same_minute_row_consumption_logged(tmp_path, caplog):
+    """同一分钟晚到行被消费时 INFO 留痕（可看出「这一行被消费了」而非静默跳过）。"""
+    clock = _Clock(datetime(2026, 10, 30, 10, 0, 0))
+    p = _write_lines(tmp_path, [
+        _line(1, "920718", "六合高科", "2026-10-30 10:01", "9.83", "0.1%", "1", "分时突击"),
+    ])
+    src = ExternalSignalFileSource(str(p), NAMES, lookback_seconds=300, clock=clock)
+    clock.now = datetime(2026, 10, 30, 10, 1, 30)
+    assert len(src.read_new_signals()) == 1
+    _write_lines(tmp_path, [
+        _line(2, "605377", "科兴科技", "2026-10-30 10:01", "7.74", "0.1%", "1", "分时突击"),
+    ], append=True)
+    with caplog.at_level(logging.INFO):
+        assert [s["code"] for s in src.read_new_signals()] == ["605377"]
+    assert "same-minute row consumed" in caplog.text
+
+
+def test_same_minute_row_still_subject_to_lookback(tmp_path):
+    """同一分钟的行同样受 lookback 新鲜度约束；被挡掉的也计入已消费，不重放。"""
+    clock = _Clock(datetime(2026, 10, 30, 10, 0, 0))
+    p = _write_lines(tmp_path, [
+        _line(1, "920718", "六合高科", "2026-10-30 10:01", "9.83", "0.1%", "1", "分时突击"),
+    ])
+    src = ExternalSignalFileSource(str(p), NAMES, lookback_seconds=300, clock=clock)
+    clock.now = datetime(2026, 10, 30, 10, 1, 30)
+    assert len(src.read_new_signals()) == 1
+    # 同分钟第二行延迟到 10:10 才被读到（超出 300s 窗口）→ 不交易
+    _write_lines(tmp_path, [
+        _line(2, "605377", "科兴科技", "2026-10-30 10:01", "7.74", "0.1%", "1", "分时突击"),
+    ], append=True)
+    clock.now = datetime(2026, 10, 30, 10, 10, 0)
+    assert src.read_new_signals() == []
+    # 之后也不会把它当新行重放
+    clock.now = datetime(2026, 10, 30, 10, 10, 5)
+    assert src.read_new_signals() == []
+
+
 def test_reset_daily_resets_cursor(tmp_path):
     p = _write_lines(tmp_path, [
         _line(1, "920718", "六合高科", "2026-10-30 09:50", "9.83", "-1.90%", "1", "分时突击"),
@@ -283,6 +356,7 @@ def test_reset_daily_resets_cursor(tmp_path):
     src.reset_daily()
     # 时间戳游标归位当前时间（新文件「启动后新信号才消费」同语义）
     assert src._last_read_time == TEST_NOW
+    assert src._cursor_count == 0
     # 重置后重读（文件按日轮转场景）
     assert len(src.read_new_signals()) == 1
 

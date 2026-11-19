@@ -14,8 +14,10 @@ signal_cache 走 Portfolio.on_bar 全套（风控/审批/在途单闸不绕过�
 写入文件——按行号游标处理会消费所有旧信号（旧信号股价已拉升/条件已消失，
 不应交易）。改为双重过滤：
 
-    ① 时间戳游标（_last_read_time，初始=启动时当前时间）——只处理时间 > 游标
-       的行，启动前存量（含窗口内近端补齐行）全挡；
+    ① 时间戳游标（_last_read_time，初始=启动时当前时间）——只处理时间 >= 游标
+       的行，启动前存量（含窗口内近端补齐行）全挡；游标时间戳上再记「已消费
+       行数」（_cursor_count），同一分钟内晚到的第二/第 N 行不会被 <= 判定
+       静默丢弃（见 read_new_signals）；
     ② lookback 窗口（默认 300s）——晚到的陈旧行（时间 > 游标但早于
        now - lookback_seconds）不返回，信号新鲜度兜底。
 
@@ -90,6 +92,10 @@ class ExternalSignalFileSource:
         # 信号写入文件，游标把启动前存量（含窗口内近端补齐行）全部挡掉，
         # 只消费启动后新触发的信号。
         self._last_read_time: datetime = self._clock()
+        # 游标时间戳上的「已消费行数」：文件只追加、每轮全量重读，同一分钟内
+        # 晚到的第二行若只按时间（<= 游标）判定会被静默丢弃。改为：时间 == 游标
+        # 的行按出现顺序跳过前 _cursor_count 条（已消费），其余全是新行。
+        self._cursor_count: int = 0
         # 文件缺失告警去重：只在「存在 → 缺失」状态跳变时打一条 WARNING，
         # 避免每 60s tick 刷屏，同时让填错路径可见（不再静默当无信号）。
         self._missing_warned = False
@@ -102,40 +108,72 @@ class ExternalSignalFileSource:
         （code 为文件中的 6 位原码，带后缀归一由引擎注入时完成。）
 
         双重过滤（批次1）：
-        ① 时间戳游标——只处理 signal_time > _last_read_time 的行；
+        ① 时间戳游标——时间 < _last_read_time 的行已消费；时间 == 游标时按
+           出现顺序跳过前 _cursor_count 条（同一分钟内更早读到的行），其余
+           视为新行（同一分钟晚到的第二/第 N 行不再丢失）；
         ② lookback 窗口——只返回 signal_time >= now - lookback_seconds 的信号。
         游标推进：本轮文件全部可解析行中最晚 signal_time（单调不回退，防补齐
-        旧行把游标拉回过去）。编码 GBK（通达信输出）。解析失败的行跳过 +
-        warning 留痕。
+        旧行把游标拉回过去），同时记下该时间戳上的行数。编码 GBK（通达信
+        输出）。解析失败的行跳过 + warning 留痕。
 
         去重不在本层做：文件不含买卖方向（方向由策略公式信号配置决定），
         同代码同日可能先出买入、后出卖出行。引擎按「同代码 + 同日 + 同方向」
-        去重（各认第一条），本层只保证「不重读已消费的时间窗」。
+        去重（默认各认第一条，可由配置放开），本层只保证「不重读已消费的行」。
         """
         now = self._clock()
         cutoff = now - timedelta(seconds=self._lookback_seconds)
         lines = self._read_complete_lines()
-        signals: List[Dict] = []
-        latest: Optional[datetime] = None
+        parsed: List[Dict] = []
         for raw in lines:
             line = raw.strip().lstrip("﻿").strip()
             if not line:
                 continue  # 空行
             sig = self._parse_line(line)
-            if sig is None:
+            if sig is not None:
+                parsed.append(sig)
+        # 游标时间戳及之后每个时间戳的行数：同一分钟多行靠「已消费行数」区分新旧
+        counts: Dict[datetime, int] = {}
+        latest = self._last_read_time
+        for sig in parsed:
+            ts = sig["time"]
+            if ts < self._last_read_time:
                 continue
-            if latest is None or sig["time"] > latest:
-                latest = sig["time"]
-            # ① 时间戳游标：启动前存量行（含通达信补齐历史）不消费
-            if sig["time"] <= self._last_read_time:
+            counts[ts] = counts.get(ts, 0) + 1
+            if ts > latest:
+                latest = ts
+        signals: List[Dict] = []
+        seen_at_cursor = 0
+        same_minute_rows = 0
+        for sig in parsed:
+            ts = sig["time"]
+            if ts < self._last_read_time:
+                continue  # ① 早于游标：已消费（含启动前存量行）
+            if ts == self._last_read_time:
+                seen_at_cursor += 1
+                if seen_at_cursor <= self._cursor_count:
+                    continue  # 该时间戳此前的行已消费过（全量重读去重）
+                # ② lookback 窗口：晚到的陈旧行不交易（股价已拉升/条件已消失）
+                if ts < cutoff:
+                    continue
+                signals.append(sig)
+                same_minute_rows += 1
                 continue
-            # ② lookback 窗口：晚到的陈旧行不交易（股价已拉升/条件已消失）
-            if sig["time"] < cutoff:
+            # ② 时间晚于游标的新行同样受 lookback 新鲜度约束
+            if ts < cutoff:
                 continue
             signals.append(sig)
-        # 游标单调推进 = 文件中最晚信号时间（仅前进，防补齐行把游标拉回过去）
-        if latest is not None and latest > self._last_read_time:
-            self._last_read_time = latest
+        if same_minute_rows:
+            logger.info(
+                "external signal same-minute row consumed: %d row(s) at %s "
+                "(file %s)",
+                same_minute_rows,
+                self._last_read_time.strftime("%Y-%m-%d %H:%M"),
+                self._path,
+            )
+        # 游标单调推进 = 文件中最晚信号时间；行数 = 该时间戳在文件中的总行数
+        # （含本轮被 lookback 挡掉的，避免下一轮把它们当新行再判一次）。
+        self._last_read_time = latest
+        self._cursor_count = counts.get(latest, 0)
         return signals
 
     def reset_daily(self):
@@ -146,6 +184,7 @@ class ExternalSignalFileSource:
         重置时点且落在 lookback 窗口内即消费。
         """
         self._last_read_time = self._clock()
+        self._cursor_count = 0
 
     # ------------------------------------------------------------------
     def _read_complete_lines(self) -> List[str]:
