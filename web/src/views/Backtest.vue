@@ -6686,7 +6686,8 @@ watch(theme, () => {
   .summary-section { grid-template-columns: repeat(2, 1fr); }
   .ca-kpi-grid { grid-template-columns: repeat(2, 1fr); }
 }
-@media (max-width: 768px) {
+/* 断点统一为 760：与 Dashboard 通道卡、全局弹窗/指标卡同一档，避免 761-767px 空档 */
+@media (max-width: 760px) {
   .stats-grid { grid-template-columns: repeat(2, 1fr); }
   .summary-section { grid-template-columns: 1fr; }
   .risk-metrics { grid-template-columns: 1fr; }

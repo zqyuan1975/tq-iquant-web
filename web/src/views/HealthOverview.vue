@@ -133,39 +133,51 @@ onUnmounted(() => {
       <div class="frame-body">
         <div class="health-stats">
           <div class="health-stat">
-            <span>Core</span>
-            <b :style="{ color: data.core.online ? 'var(--green)' : 'var(--red)' }">{{ data.core.online ? '在线' : '离线' }}</b>
-            <i>v{{ data.core.version || '—' }} · {{ data.core.uptime || '—' }}</i>
+            <div class="hs-head">
+              <span class="hs-label">Core</span>
+              <b :style="{ color: data.core.online ? 'var(--green)' : 'var(--red)' }">{{ data.core.online ? '在线' : '离线' }}</b>
+            </div>
+            <i class="hs-sub" :title="`v${data.core.version || '—'} · ${data.core.uptime || '—'}`">v{{ data.core.version || '—' }} · {{ data.core.uptime || '—' }}</i>
           </div>
           <div class="health-stat">
-            <span>引擎 watchdog</span>
-            <b>{{ data.watchdog.running ? '运行中' : '未运行' }}</b>
-            <i>告警 {{ data.watchdog.active_alarms.length }} 条 · 扫描 {{ fmtTime(data.watchdog.last_scan_at) }}</i>
+            <div class="hs-head">
+              <span class="hs-label">引擎 watchdog</span>
+              <b>{{ data.watchdog.running ? '运行中' : '未运行' }}</b>
+            </div>
+            <i class="hs-sub" :title="`告警 ${data.watchdog.active_alarms.length} 条 · 扫描 ${fmtTime(data.watchdog.last_scan_at)}`">告警 {{ data.watchdog.active_alarms.length }} 条 · 扫描 {{ fmtTime(data.watchdog.last_scan_at) }}</i>
           </div>
           <div class="health-stat">
-            <span>自动备份</span>
-            <b>{{ data.tasks.backup_done_today ? '今日已完成' : '今日未完成' }}</b>
-            <i>计划 {{ data.tasks.backup_at || '—' }}</i>
+            <div class="hs-head">
+              <span class="hs-label">自动备份</span>
+              <b>{{ data.tasks.backup_done_today ? '今日已完成' : '今日未完成' }}</b>
+            </div>
+            <i class="hs-sub" :title="`计划 ${data.tasks.backup_at || '—'}`">计划 {{ data.tasks.backup_at || '—' }}</i>
           </div>
           <div class="health-stat">
-            <span>磁盘剩余</span>
-            <b :style="{ color: data.disk.ok ? 'var(--green)' : 'var(--red)' }">
-              {{ data.disk.free_mb === null ? '—' : `${data.disk.free_mb} MB` }}
-            </b>
-            <i>保护阈值 {{ data.disk.min_free_mb }} MB</i>
+            <div class="hs-head">
+              <span class="hs-label">磁盘剩余</span>
+              <b :style="{ color: data.disk.ok ? 'var(--green)' : 'var(--red)' }">
+                {{ data.disk.free_mb === null ? '—' : `${data.disk.free_mb} MB` }}
+              </b>
+            </div>
+            <i class="hs-sub" :title="`保护阈值 ${data.disk.min_free_mb} MB`">保护阈值 {{ data.disk.min_free_mb }} MB</i>
           </div>
           <div class="health-stat">
-            <span>待处理告警</span>
-            <b :style="{ color: alertTotal ? 'var(--red)' : 'var(--ink)' }">{{ alertTotal }}</b>
-            <i>
+            <div class="hs-head">
+              <span class="hs-label">待处理告警</span>
+              <b :style="{ color: alertTotal ? 'var(--red)' : 'var(--ink)' }">{{ alertTotal }}</b>
+            </div>
+            <i class="hs-sub" :title="`未处理告警 ${data.alert_totals.open_decisions} · 顺延 ${data.alert_totals.deferred_orders} · 待审批 ${data.alert_totals.pending_approvals}`">
               未处理告警 {{ data.alert_totals.open_decisions }} · 顺延 {{ data.alert_totals.deferred_orders }} ·
               <RouterLink to="/live?tab=approvals" class="alert-link">待审批 {{ data.alert_totals.pending_approvals }}</RouterLink>
             </i>
           </div>
           <div class="health-stat">
-            <span>告警外发</span>
-            <b>{{ data.notify.usable ? '已配置' : (data.notify.enabled ? '未就绪' : '关闭') }}</b>
-            <i>
+            <div class="hs-head">
+              <span class="hs-label">告警外发</span>
+              <b>{{ data.notify.usable ? '已配置' : (data.notify.enabled ? '未就绪' : '关闭') }}</b>
+            </div>
+            <i class="hs-sub" :title="`${data.notify.channels.map((c) => NOTIFY_LABEL[c] || c).join(' / ') || '未配置渠道'} · 最低 ${data.notify.min_level}`">
               {{ data.notify.channels.map((c) => NOTIFY_LABEL[c] || c).join(' / ') || '未配置渠道' }}
               · 最低 {{ data.notify.min_level }}
             </i>
@@ -294,10 +306,14 @@ onUnmounted(() => {
 .frame { margin-bottom: 10px }
 .frame-head { padding: 6px 12px }
 .frame-body { padding: 8px 12px }
-.health-stats { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 24px }
-.health-stat { display: flex; align-items: baseline; gap: 6px; min-width: 0; font-size: 12px; color: var(--ink-soft) }
-.health-stat > b { font-size: 16px; font-weight: 800; color: var(--ink); white-space: nowrap; font-variant-numeric: tabular-nums }
-.health-stat > i { font-style: normal; font-size: 11px; color: var(--ink-faint); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 168px }
+/* 01 区单行数字条：主值一行 + 副信息小字（对齐首页状态总览 01 的形态） */
+.health-stats { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 10px 0 }
+.health-stat { display: flex; flex-direction: column; gap: 1px; min-width: 0; padding: 0 12px; border-left: 1px solid var(--line) }
+.health-stat:first-child { padding-left: 0; border-left: none }
+.hs-head { display: flex; align-items: baseline; gap: 6px; min-width: 0 }
+.hs-label { font-size: 11.5px; color: var(--ink-soft); white-space: nowrap; flex: 0 0 auto }
+.health-stat > b { min-width: 0; font-family: var(--font-serif); font-size: 16px; font-weight: 800; color: var(--ink); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-variant-numeric: tabular-nums }
+.health-stat > i { font-style: normal; font-size: 11px; color: var(--ink-faint); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; font-variant-numeric: tabular-nums }
 .health-table { font-size: 13px }
 .health-table th, .health-table td { padding: 4px 10px }
 .health-table td { vertical-align: top }
@@ -318,5 +334,15 @@ onUnmounted(() => {
 .alert-link:hover { text-decoration: underline }
 @media (max-width: 1100px) {
   .dash-hero { flex-wrap: wrap; align-items: center; row-gap: 10px; padding-bottom: 12px; margin-bottom: 14px; }
+  /* 01 数字条：6 列 -> 3 列（两行），保持「主值 + 副信息」两行结构 */
+  .health-stats { grid-template-columns: repeat(3, minmax(0, 1fr)); row-gap: 10px }
+  .health-stat { padding-left: 12px; border-left: 1px solid var(--line) }
+  .health-stat:nth-child(3n + 1) { padding-left: 0; border-left: none }
+}
+@media (max-width: 760px) {
+  /* 01 数字条：3 列 -> 2 列 */
+  .health-stats { grid-template-columns: repeat(2, minmax(0, 1fr)) }
+  .health-stat { padding-left: 12px; border-left: 1px solid var(--line) }
+  .health-stat:nth-child(2n + 1) { padding-left: 0; border-left: none }
 }
 </style>

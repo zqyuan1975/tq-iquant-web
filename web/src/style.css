@@ -238,8 +238,8 @@ tbody tr:last-child td{border-bottom:none}
 
 /* 紧凑表单弹窗：字段较多的编辑弹窗统一收紧行距、标签宽度与分组标题；
    `--3col` 变体用于短字段较多的表单（长文本/带说明字段仍由 span-2 占两列）。 */
-.modal-dense.modal-lg .modal-content{width:960px;padding:20px}
-.modal-dense--3col.modal-lg .modal-content{width:1020px}
+.modal-dense.modal-lg .modal-content{width:min(960px,94vw);padding:20px}
+.modal-dense--3col.modal-lg .modal-content{width:min(1020px,94vw)}
 .modal-dense .modal-body{padding-right:2px}
 .modal-dense .group-label{margin:8px 0 4px;padding-bottom:3px;font-size:12px}
 .modal-dense .field-grid{column-gap:14px;row-gap:1px}
@@ -277,9 +277,8 @@ tbody tr:last-child td{border-bottom:none}
 .sub-strategy-meta{font-size:12px;color:var(--ink-soft)}
 .sub-strategy-actions{margin-left:auto;display:flex;align-items:center}
 
-/* 回测详情：评估指标卡 */
-.metric-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:10px;margin-bottom:16px}
-.metric-card{background:var(--card-bg);border:1px solid var(--border);border-radius:var(--radius);padding:14px 14px 12px;display:flex;flex-direction:column;gap:6px}
+/* 回测详情：评估指标卡（.metric-grid 的唯一定义在下方「详情指标面板」处，
+   此处原先的 auto-fill 版本已被 12 列版覆盖，已删除以免误改） */
 .metric-label{font-size:11px;letter-spacing:.15em;color:var(--ink-faint);text-transform:uppercase;font-weight:600}
 .metric-value{font-size:24px;font-weight:700;color:var(--ink);font-family:var(--font-serif);font-variant-numeric:tabular-nums;line-height:1.15}
 
@@ -392,7 +391,7 @@ tbody tr:last-child td{border-bottom:none}
 }
 
 /* ---- 详情指标面板（成本/容量等）：指标卡 + 环图/对照刻度/进度条，可复用于其它详情指标区 ---- */
-.metric-grid { display: grid; grid-template-columns: repeat(12, minmax(0, 1fr)); gap: 12px; }
+.metric-grid { display: grid; grid-template-columns: repeat(12, minmax(0, 1fr)); gap: 12px; margin-bottom: 16px; }
 .metric-card {
   grid-column: span 6; display: flex; flex-direction: column; gap: 8px;
   padding: 14px 16px; background: var(--card-bg); border: 1px solid var(--border);
