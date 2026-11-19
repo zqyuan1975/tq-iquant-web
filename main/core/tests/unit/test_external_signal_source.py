@@ -1,9 +1,11 @@
 """外部信号注入源单测 — 通达信条件预警文本文件解析（0011 外部信号注入链路）。
 
-文件形态（真机样本）：GBK 编码、追加写入、制表符分隔，每行一条预警：
-  行号\t代码(6位)\t名称\tYYYY-MM-DD HH:MM\t价格\t涨跌幅%\t现量\t公式名
-ExternalSignalFileSource 时间窗口增量读取（时间戳游标 + lookback 窗口）→
-公式名匹配过滤 → 标准化信号 dict。
+文件形态（真机样本，当前版本）：GBK 编码、CRLF、追加写入、制表符分隔，每行
+一条预警（无行号列，行尾常带多余 TAB）：
+  代码(6位)\t名称\tYYYY-MM-DD HH:MM\t价格\t涨跌幅%\t现量\t公式名\t
+早期版本带行号（首列行号、次列代码）仍兼容。ExternalSignalFileSource 时间窗口
+增量读取（时间戳游标 + 已消费行数 + lookback 窗口）→ 公式名匹配过滤 →
+标准化信号 dict。
 
 时间窗口模型（批次1 外部信号改造）：通达信条件预警启动时会补齐全部历史信号
 写入文件——按行号游标处理会消费所有旧信号（旧信号股价已拉升/条件已消失）。
@@ -87,6 +89,100 @@ def test_parse_normal_lines(tmp_path):
     assert s1["code"] == "605377"
     assert s1["time"] == datetime(2026, 10, 30, 9, 51)
     assert s1["price"] == Decimal("7.74")
+
+
+def test_parse_real_sample_plain_layout(tmp_path):
+    """真机样本（BDXH.txt）：无行号列、7 列 + 行尾 TAB、GBK、CRLF → 正确解析。"""
+    p = tmp_path / "BDXH.txt"
+    p.write_bytes((
+        "300456\t赛微电子\t2026-09-08 23:08\t37.61\t-2.77%\t 5387\t波段加仓\t\r\n"
+        "300623\t捷捷微电\t2026-09-08 23:08\t28.95\t-1.23%\t 1381\t波段清仓\t\r\n"
+    ).encode("gbk"))
+    src = ExternalSignalFileSource(
+        str(p), {"波段加仓", "波段清仓"}, lookback_seconds=300,
+        clock=_Clock(datetime(2026, 9, 8, 23, 7)))
+    sigs = src.read_new_signals()
+    assert [(s["code"], s["name"], s["formula_name"]) for s in sigs] == [
+        ("300456", "赛微电子", "波段加仓"),
+        ("300623", "捷捷微电", "波段清仓"),
+    ]
+    assert sigs[0]["time"] == datetime(2026, 9, 8, 23, 8)
+    assert sigs[0]["price"] == Decimal("37.61")
+    assert sigs[1]["price"] == Decimal("28.95")
+
+
+def test_plain_layout_appended_line_consumed(tmp_path):
+    """真实格式追加写：新增行（CRLF + 行尾 TAB）能被增量消费且不重放。"""
+    clock = _Clock(datetime(2026, 9, 8, 9, 29))
+    p = tmp_path / "BDXH.txt"
+    p.write_bytes(b"")
+    src = ExternalSignalFileSource(
+        str(p), {"波段加仓"}, lookback_seconds=300, clock=clock)
+    assert src.read_new_signals() == []
+    _write_bytes(p, (
+        "300456\t赛微电子\t2026-09-08 09:30\t37.61\t-2.77%\t 5387\t波段加仓\t\r\n"
+    ).encode("gbk"), append=True)
+    clock.now = datetime(2026, 9, 8, 9, 30, 10)
+    assert [s["code"] for s in src.read_new_signals()] == ["300456"]
+    assert src.read_new_signals() == []
+
+
+def test_legacy_row_number_layout_still_supported(tmp_path):
+    """早期带行号（8 列）格式继续兼容：首列行号、次列代码。"""
+    p = _write_lines(tmp_path, [
+        _line(1, "920718", "六合高科", "2026-10-30 09:50", "9.83", "-1.90%", "1", "分时突击"),
+    ])
+    sigs = _source(p).read_new_signals()
+    assert [(s["code"], s["name"]) for s in sigs] == [("920718", "六合高科")]
+
+
+def test_header_line_skipped_without_warning(tmp_path, caplog):
+    """表头行静默跳过（不算坏行、不刷 WARNING），后续数据行正常消费。"""
+    p = tmp_path / "BDXH.txt"
+    p.write_bytes((
+        "代码\t名称\t时间\t价格\t涨幅\t现量\t公式名\t\r\n"
+        "300456\t赛微电子\t2026-09-08 09:30\t37.61\t-2.77%\t 5387\t波段加仓\t\r\n"
+    ).encode("gbk"))
+    src = ExternalSignalFileSource(
+        str(p), {"波段加仓"}, lookback_seconds=300,
+        clock=_Clock(datetime(2026, 9, 8, 9, 29)))
+    with caplog.at_level(logging.WARNING):
+        sigs = src.read_new_signals()
+    assert [s["code"] for s in sigs] == ["300456"]
+    assert "跳过" not in caplog.text
+
+
+def test_unchanged_file_skips_parse(tmp_path):
+    """size+mtime 未变 → 跳过读盘/解析（独立 5s 轮询下多数轮次无新行）。"""
+    p = _write_lines(tmp_path, [
+        _line(1, "600000", "浦发银行", "2026-10-30 09:50", "9.83", "0.1%", "1", "分时突击"),
+    ])
+    src = _source(p)
+    assert len(src.read_new_signals()) == 1
+
+    def _boom(_line):
+        raise AssertionError("文件无变化时不应重新解析")
+
+    src._parse_line = _boom
+    assert src.read_new_signals() == []
+
+
+def test_truncated_file_keeps_cursor_and_warns(tmp_path, caplog):
+    """文件被截断/重建：保留游标（宁漏不重），并留 WARNING 痕迹。"""
+    clock = _Clock(datetime(2026, 10, 30, 9, 49))
+    p = _write_lines(tmp_path, [
+        _line(1, "920718", "六合高科", "2026-10-30 09:50", "9.83", "0.1%", "1", "分时突击"),
+    ])
+    src = _source(p, clock=clock)
+    assert len(src.read_new_signals()) == 1
+    with caplog.at_level(logging.WARNING):
+        # 重建为更短的新文件（游标时刻的行数从 1 变 1，不做重放）
+        _write_lines(tmp_path, [
+            _line(1, "605377", "科兴", "2026-10-30 09:50", "7.74", "0.1%", "1", "分时突击"),
+        ])
+        sigs = src.read_new_signals()
+    assert sigs == []  # 宁漏不重：游标时间戳上已消费 1 行，新文件同时间首行不重放
+    assert "截断/重建" in caplog.text
 
 
 def test_missing_file_returns_empty(tmp_path):
