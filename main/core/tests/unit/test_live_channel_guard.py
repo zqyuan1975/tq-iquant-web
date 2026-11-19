@@ -58,6 +58,18 @@ def test_guard_lists_checks_and_actions(monkeypatch):
     assert live_service.session_channel_guard(db, 99999, {}) is None
 
 
+def test_guard_skips_backup_check_for_stopped_session(monkeypatch):
+    """停止态不判备用通道：未配置/离线都不再制造假告警（2026-11-19）。"""
+    db = _db()
+    sid = _session(db, engine="tdx", backup=None, status="stopped")
+    monkeypatch.setattr(live_service, "channel_status",
+                        _fake_status({"tdx": True}))
+    data = live_service.session_channel_guard(db, sid, {})
+    checks = {c["key"]: c for c in data["checks"]}
+    assert checks["backup_ready"]["ok"] is True
+    assert "未运行" in checks["backup_ready"]["detail"]
+
+
 def test_guard_flags_running_session_without_engine(monkeypatch):
     db = _db()
     sid = _session(db, engine="tdx", status="running")

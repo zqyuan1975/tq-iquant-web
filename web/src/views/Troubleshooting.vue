@@ -31,7 +31,7 @@ const PLAYBOOK: PlaybookItem[] = [
     checks: [
       { label: '主通道状态', detail: '健康总览「通道」区确认 primary.online 与 configured；主通道不可用会亮 error。', to: '/health', linkText: '查看健康总览' },
       { label: '客户端进程', detail: '通达信/同花顺客户端是否仍在运行；ths 通道还需确认窗口标题与交接目录未被改动。', to: '/system', linkText: '核对通道配置' },
-      { label: '通道守卫检查', detail: '健康总览中的 channel_guard.failed 列出未通过项（桥地址、账号、文件目录等）。', to: '/health', linkText: '查看失败项' },
+      { label: '通道守卫检查', detail: '健康总览「通道检查明细」逐项列出 5 项检查（主通道配置 / 客户端在线 / 运行态引擎注册 / 备用通道 / 无待生效配置）；未通过项也会出现在「需要关注」。停止态会话不判备用通道。', to: '/health', linkText: '查看逐项明细' },
       { label: '近期通道事件', detail: '关键事件检索里 gate=channel_offline / channel_recovered，确认断线持续时间与恢复时间。', to: '/events', linkText: '检索通道事件' },
     ],
   },
@@ -43,7 +43,7 @@ const PLAYBOOK: PlaybookItem[] = [
       { label: '最近 bar 时间', detail: '健康总览「数据新鲜度」按周期列出 stale/empty 数量；业务心跳开启时 /health 也带最近 bar。', to: '/health', linkText: '查看数据体检' },
       { label: '行情链路', detail: '确认行情源（TQ / 桥）在线；bridge_online=false 或客户端退出都会先表现为行情停摆。', to: '/health', linkText: '查看通道状态' },
       { label: '盘外误报', detail: '午休 11:30–13:00、盘后与非交易日不判停滞；先确认当前是否在连续竞价时段。', to: '/health', linkText: '查看当日任务' },
-      { label: '关键事件', detail: '检索 gate=market_data_stalled，确认是否已由 watchdog 落库。', to: '/events', linkText: '检索行情事件' },
+      { label: '关键事件', detail: '检索 gate=channel_offline，关键字填 market_data_stalled（事件 message 含「判据=market_data_stalled」；行情停滞类事件统一落在 channel_offline）。', to: '/events', linkText: '检索行情事件' },
     ],
   },
   {
@@ -52,8 +52,8 @@ const PLAYBOOK: PlaybookItem[] = [
     symptom: '进程还在、/health 正常，但引擎长期没有新的 tick 或账户快照。',
     checks: [
       { label: '业务心跳', detail: '开启 health.business_probe_enabled 后，/health 的 business.sessions 会给出 last_tick_at / last_bar_at / 停滞秒数。', to: '/health', linkText: '查看健康总览' },
-      { label: 'watchdog 扫描', detail: 'watchdog-status 的 last_scan_at 停止前进 = 扫描线程卡死；active_alarms 列出当前告警。', to: '/health', linkText: '查看 watchdog' },
-      { label: '引擎层告警', detail: '关键事件检索 gate=engine_stale / 通道类离线事件，确认是否已触发并恢复。', to: '/events', linkText: '检索引擎事件' },
+      { label: 'watchdog 扫描', detail: 'watchdog-status 的 last_scan_at 停止前进 = 扫描线程卡死；活跃告警明细在实盘工作台的通道/风险提示区查看（健康总览只给计数）。', to: '/live', linkText: '查看告警明细' },
+      { label: '引擎层告警', detail: 'engine_stale 只进 watchdog 告警，不落决策事件；到实盘工作台看当前告警，通道类离线事件再去关键事件检索 gate=channel_offline。', to: '/live', linkText: '查看 watchdog 告警' },
       { label: '重启会话', detail: '确认无未完成委托后，在实盘工作台停止并重新启动该会话（本向导不代操作）。', to: '/live', linkText: '进入实盘工作台' },
     ],
   },
@@ -63,8 +63,8 @@ const PLAYBOOK: PlaybookItem[] = [
     symptom: '委托长期处于 deferred 或审批队列 pending，未成交也未撤销。',
     checks: [
       { label: '待放行委托', detail: '健康总览 alerts.deferred_orders 按会话计数；点进实盘工作台查看具体委托。', to: '/live', linkText: '处理委托' },
-      { label: '待审批单', detail: 'alerts.pending_approvals 非 0 时需人工审批，超时按配置自动过期。', to: '/live', linkText: '处理审批' },
-      { label: '执行为停滞', detail: '关键事件检索 gate=execution_stalled（ths 积压/回执未消费）确认执行层是否卡住。', to: '/events', linkText: '检索执行事件' },
+      { label: '待审批单', detail: 'alerts.pending_approvals 非 0 时需人工审批；当前工作台暂无审批界面，需调用 POST /api/live/sessions/{id}/approvals/{approval_id}/approve|reject 处理。超时过期只在会话运行中的引擎 tick 内执行。', to: '/live', linkText: '进入实盘工作台' },
+      { label: '执行为停滞', detail: '检索 gate=channel_offline，关键字填 execution_stalled（message 含「判据=execution_stalled」，ths 积压/回执未消费会触发）。', to: '/events', linkText: '检索执行事件' },
     ],
   },
   {
@@ -74,7 +74,7 @@ const PLAYBOOK: PlaybookItem[] = [
     checks: [
       { label: '按周期排查', detail: '健康总览 data.periods 逐周期给出 stale/empty/total，定位是分钟线还是日线缺口。', to: '/health', linkText: '查看数据体检' },
       { label: '行情通道', detail: '数据体检 unavailable 时先修通道（行情源不可用无法补齐）。', to: '/health', linkText: '查看通道' },
-      { label: '股票池 / 数据下载', detail: '确认备选股池与数据下载任务是否完成，必要时重新触发补齐。', to: '/stock-pools', linkText: '进入备选股池' },
+      { label: '股票池 / 数据体检', detail: '备选股池可核对股票池同步；数据缺口到实盘工作台点「数据体检」查看。非盘中会自动重读本地落盘，但平台无法程序化触发通达信下载，需在通达信客户端人工补下载。', to: '/live', linkText: '进入实盘工作台' },
     ],
   },
   {

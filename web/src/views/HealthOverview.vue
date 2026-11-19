@@ -44,13 +44,30 @@ function onlineText(v: boolean | null | undefined): string {
 function dataText(s: HealthSessionItem): string {
   if (s.data.unavailable) return '不可用'
   if (!s.data.available) return '—'
-  if (s.data.healthy) return '正常'
-  return `缺失/陈旧 ${s.data.bad_total ?? 0}`
+  return s.data.healthy ? '正常' : '有缺失/陈旧'
 }
 
 function dataBadge(s: HealthSessionItem): string {
   if (s.data.unavailable || !s.data.available) return 'badge-gray'
   return s.data.healthy ? 'badge-green' : 'badge-red'
+}
+
+interface GuardCheck {
+  key?: string
+  label?: string
+  ok?: boolean
+  detail?: string
+}
+
+/** 后端在 channel_guard 内返回逐项 checks（5 项）；旧数据无该字段时返回空数组。 */
+function guardChecks(s: HealthSessionItem): GuardCheck[] {
+  const raw = (s.channel_guard as unknown as { checks?: GuardCheck[] }).checks
+  return Array.isArray(raw) ? raw : []
+}
+
+/** 逐周期新鲜度（1d/1m…），替代原先单一聚合数字。 */
+function periodEntries(s: HealthSessionItem): [string, { stale: number; empty: number; total: number }][] {
+  return Object.entries(s.data.periods ?? {})
 }
 
 function fmtTime(iso: string | null): string {
@@ -200,7 +217,15 @@ onUnmounted(() => {
                   {{ s.channel_ok ? onlineText(s.channel.primary?.online) : '不可用' }}
                 </td>
                 <td>{{ onlineText(s.bridge.online) }}</td>
-                <td><span class="badge" :class="dataBadge(s)">{{ dataText(s) }}</span></td>
+                <td class="data-cell">
+                  <span class="badge" :class="dataBadge(s)">{{ dataText(s) }}</span>
+                  <div v-if="s.data.unavailable" class="period-line">
+                    {{ s.data.reason || '行情通道不可用' }}
+                  </div>
+                  <div v-for="[p, v] in periodEntries(s)" :key="p" class="period-line">
+                    {{ p }}：陈旧 {{ v.stale }} / 空 {{ v.empty }} / 共 {{ v.total }}
+                  </div>
+                </td>
                 <td class="num">{{ s.today.orders }} / {{ s.today.trades }}</td>
                 <td class="num">{{ s.alerts.open_decisions }}</td>
                 <td class="num">{{ s.alerts.deferred_orders }}</td>
@@ -209,6 +234,36 @@ onUnmounted(() => {
             </tbody>
           </table>
           <div v-if="data.sessions.length === 0" class="empty-state"><p>暂无实盘会话</p></div>
+        </div>
+      </div>
+    </div>
+
+    <div v-if="data.sessions.length" class="frame">
+      <div class="frame-head">
+        <span class="frame-num">04</span>
+        <span class="frame-title">通道检查明细（逐项）</span>
+      </div>
+      <div class="frame-body">
+        <div v-for="s in data.sessions" :key="s.id" class="guard-block">
+          <div class="guard-head">
+            <b>{{ s.name }}</b>
+            <span class="badge" :class="s.channel_guard.ok ? 'badge-green' : 'badge-orange'">
+              {{ s.channel_guard.available
+                ? (s.channel_guard.ok ? '全部通过'
+                  : `未通过 ${s.channel_guard.failed.length} 项`)
+                : '检查不可用' }}
+            </span>
+          </div>
+          <ul v-if="guardChecks(s).length" class="guard-list">
+            <li v-for="c in guardChecks(s)" :key="c.key || c.label" :class="{ bad: c.ok === false }">
+              <span class="badge" :class="c.ok ? 'badge-green' : 'badge-red'">
+                {{ c.ok ? '通过' : '未通过' }}
+              </span>
+              <span class="guard-label">{{ c.label || c.key || '—' }}</span>
+              <span class="guard-detail">{{ c.detail || '—' }}</span>
+            </li>
+          </ul>
+          <p v-else class="guard-detail">该会话没有可用的通道检查结果。</p>
         </div>
       </div>
     </div>
@@ -233,6 +288,16 @@ onUnmounted(() => {
 .problem-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 8px }
 .problem-list li { display: flex; align-items: flex-start; gap: 8px; font-size: 13px; line-height: 1.5 }
 .num { font-variant-numeric: tabular-nums; text-align: right }
+.data-cell { min-width: 150px }
+.period-line { font-size: 11px; color: var(--ink-soft); line-height: 1.5; margin-top: 3px; font-variant-numeric: tabular-nums }
+.guard-block { padding: 8px 0; border-top: 1px dashed var(--line) }
+.guard-block:first-child { padding-top: 0; border-top: none }
+.guard-head { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; font-size: 13px }
+.guard-list { list-style: none; margin: 0; padding: 0; display: grid; gap: 5px }
+.guard-list li { display: flex; align-items: baseline; gap: 8px; font-size: 12px }
+.guard-list li.bad .guard-label { color: var(--red) }
+.guard-label { font-weight: 600; flex-shrink: 0 }
+.guard-detail { color: var(--ink-soft); overflow-wrap: anywhere }
 @media (max-width: 1100px) {
   .dash-hero { flex-wrap: wrap; align-items: center; row-gap: 10px; padding-bottom: 12px; margin-bottom: 14px; }
 }

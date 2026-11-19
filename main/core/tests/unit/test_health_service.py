@@ -131,6 +131,9 @@ def test_overview_counts_today_alerts_and_warns(session_factory, patched):
     assert item["today"] == {"orders": 2, "trades": 1}
     assert item["alerts"] == {"open_decisions": 3, "deferred_orders": 1,
                               "pending_approvals": 1}
+    assert item["channel_guard"]["checks"] == [
+        {"key": "client_online", "label": "客户端/桥在线", "ok": True,
+         "detail": ""}]
     assert res["alert_totals"] == {"open_decisions": 3, "deferred_orders": 1,
                                   "pending_approvals": 1}
     assert res["level"] == "warn"

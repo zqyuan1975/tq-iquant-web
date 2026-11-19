@@ -134,6 +134,17 @@ def _session_item(db, session: LiveSession, now: datetime) -> dict:
             "available": guard is not None,
             "ok": bool(checks) and not failed,
             "failed": failed,
+            # 逐项结果（5 项）供健康总览/故障向导展示，避免只看到 problems 里
+            # 被截断的前 4 项（2026-11-19）。
+            "checks": [
+                {
+                    "key": c.get("key"),
+                    "label": c.get("label"),
+                    "ok": bool(c.get("ok")),
+                    "detail": c.get("detail") or "",
+                }
+                for c in checks
+            ],
         },
         "data": data,
         "today": {"orders": orders_today, "trades": trades_today},

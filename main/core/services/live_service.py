@@ -2459,10 +2459,14 @@ def session_channel_guard(db: Session, session_id: int,
          "label": "运行态引擎已注册",
          "detail": ("未运行（不需要）" if not running_status else
                     ("已注册" if registered else "会话运行中但后端无引擎实例，需停止后重新启动"))},
-        {"key": "backup_ready", "ok": bool(backup and backup.get("online")),
+        # 停止态不判备用通道：未运行会话没有「切换」需求，硬判未配置会制造
+        # 假告警（2026-11-19：停止会话仍报「备用通道可用」失败）。
+        {"key": "backup_ready",
+         "ok": (not running_status) or bool(backup and backup.get("online")),
          "label": "备用通道可用",
-         "detail": ("未配置" if backup is None else
-                    ("在线" if backup.get("online") else "离线"))},
+         "detail": ("未运行（不需要）" if not running_status else
+                    ("未配置" if backup is None else
+                     ("在线" if backup.get("online") else "离线")))},
         {"key": "pending_changes", "ok": pending_count == 0,
          "label": "无待生效配置",
          "detail": ("无" if pending_count == 0 else
