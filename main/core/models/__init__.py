@@ -32,7 +32,11 @@ from .incremental_backtest import (
     IncrementalBacktestDay,
     IncrementalBacktestValidation,
 )
-from .decision_event import BacktestDecisionEvent, LiveDecisionEvent
+from .decision_event import (
+    BacktestDecisionEvent,
+    LiveDecisionAckLog,
+    LiveDecisionEvent,
+)
 from .data_backup import DataBackupRecord
 from .corporate_action import CorporateAction, LiveCorporateAction
 from .live_approval_queue import LiveApprovalQueue
@@ -80,6 +84,7 @@ __all__ = [
     "IncrementalBacktestDay",
     "IncrementalBacktestValidation",
     "BacktestDecisionEvent",
+    "LiveDecisionAckLog",
     "LiveDecisionEvent",
     "DataBackupRecord",
     "CorporateAction",

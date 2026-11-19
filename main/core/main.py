@@ -22,7 +22,7 @@ from core.services.backtest_service import (
     recover_stale_running_backtests, recover_stale_running_batch_runs,
 )
 from core.services.live_service import (
-    ENGINES, recover_stale_running_live_sessions,
+    ENGINES, DecisionArchiveScheduler, recover_stale_running_live_sessions,
 )
 from core.engine.live.engine_watchdog import (
     EngineWatchdog, record_channel_decision,
@@ -140,7 +140,23 @@ async def lifespan(app: FastAPI):
         except Exception:  # noqa: BLE001 — 调度失败不得阻断交易主服务
             logger.exception("增量回测调度启动失败（主服务继续运行）")
             incr_scheduler = None
+    # 决策事件过期归档调度（daemon 线程，每小时）：把超过
+    # live.decision_archive_days（默认 7 天）仍 open 的非高危事件标为 archived，
+    # 只移出「未处理」计数，不删除；<=0 时调度自身空转（maybe_run 直接返回）。
+    archive_scheduler = None
+    if os.environ.get("TQ_DECISION_ARCHIVE_SCHEDULER_DISABLED") == "1":
+        logger.info("决策事件归档调度已禁用（TQ_DECISION_ARCHIVE_SCHEDULER_DISABLED=1）")
+    else:
+        try:
+            archive_scheduler = DecisionArchiveScheduler()
+            archive_scheduler.start()
+            logger.info("决策事件归档调度已启动（进程内，每小时）")
+        except Exception:  # noqa: BLE001 — 归档调度失败不得阻断交易主服务
+            logger.exception("决策事件归档调度启动失败（主服务继续运行）")
+            archive_scheduler = None
     yield
+    if archive_scheduler is not None:
+        archive_scheduler.stop()
     if incr_scheduler is not None:
         incr_scheduler.stop()
     if backup_scheduler is not None:

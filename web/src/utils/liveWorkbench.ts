@@ -83,9 +83,12 @@ export interface DecisionRow {
   requested_qty: number | null
   final_qty: number | null
   message: string
-  // M4 确认/关闭状态
-  ack_status?: 'open' | 'acked' | null
+  // 处理状态：open 未处理 / acked 人工确认 / archived 过期归档
+  ack_status?: 'open' | 'acked' | 'archived' | null
   ack_note?: string | null
+  ack_by?: string | null
+  archived_at?: string | null
+  archive_reason?: string | null
 }
 
 type Ev = Record<string, unknown>
@@ -536,6 +539,9 @@ export function decisionHistoryToRows(items: DecisionEventItem[]): DecisionRow[]
       message: i.message || '',
       ack_status: i.ack_status ?? 'open',
       ack_note: i.ack_note ?? null,
+      ack_by: i.ack_by ?? null,
+      archived_at: i.archived_at ?? null,
+      archive_reason: i.archive_reason ?? null,
     }
   }).reverse()
 }

@@ -102,8 +102,10 @@ const PLAYBOOK: PlaybookItem[] = [
     title: '告警堆积 / 事件未确认',
     symptom: '未处理决策事件持续增长，盘后无人清零。',
     checks: [
-      { label: '未处理事件', detail: '健康总览 alerts.open_decisions 按会话统计，事件检索默认只看「未处理」。', to: '/events', linkText: '检索未处理事件' },
-      { label: '逐条确认', detail: '在实盘工作台的决策事件面板确认或批量确认；日终可一键清零。', to: '/live', linkText: '处理事件' },
+      { label: '未处理事件', detail: '健康总览 alerts.open_decisions 与事件检索「未处理」同一口径：ack_status=open 且未归档，两处数字应永远一致。', to: '/events', linkText: '检索未处理事件' },
+      { label: '批量确认', detail: '在实盘工作台决策面板按门类/层级/时间/关键字筛选后先预览「将确认 N 条」再二次确认；不支持全选，原因必填并逐条留痕。', to: '/live', linkText: '批量确认事件' },
+      { label: '高危门类', detail: 'cash_diff / equity_deviation / engine_owner_mismatch / sell_scope / split_children_lost / out_of_pool_position 不参与批量与自动归档，必须逐条核对后确认。', to: '/live', linkText: '逐条处理' },
+      { label: '过期归档', detail: '普通事件超过 7 天未处理自动归档（config: live.decision_archive_days 可调），移出未处理计数但仍可按「已归档」查询回看，不是删除。', to: '/events', linkText: '查看已归档' },
     ],
   },
 ]

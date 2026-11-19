@@ -1250,11 +1250,11 @@ def session_decisions(session_id: int, ack_status: Optional[str] = None,
     """决策闸门事件（调参可观测性）：聚合统计 summary + 原始事件 events。
 
     覆盖信号→成交全链路拦截点（止损/止盈/熔断/资金不足/超仓/收盘/去重/桥拒单…），
-    与回测详情的 decision_summary/decisions 同口径。M4：ack_status=open/acked
-    可过滤未处理/已确认事件，ack_summary 返回两类计数。
+    与回测详情的 decision_summary/decisions 同口径。ack_status=open/acked/archived
+    可过滤未处理（open 且未归档）/已确认/已归档，ack_summary 返回三类计数。
     """
-    if ack_status not in (None, "", "open", "acked"):
-        return err(400, "ack_status 仅支持 open / acked")
+    if ack_status not in (None, "", "open", "acked", "archived"):
+        return err(400, "ack_status 仅支持 open / acked / archived")
     data = svc.session_decisions(db, session_id, ack_status or None)
     if data is None:
         return err(404, "资源不存在")
@@ -1274,8 +1274,8 @@ def search_decision_events(session_id: Optional[int] = None,
                            offset: int = 0,
                            db: Session = Depends(get_db)):
     """L4 关键事件检索：跨会话只读查询决策事件（默认最近 200 条）。"""
-    if ack_status not in (None, "", "open", "acked"):
-        return err(400, "ack_status 仅支持 open / acked")
+    if ack_status not in (None, "", "open", "acked", "archived"):
+        return err(400, "ack_status 仅支持 open / acked / archived")
     try:
         start_date = date.fromisoformat(start) if start else None
         end_date = date.fromisoformat(end) if end else None
@@ -1293,25 +1293,90 @@ def search_decision_events(session_id: Optional[int] = None,
 def ack_decision(session_id: int, event_id: int,
                  data: Optional[dict] = None,
                  db: Session = Depends(get_db)):
-    """M4：确认/关闭单条决策事件，可带处理备注。"""
-    note = (data or {}).get("note")
-    result = svc.ack_decision(db, session_id, event_id, note=note)
+    """确认/关闭单条决策事件，可带处理备注与操作者（写审计日志）。"""
+    data = data or {}
+    result = svc.ack_decision(db, session_id, event_id,
+                              note=data.get("note"),
+                              operator=data.get("operator"))
     if result is None:
         return err(404, "会话或决策事件不存在")
     return ok(result)
 
 
-@router.post("/sessions/{session_id}/decisions/ack-all")
-def ack_all_decisions(session_id: int, data: Optional[dict] = None,
+def _parse_decision_range(start: Optional[str], end: Optional[str]):
+    """批量确认的日期过滤解析（YYYY-MM-DD，created_at 自然日闭区间）。"""
+    start_date = date.fromisoformat(start) if start else None
+    end_date = date.fromisoformat(end) if end else None
+    if start_date and end_date and start_date > end_date:
+        raise ValueError("start 不能晚于 end")
+    return start_date, end_date
+
+
+@router.get("/sessions/{session_id}/decisions/batch-ack/preview")
+def preview_batch_ack(session_id: int,
+                      gate: Optional[str] = None,
+                      layer: Optional[str] = None,
+                      action: Optional[str] = None,
+                      keyword: Optional[str] = None,
+                      start: Optional[str] = None,
+                      end: Optional[str] = None,
                       db: Session = Depends(get_db)):
-    """M4：批量确认未处理事件；day_end=true 时备注默认「日终清零」。"""
+    """批量确认预览：必须带筛选条件；返回将确认 N 条与高危排除条数。"""
+    try:
+        start_date, end_date = _parse_decision_range(start, end)
+        data = svc.preview_batch_ack(
+            db, session_id, gate=gate, layer=layer, action=action,
+            keyword=keyword, start=start_date, end=end_date)
+    except ValueError as exc:
+        return err(400, str(exc))
+    if data is None:
+        return err(404, "资源不存在")
+    return ok(data)
+
+
+@router.post("/sessions/{session_id}/decisions/batch-ack")
+def batch_ack_decisions(session_id: int, data: Optional[dict] = None,
+                        db: Session = Depends(get_db)):
+    """按筛选条件批量确认（高危门类除外），逐条写审计 + 一条批量汇总。
+
+    必须带至少一个筛选条件（gate/layer/时间范围/关键字，不提供「全选所有」），
+    ``note``（原因）必填；``action`` 仅作附加收窄。
+    ``expected_count`` 与当前可确认数不一致时返回 409，要求重新预览。
+    """
     data = data or {}
-    result = svc.ack_all_decisions(
-        db, session_id, note=data.get("note"),
-        day_end=bool(data.get("day_end")))
+    try:
+        start_date, end_date = _parse_decision_range(
+            data.get("start"), data.get("end"))
+        result = svc.batch_ack_decisions(
+            db, session_id,
+            gate=data.get("gate"), layer=data.get("layer"),
+            action=data.get("action"), keyword=data.get("keyword"),
+            start=start_date, end=end_date, note=data.get("note"),
+            operator=data.get("operator"),
+            expected_count=data.get("expected_count"))
+    except ValueError as exc:
+        return err(400, str(exc))
     if result is None:
         return err(404, "资源不存在")
+    if result.get("conflict"):
+        return err(409, "筛选结果已变化（当前可确认 %d 条），请重新预览后再提交"
+                   % int(result.get("matched") or 0), result)
+    if not int(result.get("acked") or 0):
+        return err(400, "没有可批量确认的事件；高危门类需逐条查看后手动确认",
+                   result)
     return ok(result)
+
+
+@router.get("/sessions/{session_id}/decisions/ack-logs")
+def decision_ack_logs(session_id: int, limit: int = 200,
+                      event_id: Optional[int] = None,
+                      db: Session = Depends(get_db)):
+    """处理审计回看：单条确认/批量确认/过期归档（只读）。"""
+    data = svc.list_decision_ack_logs(
+        db, session_id, limit=limit, event_id=event_id)
+    if data is None:
+        return err(404, "资源不存在")
+    return ok(data)
 
 
 @router.delete("/sessions/{session_id}")

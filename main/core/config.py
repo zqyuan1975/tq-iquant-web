@@ -243,6 +243,12 @@ def _defaults() -> dict:
             "execution_stall_seconds": 180,
             "bridge_timeout_seconds": 90,
             "market_data_stall_seconds": 180,
+            # 决策事件过期归档：open 事件超过该天数由后台每小时扫描自动归档
+            # （ack_status=archived，移出「未处理」计数，记录仍可查询回看）。
+            # 高危门类（cash_diff/equity_deviation/engine_owner_mismatch/
+            # sell_scope/split_children_lost/out_of_pool_position）不自动归档。
+            # <=0 关闭自动归档（事件只能人工逐条确认）。
+            "decision_archive_days": 7,
             # HTTP 桥客户端超时（秒；通道未显式配 request_timeout_seconds 时生效）：
             # 读/写/池默认 15（掘金桥 /ping 实测 5~8s，10s 贴太近会误判断链）；
             # 建连默认 3（本机 loopback，无需等满读超时）。/order /orders /deals

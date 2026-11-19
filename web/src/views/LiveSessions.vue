@@ -17,7 +17,8 @@ import {
 } from '../utils/liveWorkbench'
 import {
   getLiveOrders, getLiveTrades, getLivePositions, getLiveDecisions, getLiveSignals, getPortfolios,
-  ackLiveDecision, ackAllLiveDecisions,
+  ackLiveDecision, previewLiveDecisionBatch, batchAckLiveDecisions,
+  type DecisionBatchFilters, type DecisionBatchPreview,
   getLiveSessions, getLiveSession, createLiveSession, updateLiveSession, startLiveSession, stopLiveSession, deleteLiveSession,
   setLiveSessionSellScope,
   getLiveSessionChannelHealth, failoverLiveSession,
@@ -414,10 +415,44 @@ const TAB_LABEL: Record<WbTab, string> = {
 // 旧版只有挂载/切会话/reconnect/「刷新持仓」按钮会重拉历史，收盘后看当天移动止损与
 // 顺延事件常常是空表（页签没数据也没入口）——这里给决策页签独立刷新入口。
 const decisionsLoading = ref(false)
-/** M4：未处理/已确认计数（后端全量口径）。 */
-const decisionAckSummary = ref<{ open: number; acked: number }>({ open: 0, acked: 0 })
+/** 未处理（open 且未归档）/已确认/已归档计数（后端全量口径）。 */
+const decisionAckSummary = ref<{ open: number; acked: number; archived: number }>(
+  { open: 0, acked: 0, archived: 0 })
 /** 正在确认的事件 id（按钮防重）。 */
 const ackingEventId = ref<number | null>(null)
+/** 高危门类：与后端 HIGH_RISK_DECISION_GATES 对齐，只能逐条确认。 */
+const HIGH_RISK_GATES = new Set([
+  'cash_diff', 'equity_deviation', 'engine_owner_mismatch',
+  'sell_scope', 'split_children_lost', 'out_of_pool_position',
+])
+/** 批量确认筛选（必须至少一项；不提供「全选所有」）。 */
+const decBatch = ref({
+  gate: '', layer: '', start: '', end: '', keyword: '', note: '',
+})
+const decBatchPreview = ref<DecisionBatchPreview | null>(null)
+const decBatchLoading = ref(false)
+const decBatchMsg = ref('')
+const decBatchError = ref('')
+const decBatchFilterActive = computed(() => Boolean(
+  decBatch.value.gate || decBatch.value.layer || decBatch.value.start
+  || decBatch.value.end || decBatch.value.keyword.trim(),
+))
+const decBatchGateOptions = computed(() => Array.from(
+  new Set(decisions.value.map((d) => d.gate).filter(Boolean))).sort())
+const decBatchLayerOptions = computed(() => Array.from(
+  new Set(decisions.value.map((d) => d.layer).filter(Boolean))).sort())
+watch(
+  () => [
+    decBatch.value.gate, decBatch.value.layer, decBatch.value.start,
+    decBatch.value.end, decBatch.value.keyword,
+  ],
+  () => {
+    // 筛选变化后旧的「将确认 N 条」失效，必须重新预览；改原因不触发。
+    decBatchPreview.value = null
+    decBatchMsg.value = ''
+    decBatchError.value = ''
+  },
+)
 /** 顺延待次日提交筛选开关（汇总条点击切换；只筛事件表，不动上方聚合统计）。 */
 const decOnlyDeferred = ref(false)
 /** 顺延待次日提交（gate=signal_bar_date / action=defer）的笔数（随筛选区间重算）。 */
@@ -438,19 +473,22 @@ async function reloadDecisions() {
     const dec = await getLiveDecisions(id).catch(() => null)
     if (activeSessionId !== id) return
     decisions.value = dec ? decisionHistoryToRows(dec.events) : []
-    decisionAckSummary.value = dec?.ack_summary || { open: 0, acked: 0 }
+    decisionAckSummary.value = dec?.ack_summary
+      ? { open: dec.ack_summary.open, acked: dec.ack_summary.acked,
+          archived: dec.ack_summary.archived || 0 }
+      : { open: 0, acked: 0, archived: 0 }
   } finally {
     decisionsLoading.value = false
   }
 }
 
-/** M4：确认单条事件（附带「人工确认」备注，刷新计数与状态）。 */
+/** 确认单条事件（高危门类也必须逐条人工确认，备注与操作者写入审计）。 */
 async function ackDecisionRow(d: DecisionRow) {
   const sid = activeSessionId
   if (sid === null || !d.id || ackingEventId.value === d.id) return
   ackingEventId.value = d.id
   try {
-    await ackLiveDecision(sid, d.id, '人工确认')
+    await ackLiveDecision(sid, d.id, '人工确认', 'web')
     await reloadDecisions()
   } catch {
     /* 失败保持原状，用户可重试 */
@@ -459,19 +497,76 @@ async function ackDecisionRow(d: DecisionRow) {
   }
 }
 
-/** M4：日终清零——把所有未处理事件批量标记为已确认。 */
-async function ackAllDayEnd() {
+function decisionBatchFilters(): DecisionBatchFilters {
+  const out: DecisionBatchFilters = {}
+  if (decBatch.value.gate) out.gate = decBatch.value.gate
+  if (decBatch.value.layer) out.layer = decBatch.value.layer
+  if (decBatch.value.start) out.start = decBatch.value.start
+  if (decBatch.value.end) out.end = decBatch.value.end
+  if (decBatch.value.keyword.trim()) out.keyword = decBatch.value.keyword.trim()
+  return out
+}
+
+/** 批量确认第一步：预览「将确认 N 条」；高危门类自动排除，不参与统计。 */
+async function previewDecisionBatch() {
   const sid = activeSessionId
   if (sid === null) return
-  if (!window.confirm('将当前所有未处理的决策/拦截事件标记为已确认（日终清零）？')) return
-  decisionsLoading.value = true
+  if (!decBatchFilterActive.value) {
+    decBatchError.value = '请至少选择一个筛选条件（门类/层级/时间范围/关键字），不支持全选'
+    decBatchPreview.value = null
+    return
+  }
+  decBatchLoading.value = true
+  decBatchError.value = ''
+  decBatchMsg.value = ''
   try {
-    await ackAllLiveDecisions(sid, { day_end: true })
-    await reloadDecisions()
-  } catch {
-    /* 失败保持原状，用户可重试 */
+    const p = await previewLiveDecisionBatch(sid, decisionBatchFilters())
+    decBatchPreview.value = p
+    decBatchMsg.value = `将确认 ${p.matched} 条` + (p.high_risk_excluded
+      ? `；另有 ${p.high_risk_excluded} 条高危门类需逐条查看后手动确认` : '')
+  } catch (e) {
+    decBatchPreview.value = null
+    decBatchError.value = '预览失败：' + (e instanceof Error ? e.message : String(e))
   } finally {
-    decisionsLoading.value = false
+    decBatchLoading.value = false
+  }
+}
+
+/** 批量确认第二步：二次确认后提交（带 expected_count 防集合漂移）。 */
+async function submitDecisionBatch() {
+  const sid = activeSessionId
+  const p = decBatchPreview.value
+  if (sid === null || !p) return
+  const note = decBatch.value.note.trim()
+  if (!note) {
+    decBatchError.value = '请填写确认原因（写入逐条审计，不能留空）'
+    return
+  }
+  if (p.matched <= 0) {
+    decBatchError.value = '没有可批量确认的事件；高危门类需逐条手动确认'
+    return
+  }
+  const extra = p.high_risk_excluded
+    ? `\n高危门类 ${p.high_risk_excluded} 条不参与批量，需逐条查看后确认。` : ''
+  if (!window.confirm(
+    `将确认 ${p.matched} 条事件（按当前筛选条件）。${extra}\n原因：${note}\n确认提交？`,
+  )) return
+  decBatchLoading.value = true
+  decBatchError.value = ''
+  try {
+    const result = await batchAckLiveDecisions(sid, {
+      ...decisionBatchFilters(), note, operator: 'web',
+      expected_count: p.matched,
+    })
+    decBatchPreview.value = null
+    decBatchMsg.value = `已确认 ${result.acked} 条（审计批次 ${result.batch_id || '—'}）`
+      + (result.high_risk_excluded
+        ? `；跳过高危 ${result.high_risk_excluded} 条` : '')
+    await reloadDecisions()
+  } catch (e) {
+    decBatchError.value = '提交失败：' + (e instanceof Error ? e.message : String(e))
+  } finally {
+    decBatchLoading.value = false
   }
 }
 
@@ -698,7 +793,10 @@ async function loadHistory(id: number) {
     trades.value = tradeHistoryToRows(trd)
     // 决策历史：逐事件（旧库/迁移未应用时端点 404 → 兜底空）；聚合统计前端按筛选区重算
     decisions.value = dec ? decisionHistoryToRows(dec.events) : []
-    decisionAckSummary.value = dec?.ack_summary || { open: 0, acked: 0 }
+    decisionAckSummary.value = dec?.ack_summary
+      ? { open: dec.ack_summary.open, acked: dec.ack_summary.acked,
+          archived: dec.ack_summary.archived || 0 }
+      : { open: 0, acked: 0, archived: 0 }
     // 预警信号：alert 模式主产物；auto 模式下也可能有信号落库
     signals.value = sig?.items ?? []
     signalsTotal.value = sig?.total ?? 0
@@ -2205,16 +2303,48 @@ onUnmounted(() => {
         </select>
         <span style="font-size:12px;color:var(--ink-faint)">按北京时间自然日 · 聚合与统计随筛选重算 · 共 {{ filteredDecisions.length }} 条事件</span>
         <span style="margin-left:auto;font-size:12px;color:var(--ink-soft)">
-          未处理 {{ decisionAckSummary.open }} 条 · 已确认 {{ decisionAckSummary.acked }} 条
+          未处理 {{ decisionAckSummary.open }} 条 · 已确认 {{ decisionAckSummary.acked }} 条 · 已归档 {{ decisionAckSummary.archived }} 条
         </span>
+      </div>
+      <!-- 批量确认：必须带筛选条件（不提供「全选所有」）；高危门类永远排除，只能逐条确认。
+           先预览「将确认 N 条」，再二次确认提交；原因必填并写入逐条审计。 -->
+      <div
+        data-test="decisions-batch"
+        style="border:1px solid var(--line);border-radius:8px;padding:8px 10px;margin:0 0 10px;display:flex;flex-wrap:wrap;align-items:center;gap:6px"
+      >
+        <span style="font-size:12px;font-weight:700;color:var(--ink-soft)">批量确认（必须筛选）</span>
+        <select class="field-select field-select--compact" v-model="decBatch.gate" aria-label="批量确认门类">
+          <option value="">门类 gate · 请选择</option>
+          <option v-for="g in decBatchGateOptions" :key="g" :value="g">{{ gateLabel(g) }} ({{ g }})</option>
+        </select>
+        <select class="field-select field-select--compact" v-model="decBatch.layer" aria-label="批量确认层级">
+          <option value="">层级 layer · 请选择</option>
+          <option v-for="l in decBatchLayerOptions" :key="l" :value="l">{{ layerLabel(l) }} ({{ l }})</option>
+        </select>
+        <input style="font-size:12px;padding:2px 6px;border:1px solid var(--line);border-radius:6px;background:var(--bg);color:var(--ink)" type="date" v-model="decBatch.start" aria-label="批量确认开始日期" />
+        <input style="font-size:12px;padding:2px 6px;border:1px solid var(--line);border-radius:6px;background:var(--bg);color:var(--ink)" type="date" v-model="decBatch.end" aria-label="批量确认结束日期" />
+        <input style="font-size:12px;padding:2px 6px;border:1px solid var(--line);border-radius:6px;background:var(--bg);color:var(--ink)" v-model="decBatch.keyword" placeholder="关键字（消息/股票/参数）" aria-label="批量确认关键字" />
+        <input style="font-size:12px;padding:2px 6px;border:1px solid var(--line);border-radius:6px;background:var(--bg);color:var(--ink)" v-model="decBatch.note" placeholder="确认原因（必填，写入审计）" aria-label="批量确认原因" />
         <button
           class="btn ghost"
-          data-test="decisions-ack-all"
+          data-test="decisions-batch-preview"
           style="font-size:12px;padding:2px 10px"
-          :disabled="decisionsLoading || decisionAckSummary.open === 0"
-          title="把所有未处理的决策/拦截事件标记为已确认（日终清零）"
-          @click="ackAllDayEnd"
-        >全部确认（日终清零）</button>
+          :disabled="decisionsLoading || decBatchLoading || !decBatchFilterActive"
+          :title="decBatchFilterActive ? '按筛选条件统计将确认条数' : '请先选择至少一个筛选条件（不支持全选）'"
+          @click="previewDecisionBatch"
+        >预览</button>
+        <button
+          class="btn"
+          data-test="decisions-batch-submit"
+          style="font-size:12px;padding:2px 10px"
+          :disabled="decisionsLoading || decBatchLoading || !decBatchPreview || decBatchPreview.matched <= 0 || !decBatch.note.trim()"
+          @click="submitDecisionBatch"
+        >确认 {{ decBatchPreview ? decBatchPreview.matched : 0 }} 条</button>
+        <span v-if="decBatchMsg" style="font-size:12px;color:var(--ink-soft)">{{ decBatchMsg }}</span>
+        <span v-if="decBatchError" style="font-size:12px;color:var(--red)">{{ decBatchError }}</span>
+        <span style="flex-basis:100%;font-size:11px;color:var(--ink-faint)">
+          高危门类（cash_diff / equity_deviation / engine_owner_mismatch / sell_scope / split_children_lost / out_of_pool_position）不参与批量，需逐条查看后确认；超过 7 天未处理的普通事件自动归档（仍可查询回看）。
+        </span>
       </div>
       <!-- 顺延待次日提交汇总：gate=signal_bar_date / action=defer，N=0 不显示。
            点击=把下方事件表筛到这一类（不隐藏入口，再点一次取消），非行高亮。 -->
@@ -2271,14 +2401,18 @@ onUnmounted(() => {
             <td style="text-align:right">{{ qtyPair(d.requested_qty, d.final_qty) }}</td>
             <td style="color:var(--ink-soft);white-space:normal;min-width:160px" :title="d.message">{{ d.message || '—' }}</td>
             <td style="white-space:nowrap">
-              <span v-if="d.ack_status === 'acked'" class="badge badge-gray" :title="d.ack_note || '已确认'">已确认</span>
+              <span v-if="d.ack_status === 'archived'" class="badge badge-gray"
+                    :title="d.archive_reason || '超过 7 天未处理，已自动归档（可查询回看）'">已归档</span>
+              <span v-else-if="d.ack_status === 'acked'" class="badge badge-gray"
+                    :title="[d.ack_note, d.ack_by ? '操作者 ' + d.ack_by : ''].filter(Boolean).join(' · ') || '已确认'">已确认</span>
               <button
                 v-else-if="d.id"
                 class="btn ghost"
                 style="font-size:11px;padding:1px 8px"
                 :disabled="ackingEventId === d.id"
+                :title="HIGH_RISK_GATES.has(d.gate) ? '高危门类：请先核对事件内容再逐条确认（不参与批量）' : '确认此事件'"
                 @click="ackDecisionRow(d)"
-              >确认</button>
+              >确认{{ HIGH_RISK_GATES.has(d.gate) ? '（高危·逐条）' : '' }}</button>
               <span v-else style="color:var(--ink-soft)">—</span>
             </td>
           </tr>

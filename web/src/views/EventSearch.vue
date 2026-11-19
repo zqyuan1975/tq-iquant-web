@@ -20,7 +20,7 @@ const sessionId = ref('')
 const gate = ref('')
 const layer = ref('')
 const action = ref('')
-const ackStatus = ref<'' | 'open' | 'acked'>('open')
+const ackStatus = ref<'' | 'open' | 'acked' | 'archived'>('open')
 const keyword = ref('')
 const start = ref('')
 const end = ref('')
@@ -128,6 +128,7 @@ onMounted(async () => {
           <option value="">全部</option>
           <option value="open">未处理</option>
           <option value="acked">已确认</option>
+          <option value="archived">已归档</option>
         </select>
       </label>
       <label class="field">
@@ -175,8 +176,10 @@ onMounted(async () => {
           <td>{{ e.param_name || '—' }}</td>
           <td class="msg">{{ e.message || '—' }}</td>
           <td>
-            <span class="badge" :class="(e.ack_status || 'open') === 'open' ? 'badge-blue' : 'badge-gray'">
-              {{ (e.ack_status || 'open') === 'open' ? '未处理' : '已确认' }}
+            <span class="badge" :class="(e.ack_status || 'open') === 'open' ? 'badge-blue' : 'badge-gray'"
+                  :title="e.archive_reason || e.ack_note || ''">
+              {{ (e.ack_status || 'open') === 'open' ? '未处理'
+                : (e.ack_status === 'archived' ? '已归档' : '已确认') }}
             </span>
           </td>
         </tr>

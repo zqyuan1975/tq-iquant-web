@@ -25,11 +25,12 @@ import math
 import re
 import threading
 import time
+import uuid
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Dict, List, Optional, Tuple
 
-from sqlalchemy import func, or_
+from sqlalchemy import and_, func, or_
 from sqlalchemy.orm import Session
 
 from core.config import load_config
@@ -38,6 +39,7 @@ from core.runtime import process_tag
 from core.models import (
     LiveSession, LiveSessionPortfolio, PortfolioStrategy, Strategy,
     StockPoolStock, StockPoolMembership, Formula, FormulaSignal, LiveOrder, LiveTrade, LiveDecisionEvent,
+    LiveDecisionAckLog,
     LiveSignal, LiveAccountSnapshot, LiveAccountPositionSnapshot,
     LiveCashFlow, LiveBaselineReset,
     LiveManualAction, LiveReconciliationDiff, LiveReconciliationReport,
@@ -6406,10 +6408,13 @@ def serialize_decision(d: LiveDecisionEvent) -> dict:
         "final_qty": d.final_qty,
         "message": d.message,
         "created_at": _iso_utc(d.created_at),
-        # M4 确认/关闭状态：open 未处理 / acked 已确认（含日终清零）
+        # 处理状态：open 未处理 / acked 人工确认 / archived 过期归档
         "ack_status": getattr(d, "ack_status", None) or "open",
         "ack_note": getattr(d, "ack_note", None),
         "ack_at": _iso_utc(getattr(d, "ack_at", None)),
+        "ack_by": getattr(d, "ack_by", None),
+        "archived_at": _iso_utc(getattr(d, "archived_at", None)),
+        "archive_reason": getattr(d, "archive_reason", None),
     }
 
 
@@ -6418,6 +6423,107 @@ def serialize_decision(d: LiveDecisionEvent) -> dict:
 # 是正常事件，不在此过滤范围内。
 _MIN_DECISION_BAR_TIME = datetime(2000, 1, 1)
 
+#: 高危门类：一确认就可能掩盖真问题，**禁止参与批量确认与自动归档**，
+#: 必须逐条看内容后手动确认。值为对运营可读的理由（预览接口原样返回）。
+HIGH_RISK_DECISION_GATES = {
+    "cash_diff": "柜台现金与虚拟账不一致，批量确认会掩盖错账或未登记出入金",
+    "equity_deviation": "市值/净值偏差，可能是漏仓或价格源错误",
+    "engine_owner_mismatch": "同一账户被多个引擎持有，可能重复下单",
+    "sell_scope": "存量仓代卖首笔对账，确认会掩盖账本变形",
+    "split_children_lost": "停会话丢弃拆单子单，涉及未提交股数",
+    "out_of_pool_position": "池外持仓需 include/ignore 处置，确认不等于处置",
+}
+
+
+def _utcnow_naive() -> datetime:
+    """与 created_at（server_default=now()，UTC naive）同一时钟的当前时间。"""
+    return datetime.now(timezone.utc).replace(tzinfo=None)
+
+
+def _open_decision_clause():
+    """统一「未处理」口径：``open``（含历史 NULL）且未归档。
+
+    健康总览、事件检索、批量预览/提交、过期归档全部复用本谓词，
+    保证「数字」与「列表条数」永远一致。
+    """
+    return and_(
+        or_(LiveDecisionEvent.ack_status == "open",
+            LiveDecisionEvent.ack_status.is_(None)),
+        LiveDecisionEvent.archived_at.is_(None),
+    )
+
+
+def _is_open_decision(d: LiveDecisionEvent) -> bool:
+    status = getattr(d, "ack_status", None) or "open"
+    return status == "open" and getattr(d, "archived_at", None) is None
+
+
+def _is_archived_decision(d: LiveDecisionEvent) -> bool:
+    return (getattr(d, "ack_status", None) == "archived"
+            or getattr(d, "archived_at", None) is not None)
+
+
+def _high_risk_clause():
+    return LiveDecisionEvent.gate.in_(tuple(HIGH_RISK_DECISION_GATES))
+
+
+def _decision_base_query(db: Session):
+    """决策事件列表/统计共用底座：过滤历史脏 bar_time。"""
+    return db.query(LiveDecisionEvent).filter(
+        or_(
+            LiveDecisionEvent.bar_time.is_(None),
+            LiveDecisionEvent.bar_time >= _MIN_DECISION_BAR_TIME,
+        )
+    )
+
+
+def _apply_decision_filters(query, *, gate: Optional[str] = None,
+                            layer: Optional[str] = None,
+                            action: Optional[str] = None,
+                            keyword: Optional[str] = None,
+                            start: Optional[date] = None,
+                            end: Optional[date] = None):
+    """检索与批量确认共用筛选（created_at 自然日闭区间，keyword 四字段）。"""
+    if gate:
+        query = query.filter(LiveDecisionEvent.gate == str(gate))
+    if layer:
+        query = query.filter(LiveDecisionEvent.layer == str(layer))
+    if action:
+        query = query.filter(LiveDecisionEvent.action == str(action))
+    text = str(keyword or "").strip()
+    if text:
+        like = "%%%s%%" % text
+        query = query.filter(or_(
+            LiveDecisionEvent.message.like(like),
+            LiveDecisionEvent.stock_code.like(like),
+            LiveDecisionEvent.param_name.like(like),
+            LiveDecisionEvent.gate.like(like),
+        ))
+    if start is not None:
+        query = query.filter(
+            LiveDecisionEvent.created_at
+            >= datetime.combine(start, datetime.min.time()))
+    if end is not None:
+        query = query.filter(
+            LiveDecisionEvent.created_at
+            < datetime.combine(end + timedelta(days=1), datetime.min.time()))
+    return query
+
+
+def _decision_filters_provided(*, gate: Optional[str] = None,
+                               layer: Optional[str] = None,
+                               action: Optional[str] = None,
+                               keyword: Optional[str] = None,
+                               start: Optional[date] = None,
+                               end: Optional[date] = None) -> bool:
+    """批量操作必须带门类/层级/时间范围/关键字之一，不提供「全选所有」。
+
+    ``action`` 只能作为附加收窄条件，单独使用（如 action=block）不算有效筛选，
+    防止变相全选。
+    """
+    del action  # 仅作附加收窄，不构成批量操作的准入筛选
+    return bool(gate or layer or (keyword or "").strip() or start or end)
+
 
 def session_decisions(db: Session, session_id: int,
                       ack_status: Optional[str] = None) -> Optional[dict]:
@@ -6425,7 +6531,10 @@ def session_decisions(db: Session, session_id: int,
 
     summary 复用 summarize_decisions（与回测详情同口径），按 (gate, param_name)
     分组计数；events 按 bar_time 正序返回（下钻看逐次触发）。
-    ``ack_status`` 可选 open/acked 过滤（M4 事件关闭），ack_summary 始终按全量计。
+    ``ack_status`` 可选 open/acked/archived 过滤（M4 事件关闭 + 过期归档）。
+
+    ``ack_summary.open`` 是**唯一**未处理计数口径（open 且未归档），健康总览与
+    事件检索共用；archived 单列计数，仍可查询回看。
 
     读取侧年份下限：历史脏行 ``bar_time = 1970-08-23 20:05:06``（旧
     ``parse_bar_time`` 把 ``20261106`` 当 epoch 秒，2026-11-06 一次性写入会话 4
@@ -6436,27 +6545,28 @@ def session_decisions(db: Session, session_id: int,
     if not session:
         return None
     rows = (
-        db.query(LiveDecisionEvent)
-        .filter(
-            LiveDecisionEvent.live_session_id == session_id,
-            or_(
-                LiveDecisionEvent.bar_time.is_(None),
-                LiveDecisionEvent.bar_time >= _MIN_DECISION_BAR_TIME,
-            ),
-        )
+        _decision_base_query(db)
+        .filter(LiveDecisionEvent.live_session_id == session_id)
         .order_by(LiveDecisionEvent.bar_time, LiveDecisionEvent.id)
         .all()
     )
-    ack_summary = {"open": 0, "acked": 0}
+    ack_summary = {"open": 0, "acked": 0, "archived": 0}
     for d in rows:
         status = getattr(d, "ack_status", None) or "open"
-        if status == "acked":
+        if _is_archived_decision(d):
+            ack_summary["archived"] += 1
+        elif status == "acked":
             ack_summary["acked"] += 1
         else:
             ack_summary["open"] += 1
-    if ack_status:
+    if ack_status == "open":
+        rows = [d for d in rows if _is_open_decision(d)]
+    elif ack_status == "acked":
         rows = [d for d in rows
-                if (getattr(d, "ack_status", None) or "open") == ack_status]
+                if (getattr(d, "ack_status", None) or "open") == "acked"
+                and not _is_archived_decision(d)]
+    elif ack_status == "archived":
+        rows = [d for d in rows if _is_archived_decision(d)]
     return {
         "summary": summarize_decisions(rows),
         "ack_summary": ack_summary,
@@ -6465,10 +6575,12 @@ def session_decisions(db: Session, session_id: int,
 
 
 def ack_decision(db: Session, session_id: int, event_id: int,
-                 note: Optional[str] = None) -> Optional[dict]:
-    """M4：确认/关闭单条决策事件；session 或事件不存在返回 None。
+                 note: Optional[str] = None,
+                 operator: Optional[str] = None) -> Optional[dict]:
+    """确认/关闭单条决策事件；session 或事件不存在返回 None。
 
-    重复确认为幂等覆盖（更新备注与时间），便于补记处理说明。
+    重复确认幂等覆盖（更新备注与时间），便于补记处理说明；每次操作都写审计行
+    （from_status → acked），保证「谁、何时、从什么到什么、为什么」可追溯。
     """
     if not db.query(LiveSession.id).filter(LiveSession.id == session_id).first():
         return None
@@ -6480,40 +6592,302 @@ def ack_decision(db: Session, session_id: int, event_id: int,
     )
     if event is None:
         return None
+    resolved_note = (str(note).strip()[:200]
+                     if note not in (None, "") else None)
+    resolved_operator = (str(operator).strip()[:64]
+                         if operator not in (None, "") else None)
+    prev_status = getattr(event, "ack_status", None) or "open"
     event.ack_status = "acked"
-    event.ack_note = (str(note).strip()[:200] if note not in (None, "") else None)
+    event.ack_note = resolved_note
     event.ack_at = datetime.now()
+    event.ack_by = resolved_operator
+    db.add(LiveDecisionAckLog(
+        batch_id=None, live_session_id=session_id, event_id=event.id,
+        action="ack", from_status=prev_status, to_status="acked",
+        operator=resolved_operator, reason=resolved_note))
     db.commit()
     return serialize_decision(event)
 
 
-def ack_all_decisions(db: Session, session_id: int,
-                      note: Optional[str] = None,
-                      day_end: bool = False) -> Optional[dict]:
-    """M4：批量确认当前所有 open 事件；session 不存在返回 None。
+def preview_batch_ack(db: Session, session_id: int, *,
+                      gate: Optional[str] = None, layer: Optional[str] = None,
+                      action: Optional[str] = None,
+                      keyword: Optional[str] = None,
+                      start: Optional[date] = None,
+                      end: Optional[date] = None) -> Optional[dict]:
+    """批量确认预览：必须带筛选条件，返回「将确认 N 条」与高危排除数。
 
-    ``day_end=true`` 时备注默认写「日终清零」，用于日终把当天的拦截事件一次性
-    归档，避免天天堆积；已 acked 的事件不重复处理。
+    高危门类永远不进入可批量集合（``HIGH_RISK_DECISION_GATES``），只能逐条确认。
+    ``action`` 仅作附加收窄，不能单独作为筛选条件。
     """
     if not db.query(LiveSession.id).filter(LiveSession.id == session_id).first():
         return None
-    rows = (
-        db.query(LiveDecisionEvent)
-        .filter(LiveDecisionEvent.live_session_id == session_id,
-                or_(LiveDecisionEvent.ack_status == "open",
-                    LiveDecisionEvent.ack_status.is_(None)))
-        .all()
-    )
-    resolved_note = str(note).strip()[:200] if note not in (None, "") else None
-    if resolved_note is None and day_end:
-        resolved_note = "日终清零"
+    if not _decision_filters_provided(
+            gate=gate, layer=layer, action=action, keyword=keyword,
+            start=start, end=end):
+        raise ValueError("批量确认必须至少指定一个筛选条件（gate/layer/"
+                         "时间范围/关键字）")
+    base = _decision_base_query(db).filter(
+        LiveDecisionEvent.live_session_id == session_id,
+        _open_decision_clause())
+    filtered = _apply_decision_filters(
+        base, gate=gate, layer=layer, action=action, keyword=keyword,
+        start=start, end=end)
+    matched_rows = filtered.filter(~_high_risk_clause()).all()
+    matched_total = filtered.count()
+    by_gate: Dict[str, int] = {}
+    for e in matched_rows:
+        by_gate[e.gate] = by_gate.get(e.gate, 0) + 1
+    return {
+        "matched": len(matched_rows),
+        "high_risk_excluded": max(matched_total - len(matched_rows), 0),
+        "by_gate": by_gate,
+        "high_risk_gates": [
+            {"gate": g, "reason": r}
+            for g, r in HIGH_RISK_DECISION_GATES.items()
+        ],
+    }
+
+
+def batch_ack_decisions(db: Session, session_id: int, *,
+                        gate: Optional[str] = None, layer: Optional[str] = None,
+                        action: Optional[str] = None,
+                        keyword: Optional[str] = None,
+                        start: Optional[date] = None,
+                        end: Optional[date] = None,
+                        note: Optional[str] = None,
+                        operator: Optional[str] = None,
+                        expected_count: Optional[int] = None) -> Optional[dict]:
+    """按筛选条件批量确认（不含高危门类），逐条写审计 + 一条批量汇总。
+
+    - 必须至少一个筛选条件（不提供「全选所有」）；
+    - ``note``（原因）必填；
+    - ``expected_count`` 与预览数不一致时返回 ``conflict=True``，由路由转 409，
+      避免预览后事件集合变化导致「确认了没看过的内容」；
+    - 高危门类被排除，只在结果中报告排除条数，绝不自动确认。
+    """
+    if not db.query(LiveSession.id).filter(LiveSession.id == session_id).first():
+        return None
+    if not _decision_filters_provided(
+            gate=gate, layer=layer, action=action, keyword=keyword,
+            start=start, end=end):
+        raise ValueError("批量确认必须至少指定一个筛选条件（gate/layer/"
+                         "时间范围/关键字）")
+    resolved_note = str(note or "").strip()[:200]
+    if not resolved_note:
+        raise ValueError("批量确认必须填写确认原因")
+    resolved_operator = (str(operator).strip()[:64]
+                         if operator not in (None, "") else "web")
+    base = _decision_base_query(db).filter(
+        LiveDecisionEvent.live_session_id == session_id,
+        _open_decision_clause())
+    filtered = _apply_decision_filters(
+        base, gate=gate, layer=layer, action=action, keyword=keyword,
+        start=start, end=end)
+    rows = (filtered.filter(~_high_risk_clause())
+            .order_by(LiveDecisionEvent.id).all())
+    matched_total = filtered.count()
+    excluded = max(matched_total - len(rows), 0)
+    if expected_count is not None:
+        try:
+            expected = int(expected_count)
+        except (TypeError, ValueError):
+            raise ValueError("expected_count 须为整数")
+        if expected != len(rows):
+            return {"conflict": True, "matched": len(rows),
+                    "high_risk_excluded": excluded}
+    if not rows:
+        return {"acked": 0, "batch_id": None, "matched": 0,
+                "high_risk_excluded": excluded, "note": resolved_note,
+                "operator": resolved_operator}
+    batch_id = uuid.uuid4().hex
     now = datetime.now()
+    filters_payload = {
+        "gate": gate, "layer": layer, "action": action,
+        "keyword": (str(keyword).strip() if keyword else None),
+        "start": start.isoformat() if start else None,
+        "end": end.isoformat() if end else None,
+    }
+    db.add(LiveDecisionAckLog(
+        batch_id=batch_id, live_session_id=session_id, event_id=None,
+        action="ack", from_status=None, to_status="acked",
+        operator=resolved_operator, reason=resolved_note,
+        filters_json=json.dumps(filters_payload, ensure_ascii=False)[:1000],
+        affected_count=len(rows)))
     for event in rows:
+        prev_status = getattr(event, "ack_status", None) or "open"
         event.ack_status = "acked"
         event.ack_note = resolved_note
         event.ack_at = now
+        event.ack_by = resolved_operator
+        db.add(LiveDecisionAckLog(
+            batch_id=batch_id, live_session_id=session_id, event_id=event.id,
+            action="ack", from_status=prev_status, to_status="acked",
+            operator=resolved_operator, reason=resolved_note))
     db.commit()
-    return {"acked": len(rows), "ack_status": "acked", "note": resolved_note}
+    return {"acked": len(rows), "batch_id": batch_id, "matched": len(rows),
+            "high_risk_excluded": excluded, "note": resolved_note,
+            "operator": resolved_operator}
+
+
+def archive_stale_decisions(db: Session, *, days: int = 7,
+                            now: Optional[datetime] = None,
+                            session_id: Optional[int] = None) -> dict:
+    """过期归档：open 且超过 ``days`` 天未处理的事件移出「未处理」计数。
+
+    只改状态，不删除记录：``ack_status=archived`` + ``archived_at`` +
+    ``archive_reason``，仍可按 ``ack_status=archived`` 查询回看。高危门类
+    （``HIGH_RISK_DECISION_GATES``）不自动归档，避免变相掩盖真问题。
+    ``days <= 0`` 表示关闭，直接返回 0。
+    """
+    if days is None or int(days) <= 0:
+        return {"archived": 0, "days": days, "batch_id": None}
+    days = int(days)
+    now_utc = now or _utcnow_naive()
+    if now_utc.tzinfo is not None:
+        now_utc = now_utc.astimezone(timezone.utc).replace(tzinfo=None)
+    cutoff = now_utc - timedelta(days=days)
+    query = db.query(LiveDecisionEvent).filter(
+        _open_decision_clause(),
+        ~_high_risk_clause(),
+        LiveDecisionEvent.created_at.isnot(None),
+        LiveDecisionEvent.created_at < cutoff,
+    )
+    if session_id is not None:
+        query = query.filter(LiveDecisionEvent.live_session_id == int(session_id))
+    rows = query.order_by(LiveDecisionEvent.id).all()
+    if not rows:
+        return {"archived": 0, "days": days, "batch_id": None}
+    batch_id = uuid.uuid4().hex
+    reason = ("超过 %d 天未处理自动归档（仅移出未处理计数，记录仍可查询回看）"
+              % days)[:200]
+    per_session: Dict[int, int] = {}
+    for event in rows:
+        prev_status = getattr(event, "ack_status", None) or "open"
+        event.ack_status = "archived"
+        event.archived_at = now_utc
+        event.archive_reason = reason
+        per_session[event.live_session_id] = (
+            per_session.get(event.live_session_id, 0) + 1)
+        db.add(LiveDecisionAckLog(
+            batch_id=batch_id, live_session_id=event.live_session_id,
+            event_id=event.id, action="archive", from_status=prev_status,
+            to_status="archived", operator="system:auto-archive",
+            reason=reason))
+    for sid, count in per_session.items():
+        db.add(LiveDecisionAckLog(
+            batch_id=batch_id, live_session_id=sid, event_id=None,
+            action="archive", from_status=None, to_status="archived",
+            operator="system:auto-archive", reason=reason,
+            filters_json=json.dumps(
+                {"days": days, "cutoff": cutoff.isoformat()},
+                ensure_ascii=False)[:1000], affected_count=count))
+    db.commit()
+    return {"archived": len(rows), "days": days, "batch_id": batch_id}
+
+
+def serialize_ack_log(log: LiveDecisionAckLog) -> dict:
+    return {
+        "id": log.id,
+        "batch_id": log.batch_id,
+        "live_session_id": log.live_session_id,
+        "event_id": log.event_id,
+        "action": log.action,
+        "from_status": log.from_status,
+        "to_status": log.to_status,
+        "operator": log.operator,
+        "reason": log.reason,
+        "filters_json": log.filters_json,
+        "affected_count": log.affected_count,
+        "created_at": _iso_utc(log.created_at),
+    }
+
+
+def list_decision_ack_logs(db: Session, session_id: int,
+                           limit: int = 200,
+                           event_id: Optional[int] = None) -> Optional[dict]:
+    """处理审计回看（只读）：单条确认 / 批量确认 / 过期归档逐条可查。"""
+    if not db.query(LiveSession.id).filter(LiveSession.id == session_id).first():
+        return None
+    try:
+        limit = int(limit)
+    except (TypeError, ValueError):
+        limit = 200
+    limit = min(max(limit, 1), 1000)
+    query = db.query(LiveDecisionAckLog).filter(
+        LiveDecisionAckLog.live_session_id == session_id)
+    if event_id is not None:
+        query = query.filter(LiveDecisionAckLog.event_id == int(event_id))
+    total = query.count()
+    rows = (query.order_by(LiveDecisionAckLog.created_at.desc(),
+                           LiveDecisionAckLog.id.desc())
+            .limit(limit).all())
+    return {"items": [serialize_ack_log(r) for r in rows], "total": total,
+            "limit": limit}
+
+
+class DecisionArchiveScheduler:
+    """进程内过期归档调度（daemon 线程，默认每小时扫描一次）。
+
+    只归档「open 且超过 ``live.decision_archive_days`` 天」的非高危事件；
+    配置 ``<=0`` 关闭。单次失败只记日志，绝不影响实盘主链路。
+    """
+
+    def __init__(self, *, session_factory=None, cfg_provider=None,
+                 interval_seconds: float = 3600.0,
+                 now_fn=_utcnow_naive):
+        self._factory = session_factory or SessionLocal
+        self._cfg = cfg_provider or load_config
+        self._interval = max(float(interval_seconds), 60.0)
+        self._now = now_fn
+        self._stop = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+        self._lock = threading.Lock()
+
+    def start(self) -> None:
+        with self._lock:
+            if self._thread is not None and self._thread.is_alive():
+                return
+            self._stop.clear()
+            self._thread = threading.Thread(
+                target=self._loop, name="decision-archive-scheduler",
+                daemon=True)
+            self._thread.start()
+
+    def stop(self, timeout: float = 2.0) -> None:
+        self._stop.set()
+        thread = self._thread
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=timeout)
+        self._thread = None
+
+    def _loop(self) -> None:
+        # 首轮等待一个周期再扫描：避免测试/短生命周期进程一启动就写生产库。
+        while not self._stop.wait(self._interval):
+            try:
+                self.maybe_run()
+            except Exception:  # noqa: BLE001 — 归档失败不得拖垮进程
+                logger.exception("决策事件过期归档异常（下轮重试）")
+
+    def maybe_run(self) -> Optional[dict]:
+        cfg = self._cfg() or {}
+        live_cfg = cfg.get("live") or {}
+        try:
+            days = int(live_cfg.get("decision_archive_days", 7))
+        except (TypeError, ValueError):
+            days = 7
+        if days <= 0:
+            return None
+        db = self._factory()
+        try:
+            result = archive_stale_decisions(db, days=days, now=self._now())
+        finally:
+            db.close()
+        if result.get("archived"):
+            logger.info("决策事件过期归档 %d 条（%d 天，batch=%s）",
+                        result["archived"], days, result.get("batch_id"))
+        return result
+
 
 
 def search_decision_events(db: Session, *, session_id: Optional[int] = None,
@@ -6534,6 +6908,8 @@ def search_decision_events(db: Session, *, session_id: Optional[int] = None,
     1~1000；bar_time 历史脏行沿用 ``session_decisions`` 同一年份下限过滤。
 
     纯只读：不写库、不改 ack、不触发任何交易路径。
+    ``ack_status=open`` 复用统一「open 且未归档」谓词；``acked`` 只含人工确认；
+    ``archived`` 为过期归档回看。
     """
     try:
         limit = int(limit)
@@ -6546,41 +6922,21 @@ def search_decision_events(db: Session, *, session_id: Optional[int] = None,
     limit = min(max(limit, 1), 1000)
     offset = max(offset, 0)
 
-    query = db.query(LiveDecisionEvent).filter(
-        or_(
-            LiveDecisionEvent.bar_time.is_(None),
-            LiveDecisionEvent.bar_time >= _MIN_DECISION_BAR_TIME,
-        )
-    )
+    query = _decision_base_query(db)
     if session_id is not None:
         query = query.filter(LiveDecisionEvent.live_session_id == int(session_id))
-    if gate:
-        query = query.filter(LiveDecisionEvent.gate == str(gate))
-    if layer:
-        query = query.filter(LiveDecisionEvent.layer == str(layer))
-    if action:
-        query = query.filter(LiveDecisionEvent.action == str(action))
     if ack_status == "open":
-        query = query.filter(or_(LiveDecisionEvent.ack_status == "open",
-                                 LiveDecisionEvent.ack_status.is_(None)))
+        query = query.filter(_open_decision_clause())
     elif ack_status == "acked":
-        query = query.filter(LiveDecisionEvent.ack_status == "acked")
-    text = str(keyword or "").strip()
-    if text:
-        like = "%%%s%%" % text
+        query = query.filter(LiveDecisionEvent.ack_status == "acked",
+                             LiveDecisionEvent.archived_at.is_(None))
+    elif ack_status == "archived":
         query = query.filter(or_(
-            LiveDecisionEvent.message.like(like),
-            LiveDecisionEvent.stock_code.like(like),
-            LiveDecisionEvent.param_name.like(like),
-            LiveDecisionEvent.gate.like(like),
-        ))
-    if start is not None:
-        query = query.filter(
-            LiveDecisionEvent.created_at >= datetime.combine(start, datetime.min.time()))
-    if end is not None:
-        query = query.filter(
-            LiveDecisionEvent.created_at
-            < datetime.combine(end + timedelta(days=1), datetime.min.time()))
+            LiveDecisionEvent.ack_status == "archived",
+            LiveDecisionEvent.archived_at.isnot(None)))
+    query = _apply_decision_filters(
+        query, gate=gate, layer=layer, action=action, keyword=keyword,
+        start=start, end=end)
 
     total = query.count()
     rows = (query.order_by(LiveDecisionEvent.created_at.desc(),

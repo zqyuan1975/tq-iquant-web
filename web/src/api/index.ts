@@ -347,10 +347,13 @@ export interface DecisionEventItem {
   final_qty: number | null
   message: string | null
   created_at?: string | null
-  // M4 确认/关闭：open 未处理 / acked 已确认（日终清零等同 acked）
-  ack_status?: 'open' | 'acked' | null
+  // 处理状态：open 未处理 / acked 人工确认 / archived 过期归档（仍可回看）
+  ack_status?: 'open' | 'acked' | 'archived' | null
   ack_note?: string | null
   ack_at?: string | null
+  ack_by?: string | null
+  archived_at?: string | null
+  archive_reason?: string | null
 }
 
 // 决策闸门聚合统计（summarize_decisions，按 gate+param_name 分组）
@@ -371,8 +374,8 @@ export interface DecisionSummaryItem {
 // 决策事件查询响应（实盘 /decisions；回测详情内嵌同构字段）
 export interface DecisionData {
   summary: DecisionSummaryItem[]
-  // M4：未处理/已确认计数（后端全量口径，不随 ack_status 过滤变化）
-  ack_summary?: { open: number; acked: number }
+  // 未处理(opened且未归档)/已确认/已归档计数（后端全量口径，不随 ack_status 过滤变化）
+  ack_summary?: { open: number; acked: number; archived?: number }
   events: DecisionEventItem[]
 }
 
@@ -387,7 +390,7 @@ export interface DecisionEventSearchFilters {
   gate?: string
   layer?: string
   action?: string
-  ack_status?: 'open' | 'acked'
+  ack_status?: 'open' | 'acked' | 'archived'
   keyword?: string
   start?: string  // YYYY-MM-DD
   end?: string    // YYYY-MM-DD
@@ -2015,7 +2018,9 @@ export async function getLivePositions(sessionId: number) {
 }
 
 // 决策闸门事件（调参可观测性）：聚合统计 + 逐事件，对齐 live.session_decisions
-export async function getLiveDecisions(sessionId: number, ackStatus?: 'open' | 'acked') {
+export async function getLiveDecisions(
+  sessionId: number, ackStatus?: 'open' | 'acked' | 'archived',
+) {
   const res = await api.get<ApiResponse<DecisionData>>(
     `/live/sessions/${sessionId}/decisions`,
     { params: ackStatus ? { ack_status: ackStatus } : undefined },
@@ -2023,22 +2028,95 @@ export async function getLiveDecisions(sessionId: number, ackStatus?: 'open' | '
   return res.data.data
 }
 
-/** M4：确认/关闭单条决策事件（幂等，可附处理备注）。 */
-export async function ackLiveDecision(sessionId: number, eventId: number, note?: string) {
+/** 确认/关闭单条决策事件（幂等，可附处理备注与操作者，后端写审计）。 */
+export async function ackLiveDecision(
+  sessionId: number, eventId: number, note?: string, operator?: string,
+) {
+  const payload: { note?: string; operator?: string } = {}
+  if (note) payload.note = note
+  if (operator) payload.operator = operator
   const res = await api.post<ApiResponse<DecisionEventItem>>(
     `/live/sessions/${sessionId}/decisions/${eventId}/ack`,
-    note ? { note } : {},
+    payload,
   )
   return res.data.data
 }
 
-/** M4：批量确认未处理事件；day_end=true 时备注默认「日终清零」。 */
-export async function ackAllLiveDecisions(
-  sessionId: number, opts?: { note?: string; day_end?: boolean },
+/** 批量确认筛选条件：必须至少提供一项（后端拒绝「全选所有」）。 */
+export interface DecisionBatchFilters {
+  gate?: string
+  layer?: string
+  action?: string
+  keyword?: string
+  start?: string  // YYYY-MM-DD
+  end?: string    // YYYY-MM-DD
+}
+
+export interface DecisionBatchPreview {
+  matched: number
+  high_risk_excluded: number
+  by_gate: Record<string, number>
+  high_risk_gates: { gate: string; reason: string }[]
+}
+
+export interface DecisionBatchAckResult {
+  acked: number
+  batch_id: string | null
+  matched: number
+  high_risk_excluded: number
+  note: string
+  operator: string
+}
+
+/** 批量确认预览：返回「将确认 N 条」与高危排除数（高危只能逐条确认）。 */
+export async function previewLiveDecisionBatch(
+  sessionId: number, filters: DecisionBatchFilters,
 ) {
-  const res = await api.post<ApiResponse<{ acked: number; ack_status: string; note: string | null }>>(
-    `/live/sessions/${sessionId}/decisions/ack-all`,
-    opts || {},
+  const res = await api.get<ApiResponse<DecisionBatchPreview>>(
+    `/live/sessions/${sessionId}/decisions/batch-ack/preview`,
+    { params: filters },
+  )
+  return res.data.data
+}
+
+/** 批量确认（高危门类自动排除）；expected_count 不一致时后端返回 409。 */
+export async function batchAckLiveDecisions(
+  sessionId: number,
+  payload: DecisionBatchFilters & {
+    note: string; operator?: string; expected_count?: number
+  },
+) {
+  const res = await api.post<ApiResponse<DecisionBatchAckResult>>(
+    `/live/sessions/${sessionId}/decisions/batch-ack`,
+    payload,
+  )
+  return res.data.data
+}
+
+export interface DecisionAckLogItem {
+  id: number
+  batch_id: string | null
+  live_session_id: number
+  event_id: number | null
+  action: 'ack' | 'archive' | string
+  from_status: string | null
+  to_status: string | null
+  operator: string | null
+  reason: string | null
+  filters_json: string | null
+  affected_count: number | null
+  created_at: string | null
+}
+
+/** 处理审计回看：单条确认/批量确认/过期归档（只读）。 */
+export async function getLiveDecisionAckLogs(
+  sessionId: number, opts?: { limit?: number; eventId?: number },
+) {
+  const params: Record<string, number> = {}
+  if (opts?.limit) params.limit = opts.limit
+  if (opts?.eventId) params.event_id = opts.eventId
+  const res = await api.get<ApiResponse<{ items: DecisionAckLogItem[]; total: number }>>(
+    `/live/sessions/${sessionId}/decisions/ack-logs`, { params },
   )
   return res.data.data
 }
