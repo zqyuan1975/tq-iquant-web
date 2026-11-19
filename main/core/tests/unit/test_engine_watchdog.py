@@ -44,6 +44,8 @@ def _watchdog(engines, **kw):
     kw.setdefault("snapshot_fn", lambda sid: None)
     # 默认注入「DB running」：单测不读真实 dev.db，也避免错配自检干扰既有断言
     kw.setdefault("session_status_fn", lambda sid: "running")
+    # 默认无 DB 启动时刻（错配自愈的「同代」判据恒不满足 → 只告警不杀）
+    kw.setdefault("session_started_at_fn", lambda sid: None)
     kw.setdefault("in_session_fn", lambda dt: True)
     # 客户端窗口探针注入固定「在线」：单测不依赖本机是否真的开着通达信
     kw.setdefault("client_online_fn", lambda ch: True)
@@ -376,6 +378,15 @@ def _running_engine():
     return eng
 
 
+def _orphan_engine():
+    """引擎仍在注册表但快照/心跳均已静默（自愈证据充分的那种孤儿）。"""
+    eng = _Engine(channel="tdx_tq", started=NOW - timedelta(seconds=3600),
+                  tick=NOW - timedelta(seconds=900))
+    eng._available_bar = SimpleNamespace(
+        bar_time=NOW - timedelta(seconds=900), period="1m")
+    return eng
+
+
 def test_owner_mismatch_alerts_once_and_persists():
     eng = _running_engine()
     persisted = []
@@ -463,7 +474,7 @@ def test_process_tag_contains_pid():
 
 def test_owner_mismatch_self_heal_stops_and_unregisters():
     engines = {}
-    eng = _running_engine()
+    eng = _orphan_engine()
     eng._stop_requested = False
     engines[1] = eng
     unregistered = []
@@ -473,6 +484,8 @@ def test_owner_mismatch_self_heal_stops_and_unregisters():
         engines.pop(sid, None)
 
     wd = _watchdog(engines, session_status_fn=lambda sid: "stopped",
+                   session_started_at_fn=lambda sid: eng._started_at,
+                   timeout_seconds=90,
                    unregister_fn=unregister)
     wd.scan()
 
@@ -496,13 +509,71 @@ def test_owner_mismatch_no_self_heal_without_unregister():
     assert len(_risk(eng, "engine_owner_mismatch")) == 1
 
 
+def test_owner_mismatch_fresh_activity_skips_self_heal():
+    """DB 已停 + 引擎健在 + 快照新鲜 → 证据不足，只告警不自愈（2026-11-19 错杀回归）。
+
+    事故形态：DB 被写成 stopped，引擎仍在每 5s 落快照。此时看门狗若照旧按
+    DB 一行 stopped 就杀引擎，等于盘中掐断健在的交易链路。
+    """
+    engines = {}
+    eng = _running_engine()          # 心跳/行情新鲜
+    engines[1] = eng
+    unregistered = []
+    persisted = []
+
+    def unregister(sid):
+        unregistered.append(sid)
+        engines.pop(sid, None)
+
+    wd = _watchdog(engines, session_status_fn=lambda sid: "stopped",
+                   session_started_at_fn=lambda sid: eng._started_at,
+                   snapshot_fn=lambda sid: NOW - timedelta(seconds=5),
+                   timeout_seconds=90,
+                   unregister_fn=unregister,
+                   persist_fn=lambda **kw: persisted.append(kw))
+    wd.scan()
+
+    assert eng._running is True            # 不杀健在引擎
+    assert unregistered == []
+    assert 1 in engines
+    alerts = _risk(eng, "engine_owner_mismatch")
+    assert len(alerts) == 1
+    assert "证据不足，跳过自愈" in alerts[0]["message"]
+    assert alerts[0]["self_heal"] is False
+    # 告警仍落库（让用户看到错配），只是不执行自愈
+    assert len(persisted) == 1
+    assert persisted[0]["gate"] == "engine_owner_mismatch"
+
+    wd.scan()  # 继续保持新鲜 → 仍不杀
+    assert eng._running is True
+    assert unregistered == []
+
+
+def test_owner_mismatch_different_generation_skips_self_heal():
+    """引擎与 DB started_at 不同代（DB 是上一次启动/另一代）→ 证据不足不杀。"""
+    engines = {}
+    eng = _orphan_engine()
+    engines[1] = eng
+    unregistered = []
+    wd = _watchdog(engines, session_status_fn=lambda sid: "stopped",
+                   session_started_at_fn=lambda sid: NOW - timedelta(seconds=300),
+                   timeout_seconds=90,
+                   unregister_fn=lambda sid: unregistered.append(sid))
+    wd.scan()
+    assert eng._running is True
+    assert unregistered == []
+    assert "不同代" in _risk(eng, "engine_owner_mismatch")[0]["message"]
+
+
 def test_owner_mismatch_self_heal_unregister_failure_is_tolerated():
-    eng = _running_engine()
+    eng = _orphan_engine()
 
     def boom(sid):
         raise RuntimeError("registry busy")
 
     wd = _watchdog({1: eng}, session_status_fn=lambda sid: "stopped",
+                   session_started_at_fn=lambda sid: eng._started_at,
+                   timeout_seconds=90,
                    unregister_fn=boom)
     wd.scan()  # 不抛异常；标志已置，告警仍留痕
     assert eng._running is False

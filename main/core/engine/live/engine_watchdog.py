@@ -90,6 +90,10 @@ _LONG_PERIODS = frozenset({"1d", "1w", "1mon", "day", "week", "month"})
 #: 因此引擎仍在跑即为进程/状态错配；见 _check_owner_mismatch）。
 _NOT_RUNNING_STATUSES = frozenset({"stopped", "stopping"})
 
+#: 「同代」容差：DB ``started_at`` 与引擎 ``_started_at`` 相差超过该值即视为
+#: 不同一次启动（DB 时间在 create_task 前写、引擎时间在协程内写，正常仅差数秒）。
+_GENERATION_TOLERANCE_SECONDS = 120.0
+
 #: 连续竞价边界（用于把「墙钟静默」折算成「有效交易静默」）
 _AM_OPEN = _dtime(9, 30)
 _LUNCH_START = _dtime(11, 30)
@@ -200,6 +204,21 @@ def live_session_status(session_id: int) -> Optional[str]:
         db.close()
 
 
+def live_session_started_at(session_id: int) -> Optional[datetime]:
+    """该会话 ``live_sessions.started_at``；无记录/为空/失败 → None。
+
+    错配自愈的「同代」判据：DB 行与引擎实例必须是同一次 start 产生的，
+    否则 ``stop`` 说的是上一代/另一代会话，不能据此杀当前引擎。
+    """
+    db = SessionLocal()
+    try:
+        row = db.query(LiveSession.started_at).filter(
+            LiveSession.id == session_id).first()
+        return row[0] if row else None
+    finally:
+        db.close()
+
+
 @dataclass
 class StallSignal:
     """通道探针命中结果。"""
@@ -228,6 +247,8 @@ class EngineWatchdog:
         mono_fn: Callable[[], float] = time.monotonic,
         snapshot_fn: Callable[[int], Optional[datetime]] = latest_snapshot_at,
         session_status_fn: Callable[[int], Optional[str]] = live_session_status,
+        session_started_at_fn: Callable[[int], Optional[datetime]] = (
+            live_session_started_at),
         unregister_fn: Optional[Callable[[int], None]] = None,
         in_session_fn: Callable[[datetime], bool] = default_in_session,
         client_online_fn: Callable[[str], bool] = client_window_present,
@@ -253,6 +274,8 @@ class EngineWatchdog:
         self._snapshot = snapshot_fn
         # 会话 DB 状态探针（错配自检用；单测可注入，避免读真实库）
         self._session_status = session_status_fn
+        # 会话 DB 启动时刻（错配自愈的「同代」判据；单测可注入）
+        self._session_started_at = session_started_at_fn
         # 错配自愈：把本进程的孤儿引擎移出注册表（生产注入 ENGINES.pop）
         self._unregister = unregister_fn
         self._in_session = in_session_fn
@@ -410,6 +433,8 @@ class EngineWatchdog:
         ``_heal_owner_mismatch`` 收敛（本进程自愈）。
 
         返回 True 表示引擎已被自愈移出注册表，调用方应跳过本轮其它探针。
+        「自愈」必须证据充分：注册表实例一致 + 与 DB 同代 + 无任何新鲜活动；
+        任一不满足都只告警、不杀引擎（宁可漏杀不可错杀，2026-11-19 错杀事故）。
         """
         # 过期快照保护：``stop_session`` 先 pop 注册表再 commit，正常 stop 的
         # 瞬间可能被扫到「快照里有引擎、DB 已 stopping」。此时注册表里已无该
@@ -433,6 +458,9 @@ class EngineWatchdog:
         if status not in _NOT_RUNNING_STATUSES:
             self._recover_owner_mismatch(session_id, engine, channel, status)
             return False
+        # 自愈前置：先判「这真的是一个该杀的孤儿引擎吗」。证据不足时只告警，
+        # 保留 _owner_mismatch 态（后续扫描可重判，活动停掉后才可能变成充分）。
+        sufficient, evidence = self._orphan_evidence(session_id, engine)
         mono = self._mono()
         state = self._owner_mismatch.get(session_id)
         if state is None:
@@ -440,6 +468,7 @@ class EngineWatchdog:
                      "last_log_mono": 0.0, "db_status": status}
             self._owner_mismatch[session_id] = state
         state["db_status"] = status
+        state["evidence"] = evidence
         if state["alerted"] and mono - state["last_log_mono"] < self._repeat:
             return False
         first = not state["alerted"]
@@ -451,7 +480,11 @@ class EngineWatchdog:
             "进程/会话状态错配：会话 %s 在 DB 已 %s，但本进程引擎仍在运行"
             "（%s，已持续 %.0f 秒）——快照/成交回填会继续写入。"
             "请确认是否有另一个后端进程持有该引擎（stop 打到了没有引擎的进程）"
-            % (session_id, status, process_tag(), seconds))
+            "；%s"
+            % (session_id, status, process_tag(), seconds,
+               ("自愈证据充分（%s）" % evidence) if sufficient
+               else ("证据不足，跳过自愈（%s）" % evidence))
+        )
         logger.error("%s", message)
         self._safe_emit(engine, "risk", {
             "session_id": session_id,
@@ -459,18 +492,73 @@ class EngineWatchdog:
             "rule": "engine_owner_mismatch",
             "seconds": int(seconds),
             "db_status": status,
+            "self_heal": bool(self._unregister is not None and sufficient),
+            "evidence": evidence,
             "message": message,
         })
         if first:
             self._persist_owner_event(
                 session_id, channel, "engine_owner_mismatch", "trigger",
-                seconds, "db_status=%s" % status, message)
-            # 自愈默认关闭：只有生产注入 unregister_fn（真实的 ENGINES 注册表）
-            # 才收敛停机；未注入（单测/只读诊断）保持「只告警不动引擎」。
-            if self._unregister is not None:
-                self._heal_owner_mismatch(session_id, engine, status)
-                return True
+                seconds, "db_status=%s;%s" % (status, evidence), message)
+        # 自愈默认关闭：只有生产注入 unregister_fn（真实的 ENGINES 注册表）
+        # 才收敛停机；未注入（单测/只读诊断）保持「只告警不动引擎」。
+        # 证据不充分一律不杀：DB 一行 stopped 不足以认定引擎该停。
+        if self._unregister is not None and sufficient:
+            self._heal_owner_mismatch(session_id, engine, status)
+            return True
         return False
+
+    def _orphan_evidence(self, session_id: int,
+                         engine: object) -> tuple:
+        """判定「DB 已停、本进程引擎仍在跑」是否足以自愈；返回 (是否充分, 依据)。
+
+        三条判据缺一不可：
+
+        1. 注册表里就是这个实例（调用方已查一次，这里复核，防扫描中换引擎）；
+        2. 引擎 ``_started_at`` 与 DB ``started_at`` 同代（差 ≤ 120s）；
+        3. 引擎**没有任何新鲜活动**（快照与 ``_last_tick_at`` 均超过心跳阈值）。
+
+        第 3 条是关键：快照/心跳新鲜 = 引擎健在，此时 DB 的 stopped 更可能是
+        写错了或 stop 落到了别的进程，杀它就是把健在的交易引擎掐掉。
+        读不到判据（DB 抖动/字段为空）也按证据不足处理，只告警。
+        """
+        try:
+            if self._sessions_provider().get(session_id) is not engine:
+                return False, "注册表实例已不是本引擎（可能已重启）"
+        except Exception:  # noqa: BLE001 — 注册表不可读即证据不足
+            return False, "注册表不可读"
+        engine_started = getattr(engine, "_started_at", None)
+        try:
+            db_started = self._session_started_at(session_id)
+        except Exception:  # noqa: BLE001 — DB 抖动即证据不足
+            logger.warning(
+                "engine watchdog: 读取会话 started_at 失败 (session %s)",
+                session_id, exc_info=True)
+            return False, "DB started_at 读取失败"
+        if engine_started is None or db_started is None:
+            return False, "缺少启动时刻（engine=%s, db=%s）" % (
+                engine_started, db_started)
+        diff = abs((engine_started - db_started).total_seconds())
+        if diff > _GENERATION_TOLERANCE_SECONDS:
+            return False, "started_at 不同代（相差 %.0f 秒）" % diff
+        now = self._now()
+        try:
+            snap = self._snapshot(session_id)
+        except Exception:  # noqa: BLE001 — 读不到快照即无法确认孤儿
+            logger.warning(
+                "engine watchdog: 读取账户快照时间失败 (session %s)",
+                session_id, exc_info=True)
+            return False, "快照时间读取失败"
+        for label, ts in (("快照", snap),
+                          ("心跳", getattr(engine, "_last_tick_at", None))):
+            if ts is None:
+                continue
+            age = (now - ts).total_seconds()
+            if age <= self._timeout:
+                return False, "引擎仍有新鲜活动（%s 距now %.0fs ≤ %.0fs）" % (
+                    label, age, self._timeout)
+        return True, ("注册表实例一致、started_at 同代（差 %.1fs）、"
+                      "快照/心跳均静默超过 %.0fs" % (diff, self._timeout))
 
     def _heal_owner_mismatch(self, session_id: int, engine: object,
                              status: str) -> None:
