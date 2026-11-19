@@ -80,6 +80,10 @@ class OrderEvent:
     # +1；达到 capacity_slice_ttl_bars 即作废。与 pending_since 的 20 日上限独立，
     # 专门限制「流动性不足」造成的长期挂单。
     capacity_carry_bars: int = 0
+    # 信号目标股数（2026-11-19 达成率埋点）：订单首次进入提交链时的数量，此后
+    # 不再被任何闸门/切片修改。实盘落 live_orders.orig_quantity，用于逐笔
+    # 「目标股数 / 累计成交股数」复现误差对照；0 = 未采集（回测/旧路径）。
+    target_quantity: int = 0
 
 
 @dataclass

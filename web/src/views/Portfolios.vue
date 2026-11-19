@@ -89,7 +89,7 @@ const PORTFOLIO_RATIO_FIELDS = new Set([
   'max_drawdown', 'daily_loss_limit',
   'buy_commission_rate', 'sell_commission_rate', 'stamp_duty_rate', 'transfer_fee_rate', 'slippage',
   'volume_limit_ratio', 'cash_enhance_position_ratio_threshold',
-  'slippage_impact_coef',
+  'slippage_impact_coef', 'minute_volume_limit_ratio',
   'max_single_position_pct', 'min_cash_reserve_pct',
   'market_gate_bear_reduce_ratio',
 ])
@@ -112,9 +112,10 @@ const NULLABLE_NUMERIC_FIELDS = new Set([
   'split_order_interval_seconds', 'split_order_volume_pct',
   'cash_enhance_equity_threshold', 'cash_enhance_position_ratio_threshold',
   'trend_trailing_stop_ratio', 'trend_max_positions',
-  'signal_weekday', 'risk_cooldown_days',
-  'priority',
+  'signal_weekday', 'risk_cooldown_days', 'priority',
   'market_gate_strength_threshold',
+  // 实盘分钟级单次可下单量：留空=后端默认 0.10；0=关闭分钟闸门
+  'minute_volume_limit_ratio',
 ])
 
 // 表单字段元数据：key/名称/一行几个（≤2 保证不溢出）。分组用于弹窗分区。
@@ -156,7 +157,8 @@ const PORTFOLIO_GROUPS: { title: string; hint?: string; fields: FieldMeta[] }[] 
     { key: 'price_limit_check_enabled', label: '涨跌停校验', span: 1, type: 'switch', hint: '默认开启。回测：涨停买不进/跌停卖不出，延后重试；实盘：下单前拦截并落拒单事件（通达信 TQ / 同花顺生效，QMT/掘金桥无前收数据恒放行）' },
     { key: 'volume_limit_enabled', label: '成交量约束', span: 1, type: 'switch', hint: '按 bar 成交量占比封顶' },
     { key: 'adaptive_slippage_enabled', label: '自适应滑点', span: 1, type: 'switch', hint: '滑点随订单量占 bar 成交量比例上浮（市场冲击成本）' },
-    { key: 'volume_limit_ratio', label: '成交量占比上限', span: 2, type: 'percent', placeholder: '10', showIf: { key: 'volume_limit_enabled', equals: true } },
+    { key: 'volume_limit_ratio', label: '日线流动性占比', span: 1, type: 'percent', placeholder: '10', showIf: { key: 'volume_limit_enabled', equals: true }, hint: '单笔 ≤ 前 5 个交易日日均成交量 × 本比例（回测/实盘同口径，严格不含当日）。回测与实盘的首笔报单都按此封顶。' },
+    { key: 'minute_volume_limit_ratio', label: '分钟单次可下单量', span: 1, type: 'percent', placeholder: '10', showIf: { key: 'volume_limit_enabled', equals: true }, hint: '实盘专用：单次提交 ≤ 最近完成 1m bar 成交量 × 本比例。缩掉的差额进当日补单队列，随新 bar 续发。0=关闭分钟闸门（只按日线口径）；留空=默认 10%。' },
     { key: 'slippage_impact_coef', label: '滑点冲击系数', span: 1, type: 'percent', placeholder: '10', showIf: { key: 'adaptive_slippage_enabled', equals: true }, hint: '订单吞掉整根 bar 成交量时冲击 10%，封顶' },
   ]},
   { title: '仓位与现金管理', fields: [
@@ -276,6 +278,7 @@ function emptyPortfolioForm(): Record<string, any> {
     risk_cooldown_days: 1,
     trading_session: 'full', status: 'active',
     price_limit_check_enabled: true, volume_limit_enabled: false, volume_limit_ratio: 0.1,
+    minute_volume_limit_ratio: 0.1,
     adaptive_slippage_enabled: false, slippage_impact_coef: 0.1,
     position_sizing: 'dynamic', daily_loss_basis: 'equity', cash_enhance_enabled: false,
     cash_enhance_equity_threshold: null, cash_enhance_position_ratio_threshold: null,
@@ -585,6 +588,8 @@ async function openEditPortfolio(p: PortfolioItem) {
     price_limit_check_enabled: detail.price_limit_check_enabled,
     volume_limit_enabled: detail.volume_limit_enabled,
     volume_limit_ratio: detail.volume_limit_ratio,
+    // 分钟级单次可下单量：NULL=后端默认 0.10，表单按 10% 展示
+    minute_volume_limit_ratio: detail.minute_volume_limit_ratio ?? 0.1,
     adaptive_slippage_enabled: detail.adaptive_slippage_enabled ?? false,
     slippage_impact_coef: detail.slippage_impact_coef ?? 0.1,
     position_sizing: detail.position_sizing || 'dynamic',

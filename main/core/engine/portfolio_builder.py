@@ -105,11 +105,15 @@ def assemble_portfolio(
             str(getattr(ps, "market_gate_bear_reduce_ratio", 0) or 0))
     except (TypeError, ValueError):
         port.gate_bear_reduce_ratio = Decimal("0")
-    # #2 成交量/流动性约束（可选，默认关；仅回测成交步生效）
+    # #2 成交量/流动性约束（可选，默认关）
     port.volume_limit_enabled = bool(getattr(ps, "volume_limit_enabled", False))
     _vol_ratio = getattr(ps, "volume_limit_ratio", None)
     if _vol_ratio is not None:
         port.volume_limit_ratio = Decimal(str(_vol_ratio))
+    # 分钟级单次可下单量（实盘专用）：NULL=未配置 → 用类默认 0.10；0=关闭分钟闸门
+    _minute_ratio = getattr(ps, "minute_volume_limit_ratio", None)
+    if _minute_ratio is not None:
+        port.minute_volume_limit_ratio = Decimal(str(_minute_ratio))
     # #4 自适应滑点（可选，默认关；仅回测成交步生效）：市场冲击随订单量占比上浮
     port.adaptive_slippage_enabled = bool(getattr(ps, "adaptive_slippage_enabled", False))
     _impact_coef = getattr(ps, "slippage_impact_coef", None)

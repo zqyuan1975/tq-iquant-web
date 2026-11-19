@@ -64,6 +64,29 @@ def test_persist_requote_attempt():
     assert row.requote_attempt == 2
 
 
+def test_persist_order_writes_signal_target_for_achievement():
+    """达成率埋点：orig_quantity = 信号目标股数（闸门/切片前），不是提交量。"""
+    db = _db()
+    machine = OrderStateMachine(SimpleNamespace(session_id=1), lambda *a, **k: None)
+    order = _order(target_quantity=1000)
+    order.quantity = 400  # 闸门缩量后的提交量
+    row = machine.persist_order_submitted(db, order)
+    db.commit()
+
+    assert row.quantity == 400
+    assert row.orig_quantity == 1000
+    assert row.filled_quantity == 0
+
+
+def test_persist_order_without_target_falls_back_to_quantity():
+    """回测/旧路径 target_quantity=0 → orig_quantity 回落提交量，不写 0。"""
+    db = _db()
+    machine = OrderStateMachine(SimpleNamespace(session_id=1), lambda *a, **k: None)
+    row = machine.persist_order_submitted(db, _order())
+    db.commit()
+    assert row.orig_quantity == row.quantity
+
+
 def test_session_orders_aggregates_split_group():
     db = _db()
     db.add(LiveSession(id=1, name="s", mode="simulation", status="stopped"))

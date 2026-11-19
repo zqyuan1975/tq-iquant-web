@@ -116,6 +116,53 @@ def build_prev_close_by_day(klines: dict) -> Dict[tuple, Decimal]:
     return result
 
 
+def build_volume_ref_by_day(klines: dict, lookback: int = 5) -> Dict[tuple, int]:
+    """按 ``(code, 交易日)`` 预计算「此前 lookback 个有效交易日日均成交量（股）」。
+
+    2026-11-19 口径统一（与实盘 ``LiveEngine._daily_reference_volume`` 对齐）：
+      - 只用**严格早于该交易日**的完整日成交量，当日 bar 量绝不进入分母
+        （旧实现直接用成交当根 bar 的 Volume，含当日未来信息）；
+      - 优先日线；无日线时取最细分钟周期按日累加（避免多周期重复计数）；
+        纯周/月线无法还原日量 → 不给键，调用方 fail-open；
+      - 不足 lookback 日按已有天数均值；无历史（首日/新股）→ 不给键。
+    """
+    day_vols: Dict[str, Dict[date, float]] = {}
+    intraday_periods = ("1m", "5m", "15m", "30m", "1h")
+    for _code, _periods in (klines or {}).items():
+        per_day: Dict[date, float] = {}
+        _periods = _periods or {}
+        if "1d" in _periods:
+            _df = _periods.get("1d")
+            if _df is not None and "datetime" in _df.columns and "Volume" in _df.columns:
+                for _dt, _vol in zip(_df["datetime"].to_list(), _df["Volume"].to_list()):
+                    if _dt is None or _vol is None or _vol <= 0:
+                        continue
+                    per_day[_dt.date()] = per_day.get(_dt.date(), 0.0) + float(_vol)
+        else:
+            for _p in sorted(_periods.keys(), key=lambda p: _PERIOD_ORDER.get(p, 99)):
+                if _p not in intraday_periods:
+                    continue
+                _df = _periods.get(_p)
+                if _df is None or "datetime" not in _df.columns or "Volume" not in _df.columns:
+                    break
+                for _dt, _vol in zip(_df["datetime"].to_list(), _df["Volume"].to_list()):
+                    if _dt is None or _vol is None or _vol <= 0:
+                        continue
+                    per_day[_dt.date()] = per_day.get(_dt.date(), 0.0) + float(_vol)
+                break
+        if per_day:
+            day_vols[_code] = per_day
+
+    result: Dict[tuple, int] = {}
+    for _code, per_day in day_vols.items():
+        _days = sorted(per_day.keys())
+        for _i, _d in enumerate(_days):
+            _hist = [per_day[_x] for _x in _days[max(0, _i - lookback):_i]]
+            if _hist:
+                result[(_code, _d)] = int(sum(_hist) / len(_hist))
+    return result
+
+
 class BacktestEngine:
     def run(
         self,
@@ -186,6 +233,8 @@ class BacktestEngine:
         total_bars = len(times)
         report_every = max(1, total_bars // 100)
         price_index = self._build_price_index(klines)
+        # #2 成交量闸门分母：成交日之前 5 个交易日日均量（与实盘同口径，无前视）
+        volume_ref_by_day = build_volume_ref_by_day(klines)
         pending_orders: List[OrderEvent] = list(initial_pending_orders or [])
         # 续跑带入的在途单：checkpoint 序列化了 pending_since 时沿用（跨段累计
         # 交易日，寿命上限不被分段重置）；旧 checkpoint 无该字段 → 以本段首根
@@ -588,12 +637,15 @@ class BacktestEngine:
                                 capacity_residual = _requested - _allowed
                             order.quantity = _allowed
                     elif portfolio.volume_limit_enabled:
-                        bar_volume = price_index.get((t, period), {}).get(
-                            order.stock_code, {}).get("volume")
-                        if bar_volume is not None:
-                            # TQ Volume 单位=股（非手），cap = 占比 × 当日成交股数
+                        # 2026-11-19 口径统一：分母 = 成交日之前 5 个有效交易日
+                        # 日均成交量（股），与实盘同口径；严格不含当日（旧实现用
+                        # 成交当根 bar 量，含当日未来信息）。无历史 → fail-open。
+                        ref_volume = volume_ref_by_day.get(
+                            (order.stock_code, t.date()))
+                        if ref_volume:
+                            # TQ Volume 单位=股（非手），cap = 占比 × 近5日均量
                             cap_shares = int(
-                                portfolio.volume_limit_ratio * Decimal(int(bar_volume))
+                                portfolio.volume_limit_ratio * Decimal(int(ref_volume))
                             )
                             if order.quantity > cap_shares:
                                 vol_lot = lot_size_for(
@@ -617,9 +669,9 @@ class BacktestEngine:
                                         bar_time=t,
                                         requested_qty=order.quantity,
                                         final_qty=final_qty,
-                                        message="成交量约束：订单 %d 股 > 本 bar 上限 %d 股"
-                                                "（当日成交 %s 股 ×%s），缩量至 %d 股成交"
-                                                % (order.quantity, cap_shares, bar_volume,
+                                        message="成交量约束：订单 %d 股 > 近5日均量口径上限 %d 股"
+                                                "（近5日均量 %s 股 ×%s），缩量至 %d 股成交"
+                                                % (order.quantity, cap_shares, ref_volume,
                                                    portfolio.volume_limit_ratio, final_qty),
                                     )
                                     if (not is_buy
@@ -639,9 +691,9 @@ class BacktestEngine:
                                             stock_code=order.stock_code,
                                             bar_time=t,
                                             requested_qty=order.quantity,
-                                            message="成交量约束：本 bar 上限 %d 股不足一手"
-                                                    "（当日成交 %s 股 ×%s），订单延后至量足 bar"
-                                                    % (cap_shares, bar_volume,
+                                            message="成交量约束：近5日均量口径上限 %d 股不足一手"
+                                                    "（近5日均量 %s 股 ×%s），订单延后至量足 bar"
+                                                    % (cap_shares, ref_volume,
                                                        portfolio.volume_limit_ratio),
                                         )
                                     deferred.append(order)
@@ -993,6 +1045,8 @@ class BacktestEngine:
         times = self._build_timeline(klines)
         price_index = self._build_price_index(klines)
         prev_close_by_day = build_prev_close_by_day(klines)
+        # #2 成交量闸门分母：成交日之前 5 个交易日日均量（与实盘同口径，无前视）
+        volume_ref_by_day = build_volume_ref_by_day(klines)
         first_bar_date: Dict[str, date] = {}
         for _code, _periods in klines.items():
             _dates = [
@@ -1315,11 +1369,14 @@ class BacktestEngine:
                                 capacity_residual = _requested - _allowed
                             order.quantity = _allowed
                     elif portfolio.volume_limit_enabled:
-                        bar_volume = bar_volumes.get(order.stock_code)
-                        if bar_volume is not None:
+                        # 2026-11-19 口径统一：成交日之前 5 个交易日日均量（股），
+                        # 不含当日、无前视；无历史 → fail-open。
+                        ref_volume = volume_ref_by_day.get(
+                            (order.stock_code, t.date()))
+                        if ref_volume:
                             cap_shares = int(
                                 portfolio.volume_limit_ratio
-                                * Decimal(int(bar_volume)))
+                                * Decimal(int(ref_volume)))
                             if order.quantity > cap_shares:
                                 vol_lot = lot_size_for(
                                     order.stock_code, portfolio.bond_lot_enabled)
@@ -1345,8 +1402,10 @@ class BacktestEngine:
                                             strategy_id=order.strategy_id,
                                             stock_code=order.stock_code,
                                             bar_time=t,
-                                            message="成交量约束：本 bar 上限不足一手，"
-                                                    "订单延后至量足 bar")
+                                            message="成交量约束：近5日均量口径上限不足一手，"
+                                                    "订单延后至量足 bar（近5日均量 %s 股 ×%s）"
+                                                    % (ref_volume,
+                                                       portfolio.volume_limit_ratio))
                                     deferred.append(order)
                                     continue
                     order.bar_time = t

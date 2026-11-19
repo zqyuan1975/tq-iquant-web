@@ -4026,6 +4026,13 @@ watch(theme, () => {
         容量模型版本 <code>{{ detail.capacity_model_version || 'v1' }}</code>
         <span v-if="(detail.capacity_model_version || 'v1') === 'v1'">（4% 成交量闸门 / 固定单笔上限旧口径）</span>
         <span v-else>（参与率 + sqrt 冲击 + 残量顺延）</span>
+        <span class="caliber-tag" :class="detail.liquidity_caliber === 'prev5d_avg' ? 'caliber-new' : 'caliber-old'"
+              :title="detail.liquidity_caliber === 'prev5d_avg'
+                ? '成交量分母 = 成交日之前 5 个有效交易日日均量（无前视），与实盘同口径'
+                : '成交量分母 = 成交当根 bar 的成交量（日线含当日未来信息），旧口径'">
+          流动性口径 {{ detail.liquidity_caliber === 'prev5d_avg' ? 'prev5d_avg（前5日均量）' : 'same_day_bar（当日 bar 量，旧）' }}
+        </span>
+        <span v-if="detail.liquidity_caliber !== 'prev5d_avg'" class="caliber-warn">不可与新口径结果混比</span>
       </p>
       <a v-if="currentRecord.id"
          :href="`/api/backtest/records/${currentRecord.id}/export/html`"
@@ -6208,6 +6215,31 @@ watch(theme, () => {
   margin: 6px 0 0;
   font-size: 13px;
   color: var(--ink-soft);
+}
+/* 流动性口径标记（2026-11-19）：新旧口径结果不可混看 */
+.caliber-tag {
+  display: inline-block;
+  margin-left: 10px;
+  padding: 1px 8px;
+  border-radius: 10px;
+  font-size: 12px;
+  border: 1px solid transparent;
+  cursor: help;
+}
+.caliber-tag.caliber-new {
+  color: #1a7f37;
+  background: rgba(26,127,55,.10);
+  border-color: rgba(26,127,55,.35);
+}
+.caliber-tag.caliber-old {
+  color: #9a6700;
+  background: rgba(154,103,0,.10);
+  border-color: rgba(154,103,0,.35);
+}
+.caliber-warn {
+  margin-left: 8px;
+  font-size: 12px;
+  color: #9a6700;
 }
 
 /* 区块标题 */

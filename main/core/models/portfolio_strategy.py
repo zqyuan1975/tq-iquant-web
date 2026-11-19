@@ -65,9 +65,15 @@ class PortfolioStrategy(Base):
     # #1 涨跌停约束（回测成交步）：True=涨停买不进/跌停卖不出（延后重试）。
     # 默认开（含 ORM/server 默认）——无约束回测会系统性高估可成交性；旧组合由迁移置 1。
     price_limit_check_enabled = Column(Boolean, default=True, server_default="1", nullable=False)
-    # #2 成交量/流动性约束（回测成交步，可选默认关）：单 bar 成交量 × ratio 封顶成交股数。
+    # #2 成交量/流动性约束（回测成交步，可选默认关）：单笔 ≤ 前 5 个交易日日均量
+    # （股）× ratio；回测/实盘统一口径，严格不含当日（无前视）。
     volume_limit_enabled = Column(Boolean, default=False, server_default="0", nullable=False)
     volume_limit_ratio = Column(Numeric(4, 2), default=0.10, server_default="0.10", nullable=False)
+    # 分钟级「单次可下单量」比例（实盘专用，2026-11-19）：单次提交 ≤ 最近完成
+    # 1m bar 量 × 本比例；缩掉的残量进当日补单队列按后续 bar 续发。
+    # 与 volume_limit_ratio 分离，避免把日线 4% 直接套到分钟单上。
+    # NULL=未配置（引擎回落 0.10）；0=关闭分钟闸门（只保留日线口径）。
+    minute_volume_limit_ratio = Column(Numeric(5, 4), nullable=True)
     # #4 自适应滑点（回测成交步，可选默认关）：开启后有效滑点 =
     # slippage + slippage_impact_coef × 订单股数/(bar成交量×100)，封顶 0.10，
     # 模拟市场冲击成本（订单量占当日成交量比例越大滑点越高）；与 volume_limit

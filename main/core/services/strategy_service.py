@@ -112,6 +112,10 @@ def serialize_portfolio(db: Session, p: PortfolioStrategy) -> dict:
         "price_limit_check_enabled": bool(p.price_limit_check_enabled) if p.price_limit_check_enabled is not None else True,
         "volume_limit_enabled": bool(p.volume_limit_enabled) if p.volume_limit_enabled is not None else False,
         "volume_limit_ratio": float(p.volume_limit_ratio) if p.volume_limit_ratio is not None else 0.10,
+        "minute_volume_limit_ratio": (
+            float(p.minute_volume_limit_ratio)
+            if p.minute_volume_limit_ratio is not None else None
+        ),
         "adaptive_slippage_enabled": bool(p.adaptive_slippage_enabled) if p.adaptive_slippage_enabled is not None else False,
         "slippage_impact_coef": float(p.slippage_impact_coef) if p.slippage_impact_coef is not None else 0.10,
         "position_sizing": p.position_sizing or "dynamic",
@@ -205,6 +209,9 @@ def _apply_portfolio_fields(p: PortfolioStrategy, req) -> None:
         p.volume_limit_enabled = req.volume_limit_enabled
     if getattr(req, "volume_limit_ratio", None) is not None:
         p.volume_limit_ratio = req.volume_limit_ratio
+    # 分钟级单次可下单量（实盘）：None 不动；0=显式关闭分钟闸门，必须原样落库
+    if getattr(req, "minute_volume_limit_ratio", None) is not None:
+        p.minute_volume_limit_ratio = req.minute_volume_limit_ratio
     # #4 自适应滑点（默认关）：None 不动（新建落 ORM 默认 False/0.10）
     if getattr(req, "adaptive_slippage_enabled", None) is not None:
         p.adaptive_slippage_enabled = req.adaptive_slippage_enabled

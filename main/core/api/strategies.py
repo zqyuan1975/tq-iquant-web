@@ -158,6 +158,9 @@ class PortfolioCreate(BaseModel):
     # #2 成交量/流动性约束（回测，默认关）：None=不动（新建落默认 False/0.10）
     volume_limit_enabled: bool | None = None
     volume_limit_ratio: float | None = None
+    # 分钟级单次可下单量（实盘，2026-11-19）：None=不动（新建 NULL→引擎默认
+    # 0.10）；0=关闭分钟闸门（只保留日线口径）。
+    minute_volume_limit_ratio: float | None = None
     # #4 自适应滑点（回测，默认关）：None=不动（新建落默认 False/0.10）
     adaptive_slippage_enabled: bool | None = None
     slippage_impact_coef: float | None = None
@@ -352,6 +355,12 @@ def _validate_portfolio(req: PortfolioCreate, db: Session) -> str | None:
         return num_msg
     if req.volume_limit_ratio is not None and not (0 < req.volume_limit_ratio <= 1):
         return f"volume_limit_ratio 必须在 (0,1]，收到 {req.volume_limit_ratio}"
+    # 分钟级单次比例：0 是合法值（关闭分钟闸门），上限 1（单次最多吃满一根 1m bar）
+    if req.minute_volume_limit_ratio is not None and not (0 <= req.minute_volume_limit_ratio <= 1):
+        return (
+            "minute_volume_limit_ratio 必须在 [0,1]，"
+            f"收到 {req.minute_volume_limit_ratio}"
+        )
     if req.slippage_impact_coef is not None and not (0 < req.slippage_impact_coef <= 1):
         return f"slippage_impact_coef 必须在 (0,1]，收到 {req.slippage_impact_coef}"
     if req.position_sizing not in VALID_POSITION_SIZING:

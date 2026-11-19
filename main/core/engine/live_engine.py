@@ -26,6 +26,7 @@ from decimal import Decimal, ROUND_CEILING, ROUND_HALF_UP
 from typing import (
     AsyncIterator, Callable, Dict, List, Optional, Set, Tuple,
 )
+from uuid import uuid4
 
 from sqlalchemy import case, func, or_
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
@@ -995,6 +996,21 @@ class LiveEngine:
         # 仅内存：Core 重启即丢（未提交子单不落库无从重建；已落库子单由 D6 去重
         # 防重放）。注意与 _signal_bar_deferred 不同——后者已 DB 持久化可重建。
         self._split_children: Dict[tuple, dict] = {}
+        # 成交量残量补单队列（2026-11-19，当日有效）：
+        # key=residual_id（vr-<session>-<ps>-<strategy>-<code>-<rand>），
+        # value={"portfolio","template","period","target_qty","filled_qty","pending_qty",
+        #        "inflight","attempts","ref_price","expire_at","last_bar_key",
+        #        "signal_name","signal_bar_time","approved"}。
+        # 语义：分钟/日线闸门缩掉的差额不丢弃，按后续完成的新 1m bar 重算可下量
+        # 续发；仅内存（当日会话内有效，重启丢失 → 由 TTL/收盘兜底留痕）。
+        self._volume_residuals: Dict[str, dict] = {}
+        # 日线参考量缓存：(code, 交易日) → 前 5 个有效交易日日均成交量（股）。
+        # 失败缓存 None（同一天不重复打 TQ），保证无前视：只取 trade_date 之前。
+        self._daily_volume_ref_cache: Dict[tuple, Optional[int]] = {}
+        # 残量放弃阈值（可被测试覆盖）：TTL 到当日 14:55、价格偏离 >2%、
+        # 同组累计 20 次提交仍无进展。
+        self.volume_residual_max_dev_pct = 0.02
+        self.volume_residual_max_attempts = 20
         # G5：/deals 成交回报轮询独立节拍（默认 5s，比主循环 60s 更短）——成交秒级回报，
         # 持仓/资金反馈要近实时，不跟 bar 拉取同频。
         self._deals_poll_interval = deals_poll_interval
@@ -4047,6 +4063,10 @@ class LiveEngine:
                 # 依赖本轮回填/终态同步把队首子单推进到 filled/canceled/rejected，
                 # 再决定续发下一笔或整队中止。同持 _book_lock（RLock 可重入）。
                 self._tick_split_children()
+                # 成交量闸门残量顺延：拆单队列之后、撤单收敛之前。被分钟/日线闸门
+                # 缩掉的差额进「当日有效」残量队列，本 tick 按最新 1m bar 量重算
+                # 可下单量续发；等待在途 chunk 终态、过期/偏离/无进展则放弃并留痕。
+                self._tick_volume_residuals()
                 # 撤单收敛统一 requote 挂点（53/54 终态同步路径）：带撤单请求
                 # 标记的单在委托表呈 53/54 终态收敛 canceled 后做有限追价重下
                 # （TDX/THS 当日委托表保留已撤单，真机超时撤单全走本路径）。
@@ -5805,44 +5825,444 @@ class LiveEngine:
             return None
         return price if price > 0 else None
 
-    def _apply_volume_cap(self, order, portfolio: Portfolio) -> None:
-        """成交量约束（实盘化，对齐回测 #2）：本单股数上限 = 最近完成 1m bar
-        成交量 × volume_limit_ratio。
+    def _daily_reference_volume(self, code: str, trade_date: date) -> Optional[int]:
+        """前 5 个有效交易日日均成交量（股），严格不含 trade_date 及以后。
 
-        - BUY > 上限且上限 ≥ 1 手 → 缩至整手（floor）；上限 < 1 手 → 拒单
-          （标 _volume_capped_out，下一信号重试——回测「延后至量足 bar」的实盘化）；
-        - SELL > 上限 → 缩量不取整手（A 股允许零股卖出）；上限 ≤ 0 → 放行
-          （风控卖出优先，薄量由部分成交+回填/超时链收敛）；
-        - 未启用 / 无快照量源 → 不干预（fail-open，iquant 通道量纲未标定）。
+        与回测 ``build_volume_ref_by_day`` 同口径：TQ 日线 Volume 单位=股，
+        只取 ``date < trade_date`` 的完整交易日；不足 5 日按已有天数均值；
+        无历史/取数失败 → None（调用方 fail-open 留痕），绝不回退当日量。
+        按 (code, 交易日) 缓存，失败也缓存 None，避免盘中反复打 TQ。
         """
+        key = (code, trade_date)
+        if key in self._daily_volume_ref_cache:
+            return self._daily_volume_ref_cache[key]
+        ref: Optional[int] = None
+        try:
+            from core.tq.data import TQData
+            end = (trade_date - timedelta(days=1)).isoformat()
+            start = (trade_date - timedelta(days=21)).isoformat()
+            raw = TQData().get_history_raw(
+                [code], ["1d"], start=start, end=end,
+                dividend_type="none", count=-1)
+            vol_df = (raw.get("1d") or {}).get("Volume")
+            if vol_df is not None and code in getattr(vol_df, "columns", []):
+                vals: List[float] = []
+                for dt, v in zip(vol_df.index, vol_df[code].to_list()):
+                    try:
+                        d = dt.date() if hasattr(dt, "date") else dt
+                    except Exception:  # noqa: BLE001
+                        continue
+                    if d is None or d >= trade_date or v is None:
+                        continue
+                    try:
+                        fv = float(v)
+                    except (TypeError, ValueError):
+                        continue
+                    if fv > 0:
+                        vals.append(fv)
+                vals = vals[-5:]
+                if vals:
+                    ref = int(sum(vals) / len(vals))
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("日线参考量取数失败 %s@%s: %s", code, trade_date, exc)
+        self._daily_volume_ref_cache[key] = ref
+        return ref
+
+    def _latest_bar_snapshot(self, code: str) -> Optional[dict]:
+        """最近一根已完成 1m bar（快照合成），无则 None（盘前/停牌/通道未启用）。"""
+        if self._snapshot_synth is None:
+            return None
+        try:
+            bars = self._snapshot_synth.completed_bars([code], 2).get(code) or []
+        except Exception:  # noqa: BLE001
+            return None
+        return bars[-1] if bars else None
+
+    def _apply_volume_cap(self, order, portfolio: Portfolio) -> None:
+        """双层成交量闸门（2026-11-19，参数拆分后的实盘口径）。
+
+        - 日线层：单笔 ≤ 前 5 个有效交易日日均量（股）× volume_limit_ratio，
+          与回测统一、严格不含当日（无前视）；
+        - 分钟层：**单次提交** ≤ 最近完成 1m bar 量 × minute_volume_limit_ratio
+          （独立参数，不再复用日线 4%）；
+        本次可提交量取两层较小值。缩掉的差额注册进当日残量补单队列，由后续
+        新 1m bar 按同一口径续发，不再直接改 quantity 后丢弃。
+
+        盘前无已完成 1m bar：按日线口径放行，并落 ``volume_cap/daily_fallback``
+        事件（可事后追溯）；日线基准也取不到 → fail-open 留痕。
+        残量 chunk 自带 ``_volume_residual_chunk``（tick 已算过量）→ 直接放行。
+        """
+        if getattr(order, "_volume_residual_chunk", False):
+            return
+        # 追价重下（撤单后同一张单加价重报）：数量已在首报时过闸，重报不再缩量，
+        # 否则会为同一逻辑单重复登记残量（首报已登记「目标−首报量」，重报再缩
+        # 会重复计入队列 → 累计目标大于信号目标）。
+        if getattr(order, "_requote", False):
+            return
         if not getattr(portfolio, "volume_limit_enabled", False):
             return
-        ratio = getattr(portfolio, "volume_limit_ratio", None)
-        if not ratio or ratio <= 0:
+        daily_ratio = getattr(portfolio, "volume_limit_ratio", None)
+        minute_ratio = getattr(portfolio, "minute_volume_limit_ratio", None)
+        if minute_ratio is None:
+            minute_ratio = Decimal("0.10")
+        target = int(order.quantity)
+        if target <= 0:
             return
-        bar_vol = self._volume_cap_shares(order.stock_code)
-        if not bar_vol or bar_vol <= 0:
+        trade_date = (order.bar_time.date() if order.bar_time
+                      else now_shanghai().date())
+        daily_ref = self._daily_reference_volume(order.stock_code, trade_date)
+        bar = self._latest_bar_snapshot(order.stock_code)
+        bar_vol: Optional[int] = None
+        if bar is not None:
+            try:
+                bar_vol = int(bar.get("volume") or 0) * 100
+            except (TypeError, ValueError):
+                bar_vol = None
+
+        caps: List[Tuple[str, int]] = []
+        if daily_ratio and daily_ratio > 0 and daily_ref:
+            caps.append(("daily", int(Decimal(str(daily_ratio)) * Decimal(int(daily_ref)))))
+        minute_ratio_f = Decimal(str(minute_ratio or 0))
+        if minute_ratio_f > 0 and bar_vol and bar_vol > 0:
+            caps.append(("minute", int(minute_ratio_f * Decimal(int(bar_vol)))))
+        if not caps:
+            self._rec_live(
+                "volume_cap", "fail_open", portfolio, order,
+                requested_qty=target, final_qty=target,
+                message="成交量约束无可用基准（近5日均量=%s，1m bar 量=%s），放行不缩量"
+                        % (daily_ref, bar_vol),
+            )
             return
-        cap_shares = int(ratio * Decimal(int(bar_vol)))
-        if order.quantity <= cap_shares:
+
+        cap_shares = min(c for _, c in caps)
+        if not bar_vol:
+            # 盘前兜底显式化：无 1m bar 时按日线口径放行并留痕（放行/缩量都记，
+            # 可事后追溯「这根单的分钟闸门未生效、只用了日线基准」）。
+            self._rec_live(
+                "volume_cap", "daily_fallback", portfolio, order,
+                requested_qty=target, final_qty=min(target, cap_shares),
+                message="盘前无已完成 1m bar：按日线口径放行（近5日均量 %s 股 ×%s = %d 股）"
+                        % (daily_ref, daily_ratio, cap_shares),
+            )
+        if target <= cap_shares:
             return
         lot = self._engine._lot(order.stock_code)
         is_buy = order.trade_type.value == "BUY"
-        final_qty = (cap_shares // lot) * lot if is_buy else cap_shares
-        if final_qty >= lot or (not is_buy and final_qty > 0):
-            self._rec_live(
-                "volume_cap_shrink", "shrink", portfolio, order,
-                message="成交量约束：订单 %d 股 > 本 bar 上限 %d 股（成交 %d 手 ×%s），缩量至 %d 股"
-                        % (order.quantity, cap_shares, bar_vol, ratio, final_qty),
-            )
-            order.quantity = final_qty
-        elif is_buy:
+        submit_qty = (cap_shares // lot) * lot if is_buy else cap_shares
+        if is_buy and submit_qty < lot:
+            submit_qty = 0
+        residual = target - submit_qty
+        if residual > 0:
+            self._register_volume_residual(portfolio, order, residual)
+        if submit_qty <= 0:
             order._volume_capped_out = True
             self._rec_live(
-                "volume_cap", "block", portfolio, order,
-                message="成交量约束：请求 %d 股，本 bar 上限 %d 股不足一手（成交 %d 手 ×%s），BUY 拒单待重试"
-                        % (order.quantity, cap_shares, bar_vol, ratio),
+                "volume_cap", "queue", portfolio, order,
+                requested_qty=target, final_qty=0,
+                message="成交量约束：本次可提交 0 股（上限 %d 股不足一手），"
+                        "整单 %d 股转当日补单队列" % (cap_shares, target),
             )
+            return
+        order.quantity = submit_qty
+        self._rec_live(
+            "volume_cap_shrink", "shrink", portfolio, order,
+            requested_qty=target, final_qty=submit_qty,
+            message="成交量约束：请求 %d 股 > 上限 %d 股（%s），本次提交 %d 股，"
+                    "残量 %d 股转当日补单队列"
+                    % (target, cap_shares,
+                       "，".join("%s %d" % (k, c) for k, c in caps),
+                       submit_qty, residual),
+        )
+
+    # ---- 成交量残量补单队列（2026-11-19，当日有效）----------------------
+
+    def _register_volume_residual(self, portfolio: Portfolio, order: OrderEvent,
+                                  residual_qty: int) -> None:
+        """把闸门缩掉的差额注册进当日补单队列（不再直接丢弃）。
+
+        队列只跟踪「未提交的残量」：首笔已提交部分由 live_orders 正常回填，
+        不在这里重复记账；同一逻辑单同时最多 1 个在途 chunk。
+        """
+        if residual_qty <= 0:
+            return
+        now = now_shanghai()
+        expire_at = self._volume_residual_expire_at(now)
+        if expire_at is None or now >= expire_at:
+            self._rec_live(
+                "volume_residual", "abandon", portfolio, order,
+                requested_qty=int(residual_qty), final_qty=0,
+                message="残量 %d 股未入队：已过当日顺延截止（%s）"
+                        % (residual_qty, expire_at),
+            )
+            return
+        key = "vr-%s-%s-%s-%s-%s" % (
+            self.session_id, portfolio.portfolio_id, order.strategy_id,
+            order.stock_code, uuid4().hex[:8],
+        )
+        template = replace(order)
+        template.quantity = int(residual_qty)
+        template.signal_bar_date = None  # 残量当日续发，不再按跨日 deferred
+        # 目标量留 0：每个 chunk 提交时按自身数量重新登记（达成率按 chunk 记账；
+        # 队列整体目标见本队列的 volume_residual 决策事件）。
+        template.target_quantity = 0
+        self._volume_residuals[key] = {
+            "portfolio": portfolio,
+            "template": template,
+            "period": getattr(order, "period", None),
+            "target_qty": int(residual_qty),
+            "filled_qty": 0,
+            "pending_qty": 0,
+            "inflight": None,
+            "attempts": 0,
+            "ref_price": Decimal(str(order.price)) if order.price else None,
+            "expire_at": expire_at,
+            "last_bar_key": self._bar_key_from_time(order.bar_time),
+            "signal_name": getattr(order, "signal_name", ""),
+            "signal_bar_time": order.bar_time,
+            "approved": bool(getattr(order, "_approval_passed", False)),
+        }
+        self._rec_live(
+            "volume_residual", "enqueue", portfolio, order,
+            requested_qty=int(residual_qty), final_qty=0,
+            message="残量 %d 股入当日补单队列（截止 %s，参考价 %s）"
+                    % (residual_qty, expire_at.strftime("%H:%M"), order.price),
+        )
+
+    def _volume_residual_expire_at(self, now: datetime) -> Optional[datetime]:
+        """当日残量顺延截止：收盘前 5 分钟（14:55）。"""
+        try:
+            return now.replace(hour=14, minute=55, second=0, microsecond=0)
+        except (TypeError, ValueError):
+            return None
+
+    def _bar_key_from_time(self, dt: Optional[datetime]) -> Optional[str]:
+        return dt.strftime("%Y%m%d%H%M%S") if dt else None
+
+    def _bar_time_from_key(self, key: Optional[str]) -> Optional[datetime]:
+        if not key:
+            return None
+        for fmt in ("%Y%m%d%H%M%S", "%Y%m%d%H%M"):
+            try:
+                return datetime.strptime(key, fmt)
+            except ValueError:
+                continue
+        return None
+
+    def _latest_bar_key(self, code: str) -> Optional[str]:
+        bar = self._latest_bar_snapshot(code)
+        if not bar:
+            return None
+        value = bar.get("stime") or bar.get("bar_time")
+        return str(value) if value else None
+
+    def _tick_volume_residuals(self) -> None:
+        """推进全部残量队列（deals 循环末尾、持 _book_lock 调用）。
+
+        节拍：每根新完成的 1m bar 最多发一次（同一 bar 不重复），等价于
+        「每根新 1m bar 重算可下单量」；deals 5s 轮询只负责终态推进。
+        """
+        if not self._volume_residuals:
+            return
+        db = self._db_session_factory()
+        try:
+            first_port: Optional[Portfolio] = None
+            for key in list(self._volume_residuals.keys()):
+                entry = self._volume_residuals.get(key)
+                if entry is None:
+                    continue
+                if first_port is None:
+                    first_port = entry.get("portfolio")
+                try:
+                    self._advance_volume_residual(db, key, entry)
+                except Exception:
+                    # 单条队列异常不得吃掉整个 deals 轮次（成交/持仓回填优先）；
+                    # 回滚本队列的写入，下一轮重试。
+                    db.rollback()
+                    logger.exception("残量补单队列推进失败 key=%s", key)
+            self._drain_decisions(db, first_port)
+        finally:
+            db.close()
+
+    def _advance_volume_residual(self, db: Session, key: str, entry: dict) -> None:
+        """推进单个残量队列：终态结算 / 放弃判定 / 新 bar 续发。"""
+        portfolio = entry.get("portfolio")
+        template: Optional[OrderEvent] = entry.get("template")
+        if portfolio is None or template is None:
+            self._volume_residuals.pop(key, None)
+            return
+        now = now_shanghai()
+        expire_at = entry.get("expire_at")
+        if expire_at is None or now >= expire_at:
+            self._finish_volume_residual(
+                db, key, entry, "ttl", "到达当日顺延截止（14:55）")
+            return
+        code = template.stock_code
+        bar_key = self._latest_bar_key(code)
+        if not bar_key:
+            return  # 盘前/停牌：无已完成 1m bar，等待（TTL 兜底）
+        inflight: Optional[OrderEvent] = entry.get("inflight")
+        if inflight is not None:
+            row = self._find_volume_chunk_row(db, key)
+            if row is None:
+                # 提交未落库（审批/资金/前置闸门拦截）：只在「新 bar」记一次失败，
+                # 5s tick 不重复计数（否则 100s 就误判为无进展）。
+                entry["inflight"] = None
+                entry["pending_qty"] = 0
+                if bar_key != entry.get("last_bar_key"):
+                    entry["attempts"] = int(entry.get("attempts") or 0) + 1
+                    entry["last_bar_key"] = bar_key
+                if entry["attempts"] >= self.volume_residual_max_attempts:
+                    self._finish_volume_residual(
+                        db, key, entry, "max_attempts", "累计提交未受理达上限")
+                return
+            # 非终态（submitted/partial/deferred…）一律等待：宁可等到 TTL 放弃，
+            # 也不能在同一队列上重复提交（deferred 行会在后续 bar 由原语义释放）。
+            if row.status not in ("filled", "canceled", "rejected"):
+                entry["last_bar_key"] = bar_key  # 在途，等终态
+                return
+            chunk_qty = int(inflight.quantity or 0)
+            entry["pending_qty"] = max(
+                0, int(entry.get("pending_qty") or 0) - chunk_qty)
+            entry["filled_qty"] = int(entry.get("filled_qty") or 0) + int(
+                row.filled_quantity or 0)
+            entry["inflight"] = None
+            if row.status == "canceled":
+                self._finish_volume_residual(
+                    db, key, entry, "canceled",
+                    "在途补单被撤单（人工/超时），不覆盖撤单意图")
+                return
+            if row.status == "rejected":
+                if bar_key != entry.get("last_bar_key"):
+                    entry["attempts"] = int(entry.get("attempts") or 0) + 1
+                    entry["last_bar_key"] = bar_key
+                if entry["attempts"] >= self.volume_residual_max_attempts:
+                    self._finish_volume_residual(
+                        db, key, entry, "max_attempts", "补单连续被拒达上限")
+                return
+            if int(entry["filled_qty"]) >= int(entry["target_qty"]):
+                self._finish_volume_residual(
+                    db, key, entry, "complete", "残量已全部成交")
+                return
+        # 同一根 1m bar 只发一次：终态结算可能就在本 bar 内完成，也不能立刻再发。
+        if bar_key == entry.get("last_bar_key"):
+            return
+
+        # 放弃条件 2：价格偏离原始参考价超阈值（防追高/杀跌变成另一种成本）
+        bar = self._latest_bar_snapshot(code)
+        ref_price = entry.get("ref_price")
+        cur_price: Optional[Decimal] = None
+        if bar is not None:
+            try:
+                cur_price = Decimal(str(bar.get("close")))
+            except (ArithmeticError, TypeError, ValueError):
+                cur_price = None
+        if ref_price and cur_price and ref_price > 0:
+            dev = abs(float(cur_price) / float(ref_price) - 1.0)
+            if dev > self.volume_residual_max_dev_pct:
+                self._finish_volume_residual(
+                    db, key, entry, "price_deviation",
+                    "价格偏离参考价 %.2f%% > %.2f%%，放弃剩余"
+                    % (dev * 100, self.volume_residual_max_dev_pct * 100))
+                return
+
+        remain = (int(entry["target_qty"]) - int(entry.get("filled_qty") or 0)
+                  - int(entry.get("pending_qty") or 0))
+        if remain <= 0:
+            self._finish_volume_residual(
+                db, key, entry, "complete", "残量已全部成交")
+            return
+        # 按与首笔完全相同的两层口径重算本次可下量（单笔口径，与回测一致：
+        # 每次提交 ≤ 日线基准 × ratio，不按日内累计扣减）。
+        allowed = remain
+        daily_ratio = getattr(portfolio, "volume_limit_ratio", None)
+        daily_ref = self._daily_reference_volume(code, now.date())
+        if daily_ratio and daily_ratio > 0 and daily_ref:
+            daily_cap = int(Decimal(str(daily_ratio)) * Decimal(int(daily_ref)))
+            allowed = min(allowed, daily_cap)
+        minute_ratio = getattr(portfolio, "minute_volume_limit_ratio", None)
+        if minute_ratio is None:
+            minute_ratio = Decimal("0.10")
+        bar_vol = 0
+        if bar is not None:
+            try:
+                bar_vol = int(bar.get("volume") or 0) * 100
+            except (TypeError, ValueError):
+                bar_vol = 0
+        if Decimal(str(minute_ratio or 0)) > 0 and bar_vol > 0:
+            minute_cap = int(Decimal(str(minute_ratio)) * Decimal(int(bar_vol)))
+            allowed = min(allowed, minute_cap)
+        is_buy = template.trade_type.value == "BUY"
+        lot = self._engine._lot(code)
+        if is_buy:
+            allowed = (allowed // lot) * lot
+        if allowed <= 0:
+            entry["last_bar_key"] = bar_key
+            entry["attempts"] = int(entry.get("attempts") or 0) + 1
+            if entry["attempts"] >= self.volume_residual_max_attempts:
+                self._finish_volume_residual(
+                    db, key, entry, "no_progress", "连续多根 bar 可下量为 0")
+            return
+        chunk = replace(template)
+        chunk.quantity = int(allowed)
+        chunk.bar_time = self._bar_time_from_key(bar_key) or now
+        chunk.signal_bar_date = None
+        # 达成率口径：本 chunk 的目标量就是它自己的提交量（整笔逻辑单的目标量在
+        # 首报行 orig_quantity 上，残量队列整体目标见 volume_residual 决策事件）。
+        chunk.target_quantity = int(allowed)
+        setattr(chunk, "_volume_residual_chunk", True)
+        setattr(chunk, "_volume_residual_key", key)
+        # 分组键 = 队列 key：落库后按 split_group 精确定位本 chunk 行（不依赖
+        # bar_time，避免与同一根 bar 上策略正常信号单混淆）。
+        setattr(chunk, "_split_group", key)
+        if entry.get("approved"):
+            setattr(chunk, "_approval_passed", True)
+        entry["inflight"] = chunk
+        entry["pending_qty"] = int(entry.get("pending_qty") or 0) + int(allowed)
+        entry["last_bar_key"] = bar_key
+        entry["attempts"] = int(entry.get("attempts") or 0) + 1
+        self._submit_one_order(
+            db, portfolio, chunk, entry.get("period"), emit_signal=False)
+        if self._find_volume_chunk_row(db, key) is None:
+            # 未受理：回滚 pending，下一根 bar 重试（attempts 已计数）
+            entry["inflight"] = None
+            entry["pending_qty"] = max(
+                0, int(entry.get("pending_qty") or 0) - int(allowed))
+
+    def _find_volume_chunk_row(self, db: Session, key: str) -> Optional[LiveOrder]:
+        """残量 chunk 落库行（split_group=队列 key），终态也要能查到。"""
+        return (
+            db.query(LiveOrder)
+            .filter(
+                LiveOrder.live_session_id == self.session_id,
+                LiveOrder.split_group == key,
+            )
+            .order_by(LiveOrder.id.desc())
+            .first()
+        )
+
+    def _finish_volume_residual(self, db: Session, key: str, entry: dict,
+                                reason: str, text: str) -> None:
+        """残量队列收尾：完成/放弃均落一条可追溯决策事件，然后清队。"""
+        portfolio = entry.get("portfolio")
+        template = entry.get("template")
+        target = int(entry.get("target_qty") or 0)
+        filled = int(entry.get("filled_qty") or 0)
+        action = "complete" if reason == "complete" else "abandon"
+        if portfolio is not None and template is not None:
+            self._rec_live(
+                "volume_residual", action, portfolio, template,
+                requested_qty=target, final_qty=filled,
+                message="残量补单%s：残量目标 %d 股，累计成交 %d 股（%.1f%%），原因：%s"
+                        % ("完成" if reason == "complete" else "放弃",
+                           target, filled,
+                           (filled / target * 100.0) if target else 0.0,
+                           text),
+            )
+        if reason != "complete":
+            logger.warning(
+                "volume residual abandoned (session %s) key=%s: %s, target=%d filled=%d",
+                self.session_id, key, reason, target, filled)
+        self._volume_residuals.pop(key, None)
 
     def _intraday_reconcile_diffs(self, db: Session, positions: list) -> list:
         """盘中对账差异集：(code, 虚拟聚合量, 真实量)，仅差异项。
@@ -6062,6 +6482,10 @@ class LiveEngine:
         盘前单（已按 bias% 让价）一律不动。
         """
         if not getattr(ctx, "requote_enabled", False):
+            return
+        # 残量顺延 chunk 已在 `_advance_volume_residual` 里按最新价重算过提交价，
+        # 不再叠加 1 跳让价（否则同一逻辑单每补一次就多偏 1 跳）。
+        if getattr(order, "_volume_residual_chunk", False):
             return
         if getattr(order, "_requote", False):
             return
@@ -9471,6 +9895,10 @@ class LiveEngine:
         ctx = portfolio.find_strategy(order.strategy_id)
         if ctx is None:
             return
+        # 达成率埋点（2026-11-19）：首次进入提交链的数量即「信号目标股数」。
+        # 此后任何闸门/拆单/残量 chunk 都保留该值不覆盖；落库到 orig_quantity。
+        if not int(getattr(order, "target_quantity", 0) or 0):
+            order.target_quantity = int(order.quantity)
         # 每单价型覆盖（P4）：deferred 放行按单下发 limit，未显式传参时取订单上
         # 的标记（None = 通道按配置默认，盘中单不受影响）。
         if price_type is None:
@@ -10228,7 +10656,10 @@ class LiveEngine:
             # 独立冻结资金，顺序提交不等成交会超预算——成交结算后子单审批现金才对）。
             # 资格判定在原单落库前——原单不落库，子单 1 带同 bar_time 落库，
             # 重启重驱同一信号由 D6 去重挡住，不会重复下单。
-            if self._maybe_split_order(db, portfolio, order, ctx, period):
+            # 残量顺延 chunk 是「同一逻辑单的补量」，已由闸门算过量；跳过拆单，
+            # 避免残量 chunk 再被拆成子单队列（两套队列互相等待 → 死锁式停滞）。
+            if (not getattr(order, "_volume_residual_chunk", False)
+                    and self._maybe_split_order(db, portfolio, order, ctx, period)):
                 return None
             # ① 先写 submitted + commit（I4 命门窗口闭合）；计入在途集合（G7 计数）
             # 放行的 deferred 单：删除 B-1 时落库的 deferred 旧行（防同一逻辑单双行）
@@ -10246,8 +10677,11 @@ class LiveEngine:
             live_order = self._persist_order_submitted(db, order)
             # 持久幂等标记与订单行**同事务**落库：唯一索引兜底并发（应用层先查后写
             # 在多线程下会漏）。冲突 = 同一根 bar 已被处理 → 回滚本单，绝不发桥。
-            # 追价重下不写标记（同一张单的加价重报，原单标记已在）。
-            if not getattr(order, "_requote", False):
+            # 追价重下不写标记（同一张单的加价重报，原单标记已在）；残量 chunk
+            # 不是信号重放（去重由残量队列「同 bar 只发一次」保证），不占信号标记，
+            # 避免与同一根 bar 的策略正常信号单撞唯一索引而互相压制。
+            if not (getattr(order, "_requote", False)
+                    or getattr(order, "_volume_residual_chunk", False)):
                 bar_mark_key = self._bar_mark_key(order)
                 bar_mark_ok = self._mark_bar_processed(db, order)
                 if not bar_mark_ok:
@@ -11188,8 +11622,13 @@ class LiveEngine:
     def _rec_live(
         self, gate: str, action: str, portfolio: Portfolio, order: OrderEvent,
         message: Optional[str] = None, bar_time: Optional[datetime] = None,
+        requested_qty: Optional[int] = None, final_qty: Optional[int] = None,
+        param_name: Optional[str] = None, param_value: Optional[float] = None,
     ) -> None:
-        """记录一条实盘专属闸门事件（收盘/日历/去重/在途/桥拒单）。"""
+        """记录一条实盘专属闸门事件（收盘/日历/去重/在途/桥拒单/成交量）。
+
+        requested_qty/final_qty 用于达成率与缩量幅度统计（与回测同字段口径）。
+        """
         self._recorder.record(
             gate=gate, layer="live_gate", action=action,
             portfolio_id=portfolio.portfolio_id,
@@ -11197,6 +11636,10 @@ class LiveEngine:
             stock_code=order.stock_code,
             bar_time=bar_time or order.bar_time,
             message=message,
+            requested_qty=requested_qty,
+            final_qty=final_qty,
+            param_name=param_name,
+            param_value=param_value,
         )
 
     def _drain_decisions(self, db, portfolio: Portfolio) -> None:

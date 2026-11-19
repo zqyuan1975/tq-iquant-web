@@ -237,6 +237,12 @@ _MIN_TRADE_PRICE = Decimal("0.01")
 # 收盘的「停牌/上市前」补行整行剔除，不参与成交/估值/日快照。写入 params_snapshot，
 # 旧结果（含假 bar）不与新结果混比。
 NO_TRADE_BAR_POLICY = "drop_volume0_carryforward_v1"
+# 成交量闸门流动性口径版本（2026-11-19）：旧口径 same_day_bar = 成交当根 bar 的
+# Volume × ratio（含当日未来信息，日线回测里等价于「当日全天量」）；新口径
+# prev5d_avg = 成交日之前 5 个有效交易日日均量 × ratio（严格不含当日、无前视，
+# 与实盘 _daily_reference_volume 同口径）。改口径会改变缩量后的成交量与收益，
+# 旧记录（缺该键）一律按 same_day_bar 解释，禁止与新结果混看。
+LIQUIDITY_CALIBER_VERSION = "prev5d_avg"
 # N1 多组合回测口径版本：共用「资金审批内核」（cash_allocator，80% 门槛、不做等比
 # 缩量），各组合虚拟现金独立、不跨组合划转。分配语义一变必须改版本号并判废旧结果。
 MULTI_PORTFOLIO_VERSION = "shared_cash_allocator_v1"
@@ -955,6 +961,9 @@ def build_params_snapshot(ps, dividend_mode: str = "front",
     # 两者都会改变历史回测的成本/成交结果，旧快照缺这两项即不可与新结果混比。
     payload["no_trade_bar_policy"] = NO_TRADE_BAR_POLICY
     payload["stamp_duty_segments"] = STAMP_DUTY_SEGMENTS_VERSION
+    # 成交量闸门流动性口径（2026-11-19）：新记录写 prev5d_avg；旧记录缺该键
+    # 即 same_day_bar（成交当根 bar 量），详情页据此显示口径标记、禁止混看。
+    payload["liquidity_caliber"] = LIQUIDITY_CALIBER_VERSION
     # 费用阈值币种口径（2026-11-16 B3，已知限制）：min_commission（最低 5 元）/
     # max_order_amount / equity_cap 都以「元」为单位，而成交额 = 价格×数量；back/
     # dual 模式下记账价是**后复权价**，长区间可把价格放大数倍 → 按缩放后的金额
@@ -3976,6 +3985,10 @@ def get_record_detail(
         # 层 1 容量模型版本：老记录缺键即 v1（4% 闸门/固定单笔上限口径）
         "capacity_model_version": (
             (_snapshot_data or {}).get("capacity_model_version") or "v1"),
+        # 流动性口径：老记录缺键即 same_day_bar（当日当根 bar 量，含未来信息），
+        # 新记录 prev5d_avg（前 5 日均量，无前视）。详情页据此打口径标记。
+        "liquidity_caliber": (
+            (_snapshot_data or {}).get("liquidity_caliber") or "same_day_bar"),
         "snapshots": [_serialize_snapshot(s) for s in snaps],
         "trades": [_serialize_trade_with_name(t, strat_name_map) for t in trades],
         "evaluations": evals_dict,
@@ -5310,6 +5323,8 @@ def run_multi_backtest(db: Session, portfolios: list, req) -> dict:
             # 虚拟现金独立、不跨组合划转；算法语义一变必须改版本号。
             "multi_portfolio": True,
             "multi_portfolio_version": MULTI_PORTFOLIO_VERSION,
+            # 流动性口径（2026-11-19）：组内各记录同口径，缺键=旧口径 same_day_bar。
+            "liquidity_caliber": LIQUIDITY_CALIBER_VERSION,
         }, ensure_ascii=False, sort_keys=True),
     )
     db.add(group)

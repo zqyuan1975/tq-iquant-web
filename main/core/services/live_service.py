@@ -5801,6 +5801,10 @@ def serialize_order(o: LiveOrder) -> dict:
         "order_type": o.order_type,
         "price": float(o.price) if o.price is not None else None,
         "quantity": o.quantity,
+        # 达成率埋点（2026-11-19）：信号目标股数（闸门/切片前）与累计成交股数。
+        # 旧行为 NULL 时回落 quantity（旧行按「提交量=目标量」解释）。
+        "orig_quantity": (o.orig_quantity if o.orig_quantity is not None
+                          else o.quantity),
         "filled_quantity": o.filled_quantity,
         "filled_price": float(o.filled_price) if o.filled_price is not None else None,
         "status": o.status,

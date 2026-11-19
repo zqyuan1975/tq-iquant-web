@@ -205,11 +205,15 @@ class Portfolio:
         self.risk_cooldown_days: int = 1
         # {(strategy_id, code): 最近一次风控卖出成交日}，由 note_trade 登记
         self._risk_cooldown: Dict[tuple, date] = {}
-        # #2 成交量/流动性约束（可选，默认关）：单 bar 成交量 × volume_limit_ratio
-        # 为成交股数上限（TDX Volume 单位=手，×100 转股数）。超限缩量成交，
-        # 不足一手延后重试。同样仅回测成交步生效。
+        # #2 成交量/流动性约束（可选，默认关）：
+        # - volume_limit_ratio 为「日线流动性目标」：单笔 ≤ 前 5 个交易日日均量
+        #   （股）× 本比例。回测与实盘统一口径，且严格只用 t 日之前的数据（无前视）。
+        # - minute_volume_limit_ratio 为「实盘单次可下单量」：单次提交 ≤ 最近完成
+        #   1m bar 量 × 本比例。仅实盘消费；回测无分钟执行，不读该字段。
+        # 缩量后的残量由实盘补单队列按后续 bar 续发；回测按 bar 顺延/残量切片。
         self.volume_limit_enabled: bool = False
         self.volume_limit_ratio: Decimal = Decimal("0.10")
+        self.minute_volume_limit_ratio: Decimal = Decimal("0.10")
         # #4 自适应滑点（可选，默认关）：开启后回测成交步按订单量占当根 bar
         # 成交量比例动态加冲击成本（由 BacktestEngine 构造 dispatcher 时透传
         # bar_volumes + 系数）。类默认 False，直接构造 Portfolio 的引擎单测

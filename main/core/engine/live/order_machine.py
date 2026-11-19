@@ -320,6 +320,11 @@ class OrderStateMachine:
             order_type="limit",
             price=order.price,
             quantity=order.quantity,
+            # 达成率埋点（2026-11-19）：本笔逻辑单的信号目标股数（闸门/切片前），
+            # 与 filled_quantity（累计成交）同口径对照回测「目标 vs 成交」。
+            # target_quantity=0（回测/旧路径/未捕获）时回落为本次提交量。
+            orig_quantity=(int(getattr(order, "target_quantity", 0) or 0)
+                           or order.quantity),
             filled_quantity=0,
             filled_price=None,
             status=status,

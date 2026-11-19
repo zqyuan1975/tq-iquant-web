@@ -1163,18 +1163,26 @@ def test_volume_cap_shrinks_buy_order():
     assert order.quantity == 3000
 
 
-def test_volume_cap_rejects_buy_below_one_lot():
-    """上限不足一手 → BUY 拒单（下一信号重试，对齐回测延后语义的实盘化）。"""
+def test_volume_cap_rejects_buy_below_one_lot(monkeypatch):
+    """分钟层上限不足一手 → BUY 缩量为 0（残量进当日补单队列，待后续 bar 续发）。"""
+    from core.engine import live_engine as live_mod
+    monkeypatch.setattr(live_mod, "now_shanghai",
+                        lambda: datetime(2026, 11, 19, 10, 0))
     port, ctx = _portfolio_single()
     port.volume_limit_enabled = True
     from decimal import Decimal as D
-    port.volume_limit_ratio = D("0.0005")     # 300 手×100×0.0005=15 股 < 100
+    port.volume_limit_ratio = D("0.0005")
+    # 2026-11-19 拆参后：单次可下单量由分钟层单独控制（默认 0.10）
+    port.minute_volume_limit_ratio = D("0.0005")  # 300 手×100×0.0005=15 股 < 100
     disp = _AcctDispatcher()
     engine, synth = _engine_with_synth_volume(port, disp, 300)
     order = _order(D("10"))
     order.quantity = 500
     engine._apply_volume_cap(order, port)
     assert getattr(order, "_volume_capped_out", False) is True
+    # 缩掉的差额全部进当日队列，不再直接丢弃
+    assert engine._volume_residuals
+    assert next(iter(engine._volume_residuals.values()))["target_qty"] == 500
 
 
 def test_volume_cap_sell_shrinks_without_lot_floor():

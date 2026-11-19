@@ -1346,10 +1346,12 @@ def _volume_portfolio(enabled=True, ratio=Decimal("0.1")):
 
 
 def test_volume_limit_shrinks_buy_to_participation_cap():
-    """开启成交量约束：订单量 > ratio×bar 成交量 → 缩量至整手上限成交。
+    """开启成交量约束：订单量 > ratio×前 5 日均量 → 缩量至整手上限成交。
 
+    口径（2026-11-19 与实盘统一）：成交日之前 5 个有效交易日日均成交量 × ratio，
+    严格不含成交当日（无前视）。
     bar1(7/29) 触发 OPEN：策略资金 60000 × 0.1 / 10 = 600 股；
-    bar2(7/30) Volume=5000 股 → 上限 int(0.1×5000)=500 股 < 600 → 缩量成交 500 股。
+    bar2(7/30) 的基准 = 7/29 全天量 1000 股 → 上限 int(0.1×1000)=100 股 < 600 → 成交 100 股。
     """
     stock = "000001.SZ"
     klines = _klines(stock, [
@@ -1362,7 +1364,7 @@ def test_volume_limit_shrinks_buy_to_participation_cap():
 
     trades = result["trades"]
     assert len(trades) == 1
-    assert trades[0].quantity == 500
+    assert trades[0].quantity == 100
     events = [d for d in result["decisions"] if d["gate"] == "volume_cap_shrink"]
     assert len(events) == 1
     assert events[0]["action"] == "shrink" and events[0]["stock_code"] == stock
@@ -1371,12 +1373,13 @@ def test_volume_limit_shrinks_buy_to_participation_cap():
 def test_volume_limit_shrinks_buy_to_whole_lot():
     """上限非整手时按手向下取整成交（A 股买入必须整手）。
 
-    bar2 Volume=1500 股 → 上限 int(0.1×1500)=150 股；买入缩量须取整到 100 股，
-    否则会成交 150 股，留下非整手持仓（后续卖出按手校验会卡死）。
+    7/29 全天量 1000 股 → 7/30 基准 int(0.1×1000)=100 股（本身即整手，验证取整链路）；
+    若基准给出非整手（如 150），买入也必须向下取整到 100 股，否则会留下非整手持仓
+    （后续卖出按手校验会卡死）。
     """
     stock = "000001.SZ"
     klines = _klines(stock, [
-        (datetime(2026, 7, 29), Decimal("10"), Decimal("10.3"), Decimal("9.9"), Decimal("10"), 1000),
+        (datetime(2026, 7, 29), Decimal("10"), Decimal("10.3"), Decimal("9.9"), Decimal("10"), 1500),
         (datetime(2026, 7, 30), Decimal("10"), Decimal("10.3"), Decimal("9.9"), Decimal("10.1"), 1500),
     ])
     port, ctx = _volume_portfolio(enabled=True)
@@ -1395,12 +1398,13 @@ def test_volume_limit_shrinks_buy_to_whole_lot():
 def test_volume_limit_defers_when_cap_below_one_lot():
     """上限不足一手 → 延后至量足 bar 成交（每订单仅首次记 1 条 defer 事件）。
 
-    bar2(7/30) Volume=5 股 → 上限 0 股 <100 股 → 延后；bar3(7/31) 量足 → 成交 600 股。
+    口径：基准 = 成交日之前的日均量。7/29 量 5 股 → 7/30 上限 0 股 < 100 股 → 延后；
+    7/30 放量 20000 → 7/31 基准 (5+20000)/2≈10002 → 上限 1000 ≥ 600 → 成交 600 股。
     """
     stock = "000001.SZ"
     klines = _klines(stock, [
-        (datetime(2026, 7, 29), Decimal("10"), Decimal("10.3"), Decimal("9.9"), Decimal("10"), 1000),
-        (datetime(2026, 7, 30), Decimal("10"), Decimal("10.3"), Decimal("9.9"), Decimal("10.1"), 5),
+        (datetime(2026, 7, 29), Decimal("10"), Decimal("10.3"), Decimal("9.9"), Decimal("10"), 5),
+        (datetime(2026, 7, 30), Decimal("10"), Decimal("10.3"), Decimal("9.9"), Decimal("10.1"), 20000),
         (datetime(2026, 7, 31), Decimal("10"), Decimal("10.3"), Decimal("9.9"), Decimal("10.1"), 10000),
     ])
     port, ctx = _volume_portfolio(enabled=True)
@@ -2189,32 +2193,41 @@ def test_risk_sell_shrink_carries_residual_without_retrigger():
 
     对齐实盘 inflight_sell：同一 (策略, 代码, SELL) 未结清（含缩量残量）时，
     不再重复产生 trigger 事件与新订单，残量挂在原单上于后续 bar 继续成交。
+    口径（2026-11-19）：上限 = 成交日之前日均量 × 10%（无前视），故前两日提供
+    历史量；7/29 跌破移动止损线触发，7/29–7/31 逐日缩量成交直至清仓。
     """
     stock = "000001.SZ"
     klines = _klines(stock, [
-        (datetime(2026, 7, 29), Decimal("10"), Decimal("10"), Decimal("10"), Decimal("10"), 100000),
-        (datetime(2026, 7, 30), Decimal("10"), Decimal("10"), Decimal("10"), Decimal("10"), 31140),
-        (datetime(2026, 7, 31), Decimal("10"), Decimal("10"), Decimal("10"), Decimal("10"), 44520),
-        (datetime(2026, 8, 1), Decimal("10"), Decimal("10"), Decimal("10"), Decimal("10"), 2340),
+        # 触发前的历史量（价格 40 = 种子最高价，不触发移动止损/止盈）
+        (datetime(2026, 7, 27), Decimal("40"), Decimal("40"), Decimal("40"), Decimal("40"), 31140),
+        (datetime(2026, 7, 28), Decimal("40"), Decimal("40"), Decimal("40"), Decimal("40"), 31140),
+        # 7/29 跌到 38（-5% = 阈值）→ 触发移动止损；基准 = 前两日均量 31140 → 上限 3114
+        (datetime(2026, 7, 29), Decimal("38"), Decimal("38"), Decimal("38"), Decimal("38"), 31140),
+        (datetime(2026, 7, 30), Decimal("38"), Decimal("38"), Decimal("38"), Decimal("38"), 44520),
+        (datetime(2026, 7, 31), Decimal("38"), Decimal("38"), Decimal("38"), Decimal("38"), 2340),
+        # 8/1 收尾：基准 = 前 5 日均量 28056 → 上限 2805 ≥ 剩余 1238 → 清仓
+        (datetime(2026, 8, 1), Decimal("38"), Decimal("38"), Decimal("38"), Decimal("38"), 2340),
     ])
     port, ctx = _portfolio_with_strategy(stop_loss=Decimal("0.9"),
                                          trailing=Decimal("0.05"))
     port.volume_limit_enabled = True
     port.volume_limit_ratio = Decimal("0.10")
-    _seed_trailing_position(ctx, stock, 7800)
-    port.account.cash = Decimal("22000")  # 市值 78000 + 现金 22000 = 100000
+    # 成本=最高价=40：价格持平不触发止损/止盈，7/29 跌破 5% 才触发移动止损
+    _seed_trailing_position(ctx, stock, 7800, cost="40", high="40")
+    port.account.cash = Decimal("22000")
 
     result = BacktestEngine().run(port, klines=klines, signal_cache={})
 
     sells = [t for t in result["trades"] if t.trade_type == TradeType.SELL]
-    assert [int(t.quantity) for t in sells] == [3114, 4452, 234]
+    # 7/30: 7800→3114（基准 31140）；7/31: 4686→3448（基准 34485）；8/1: 1238 清仓
+    assert [int(t.quantity) for t in sells] == [3114, 3448, 1238]
     assert ctx.positions[stock].quantity == 0
 
     triggers = [d for d in result["decisions"]
                 if d.get("gate") == "trailing_stop" and d.get("action") == "trigger"]
     assert len(triggers) == 1
     carries = [d for d in result["decisions"] if d.get("gate") == "risk_sell_residual"]
-    assert [int(d["requested_qty"]) for d in carries] == [4686, 234]
+    assert [int(d["requested_qty"]) for d in carries] == [4686, 1238]
     assert sells[0].signal_type == SignalType.TRAILING_STOP
     assert all(t.signal_type == SignalType.TRAILING_STOP for t in sells)
     # 统计口径：triggered（真实触发次数）与 fill_attempts（缩量分批成交次数）
@@ -2329,6 +2342,54 @@ def test_build_prev_close_by_day_mixed_period_prefers_latest_timestamp():
     table = build_prev_close_by_day(klines)
     # 7/30 的前收取 7/29 最晚时间戳（5m 15:00 的 10.9），不是日线的 10.1
     assert table[(code, date(2026, 7, 30))] == Decimal("10.9")
+
+
+def test_build_volume_ref_by_day_uses_prev_days_only_no_lookahead():
+    """成交量基准 = 成交日之前 5 个有效交易日日均量，**绝不含当日**。
+
+    旧口径直接用成交当根 bar 的 Volume（日线即当日全天量），属于未来信息；
+    新口径与实盘 `_daily_reference_volume` 统一为 prev5d_avg。
+    """
+    from core.engine.backtest_engine import build_volume_ref_by_day
+    code = "600000.SH"
+    days = [date(2026, 7, 27) + timedelta(days=i) for i in range(6)]
+    daily = pl.DataFrame({
+        "datetime": [datetime(d.year, d.month, d.day) for d in days],
+        # 最后一天 9,000 是当日巨量：若被计入分母即为前视
+        "Volume": [100, 200, 300, 400, 500, 9000],
+    })
+    table = build_volume_ref_by_day({code: {"1d": daily}})
+
+    assert (code, days[0]) not in table          # 首日无历史
+    assert table[(code, days[1])] == 100         # 不足 5 日按已有天数均值
+    assert table[(code, days[5])] == 300         # (100+200+300+400+500)/5，不含 9000
+
+
+def test_build_volume_ref_by_day_falls_back_to_intraday_sum():
+    """无日线时用最细分钟周期按日累加（不重复计多周期）。"""
+    from core.engine.backtest_engine import build_volume_ref_by_day
+    code = "000001.SZ"
+    five_min = pl.DataFrame({
+        "datetime": [datetime(2026, 7, 29, 9, 35),
+                     datetime(2026, 7, 29, 9, 40),
+                     datetime(2026, 7, 30, 9, 35)],
+        "Volume": [100, 150, 9999],
+    })
+    table = build_volume_ref_by_day({code: {"5m": five_min}})
+    # 7/30 的基准 = 7/29 全天累加 250，不含 7/30 的 9999
+    assert table[(code, date(2026, 7, 30))] == 250
+
+
+def test_build_volume_ref_by_day_weekly_only_gives_no_key():
+    """纯周线无法还原日量 → 不给键（调用方 fail-open），不猜当日量。"""
+    from core.engine.backtest_engine import build_volume_ref_by_day
+    code = "000001.SZ"
+    weekly = pl.DataFrame({
+        "datetime": [datetime(2026, 7, 27), datetime(2026, 8, 3)],
+        "Volume": [700, 800],
+    })
+    table = build_volume_ref_by_day({code: {"1w": weekly}})
+    assert not table
 
 
 def _weekday_dates(start: date, n: int):

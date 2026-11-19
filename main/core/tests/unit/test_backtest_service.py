@@ -1974,6 +1974,8 @@ _SNAPSHOT_KEYS = {
     "corporate_actions",
     # 时点股票池（J7）+ 执行档位（N1，2026-11-18）：未启用/legacy 时同样写块
     "pool_timeline", "execution",
+    # 流动性口径（2026-11-19）：prev5d_avg=前 5 日均量（无前视）；旧记录缺键=same_day_bar
+    "liquidity_caliber",
     # 回测/实盘桥复权口径冻结（J3，21c011d）：始终写块，含版本与 aligned_with_live
     "price_caliber",
 }
