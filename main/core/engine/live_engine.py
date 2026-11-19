@@ -82,6 +82,7 @@ from .bar_poller import (
 # 0010 后续迁入 live 子包；旧路径 core.engine.trading_calendar 保留 re-export shim。
 from .live.calendar import TradingCalendar
 from .live.snapshot_bars import SnapshotBarSynthesizer
+from .live.tq_minute_probe import TqMinuteProbe, DEFAULT_INTERVAL_SECONDS as _TQ_PROBE_INTERVAL
 # 时间/周期/数值工具归 live 协作者子包（core.engine.live.timing，0010 步骤 0）；
 # re-export 其中被测试直接 import 的符号（now_shanghai/periods_on_boundary/_CST），
 # 保持 core.engine.live_engine 命名空间可见。
@@ -920,6 +921,11 @@ class LiveEngine:
         self._ext_daily_dedup = bool(external_signal_daily_dedup)
         self._signal_task: Optional[asyncio.Task] = None
         self._signal_executor: Optional[ThreadPoolExecutor] = None
+        # TQ 盘中 1m 主备探测（只留痕，不切换数据源）：仅快照合成通道启动。
+        # 独立单 worker 池 + 独立循环，不参与 BarPoller/Dispatcher 装配。
+        self._tq_probe: Optional[TqMinuteProbe] = None
+        self._tq_probe_task: Optional[asyncio.Task] = None
+        self._tq_probe_executor: Optional[ThreadPoolExecutor] = None
         # _handle_bar 串行化锁：源未启用时完全不取（默认路径零变化）；启用后主
         # 循环 bar 与信号线程注入互斥，组合账本/信号评估不并发。锁序恒为
         # _handle_bar_lock → _book_lock（deals 池只取 _book_lock，无反向）。
@@ -1568,6 +1574,22 @@ class LiveEngine:
         self._signal_executor = ThreadPoolExecutor(
             max_workers=1, thread_name_prefix="live-signal"
         )
+        # TQ 盘中 1m 主备探测（0011 后续）：只在快照合成通道启动——周期性读 TQ 1m
+        # 最新时间戳并留痕（[tq-1m-probe]），不切换数据源、不影响信号与下单。
+        if self._tq_probe_executor is not None:
+            try:
+                self._tq_probe_executor.shutdown(wait=False)
+            except Exception:  # noqa: BLE001
+                pass
+        if self._snapshot_synth is not None:
+            self._tq_probe_executor = ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="live-tqprobe"
+            )
+            self._tq_probe = TqMinuteProbe(
+                self.session_id, self._tq_probe_codes,
+                interval_seconds=_TQ_PROBE_INTERVAL,
+            )
+            self._tq_probe_task = asyncio.create_task(self._tq_probe_loop())
         # I-6（audit）：启动一次性同步重活（通达信 1w/1mon 注入 + 全量预热拉取）
         # 经 executor 执行——事件循环不被 TDX 计算/桥拉取阻塞（SSE/HTTP 保持响应）。
         # await 等其完成再起循环，时序语义与原同步内联一致。
@@ -1798,6 +1820,16 @@ class LiveEngine:
             except Exception:  # noqa: BLE001
                 logger.exception("signal loop task ended with error on stop")
             self._signal_task = None
+        if self._tq_probe_task is not None:
+            self._tq_probe_task.cancel()
+            try:
+                await self._tq_probe_task
+            except asyncio.CancelledError:
+                pass
+            except Exception:  # noqa: BLE001
+                logger.exception("tq 1m probe loop task ended with error on stop")
+            self._tq_probe_task = None
+        self._tq_probe = None
         # I-3（终审）：置闸后、close 前对在途真实单 best-effort 撤单。此刻两循环任务
         # 已 cancel，在途 tick 排在主单 worker 池里先跑完，本步经同一池串行执行——
         # 读到的 _pending_orders 不再被并发修改。撤单走 worker 线程（SDK/HTTP 同步调），
@@ -1915,6 +1947,8 @@ class LiveEngine:
             self._deals_executor.shutdown(wait=False)
         if self._signal_executor is not None:
             self._signal_executor.shutdown(wait=False)
+        if self._tq_probe_executor is not None:
+            self._tq_probe_executor.shutdown(wait=False)
         logger.info(
             "engine.stop done: session=%s %s（两循环已停止，快照/成交回填不再写入）",
             self.session_id, process_tag())
@@ -1955,6 +1989,39 @@ class LiveEngine:
                     # （0.01s 级）不额外减速，保持原「连续轮」语义
                     delay = min(1.0, interval) if interval >= 10 else 0.0
             await asyncio.sleep(delay)
+
+    # ---------------- TQ 盘中 1m 主备探测（只留痕，不切换）----------------
+
+    def _tq_probe_codes(self) -> List[str]:
+        """探测样本：当前行情池（只读快照，不改池）。"""
+        return list(getattr(self._bar_poller, "stock_codes", None) or [])
+
+    def _tq_probe_once(self) -> None:
+        """同步执行一轮探测（在独立单 worker 池里跑，TQ 阻塞不占事件循环）。"""
+        probe = self._tq_probe
+        if probe is None:
+            return
+        try:
+            probe.tick()
+        except Exception:  # noqa: BLE001 —— 探测失败绝不影响实盘主链路
+            logger.debug("tq-1m-probe tick failed (session %s)", self.session_id, exc_info=True)
+
+    async def _tq_probe_loop(self) -> None:
+        """周期性探测 TQ 1m 最新时间戳并留痕；不切换数据源、不参与信号。"""
+        # 首轮延后一个间隔：避开启动预热（1w/1mon 注入 + 全量拉取）的 TDX 锁竞争。
+        while self._running:
+            await asyncio.sleep(float(_TQ_PROBE_INTERVAL))
+            if not self._running:
+                break
+            try:
+                await asyncio.get_running_loop().run_in_executor(
+                    self._tq_probe_executor, self._tq_probe_once
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001
+                logger.exception("tq 1m probe loop error (session %s)", self.session_id)
+            await asyncio.sleep(float(_TQ_PROBE_INTERVAL))
 
     # ---------------- 行情轮询窗口（收盘后停拉行情）----------------
     def _quote_window_open(self, now: datetime) -> bool:
