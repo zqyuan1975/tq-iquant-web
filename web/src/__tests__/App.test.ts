@@ -24,10 +24,10 @@ vi.mock('../api', () => ({
 
 import App from '../App.vue'
 
-const KEYS = ['dashboard', 'pools', 'formula', 'portfolio', 'backtest', 'live', 'system', 'sun', 'moon', 'search']
+const KEYS = ['dashboard', 'pools', 'formula', 'portfolio', 'backtest', 'live', 'health', 'system', 'sun', 'moon', 'search']
 
 describe('icons.ts', () => {
-  it('导出 10 个图标 key，值均为合法 path d 字符串', () => {
+  it('导出 11 个图标 key，值均为合法 path d 字符串', () => {
     expect(Object.keys(ICONS).sort()).toEqual([...KEYS].sort())
     for (const k of KEYS) {
       expect(typeof ICONS[k]).toBe('string')
@@ -49,11 +49,11 @@ describe('App.vue — 图标渲染', () => {
     localStorage.clear()
   })
 
-  it('侧边栏 9 个导航项各渲染一个内联 SVG 图标（非 Emoji 文本节点）', async () => {
+  it('侧边栏 12 个导航项各渲染一个内联 SVG 图标（非 Emoji 文本节点）', async () => {
     const w = mount(App)
     await flushPromises()
     const items = w.findAll('.sidebar-nav .nav-item')
-    expect(items).toHaveLength(9)
+    expect(items).toHaveLength(12)
     items.forEach((it) => {
       const svg = it.find('svg.icon')
       expect(svg.exists()).toBe(true)
