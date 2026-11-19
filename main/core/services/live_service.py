@@ -1662,6 +1662,29 @@ def next_start_seq(session_id: int) -> int:
     return seq
 
 
+
+def mark_session_started(session: LiveSession, *,
+                         caller: str = "api.start_session") -> int:
+    """启动成功后的统一落库前处理：running + started_at + 清上一轮 stopped_at。
+
+    返回本进程内启动序号。启动序号只进日志（不新增列）：跨进程的代际以
+    ``started_at`` 判定（见 ``engine_watchdog._orphan_evidence``）。
+    """
+    seq = next_start_seq(int(session.id))
+    changed = set_session_status(
+        session, "running", caller=caller,
+        reason="启动成功（本进程内第 %d 次，清空上一轮 stopped_at）" % seq)
+    session.started_at = datetime.now()
+    session.stopped_at = None
+    if not changed:
+        # 已是 running（重复启动/状态未落库）：状态未变化也要留一条启动痕迹
+        logger.warning(
+            "实盘会话启动 #%s「%s」: 本进程内第 %d 次（调用方=%s，%s）",
+            session.id, getattr(session, "name", ""), seq, caller,
+            process_tag())
+    return seq
+
+
 def recover_stale_running_live_sessions(
     db: Session, engines: Optional[Dict[int, LiveEngine]] = None,
 ) -> int:
