@@ -387,6 +387,15 @@ def _defaults() -> dict:
                 "today_ttl_seconds": 300,
             },
         },
+        # 资金池（docs/plans/0019 / 0020 / 0021）：四个开关默认全关。
+        # 关闭时额度推导器不计算、不落库、不影响任何既有回测/实盘结果；
+        # A 阶段只提供纯计算（A4 的只读接口与 UI 另行接入）。
+        "capital_pool": {
+            "enabled": False,
+            "pairing_enabled": False,
+            "loan_model_enabled": False,
+            "cash_outlet_enabled": False,
+        },
     }
 
 
