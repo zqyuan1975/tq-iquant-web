@@ -175,8 +175,8 @@ def _nav_chart(snapshots: List[dict]) -> Optional[Tuple[str, dict]]:
             {"type": "value", "scale": True, "gridIndex": 0, "name": "策略净值",
              "nameLocation": "middle", "nameRotate": 90, "nameGap": 54,
              "nameTextStyle": {"fontSize": 12}},
-            # 网格1 的左轴：回撤（%）
-            {"type": "value", "gridIndex": 1, "max": 0,
+            # 网格1 的左轴：回撤（%）；子图只有 16% 高度，刻度限 3 段避免文字叠成一团
+            {"type": "value", "gridIndex": 1, "max": 0, "splitNumber": 3,
              "axisLabel": {"formatter": "{value}%"}},
             # 右轴：基准净值（独立刻度，避免与策略净值量级不同被压平）
             {"type": "value", "scale": True, "gridIndex": 0, "position": "right",
@@ -237,8 +237,10 @@ def _industry_chart(ia: dict) -> Optional[Tuple[str, dict]]:
     })
     option = {
         "tooltip": {"trigger": "axis"},
-        "legend": {"bottom": 0, "type": "scroll"},
-        "grid": {"left": 24, "right": 20, "bottom": 44, "top": 24, "containLabel": True},
+        # 图例平铺换行（不用 scroll）：打印/PDF 里翻页箭头不可点，会丢掉一半行业
+        "legend": {"bottom": 0, "type": "plain", "itemGap": 8,
+                   "textStyle": {"fontSize": 10}, "width": "96%"},
+        "grid": {"left": 24, "right": 20, "bottom": 96, "top": 24, "containLabel": True},
         "xAxis": {"type": "category", "data": exp.get("dates", []),
                   "boundaryGap": False, "axisLabel": {"formatter": "__DATEFMT__"}},
         # 竖排居中，避免「仓位(%)」在左上角与 100% 刻度重叠
@@ -524,7 +526,8 @@ def _ca_multi_chart(d: dict) -> Optional[Tuple[str, dict]]:
         return None
     option = {
         "tooltip": {"trigger": "axis", "axisPointer": {"type": "shadow"}},
-        "grid": {"left": 24, "right": 24, "top": 24, "bottom": 40, "containLabel": True},
+        # left 需让出竖排轴名（nameGap 46）：containLabel 只兜轴刻度，不兜轴名
+        "grid": {"left": 56, "right": 24, "top": 24, "bottom": 40, "containLabel": True},
         "xAxis": {"type": "category",
                   "data": [r["name"] + ("（主）" if r.get("is_main") else "") for r in rows]},
         # 竖排居中：默认 'end' 会把「危机Alpha占比」挤在左上角被裁切
@@ -546,7 +549,8 @@ def _ca_annual_bar(d: dict) -> Optional[Tuple[str, dict]]:
         return None
     option = {
         "tooltip": {"trigger": "axis", "axisPointer": {"type": "shadow"}},
-        "grid": {"left": 24, "right": 24, "top": 24, "bottom": 40, "containLabel": True},
+        # left 需让出竖排轴名（nameGap 42），否则打印时左侧轴名被画布裁掉
+        "grid": {"left": 56, "right": 24, "top": 24, "bottom": 40, "containLabel": True},
         "xAxis": {"type": "category",
                   "data": [f"{r['年份']}{'*' if not r.get('完整') else ''}" for r in rows]},
         # 竖排居中，避免「危机Alpha」轴名与顶部刻度重叠
@@ -975,7 +979,7 @@ def _industry_block(d: dict, charts: List[Tuple[str, dict]]) -> str:
     chart = _industry_chart(ia)
     if chart:
         charts.append(chart)
-        out += _chart("chart-ia", 300)
+        out += _chart("chart-ia", 360)
     unmapped = ia.get("unmapped_codes") or []
     if unmapped:
         out += f'<p class="note">未匹配行业（计入未分类）：{esc("、".join(unmapped))}</p>'
@@ -1383,7 +1387,7 @@ def _box_chart(rb: dict, key: str, name: str) -> Optional[Tuple[str, dict]]:
                 "最小值：{c1}%"
             ),
         },
-        "grid": {"left": 24, "right": 24, "top": 30, "bottom": 30, "containLabel": True},
+        "grid": {"left": 56, "right": 24, "top": 30, "bottom": 30, "containLabel": True},
         "xAxis": {"type": "category", "data": categories},
         # 竖排居中：默认 'end' 会把「日收益率(%)」等轴名挤到左上角被裁切
         "yAxis": {"type": "value", "name": f"{name}收益率(%)",
@@ -1454,7 +1458,7 @@ def _annual_bar_chart(rb: dict) -> Optional[Tuple[str, dict]]:
         return None
     option = {
         "tooltip": {"trigger": "axis", "axisPointer": {"type": "shadow"}},
-        "grid": {"left": 24, "right": 24, "top": 30, "bottom": 30, "containLabel": True},
+        "grid": {"left": 56, "right": 24, "top": 30, "bottom": 30, "containLabel": True},
         "xAxis": {"type": "category", "data": [str(y.get("year")) for y in yearly]},
         # 竖排居中，避免「年收益(%)」与顶部刻度挤在一起
         "yAxis": {"type": "value", "name": "年收益(%)",
@@ -1478,8 +1482,9 @@ def _persistence_rolling_chart(d: dict) -> Optional[Tuple[str, dict]]:
 
     return "chart-p-rolling", {
         "tooltip": {"trigger": "axis"},
-        "legend": {"itemGap": 20, "textStyle": {"fontSize": 12}},
-        "grid": {"left": 70, "right": 24, "bottom": 46, "top": 46},
+        "legend": {"bottom": 0, "itemGap": 20, "textStyle": {"fontSize": 12}},
+        # bottom 46→72：底部图例独占一行，避免窄版式（A4 正文宽）压住日期刻度
+        "grid": {"left": 70, "right": 24, "bottom": 72, "top": 46},
         "xAxis": {"type": "category", "data": dates,
                   "axisLabel": {"formatter": "__DATEFMT__", "fontSize": 11}},
         # 竖排居中：默认 'end' 会把「滚动年化(%)」挤在左上角被裁切
@@ -1859,7 +1864,70 @@ details{margin:8px 0}summary{cursor:pointer;font-size:13px;color:#4b5563}
 .scroll-tbl{max-height:520px;overflow:auto}
 .gate-code{color:#9ca3af;font-size:10px;margin-left:4px}
 pre.json-dump{background:#0f172a;color:#e2e8f0;border-radius:6px;padding:12px;font-size:11px;line-height:1.5;max-height:480px;overflow:auto;white-space:pre-wrap;word-break:break-all}
+
+/* ===== 打印版式（A4）：仅作用于 @media print，不影响屏幕预览 ===== */
+@media print{
+  html,body{background:#fff}
+  body{font-size:10pt;line-height:1.5;color:#111827;
+       -webkit-print-color-adjust:exact;print-color-adjust:exact}
+  .wrap{max-width:none;margin:0;padding:0}
+  h1{font-size:18pt;line-height:1.3;margin:0 0 8pt;padding-bottom:6pt;
+     border-bottom:1.5pt solid #4a7ec4;break-after:avoid}
+  h2{font-size:13pt;line-height:1.35;margin:0 0 8pt;padding-left:8pt;
+     border-left:3pt solid #4a7ec4;break-after:avoid}
+  h3{font-size:10.5pt;line-height:1.4;margin:8pt 0 4pt;break-after:avoid}
+  /* 章节强制分页：封面（标题/概览/净值图）之后每章新起一页 */
+  section{background:none;border:0;border-radius:0;padding:0;margin:0;
+          break-inside:auto;break-before:page}
+  section:first-of-type{break-before:auto}
+  .meta{font-size:9pt;line-height:1.7;margin:0 0 8pt}
+  .gen{font-size:8pt}
+  .kpi-grid{grid-template-columns:repeat(3,1fr);gap:6pt;margin:6pt 0 10pt;
+            break-inside:avoid}
+  .kpi{padding:6pt 8pt}
+  .kpi-label{font-size:8pt}.kpi-value{font-size:13pt}.kpi-sub{font-size:7.5pt}
+  /* 表格：正文宽度内自适应换行，禁止横向溢出；跨页重复表头，行不拆断 */
+  table{font-size:8.5pt;margin:4pt 0 8pt;width:100%;table-layout:auto}
+  th,td{padding:3pt 4pt;white-space:normal;overflow-wrap:break-word}
+  th{background:#f3f4f6!important;color:#374151}
+  thead{display:table-header-group;break-after:avoid}
+  tfoot{display:table-footer-group}
+  tr{break-inside:avoid}
+  /* 屏幕上的滚动容器在打印时展开，避免只打出可视区（成交明细被截断） */
+  .scroll-tbl{max-height:none;overflow:visible}
+  .chart-box{overflow:visible;break-inside:avoid}
+  .chart{min-width:0;width:100%;margin:4pt 0}
+  /* ECharts 画布按屏幕宽度初始化，打印时等比缩进正文宽度，不横向溢出 */
+  .chart canvas{max-width:100%!important;height:auto!important}
+  .spb,.empty,details{break-inside:avoid}
+  .spb ul{font-size:9pt}
+  .note{font-size:8pt;margin:4pt 0;break-before:avoid}
+  pre.json-dump{max-height:none;overflow:visible}
+}
 """
+
+
+def _css_string(value: Any) -> str:
+    """把任意文本转成可安全放进 CSS 字符串（@page 页眉/页脚）的形式。"""
+    text = " ".join(str(value or "").split())
+    return text.replace("\\", "\\\\").replace('"', '\\"')
+
+
+def _print_page_css(rec: dict) -> str:
+    """按报告生成 A4 页面规则：纸张/页边距 + 页眉（报告名）+ 页脚（页码）。
+
+    Chromium(≥131) 支持 @page 外边距盒，由 PDF 打印时直接渲染页眉页脚；
+    旧版浏览器不支持时静默忽略，不影响正文排版。
+    """
+    name = _css_string(rec.get("name")) or "未命名"
+    return (
+        "@page{size:A4 portrait;margin:16mm 14mm 16mm 14mm;"
+        '@top-left{content:"回测分析报告";font-size:8pt;color:#6b7280}'
+        f'@top-right{{content:"{name}";font-size:8pt;color:#6b7280}}'
+        '@bottom-right{content:"第 " counter(page) " 页 / 共 " '
+        'counter(pages) " 页";font-size:8pt;color:#6b7280}'
+        "}"
+    )
 
 
 def build_html_report(detail: dict) -> str:
@@ -1894,17 +1962,26 @@ var __INSTANCES__ = [];
 document.querySelectorAll('.chart').forEach(function(el){
   var opt = __CHARTS__[el.id];
   if(!opt) return;
+  // 离线报告是静态快照：关闭入场动画，避免打印瞬间截到画到一半的图表
+  opt.animation = false;
   [opt.xAxis].flat().forEach(function(ax){
     if(ax && ax.axisLabel && ax.axisLabel.formatter === '__DATEFMT__'){
       ax.axisLabel.formatter = __datefmt;
     }
   });
-  var ch = echarts.init(el, null, {renderer:'canvas'});
+  var ch = echarts.init(el, null, {renderer:'canvas', devicePixelRatio: 2});
   ch.setOption(opt);
   __INSTANCES__.push(ch);
 });
 // 窗口尺寸变化/缩放后重算布局，避免 canvas 停在初始化时的宽度导致文字挤压
 window.addEventListener('resize', function(){
+  __INSTANCES__.forEach(function(ch){ ch.resize(); });
+});
+// 打印/导出 PDF 前后按版式宽度重排一次，保证 canvas 不被拉伸模糊
+window.addEventListener('beforeprint', function(){
+  __INSTANCES__.forEach(function(ch){ ch.resize(); });
+});
+window.addEventListener('afterprint', function(){
   __INSTANCES__.forEach(function(ch){ ch.resize(); });
 });
 </script>
@@ -1914,7 +1991,7 @@ window.addEventListener('resize', function(){
         "<!DOCTYPE html>\n<html lang=\"zh-CN\"><head><meta charset=\"utf-8\">"
         '<meta name="viewport" content="width=device-width,initial-scale=1">'
         f"<title>回测分析报告 - {esc(rec.get('name'))}</title>"
-        f"<style>{_CSS}</style></head><body><div class=\"wrap\">"
+        f"<style>{_CSS}{_print_page_css(rec)}</style></head><body><div class=\"wrap\">"
         f"<h1>回测分析报告：{esc(rec.get('name'))}</h1>"
         f"<script>{_echarts_source()}</script>"
         f"{body}{boot}</div></body></html>"
