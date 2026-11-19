@@ -1685,13 +1685,14 @@ def recompute_validation(db: Session, record_id: int) -> Optional[dict]:
     evaluations = {}
     if ev_row is not None and ev_row.max_single_weight is not None:
         evaluations = {"max_single_weight": float(ev_row.max_single_weight)}
-    capacity = build_capacity_warnings(
+    capacity_profile = build_capacity_profile(
         [], None, evaluations,
         getattr(ps, "position_sizing", "dynamic"),
         getattr(ps, "equity_cap", None),
         snapshots=snaps,
         exposure_ceiling=_exposure_ceiling_for_ps(db, ps.id),
     )
+    capacity = _format_capacity_warnings(capacity_profile)
     crisis = build_crisis_verification([
         {"snap_date": s.snap_date, "total_value": s.total_value,
          "cash": s.cash, "benchmark_value": s.benchmark_value}
@@ -1713,10 +1714,16 @@ def recompute_validation(db: Session, record_id: int) -> Optional[dict]:
             "overall_pass": (json.loads(wf.summary_json or "{}")
                              .get("overall_pass")),
         }
-    payload = {"capacity": capacity, "crisis": crisis, "oos": oos}
+    payload = {
+        "capacity": capacity,
+        "capacity_metrics": capacity_profile,
+        "crisis": crisis,
+        "oos": oos,
+    }
     rec.validation_json = json.dumps(payload, ensure_ascii=False, default=str)
     db.commit()
-    return {"status": "ok", "capacity": capacity, "crisis": crisis, "oos": oos}
+    return {"status": "ok", "capacity": capacity, "capacity_metrics": capacity_profile,
+            "crisis": crisis, "oos": oos}
 
 
 # ---------------------------------------------------------------------------
@@ -3872,6 +3879,30 @@ def get_record_detail(
     # 样本外引用刷新：冻结快照可能早于后来补跑的 walk-forward
     _refresh_oos_from_latest_wf(db, record_payload)
 
+    cost_capacity = build_cost_capacity(
+        snaps, trades, _compare_scalar_params(rec.params_snapshot))
+    if cost_capacity is not None:
+        # 容量结构：优先用回测完成时冻结的结构化指标（含 ADV）；老记录缺该块
+        # 时按落库快照/评估/当前策略配置重算（ADV 依赖 K 线，显示为空）。
+        frozen_capacity = (
+            (record_payload.get("validation") or {}).get("capacity_metrics")
+        )
+        if frozen_capacity:
+            cost_capacity["capacity"]["structure"] = frozen_capacity
+        else:
+            ps = db.get(PortfolioStrategy, rec.portfolio_strategy_id)
+            evaluations = {}
+            if evals is not None and evals.max_single_weight is not None:
+                evaluations = {"max_single_weight": float(evals.max_single_weight)}
+            cost_capacity["capacity"]["structure"] = build_capacity_profile(
+                [], None, evaluations,
+                getattr(ps, "position_sizing", "dynamic") if ps else "dynamic",
+                getattr(ps, "equity_cap", None) if ps else None,
+                snapshots=snaps,
+                exposure_ceiling=(
+                    _exposure_ceiling_for_ps(db, ps.id) if ps else None),
+            )
+
     return {
         "record": record_payload,
         "snapshots": [_serialize_snapshot(s) for s in snaps],
@@ -3889,8 +3920,7 @@ def get_record_detail(
         "persistence": persistence,
         "acceptance": acceptance,
         # K5 成本与容量：按 trades+snapshots 现算，不改落库结构
-        "cost_capacity": build_cost_capacity(
-            snaps, trades, _compare_scalar_params(rec.params_snapshot)),
+        "cost_capacity": cost_capacity,
     }
 
 
@@ -4142,7 +4172,7 @@ def build_validation_verdict(result: dict, klines: dict, ps, db: Session) -> dic
     snapshots = result.get("snapshots") or []
     trades = result.get("trades") or []
     ceiling = _exposure_ceiling_for_ps(db, ps.id) if db is not None else None
-    warnings = build_capacity_warnings(
+    capacity_profile = build_capacity_profile(
         trades, klines,
         result.get("evaluations") or {},
         getattr(ps, "position_sizing", "dynamic"),
@@ -4150,6 +4180,7 @@ def build_validation_verdict(result: dict, klines: dict, ps, db: Session) -> dic
         snapshots=snapshots,
         exposure_ceiling=ceiling,
     )
+    warnings = _format_capacity_warnings(capacity_profile)
     crisis = build_crisis_verification(snapshots)
     oos: Optional[dict] = None
     if db is not None:
@@ -4170,6 +4201,7 @@ def build_validation_verdict(result: dict, klines: dict, ps, db: Session) -> dic
             }
     return {
         "capacity": warnings,
+        "capacity_metrics": capacity_profile,
         "crisis": crisis,
         "oos": oos,
     }
@@ -4198,32 +4230,32 @@ def _exposure_ceiling_for_ps(db: Session, ps_id: int) -> Optional[Decimal]:
     return total if found else None
 
 
-def build_capacity_warnings(
+def build_capacity_profile(
     trades: list,
-    klines: dict,
+    klines: Optional[dict],
     evaluations: Optional[dict] = None,
     position_sizing: str = "dynamic",
     equity_cap=None,
     snapshots: Optional[list] = None,
     exposure_ceiling=None,
-) -> list:
-    """容量健康度告警（自动）：即使未设 equity_cap，也在结果里明确提示
-    "该结果是否含不可实现仓位"。
+) -> dict:
+    """容量健康结构化画像（验证结论与成本与容量共用同一口径）。
 
-    - 单笔成交 vs 该股日均成交额（ADV = mean(Volume_股×Close)，从 klines 估算）：
-      最大占比 ≥ 30% → 该笔实盘按回测价成交不现实；
-    - 最大单票权重 max_single_weight > 25% → 集中度/权重随涨幅过度膨胀；
-    - 敞口上限（snapshots + exposure_ceiling 均传入时）：Σ(持仓数上限×单仓上限)
-      < 期末净值 50% → 仓位上限已结构性约束策略弹性，附近端/全期利用率对照；
-    - dynamic 且未设 equity_cap 时命中任一 → 附设置容量上限/成交量约束的建议。
+    原先 build_capacity_warnings 只产出文案，前端无法把关键数值前置。
+    这里把同一套判定拆成可展示指标 + 建议，文案层仍由
+    build_capacity_warnings 从本结构格式化，保证既有文字/HTML 报告不变。
 
-    仅在有成交且可估算 ADV 时生效；无数据静默跳过（不误报）。
+    返回键：
+    - adv：最大单笔成交 vs 该股日均成交额（klines 缺失时为 None）
+    - concentration：最大单票权重
+    - exposure：敞口上限 vs 期末净值 + 近端/全期仓位利用率
+    - advice：结构化建议（raise_exposure / equity_cap）
     """
-    warns: list = []
-    # 1. 每股日均成交额（元）。TQ 单位已实测确认：Volume=股、Amount=万元。
-    #    故优先用 量(股)×价(元) 直接得元口径；Amount(万元)×10000 兜底。
-    adv_by_code: Dict[str, float] = {}
-    if trades:
+    adv = None
+    # 每股日均成交额（元）。TQ 单位已实测确认：Volume=股、Amount=万元。
+    # 故优先用 量(股)×价(元) 直接得元口径；Amount(万元)×10000 兜底。
+    if trades and klines:
+        adv_by_code: Dict[str, float] = {}
         for code, periods in (klines or {}).items():
             df = periods.get("1d") if isinstance(periods, dict) else None
             if df is None:
@@ -4247,34 +4279,38 @@ def build_capacity_warnings(
                             if a is not None and float(a) > 0]
             if day_amts:
                 adv_by_code[code] = sum(day_amts) / len(day_amts)
-        # 2. 最大单笔成交 vs ADV 占比
         worst = None  # (amount, code, adv, ratio)
         for t in trades:
             code = getattr(t, "stock_code", None)
-            adv = adv_by_code.get(code)
-            if not adv or adv <= 0:
+            adv_value = adv_by_code.get(code)
+            if not adv_value or adv_value <= 0:
                 continue
             amt = float(getattr(t, "amount", 0) or 0)
             if amt <= 0:
                 continue
-            ratio = amt / adv
+            ratio = amt / adv_value
             if worst is None or ratio > worst[3]:
-                worst = (amt, code, adv, ratio)
-        if worst is not None and worst[3] >= _CAP_PARTICIPATION_WARN:
-            amt, code, adv, ratio = worst
-            warns.append(
-                f"容量预警：最大单笔成交 {_fmt_yuan(amt)}（{code}）≈ 该股日均成交额 "
-                f"{_fmt_yuan(adv)}的 {ratio:.0%}（≥30%）。回测按无限流动性成交，"
-                f"实盘按此价成交不现实，该结果可能含不可实现仓位"
-            )
-    # 3. 最大单票权重
+                worst = (amt, code, adv_value, ratio)
+        if worst is not None:
+            amt, code, adv_value, ratio = worst
+            adv = {
+                "stock_code": code,
+                "amount": amt,
+                "adv": adv_value,
+                "ratio": ratio,
+                "threshold": _CAP_PARTICIPATION_WARN,
+                "hit": ratio >= _CAP_PARTICIPATION_WARN,
+            }
+
     msw = (evaluations or {}).get("max_single_weight")
-    if msw is not None and float(msw) > _CAP_MAX_WEIGHT_WARN:
-        warns.append(
-            f"集中度预警：最大单票权重 {float(msw):.1%} 超过 {_CAP_MAX_WEIGHT_WARN:.0%}，"
-            f"组合过度集中于单只股票（仓位随涨幅膨胀）"
-        )
-    # 4. 敞口上限 vs 净值规模：上限 < 期末净值 50% → 已结构性限制仓位部署
+    msw_f = float(msw) if msw is not None else None
+    concentration = {
+        "max_single_weight": msw_f,
+        "threshold": _CAP_MAX_WEIGHT_WARN,
+        "hit": msw_f is not None and msw_f > _CAP_MAX_WEIGHT_WARN,
+    }
+
+    exposure = None
     if exposure_ceiling and snapshots:
         utils: list = []
         final_tv = Decimal("0")
@@ -4288,28 +4324,113 @@ def build_capacity_warnings(
             utils.append(Decimal(str(mv)) / tv_d if mv else Decimal("0"))
         if final_tv > 0:
             cap_ratio = float(exposure_ceiling) / float(final_tv)
-            if cap_ratio < _CAP_CEILING_RATIO_WARN:
-                whole = float(sum(utils) / len(utils)) if utils else 0.0
-                recent_n = min(len(utils), _CAP_RECENT_UTIL_DAYS)
-                recent = (
-                    float(sum(utils[-recent_n:]) / recent_n) if recent_n else 0.0
-                )
-                warns.append(
-                    f"敞口上限预警：策略敞口上限（Σ 持仓数上限×单仓上限）"
-                    f"{_fmt_yuan(float(exposure_ceiling))}，仅为期末净值 "
-                    f"{_fmt_yuan(float(final_tv))} 的 {cap_ratio:.0%}"
-                    f"（<{_CAP_CEILING_RATIO_WARN:.0%}），"
-                    f"近 {_CAP_RECENT_UTIL_DAYS} 日平均仓位利用率 "
-                    f"{recent:.1%}（全期 {whole:.1%}）——仓位上限已开始约束策略弹性；"
-                    f"资金规模扩大前建议上调 max_order_amount/持仓数并重测容量"
-                )
-    # 5. 修复建议
-    if warns and position_sizing == "dynamic" and not equity_cap:
+            whole = float(sum(utils) / len(utils)) if utils else 0.0
+            recent_n = min(len(utils), _CAP_RECENT_UTIL_DAYS)
+            recent = (
+                float(sum(utils[-recent_n:]) / recent_n) if recent_n else 0.0
+            )
+            exposure = {
+                "ceiling": float(exposure_ceiling),
+                "final_equity": float(final_tv),
+                "ratio": cap_ratio,
+                "threshold": _CAP_CEILING_RATIO_WARN,
+                "recent_days": _CAP_RECENT_UTIL_DAYS,
+                "recent_utilization": recent,
+                "whole_utilization": whole,
+                "hit": cap_ratio < _CAP_CEILING_RATIO_WARN,
+            }
+
+    advice: list = []
+    if exposure is not None and exposure["hit"]:
+        advice.append({
+            "key": "raise_exposure",
+            "text": "资金规模扩大前建议上调 max_order_amount/持仓数并重测容量",
+        })
+    any_hit = bool(
+        (adv is not None and adv["hit"])
+        or concentration["hit"]
+        or (exposure is not None and exposure["hit"])
+    )
+    if any_hit and position_sizing == "dynamic" and not equity_cap:
+        advice.append({
+            "key": "equity_cap",
+            "text": (
+                "为组合设置 equity_cap（容量上限，仓位封顶）或开启 "
+                "volume_limit 成交量约束，让仓位落在真实可成交规模；"
+                "否则本结果仅作上界参考"
+            ),
+        })
+    return {
+        "adv": adv,
+        "concentration": concentration,
+        "exposure": exposure,
+        "advice": advice,
+    }
+
+
+def _format_capacity_warnings(profile: dict) -> list:
+    """把结构化容量画像格式化为既有告警文案（文本逐字保持不变）。"""
+    warns: list = []
+    adv = profile.get("adv")
+    if adv is not None and adv.get("hit"):
         warns.append(
-            "容量建议：为组合设置 equity_cap（容量上限，仓位封顶）或开启 "
-            "volume_limit 成交量约束，让仓位落在真实可成交规模；否则本结果仅作上界参考"
+            f"容量预警：最大单笔成交 {_fmt_yuan(adv['amount'])}（{adv['stock_code']}）≈ 该股日均成交额 "
+            f"{_fmt_yuan(adv['adv'])}的 {adv['ratio']:.0%}（≥30%）。回测按无限流动性成交，"
+            f"实盘按此价成交不现实，该结果可能含不可实现仓位"
         )
+    concentration = profile.get("concentration") or {}
+    if concentration.get("hit"):
+        warns.append(
+            f"集中度预警：最大单票权重 {concentration['max_single_weight']:.1%} 超过 "
+            f"{concentration['threshold']:.0%}，组合过度集中于单只股票（仓位随涨幅膨胀）"
+        )
+    exposure = profile.get("exposure")
+    if exposure is not None and exposure.get("hit"):
+        raise_text = next(
+            (a["text"] for a in profile.get("advice") or []
+             if a.get("key") == "raise_exposure"),
+            "资金规模扩大前建议上调 max_order_amount/持仓数并重测容量",
+        )
+        warns.append(
+            f"敞口上限预警：策略敞口上限（Σ 持仓数上限×单仓上限）"
+            f"{_fmt_yuan(exposure['ceiling'])}，仅为期末净值 "
+            f"{_fmt_yuan(exposure['final_equity'])} 的 {exposure['ratio']:.0%}"
+            f"（<{exposure['threshold']:.0%}），"
+            f"近 {exposure['recent_days']} 日平均仓位利用率 "
+            f"{exposure['recent_utilization']:.1%}（全期 {exposure['whole_utilization']:.1%}）"
+            f"——仓位上限已开始约束策略弹性；{raise_text}"
+        )
+    for item in profile.get("advice") or []:
+        if item.get("key") == "equity_cap":
+            warns.append("容量建议：" + item["text"])
     return warns
+
+
+def build_capacity_warnings(
+    trades: list,
+    klines: dict,
+    evaluations: Optional[dict] = None,
+    position_sizing: str = "dynamic",
+    equity_cap=None,
+    snapshots: Optional[list] = None,
+    exposure_ceiling=None,
+) -> list:
+    """容量健康度告警（自动）：即使未设 equity_cap，也在结果里明确提示
+    "该结果是否含不可实现仓位"。
+
+    - 单笔成交 vs 该股日均成交额（ADV = mean(Volume_股×Close)，从 klines 估算）：
+      最大占比 ≥ 30% → 该笔实盘按回测价成交不现实；
+    - 最大单票权重 max_single_weight > 25% → 集中度/权重随涨幅过度膨胀；
+    - 敞口上限（snapshots + exposure_ceiling 均传入时）：Σ(持仓数上限×单仓上限)
+      < 期末净值 50% → 仓位上限已结构性约束策略弹性，附近端/全期利用率对照；
+    - dynamic 且未设 equity_cap 时命中任一 → 附设置容量上限/成交量约束的建议。
+
+    仅在有成交且可估算 ADV 时生效；无数据静默跳过（不误报）。
+    """
+    return _format_capacity_warnings(build_capacity_profile(
+        trades, klines, evaluations, position_sizing, equity_cap,
+        snapshots=snapshots, exposure_ceiling=exposure_ceiling,
+    ))
 
 
 def run_backtest(db: Session, ps: PortfolioStrategy, req,

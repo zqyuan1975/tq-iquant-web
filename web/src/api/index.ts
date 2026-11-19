@@ -215,8 +215,23 @@ export interface DataQuality {
 }
 
 // 回测"验证结论"（对齐 backtest_service.build_validation_verdict）
+export interface CapacityMetrics {
+  adv: {
+    stock_code: string | null; amount: number; adv: number; ratio: number
+    threshold: number; hit: boolean
+  } | null
+  concentration: { max_single_weight: number | null; threshold: number; hit: boolean }
+  exposure: {
+    ceiling: number; final_equity: number; ratio: number; threshold: number
+    recent_days: number; recent_utilization: number; whole_utilization: number
+    hit: boolean
+  } | null
+  advice: { key: string; text: string }[]
+}
+
 export interface ValidationVerdict {
   capacity: string[]
+  capacity_metrics?: CapacityMetrics | null  // K7 结构化容量画像（老记录可能缺）
   crisis: { key: string; name: string; start: string; end: string;
     strategy_return: number | null; benchmark_return: number | null;
     max_drawdown: number | null; min_cash_ratio: number | null;
@@ -623,6 +638,7 @@ export interface BacktestCostCapacity {
     large_trade_count: number
     large_trade_amount_ratio: number | null
     pressure_level: string
+    structure?: CapacityMetrics | null  // K7 规模约束结构指标（老记录为读取时重算）
   }
 }
 

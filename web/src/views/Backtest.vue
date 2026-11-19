@@ -1103,18 +1103,172 @@ function replayDirectionText(d: string): string {
 
 // ---- K5 成本与容量（详情接口现算块）----
 const costCapacity = computed(() => detail.value?.cost_capacity ?? null)
-const costCapacityCards = computed(() => {
-  const cc = costCapacity.value
-  if (!cc) return []
-  const bps = (v: number | null) => (v === null ? '—' : `${v.toFixed(2)} bps`)
+const bpsText = (v: number | null | undefined) => (v === null || v === undefined ? '—' : `${v.toFixed(2)} bps`)
+const clampPct = (v: number) => Math.max(0, Math.min(100, v))
+
+/** 显性成本结构：佣金 / 印花税 / 过户费占比。 */
+const costMix = computed(() => {
+  const e = costCapacity.value?.explicit
+  if (!e) return []
+  const total = Math.max(e.total_cost ?? 0, 1e-9)
   return [
-    { label: '交易成本合计', value: fmtMoney(cc.explicit.total_cost), sub: '佣金+印花税+过户费' },
-    { label: '成本拖累占比', value: pct(cc.explicit.cost_drag_ratio), sub: '成本 / 毛利（毛利=净收益+成本）' },
-    { label: '成本 / 成交额', value: bps(cc.explicit.cost_bps), sub: '双边换手口径' },
-    { label: '滑点实现偏差', value: bps(cc.slippage.realized_deviation_bps), sub: `配置 ${bps(cc.slippage.configured_bps)}` },
-    { label: '容量压力', value: cc.capacity.pressure_level || '—', sub: `最大单笔占净值 ${fmtPct(cc.capacity.max_trade_pct_equity)}` },
+    { key: 'mix-1', label: '佣金', value: e.commission ?? 0, width: clampPct((e.commission ?? 0) / total * 100) },
+    { key: 'mix-2', label: '印花税', value: e.stamp_duty ?? 0, width: clampPct((e.stamp_duty ?? 0) / total * 100) },
+    { key: 'mix-3', label: '过户费', value: e.transfer_fee ?? 0, width: clampPct((e.transfer_fee ?? 0) / total * 100) },
   ]
 })
+
+const DONUT_C = 2 * Math.PI * 52
+/** 成本拖累占比（成本/毛利）的环图：超过 100% 时按满环显示，数值仍精确展示。 */
+const dragView = computed(() => {
+  const r = costCapacity.value?.explicit.cost_drag_ratio ?? null
+  const ratio = r === null ? 0 : Math.max(0, Math.min(1, r))
+  const tone = r === null ? 'neutral' : r >= 0.5 ? 'bad' : r >= 0.25 ? 'warn' : 'ok'
+  return { ratio, tone, dash: DONUT_C * ratio, offset: DONUT_C * (1 - ratio) }
+})
+
+/** 滑点实测 vs 配置：以 0 为中点的对称刻度，负值落在左侧。 */
+const slippageView = computed(() => {
+  const s = costCapacity.value?.slippage
+  if (!s) return null
+  const cfg = s.configured_bps ?? 0
+  const real = s.realized_deviation_bps ?? 0
+  const domain = Math.max(Math.abs(cfg), Math.abs(real), 1) * 1.35
+  const pos = (v: number) => clampPct(50 + v / domain * 50)
+  const tone = real > cfg + 0.01 ? 'bad' : real < cfg - 0.01 ? 'ok' : 'neutral'
+  return { cfg, real, tone, cfgPos: pos(cfg), realPos: pos(real) }
+})
+
+/** 容量压力：以「大额阈值 ×2」与当前最大单笔占净值的较大值为刻度上限。 */
+const capacityView = computed(() => {
+  const c = costCapacity.value?.capacity
+  if (!c) return null
+  const value = c.max_trade_pct_equity ?? 0
+  const threshold = c.large_trade_threshold_pct ?? 0
+  const scaleMax = Math.max(value * 1.15, threshold * 2, 0.01)
+  const level = String(c.pressure_level ?? '')
+  const tone = /高|high/i.test(level) ? 'bad'
+    : /中|medium/i.test(level) ? 'warn'
+      : /低|low/i.test(level) ? 'ok' : 'neutral'
+  return {
+    tone,
+    barPct: clampPct(value / scaleMax * 100),
+    thresholdPos: clampPct(threshold / scaleMax * 100),
+    scaleMax,
+  }
+})
+
+/** 容量结构（规模约束）：优先用验证结论冻结的结构化指标，老记录用详情重算值。 */
+const capacityMetrics = computed(() => (
+  validation.value?.capacity_metrics ?? costCapacity.value?.capacity.structure ?? null))
+
+/** 规模约束卡：敞口上限/净值、仓位利用率、集中度、ADV 参与率。 */
+const structureView = computed(() => {
+  const m = capacityMetrics.value
+  if (!m) return null
+  const exposure = m.exposure
+  const hits = [
+    exposure?.hit === true,
+    m.concentration?.hit === true,
+    m.adv?.hit === true,
+  ].filter(Boolean).length
+  return {
+    exposure,
+    concentration: m.concentration,
+    adv: m.adv,
+    hits,
+    tone: hits > 0 ? 'bad' : 'ok',
+    ratioPct: exposure ? clampPct(exposure.ratio * 100) : 0,
+    ratioTone: exposure ? (exposure.hit ? 'bad' : 'ok') : 'neutral',
+    concentrationTone: m.concentration?.hit ? 'warn' : 'ok',
+    advTone: m.adv ? (m.adv.hit ? 'bad' : 'ok') : 'neutral',
+  }
+})
+
+/** 验证结论·容量健康：只给判断与建议，数值统一在「规模约束」卡。 */
+const capacityVerdict = computed(() => {
+  const v = validation.value
+  if (!v) return null
+  const m = capacityMetrics.value
+  const legacy = (v.capacity || []).map(w => String(w))
+  const legacyWarns = legacy.filter(w => !w.startsWith('容量建议'))
+  const conclusions: string[] = []
+  if (m) {
+    if (m.exposure?.hit) conclusions.push('敞口上限已结构性约束仓位弹性')
+    if (m.adv?.hit) conclusions.push('最大单笔成交占 ADV 过高，实盘成交可实现性存疑')
+    if (m.concentration?.hit) conclusions.push('单票权重超过 25%，集中度偏高')
+  } else {
+    for (const w of legacyWarns) {
+      if (w.includes('敞口上限预警')) conclusions.push('敞口上限已结构性约束仓位弹性')
+      else if (w.includes('容量预警')) conclusions.push('最大单笔成交占 ADV 过高，实盘成交可实现性存疑')
+      else if (w.includes('集中度预警')) conclusions.push('单票权重超过 25%，集中度偏高')
+    }
+  }
+  const advice = m?.advice?.length
+    ? m.advice.map(a => a.text)
+    : legacy
+      .filter(w => w.startsWith('容量建议'))
+      .map(w => w.replace(/^容量建议：/, ''))
+  const count = m
+    ? [m.exposure?.hit, m.adv?.hit, m.concentration?.hit].filter(Boolean).length
+    : legacyWarns.length
+  return {
+    healthy: count === 0,
+    count,
+    tone: count === 0 ? 'ok' : 'bad',
+    conclusions,
+    advice,
+  }
+})
+
+/** 验证结论·危机防御：窗口计数 + 最差窗口，明细表保留。 */
+const crisisSummary = computed(() => {
+  const rows = validation.value?.crisis || []
+  if (!rows.length) return null
+  const total = rows.length
+  const defensive = rows.filter(r => r.verdict === 'defensive').length
+  const exposed = rows.filter(r => r.verdict === 'exposed').length
+  const withReturn = rows.filter(r => r.strategy_return !== null)
+  const worst = withReturn.length
+    ? withReturn.reduce((a, b) => (a.strategy_return! <= b.strategy_return! ? a : b))
+    : null
+  const minCash = rows.reduce<number | null>((acc, r) => (
+    r.min_cash_ratio === null ? acc
+      : (acc === null ? r.min_cash_ratio : Math.min(acc, r.min_cash_ratio))), null)
+  const maxDd = rows.reduce<number | null>((acc, r) => (
+    r.max_drawdown === null ? acc
+      : (acc === null ? r.max_drawdown : Math.max(acc, r.max_drawdown))), null)
+  return {
+    total,
+    defensive,
+    exposed,
+    worst,
+    minCash,
+    maxDd,
+    label: exposed ? `暴露 ${exposed}/${total} 窗` : `防御 ${defensive}/${total} 窗`,
+    tone: exposed ? 'bad' : defensive === total ? 'ok' : 'neutral',
+    conclusion: exposed
+      ? `${exposed} 个危机窗口未能防御，需复核风控与现金管理`
+      : '已覆盖的危机窗口均通过防御判定',
+  }
+})
+
+/** 验证结论·样本外：通过状态与窗口数。 */
+const oosView = computed(() => {
+  const o = validation.value?.oos
+  if (!o) return { tone: 'neutral', label: '未执行', detail: '' }
+  return {
+    tone: o.overall_pass === true ? 'ok' : o.overall_pass === false ? 'bad' : 'neutral',
+    label: o.overall_pass === true ? '样本外通过'
+      : o.overall_pass === false ? '样本外未通过' : '结果未知',
+    detail: o.windows_passed || '',
+  }
+})
+
+function scrollToCapacityStructure() {
+  document.getElementById('capacity-structure')
+    ?.scrollIntoView({ behavior: 'smooth', block: 'center' })
+}
 
 function openForm() {
   const today = new Date()
@@ -3927,55 +4081,103 @@ watch(theme, () => {
     <div v-if="validation" class="card" style="margin-top:12px;padding:14px">
       <div style="display:flex;align-items:center;gap:8px;margin-bottom:10px">
         <span style="font-weight:600;font-size:14px">🧪 验证结论</span>
-        <span style="font-size:12px;color:var(--ink-soft)">容量健康 · 危机防御 · 样本外（回测完成时自动冻结）</span>
+        <span style="font-size:12px;color:var(--ink-soft)">
+          判断与建议 · 容量数值统一在「成本与容量 → 规模约束」
+        </span>
       </div>
-      <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px">
-        <!-- 容量健康 -->
-        <div>
-          <div style="font-size:12px;font-weight:600;color:var(--ink-soft);margin-bottom:6px">容量健康</div>
-          <ul v-if="validation.capacity.length" class="spb-list">
-            <li v-for="(w, i) in validation.capacity" :key="i">{{ w }}</li>
-          </ul>
-          <span v-else class="badge badge-green">健康（未命中容量/集中度阈值）</span>
-        </div>
-        <!-- 样本外引用 -->
-        <div>
-          <div style="font-size:12px;font-weight:600;color:var(--ink-soft);margin-bottom:6px">样本外验证（Walk-Forward）</div>
-          <template v-if="validation.oos">
-            <span class="badge" :class="validation.oos.overall_pass ? 'badge-green' : 'badge-red'">
-              {{ validation.oos.overall_pass ? '样本外通过' : '样本外未通过' }} {{ validation.oos.windows_passed }}
+      <div class="metric-grid">
+        <!-- 容量健康：只保留判断/建议 + 交叉引用 -->
+        <div class="metric-card metric-card--wide" v-if="capacityVerdict">
+          <span class="metric-kicker">容量健康</span>
+          <div class="metric-headline">
+            <span class="metric-pill" :class="'metric-tone--' + capacityVerdict.tone">
+              {{ capacityVerdict.healthy ? '健康' : `预警 ${capacityVerdict.count} 项` }}
             </span>
-            <span style="font-size:12px;color:var(--ink-soft);margin-left:6px">{{ validation.oos.name }}</span>
-            <RouterLink to="/backtest/analysis" class="btn btn-sm" style="margin-left:8px">查看</RouterLink>
+            <span class="metric-sub">敞口上限 · 仓位利用率 · 集中度 · ADV</span>
+          </div>
+          <ul v-if="capacityVerdict.conclusions.length" class="metric-advice">
+            <li v-for="(c, i) in capacityVerdict.conclusions" :key="'c' + i">{{ c }}</li>
+          </ul>
+          <p v-else class="metric-conclusion">未命中容量/集中度阈值。</p>
+          <template v-if="capacityVerdict.advice.length">
+            <span class="metric-kicker">建议</span>
+            <ul class="metric-advice">
+              <li v-for="(a, i) in capacityVerdict.advice" :key="'a' + i">{{ a }}</li>
+            </ul>
           </template>
-          <span v-else style="font-size:12px;color:var(--ink-soft)">
-            未执行
-            <RouterLink to="/backtest/analysis" class="btn btn-sm btn-primary" style="margin-left:8px" @click="prefillWalkForward">立即发起验证</RouterLink>
-          </span>
+          <button class="btn btn-sm" style="align-self:flex-start;margin-top:auto" @click="scrollToCapacityStructure">
+            查看成本与容量 · 规模约束 ↓
+          </button>
+        </div>
+
+        <!-- 样本外引用 -->
+        <div class="metric-card metric-card--narrow">
+          <span class="metric-kicker">样本外验证</span>
+          <div class="metric-headline">
+            <span class="metric-pill" :class="'metric-tone--' + oosView.tone">{{ oosView.label }}</span>
+            <span v-if="oosView.detail" class="metric-sub">{{ oosView.detail }}</span>
+          </div>
+          <p class="metric-conclusion">
+            <template v-if="validation.oos">{{ validation.oos.name }}</template>
+            <template v-else>尚无 Walk-Forward 运行，建议先做样本外验证再采纳。</template>
+          </p>
+          <RouterLink v-if="validation.oos" to="/backtest/analysis" class="btn btn-sm"
+                      style="align-self:flex-start;margin-top:auto">查看</RouterLink>
+          <RouterLink v-else to="/backtest/analysis" class="btn btn-sm btn-primary"
+                      style="align-self:flex-start;margin-top:auto"
+                      @click="prefillWalkForward">立即发起验证</RouterLink>
+        </div>
+
+        <!-- 危机防御：结论 + 最差窗口 + 明细 -->
+        <div class="metric-card metric-card--full">
+          <span class="metric-kicker">危机防御</span>
+          <template v-if="crisisSummary">
+            <div class="metric-headline">
+              <span class="metric-pill" :class="'metric-tone--' + crisisSummary.tone">{{ crisisSummary.label }}</span>
+              <span class="metric-sub">固定窗口 · 历史锁定 · 不随结果回填</span>
+            </div>
+            <p class="metric-conclusion">{{ crisisSummary.conclusion }}</p>
+            <div class="metric-mini-row">
+              <div v-if="crisisSummary.worst">
+                <span>最差窗口</span><b>{{ crisisSummary.worst.name }}</b>
+              </div>
+              <div v-if="crisisSummary.worst">
+                <span>策略收益</span>
+                <b :class="(crisisSummary.worst.strategy_return ?? 0) >= 0 ? 'text-red' : 'text-green'">
+                  {{ crisisSummary.worst.strategy_return === null ? '—' : fmtSignedPct(crisisSummary.worst.strategy_return) }}
+                </b>
+              </div>
+              <div>
+                <span>最低现金占比</span>
+                <b>{{ crisisSummary.minCash === null ? '—' : fmtPct(crisisSummary.minCash) }}</b>
+              </div>
+              <div>
+                <span>最大窗口回撤</span>
+                <b class="text-green">{{ crisisSummary.maxDd === null ? '—' : fmtPct(crisisSummary.maxDd) }}</b>
+              </div>
+            </div>
+            <table>
+              <thead><tr>
+                <th>危机窗口</th><th>策略收益</th><th>基准收益</th><th>窗口回撤</th><th>最低现金占比</th><th>判定</th>
+              </tr></thead>
+              <tbody>
+                <tr v-for="c in validation.crisis" :key="c.key">
+                  <td>{{ c.name }}</td>
+                  <td :class="(c.strategy_return ?? 0) >= 0 ? 'text-red' : 'text-green'">{{ c.strategy_return === null ? '—' : fmtSignedPct(c.strategy_return) }}</td>
+                  <td :class="(c.benchmark_return ?? 0) >= 0 ? 'text-red' : 'text-green'">{{ c.benchmark_return === null ? '—' : fmtSignedPct(c.benchmark_return) }}</td>
+                  <td class="text-green">{{ c.max_drawdown === null ? '—' : fmtPct(c.max_drawdown) }}</td>
+                  <td>{{ c.min_cash_ratio === null ? '—' : fmtPct(c.min_cash_ratio) }}</td>
+                  <td>
+                    <span class="badge" :class="c.verdict === 'defensive' ? 'badge-green' : c.verdict === 'exposed' ? 'badge-red' : 'badge-gray'"
+                          :title="c.reason">{{ c.verdict === 'defensive' ? '防御 ✓' : c.verdict === 'exposed' ? '暴露 ✗' : '—' }}</span>
+                  </td>
+                </tr>
+              </tbody>
+            </table>
+          </template>
+          <p v-else class="metric-conclusion">回测区间未覆盖任何固定危机窗口。</p>
         </div>
       </div>
-      <!-- 危机防御表 -->
-      <template v-if="validation.crisis.length">
-        <div style="font-size:12px;font-weight:600;color:var(--ink-soft);margin:10px 0 6px">危机防御机制（固定窗口，历史锁定）</div>
-        <table>
-          <thead><tr>
-            <th>危机窗口</th><th>策略收益</th><th>基准收益</th><th>窗口回撤</th><th>最低现金占比</th><th>判定</th>
-          </tr></thead>
-          <tbody>
-            <tr v-for="c in validation.crisis" :key="c.key">
-              <td>{{ c.name }}</td>
-              <td :class="(c.strategy_return ?? 0) >= 0 ? 'text-red' : 'text-green'">{{ c.strategy_return === null ? '—' : fmtSignedPct(c.strategy_return) }}</td>
-              <td :class="(c.benchmark_return ?? 0) >= 0 ? 'text-red' : 'text-green'">{{ c.benchmark_return === null ? '—' : fmtSignedPct(c.benchmark_return) }}</td>
-              <td class="text-green">{{ c.max_drawdown === null ? '—' : fmtPct(c.max_drawdown) }}</td>
-              <td>{{ c.min_cash_ratio === null ? '—' : fmtPct(c.min_cash_ratio) }}</td>
-              <td>
-                <span class="badge" :class="c.verdict === 'defensive' ? 'badge-green' : c.verdict === 'exposed' ? 'badge-red' : 'badge-gray'"
-                      :title="c.reason">{{ c.verdict === 'defensive' ? '防御 ✓' : c.verdict === 'exposed' ? '暴露 ✗' : '—' }}</span>
-              </td>
-            </tr>
-          </tbody>
-        </table>
-      </template>
     </div>
 
     <!-- 采纳验收 -->
@@ -5238,57 +5440,147 @@ watch(theme, () => {
     <!-- K5 成本与容量（详情接口现算：显性成本 / 滑点实现偏差 / 容量与冲击） -->
     <div class="ca-section" v-if="costCapacity">
       <div class="section-title ca-header"><span>成本与容量</span></div>
-      <div class="kpi-grid" style="margin-bottom:10px">
-        <div class="kpi" v-for="c in costCapacityCards" :key="c.label">
-          <div class="kpi-label">{{ c.label }}</div>
-          <div class="kpi-value">{{ c.value }}</div>
-          <div class="kpi-sub">{{ c.sub }}</div>
+      <div class="metric-grid">
+        <div class="metric-card metric-card--wide">
+          <div class="metric-head">
+            <span class="metric-kicker">成本规模</span>
+            <span class="metric-big">{{ fmtMoney(costCapacity.explicit.total_cost) }}</span>
+            <span class="metric-sub">交易成本合计 · 佣金+印花税+过户费</span>
+          </div>
+          <div class="metric-mix-bar">
+            <i v-for="s in costMix" :key="s.key" :class="s.key" :style="{ width: s.width + '%' }"></i>
+          </div>
+          <div class="metric-legend">
+            <span v-for="s in costMix" :key="s.key"><i :class="s.key"></i>{{ s.label }} <b>{{ fmtMoney(s.value) }}</b></span>
+          </div>
+          <div class="metric-mini-row">
+            <div><span>成交额（双边）</span><b>{{ fmtMoney(costCapacity.explicit.turnover) }}</b></div>
+            <div><span>日均净值</span><b>{{ fmtMoney(costCapacity.explicit.avg_equity) }}</b></div>
+            <div><span>成本 / 日均净值</span><b>{{ pct(costCapacity.explicit.cost_to_avg_equity) }}</b></div>
+          </div>
         </div>
-      </div>
-      <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:12px">
-        <div class="card" style="padding:10px">
-          <div class="section-title" style="font-size:13px">显性成本拆解</div>
-          <table>
-            <tbody>
-              <tr><td>佣金</td><td class="num">{{ fmtMoney(costCapacity.explicit.commission) }}</td></tr>
-              <tr><td>印花税</td><td class="num">{{ fmtMoney(costCapacity.explicit.stamp_duty) }}</td></tr>
-              <tr><td>过户费</td><td class="num">{{ fmtMoney(costCapacity.explicit.transfer_fee) }}</td></tr>
-              <tr><td>合计</td><td class="num">{{ fmtMoney(costCapacity.explicit.total_cost) }}</td></tr>
-              <tr><td>成交额（双边）</td><td class="num">{{ fmtMoney(costCapacity.explicit.turnover) }}</td></tr>
-              <tr><td>日均净值</td><td class="num">{{ fmtMoney(costCapacity.explicit.avg_equity) }}</td></tr>
-              <tr><td>成本 / 日均净值</td><td class="num">{{ pct(costCapacity.explicit.cost_to_avg_equity) }}</td></tr>
-            </tbody>
-          </table>
+
+        <div class="metric-card metric-card--narrow">
+          <span class="metric-kicker">成本效率</span>
+          <div class="metric-donut-wrap">
+            <svg class="metric-donut" viewBox="0 0 120 120" role="img" aria-label="成本拖累占比">
+              <circle class="track" cx="60" cy="60" r="52" />
+              <circle class="value" :class="'metric-stroke--' + dragView.tone" cx="60" cy="60" r="52"
+                      :stroke-dasharray="DONUT_C" :stroke-dashoffset="dragView.offset" />
+            </svg>
+            <div class="metric-donut-center">
+              <b>{{ pct(costCapacity.explicit.cost_drag_ratio) }}</b>
+              <span>成本拖累占比</span>
+            </div>
+          </div>
+          <p class="metric-note">成本 / 毛利（毛利=净收益+成本）</p>
+          <div class="metric-mini-row">
+            <div><span>成本 / 成交额</span><b>{{ bpsText(costCapacity.explicit.cost_bps) }}</b></div>
+            <div><span>口径</span><b>双边换手</b></div>
+          </div>
         </div>
-        <div class="card" style="padding:10px">
-          <div class="section-title" style="font-size:13px">滑点实现偏差</div>
-          <table>
-            <tbody>
-              <tr><td>配置固定滑点</td><td class="num">{{ costCapacity.slippage.configured_bps?.toFixed(2) ?? '—' }} bps</td></tr>
-              <tr><td>实测实现偏差（买高/卖低为正）</td><td class="num">{{ costCapacity.slippage.realized_deviation_bps?.toFixed(2) ?? '—' }} bps</td></tr>
-              <tr><td>固定滑点无法解释的部分</td><td class="num">{{ costCapacity.slippage.excess_bps?.toFixed(2) ?? '—' }} bps</td></tr>
-              <tr><td>对应金额</td><td class="num">{{ fmtMoney(costCapacity.slippage.excess_cost_amount) }}</td></tr>
-              <tr><td>可匹配成交 / 总成交</td>
-                <td class="num">{{ costCapacity.slippage.matched_trades }} / {{ costCapacity.slippage.trades_count }} 笔</td>
-              </tr>
-            </tbody>
-          </table>
+
+        <div class="metric-card" v-if="slippageView">
+          <span class="metric-kicker">滑点实现偏差</span>
+          <div class="metric-headline">
+            <span class="metric-value" :class="'metric-tone--' + slippageView.tone">{{ bpsText(costCapacity.slippage.realized_deviation_bps) }}</span>
+            <span class="metric-sub">实测 · 买高/卖低为正</span>
+          </div>
+          <div class="metric-scale">
+            <div class="metric-scale-track"></div>
+            <div class="metric-scale-zero" style="left: 50%"></div>
+            <div class="metric-scale-mark metric-scale-mark--config" :style="{ left: slippageView.cfgPos + '%' }">
+              <span>配置 {{ bpsText(costCapacity.slippage.configured_bps) }}</span><i></i>
+            </div>
+            <div class="metric-scale-mark metric-scale-mark--realized" :class="'metric-tone--' + slippageView.tone"
+                 :style="{ left: slippageView.realPos + '%' }">
+              <i></i><span>实测 {{ bpsText(costCapacity.slippage.realized_deviation_bps) }}</span>
+            </div>
+          </div>
+          <div class="metric-mini-row">
+            <div><span>固定滑点无法解释</span><b>{{ bpsText(costCapacity.slippage.excess_bps) }}</b></div>
+            <div><span>对应金额</span><b>{{ fmtMoney(costCapacity.slippage.excess_cost_amount) }}</b></div>
+            <div><span>可匹配成交 / 总成交</span><b>{{ costCapacity.slippage.matched_trades }} / {{ costCapacity.slippage.trades_count }} 笔</b></div>
+          </div>
         </div>
-        <div class="card" style="padding:10px">
-          <div class="section-title" style="font-size:13px">容量与冲击成本</div>
-          <table>
-            <tbody>
-              <tr><td>成交笔数</td><td class="num">{{ costCapacity.capacity.trades_count }}</td></tr>
-              <tr><td>最大单笔成交额</td><td class="num">{{ fmtMoney(costCapacity.capacity.max_trade_amount) }}</td></tr>
-              <tr><td>最大单笔 / 当日净值</td><td class="num">{{ fmtPct(costCapacity.capacity.max_trade_pct_equity) }}</td></tr>
-              <tr><td>平均单笔 / 当日净值</td><td class="num">{{ fmtPct(costCapacity.capacity.avg_trade_pct_equity) }}</td></tr>
-              <tr><td>大额成交笔数（≥{{ fmtPct(costCapacity.capacity.large_trade_threshold_pct) }} 净值）</td>
-                <td class="num">{{ costCapacity.capacity.large_trade_count }}</td>
-              </tr>
-              <tr><td>大额成交额占比</td><td class="num">{{ fmtPct(costCapacity.capacity.large_trade_amount_ratio) }}</td></tr>
-              <tr><td>容量压力等级</td><td class="num">{{ costCapacity.capacity.pressure_level || '—' }}</td></tr>
-            </tbody>
-          </table>
+
+        <div class="metric-card" v-if="capacityView">
+          <span class="metric-kicker">容量压力</span>
+          <div class="metric-headline">
+            <span class="metric-pill" :class="'metric-tone--' + capacityView.tone">{{ costCapacity.capacity.pressure_level || '—' }}</span>
+            <span class="metric-sub">最大单笔占净值 {{ fmtPct(costCapacity.capacity.max_trade_pct_equity) }}</span>
+          </div>
+          <div class="metric-bar">
+            <i :class="'metric-fill--' + capacityView.tone" :style="{ width: capacityView.barPct + '%' }"></i>
+            <span class="metric-bar-threshold" :style="{ left: capacityView.thresholdPos + '%' }"></span>
+          </div>
+          <div class="metric-bar-legend">
+            <span>0</span>
+            <span>大额阈值 {{ fmtPct(costCapacity.capacity.large_trade_threshold_pct) }}</span>
+            <span>{{ fmtPct(capacityView.scaleMax) }}</span>
+          </div>
+          <div class="metric-mini-row">
+            <div><span>最大单笔成交额</span><b>{{ fmtMoney(costCapacity.capacity.max_trade_amount) }}</b></div>
+            <div><span>平均单笔 / 当日净值</span><b>{{ fmtPct(costCapacity.capacity.avg_trade_pct_equity) }}</b></div>
+            <div><span>大额成交笔数</span><b>{{ costCapacity.capacity.large_trade_count }} 笔</b></div>
+            <div><span>大额成交额占比</span><b>{{ fmtPct(costCapacity.capacity.large_trade_amount_ratio) }}</b></div>
+            <div><span>成交笔数</span><b>{{ costCapacity.capacity.trades_count }}</b></div>
+          </div>
+        </div>
+
+        <!-- 规模约束：与容量压力并列，区分「单笔冲击」与「规模上限」 -->
+        <div class="metric-card metric-card--full" id="capacity-structure" v-if="structureView">
+          <span class="metric-kicker">规模约束</span>
+          <div class="metric-headline">
+            <span class="metric-pill" :class="'metric-tone--' + structureView.tone">
+              {{ structureView.hits ? `约束 ${structureView.hits} 项` : '未触发阈值' }}
+            </span>
+            <span class="metric-sub">敞口上限 / 期末净值 · 仓位利用率 · 单票权重 · ADV 参与率</span>
+          </div>
+          <div class="metric-subgrid">
+            <div class="metric-tile">
+              <span>敞口上限 / 期末净值</span>
+              <b v-if="structureView.exposure" :class="'metric-tone--' + structureView.ratioTone">
+                {{ fmtPct(structureView.exposure.ratio) }}
+              </b>
+              <b v-else>—</b>
+              <i v-if="structureView.exposure">
+                上限 {{ fmtMoney(structureView.exposure.ceiling) }} / 净值
+                {{ fmtMoney(structureView.exposure.final_equity) }}（阈值
+                {{ fmtPct(structureView.exposure.threshold) }}）
+              </i>
+              <i v-else>组合已删除，无法重算敞口上限</i>
+            </div>
+            <div class="metric-tile">
+              <span>仓位利用率（近 {{ structureView.exposure?.recent_days ?? 60 }} 日 / 全期）</span>
+              <b v-if="structureView.exposure">
+                {{ fmtPct(structureView.exposure.recent_utilization) }} /
+                {{ fmtPct(structureView.exposure.whole_utilization) }}
+              </b>
+              <b v-else>—</b>
+              <i>持仓市值 / 组合总资产</i>
+            </div>
+            <div class="metric-tile">
+              <span>最大单票权重</span>
+              <b :class="'metric-tone--' + structureView.concentrationTone">
+                {{ structureView.concentration?.max_single_weight === null
+                  || structureView.concentration?.max_single_weight === undefined
+                  ? '—' : fmtPct(structureView.concentration.max_single_weight) }}
+              </b>
+              <i>阈值 {{ fmtPct(structureView.concentration?.threshold ?? 0.25) }}</i>
+            </div>
+            <div class="metric-tile">
+              <span>最大单笔 / 股票 ADV</span>
+              <b :class="'metric-tone--' + structureView.advTone">
+                {{ structureView.adv ? fmtPct(structureView.adv.ratio) : '—' }}
+              </b>
+              <i v-if="structureView.adv">
+                {{ structureView.adv.stock_code || '—' }} · 阈值
+                {{ fmtPct(structureView.adv.threshold) }}
+              </i>
+              <i v-else>旧记录未冻结 ADV（需 K 线）</i>
+            </div>
+          </div>
         </div>
       </div>
       <p class="ca-note">

@@ -2421,8 +2421,10 @@ def test_build_validation_verdict_includes_all_blocks():
     }
     ps = SimpleNamespace(position_sizing="dynamic", equity_cap=None, id=1)
     v = svc.build_validation_verdict(result, _mock_klines(), ps, None)
-    assert set(v) == {"capacity", "crisis", "oos"}
+    assert set(v) == {"capacity", "crisis", "oos", "capacity_metrics"}
     assert isinstance(v["capacity"], list)
+    # K7：结构化容量画像与文案同源，随验证结论一并返回/落库
+    assert set(v["capacity_metrics"]) == {"adv", "concentration", "exposure", "advice"}
     assert isinstance(v["crisis"], list)
     assert v["oos"] is None
 
@@ -2544,6 +2546,11 @@ def test_recompute_validation_rebuilds_all_blocks(db_session):
     payload = json.loads(rec.validation_json)
     assert any("敞口上限预警" in w for w in payload["capacity"])
     assert not any("旧容量告警" in w for w in payload["capacity"])
+    # K7 结构化容量画像随验证结论一起落库（前端规模约束卡数据源）
+    assert payload["capacity_metrics"]["exposure"]["hit"] is True
+    assert payload["capacity_metrics"]["exposure"]["ceiling"] == 1_000_000.0
+    assert payload["capacity_metrics"]["exposure"]["final_equity"] == 2_500_000.0
+    assert payload["capacity_metrics"]["advice"][0]["key"] == "raise_exposure"
     assert "2024_liquidity" in [c["key"] for c in payload["crisis"]]
     assert payload["oos"] is None
 
