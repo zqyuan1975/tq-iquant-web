@@ -87,6 +87,11 @@ class BacktestRequest(BaseModel):
     # cap=只封顶新开仓定量（默认，旧行为）；distribute=日终把超上限部分
     # 作为外部流出扣出现金（仅回测生效，不强制减仓）
     equity_cap_mode: str | None = None
+    # 层 1 容量模型 run 级覆盖（None=linear 旧口径）：
+    # linear=4% 成交量闸门 + 固定滑点（v1）；sqrt=参与率预算 + sqrt 冲击 +
+    # 残量顺延切片（v2）。k 为 sqrt 冲击系数（0.05/0.10/0.20 做敏感性对照）。
+    capacity_model: str | None = None
+    capacity_impact_k: float | None = None
     # 日末 peak 保护（默认关）：开启后 peak/max_drawdown 只在当日最后一根 bar 更新，
     # 避免混合周期粗 bar 的周期末 close 污染峰值；纯 1d 行为不变
     daily_close_peak_enabled: bool = False
@@ -123,6 +128,9 @@ class MultiBacktestRequest(BaseModel):
     execution_profile: str | None = None
     partial_fill_enabled: bool | None = None
     first_bar_no_fill: bool | None = None
+    # 层 1 容量模型 run 级覆盖（None=linear 旧口径）
+    capacity_model: str | None = None
+    capacity_impact_k: float | None = None
 
 
 class PoolCompareRequest(BaseModel):
@@ -531,6 +539,13 @@ def _validate_backtest_request(req: BacktestRequest) -> Optional[str]:
     if req.execution_profile not in (None, "", "legacy", "realistic"):
         return (f"execution_profile 仅支持 legacy/realistic（None=legacy），"
                 f"收到 {req.execution_profile!r}")
+    # 层 1 容量模型：None=linear；显式值仅限 linear/sqrt；k 须在 (0,1]
+    if req.capacity_model not in (None, "linear", "sqrt"):
+        return (f"capacity_model 仅支持 linear/sqrt（None=linear），"
+                f"收到 {req.capacity_model!r}")
+    if (req.capacity_impact_k is not None
+            and not (0 < req.capacity_impact_k <= 1)):
+        return f"capacity_impact_k 须在 (0,1]，收到 {req.capacity_impact_k}"
     return None
 
 
@@ -594,6 +609,12 @@ def _validate_multi_request(req: MultiBacktestRequest) -> Optional[str]:
     if req.execution_profile not in (None, "", "legacy", "realistic"):
         return (f"execution_profile 仅支持 legacy/realistic（None=legacy），"
                 f"收到 {req.execution_profile!r}")
+    if req.capacity_model not in (None, "linear", "sqrt"):
+        return (f"capacity_model 仅支持 linear/sqrt（None=linear），"
+                f"收到 {req.capacity_model!r}")
+    if (req.capacity_impact_k is not None
+            and not (0 < req.capacity_impact_k <= 1)):
+        return f"capacity_impact_k 须在 (0,1]，收到 {req.capacity_impact_k}"
     return None
 
 

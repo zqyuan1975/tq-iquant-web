@@ -76,6 +76,9 @@ class SimulatedDispatcher(OrderDispatcher):
         bar_volumes: dict = None,
         slippage_impact_coef: Optional[Decimal] = None,
         price_limits: dict = None,
+        impact_model: str = "linear",
+        impact_base: Decimal = Decimal("0.002"),
+        impact_cap: Decimal = Decimal("0.05"),
     ):
         """成本参数来自组合表，默认值 = 历史硬编码值，老调用不破。
 
@@ -83,6 +86,8 @@ class SimulatedDispatcher(OrderDispatcher):
         时有效滑点 = slippage + coef×订单股数/(bar成交量×100)，封顶 0.10；
         任一缺失或该票无量时回退固定 slippage（原行为）。bar_volumes 值为
         TDX Volume（单位=手，×100 转股数）。
+        impact_model（层 1）：``linear``=旧口径逐位不变；``sqrt``=20bps 基础 +
+        k×√参与率，冲击 > impact_cap 判「不可成交」（返回 None，不下单）。
         price_limits：{(code): (跌停价, 涨停价)}，可选。提供时把**含滑点的成交价**
         夹进该区间（2026-11-16 修复滑点越板：闸门只比 open 与涨跌停，开盘贴板时
         含滑点成交价可越板）；未提供（涨跌停校验关闭/无前收/新股窗口）不夹取。
@@ -99,20 +104,35 @@ class SimulatedDispatcher(OrderDispatcher):
         self.bar_volumes = bar_volumes
         self.slippage_impact_coef = slippage_impact_coef
         self.price_limits = price_limits or {}
+        self.impact_model = impact_model if impact_model in ("linear", "sqrt") else "linear"
+        self.impact_base = impact_base
+        self.impact_cap = impact_cap
 
-    def _effective_slippage(self, order: OrderEvent) -> Decimal:
-        """#4 自适应滑点：市场冲击随订单量占 bar 成交量比例线性上浮，封顶 0.10。
-        bar_volumes 值为 TQ Volume（单位=股），直接按股数占比计算。"""
+    def _effective_slippage(self, order: OrderEvent) -> Optional[Decimal]:
+        """#4 自适应滑点：线性（旧口径）/ sqrt（层 1）两档。
+
+        linear：冲击 = k×订单股数/bar 成交量，与固定滑点相加，封顶 0.10。
+        sqrt：冲击 = 20bps + k×√参与率；超过 impact_cap（默认 5%）返回 None，
+        由 ``place_order`` 视为「不可成交」不下单（容量切片把量压到参与率以内后
+        一般不会命中，此闸门用于兜底异常大单）。
+        bar_volumes 值为 TQ Volume（单位=股），直接按股数占比计算。
+        """
         if self.bar_volumes is None or self.slippage_impact_coef is None:
             return self.slippage
         vol = self.bar_volumes.get(order.stock_code)
         if not vol:
             return self.slippage
-        impact = (
-            self.slippage_impact_coef
-            * Decimal(order.quantity)
-            / Decimal(int(vol))
+        participation = (
+            Decimal(order.quantity) / Decimal(int(vol))
         )
+        if self.impact_model == "sqrt":
+            # 用 str() 转 Decimal，避免二进制浮点尾差（0.1 → 0.1000000000000000055…）
+            _sqrt_p = Decimal(str(math.sqrt(float(participation))))
+            impact = self.impact_base + self.slippage_impact_coef * _sqrt_p
+            if impact > self.impact_cap:
+                return None
+            return self.slippage + impact
+        impact = self.slippage_impact_coef * participation
         return min(self.slippage + impact, Decimal("0.10"))
 
     def place_order(self, order: OrderEvent) -> Optional[TradeEvent]:
@@ -122,6 +142,9 @@ class SimulatedDispatcher(OrderDispatcher):
             return None
         # 滑点：买入成交价上浮、卖出成交价下浮（#4 开启时按量动态上浮）
         slippage = self._effective_slippage(order)
+        # sqrt 冲击超过上限 → 判不可成交（异常大单兜底，容量切片正常情况下已拦下）
+        if slippage is None:
+            return None
         if order.trade_type.value == "BUY":
             fill_price = price * (Decimal("1") + slippage)
         else:
@@ -209,7 +232,7 @@ class LiveT1Checker(T1Checker):
 
 class ExecutionEngine:
     def __init__(self, dispatcher: OrderDispatcher, t1_checker: T1Checker,
-                 recorder=None, lot_size_of=None):
+                 recorder=None, lot_size_of=None, stats: Optional[dict] = None):
         self._dispatcher = dispatcher
         self._t1_checker = t1_checker
         # 决策闸门采集（调参可观测性）：默认空采集器，回测/实盘引擎注入同一实例
@@ -217,6 +240,9 @@ class ExecutionEngine:
         # 交易手数回调（可选，默认 None=恒 100 股，原行为）。
         # 可转债 10 张取整开启时由回测引擎注入 lot_size_for(code, bond_lot_enabled)。
         self._lot_size_of = lot_size_of
+        # 执行统计（层 1，可选共享 dict）：回测每 bar 重建 ExecutionEngine 时传入
+        # 同一引用，累计「BUY 订单数 / 被单笔金额上限缩量或拒单数」，用于 >5% 告警。
+        self.stats: dict = stats if stats is not None else {}
 
     def _lot(self, stock_code: str) -> int:
         if self._lot_size_of is None:
@@ -263,6 +289,7 @@ class ExecutionEngine:
         现金上限取 min(账本现金, 该值)——真实账户可用资金（快照表 × 0.98 缓冲）
         透传 approve_order.cash_override，防虚拟虚高导致柜台拒单。"""
         if order.trade_type.value == "BUY":
+            self.stats["buy_orders"] = int(self.stats.get("buy_orders", 0)) + 1
             lot = self._lot(order.stock_code)
             use_exposure = strategy_capital_limit is not None
             pos_value = (
@@ -338,6 +365,8 @@ class ExecutionEngine:
                     and order.price and order.price > 0):
                 max_qty = int(float(max_order_amount) / float(order.price) / lot) * lot
                 if max_qty < qty:
+                    self.stats["amount_cap_hits"] = int(
+                        self.stats.get("amount_cap_hits", 0)) + 1
                     if max_qty < lot:
                         self._rec_gate(
                             "order_amount_cap", "reject", order, "capital_gate",

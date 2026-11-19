@@ -1950,6 +1950,8 @@ _SNAPSHOT_KEYS = {
     "cash_enhance_position_ratio_threshold", "equity_cap",
     # 层 2（2026-11-19）：上限处理模式（cap 默认 / distribute 日终出金）
     "equity_cap_mode",
+    # 层 1（2026-11-19）：容量模型版本（v1 旧口径 / v2-sqrt-…）
+    "capacity_model_version",
     "fee_reserve_enabled",
     "bond_t0_enabled", "bond_lot_enabled",
     "daily_close_peak_enabled",

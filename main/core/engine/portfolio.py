@@ -216,6 +216,23 @@ class Portfolio:
         # 不受影响；builder 从组合表字段装配。
         self.adaptive_slippage_enabled: bool = False
         self.slippage_impact_coef: Decimal = Decimal("0.10")
+        # 层 1 容量模型（默认 linear=旧口径）：sqrt 启用「参与率 + sqrt 冲击 +
+        # 残量顺延切片」，替代 4% 成交量闸门与固定单笔金额闸门。参数取保守值，
+        # 可由 run 级请求覆盖；capacity_model != "sqrt" 时全部不生效（行为逐位一致）。
+        self.capacity_model: str = "linear"
+        # 单日参与率：中小盘 0.5% / 超大市值 1%（当日成交额 ≥ capacity_large_turnover）
+        self.capacity_daily_ratio_small: Decimal = Decimal("0.005")
+        self.capacity_daily_ratio_large: Decimal = Decimal("0.01")
+        # 最近 5 个交易日累计参与率：中小盘 1.5% / 超大市值 2%
+        self.capacity_5d_ratio_small: Decimal = Decimal("0.015")
+        self.capacity_5d_ratio_large: Decimal = Decimal("0.02")
+        self.capacity_large_turnover: Decimal = Decimal("5000000000")
+        # sqrt 冲击：20bps + k×√参与率，> 上限判不可成交
+        self.capacity_impact_base: Decimal = Decimal("0.002")
+        self.capacity_impact_k: Decimal = Decimal("0.10")
+        self.capacity_impact_cap: Decimal = Decimal("0.05")
+        # 残量顺延切片 TTL（根 bar）：超期作废，不整单拒绝
+        self.capacity_slice_ttl_bars: int = 3
         # 费用预留（可选，默认关）：开启后买入资金审批含佣金，防现金为负。
         # 经 setter 同步 account.buy_fee_cfg（见下方 property）。
         self._fee_reserve_enabled: bool = False

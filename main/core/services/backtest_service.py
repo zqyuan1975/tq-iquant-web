@@ -44,6 +44,7 @@ from core.engine.execution_profile import (
     snapshot_payload,
 )
 from core.engine.execution_engine import STAMP_DUTY_SEGMENTS_VERSION
+from core.engine.capacity import capacity_model_version as capacity_version_of
 from core.engine.evaluator import Evaluator
 from core.engine.crisis_alpha import (
     BENCHMARK_EXTRA_NAMES, CRISIS_BENCHMARKS, DEFAULT_BENCHMARK_CODE,
@@ -929,6 +930,7 @@ def build_params_snapshot(ps, dividend_mode: str = "front",
                           volume_limit_ratio=None,
                           equity_cap=None,
                           equity_cap_mode: str = "cap",
+                          capacity_model_version: str | None = None,
                           daily_close_peak_enabled: bool = False,
                           daily_loss_basis: str = "equity",
                           data_start: str | None = None,
@@ -990,6 +992,10 @@ def build_params_snapshot(ps, dividend_mode: str = "front",
     # 与 equity_cap 一起决定结果可比性。
     payload["equity_cap_mode"] = (
         equity_cap_mode if equity_cap_mode in ("cap", "distribute") else "cap")
+    # 容量模型版本（2026-11-19 层 1）：v1=旧口径（4% 成交量闸门/固定单笔上限）；
+    # v2-sqrt-…=参与率 + sqrt 冲击 + 残量顺延。改模型/改 k 都会改变结果数值，
+    # 老记录缺该键即 v1，跨记录比较先看此项。
+    payload["capacity_model_version"] = capacity_model_version or "v1"
     for name, val in (
         ("adaptive_slippage_enabled", adaptive_slippage_enabled),
         ("slippage_impact_coef", slippage_impact_coef),
@@ -3960,8 +3966,16 @@ def get_record_detail(
                     _exposure_ceiling_for_ps(db, ps.id) if ps else None),
             )
 
+    _snapshot_data = {}
+    try:
+        _snapshot_data = json.loads(rec.params_snapshot or "{}")
+    except (TypeError, ValueError):
+        _snapshot_data = {}
     return {
         "record": record_payload,
+        # 层 1 容量模型版本：老记录缺键即 v1（4% 闸门/固定单笔上限口径）
+        "capacity_model_version": (
+            (_snapshot_data or {}).get("capacity_model_version") or "v1"),
         "snapshots": [_serialize_snapshot(s) for s in snaps],
         "trades": [_serialize_trade_with_name(t, strat_name_map) for t in trades],
         "evaluations": evals_dict,
@@ -4575,6 +4589,27 @@ def run_backtest(db: Session, ps: PortfolioStrategy, req,
         _ec_mode_req if _ec_mode_req in ("cap", "distribute")
         else portfolio_settings.get_equity_cap_mode(ps.id)
     )
+    # 层 1 容量模型 run 级覆盖（None/非法 → linear=旧口径，结果逐位一致）。
+    # 版本串写入 params_snapshot；k 变化也会改变结果数值。
+    _cap_model_req = getattr(req, "capacity_model", None)
+    capacity_model = _cap_model_req if _cap_model_req in ("linear", "sqrt") else "linear"
+    _cap_k_req = getattr(req, "capacity_impact_k", None)
+    try:
+        capacity_impact_k = (Decimal(str(_cap_k_req))
+                             if _cap_k_req is not None else None)
+    except (TypeError, ValueError, ArithmeticError):
+        capacity_impact_k = None
+    capacity_version = "v1"
+    if capacity_model == "sqrt":
+        capacity_version = capacity_version_of(
+            "sqrt",
+            daily_small=Decimal("0.005"),
+            daily_large=Decimal("0.01"),
+            five_day_small=Decimal("0.015"),
+            five_day_large=Decimal("0.02"),
+            impact_k=(capacity_impact_k
+                      if capacity_impact_k is not None else Decimal("0.10")),
+        )
     # 日末 peak 保护（默认关；纯 1d 行为不变）
     daily_close_peak_enabled = bool(
         getattr(req, "daily_close_peak_enabled", False)
@@ -4676,6 +4711,7 @@ def run_backtest(db: Session, ps: PortfolioStrategy, req,
             volume_limit_ratio=volume_limit_ratio,
             equity_cap=equity_cap,
             equity_cap_mode=equity_cap_mode,
+            capacity_model_version=capacity_version,
             daily_close_peak_enabled=daily_close_peak_enabled,
             daily_loss_basis=daily_loss_basis,
             data_start=req.start_date,
@@ -4749,6 +4785,11 @@ def run_backtest(db: Session, ps: PortfolioStrategy, req,
         if equity_cap is not None:
             portfolio.equity_cap = Decimal(str(equity_cap))
         portfolio.equity_cap_mode = equity_cap_mode
+        # 层 1 容量模型（run 级，仅本轮内存生效）：sqrt 时启用参与率预算 +
+        # sqrt 冲击 + 残量顺延，并停用旧 4% 成交量闸门的双重约束（引擎内互斥）。
+        portfolio.capacity_model = capacity_model
+        if capacity_impact_k is not None:
+            portfolio.capacity_impact_k = capacity_impact_k
         t1 = datetime.now()
         # klines 含公式预热段（早于 start，保证首根 bar 公式有效值）
         # 时点池关闭（默认）时不传 pool_codes：取数口径与改动前逐字一致
@@ -4930,6 +4971,17 @@ def run_backtest(db: Session, ps: PortfolioStrategy, req,
             getattr(ps, "position_sizing", "dynamic"),
             getattr(ps, "equity_cap", None),
         ))
+        # 层 1：单笔金额上限已回归「异常保护」语义；被它缩量/拒单的订单占比
+        # 超过 5% 说明阈值偏低或策略下单价异常，显式告警（不自动调参）。
+        _exec_stats = result.get("execution_stats") or {}
+        _buy_orders = int(_exec_stats.get("buy_orders") or 0)
+        _cap_hits = int(_exec_stats.get("amount_cap_hits") or 0)
+        if _buy_orders > 0 and _cap_hits / _buy_orders > 0.05:
+            warnings.append(
+                "单笔金额上限（异常保护）触发 %d/%d 笔买入（%.1f%% > 5%%）："
+                "阈值可能偏低或订单金额异常，请检查 max_order_amount / 单仓目标"
+                % (_cap_hits, _buy_orders, _cap_hits * 100.0 / _buy_orders)
+            )
 
         _persist_result(db, record_id, ps.id, result, strategies)
         t8 = datetime.now()
@@ -5111,6 +5163,26 @@ def run_multi_backtest(db: Session, portfolios: list, req) -> dict:
         getattr(req, "execution_profile", None), _exec_overrides)
     exec_snapshot = snapshot_payload(exec_flags)
     _exec_realistic = exec_flags["profile"] == PROFILE_REALISTIC
+    # 层 1 容量模型 run 级覆盖（None/非法 → linear=旧口径）
+    _cap_model_req = getattr(req, "capacity_model", None)
+    capacity_model = _cap_model_req if _cap_model_req in ("linear", "sqrt") else "linear"
+    _cap_k_req = getattr(req, "capacity_impact_k", None)
+    try:
+        capacity_impact_k = (Decimal(str(_cap_k_req))
+                             if _cap_k_req is not None else None)
+    except (TypeError, ValueError, ArithmeticError):
+        capacity_impact_k = None
+    capacity_version = "v1"
+    if capacity_model == "sqrt":
+        capacity_version = capacity_version_of(
+            "sqrt",
+            daily_small=Decimal("0.005"),
+            daily_large=Decimal("0.01"),
+            five_day_small=Decimal("0.015"),
+            five_day_large=Decimal("0.02"),
+            impact_k=(capacity_impact_k
+                      if capacity_impact_k is not None else Decimal("0.10")),
+        )
 
     # 每个组合的策略列表 / 装配 / 口径组件（全在写库前完成：取数或门控失败
     # 抛 ValueError → 路由 400，不产生一条必然失败的 running 记录）
@@ -5158,6 +5230,10 @@ def run_multi_backtest(db: Session, portfolios: list, req) -> dict:
         portfolio.risk_manager.daily_loss_on_equity_enabled = (_basis != "initial")
         # 上限处理模式（组合 JSON 侧配置；缺省 cap=旧行为）
         portfolio.equity_cap_mode = portfolio_settings.get_equity_cap_mode(ps.id)
+        # 层 1 容量模型（run 级；各组合共享同一 CapacityBudget 实现跨策略聚合）
+        portfolio.capacity_model = capacity_model
+        if capacity_impact_k is not None:
+            portfolio.capacity_impact_k = capacity_impact_k
         # 市场多空门控：run 级三态覆盖（None=跟随组合；策略 on 可单独启用）
         _gate_req = getattr(req, "market_gate_enabled", None)
         gate_enabled = gate_enabled_for(ps, strategies, _gate_req)
@@ -5251,6 +5327,7 @@ def run_multi_backtest(db: Session, portfolios: list, req) -> dict:
                 params_snapshot=build_params_snapshot(
                     ps, dividend_mode=dividend_mode,
                     equity_cap_mode=portfolio_settings.get_equity_cap_mode(ps.id),
+                    capacity_model_version=capacity_version,
                     daily_loss_basis=(daily_loss_basis if daily_loss_basis in
                                       ("equity", "initial") else
                                       (getattr(ps, "daily_loss_basis", None) or "equity")),
@@ -5324,6 +5401,15 @@ def run_multi_backtest(db: Session, portfolios: list, req) -> dict:
                 "canceled": True,
             }
         decisions = results.pop("_decisions", []) if isinstance(results, dict) else []
+        _exec_stats = results.pop("execution_stats", {}) if isinstance(results, dict) else {}
+        _buy_orders = int(_exec_stats.get("buy_orders") or 0)
+        _cap_hits = int(_exec_stats.get("amount_cap_hits") or 0)
+        _cap_warning = None
+        if _buy_orders > 0 and _cap_hits / _buy_orders > 0.05:
+            _cap_warning = (
+                "单笔金额上限（异常保护）触发 %d/%d 笔买入（%.1f%% > 5%%）："
+                "阈值可能偏低或订单金额异常，请检查 max_order_amount / 单仓目标"
+                % (_cap_hits, _buy_orders, _cap_hits * 100.0 / _buy_orders))
         per_portfolio: Dict[int, dict] = {}
         for e in entries:
             ps = e["ps"]
@@ -5349,6 +5435,9 @@ def run_multi_backtest(db: Session, portfolios: list, req) -> dict:
                     rec.warnings_json = json.dumps(
                         [f"回测结束时仍有 {res['pending_order_count']} 笔信号未成交"],
                         ensure_ascii=False)
+                elif _cap_warning:
+                    rec.warnings_json = json.dumps(
+                        [_cap_warning], ensure_ascii=False)
                 rec.completed_at = datetime.now(timezone.utc).replace(tzinfo=None)
             db.commit()
 

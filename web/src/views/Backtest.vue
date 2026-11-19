@@ -119,7 +119,7 @@ const showBacktestGuide = ref(false)
 const submitting = ref(false)
 // 高级选项（评估口径 / IS-OOS 采纳门槛 / 费用预留 / 自适应滑点）默认折叠：发起回测默认走增强前的基础方式
 const showAdvanced = ref(false)
-const form = ref({ portfolio_strategy_id: 0, name: '', start_date: '', end_date: '', dividend_mode: 'front', evaluation_profile: 'absolute', is_oos_gate_enabled: false, oos_gate_min_ratio: 0.5, fee_reserve_enabled: false, bond_t0_enabled: false, bond_lot_enabled: false, adaptive_slippage_enabled: undefined as boolean | undefined, slippage_impact_coef: undefined as string | undefined, volume_limit_enabled: undefined as boolean | undefined, volume_limit_ratio: undefined as string | undefined, equity_cap: undefined as string | undefined, daily_close_peak_enabled: false, daily_loss_basis: '' as '' | 'equity' | 'initial', market_gate_enabled: '' as '' | 'true' | 'false' })
+const form = ref({ portfolio_strategy_id: 0, name: '', start_date: '', end_date: '', dividend_mode: 'front', evaluation_profile: 'absolute', is_oos_gate_enabled: false, oos_gate_min_ratio: 0.5, fee_reserve_enabled: false, bond_t0_enabled: false, bond_lot_enabled: false, adaptive_slippage_enabled: undefined as boolean | undefined, slippage_impact_coef: undefined as string | undefined, volume_limit_enabled: undefined as boolean | undefined, volume_limit_ratio: undefined as string | undefined, equity_cap: undefined as string | undefined, capacity_model: '' as '' | 'linear' | 'sqrt', capacity_impact_k: '0.1' as string, daily_close_peak_enabled: false, daily_loss_basis: '' as '' | 'equity' | 'initial', market_gate_enabled: '' as '' | 'true' | 'false' })
 const gateBanner = ref<BacktestGateResult | null>(null)
 
 // ===== 详情视图 =====
@@ -1291,6 +1291,8 @@ function openForm() {
     slippage_impact_coef: undefined,
     volume_limit_enabled: undefined,
     volume_limit_ratio: undefined,
+    capacity_model: '',
+    capacity_impact_k: '0.1',
     equity_cap: undefined,
     daily_close_peak_enabled: false,
     daily_loss_basis: '',
@@ -1323,6 +1325,10 @@ async function submit() {
   if (form.value.equity_cap !== undefined && form.value.equity_cap !== '') {
     const e = Number(form.value.equity_cap)
     if (!(e > 0)) { alert('容量上限必须大于 0（留空=用组合默认）'); return }
+  }
+  if (form.value.capacity_model === 'sqrt') {
+    const k = Number(form.value.capacity_impact_k)
+    if (!(k > 0 && k <= 1)) { alert('sqrt 冲击系数 k 须在 (0,1]'); return }
   }
   submitting.value = true
   try {
@@ -1363,6 +1369,14 @@ async function submit() {
             : {}),
           ...(form.value.equity_cap !== undefined && form.value.equity_cap !== ''
             ? { equity_cap: Number(form.value.equity_cap) }
+            : {}),
+          ...(form.value.capacity_model
+            ? {
+                capacity_model: form.value.capacity_model as 'linear' | 'sqrt',
+                ...(form.value.capacity_model === 'sqrt'
+                  ? { capacity_impact_k: Number(form.value.capacity_impact_k) }
+                  : {}),
+              }
             : {}),
     })
     showForm.value = false
@@ -3914,6 +3928,24 @@ watch(theme, () => {
                 <input type="number" step="10000" min="1000" v-model="form.equity_cap" placeholder="用组合默认" data-field="equity_cap" />
                 <span class="field-suffix">元（留空=用组合默认）</span>
               </div>
+              <div class="field-row">
+                <span class="field-label">容量模型</span>
+                <select v-model="form.capacity_model" data-field="capacity_model">
+                  <option value="">默认（linear 旧口径）</option>
+                  <option value="linear">linear（4% 成交量闸门）</option>
+                  <option value="sqrt">sqrt（参与率 + 冲击 + 残量顺延）</option>
+                </select>
+                <span class="field-suffix">改模型会改变结果数值，写入 capacity_model_version</span>
+              </div>
+              <div class="field-row" v-if="form.capacity_model === 'sqrt'">
+                <span class="field-label">sqrt 冲击系数 k</span>
+                <select v-model="form.capacity_impact_k" data-field="capacity_impact_k">
+                  <option value="0.05">0.05（低敏感）</option>
+                  <option value="0.1">0.10（默认）</option>
+                  <option value="0.2">0.20（高敏感）</option>
+                </select>
+                <span class="field-suffix">冲击 = 20bps + k×√参与率（>5% 判不可成交）</span>
+              </div>
             </div>
           </div>
         </div>
@@ -3990,6 +4022,11 @@ watch(theme, () => {
       <button @click="backToList" class="back-link btn btn-sm">← 返回</button>
       <h1>{{ currentRecord.name }}</h1>
       <p class="subtitle">{{ currentRecord.start_date }} ~ {{ currentRecord.end_date }} · {{ subtitle }}</p>
+      <p class="subtitle" v-if="detail">
+        容量模型版本 <code>{{ detail.capacity_model_version || 'v1' }}</code>
+        <span v-if="(detail.capacity_model_version || 'v1') === 'v1'">（4% 成交量闸门 / 固定单笔上限旧口径）</span>
+        <span v-else>（参与率 + sqrt 冲击 + 残量顺延）</span>
+      </p>
       <a v-if="currentRecord.id"
          :href="`/api/backtest/records/${currentRecord.id}/export/html`"
          target="_blank"

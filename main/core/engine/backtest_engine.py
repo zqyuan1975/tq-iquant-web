@@ -8,6 +8,7 @@ from .portfolio import Portfolio
 from .position import Position, is_convertible_bond, lot_size_for
 from .execution_engine import ExecutionEngine, SimulatedDispatcher, SimulatedT1Checker
 from .cash_allocator import MIN_FILL_RATIO, allocate_batch_buys
+from .capacity import CapacityBudget
 from .format import fmt_money
 from .evaluator import Evaluator
 from .event import BarEvent, OrderEvent, TradeEvent
@@ -207,6 +208,11 @@ class BacktestEngine:
         price_limit_recorded: set = set()
         # #2 成交量约束：已记过 volume_cap_defer 事件的订单 id（每订单只记 1 条）
         volume_defer_recorded: set = set()
+        # 层 1 容量模型（sqrt）：参与率 + 5 日累计 + 同日同票跨策略聚合。
+        # 单组合路径一个实例；多组合路径共享同一实例以聚合各策略订单。
+        capacity = self._build_capacity_budget(portfolio, klines)
+        # 执行统计（BUY 单数 / 单笔金额上限缩量数）→ 服务层 >5% 告警
+        run_stats: dict = {}
         # 策略层快照：strategy_id → 快照序列。共享现金按 capital_ratio 归一化分摊。
         strategy_snapshots: Dict[int, List[dict]] = {
             ctx.strategy_id: [] for ctx in portfolio.strategies
@@ -359,18 +365,26 @@ class BacktestEngine:
                 # #4 自适应滑点（可选，默认关）：开启时透传本 bar 各票成交量
                 # （手）与冲击系数，dispatcher 按订单量占比动态加滑点；
                 # 关闭时不传（dispatcher 走固定滑点，原行为）。
+                # 层 1：容量模型 sqrt 时同样需要成交量与 sqrt 冲击参数（k 取
+                # capacity_impact_k），并为超限大单提供「不可成交」兜底。
+                _use_impact = (
+                    portfolio.adaptive_slippage_enabled or capacity is not None)
                 dispatcher = SimulatedDispatcher(
                     bar_open_prices,
                     bar_volumes=(
                         {code: ohlcv.get("volume")
                          for code, ohlcv in price_index.get((t, period), {}).items()}
-                        if portfolio.adaptive_slippage_enabled else None
+                        if _use_impact else None
                     ),
                     slippage_impact_coef=(
-                        portfolio.slippage_impact_coef
-                        if portfolio.adaptive_slippage_enabled else None
+                        portfolio.capacity_impact_k if capacity is not None
+                        else (portfolio.slippage_impact_coef
+                              if portfolio.adaptive_slippage_enabled else None)
                     ),
                     price_limits=bar_price_limits or None,
+                    impact_model=("sqrt" if capacity is not None else "linear"),
+                    impact_base=portfolio.capacity_impact_base,
+                    impact_cap=portfolio.capacity_impact_cap,
                     **portfolio.cost_params,
                 )
                 engine = ExecutionEngine(
@@ -379,6 +393,7 @@ class BacktestEngine:
                     lot_size_of=lambda code: lot_size_for(
                         code, portfolio.bond_lot_enabled
                     ),
+                    stats=run_stats,
                 )
                 # 未来函数闸门：日线级信号（signal_bar_date 非 None）须在
                 # t.date() > signal_bar_date 的下一交易日成交，防止当日 00:00
@@ -506,7 +521,73 @@ class BacktestEngine:
                     # 残量回队续成交（仅 BUY；卖出残量由既有风控残量/下一次信号处理，
                     # 避免一次卖出被拆成两笔重复计入卖出信号统计）。
                     partial_residual = 0
-                    if portfolio.volume_limit_enabled:
+                    # 层 1 容量模型（sqrt）：参与率预算不足 → 残量顺延切片（TTL 内
+                    # 每根 bar 重校验价格笼子/现金），不整单拒绝；超 TTL 才作废。
+                    # 与旧 4% 闸门互斥：sqrt 下一律走本链路，linear/legacy 不变。
+                    capacity_residual = 0
+                    if capacity is not None:
+                        _row = price_index.get((t, period), {}).get(
+                            order.stock_code) or {}
+                        _is_buy = order.trade_type == TradeType.BUY
+                        _requested = order.quantity
+                        _allowed, _why = capacity.allow(
+                            order.stock_code, t, _row.get("volume"),
+                            _row.get("close"), _requested,
+                            lot_size_for(order.stock_code,
+                                         portfolio.bond_lot_enabled)
+                            if _is_buy else 1,
+                        )
+                        if _allowed < _requested:
+                            recorder.record(
+                                gate="capacity_slice", layer="execution",
+                                action=("shrink" if _allowed > 0 else "defer"),
+                                portfolio_id=order.portfolio_id or 0,
+                                strategy_id=order.strategy_id,
+                                stock_code=order.stock_code,
+                                bar_time=t,
+                                requested_qty=_requested,
+                                final_qty=_allowed,
+                                param_name=_why,
+                                message="容量约束（%s）：请求 %d 股，本 bar 可成交 %d 股，"
+                                        "残量顺延（TTL %d 根 bar）"
+                                        % ({"bar": "本 bar 成交量",
+                                            "day": "当日累计成交量",
+                                            "5d": "5 日累计成交量",
+                                            "no_volume": "无成交量"}.get(_why, _why),
+                                           _requested, _allowed,
+                                           portfolio.capacity_slice_ttl_bars),
+                            )
+                            if _allowed <= 0:
+                                if (order.capacity_carry_bars + 1
+                                        >= portfolio.capacity_slice_ttl_bars):
+                                    recorder.record(
+                                        gate="capacity_slice_expired",
+                                        layer="execution", action="cancel",
+                                        portfolio_id=order.portfolio_id or 0,
+                                        strategy_id=order.strategy_id,
+                                        stock_code=order.stock_code,
+                                        bar_time=t,
+                                        requested_qty=_requested,
+                                        param_name="capacity_slice_ttl_bars",
+                                        param_value=float(
+                                            portfolio.capacity_slice_ttl_bars),
+                                        message="容量约束顺延超过 %d 根 bar 仍未成交，"
+                                                "订单作废" % portfolio.capacity_slice_ttl_bars,
+                                    )
+                                    continue
+                                deferred.append(replace(
+                                    order,
+                                    capacity_carry_bars=order.capacity_carry_bars + 1,
+                                ))
+                                continue
+                            if (not _is_buy
+                                    and order.signal_type in _RISK_SELL_TYPES):
+                                # 风控卖单残量沿用既有 risk_sell_residual 回队
+                                risk_sell_original = _requested
+                            else:
+                                capacity_residual = _requested - _allowed
+                            order.quantity = _allowed
+                    elif portfolio.volume_limit_enabled:
                         bar_volume = price_index.get((t, period), {}).get(
                             order.stock_code, {}).get("volume")
                         if bar_volume is not None:
@@ -630,6 +711,44 @@ class BacktestEngine:
                             message="成交量约束部分成交，剩余 %d 股回队于后续 bar 续买"
                                     "（execution_profile=realistic）" % partial_residual,
                         )
+                    # 层 1 容量模型：以实际成交量记账（资金/敞口二次缩量后仍准确），
+                    # 并把未成交残量作为新在途单回队（TTL 内继续切片；超期作废）。
+                    if capacity is not None and trade is not None:
+                        capacity.consume(order.stock_code, t,
+                                         int(getattr(trade, "quantity", 0) or 0))
+                    if capacity_residual > 0 and trade is not None:
+                        if (order.capacity_carry_bars + 1
+                                >= portfolio.capacity_slice_ttl_bars):
+                            recorder.record(
+                                gate="capacity_slice_expired", layer="execution",
+                                action="cancel",
+                                portfolio_id=order.portfolio_id or 0,
+                                strategy_id=order.strategy_id,
+                                stock_code=order.stock_code,
+                                bar_time=t,
+                                requested_qty=capacity_residual,
+                                param_name="capacity_slice_ttl_bars",
+                                param_value=float(portfolio.capacity_slice_ttl_bars),
+                                message="容量切片残量 %d 股顺延超过 %d 根 bar，作废"
+                                        % (capacity_residual,
+                                           portfolio.capacity_slice_ttl_bars),
+                            )
+                        else:
+                            deferred.append(replace(
+                                order, quantity=capacity_residual,
+                                capacity_carry_bars=order.capacity_carry_bars + 1,
+                            ))
+                            recorder.record(
+                                gate="capacity_slice", layer="execution",
+                                action="carry",
+                                portfolio_id=order.portfolio_id or 0,
+                                strategy_id=order.strategy_id,
+                                stock_code=order.stock_code,
+                                bar_time=t,
+                                requested_qty=capacity_residual,
+                                message="容量约束部分成交，残量 %d 股顺延至后续 bar 续成交"
+                                        % capacity_residual,
+                            )
 
             # 2. 构造 BarEvent（从预建索引 O(1) 查表；含当前周期标注）
             bar = self._build_bar(price_index, t, period)
@@ -822,6 +941,8 @@ class BacktestEngine:
             # 修复 10 汇总：风控触发次数 vs 风控卖单成交笔数（缩量分批可见）
             "risk_sell_trigger_count": risk_trigger_count,
             "risk_sell_fill_attempts": risk_fill_attempts,
+            # 层 1：BUY 单数 / 单笔金额上限缩量数（服务层 >5% 告警）
+            "execution_stats": run_stats,
         }
 
     def run_multi(
@@ -888,6 +1009,14 @@ class BacktestEngine:
         price_limit_recorded: set = set()
         volume_defer_recorded: set = set()
         _rule_cache: Dict[tuple, object] = {}
+        # 层 1 容量模型（sqrt）：多组合共享**同一实例**（同日同票跨策略聚合），
+        # 参数取首个启用 sqrt 的组合；未启用 sqrt 的组合不持有预算（旧行为）。
+        _cap_portfolio = next(
+            (p for p in portfolios
+             if getattr(p, "capacity_model", "linear") == "sqrt"), None)
+        capacity = (self._build_capacity_budget(_cap_portfolio, klines)
+                    if _cap_portfolio is not None else None)
+        run_stats: dict = {}
 
         states = []
         for portfolio in portfolios:
@@ -995,6 +1124,11 @@ class BacktestEngine:
             for s in states:
                 deferred: List[OrderEvent] = []
                 portfolio = s["portfolio"]
+                # 本组合是否启用 sqrt 容量模型（run 级开关，但按组合判定以兼容混跑）
+                _pf_capacity = (
+                    capacity
+                    if getattr(portfolio, "capacity_model", "linear") == "sqrt"
+                    else None)
                 deferred_by_state.append(deferred)
                 if not s["pending"]:
                     continue
@@ -1024,17 +1158,24 @@ class BacktestEngine:
                 dispatcher = SimulatedDispatcher(
                     bar_open_prices,
                     bar_volumes=(
-                        bar_volumes if portfolio.adaptive_slippage_enabled else None),
+                        bar_volumes
+                        if (portfolio.adaptive_slippage_enabled
+                            or _pf_capacity is not None) else None),
                     slippage_impact_coef=(
-                        portfolio.slippage_impact_coef
-                        if portfolio.adaptive_slippage_enabled else None),
+                        portfolio.capacity_impact_k if _pf_capacity is not None
+                        else (portfolio.slippage_impact_coef
+                              if portfolio.adaptive_slippage_enabled else None)),
                     price_limits=bar_price_limits or None,
+                    impact_model=("sqrt" if _pf_capacity is not None else "linear"),
+                    impact_base=portfolio.capacity_impact_base,
+                    impact_cap=portfolio.capacity_impact_cap,
                     **portfolio.cost_params,
                 )
                 engine = ExecutionEngine(
                     dispatcher, SimulatedT1Checker(), recorder=recorder,
                     lot_size_of=lambda code: lot_size_for(
                         code, portfolio.bond_lot_enabled),
+                    stats=run_stats,
                 )
                 for order in s["pending"]:
                     if (pending_order_max_days and pending_order_max_days > 0
@@ -1109,7 +1250,71 @@ class BacktestEngine:
                                     deferred.append(order)
                                     continue
                     partial_residual = 0
-                    if portfolio.volume_limit_enabled:
+                    # 层 1 容量模型（sqrt）：与单组合同一口径，预算实例在组合间共享
+                    # → 同日同票跨策略/跨组合自动聚合。
+                    capacity_residual = 0
+                    if _pf_capacity is not None:
+                        _row = price_index.get((t, period), {}).get(
+                            order.stock_code) or {}
+                        _is_buy = order.trade_type == TradeType.BUY
+                        _requested = order.quantity
+                        _allowed, _why = _pf_capacity.allow(
+                            order.stock_code, t, _row.get("volume"),
+                            _row.get("close"), _requested,
+                            lot_size_for(order.stock_code,
+                                         portfolio.bond_lot_enabled)
+                            if _is_buy else 1,
+                        )
+                        if _allowed < _requested:
+                            recorder.record(
+                                gate="capacity_slice", layer="execution",
+                                action=("shrink" if _allowed > 0 else "defer"),
+                                portfolio_id=order.portfolio_id or 0,
+                                strategy_id=order.strategy_id,
+                                stock_code=order.stock_code,
+                                bar_time=t,
+                                requested_qty=_requested,
+                                final_qty=_allowed,
+                                param_name=_why,
+                                message="容量约束（%s）：请求 %d 股，本 bar 可成交 %d 股，"
+                                        "残量顺延（TTL %d 根 bar）"
+                                        % ({"bar": "本 bar 成交量",
+                                            "day": "当日累计成交量",
+                                            "5d": "5 日累计成交量",
+                                            "no_volume": "无成交量"}.get(_why, _why),
+                                           _requested, _allowed,
+                                           portfolio.capacity_slice_ttl_bars),
+                            )
+                            if _allowed <= 0:
+                                if (order.capacity_carry_bars + 1
+                                        >= portfolio.capacity_slice_ttl_bars):
+                                    recorder.record(
+                                        gate="capacity_slice_expired",
+                                        layer="execution", action="cancel",
+                                        portfolio_id=order.portfolio_id or 0,
+                                        strategy_id=order.strategy_id,
+                                        stock_code=order.stock_code,
+                                        bar_time=t,
+                                        requested_qty=_requested,
+                                        param_name="capacity_slice_ttl_bars",
+                                        param_value=float(
+                                            portfolio.capacity_slice_ttl_bars),
+                                        message="容量约束顺延超过 %d 根 bar 仍未成交，"
+                                                "订单作废" % portfolio.capacity_slice_ttl_bars,
+                                    )
+                                    continue
+                                deferred.append(replace(
+                                    order,
+                                    capacity_carry_bars=order.capacity_carry_bars + 1,
+                                ))
+                                continue
+                            if (not _is_buy
+                                    and order.signal_type in _RISK_SELL_TYPES):
+                                risk_sell_original = _requested
+                            else:
+                                capacity_residual = _requested - _allowed
+                            order.quantity = _allowed
+                    elif portfolio.volume_limit_enabled:
                         bar_volume = bar_volumes.get(order.stock_code)
                         if bar_volume is not None:
                             cap_shares = int(
@@ -1175,6 +1380,44 @@ class BacktestEngine:
                     if (_partial_fill and trade is not None
                             and partial_residual > 0):
                         deferred.append(replace(order, quantity=partial_residual))
+                    # 层 1 容量模型：实际成交量记账 + 残量顺延（TTL 超期作废）
+                    if _pf_capacity is not None and trade is not None:
+                        _pf_capacity.consume(
+                            order.stock_code, t,
+                            int(getattr(trade, "quantity", 0) or 0))
+                    if capacity_residual > 0 and trade is not None:
+                        if (order.capacity_carry_bars + 1
+                                >= portfolio.capacity_slice_ttl_bars):
+                            recorder.record(
+                                gate="capacity_slice_expired", layer="execution",
+                                action="cancel",
+                                portfolio_id=order.portfolio_id or 0,
+                                strategy_id=order.strategy_id,
+                                stock_code=order.stock_code,
+                                bar_time=t,
+                                requested_qty=capacity_residual,
+                                param_name="capacity_slice_ttl_bars",
+                                param_value=float(portfolio.capacity_slice_ttl_bars),
+                                message="容量切片残量 %d 股顺延超过 %d 根 bar，作废"
+                                        % (capacity_residual,
+                                           portfolio.capacity_slice_ttl_bars),
+                            )
+                        else:
+                            deferred.append(replace(
+                                order, quantity=capacity_residual,
+                                capacity_carry_bars=order.capacity_carry_bars + 1,
+                            ))
+                            recorder.record(
+                                gate="capacity_slice", layer="execution",
+                                action="carry",
+                                portfolio_id=order.portfolio_id or 0,
+                                strategy_id=order.strategy_id,
+                                stock_code=order.stock_code,
+                                bar_time=t,
+                                requested_qty=capacity_residual,
+                                message="容量约束部分成交，残量 %d 股顺延至后续 bar 续成交"
+                                        % capacity_residual,
+                            )
 
             bar = self._build_bar(price_index, t, period)
 
@@ -1336,6 +1579,7 @@ class BacktestEngine:
                 "pending_order_count": len(s["pending"]),
             }
         results["_decisions"] = [ev.to_dict() for ev in recorder.drain()]
+        results["execution_stats"] = run_stats
         return results
 
     def _exposure_kwargs(self, portfolio: Portfolio, ctx) -> dict:
@@ -1356,10 +1600,30 @@ class BacktestEngine:
                 ctx.capital_ratio * portfolio.account.initial_capital
             )
         _moa = getattr(ctx, "max_order_amount", None)
+        # 层 1：sqrt 容量模型下，未显式配置单笔上限时按「20 × 单仓目标」兜底，
+        # 语义为异常保护（正常单仓目标 = single_open_ratio × 策略资金），不再
+        # 充当固定 50 万级别的硬闸门；显式配置仍以配置为准。
+        if _moa is None and getattr(portfolio, "capacity_model", "linear") == "sqrt":
+            _target = Decimal(str(ctx.single_open_ratio)) * portfolio._strategy_fund(ctx)
+            _moa = _target * Decimal("20")
         kwargs["max_order_amount"] = (
             Decimal(str(_moa)) if _moa is not None else None
         )
         return kwargs
+
+    def _build_capacity_budget(self, portfolio, klines):
+        """层 1：capacity_model == "sqrt" 时建容量预算，否则返回 None（旧行为）。"""
+        if portfolio is None or getattr(portfolio, "capacity_model", "linear") != "sqrt":
+            return None
+        return CapacityBudget(
+            klines,
+            daily_small=portfolio.capacity_daily_ratio_small,
+            daily_large=portfolio.capacity_daily_ratio_large,
+            five_day_small=portfolio.capacity_5d_ratio_small,
+            five_day_large=portfolio.capacity_5d_ratio_large,
+            large_turnover=portfolio.capacity_large_turnover,
+            ttl_bars=portfolio.capacity_slice_ttl_bars,
+        )
 
     def _build_timeline(self, klines: dict) -> List[tuple]:
         """合并所有股票所有周期的时间轴，返回排序去重的 (datetime, period) 列表。

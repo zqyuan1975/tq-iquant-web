@@ -76,6 +76,10 @@ class OrderEvent:
     # 交易日累计「已顺延天数」，超过 pending_order_max_days 作废（防停牌/连板
     # 无限顺延后凭空补做）。随增量 checkpoint 序列化，跨段续跑仍受同一上限约束。
     pending_since: Optional[date] = None
+    # 容量切片顺延次数（层 1）：sqrt 容量模型下，参与率不足导致整单/残量回队时
+    # +1；达到 capacity_slice_ttl_bars 即作废。与 pending_since 的 20 日上限独立，
+    # 专门限制「流动性不足」造成的长期挂单。
+    capacity_carry_bars: int = 0
 
 
 @dataclass
