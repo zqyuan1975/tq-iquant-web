@@ -206,35 +206,31 @@ onUnmounted(() => {
         <span class="frame-title">核心指标</span>
       </div>
       <div class="frame-body">
-        <div class="metric-grid" style="gap:12px;margin-bottom:0">
-          <div class="metric-card">
-            <span class="metric-label">股票池</span>
-            <span class="metric-value">{{ poolCount }}</span>
+        <div class="dash-stats">
+          <div class="dash-stat">
+            <span class="dash-stat-label">股票池</span>
+            <b class="dash-stat-value">{{ poolCount }}</b>
           </div>
-          <div class="metric-card">
-            <span class="metric-label">公式</span>
-            <span class="metric-value">{{ formulaCount }}</span>
+          <div class="dash-stat">
+            <span class="dash-stat-label">公式</span>
+            <b class="dash-stat-value">{{ formulaCount }}</b>
           </div>
-          <div class="metric-card">
-            <span class="metric-label">组合策略</span>
-            <span class="metric-value">{{ portfolioCount }}</span>
+          <div class="dash-stat">
+            <span class="dash-stat-label">组合策略</span>
+            <b class="dash-stat-value">{{ portfolioCount }}</b>
           </div>
-          <div class="metric-card">
-            <span class="metric-label">回测记录</span>
-            <span class="metric-value">{{ backtestCount }}</span>
+          <div class="dash-stat">
+            <span class="dash-stat-label">回测记录</span>
+            <b class="dash-stat-value">{{ backtestCount }}</b>
           </div>
-          <div class="metric-card">
-            <span class="metric-label">实盘会话</span>
-            <span class="metric-value" :style="{ fontSize: '15px' }">
-              运行中 {{ liveRunning }} · 共 {{ liveCount }}
-            </span>
+          <div class="dash-stat">
+            <span class="dash-stat-label">实盘会话</span>
+            <b class="dash-stat-value">运行中 {{ liveRunning }} · 共 {{ liveCount }}</b>
           </div>
-          <div class="metric-card">
-            <span class="metric-label">Core 状态</span>
-            <span class="metric-value" :style="{ fontSize: '15px' }">
-              {{ status ? (status.core.online ? '在线' : '离线') : '-' }}
-            </span>
-            <span class="metric-label" style="font-size:11px">
+          <div class="dash-stat">
+            <span class="dash-stat-label">Core 状态</span>
+            <b class="dash-stat-value">{{ status ? (status.core.online ? '在线' : '离线') : '-' }}</b>
+            <span class="dash-stat-sub">
               {{ status ? `v${status.core.version} · 运行 ${status.core.uptime}` : '未获取到状态' }}
             </span>
           </div>
@@ -249,7 +245,7 @@ onUnmounted(() => {
       </div>
       <div class="frame-body">
         <div class="table-wrap">
-          <table>
+          <table class="dash-table">
             <thead><tr><th>名称</th><th>引擎</th><th>执行模式</th><th>组合</th><th>状态</th><th>对账差异</th></tr></thead>
             <tbody>
               <tr v-for="s in liveSessions" :key="s.id">
@@ -284,12 +280,11 @@ onUnmounted(() => {
       </div>
       <div class="frame-body">
         <div class="channel-wrap">
-          <div class="metric-grid channel-grid">
-            <div v-for="c in channels" :key="c.key" class="metric-card channel-card">
-              <span class="metric-label">{{ c.label }}</span>
-              <span class="metric-value channel-status" :class="channelClass(c)" :style="{ fontSize: '15px' }">
-                {{ channelText(c) }}
-              </span>
+          <div class="channel-grid">
+            <div v-for="c in channels" :key="c.key" class="channel-card">
+              <span class="channel-dot" :class="channelClass(c)"></span>
+              <span class="metric-label channel-name" :title="c.label">{{ c.label }}</span>
+              <span class="channel-status" :class="channelClass(c)">{{ channelText(c) }}</span>
               <span class="channel-meta" :title="channelMeta(c)">
                 <span class="meta-line">{{ channelDetail(c) || '—' }}</span>
                 <span v-if="channelSub(c)" class="meta-line meta-sub">{{ channelSub(c) }}</span>
@@ -307,7 +302,7 @@ onUnmounted(() => {
       </div>
       <div class="frame-body">
         <div class="table-wrap">
-          <table>
+          <table class="dash-table">
             <thead><tr><th>名称</th><th>区间</th><th>状态</th></tr></thead>
             <tbody>
               <tr v-for="r in recentBacktests" :key="r.id">
@@ -332,12 +327,12 @@ onUnmounted(() => {
         <span class="frame-title">系统配置</span>
       </div>
       <div class="frame-body">
-        <p v-if="cfg" style="margin:0;color:var(--ink-soft);line-height:1.8">
+        <p v-if="cfg" class="dash-cfg">
           通达信路径：{{ cfg.tdx_path }}<br>
           掘金桥：{{ cfg.goldminer?.base_url ?? '—' }}<br>
           掘金账户：{{ cfg.goldminer?.account_id || '—' }}
         </p>
-        <p v-else style="margin:0;color:var(--ink-soft)">配置加载失败</p>
+        <p v-else class="dash-cfg">配置加载失败</p>
       </div>
     </div>
   </template>
@@ -357,54 +352,80 @@ onUnmounted(() => {
 .dash-hero-stats b { font-family: var(--font-serif); font-size: 18px; font-weight: 800; color: var(--ink); margin-right: 5px; font-variant-numeric: tabular-nums }
 .dash-hero-stats .db-accent { color: var(--red) }
 .dash-hero-actions { flex-shrink: 0 }
-/* 交易通道四卡：只允许「4 列一行」「2 列」「1 列」三种排布，永不出现 3+1 孤行。
-   判据用容器查询按「内容宽」判定（侧栏展开/收起时媒体查询会出现 1280 反而 3 列的怪相）：
-   · ≥ 836px（4×200 + 3×12）→ 4 列一行
-   · ≥ 416px（2×200 + 12，留 4px 余量）→ 2 列
-   · 更窄 → 1 列（<416px 时两列每卡不足 200px，文字会碎成多行，单列更舒服） */
-.channel-wrap { container-type: inline-size; }
-.channel-grid {
-  grid-template-columns: minmax(0, 1fr);
-  gap: 12px;
-  margin-bottom: 0;
+
+/* 本页密度：全局 .metric-grid/.metric-card 已被回测详情占用（12 列 + span 6），
+   这里不再复用，改用本页自有紧凑类，避免被全局规则撑成大卡。 */
+.frame { margin-bottom: 10px }
+.frame-head { padding: 8px 14px }
+.frame-body { padding: 10px 14px }
+
+/* 01 核心指标：一行数字条，标签与数字同处一个紧凑单元，项间细线分隔 */
+.dash-stats { display: flex; flex-wrap: wrap; align-items: baseline; row-gap: 5px }
+.dash-stat { display: flex; align-items: baseline; gap: 6px; padding: 0 12px; min-width: 0 }
+.dash-stat:first-child { padding-left: 0 }
+.dash-stat + .dash-stat { border-left: 1px solid var(--line) }
+.dash-stat-label { font-size: 11.5px; color: var(--ink-soft); white-space: nowrap }
+.dash-stat-value {
+  font-family: var(--font-serif); font-size: 16px; font-weight: 800; line-height: 1.3;
+  color: var(--ink); font-variant-numeric: tabular-nums; white-space: nowrap;
 }
-@container (min-width: 416px) {
-  .channel-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.dash-stat-sub { font-size: 10.5px; color: var(--ink-faint); white-space: nowrap }
+
+/* 02/04 表格：收紧行高与内边距，保留全部列 */
+.dash-table { font-size: 12.5px }
+.dash-table thead th { padding: 6px 10px; font-size: 10px }
+.dash-table tbody td { padding: 5px 10px }
+.dash-table .badge { padding: 1px 7px; font-size: 10.5px }
+.empty-state { padding: 14px 10px; font-size: 12px }
+
+/* 05 系统配置 */
+.dash-cfg { margin: 0; color: var(--ink-soft); font-size: 12.5px; line-height: 1.6 }
+
+/* 03 交易通道：四框一行（≥1100px），<1100px 两列、<760px 单列。
+   卡内为紧凑网格：圆点+名称一行、状态一行、附加信息（地址/账号、心跳）两行；
+   宽屏名称预留两行高度，四卡等高且状态行对齐，不因长名称错位。 */
+.channel-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px }
+.channel-card {
+  display: grid; grid-template-columns: 7px minmax(0, 1fr); column-gap: 7px; row-gap: 3px;
+  align-content: start; align-items: start; min-width: 0; padding: 8px 10px 9px;
+  border: 1px solid var(--line); border-radius: var(--radius);
+  background: var(--bg); box-shadow: none; grid-column: auto;
 }
-@container (min-width: 836px) {
-  .channel-grid { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+.channel-dot {
+  grid-column: 1; grid-row: 1; width: 7px; height: 7px; border-radius: 50%;
+  flex: 0 0 auto; background: var(--ink-faint); margin-top: 5px;
 }
-.channel-card { min-width: 0 }
-/* 名称/状态允许折行（窄卡不裁切）；通道名最长「同花顺独立交易（UI 自动化）」 */
-.channel-card .metric-label {
-  white-space: normal;
-  line-height: 1.35;
-  overflow-wrap: anywhere;
+.channel-dot.ok { background: var(--green) }
+.channel-dot.bad { background: var(--red) }
+.channel-dot.idle { background: var(--ink-faint) }
+.channel-name {
+  grid-column: 2; grid-row: 1; min-height: 2.7em;
+  font-size: 12.5px; font-weight: 600; line-height: 1.35;
+  letter-spacing: 0; text-transform: none; color: var(--ink);
+  white-space: normal; overflow-wrap: anywhere;
 }
 .channel-status {
-  white-space: normal;
-  line-height: 1.3;
-  overflow-wrap: anywhere;
+  grid-column: 2; grid-row: 2;
+  font-size: 12px; font-weight: 700; line-height: 1.3;
+  white-space: nowrap; overflow-wrap: normal;
 }
 .channel-status.ok { color: var(--green) }
 .channel-status.bad { color: var(--red) }
 .channel-status.idle { color: var(--ink-soft) }
-/* 次要信息（桥地址 / 账号 / 心跳）：强制两行——主体一行、心跳或降级原因一行，
-   200px 最小列宽下两条都能完整显示，不再依赖省略号或 line-clamp 截断。 */
 .channel-meta {
-  display: flex;
-  flex-direction: column;
-  gap: 1px;
-  font-size: 11px;
-  line-height: 1.35;
-  min-height: 2.7em;
-  color: var(--ink-soft);
-  overflow-wrap: anywhere;
-  font-variant-numeric: tabular-nums;
+  grid-column: 2; grid-row: 3; display: flex; flex-direction: column; gap: 1px;
+  min-width: 0; font-size: 11px; line-height: 1.35; color: var(--ink-soft);
+  overflow-wrap: anywhere; font-variant-numeric: tabular-nums;
 }
 .meta-line { display: block }
 .meta-sub { color: var(--ink-faint) }
 @media (max-width: 1100px) {
   .dash-hero { flex-wrap: wrap; align-items: center; row-gap: 10px; padding-bottom: 12px; margin-bottom: 14px; }
+  .channel-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px }
+  .channel-name { min-height: 0 }
+}
+@media (max-width: 760px) {
+  .channel-grid { grid-template-columns: minmax(0, 1fr) }
+  .dash-stat { padding: 0 9px }
 }
 </style>
