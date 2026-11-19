@@ -1716,6 +1716,14 @@ def build_engine(
     except (TypeError, ValueError):
         _sig_poll = 5.0
     _sig_poll = min(60.0, max(1.0, _sig_poll))
+    # 同代码 + 同日 + 同方向是否只认第一条（默认 true = 既有语义）。false 时
+    # 每次预警都注入（重复加仓/重复卖出），仅特殊场景显式打开。
+    _sig_dedup_raw = _tq_cfg.get("external_signal_daily_dedup", True)
+    if isinstance(_sig_dedup_raw, str):
+        _sig_dedup = _sig_dedup_raw.strip().lower() not in (
+            "0", "false", "off", "no", "")
+    else:
+        _sig_dedup = bool(_sig_dedup_raw)
     # G2：会话级盘前参数覆盖（NULL=跟随全局；非空=本会话覆盖）。
     _pre_open_cfg, _pre_open_overrides = resolve_pre_open_auction_config(
         session_row, _tq_cfg)
@@ -1768,6 +1776,7 @@ def build_engine(
         execution_mode=execution_mode,
         signal_file_path=signal_file_path,
         signal_poll_interval=_sig_poll,
+        external_signal_daily_dedup=_sig_dedup,
         advance_close_enabled=bool(advance_close_enabled),
         advance_close_time=advance_close_time or "14:51",
         formula_id_by_strategy=strategy_formula,

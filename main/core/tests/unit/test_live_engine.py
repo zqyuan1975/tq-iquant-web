@@ -11020,6 +11020,87 @@ def test_process_external_signal_dedup_by_direction():
     assert ("600000.SH", "sell") not in engine._ext_seen
 
 
+def test_process_external_signal_daily_dedup_disabled_allows_repeat(monkeypatch):
+    """配置放开同日同方向去重（默认关闭增强）→ 同方向每次预警都注入。
+
+    只校验方向去重分支放行（注入次数）；实际重复下单仍受持仓/在途闸约束，
+    风控链路不被绕过。
+    """
+    factory, _ = _db_factory()
+    port, ctx = _portfolio_external()
+    rec = _Recorder()
+    disp, _ = _make_dispatcher(rec)
+    from core.engine.bar_poller import BarPoller
+    engine = LiveEngine(
+        session_id=1, portfolios=[port], dispatcher=disp,
+        bar_poller=BarPoller(disp, ["600000.SH"], period="1m", count=10),
+        db_session_factory=factory, external_signal_daily_dedup=False,
+    )
+    engine._signal_source = _StubSignalSource()
+    calls = []
+    monkeypatch.setattr(engine, "_handle_bar", lambda *a, **k: calls.append(a))
+
+    engine._process_external_signal(dict(_EXT_SIG))
+    engine._process_external_signal(dict(_EXT_SIG))
+
+    assert len(calls) == 2
+
+    # 默认（去重开）：第二条同方向不再注入
+    factory2, _ = _db_factory()
+    port2, ctx2 = _portfolio_external()
+    disp2, _ = _make_dispatcher(_Recorder())
+    engine2 = LiveEngine(
+        session_id=1, portfolios=[port2], dispatcher=disp2,
+        bar_poller=BarPoller(disp2, ["600000.SH"], period="1m", count=10),
+        db_session_factory=factory2,
+    )
+    engine2._signal_source = _StubSignalSource()
+    calls2 = []
+    monkeypatch.setattr(engine2, "_handle_bar", lambda *a, **k: calls2.append(a))
+    engine2._process_external_signal(dict(_EXT_SIG))
+    engine2._process_external_signal(dict(_EXT_SIG))
+    assert len(calls2) == 1
+
+
+def test_process_external_signal_out_of_scope_blocks_and_logs(caplog):
+    """股票池归属过滤：不在本会话任何目标策略池内且无持仓 → 不消费，留 INFO。"""
+    factory, _ = _db_factory()
+    port, ctx = _portfolio_external()
+    ctx.stock_pool = {"000001.SZ"}
+    engine = _external_engine(factory, port)
+    engine._signal_source = _StubSignalSource()
+
+    with caplog.at_level(logging.INFO):
+        engine._process_external_signal(dict(_EXT_SIG))
+
+    db = factory()
+    assert db.query(LiveOrder).count() == 0
+    db.close()
+    assert engine._ext_seen == set()  # 未消费，不占去重名额
+    assert "out of scope" in caplog.text
+
+
+def test_process_external_signal_sell_allowed_outside_pool_when_holding():
+    """池外老持仓必须能卖：卖出侧不受股票池过滤（防时点池移出后锁死）。"""
+    factory, _ = _db_factory()
+    port, ctx = _portfolio_external()
+    ctx.stock_pool = {"000001.SZ"}  # 600000 已不在池内
+    ctx.formula_signals = [
+        {"signal_name": "close_sig", "signal_type": SignalType.CLOSE,
+         "trigger_value": 1},
+    ]
+    pos = Position("600000.SH")
+    pos.quantity = 600
+    pos.avg_cost = Decimal("9.0")
+    ctx.positions["600000.SH"] = pos
+    engine, _rec = _external_engine_with(factory, port, available=600)
+    engine._signal_source = _StubSignalSource()
+
+    engine._process_external_signal(dict(_EXT_SIG))
+
+    assert ("600000.SH", "sell") in engine._ext_seen
+
+
 def test_process_external_signal_max_positions_full_blocks(monkeypatch):
     """max_positions 满 → 注入前过滤（不构造合成 bar、不进 _handle_bar）。"""
     factory, _ = _db_factory()

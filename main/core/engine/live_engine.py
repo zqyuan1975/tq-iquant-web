@@ -648,6 +648,10 @@ class LiveEngine:
         # 独立于主循环 60s 拉 bar 节拍——信号最坏延迟 = 本间隔 + 单次 _handle_bar，
         # 不再是被行情轮询拉长的近一分钟。只读一个小文本文件，开销可忽略。
         signal_poll_interval: float = 5.0,
+        # 同代码 + 同日 + 同方向是否只认第一条（默认 True=保留既有语义）。
+        # False 时同方向每次预警都注入（会重复加仓/重复卖出），仅特殊场景
+        # 由配置显式打开；默认关（不改变既有行为）。
+        external_signal_daily_dedup: bool = True,
         # 14:50 提前收盘价（B，可选增强，仅 1d）：默认关 → 1d/1w/1mon 都在 15:05
         # 收盘落定后用完整 bar 算信号、次日开盘执行。开启后仅 1d 提前：用快照合成
         # 14:50 1m bar 收盘价定信号，委托价取 14:52 起始 1m bar 开盘价（14:51 兜底），
@@ -910,6 +914,9 @@ class LiveEngine:
         # 外部信号独立轮询节拍（仅源启用时起任务）：_signal_loop 在独立单 worker
         # 池里只读小文件 + 注入，不占主循环 60s 拉 bar 的 worker。
         self._signal_poll_interval = max(1.0, float(signal_poll_interval or 5.0))
+        # 方向级去重开关：True（默认）= 同代码同日同方向只认第一条；False 时
+        # 每次预警都注入。仅外部信号链路使用，默认关闭增强不影响既有行为。
+        self._ext_daily_dedup = bool(external_signal_daily_dedup)
         self._signal_task: Optional[asyncio.Task] = None
         self._signal_executor: Optional[ThreadPoolExecutor] = None
         # _handle_bar 串行化锁：源未启用时完全不取（默认路径零变化）；启用后主
@@ -923,9 +930,10 @@ class LiveEngine:
             self._signal_source = ExternalSignalFileSource(
                 signal_file_path, formula_names)
             logger.info(
-                "external signal source enabled: %s (formulas %s, poll %.0fs)",
+                "external signal source enabled: %s (formulas %s, poll %.0fs, "
+                "daily_dedup=%s)",
                 signal_file_path, sorted(formula_names),
-                self._signal_poll_interval,
+                self._signal_poll_interval, self._ext_daily_dedup,
             )
         # 外部信号源跨日重置记账（audit Fix1）：长跑会话跨日不重置则游标停在
         # 昨日、方向去重集合也残留。记引擎启动日，_tick_external_signals 检测
@@ -3760,6 +3768,22 @@ class LiveEngine:
                 "formula=%s (session %s)",
                 symbol, sig.get("time"), formula_name, self.session_id)
             return
+        # 归属过滤（0011 接线）：会话/组合策略股票池不含该代码 → 不产生委托，
+        # 并留 INFO 痕迹（不是静默丢弃）。卖出侧例外：只要该策略实际持有，池外
+        # 也允许卖出（时点池把股票移出后不能把已有持仓锁死）。
+        any_pool = any(
+            ctx.stock_pool is None or symbol in ctx.stock_pool
+            for _, ctx in targets)
+        any_holding = any(
+            ctx.positions.get(symbol) is not None
+            and ctx.positions[symbol].quantity > 0
+            for _, ctx in targets)
+        if not any_pool and not any_holding:
+            logger.info(
+                "external signal out of scope (not in session stock pools, no "
+                "holding): %s %s formula=%s (session %s)",
+                symbol, sig.get("time"), formula_name, self.session_id)
+            return
         # 逐目标策略按方向拆分公式信号配置（未知动作忽略 + 节流告警）
         plan = []
         has_buy = has_sell = False
@@ -3773,14 +3797,21 @@ class LiveEngine:
                     sell_cfgs.append(cfg)
                 else:
                     self._warn_unparseable_action(symbol, sig_type, formula_name)
-            if buy_cfgs:
+            held_pos = ctx.positions.get(symbol)
+            holding = held_pos is not None and held_pos.quantity > 0
+            in_pool = ctx.stock_pool is None or symbol in ctx.stock_pool
+            # 买入必须池内；卖出只要实际持有（池外老持仓照样能卖）
+            if in_pool and buy_cfgs and not holding:
                 has_buy = True
-            if sell_cfgs:
+            if sell_cfgs and holding:
                 has_sell = True
             plan.append((port, ctx, buy_cfgs, sell_cfgs))
-        # 方向级去重：同代码 + 同日 + 同方向各认第一条
-        take_buy = has_buy and (symbol, "buy") not in self._ext_seen
-        take_sell = has_sell and (symbol, "sell") not in self._ext_seen
+        # 方向级去重：同代码 + 同日 + 同方向各认第一条（可由配置关闭）
+        if self._ext_daily_dedup:
+            take_buy = has_buy and (symbol, "buy") not in self._ext_seen
+            take_sell = has_sell and (symbol, "sell") not in self._ext_seen
+        else:
+            take_buy, take_sell = has_buy, has_sell
         if not take_buy and not take_sell:
             logger.info(
                 "external signal skip: %s %s direction(s) already consumed "
@@ -3793,8 +3824,9 @@ class LiveEngine:
         for port, ctx, buy_cfgs, sell_cfgs in plan:
             held_pos = ctx.positions.get(symbol)
             holding = held_pos is not None and held_pos.quantity > 0
+            in_pool = ctx.stock_pool is None or symbol in ctx.stock_pool
             buy_allowed, sell_allowed = [], []
-            if take_buy and buy_cfgs:
+            if take_buy and buy_cfgs and in_pool:
                 # 买入类原闸门（一行不改）；槽位口径同 _submit_one_order：
                 # 只数平台自己买入成交过的持仓，None 上限=该策略未配置 → 不限
                 held_count = self._platform_held_count(ctx)
