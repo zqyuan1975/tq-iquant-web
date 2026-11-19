@@ -11279,6 +11279,40 @@ def test_external_unknown_action_ignored_with_throttled_warning(caplog, monkeypa
     db.close()
 
 
+def test_signal_loop_interval_and_gating():
+    """独立轮询闸：alert 模式 / stop 后 / 窗口外不读文件；正常盘中读。"""
+    factory, _ = _db_factory()
+    port, ctx = _portfolio_external()
+    engine = _external_engine(factory, port)
+    engine._signal_source = _StubSignalSource()
+    engine._signal_poll_interval = 5.0
+    now = datetime(2026, 10, 30, 10, 0)
+    assert engine._signal_tick_active(now) is True
+    engine.execution_mode = "alert"
+    assert engine._signal_tick_active(now) is False
+    engine.execution_mode = "live"
+    engine._stop_requested = True
+    assert engine._signal_tick_active(now) is False
+    engine._stop_requested = False
+    # 行情轮询窗口外（午休 12:00）不读，与主循环 poll 同口径
+    assert engine._signal_tick_active(datetime(2026, 10, 30, 12, 0)) is False
+
+
+def test_signal_poll_interval_clamped_to_floor():
+    """轮询间隔下限 1s：防误配负数导致空转占 CPU（0 视为未配置 → 默认 5s）。"""
+    factory, _ = _db_factory()
+    port, ctx = _portfolio_external()
+    rec = _Recorder()
+    disp, _ = _make_dispatcher(rec)
+    from core.engine.bar_poller import BarPoller
+    engine = LiveEngine(
+        session_id=1, portfolios=[port], dispatcher=disp,
+        bar_poller=BarPoller(disp, ["600000.SH"], period="1m", count=10),
+        db_session_factory=factory, signal_poll_interval=-2,
+    )
+    assert engine._signal_poll_interval == 1.0
+
+
 def test_process_external_signal_formula_mismatch_drops(monkeypatch):
     """公式名无匹配策略 → 信号丢弃（不占去重名额，换匹配公式后可再触发）。"""
     factory, _ = _db_factory()

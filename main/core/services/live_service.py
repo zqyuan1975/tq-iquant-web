@@ -1707,6 +1707,15 @@ def build_engine(
     _tq_cfg = load_config().get("tq_trade") or {}
     if not isinstance(_tq_cfg, dict):
         _tq_cfg = {}
+    # 外部信号文件轮询间隔（秒，仅 signal_file_path 非空时生效）：默认 5s，
+    # tq_trade.external_signal_poll_interval_seconds 可覆盖（夹取 1–60，防误配
+    # 成 0 空转 / 数分钟延迟）。详见 LiveEngine._signal_loop。
+    try:
+        _sig_poll = float(
+            _tq_cfg.get("external_signal_poll_interval_seconds", 5))
+    except (TypeError, ValueError):
+        _sig_poll = 5.0
+    _sig_poll = min(60.0, max(1.0, _sig_poll))
     # G2：会话级盘前参数覆盖（NULL=跟随全局；非空=本会话覆盖）。
     _pre_open_cfg, _pre_open_overrides = resolve_pre_open_auction_config(
         session_row, _tq_cfg)
@@ -1758,6 +1767,7 @@ def build_engine(
         },
         execution_mode=execution_mode,
         signal_file_path=signal_file_path,
+        signal_poll_interval=_sig_poll,
         advance_close_enabled=bool(advance_close_enabled),
         advance_close_time=advance_close_time or "14:51",
         formula_id_by_strategy=strategy_formula,

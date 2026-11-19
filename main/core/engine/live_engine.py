@@ -642,8 +642,12 @@ class LiveEngine:
         formula_id_by_strategy: Optional[Dict[int, int]] = None,
         enable_signal_monitor: bool = False,
         # 外部信号注入（0011）：通达信条件预警文件路径。None=不启用；非空=建
-        # ExternalSignalFileSource，_tick_main 每轮增量读取并经 _handle_bar 全套注入。
+        # ExternalSignalFileSource，独立节拍增量读取并经 _handle_bar 全套注入。
         signal_file_path: Optional[str] = None,
+        # 外部信号文件轮询间隔（秒，仅 signal_file_path 非空时生效）：默认 5s。
+        # 独立于主循环 60s 拉 bar 节拍——信号最坏延迟 = 本间隔 + 单次 _handle_bar，
+        # 不再是被行情轮询拉长的近一分钟。只读一个小文本文件，开销可忽略。
+        signal_poll_interval: float = 5.0,
         # 14:50 提前收盘价（B，可选增强，仅 1d）：默认关 → 1d/1w/1mon 都在 15:05
         # 收盘落定后用完整 bar 算信号、次日开盘执行。开启后仅 1d 提前：用快照合成
         # 14:50 1m bar 收盘价定信号，委托价取 14:52 起始 1m bar 开盘价（14:51 兜底），
@@ -903,6 +907,15 @@ class LiveEngine:
         # 条件预警文件，公式名匹配策略后合成 bar 注入 signal_cache，经 _handle_bar
         # 全套执行（风控/审批/在途闸不绕过）。None=不启用，行为不变。
         self._signal_source: Optional[ExternalSignalFileSource] = None
+        # 外部信号独立轮询节拍（仅源启用时起任务）：_signal_loop 在独立单 worker
+        # 池里只读小文件 + 注入，不占主循环 60s 拉 bar 的 worker。
+        self._signal_poll_interval = max(1.0, float(signal_poll_interval or 5.0))
+        self._signal_task: Optional[asyncio.Task] = None
+        self._signal_executor: Optional[ThreadPoolExecutor] = None
+        # _handle_bar 串行化锁：源未启用时完全不取（默认路径零变化）；启用后主
+        # 循环 bar 与信号线程注入互斥，组合账本/信号评估不并发。锁序恒为
+        # _handle_bar_lock → _book_lock（deals 池只取 _book_lock，无反向）。
+        self._handle_bar_lock = threading.RLock()
         if signal_file_path:
             formula_names = {
                 name for name in (formula_by_strategy or {}).values() if name
@@ -910,8 +923,9 @@ class LiveEngine:
             self._signal_source = ExternalSignalFileSource(
                 signal_file_path, formula_names)
             logger.info(
-                "external signal source enabled: %s (formulas %s)",
+                "external signal source enabled: %s (formulas %s, poll %.0fs)",
                 signal_file_path, sorted(formula_names),
+                self._signal_poll_interval,
             )
         # 外部信号源跨日重置记账（audit Fix1）：长跑会话跨日不重置则游标停在
         # 昨日、方向去重集合也残留。记引擎启动日，_tick_external_signals 检测
@@ -1517,6 +1531,16 @@ class LiveEngine:
         self._deals_executor = ThreadPoolExecutor(
             max_workers=1, thread_name_prefix="live-deals"
         )
+        # 外部信号轮询独立池（同 deals 池语义：不占主 worker、也不与 deals 抢
+        # /deals 回填）；只有配置了 signal_file_path 才会起任务。
+        if self._signal_executor is not None:
+            try:
+                self._signal_executor.shutdown(wait=False)
+            except Exception:  # noqa: BLE001
+                pass
+        self._signal_executor = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="live-signal"
+        )
         # I-6（audit）：启动一次性同步重活（通达信 1w/1mon 注入 + 全量预热拉取）
         # 经 executor 执行——事件循环不被 TDX 计算/桥拉取阻塞（SSE/HTTP 保持响应）。
         # await 等其完成再起循环，时序语义与原同步内联一致。
@@ -1534,6 +1558,12 @@ class LiveEngine:
         if self.execution_mode != "alert":
             self._deals_task = asyncio.create_task(self._deals_loop())
             self._deals_task.add_done_callback(functools.partial(self._on_loop_done, "deals"))
+            # 外部信号注入（0011）：独立短节拍只读预警文件，与 60s 主循环解耦。
+            # alert 模式不注入（与主循环早退同口径）。
+            if self._signal_source is not None:
+                self._signal_task = asyncio.create_task(self._signal_loop())
+                self._signal_task.add_done_callback(
+                    functools.partial(self._on_loop_done, "signals"))
 
     def _on_loop_done(self, name: str, task: asyncio.Task) -> None:
         """循环任务死亡监控（防 2026-11-03 08:54 式静默僵死）。
@@ -1577,13 +1607,20 @@ class LiveEngine:
                 )
         if not self._running:
             return
-        coro = self._loop if name == "main" else self._deals_loop
+        if name == "main":
+            coro = self._loop
+        elif name == "deals":
+            coro = self._deals_loop
+        else:
+            coro = self._signal_loop
         new_task = asyncio.create_task(coro())
         new_task.add_done_callback(functools.partial(self._on_loop_done, name))
         if name == "main":
             self._task = new_task
-        else:
+        elif name == "deals":
             self._deals_task = new_task
+        else:
+            self._signal_task = new_task
 
     def _sync_startup(self) -> None:
         """start() 的一次性同步重活（I-6：在主 executor worker 线程执行）。
@@ -1725,6 +1762,15 @@ class LiveEngine:
             except Exception:  # noqa: BLE001
                 logger.exception("deals loop task ended with error on stop")
             self._deals_task = None
+        if self._signal_task is not None:
+            self._signal_task.cancel()
+            try:
+                await self._signal_task
+            except asyncio.CancelledError:
+                pass
+            except Exception:  # noqa: BLE001
+                logger.exception("signal loop task ended with error on stop")
+            self._signal_task = None
         # I-3（终审）：置闸后、close 前对在途真实单 best-effort 撤单。此刻两循环任务
         # 已 cancel，在途 tick 排在主单 worker 池里先跑完，本步经同一池串行执行——
         # 读到的 _pending_orders 不再被并发修改。撤单走 worker 线程（SDK/HTTP 同步调），
@@ -1840,6 +1886,8 @@ class LiveEngine:
             self._executor.shutdown(wait=False)
         if self._deals_executor is not None:
             self._deals_executor.shutdown(wait=False)
+        if self._signal_executor is not None:
+            self._signal_executor.shutdown(wait=False)
         logger.info(
             "engine.stop done: session=%s %s（两循环已停止，快照/成交回填不再写入）",
             self.session_id, process_tag())
@@ -2700,9 +2748,8 @@ class LiveEngine:
                     self._audit_gap_recovery(now, triggered)
                 else:
                     _seg("poll", self._bar_poller.poll)
-                # 0011 外部信号注入：poll 之后增量读取通达信条件预警文件，公式名匹配
-                # 策略的信号逐条注入（同样走 _handle_bar 全套，与 bar 驱动同闸门链）。
-                _seg("external_signals", self._tick_external_signals)
+                # 0011 外部信号注入已移到独立 _signal_loop（默认 5s 节拍），不再
+                # 挂在本 60s 轮次里——否则信号最坏延迟被行情轮询拉到近一分钟。
             elif not self._quote_poll_paused:
                 self._quote_poll_paused = True
                 self._enter_quote_poll_pause(now)
@@ -3661,6 +3708,16 @@ class LiveEngine:
                     "external signal process error (session %s)", self.session_id)
 
     def _process_external_signal(self, sig: dict) -> None:
+        """单条外部信号注入入口：与主循环 _handle_bar 互斥（RLock，可重入）。
+
+        独立信号线程执行整条处理（读持仓 → 方向去重 → 注入 signal_cache →
+        _handle_bar 全套），与主循环 bar 的持仓/信号评估串行，避免并发读写
+        组合账本。内部 _handle_bar 再取同一把 RLock 是重入，不额外阻塞。
+        """
+        with self._handle_bar_lock:
+            self._process_external_signal_locked(sig)
+
+    def _process_external_signal_locked(self, sig: dict) -> None:
         """单条外部信号注入：公式名匹配策略 → 方向分类/去重 → 合成 bar 注入
         signal_cache → _handle_bar 全套（风控/审批/在途闸/去重与 bar 驱动同链）。
 
@@ -4008,6 +4065,37 @@ class LiveEngine:
             except Exception:  # noqa: BLE001
                 logger.exception("deals loop executor error")
             await asyncio.sleep(self._deals_next_interval(time.monotonic() - started))
+
+    async def _signal_loop(self) -> None:
+        """外部信号文件轮询（仅 signal_file_path 配置时启动）。
+
+        独立短节拍（默认 5s）只读通达信条件预警文本文件；注入仍走 _handle_bar
+        全套（风控/审批/在途闸不绕过）。与主循环 60s 拉 bar 解耦——旧实现挂在
+        主循环里，信号最坏要等一整轮（真机拉行情 50-57s，实际约 60s+）才进引擎。
+
+        窗口/模式口径与主循环一致：alert 模式不注入；行情轮询窗口外（收盘后/
+        非交易日/午休）不读文件，避免无意义的磁盘读。轮次按起点对齐：单轮超出
+        间隔时下一轮立即开始（与 _loop 同口径）。
+        """
+        while self._running:
+            started = time.monotonic()
+            try:
+                if self._signal_tick_active(now_shanghai()):
+                    await asyncio.get_running_loop().run_in_executor(
+                        self._signal_executor, self._tick_external_signals
+                    )
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001
+                logger.exception("signal loop executor error")
+            delay = self._signal_poll_interval - (time.monotonic() - started)
+            await asyncio.sleep(delay if delay > 0 else 0.0)
+
+    def _signal_tick_active(self, now: datetime) -> bool:
+        """本轮是否读取信号文件：stop 闸 / alert 模式 / 行情轮询窗口外 → 不读。"""
+        if self._stop_requested or self.execution_mode == "alert":
+            return False
+        return self._quote_poll_active(now)
 
     def _deals_next_interval(self, elapsed: float) -> float:
         """_deals_loop 下一轮间隔：clamp(上一轮耗时, [deals_poll_interval, 30s])。
@@ -7966,6 +8054,32 @@ class LiveEngine:
         return [item[2] for item in decorated]
 
     def _handle_bar(
+        self,
+        portfolio: Portfolio,
+        bar: BarEvent,
+        bars_by_code: Optional[Dict[str, list]] = None,
+        df_cache: Optional[Dict] = None,
+        raw_cache: Optional[Dict] = None,
+        mismatched_risk: Optional[bool] = None,
+    ) -> None:
+        """_handle_bar 串行化入口（0011 外部信号独立轮询后新增）。
+
+        源未启用 → 直接执行（默认路径不取任何新锁，与接线前逐字一致）；
+        源启用 → 主循环 bar 与信号线程注入共用同一把 RLock，组合账本/信号
+        评估/下单闸门不并发执行（信号线程只做一条信号的整套处理，不加其它锁）。
+        """
+        if self._signal_source is None:
+            return self._handle_bar_impl(
+                portfolio, bar, bars_by_code=bars_by_code, df_cache=df_cache,
+                raw_cache=raw_cache, mismatched_risk=mismatched_risk,
+            )
+        with self._handle_bar_lock:
+            return self._handle_bar_impl(
+                portfolio, bar, bars_by_code=bars_by_code, df_cache=df_cache,
+                raw_cache=raw_cache, mismatched_risk=mismatched_risk,
+            )
+
+    def _handle_bar_impl(
         self,
         portfolio: Portfolio,
         bar: BarEvent,
