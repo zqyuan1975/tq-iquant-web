@@ -924,6 +924,54 @@ class Portfolio:
             equity = min(equity, self.equity_cap)
         return ctx.capital_ratio * equity
 
+    def _apply_capital_budget(
+        self, ctx: StrategyContext, sig: SignalEvent, bar: BarEvent,
+        quantity: int, close: Decimal, lot: int,
+    ) -> int:
+        """资金池策略额度闸（0021 B2）：本窗口策略总市值 ≤ ``ctx.capital_budget``。
+
+        默认 ``None``（未接入）→ 原样返回，不记事件、零行为变化。
+        接入后按「额度 − 当前策略持仓市值」反推可买整手数：超出缩量，
+        剩余不足一手直接拦截；不放大、不跨策略借额度（借入由 B3/E 建模）。
+        """
+        budget = getattr(ctx, "capital_budget", None)
+        if budget is None:
+            return quantity
+        if not isinstance(budget, Decimal):
+            try:
+                budget = Decimal(str(budget))
+            except Exception:  # noqa: BLE001 - 非法额度按 0 处理（保守）
+                budget = Decimal(0)
+        held = self._holdings_value(ctx)
+        remaining = budget - held
+        if remaining <= 0:
+            self._rec("capital_quota_exhausted", "capital_gate", "block",
+                      ctx, sig, bar,
+                      param_name="capital_budget", param_value=float(budget),
+                      actual_value=float(held),
+                      message="策略额度 %s 已用尽（当前市值 %s），禁止新开仓/加仓"
+                              % (fmt_money(budget), fmt_money(held)))
+            return 0
+        cap_qty = int(remaining / close / lot) * lot
+        if cap_qty < lot:
+            self._rec("capital_quota_below_lot", "capital_gate", "block",
+                      ctx, sig, bar,
+                      param_name="capital_budget", param_value=float(budget),
+                      actual_value=float(remaining),
+                      message="策略额度剩余 %s 不足一手（价 %s × %d 股），跳过本单"
+                              % (fmt_money(remaining), fmt_price(close), lot))
+            return 0
+        if quantity <= cap_qty:
+            return quantity
+        self._rec("capital_quota_shrink", "capital_gate", "shrink",
+                  ctx, sig, bar,
+                  param_name="capital_budget", param_value=float(budget),
+                  actual_value=float(cap_qty), requested_qty=int(quantity),
+                  message="策略额度 %s 已用 %s，本单 %d 股缩量至 %d 股"
+                          % (fmt_money(budget), fmt_money(held),
+                             int(quantity), int(cap_qty)))
+        return cap_qty
+
     def _signal_to_order(
         self, ctx: StrategyContext, sig: SignalEvent, bar: BarEvent,
         inflight: Optional[Dict[int, set]] = None,
@@ -1119,6 +1167,11 @@ class Portfolio:
                                   % (fmt_pct(ctx.single_open_ratio), fmt_money(strategy_fund),
                                      fmt_price(close), quantity, lot))
                 return []
+            # 资金池策略额度闸（0021 B2，默认 None=不约束）
+            quantity = self._apply_capital_budget(
+                ctx, sig, bar, quantity, close, lot)
+            if quantity <= 0:
+                return []
             trade_type = TradeType.BUY
         elif sig.signal_type == SignalType.ADD:
             # ADD：需有持仓，且未超 max_add_count。
@@ -1178,6 +1231,11 @@ class Portfolio:
                           message="ADD 加仓比例 %s × 策略资金 %s / 价 %s 取整后 %d 股 <%d"
                                   % (fmt_pct(ctx.add_position_ratio), fmt_money(strategy_fund),
                                      fmt_price(close), quantity, lot))
+                return []
+            # 资金池策略额度闸（0021 B2，默认 None=不约束）
+            quantity = self._apply_capital_budget(
+                ctx, sig, bar, quantity, close, lot)
+            if quantity <= 0:
                 return []
             trade_type = TradeType.BUY
         else:

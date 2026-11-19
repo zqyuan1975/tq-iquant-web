@@ -44,6 +44,10 @@ class StrategyContext:
         # 策略级单笔最大买入金额（元，可选，None=不限）：BUY 审批金额封顶，
         # 超限缩量到该金额能买的整手股数（回测/实盘双端 cap_quantity 生效）
         max_order_amount: Optional[Decimal] = None,
+        # 资金池策略额度（0021 B2，默认 None=未接入）：本窗口可持有的策略总市值
+        # 上限（0019 §1.2 Entitlement_j）。None 时不改变任何现有行为；由资金池
+        # 侧显式注入后才生效，不写回 capital_ratio。
+        capital_budget: Optional[Decimal] = None,
         # 实盘执行配置（批次1，全部默认关/保守默认，关闭时行为与原逻辑一致）
         requote_enabled: bool = False,
         requote_max_attempts: int = 2,
@@ -102,6 +106,8 @@ class StrategyContext:
         self.exposure_cap_enabled = exposure_cap_enabled
         # 单笔最大买入金额（None=不限，关闭时审批行为与原逻辑一致）
         self.max_order_amount = max_order_amount
+        # 资金池策略额度（None=未接入，默认路径不加任何约束）
+        self.capital_budget = capital_budget
         # 实盘执行配置（批次1）：撤单追价重下 / TDX 大额拆单（批次2接线）/ 风控时点
         self.requote_enabled = requote_enabled
         self.requote_max_attempts = requote_max_attempts
