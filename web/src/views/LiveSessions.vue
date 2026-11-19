@@ -33,8 +33,8 @@ import {
   recoverLiveBreaker, getLiveChannel, testLiveChannel, sendUserBlock, getFormulas, getWatchdogStatus,
   getLiveAccountPreview, resetLiveBaseline,
   getLiveParamsDrift, getLiveCashFlows, createLiveCashFlow,
-  getTheoryVsLive,
-  type TheoryVsLiveResult,
+  getTheoryVsLive, getBacktestRecords,
+  type TheoryVsLiveResult, type BacktestRecordItem,
   type PortfolioItem, type LiveSessionItem,
   type LiveChannelInfo, type LiveChannelEngine, type LiveEngineKey, type LiveExecutionMode, type LiveSignalItem,
   type FormulaItem, type WatchdogAlarm, type ParamsDrift, type LiveCashFlowList, type LiveCashFlowType,
@@ -910,8 +910,41 @@ const showTvl = ref(false)
 const tvlLoading = ref(false)
 const tvlError = ref('')
 const theoryVsLive = ref<TheoryVsLiveResult | null>(null)
+// 面板内绑定：auto=按会话组合自动关联；数字字符串=显式绑定记录 id
+const tvlRecords = ref<BacktestRecordItem[]>([])
+const tvlRecordsLoading = ref(false)
+const tvlBindingValue = ref<string>('auto')
+const tvlBindingSaving = ref(false)
+const tvlBindingMsg = ref('')
 
 const _tvlPct = (v: number | null) => (v === null ? '—' : `${(v * 100).toFixed(2)}%`)
+
+async function loadTvlRecords() {
+  if (tvlRecords.value.length || tvlRecordsLoading.value) return
+  tvlRecordsLoading.value = true
+  try {
+    tvlRecords.value = await getBacktestRecords()
+  } catch {
+    tvlRecords.value = []
+  } finally {
+    tvlRecordsLoading.value = false
+  }
+}
+
+const tvlRecordOptions = computed(() => {
+  const sid = watchedSessionId.value ?? activeSessionId
+  const pids = new Set(
+    sessions.value.find((s) => s.id === sid)?.portfolio_ids || [])
+  return [...tvlRecords.value].sort((a, b) => {
+    const am = pids.has(a.portfolio_strategy_id) ? 1 : 0
+    const bm = pids.has(b.portfolio_strategy_id) ? 1 : 0
+    return bm - am || b.id - a.id
+  })
+})
+
+function recordStatusLabel(status: string): string {
+  return status === 'completed' ? '已完成' : status
+}
 
 async function openTheoryVsLive() {
   const sid = watchedSessionId.value ?? activeSessionId
@@ -919,13 +952,42 @@ async function openTheoryVsLive() {
   showTvl.value = true
   tvlLoading.value = true
   tvlError.value = ''
+  tvlBindingMsg.value = ''
   theoryVsLive.value = null
+  await loadTvlRecords()
   try {
     theoryVsLive.value = await getTheoryVsLive(sid)
+    // 显式绑定才回填下拉；自动关联保持 auto，切回自动即清除绑定
+    tvlBindingValue.value = (
+      theoryVsLive.value.binding_source === 'manual' && theoryVsLive.value.backtest_record_id
+        ? String(theoryVsLive.value.backtest_record_id)
+        : 'auto'
+    )
   } catch (e: any) {
     tvlError.value = '加载失败：' + (e?.response?.data?.message || e?.message || e)
   } finally {
     tvlLoading.value = false
+  }
+}
+
+async function saveTvlBinding() {
+  const sid = watchedSessionId.value ?? activeSessionId
+  if (sid === null || tvlBindingSaving.value) return
+  tvlBindingSaving.value = true
+  tvlBindingMsg.value = ''
+  try {
+    const recordId = tvlBindingValue.value === 'auto'
+      ? null : Number(tvlBindingValue.value)
+    const updated = await updateLiveSession(sid, { backtest_record_id: recordId })
+    const idx = sessions.value.findIndex((s) => s.id === sid)
+    if (idx >= 0) sessions.value[idx] = updated.session
+    theoryVsLive.value = await getTheoryVsLive(sid)
+    tvlBindingMsg.value = recordId === null
+      ? '已切回自动关联' : `已绑定回测记录 #${recordId}`
+  } catch (e: any) {
+    tvlBindingMsg.value = '保存失败：' + (e?.response?.data?.message || e?.message || e)
+  } finally {
+    tvlBindingSaving.value = false
   }
 }
 
@@ -2277,14 +2339,33 @@ onUnmounted(() => {
         <div v-if="tvlLoading"><p>加载中…</p></div>
         <div v-else-if="tvlError" style="color:var(--red)">{{ tvlError }}</div>
         <template v-else-if="theoryVsLive">
+          <div class="tvl-bind">
+            <label>理论基准</label>
+            <select v-model="tvlBindingValue" :disabled="tvlRecordsLoading || tvlBindingSaving">
+              <option value="auto">自动关联（同组合最近一次已完成回测）</option>
+              <option v-for="r in tvlRecordOptions" :key="r.id" :value="String(r.id)">
+                #{{ r.id }} {{ r.name }} · {{ portfolioName(r.portfolio_strategy_id) }}
+                （{{ r.start_date || '?' }} ~ {{ r.end_date || '?' }}，{{ recordStatusLabel(r.status) }}）
+              </option>
+            </select>
+            <button class="btn btn-sm" :disabled="tvlBindingSaving" @click="saveTvlBinding">
+              {{ tvlBindingSaving ? '保存中…' : '保存绑定' }}
+            </button>
+            <span v-if="tvlBindingMsg" class="note">{{ tvlBindingMsg }}</span>
+          </div>
           <p v-if="!theoryVsLive.bound" class="note" style="color:var(--red)">
-            会话未绑定回测记录：以下仅为实盘侧。请在会话配置中绑定回测记录后重试。
+            未绑定回测记录，且未找到该会话组合的已完成回测：理论侧无法生成
+            （实盘侧不受影响）。可在上方选择回测记录并保存。
           </p>
           <p v-else class="note">
             理论基准：#{{ theoryVsLive.backtest_record_id }} {{ theoryVsLive.backtest_name }}
             <span v-if="theoryVsLive.window.start">
               （{{ theoryVsLive.window.start }} ~ {{ theoryVsLive.window.end }}）
             </span>
+            <span v-if="theoryVsLive.binding_source === 'auto'" class="badge badge-gray">
+              自动关联
+            </span>
+            <span v-else class="badge badge-green">手动绑定</span>
           </p>
           <p v-for="(w, i) in theoryVsLive.warnings" :key="i" class="note" style="color:var(--orange)">
             {{ w }}
@@ -2305,7 +2386,16 @@ onUnmounted(() => {
               <span>区间 {{ tvlChart.min.toFixed(3) }} ~ {{ tvlChart.max.toFixed(3) }}</span>
             </div>
           </div>
-          <p v-else class="note">两侧均无日序列，暂无可绘曲线。</p>
+          <p v-else class="note">
+            暂无可绘曲线：
+            <span v-if="theoryVsLive.theory_series_status === 'insufficient'">
+              理论侧仅 1 个快照，无法成线；
+            </span>
+            <span v-else-if="theoryVsLive.theory_series_status !== 'ok'">
+              理论侧无可用日快照；
+            </span>
+            <span v-if="theoryVsLive.live_series_status !== 'ok'">实盘日序列未生成；</span>
+          </p>
 
           <h4 style="margin:16px 0 8px">指标对照</h4>
           <div class="table-container">
@@ -2344,16 +2434,25 @@ onUnmounted(() => {
                   <td>成交滑移（买贵/卖贱为正）</td>
                   <td>—</td>
                   <td colspan="2">
-                    <span v-if="theoryVsLive.deviation?.slippage.weighted_deviation_bps !== null">
-                      {{ theoryVsLive.deviation?.slippage.weighted_deviation_bps }} bps
-                      （匹配 {{ theoryVsLive.deviation?.slippage.matched_pairs }} 对）
+                    <span v-if="theoryVsLive.deviation
+                      && theoryVsLive.deviation.slippage.weighted_deviation_bps != null">
+                      {{ theoryVsLive.deviation.slippage.weighted_deviation_bps }} bps
+                      （匹配 {{ theoryVsLive.deviation.slippage.matched_pairs }} 对）
                     </span>
-                    <span v-else>无可匹配成交</span>
+                    <span v-else-if="!theoryVsLive.bound">未绑定回测记录，无法计算滑移</span>
+                    <span v-else-if="!theoryVsLive.deviation?.slippage.matched_pairs">
+                      无可匹配成交（无同日/同股票/同方向的理论与实盘成交样本）
+                    </span>
+                    <span v-else>—</span>
                   </td>
                 </tr>
               </tbody>
             </table>
           </div>
+          <p class="note">
+            理论指标按回测区间、实盘指标按实盘区间计算；「差异」列只在两者重叠
+            ≥2 个交易日时计算，否则显示「—」并由上方告警说明原因。
+          </p>
 
           <template v-if="theoryVsLive.deviation?.slippage.details.length">
             <h4 style="margin:16px 0 8px">滑移明细（前 20 对）</h4>
@@ -3057,6 +3156,17 @@ onUnmounted(() => {
 </template>
 
 <style scoped>
+/* 理论 vs 实盘：面板内直接绑定回测记录，避免用户去找隐蔽入口 */
+.tvl-bind {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin: 0 0 8px;
+  font-size: 13px;
+}
+.tvl-bind label { color: var(--ink-soft); }
+.tvl-bind select { max-width: 520px; }
 .channel-bar {
   display: flex;
   align-items: center;

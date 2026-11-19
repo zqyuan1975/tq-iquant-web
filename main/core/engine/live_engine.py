@@ -1766,6 +1766,22 @@ class LiveEngine:
                 # H2：把剩余子单持久化为「待补发」快照，供重启后一键补发
                 self._persist_split_remainders_now(entries)
                 self._split_children.clear()
+        # A3 兜底：停止时若当日还没有组合资金日序列（14:30 前停过），补写一条
+        # 快照；已有当日行（含 14:30 日终）则不动，避免用停止时点覆盖收盘口径。
+        try:
+            await asyncio.get_running_loop().run_in_executor(
+                self._executor,
+                functools.partial(
+                    self.backfill_daily_portfolio_snapshot,
+                    only_if_missing=True,
+                ),
+            )
+        except RuntimeError:
+            self.backfill_daily_portfolio_snapshot(only_if_missing=True)
+        except Exception:  # noqa: BLE001 — 观测补写失败不得影响停会话
+            logger.warning(
+                "daily snapshot backfill on stop failed (session %s)",
+                self.session_id, exc_info=True)
         # I-5：dispatcher.close 经同一主 executor 执行——在途 tick 持 get_tdx_lock
         # 跑完后 close 自然获得锁（同池 max_workers=1 串行排队），事件循环不被
         # TDX 退订对账阻塞（原先在事件循环线程同步 close，秒级冻结）。
@@ -6149,6 +6165,58 @@ class LiveEngine:
             logger.warning(
                 "daily portfolio snapshot write failed (session %s, %s)",
                 self.session_id, today, exc_info=True)
+        finally:
+            db.close()
+
+    def backfill_daily_portfolio_snapshot(self, only_if_missing: bool = False) -> None:
+        """启动/停止兜底：交易日补写当日组合资金快照。
+
+        原本只有 14:30 日终调度会写 ``live_portfolio_daily``，会话在 14:30 前
+        被停止（或 alert 模式不进日终调度）就永远没有当日行。启动时持仓已
+        recover、停止时内存账本仍完整，各补写一次；14:30 的日终 upsert 会把
+        同日行覆盖成收盘口径。
+        """
+        today = now_shanghai().date()
+        try:
+            if not self._calendar.is_trading_day(today):
+                return
+        except Exception:  # noqa: BLE001 — 日历不可用时不猜交易日，绝不补写脏数据
+            logger.warning(
+                "daily snapshot backfill: 交易日历不可用，跳过 (session %s)",
+                self.session_id, exc_info=True)
+            return
+        if only_if_missing and self._has_daily_portfolio_snapshot(today):
+            return
+        self._write_daily_portfolio_snapshots(today)
+        logger.info(
+            "daily portfolio snapshot backfilled (session %s, %s, only_if_missing=%s)",
+            self.session_id, today, only_if_missing)
+
+    def _has_daily_portfolio_snapshot(self, today: date) -> bool:
+        factory = self._db_session_factory
+        if factory is None:
+            return False
+        db = factory()
+        if db is None:
+            return False
+        try:
+            written = {
+                int(row[0]) for row in
+                db.query(LivePortfolioDaily.portfolio_strategy_id)
+                .filter(
+                    LivePortfolioDaily.live_session_id == self.session_id,
+                    LivePortfolioDaily.trade_date == today,
+                )
+                .distinct()
+                .all()
+            }
+            expected = {
+                int(p.portfolio_id) for p in (self.ctx.portfolios or [])
+            }
+            # 多组合会话只要还有组合缺当日行，就允许补写（upsert 幂等）。
+            return bool(expected) and expected.issubset(written)
+        except Exception:  # noqa: BLE001 — 查询失败按「无行」处理，补写是 upsert
+            return False
         finally:
             db.close()
 

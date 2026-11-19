@@ -38,7 +38,8 @@ from core.runtime import process_tag
 from core.models import (
     LiveSession, LiveSessionPortfolio, PortfolioStrategy, Strategy,
     StockPoolStock, StockPoolMembership, Formula, FormulaSignal, LiveOrder, LiveTrade, LiveDecisionEvent,
-    LiveSignal, LiveAccountSnapshot, LiveCashFlow, LiveBaselineReset,
+    LiveSignal, LiveAccountSnapshot, LiveAccountPositionSnapshot,
+    LiveCashFlow, LiveBaselineReset,
     LiveManualAction, LiveReconciliationDiff, LiveReconciliationReport,
     LiveOutOfPoolDecision, LiveCorporateAction,
     LivePortfolioDaily,
@@ -1614,6 +1615,7 @@ def list_sessions(db: Session, engines: Optional[Dict[int, LiveEngine]] = None) 
             ),
             "baseline_version": int(getattr(s, "baseline_version", 0) or 0),
             "portfolio_ids": sorted(p["portfolio_id"] for p in by_session.get(s.id, [])),
+            "backtest_record_id": getattr(s, "backtest_record_id", None),
             "portfolios": by_session.get(s.id, []),
             # I-7（audit）：运行中引擎最近一次对账差异摘要；未运行（无引擎）为 []
             "reconcile_mismatches": (
@@ -2040,6 +2042,7 @@ def get_session(db: Session, session_id: int, engine: Optional[LiveEngine] = Non
         "started_at": session.started_at,
         "stopped_at": session.stopped_at,
         "portfolio_ids": sorted(p.portfolio_strategy_id for p in portfolios),
+        "backtest_record_id": getattr(session, "backtest_record_id", None),
         "portfolios": [
             {
                 "portfolio_id": p.portfolio_strategy_id,
@@ -2107,12 +2110,16 @@ SESSION_EDIT_FIELDS = (
     "intraday_mismatched_risk_enabled", "capital_pool_mode",
     "capital_pool_rebalance_enabled", "portfolio_ids",
     "gate_recheck_on_execute",
+    # 理论 vs 实盘面板的回测基准绑定（纯观测字段，不影响交易语义）
+    "backtest_record_id",
     # G2：盘前参数会话级覆盖（NULL=跟随全局）
     "pre_open_auction_enabled", "pre_open_auction_end_time",
     "pre_open_auction_price_bias_pct",
 )
-#: 运行中只能「下次启动生效」的字段（name 为纯展示字段，立即生效）。
-SESSION_NEXT_START_FIELDS = frozenset(SESSION_EDIT_FIELDS) - {"name"}
+#: 运行中立即生效的字段（纯展示/观测，不影响已加载的交易配置）。
+SESSION_IMMEDIATE_FIELDS = frozenset({"name", "backtest_record_id"})
+#: 运行中只能「下次启动生效」的字段。
+SESSION_NEXT_START_FIELDS = frozenset(SESSION_EDIT_FIELDS) - SESSION_IMMEDIATE_FIELDS
 
 
 def _sync_session_portfolios(db: Session, session_id: int, pids: List[int]) -> None:
@@ -2218,6 +2225,22 @@ def _normalize_session_patch(db: Session, data: dict,
     if "gate_recheck_on_execute" in data:
         patch["gate_recheck_on_execute"] = bool(
             data.get("gate_recheck_on_execute"))
+    if "backtest_record_id" in data:
+        raw = data.get("backtest_record_id")
+        if raw is None or str(raw).strip() == "":
+            patch["backtest_record_id"] = None
+        else:
+            try:
+                rec_id = int(raw)
+            except (TypeError, ValueError):
+                return None, (400, "backtest_record_id 必须为整数或 null")
+            if rec_id <= 0:
+                return None, (400, "backtest_record_id 必须为正整数")
+            exists = db.query(BacktestRecord.id).filter(
+                BacktestRecord.id == rec_id).first()
+            if exists is None:
+                return None, (400, "回测记录 #%d 不存在" % rec_id)
+            patch["backtest_record_id"] = rec_id
     if "portfolio_ids" in data:
         pids = data.get("portfolio_ids")
         if not isinstance(pids, list):
@@ -2274,7 +2297,7 @@ def update_session(db: Session, session_id: int, data: dict,
     """B1 + A4：编辑会话配置。
 
     - 未运行：全部字段立即写库（组合增删同步关联表，保留会话与历史成交）；
-    - 运行中：`name` 立即生效，其余字段入 D3 待生效队列，下次启动前应用。
+    - 运行中：`name` / `backtest_record_id` 立即生效，其余字段入 D3 待生效队列。
     返回 (ok, data_or_(status, message))。
     """
     session = db.query(LiveSession).filter(LiveSession.id == session_id).first()
@@ -2288,7 +2311,7 @@ def update_session(db: Session, session_id: int, data: dict,
     applied: List[str] = []
     pending: List[str] = []
     for field, value in patch.items():
-        if running and field in SESSION_NEXT_START_FIELDS:
+        if running and field not in SESSION_IMMEDIATE_FIELDS:
             _enqueue_session_pending(db, session, field, value)
             pending.append(field)
         else:
@@ -4003,6 +4026,136 @@ def compute_params_drift(db: Session, session) -> Optional[dict]:
                     reason="参数漂移比对失败")
 
 
+def _backfill_live_daily_from_account_snapshots(
+    db: Session, session_id: int, engine=None,
+) -> int:
+    """按账户历史快照回补 ``live_portfolio_daily`` 的过去交易日。
+
+    仅单组合会话可用（账户总资产=该组合总资产）；多组合无法在不引入误差的
+    前提下拆分到各组合，直接跳过。只补「今日之前、接缝日之后」且缺失的日期，
+    不覆盖引擎/日终已写入的行。
+    """
+    links = (
+        db.query(LiveSessionPortfolio)
+        .filter(LiveSessionPortfolio.session_id == session_id)
+        .all()
+    )
+    active = [l for l in links if (l.status or "active") == "active"] or links
+    if len(active) != 1:
+        return 0
+    link = active[0]
+    today = now_shanghai().date()
+    day_q = (
+        db.query(
+            func.date(LiveAccountSnapshot.captured_at).label("d"),
+            func.max(LiveAccountSnapshot.id).label("sid"),
+        )
+        .filter(LiveAccountSnapshot.live_session_id == session_id)
+    )
+    if link.seam_date is not None:
+        day_q = day_q.filter(
+            func.date(LiveAccountSnapshot.captured_at) >= link.seam_date.isoformat())
+    day_rows = day_q.group_by(
+        func.date(LiveAccountSnapshot.captured_at)).all()
+    if not day_rows:
+        return 0
+    snap_ids = [int(row.sid) for row in day_rows]
+    snaps = {
+        int(s.id): s for s in
+        db.query(LiveAccountSnapshot)
+        .filter(LiveAccountSnapshot.id.in_(snap_ids)).all()
+    }
+    # 账户快照是真实账户口径；仅当它与会话虚拟账本对得上时才回补，避免把
+    # 未纳入本会话的资金写成实盘曲线。
+    if engine is not None:
+        try:
+            latest_snap = snaps[max(snaps)] if snaps else None
+            latest_total = (
+                latest_snap.total_asset if latest_snap is not None else None)
+            portfolio_total = sum(
+                (Decimal(str(p.account.cash or 0)) + p._holdings_value()
+                 for p in (engine.ctx.portfolios or [])
+                 if int(p.portfolio_id) == int(link.portfolio_strategy_id)),
+                Decimal("0"),
+            )
+            if latest_total is not None and portfolio_total > 0:
+                diff = abs(Decimal(str(latest_total)) - portfolio_total)
+                if diff > max(Decimal("1000"), portfolio_total * Decimal("0.02")):
+                    logger.warning(
+                        "skip live_portfolio_daily backfill: account snapshot %s "
+                        "vs session ledger %s mismatch (session %s portfolio %s)",
+                        latest_total, portfolio_total, session_id,
+                        link.portfolio_strategy_id)
+                    return 0
+        except Exception:  # noqa: BLE001 — 对账失败时宁可不回补
+            logger.warning(
+                "skip live_portfolio_daily backfill: alignment check failed "
+                "(session %s)", session_id, exc_info=True)
+            return 0
+    existing = {
+        row[0] for row in
+        db.query(LivePortfolioDaily.trade_date).filter_by(
+            live_session_id=session_id,
+            portfolio_strategy_id=link.portfolio_strategy_id,
+        ).all()
+    }
+    flows = (
+        db.query(LiveCashFlow)
+        .filter(
+            LiveCashFlow.live_session_id == session_id,
+            LiveCashFlow.portfolio_strategy_id == link.portfolio_strategy_id,
+        )
+        .all()
+    )
+    created = 0
+    for row in day_rows:
+        try:
+            trade_date = date.fromisoformat(str(row.d))
+        except (TypeError, ValueError):
+            continue
+        if trade_date >= today or trade_date in existing:
+            continue
+        snap = snaps.get(int(row.sid))
+        if snap is None or snap.total_asset is None:
+            continue
+        total = Decimal(str(snap.total_asset))
+        market_value = Decimal(str(snap.market_value or 0))
+        cash = total - market_value
+        net_flow = sum(
+            Decimal(str(f.amount or 0)) for f in flows
+            if f.flow_date is not None and f.flow_date <= trade_date)
+        positions = (
+            db.query(LiveAccountPositionSnapshot)
+            .filter_by(snapshot_id=snap.id).all()
+        )
+        detail = [{
+            "stock_code": p.stock_code,
+            "quantity": int(p.quantity or 0),
+            "market_value": (str(p.market_value)
+                             if p.market_value is not None else None),
+        } for p in positions if int(p.quantity or 0) > 0]
+        db.add(LivePortfolioDaily(
+            live_session_id=session_id,
+            portfolio_strategy_id=link.portfolio_strategy_id,
+            trade_date=trade_date,
+            cash=cash,
+            market_value=market_value,
+            total_value=total,
+            risk_value=total - net_flow,
+            weight=Decimal("1"),
+            position_count=len(detail),
+            detail=json.dumps(detail, ensure_ascii=False),
+        ))
+        created += 1
+    if created:
+        db.commit()
+        logger.info(
+            "live_portfolio_daily backfilled from account snapshots: session=%s "
+            "portfolio=%s rows=%s",
+            session_id, link.portfolio_strategy_id, created)
+    return created
+
+
 def start_session(
     db: Session,
     session_id: int,
@@ -4247,6 +4400,24 @@ def start_session(
             logger.warning(
                 "incremental backtest: 接缝日捕获失败 (session %s)",
                 session_id, exc_info=True)
+    # A3 兜底一：用账户历史快照回补过去缺失的交易日（单组合、非 alert）。
+    if execution_mode != "alert":
+        try:
+            _backfill_live_daily_from_account_snapshots(db, session_id, engine)
+        except Exception:  # noqa: BLE001 — 历史回补失败不阻断启动
+            db.rollback()
+            logger.warning(
+                "live_portfolio_daily historical backfill failed (session %s)",
+                session_id, exc_info=True)
+    # A3 兜底二：启动时补写当日组合资金快照。原本只在 14:30 日终写，会话若在
+    # 14:30 前被停止就永远没有日序列；此处按 recover 后的账本先落一条，
+    # 14:30 日终仍会 upsert 覆盖为收盘口径。失败不阻断启动。
+    try:
+        engine.backfill_daily_portfolio_snapshot()
+    except Exception:  # noqa: BLE001
+        logger.warning(
+            "daily portfolio snapshot backfill on start failed (session %s)",
+            session_id, exc_info=True)
     return engine, session, None
 
 
@@ -6195,7 +6366,8 @@ def _curve_points(rows) -> list:
 def _curve_metrics(curve: list) -> dict:
     """曲线口径指标：累计收益 / 最大回撤（基于归一净值，与初始资金无关）。"""
     values = [p["total_value"] for p in curve if p["total_value"] is not None]
-    if not values:
+    if len(values) < 2:
+        # 单点曲线无法定义累计收益/回撤：返回空而不是假 0。
         return {"total_return": None, "max_drawdown": None}
     peak = values[0]
     max_dd = 0.0
@@ -6208,6 +6380,58 @@ def _curve_metrics(curve: list) -> dict:
                          if values[0] else None),
         "max_drawdown": round(max_dd, 6),
     }
+
+
+def _session_portfolio_ids(db: Session, session_id: int) -> List[int]:
+    """会话关联的组合策略 id（理论侧自动关联的候选范围）。"""
+    rows = (
+        db.query(LiveSessionPortfolio.portfolio_strategy_id)
+        .filter(LiveSessionPortfolio.session_id == session_id)
+        .all()
+    )
+    return [int(r[0]) for r in rows]
+
+
+def _latest_portfolio_backtest_record(
+    db: Session, portfolio_ids: List[int],
+    portfolio_id: Optional[int] = None,
+) -> Optional[BacktestRecord]:
+    """按组合自动关联「最近一次已完成回测记录」。
+
+    优先取有组合日快照的记录（否则理论侧仍是空曲线）；排除 walk-forward /
+    参数扰动等派生记录，避免把辅助产物当主回测基准。
+    """
+    ids = [portfolio_id] if portfolio_id else list(portfolio_ids or [])
+    if not ids:
+        return None
+    candidates = (
+        db.query(BacktestRecord)
+        .filter(
+            BacktestRecord.portfolio_strategy_id.in_(ids),
+            BacktestRecord.status == "completed",
+            BacktestRecord.walk_forward_run_id.is_(None),
+            BacktestRecord.param_perturb_run_id.is_(None),
+        )
+        .order_by(BacktestRecord.completed_at.desc(), BacktestRecord.id.desc())
+        .all()
+    )
+    if not candidates:
+        return None
+    candidate_ids = [int(c.id) for c in candidates]
+    with_snapshots = {
+        int(r[0]) for r in
+        db.query(BacktestDailySnapshot.backtest_record_id)
+        .filter(
+            BacktestDailySnapshot.backtest_record_id.in_(candidate_ids),
+            BacktestDailySnapshot.target_type == "portfolio",
+        )
+        .distinct()
+        .all()
+    }
+    for rec in candidates:
+        if int(rec.id) in with_snapshots:
+            return rec
+    return candidates[0]
 
 
 def _snapshot_dividend_mode(raw) -> Optional[str]:
@@ -6237,6 +6461,12 @@ def compute_theory_vs_live(
     """
     result: dict = {
         "bound": False, "backtest_record_id": None, "backtest_name": None,
+        # manual=会话显式绑定；auto=按会话组合自动关联最近已完成回测
+        "binding_source": None,
+        # missing=无日序列；ok=有曲线（单点也归 ok，但指标会保持为空）
+        "live_series_status": "missing",
+        # no_binding / record_missing / empty / ok
+        "theory_series_status": "no_binding",
         "window": {"start": None, "end": None},
         "theory": {"curve": [], "metrics": {}},
         "live": {"curve": [], "metrics": {}},
@@ -6254,9 +6484,14 @@ def compute_theory_vs_live(
     if end_date:
         live_q = live_q.filter(LivePortfolioDaily.trade_date <= end_date)
     live_rows = live_q.order_by(LivePortfolioDaily.trade_date).all()
-    if not live_rows:
+    if live_rows:
+        result["live_series_status"] = "ok"
+    else:
         result["warnings"].append(
-            "无实盘日序列（live_portfolio_daily 尚未生成），实际侧曲线为空")
+            "无实盘日序列（live_portfolio_daily 尚未生成）：该表只在交易日 "
+            "14:30 由运行中的 auto/shadow 会话写入，会话若在 14:30 前停止则"
+            "当天不会落行；新版会在会话启动/停止时补写当日快照，重启会话后"
+            "即可看到")
 
     live_curve = _curve_points(
         [(r.trade_date, r.total_value) for r in live_rows])
@@ -6304,14 +6539,33 @@ def compute_theory_vs_live(
     result["live"] = {"curve": live_curve, "metrics": live_metrics}
 
     rec_id = getattr(session, "backtest_record_id", None)
-    if not rec_id:
-        result["warnings"].append(
-            "会话未绑定回测记录：只展示实际侧，无法做理论对照")
-        return result
-    rec = db.query(BacktestRecord).filter(BacktestRecord.id == rec_id).first()
+    rec = None
+    binding_source: Optional[str] = None
+    if rec_id:
+        rec = db.query(BacktestRecord).filter(BacktestRecord.id == rec_id).first()
+        if rec is None:
+            result["warnings"].append(
+                f"绑定的回测记录 #{rec_id} 不存在，已尝试按组合自动关联")
+            rec_id = None
+        else:
+            binding_source = "manual"
     if rec is None:
-        result["warnings"].append(f"绑定的回测记录 #{rec_id} 不存在")
-        return result
+        # 继承关系未显式落库时，按会话组合自动关联最近一次已完成回测：
+        # 实盘会话通常由某组合的回测起账而来，不应强迫用户先去找绑定入口。
+        rec = _latest_portfolio_backtest_record(
+            db, _session_portfolio_ids(db, session.id), portfolio_id)
+        if rec is None:
+            result["theory_series_status"] = "no_binding"
+            result["warnings"].append(
+                "未绑定回测记录，且该会话组合没有已完成回测：理论侧无法生成"
+                "（实盘侧不受影响）。可在面板上方选择回测记录并保存绑定")
+            return result
+        rec_id = int(rec.id)
+        binding_source = "auto"
+    result["binding_source"] = binding_source
+    result["binding_note"] = (
+        "自动关联：会话组合最近一次已完成回测（可在面板改选后保存）"
+        if binding_source == "auto" else "会话显式绑定")
     # J3：显式标注口径差异（实盘桥行情不复权 vs 回测复权），避免把除权日附近的
     # 理论/实际信号不一致误判为策略或执行缺陷。
     bt_mode = _snapshot_dividend_mode(getattr(rec, "params_snapshot", None))
@@ -6321,11 +6575,22 @@ def compute_theory_vs_live(
             f"回测使用 {bt_mode} 复权；除权日附近理论/实际信号可能天然不一致，"
             "非执行缺陷")
 
-    win_start = start_date or rec.start_date
-    win_end = end_date or rec.end_date
-    if live_rows:
-        win_start = start_date or live_rows[0].trade_date
-        win_end = end_date or live_rows[-1].trade_date
+    # 曲线窗口取「回测区间 ∪ 实盘区间」：绑定回测通常止于接缝日，实盘在其后
+    # 续跑；只用实盘窗口会把整段理论曲线裁掉，只用回测窗口又看不到实盘。
+    live_start = live_rows[0].trade_date if live_rows else None
+    live_end = live_rows[-1].trade_date if live_rows else None
+    starts = [d for d in (start_date, rec.start_date, live_start) if d]
+    ends = [d for d in (end_date, rec.end_date, live_end) if d]
+    win_start = min(starts) if starts else None
+    win_end = max(ends) if ends else None
+    # 指标差异只在两段区间的重叠部分计算；接缝日之后理论侧没有数据，
+    # 拿全区间收益直接相减会得出误导性的「偏差」。
+    cmp_start = max(rec.start_date, live_start) if (
+        rec.start_date and live_start) else None
+    cmp_end = min(rec.end_date, live_end) if (
+        rec.end_date and live_end) else None
+    if cmp_start and cmp_end and cmp_start > cmp_end:
+        cmp_start = cmp_end = None
     result.update({
         "bound": True,
         "backtest_record_id": int(rec.id),
@@ -6359,6 +6624,41 @@ def compute_theory_vs_live(
     theory_metrics = _curve_metrics(theory_curve)
     theory_metrics["trades_count"] = len(theory_trades)
     result["theory"] = {"curve": theory_curve, "metrics": theory_metrics}
+    if not snaps:
+        result["theory_series_status"] = "empty"
+    elif len(snaps) < 2:
+        result["theory_series_status"] = "insufficient"
+    else:
+        result["theory_series_status"] = "ok"
+
+    # 重叠区间内的收益/回撤：只有两侧都有 >=2 个同日点时才有意义
+    cmp_theory_metrics = _curve_metrics(_curve_points([
+        (s.snap_date, s.total_value) for s in snaps
+        if (cmp_start is None or s.snap_date >= cmp_start)
+        and (cmp_end is None or s.snap_date <= cmp_end)
+    ]))
+    cmp_live_metrics = _curve_metrics(_curve_points([
+        (r.trade_date, r.total_value) for r in live_rows
+        if (cmp_start is None or r.trade_date >= cmp_start)
+        and (cmp_end is None or r.trade_date <= cmp_end)
+    ]))
+    cmp_theory_days = sum(
+        1 for s in snaps
+        if (cmp_start is None or s.snap_date >= cmp_start)
+        and (cmp_end is None or s.snap_date <= cmp_end))
+    cmp_live_days = sum(
+        1 for r in live_rows
+        if (cmp_start is None or r.trade_date >= cmp_start)
+        and (cmp_end is None or r.trade_date <= cmp_end))
+    if live_rows and snaps and cmp_start is None:
+        result["warnings"].append(
+            "实盘区间与回测区间无重叠：两条曲线各自展示，"
+            "收益/回撤差异不计算（请改选覆盖实盘区间的回测记录）")
+    elif cmp_start and (
+            cmp_theory_days < 2 or cmp_live_days < 2):
+        result["warnings"].append(
+            f"重叠区间 {cmp_start.isoformat()}~{cmp_end.isoformat()} 不足 2 个"
+            "交易日，收益/回撤差异不计算")
 
     # ---- 成交滑移：同股票/同日/同方向的理论均价 vs 实盘均价 ----
     def _avg_by_key(trades, time_attr):
@@ -6397,13 +6697,15 @@ def compute_theory_vs_live(
     pairs.sort(key=lambda p: abs(p["deviation_bps"]), reverse=True)
     result["deviation"] = {
         "return_gap": (
-            round(live_metrics["total_return"] - theory_metrics["total_return"], 6)
-            if (live_metrics.get("total_return") is not None
-                and theory_metrics.get("total_return") is not None) else None),
+            round(cmp_live_metrics["total_return"]
+                  - cmp_theory_metrics["total_return"], 6)
+            if (cmp_live_metrics.get("total_return") is not None
+                and cmp_theory_metrics.get("total_return") is not None) else None),
         "max_drawdown_gap": (
-            round(live_metrics["max_drawdown"] - theory_metrics["max_drawdown"], 6)
-            if (live_metrics.get("max_drawdown") is not None
-                and theory_metrics.get("max_drawdown") is not None) else None),
+            round(cmp_live_metrics["max_drawdown"]
+                  - cmp_theory_metrics["max_drawdown"], 6)
+            if (cmp_live_metrics.get("max_drawdown") is not None
+                and cmp_theory_metrics.get("max_drawdown") is not None) else None),
         "trades_gap": len(live_trades) - len(theory_trades),
         "slippage": {
             "matched_pairs": len(pairs),
@@ -6414,5 +6716,17 @@ def compute_theory_vs_live(
         },
     }
     if not snaps:
-        result["warnings"].append("绑定回测记录在该窗口内无日快照，理论侧曲线为空")
+        result["warnings"].append(
+            "绑定回测记录在该窗口内无日快照，理论侧曲线为空："
+            f"回测区间 {_fmt_date(rec.start_date)}~{_fmt_date(rec.end_date)}，"
+            f"对照窗口 {_fmt_date(win_start)}~{_fmt_date(win_end)}；"
+            "请改选覆盖该区间的回测记录")
+    elif len(snaps) < 2:
+        result["warnings"].append(
+            "理论侧在该窗口内只有 1 个日快照，无法计算累计收益/回撤；"
+            "请改选覆盖实盘区间的回测记录")
     return result
+
+
+def _fmt_date(value) -> str:
+    return value.isoformat() if value else "-"

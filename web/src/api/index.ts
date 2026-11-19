@@ -2106,6 +2106,8 @@ export interface LiveSessionItem {
   started_at: string | null
   stopped_at: string | null
   portfolio_ids: number[]
+  // 理论 vs 实盘面板绑定的回测记录（null=未显式绑定，面板按组合自动关联）
+  backtest_record_id?: number | null
   portfolios?: { portfolio_id: number; status: string }[]  // 组合级状态(active|circuit_broken)
   reconcile_mismatches?: ReconcileMismatch[]  // 最近一次虚拟持仓 vs 桥实际对账差异（未运行 []）
   advance_close_enabled?: boolean  // 14:50 提前收盘价（B 可选增强，仅 1d）是否开启
@@ -2285,6 +2287,11 @@ export interface TheoryVsLiveResult {
   bound: boolean
   backtest_record_id: number | null
   backtest_name: string | null
+  // manual=会话显式绑定；auto=按会话组合自动关联最近一次已完成回测
+  binding_source: 'manual' | 'auto' | null
+  binding_note: string | null
+  live_series_status: 'missing' | 'ok'
+  theory_series_status: 'no_binding' | 'record_missing' | 'empty' | 'insufficient' | 'ok'
   window: { start: string | null; end: string | null }
   theory: TheoryVsLiveSide
   live: TheoryVsLiveSide

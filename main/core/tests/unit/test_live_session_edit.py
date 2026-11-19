@@ -5,9 +5,11 @@ from types import SimpleNamespace
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
+from datetime import date
+
 from core.models import (
-    Base, LiveSession, LiveSessionPendingChange, LiveSessionPortfolio,
-    PortfolioStrategy,
+    Base, BacktestRecord, LiveSession, LiveSessionPendingChange,
+    LiveSessionPortfolio, PortfolioStrategy,
 )
 from core.services import live_service
 
@@ -115,6 +117,39 @@ def test_pending_session_change_dedupes_same_field():
         live_session_id=sid, field="engine", status="pending").all()
     assert len(rows) == 1
     assert json.loads(rows[0].new_value) == "goldminer"
+
+
+def test_backtest_record_binding_is_editable_and_applies_while_running():
+    db = _db()
+    p1 = _portfolio(db)
+    sid = _session(db, [p1.id])["id"]
+    rec = BacktestRecord(
+        portfolio_strategy_id=p1.id, name="回测基准", status="completed",
+        start_date=date(2026, 1, 1), end_date=date(2026, 11, 16),
+    )
+    db.add(rec)
+    db.commit()
+
+    # 运行中也立即生效（纯观测字段，不进下次启动队列）
+    session = db.query(LiveSession).filter_by(id=sid).first()
+    session.status = "running"
+    db.commit()
+    ok, result = live_service.update_session(
+        db, sid, {"backtest_record_id": rec.id}, {sid: _fake_engine()})
+    assert ok is True
+    assert result["effective_at"] == "now"
+    assert "backtest_record_id" in result["applied"]
+    assert result["session"]["backtest_record_id"] == rec.id
+    assert db.query(LiveSession).filter_by(id=sid).first().backtest_record_id == rec.id
+
+    # 置空 = 回到按组合自动关联
+    ok, result = live_service.update_session(
+        db, sid, {"backtest_record_id": None}, {sid: _fake_engine()})
+    assert ok is True and result["session"]["backtest_record_id"] is None
+
+    ok, result = live_service.update_session(
+        db, sid, {"backtest_record_id": 99999}, {})
+    assert ok is False and result[0] == 400
 
 
 def test_update_session_validation_errors():
