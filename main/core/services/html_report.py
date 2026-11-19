@@ -358,9 +358,9 @@ def _cost_capacity_section(detail: dict) -> str:
     )
     body = (
         '<div class="kpi-grid">' + "".join(cards) + "</div>"
-        + "<h3>显性成本</h3>" + cost_tbl
-        + "<h3>滑点实现偏差</h3>" + slip_tbl
-        + "<h3>容量与冲击成本</h3>" + cap_tbl
+        + "<h3>2.1 显性成本</h3>" + cost_tbl
+        + "<h3>2.2 滑点实现偏差</h3>" + slip_tbl
+        + "<h3>2.3 容量与冲击成本</h3>" + cap_tbl
         + note
     )
     return _section(title, body)
@@ -1088,34 +1088,34 @@ def _market_regime_section(detail: dict,
                            charts: List[Tuple[str, dict]]) -> str:
     mr = detail.get("market_regime")
     if mr is None:
-        return _section("二、市场状态×绩效（机遇/中性Alpha · 风格 · 行业 · 稳健性）",
+        return _section("三、市场状态×绩效（机遇/中性Alpha · 风格 · 行业 · 稳健性）",
                         _empty("本次回测未计算市场状态分析"))
     if mr.get("status") != "completed":
-        return _section("二、市场状态×绩效（机遇/中性Alpha · 风格 · 行业 · 稳健性）",
+        return _section("三、市场状态×绩效（机遇/中性Alpha · 风格 · 行业 · 稳健性）",
                         _empty(f"分析状态：{esc(mr.get('status'))}；{esc(mr.get('error') or '')}"))
     d = mr.get("data") or {}
-    body = ["<h3>2.1 市场状态×绩效总表</h3>", _regime_states(d),
-            "<h3>2.2 机遇 Alpha（上涨捕获）</h3>", _opportunity(d),
-            "<h3>2.3 反弹弹性（下跌后反弹段）</h3>", _rebound(d),
-            "<h3>2.4 中性 Alpha（震荡磨损）</h3>", _neutral(d),
-            "<h3>2.5 风格×绩效矩阵（结构性行情）</h3>", _style_block(d),
-            "<h3>2.6 市场分化度（宽基截面标准差）</h3>",
+    body = ["<h3>3.1 市场状态×绩效总表</h3>", _regime_states(d),
+            "<h3>3.2 机遇 Alpha（上涨捕获）</h3>", _opportunity(d),
+            "<h3>3.3 反弹弹性（下跌后反弹段）</h3>", _rebound(d),
+            "<h3>3.4 中性 Alpha（震荡磨损）</h3>", _neutral(d),
+            "<h3>3.5 风格×绩效矩阵（结构性行情）</h3>", _style_block(d),
+            "<h3>3.6 市场分化度（宽基截面标准差）</h3>",
             _dispersion_block(d, charts),
-            "<h3>2.7 隐含风格暴露（滚动相关 / OLS Beta）</h3>",
+            "<h3>3.7 隐含风格暴露（滚动相关 / OLS Beta）</h3>",
             _exposure_block(d),
-            "<h3>2.7-B 巨潮四象限·纯风格暴露（规模×成长/价值）</h3>",
+            "<h3>3.7-B 巨潮四象限·纯风格暴露（规模×成长/价值）</h3>",
             _quadrant_block(d),
-            f"<h3>2.8 行业归因（{esc((d.get('industry_attribution') or {}).get('taxonomy') or '通达信二级行业')}）</h3>",
+            f"<h3>3.8 行业归因（{esc((d.get('industry_attribution') or {}).get('taxonomy') or '通达信二级行业')}）</h3>",
             _industry_block(d, charts),
-            "<h3>2.9 稳健性体检 🔬（只读快照计算，不重跑回测）</h3>",
+            "<h3>3.9 稳健性体检 🔬（只读快照计算，不重跑回测）</h3>",
             _robustness_block(d, charts)]
-    return _section("二、市场状态×绩效（机遇/中性Alpha · 风格 · 行业 · 稳健性）",
+    return _section("三、市场状态×绩效（机遇/中性Alpha · 风格 · 行业 · 稳健性）",
                     "".join(body))
 
 
 def _robustness_section(detail: dict) -> str:
-    """三、稳健性检验：年度/3年滚动/个股集中度/样本内外（纯后处理）。"""
-    title = "三、稳健性检验（年度 / 3年滚动 / 集中度 / 样本内外）"
+    """四、稳健性检验：年度/3年滚动/个股集中度/样本内外（纯后处理）。"""
+    title = "四、稳健性检验（年度 / 3年滚动 / 集中度 / 样本内外）"
     rb = detail.get("robustness")
     if rb is None:
         return _section(title, _empty("本次回测未计算稳健性检验"))
@@ -1138,7 +1138,7 @@ def _robustness_section(detail: dict) -> str:
         ann_rows.append([esc(a.get("year")), pct_signed(a.get("return")),
                          pct(a.get("max_drawdown"))])
         ann_cls.append([None, cls(a.get("return")), "neg"])
-    body.append("<h3>3.1 年度收益与年内最大回撤</h3>")
+    body.append("<h3>4.1 年度收益与年内最大回撤</h3>")
     body.append(_table(["年度", "收益", "年内最大回撤"], ann_rows, ann_cls)
                 if ann_rows else _empty("无年度数据"))
 
@@ -1148,7 +1148,7 @@ def _robustness_section(detail: dict) -> str:
         r3_rows.append([f"{esc(w.get('start'))} ~ {esc(w.get('end'))}",
                         pct_signed(w.get("cagr")), pct(w.get("max_drawdown"))])
         r3_cls.append([None, cls(w.get("cagr")), "neg"])
-    body.append("<h3>3.2 3年滚动窗口（CAGR / 窗口内最大回撤）</h3>")
+    body.append("<h3>4.2 3年滚动窗口（CAGR / 窗口内最大回撤）</h3>")
     body.append(_table(["窗口", "CAGR", "窗口内最大回撤"], r3_rows, r3_cls)
                 if r3_rows else _empty("区间不足 3 年，无滚动窗口"))
 
@@ -1175,7 +1175,7 @@ def _robustness_section(detail: dict) -> str:
                     f" ／ 占净利 {pct(conc.get('top20_share'))}")
     else:
         summary += f"　前20只占总净利 {pct(conc.get('top20_share'))}"
-    body.append("<h3>3.3 盈利贡献分布（已实现 / 未实现 / 单笔）</h3>")
+    body.append("<h3>4.3 盈利贡献分布（已实现 / 未实现 / 单笔）</h3>")
     body.append(f'<p class="note">{esc(summary)}</p>')
     body.append(_table(["#", "代码", "已实现净 P&L", "占毛利", "占净利"],
                        conc_rows, conc_cls)
@@ -1229,7 +1229,7 @@ def _robustness_section(detail: dict) -> str:
             body.append(_table(["#", "代码", "买入 → 卖出", "股数", "盈亏", "占毛利", "占净利"],
                                lot_rows, lot_cls))
 
-    body.append("<h3>3.4 样本内 / 样本外对比（默认 75/25 自动切分）</h3>")
+    body.append("<h3>4.4 样本内 / 样本外对比（默认 75/25 自动切分）</h3>")
     oos = d.get("oos")
     if not oos:
         body.append(_empty("区间不足 2 年，无法切分样本内/样本外"))
@@ -1505,8 +1505,8 @@ def _persistence_rolling_chart(d: dict) -> Optional[Tuple[str, dict]]:
 
 
 def _persistence_section(detail: dict, charts: List[Tuple[str, dict]]) -> str:
-    """四、持续性检验（阿尔法衰减 vs 风格钟摆）：分年度超额/风险/交易结构 + 滚动年化。"""
-    title = "四、持续性检验（阿尔法衰减 vs 风格钟摆）"
+    """五、持续性检验（阿尔法衰减 vs 风格钟摆）：分年度超额/风险/交易结构 + 滚动年化。"""
+    title = "五、持续性检验（阿尔法衰减 vs 风格钟摆）"
     pp = detail.get("persistence")
     if pp is None:
         return _section(title, _empty("本次回测未计算持续性检验"))
@@ -1549,7 +1549,7 @@ def _persistence_section(detail: dict, charts: List[Tuple[str, dict]]) -> str:
                 else f'<span>{esc(s.get("word") or "")}</span>',
             ])
             s_cls.append([None, None, None])
-        body.append("<h3>4.0 判定信号（判定窗口实测 → 结论）</h3>")
+        body.append("<h3>5.0 判定信号（判定窗口实测 → 结论）</h3>")
         body.append(_table(["维度", "实测", "判定"], s_rows, s_cls))
     elif v.get("reasons"):
         body.append('<ul class="note">')
@@ -1569,7 +1569,7 @@ def _persistence_section(detail: dict, charts: List[Tuple[str, dict]]) -> str:
             pct(y.get("cost_ratio")),
         ])
         m_cls.append([None, cls(y.get("nav_return")), "neg", None, None, None, None, None, None])
-    body.append("<h3>4.1 分年度指标矩阵（* 未满 200 交易日，不参与判定）</h3>")
+    body.append("<h3>5.1 分年度指标矩阵（* 未满 200 交易日，不参与判定）</h3>")
     body.append(_table(["年份", "收益", "最大回撤", "夏普", "卡玛", "胜率", "盈亏比", "换手×（双边）", "成本/日均净值"],
                        m_rows, m_cls) if m_rows else _empty("无年度数据"))
 
@@ -1586,13 +1586,13 @@ def _persistence_section(detail: dict, charts: List[Tuple[str, dict]]) -> str:
             rc.append(cls(val) if val is not None else None)
         e_rows.append(row)
         e_cls.append(rc)
-    body.append("<h3>4.2 分年度超额收益（vs 组合基准 + 宽基）</h3>")
+    body.append("<h3>5.2 分年度超额收益（vs 组合基准 + 宽基）</h3>")
     body.append(_table(head, e_rows, e_cls) if e_rows else _empty("无超额数据"))
 
     roll_opt = _persistence_rolling_chart(d)
     if roll_opt:
         charts.append(roll_opt)
-        body.append("<h3>4.3 滚动年化收益（策略 6M/12M vs 基准 12M）</h3>")
+        body.append("<h3>5.3 滚动年化收益（策略 6M/12M vs 基准 12M）</h3>")
         body.append(_chart(roll_opt[0], 340))
         body.append('<p class="note">解读：策略 12M 与基准 12M 同步回落→风格钟摆；策略 12M 单独下坠而基准平稳→疑似阿尔法衰减；6M 波动大于 12M 属正常，连续下行段才是关注点。</p>')
     return _section(title, "".join(body))
@@ -1619,7 +1619,7 @@ def _returns_bucket_section(detail: dict, charts: List[Tuple[str, dict]]) -> str
             body.append(_box_stats_table(rb, stat_key))
     if not body:
         return ""
-    return _section("五、收益分布",
+    return _section("七、收益分布",
                     "".join(body) + '<p class="note">月度热力图红涨绿跌、数值常驻显示；'
                     "箱线图方块为 Q1~Q3 四分位区间、中线为中位数、金色菱形◆为均值、"
                     "灰色虚线为零轴；下方统计表与图表同口径，正红负绿（A股口径）。"
@@ -1658,7 +1658,7 @@ def _gate_val(v) -> str:
 def _decision_section(detail: dict) -> str:
     summary = detail.get("decision_summary") or []
     decisions = detail.get("decisions") or []
-    title = "六、风控与拦截统计（调参可观测性）"
+    title = "八、风控与拦截统计（调参可观测性）"
     if not summary and not decisions:
         return _section(title, _empty("本次回测无闸门拦截/触发记录"))
     rows, row_cls = [], []
@@ -1703,7 +1703,7 @@ def _decision_section(detail: dict) -> str:
 # ---------------------------------------------------------------------------
 def _trades_section(detail: dict) -> str:
     trades = detail.get("trades") or []
-    title = "七、交易明细"
+    title = "九、交易明细"
     if not trades:
         return _section(title, _empty("本次回测无成交记录"))
     rows, row_cls = [], []
@@ -1774,7 +1774,7 @@ def _strategy_eval_section(detail: dict) -> str:
     sevs = detail.get("strategy_evaluations") or []
     if not ev and not sevs:
         return ""
-    title = "四、策略绩效评估"
+    title = "六、策略绩效评估"
     body = []
     if ev:
         cards = "".join([
@@ -1889,7 +1889,7 @@ pre.json-dump{background:#0f172a;color:#e2e8f0;border-radius:6px;padding:12px;fo
   /* 表格：正文宽度内自适应换行，禁止横向溢出；跨页重复表头，行不拆断 */
   table{font-size:8.5pt;margin:4pt 0 8pt;width:100%;table-layout:auto}
   th,td{padding:3pt 4pt;white-space:normal;overflow-wrap:break-word}
-  th{background:#f3f4f6!important;color:#374151}
+  th{background:#f3f4f6!important;color:#374151;white-space:nowrap}
   thead{display:table-header-group;break-after:avoid}
   tfoot{display:table-footer-group}
   tr{break-inside:avoid}
@@ -1899,7 +1899,15 @@ pre.json-dump{background:#0f172a;color:#e2e8f0;border-radius:6px;padding:12px;fo
   .chart{min-width:0;width:100%;margin:4pt 0}
   /* ECharts 画布按屏幕宽度初始化，打印时等比缩进正文宽度，不横向溢出 */
   .chart canvas{max-width:100%!important;height:auto!important}
-  .spb,.empty,details{break-inside:avoid}
+  .spb,.empty{break-inside:avoid}
+  /* details 下钻明细：导出/PDF 直接展开铺出，不再只留一行「点击展开」
+     （::details-content 是 Chromium 131+ 的 details 内容槽，仅在打印媒体下可见） */
+  details{break-inside:auto;margin:4pt 0}
+  details::details-content{content-visibility:visible;display:block}
+  details:not([open])>*:not(summary){display:block!important}
+  details>summary{list-style:none;font-size:9pt;font-weight:600;
+                  color:#374151;break-after:avoid}
+  details>summary::-webkit-details-marker{display:none}
   .spb ul{font-size:9pt}
   .note{font-size:8pt;margin:4pt 0;break-before:avoid}
   pre.json-dump{max-height:none;overflow:visible}
@@ -1941,8 +1949,8 @@ def build_html_report(detail: dict) -> str:
     body = (
         _overview(detail)
         + nav_html
-        + _cost_capacity_section(detail)
         + _crisis_section(detail, charts)
+        + _cost_capacity_section(detail)
         + _market_regime_section(detail, charts)
         + _robustness_section(detail)
         + _persistence_section(detail, charts)
