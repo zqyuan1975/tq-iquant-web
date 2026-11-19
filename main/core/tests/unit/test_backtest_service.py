@@ -70,6 +70,8 @@ def _seed(db) -> tuple:
     db.flush()
     ps = PortfolioStrategy(
         name="test_portfolio", stock_pool_id=pool.id,
+        # 显式指定，避免依赖模型默认值变化（本文件 fixture 的假指数数据按 000300.SH 准备）
+        benchmark_index="000300.SH",
         initial_capital=Decimal("100000"),
         max_drawdown=Decimal("0.2"), daily_loss_limit=Decimal("0.05"),
     )
@@ -1096,12 +1098,12 @@ def test_build_benchmark_data_returns_empty_on_tq_error(monkeypatch):
 
 
 def test_build_benchmark_data_uses_default_code_when_unset(monkeypatch):
-    fake = _FakeIndexTQ({"000300.SH": {date(2026, 1, 5): 3000.0}})
+    fake = _FakeIndexTQ({"000001.SH": {date(2026, 1, 5): 3000.0}})
     monkeypatch.setattr(svc, "TQData", lambda: fake)
     out = svc.build_benchmark_data(
         SimpleNamespace(benchmark_index=None), date(2026, 1, 1), date(2026, 1, 31)
     )
-    assert fake.calls[0]["stocks"] == ["000300.SH"]
+    assert fake.calls[0]["stocks"] == ["000001.SH"]
     assert list(out) == [date(2026, 1, 5)]
 
 
@@ -2753,12 +2755,13 @@ def test_resolve_crisis_benchmark_cases_without_db():
     assert fresh["stored_benchmark_code"] is None
     broken = svc.resolve_crisis_benchmark(
         SimpleNamespace(params_snapshot="{not json"), row, ps)
+    # 坏 snapshot 回落到已存记录行的基准（不是兜底常量）
     assert broken["benchmark_code"] == "000300.SH"
     assert broken["from_snapshot"] is False
     defaulted = svc.resolve_crisis_benchmark(
         SimpleNamespace(params_snapshot=None), None,
         SimpleNamespace(benchmark_index=None))
-    assert defaulted["benchmark_code"] == "000300.SH"
+    assert defaulted["benchmark_code"] == "000001.SH"
 
 
 # ---------------------------------------------------------------------------

@@ -111,7 +111,7 @@ class StrategyItem(BaseModel):
 class PortfolioCreate(BaseModel):
     name: str
     stock_pool_id: int
-    benchmark_index: str = "000985.CSI"
+    benchmark_index: str = "000001.SH"
     # 市场多空门控（2026-11-18）：基准指数空头状态禁止开仓/加仓，持仓不强平。
     # None=请求未携带（编辑不动已有值 / 新建落默认 False）。
     market_gate_enabled: bool | None = None

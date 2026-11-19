@@ -156,6 +156,10 @@ describe('Portfolios.vue — 组合列表（树状）', () => {
     await flushPromises()
     await w.find('button.btn-primary').trigger('click')  // 新建组合（取默认值）
 
+    // 新建默认基准 = 上证指数（000001.SH），编辑/切换不影响该默认
+    const benchSelect = w.find('select[data-field="benchmark_index"]')
+    expect((benchSelect.element as HTMLSelectElement).value).toBe('000001.SH')
+
     // 默认 max_drawdown=0.2 → 显示 20（百分比）
     const drawdownInput = w.find('input[data-field="max_drawdown"]')
     expect(Number((drawdownInput.element as HTMLInputElement).value)).toBe(20)
@@ -186,6 +190,7 @@ describe('Portfolios.vue — 组合列表（树状）', () => {
     // select 字段保持字符串/原值，不被 Number() 转成 NaN
     expect(arg.trading_session).toBe('full')
     expect(arg.stock_pool_id).toBe(1)
+    expect(arg.benchmark_index).toBe('000001.SH')
   })
 
   it('填组合表 + 提交 → 调 createPortfolio，strategies 为空数组', async () => {
@@ -282,6 +287,9 @@ describe('Portfolios.vue — 组合列表（树状）', () => {
     await flushPromises()
 
     expect(w.text()).toContain('编辑组合')
+    // 编辑回显组合自身保存的基准（000300.SH），不被新建默认覆盖
+    const benchSelect = w.find('select[data-field="benchmark_index"]')
+    expect((benchSelect.element as HTMLSelectElement).value).toBe('000300.SH')
     // 回填后 max_drawdown 显示百分比 20
     const drawdownInput = w.find('input[data-field="max_drawdown"]')
     expect(Number((drawdownInput.element as HTMLInputElement).value)).toBe(20)
@@ -294,6 +302,7 @@ describe('Portfolios.vue — 组合列表（树状）', () => {
     const arg = (updatePortfolio as any).mock.calls[0][1]
     expect(arg.max_drawdown).toBeCloseTo(0.2)
     expect(arg.min_commission).toBe(5)
+    expect(arg.benchmark_index).toBe('000300.SH')
   })
 
   it('点某行[删除] → 调 deletePortfolio(id)', async () => {

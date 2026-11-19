@@ -14,7 +14,7 @@ import time
 from datetime import date, datetime, timedelta
 from typing import Dict, Optional, Tuple
 
-from core.engine.crisis_alpha import CRISIS_BENCHMARKS
+from core.engine.crisis_alpha import BENCHMARK_EXTRA_NAMES, CRISIS_BENCHMARKS
 from core.engine.market_gate import (
     GATE_WARMUP_DAYS,
     MarketGateUnavailableError,
@@ -26,8 +26,9 @@ from core.services.backtest_service import build_gate_ohlcv
 
 logger = logging.getLogger(__name__)
 
-# 门控默认基准（与组合层新建默认一致）：中证全指
-DEFAULT_GATE_INDEX = "000985.CSI"
+# 门控默认基准（与组合层新建默认一致）：上证指数
+# （通达信可自动下载日线；中证全指需手工下载，缺数据会让状态卡算不出来）
+DEFAULT_GATE_INDEX = "000001.SH"
 
 # E4：状态数据落后超过 N 个交易日 → 标记陈旧（前端标黄，提示可能不准）。
 GATE_STALE_TRADING_DAYS = 3
@@ -39,6 +40,7 @@ _cache: Dict[Tuple[str, str], Tuple[float, dict]] = {}
 _DIRECTION_LABELS = {-1: "空头", 0: "未定", 1: "多头", 2: "多头"}
 
 _BENCHMARK_NAMES = {spec["code"]: spec["name"] for spec in CRISIS_BENCHMARKS}
+_BENCHMARK_NAMES.update(BENCHMARK_EXTRA_NAMES)
 
 
 def _transitions(days: list, states: dict, limit: int) -> list:

@@ -10,7 +10,8 @@ class PortfolioStrategy(Base):
     id = Column(Integer, primary_key=True)
     name = Column(String(100), nullable=False)
     stock_pool_id = Column(Integer, ForeignKey("stock_pools.id", ondelete="RESTRICT"), nullable=False, index=True)
-    benchmark_index = Column(String(20), default="000300.SH", server_default="000300.SH", nullable=False)
+    # 仅影响新建行：存量行已落库的基准保持不变（API 新建默认同为 000001.SH）
+    benchmark_index = Column(String(20), default="000001.SH", server_default="000001.SH", nullable=False)
     # 市场多空门控（2026-11-18）：基准指数空头状态禁止开仓/加仓，持仓不强平。
     # 判定内核 core/engine/market_gate.py（内置 M 状态机，右移一日）。
     # 空/未定状态一律放行；只拦 OPEN/ADD，CLOSE/REDUCE/止损止盈移动止损不受影响。

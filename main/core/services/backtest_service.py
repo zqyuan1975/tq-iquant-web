@@ -46,7 +46,8 @@ from core.engine.execution_profile import (
 from core.engine.execution_engine import STAMP_DUTY_SEGMENTS_VERSION
 from core.engine.evaluator import Evaluator
 from core.engine.crisis_alpha import (
-    CRISIS_BENCHMARKS, DEFAULT_BENCHMARK_CODE, build_crisis_alpha_payload,
+    BENCHMARK_EXTRA_NAMES, CRISIS_BENCHMARKS, DEFAULT_BENCHMARK_CODE,
+    build_crisis_alpha_payload,
 )
 from core.engine.persistence_alpha import compute_persistence
 from core.engine.backtest_robustness import analyze_robustness
@@ -739,7 +740,7 @@ def _crisis_benchmark_name(code: str) -> str:
     for spec in CRISIS_BENCHMARKS:
         if spec["code"] == code:
             return spec["name"]
-    return code
+    return BENCHMARK_EXTRA_NAMES.get(code, code)
 
 
 PARAMS_SNAPSHOT_FIELDS = (

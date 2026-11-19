@@ -15,7 +15,8 @@ WEEKS_PER_YEAR = 52
 MIN_COMMON_DAYS = 30
 FULL_YEAR_WEEKS = 40
 
-DEFAULT_BENCHMARK_CODE = "000300.SH"
+# 组合未配置基准时的兜底代码（与新建组合默认一致）：上证指数
+DEFAULT_BENCHMARK_CODE = "000001.SH"
 
 CRISIS_CATS = ["逆势上涨", "跌得少", "跟着跌", "跌更多"]
 
@@ -34,6 +35,13 @@ CRISIS_BENCHMARKS = (
     {"key": "cyb", "name": "创业板指", "code": "399006.SZ"},
     {"key": "kc50", "name": "科创50", "code": "000688.SH"},
 )
+
+# 补充显示名：仅用于状态卡/回测详情的基准名称展示。
+# 不进入 CRISIS_BENCHMARKS —— 宽基对比集保持 6 只不变（regime/persistence 等口径不受影响）。
+BENCHMARK_EXTRA_NAMES = {
+    "000001.SH": "上证指数",
+    "399001.SZ": "深证成指",
+}
 
 _HEDGE_CATS = ("逆势上涨", "跌得少")
 

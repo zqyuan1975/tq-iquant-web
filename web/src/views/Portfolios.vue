@@ -40,7 +40,7 @@ const strategyForm = ref<Record<string, any>>(emptyStrategyForm())
 // 14:50 定信号 + 14:52 bar 开盘价报单）；1w/1mon 走通达信注入（仅周期末）。
 // 60m 两端都不认。
 const PERIODS = ['1m', '5m', '15m', '30m', '1h', '1d', '1w', '1mon']
-// 基准指数可选集（TQ 指数日线可取，与回测页基准 guard 同集合；默认中证全指）
+// 基准指数可选集（TQ 指数日线可取，与回测页基准 guard 同集合；默认上证指数）
 const BENCHMARK_OPTIONS = BENCHMARKS
 const ROLES = [
   { value: 'independent', label: '独立' },
@@ -123,7 +123,7 @@ const PORTFOLIO_GROUPS: { title: string; hint?: string; fields: FieldMeta[] }[] 
   { title: '基本信息', fields: [
     { key: 'name', label: '名称', span: 2, type: 'text', placeholder: '例如：稳健组合' },
     { key: 'stock_pool_id', label: '股票池', span: 1, type: 'select', options: 'pools' },
-    { key: 'benchmark_index', label: '基准指数', span: 1, type: 'select', options: 'benchmarks', hint: '用于回测超额与 crisis alpha 对比，同时作为市场多空门控判别基准；默认中证全指（000985.CSI）' },
+    { key: 'benchmark_index', label: '基准指数', span: 1, type: 'select', options: 'benchmarks', hint: '用于回测超额与 crisis alpha 对比，同时作为市场多空门控判别基准；默认上证指数（000001.SH），通达信可自动下载日线' },
     { key: 'initial_capital', label: '初始资金（元）', span: 2, type: 'number' },
     { key: 'priority', label: '下单优先级', span: 1, type: 'number', placeholder: '0', hint: '同一 bar 多组合并发时数值越大越先分配资金并下单；0=默认顺序' },
   ]},

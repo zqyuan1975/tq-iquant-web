@@ -205,6 +205,23 @@ def test_create_portfolio_with_strategies(client):
     db.close()
 
 
+def test_create_portfolio_default_benchmark_is_sse(client):
+    """未携带 benchmark_index → 新建默认上证指数；显式值原样落库（编辑回显存量）。"""
+    c, Session = client
+    db = Session()
+    _seed_pool(db); _seed_formula(db)
+    db.close()
+
+    body = c.post("/api/portfolios", json=_create_payload()).json()
+    assert body["code"] == 0
+    assert body["data"]["benchmark_index"] == "000001.SH"
+
+    body = c.post("/api/portfolios", json=_create_payload(
+        name="OLD_BENCH", benchmark_index="000985.CSI")).json()
+    assert body["code"] == 0
+    assert body["data"]["benchmark_index"] == "000985.CSI"
+
+
 def test_create_portfolio_persists_live_position_limits(client):
     """单票上限/现金下限必须真正落库（曾因后端 schema 缺字段被 pydantic 静默丢弃）。"""
     c, Session = client
