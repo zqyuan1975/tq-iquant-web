@@ -793,13 +793,23 @@ def engine_status(engine: Optional[str]) -> dict:
 _PROBE_TTL_SECONDS = 30.0
 #: 探活硬超时**按通道类型区分**（2026-11-19 修正）：
 #: - 窗口枚举（tdx/ths）是纯 ctypes 调用，毫秒级，0.5s 足够；
-#: - HTTP 桥（goldminer/iquant）的 /ping 实测掘金 3.02s（桥内全局锁 + GIL 排队），
-#:   旧值统一 1s 会把 3s 的正常应答误判成「离线」。这里给 5s，与桥读超时同量级。
+#: - HTTP 桥（goldminer/iquant）的 /ping 实测 3.02s、抖动可到 5.04s（桥内全局锁
+#:   + GIL 排队）。给 6s 留出抖动余量，避免「本来能成功」的慢应答被判超时。
 _PROBE_TIMEOUT_WINDOW_SECONDS = 0.5
-_PROBE_TIMEOUT_BRIDGE_SECONDS = 5.0
-#: {通道键: (单调时钟时点, 是否在线)}
-_PROBE_CACHE: Dict[str, Tuple[float, bool]] = {}
+_PROBE_TIMEOUT_BRIDGE_SECONDS = 6.0
+#: 超时/预算耗尽的「降级结果」同样写缓存（值=上次已知状态，标注沿用/降级）：
+#: 30s 内重复刷新不再重付完整超时（此前掘金 5s 超时结果不落缓存，导致每次打开
+#: 都重付一次，二次打开稳定 6.9–8.9s）。降级条目标记 ``degraded``，展示继续
+#: 显示「探活超时，沿用上次结果」，不会把沿用值伪装成刚探到的实时值。
+_PROBE_DEGRADED_TTL_SECONDS = 30.0
+#: {通道键: {"ts": 单调时钟时点, "online": 是否在线, "degraded": 是否降级沿用,
+#:           "note": 探活结论代码}}
+_PROBE_CACHE: Dict[str, dict] = {}
 _PROBE_CACHE_LOCK = threading.Lock()
+#: {（通道键, base_url）: 复用的探针 dispatcher}。构造 HTTP 桥探针要建
+#: ``httpx.Client``（Windows 加载证书链 0.77–0.83s），复用后缓存命中不再付这笔钱。
+_PROBE_DISPATCHERS: Dict[Tuple[str, str], object] = {}
+_PROBE_DISPATCHERS_LOCK = threading.Lock()
 
 #: 探活结论代码 → 给用户看的说明（超预算时必须如实标注「沿用上次结果」）。
 _PROBE_NOTE_TEXT = {
@@ -883,18 +893,30 @@ def _probe_dispatcher_for(engine_key: Optional[str]):
 
     - tdx / ths：本机客户端窗口存在性（不碰 TQ / UI 自动化）；
     - goldminer / iquant：对应 HTTP 桥 /ping（常驻服务，与会话无关）。
+
+    HTTP 探针**按 (通道, base_url) 复用**：``HttpBridgeDispatcher`` 构造时建
+    ``httpx.Client``，Windows 下加载证书链实测 0.77–0.83s；若每次探活都新建，
+    30s 探活缓存带来的收益会被抹平（实测缓存命中后二次打开仍需 1.8s，其中
+    2×0.82s 全是建 client）。桥是常驻无状态服务，复用同一个 client 不影响语义，
+    /ping 的硬超时仍由 ``_probe_online_quick`` 的线程 join 兜底。
     """
     if engine_key in ("tdx", "ths"):
         return _WindowProbe(engine_key)
-    if engine_key == "goldminer" and HttpBridgeDispatcher is not None:
-        return HttpBridgeDispatcher(base_url=goldminer_config()["base_url"])
-    if engine_key == "iquant" and HttpBridgeDispatcher is not None:
-        return HttpBridgeDispatcher(base_url=iquant_config()["simulation"])
-    return None
+    if engine_key not in ("goldminer", "iquant") or HttpBridgeDispatcher is None:
+        return None
+    base_url = (goldminer_config()["base_url"] if engine_key == "goldminer"
+                else iquant_config()["simulation"])
+    cache_key = (engine_key, base_url)
+    with _PROBE_DISPATCHERS_LOCK:
+        probe = _PROBE_DISPATCHERS.get(cache_key)
+        if probe is None:
+            probe = HttpBridgeDispatcher(base_url=base_url)
+            _PROBE_DISPATCHERS[cache_key] = probe
+        return probe
 
 
 def _probe_timeout_for(engine_key: Optional[str]) -> float:
-    """该通道单次探活的硬超时：窗口类 0.5s / HTTP 桥 5s（见常量注释）。"""
+    """该通道单次探活的硬超时：窗口类 0.5s / HTTP 桥 6s（见常量注释）。"""
     if engine_key in ("goldminer", "iquant"):
         return _PROBE_TIMEOUT_BRIDGE_SECONDS
     return _PROBE_TIMEOUT_WINDOW_SECONDS
@@ -903,7 +925,7 @@ def _probe_timeout_for(engine_key: Optional[str]) -> float:
 def _probe_online_quick(engine_key: str, dispatcher,
                         deadline: Optional[float] = None
                         ) -> Tuple[Optional[bool], bool, str]:
-    """兜底探活：30s TTL 缓存 + 按通道匹配的硬超时，返回 (online, stale, note)。
+    """兜底探活：TTL 缓存 + 按通道匹配的硬超时，返回 (online, stale, note)。
 
     仅用于没有 ``bridge_online`` 的引擎替身/旧实现；真实 LiveEngine 走引擎状态，
     不会进入这里。心跳跑在守护线程里并 ``join(timeout)``，超时/预算耗尽时**沿用
@@ -912,22 +934,42 @@ def _probe_online_quick(engine_key: str, dispatcher,
     ``deadline`` 是本轮探活的时间预算（单调时钟时点）：剩余时间不足时按剩余
     时间截断；已耗尽则直接返回上次结果，不再发探针。
 
+    **降级也写缓存**：超时/预算耗尽的结论以 ``(上次已知值, degraded=True, note)``
+    落 30s 缓存。这样慢桥（掘金 /ping 3–5s）不会被每次刷新重复付满超时；缓存命中
+    时继续返回原来的 note，所以界面始终显示「探活超时，沿用上次结果」，不会把
+    沿用值冒充成实时结果。
+
     ``note`` ∈ ok / cache / timeout / timeout_no_baseline / budget /
     budget_no_baseline，供上层如实标注「探活超时，沿用上次结果」。
     """
+    def _remember(online: Optional[bool], degraded: bool, note: str) -> None:
+        with _PROBE_CACHE_LOCK:
+            _PROBE_CACHE[engine_key] = {
+                "ts": time.monotonic(),
+                "online": online,
+                "degraded": degraded,
+                "note": note,
+            }
+
     now = time.monotonic()
     with _PROBE_CACHE_LOCK:
         cached = _PROBE_CACHE.get(engine_key)
-    if cached is not None and now - cached[0] < _PROBE_TTL_SECONDS:
-        return cached[1], False, "cache"
+    if cached is not None:
+        ttl = (_PROBE_DEGRADED_TTL_SECONDS if cached.get("degraded")
+               else _PROBE_TTL_SECONDS)
+        if now - cached["ts"] < ttl:
+            note = cached.get("note") or "cache"
+            return cached.get("online"), bool(cached.get("degraded")), note
 
     has_baseline = cached is not None
+    baseline = cached.get("online") if has_baseline else None
     timeout = _probe_timeout_for(engine_key)
     if deadline is not None:
         remaining = deadline - time.monotonic()
         if remaining <= 0:
-            return (cached[1] if has_baseline else False), True, (
-                "budget" if has_baseline else "budget_no_baseline")
+            note = "budget" if has_baseline else "budget_no_baseline"
+            _remember(baseline if has_baseline else False, True, note)
+            return (baseline if has_baseline else False), True, note
         timeout = min(timeout, remaining)
 
     box: List[bool] = []
@@ -942,11 +984,11 @@ def _probe_online_quick(engine_key: str, dispatcher,
     t.start()
     t.join(timeout)
     if t.is_alive():
-        return (cached[1] if has_baseline else False), True, (
-            "timeout" if has_baseline else "timeout_no_baseline")
+        note = "timeout" if has_baseline else "timeout_no_baseline"
+        _remember(baseline if has_baseline else False, True, note)
+        return (baseline if has_baseline else False), True, note
     online = box[0] if box else False
-    with _PROBE_CACHE_LOCK:
-        _PROBE_CACHE[engine_key] = (time.monotonic(), online)
+    _remember(online, False, "ok")
     return online, False, "ok"
 
 

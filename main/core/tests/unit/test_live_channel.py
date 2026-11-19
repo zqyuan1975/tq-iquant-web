@@ -10,10 +10,12 @@ from core.services import live_service as svc
 
 @pytest.fixture(autouse=True)
 def _clear_probe_cache():
-    """每个用例独立：清空通道探活 TTL 缓存，避免跨用例复用上次结果。"""
+    """每个用例独立：清空通道探活 TTL 缓存与复用的探针，避免跨用例串味。"""
     svc._PROBE_CACHE.clear()
+    svc._PROBE_DISPATCHERS.clear()
     yield
     svc._PROBE_CACHE.clear()
+    svc._PROBE_DISPATCHERS.clear()
 
 
 def _cfg(ths_enabled=False, tq_trade=None):
@@ -965,11 +967,11 @@ def test_mirror_bridge_clears_stale_cost_when_unknown():
 # ---------------- 通道探活超时：与桥真实响应量级匹配 ----------------
 
 def test_probe_timeout_matches_channel_response_scale():
-    """窗口类 0.5s；HTTP 桥 5s（掘金 /ping 实测 3.02s，旧 1s 会误判离线）。"""
+    """窗口类 0.5s；HTTP 桥 6s（掘金 /ping 实测 3.02s、抖动到 5.04s）。"""
     assert svc._probe_timeout_for("tdx") == 0.5
     assert svc._probe_timeout_for("ths") == 0.5
-    assert svc._probe_timeout_for("goldminer") == 5.0
-    assert svc._probe_timeout_for("iquant") == 5.0
+    assert svc._probe_timeout_for("goldminer") == 6.0
+    assert svc._probe_timeout_for("iquant") == 6.0
 
 
 def test_probe_bridge_allows_three_second_ping(monkeypatch):
@@ -985,8 +987,9 @@ def test_probe_bridge_allows_three_second_ping(monkeypatch):
 
 def test_probe_budget_exhausted_reuses_last_known(monkeypatch):
     """探活预算耗尽：沿用上次已知值并给「沿用上次结果」标注，不发探针。"""
-    svc._PROBE_CACHE["goldminer"] = (
-        time.monotonic() - svc._PROBE_TTL_SECONDS - 1, True)
+    svc._PROBE_CACHE["goldminer"] = {
+        "ts": time.monotonic() - svc._PROBE_TTL_SECONDS - 1,
+        "online": True, "degraded": False, "note": "ok"}
 
     class _Never:
         def heartbeat(self):
@@ -997,6 +1000,60 @@ def test_probe_budget_exhausted_reuses_last_known(monkeypatch):
     assert online is True and stale is True
     assert note == "budget"
     assert "沿用上次结果" in svc._PROBE_NOTE_TEXT[note]
+
+
+def test_probe_timeout_writes_short_cache_and_is_reused(monkeypatch):
+    """超时结果也落缓存：第二次探活直接复用，不再重付超时（慢桥关键修复）。"""
+    class _Hanging:
+        def __init__(self):
+            self.calls = 0
+
+        def heartbeat(self):
+            self.calls += 1
+            time.sleep(0.5)
+            return True
+
+    monkeypatch.setattr(svc, "_PROBE_TIMEOUT_BRIDGE_SECONDS", 0.05)
+    disp = _Hanging()
+    t0 = time.monotonic()
+    online1, stale1, note1 = svc._probe_online_quick("goldminer", disp)
+    first_elapsed = time.monotonic() - t0
+    assert stale1 is True and note1 == "timeout_no_baseline"
+    assert first_elapsed < 0.4          # 被硬超时截断，没有等满 0.5s
+
+    t0 = time.monotonic()
+    online2, stale2, note2 = svc._probe_online_quick("goldminer", disp)
+    second_elapsed = time.monotonic() - t0
+    assert (online2, stale2, note2) == (online1, stale1, note1)  # 沿用同一结论
+    assert second_elapsed < 0.02        # 命中降级缓存，不再打桥
+    assert disp.calls == 1              # 只真正探了一次
+    assert "无上次结果" in svc._PROBE_NOTE_TEXT[note2]
+
+
+def test_probe_dispatcher_reused_across_calls(monkeypatch):
+    """HTTP 探针按 (通道, base_url) 复用：缓存命中时不再重建 client。
+
+    ``httpx.Client`` 在 Windows 上建一次要 0.77–0.83s（加载证书链）；每次探活都
+    新建会把 30s 探活缓存的收益抹平（实测二次打开仍需 1.8s）。
+    """
+    monkeypatch.setattr(svc, "load_config", lambda: _cfg(False))
+    made = []
+
+    class _Bridge:
+        def __init__(self, base_url=None, **kw):
+            made.append(base_url)
+
+        def heartbeat(self):
+            return True
+
+    monkeypatch.setattr(svc, "HttpBridgeDispatcher", _Bridge)
+    first = svc._probe_dispatcher_for("goldminer")
+    second = svc._probe_dispatcher_for("goldminer")
+    assert first is second
+    assert made == ["http://127.0.0.1:7801"]   # 只构造一次
+    # 不同通道各一份，互不串用
+    assert svc._probe_dispatcher_for("iquant") is not first
+    assert len(made) == 2
 
 
 def test_probe_budget_exhausted_without_baseline_marks_offline(monkeypatch):

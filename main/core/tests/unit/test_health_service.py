@@ -61,7 +61,7 @@ def patched(monkeypatch):
             "ack_summary": {"open": 0, "acked": 0}})
     monkeypatch.setattr(
         hs.live_service, "channel_status",
-        lambda engine_key=None: {"engines": ["tdx"], "active": "tdx"})
+        lambda engine_key=None, **kw: {"engines": ["tdx"], "active": "tdx"})
     monkeypatch.setattr(hs.backup_service, "get_status", lambda: {
         "enabled": False, "daily_at": "15:10", "auto_done_today": True,
         "last_auto": None, "last_manual": None})
@@ -278,6 +278,68 @@ def test_overview_total_budget_degrades_remaining_sessions(
     assert len(res["incomplete_sessions"]) == 2
     assert res["partial"] is True
     assert first["data"]["incomplete"] is True  # 第一个虽截断但已返回部分结果
+
+
+def test_overview_hard_deadline_stops_probe_and_data_of_later_sessions(
+        session_factory, patched, monkeypatch):
+    """硬截止：整体预算被前一个会话吃满后，后续会话零探活预算且跳过体检。"""
+    db = session_factory()
+    _session(db, name="会话A")
+    _session(db, name="会话B")
+    db.close()
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(hs, "_monotonic", lambda: clock["t"])
+    monkeypatch.setattr(hs, "_OVERVIEW_TOTAL_BUDGET_SECONDS", 5.0)
+    seen = []
+
+    def _health(db, sid, engines, probe_deadline=None):
+        now = clock["t"]
+        seen.append((sid, probe_deadline, now))
+        if len(seen) == 1:
+            clock["t"] = 1005.0  # 第一个会话吃满整个总预算
+        return {
+            "primary": {"configured": True, "online": False, "engine": "x",
+                        "probe_degraded": True,
+                        "probe_note": "探活超时，沿用上次结果"},
+            "backup": None,
+        }
+
+    patched.setattr(hs.live_service, "session_channel_health", _health)
+
+    res = hs.overview(session_factory=session_factory, now=NOW)
+
+    assert len(seen) == 2
+    assert seen[0][1] <= 1005.0          # 第一个会话的探活截止不越过总截止
+    assert seen[1][1] <= seen[1][2]      # 第二个会话只剩零预算（deadline == now）
+    assert res["sessions"][1]["data"]["reason"] == hs.REASON_OVERVIEW_BUDGET
+    assert res["partial"] is True
+    assert res["elapsed_seconds"] == 5.0
+
+
+def test_overview_global_channel_probe_bounded_by_tail_budget(
+        session_factory, patched, monkeypatch):
+    """全局通道卡只能占用收尾预留的 0.5s，慢桥不得把总览拖过硬截止。"""
+    db = session_factory()
+    _session(db)
+    db.close()
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(hs, "_monotonic", lambda: clock["t"])
+    monkeypatch.setattr(hs, "_OVERVIEW_TOTAL_BUDGET_SECONDS", 11.5)
+    seen = {}
+
+    def _status(engine_key=None, probe_deadline=None):
+        seen["now"] = clock["t"]
+        seen["deadline"] = probe_deadline
+        clock["t"] += 0.5  # 探活用满收尾预留
+        return {"engines": ["tdx"], "active": "tdx"}
+
+    patched.setattr(hs.live_service, "channel_status", _status)
+
+    res = hs.overview(session_factory=session_factory, now=NOW)
+
+    assert seen["now"] == 1000.0
+    assert seen["deadline"] == 1000.0 + 11.5 + 0.5
+    assert res["elapsed_seconds"] == 0.5  # 收尾探活计入实际耗时
 
 
 def test_in_progress_data_health_marks_incomplete(session_factory, patched):

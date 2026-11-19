@@ -43,15 +43,19 @@ LEVEL_ERROR = "error"
 # 健康总览整体时间预算：多会话逐个聚合时，不能让某个会话的体检把接口拖过百秒
 # （此前未限流，实测 200s+ 仍在跑，且请求超时后线程不可取消）。超预算的会话
 # 直接降级为「未完成」并标注原因，已拿到的部分照常返回。
-_OVERVIEW_TOTAL_BUDGET_SECONDS = 12.0
+# 11.5s 是**硬截止**：逐会话聚合的总时长按此分配，留 0.5s 给收尾（备份/磁盘/汇总/
+# 序列化），保证首次打开稳定 < 12s（此前 12.0s 只是软预算，实测尖峰 14.63s）。
+_OVERVIEW_TOTAL_BUDGET_SECONDS = 11.5
 # 单会话体检预算（与启动体检 30 只/3s 对齐）：总览是告警级信息，宁可标注
-# 「未校验完整」也不允许扫全池。
+# 「未校验完整」也不允许扫全池。1.2s ≈ 单只取价硬超时（2s 预算的 60%），
+# 3 个会话合计 3.6s，把更多时间留给慢桥探活（掘金 /ping 3–5s）。
 _OVERVIEW_DATA_HEALTH_MAX_CODES = 30
-_OVERVIEW_DATA_HEALTH_BUDGET_SECONDS = 2.0
-# 单会话通道探活预算：与 HTTP 桥 /ping 的真实量级对齐（掘金实测 3.02s，
-# 桥读超时 5s）。超过即沿用上次已知状态并标注「探活超时，沿用上次结果」，
-# 不再阻塞总览；窗口类探针本身是毫秒级，不会用到这个上限。
-_OVERVIEW_PROBE_BUDGET_SECONDS = 5.0
+_OVERVIEW_DATA_HEALTH_BUDGET_SECONDS = 1.2
+# 单会话通道探活预算上限：与 HTTP 桥探活硬超时（6s）对齐；实际值由剩余时间
+# 按会话分摊，窗口类探针毫秒级、几乎不占预算。
+_OVERVIEW_PROBE_BUDGET_SECONDS = 6.0
+# 剩余时间低于此值就不再为本会话探活/体检，直接返回已有结果（硬截止兜底）。
+_OVERVIEW_PROBE_FLOOR_SECONDS = 0.5
 # 降级原因（前端/日志可直接展示）。
 REASON_OVERVIEW_BUDGET = "健康总览整体时间预算已耗尽，未做数据体检"
 REASON_DATA_TRUNCATED = "体检超出预算，仅校验部分标的"
@@ -262,19 +266,37 @@ def overview(session_factory=None, now: Optional[datetime] = None) -> dict:
     core = _safe("status", get_status, {})
     core_data = (core or {}).get("data", {}).get("core", {}) if core else {}
 
-    # 整体预算：逐会话聚合（通道探活按 5s/会话独立预算，体检按剩余预算分配），
-    # 预算耗尽后剩余会话不再体检/探活，只标明「未完成 + 原因」。
-    deadline = _monotonic() + _OVERVIEW_TOTAL_BUDGET_SECONDS
+    # 整体预算：逐会话聚合（通道探活按通道超时封顶，体检按剩余预算分摊）。
+    # 硬截止：剩余时间不足 0.5s 的会话不再探活/体检，直接返回已有结果并标 partial，
+    # 保证任何单个会话/通道都不能把整体拖过 12s。
+    started_at = _monotonic()
+    deadline = started_at + _OVERVIEW_TOTAL_BUDGET_SECONDS
     db = factory()
     try:
         sessions = db.query(LiveSession).order_by(LiveSession.id).all()
         items = []
-        for s in sessions:
+        total = len(sessions)
+        for idx, s in enumerate(sessions):
             remaining = deadline - _monotonic()
-            probe_budget = max(0.0, min(_OVERVIEW_PROBE_BUDGET_SECONDS, remaining))
+            sessions_left = max(1, total - idx)
+            if remaining <= _OVERVIEW_PROBE_FLOOR_SECONDS:
+                # 预算已尽：不探活、不体检，沿用缓存值（探活内部会直接返回上次结果）。
+                items.append(_session_item(
+                    db, s, now, data_budget=0.0,
+                    probe_deadline=_monotonic()))
+                continue
+            # 先给本会话留出体检预算，剩余才给探活；再按剩余会话数分摊，
+            # 避免前面的慢桥把后面的会话挤成「未完成」。
+            reserve = min(_OVERVIEW_DATA_HEALTH_BUDGET_SECONDS,
+                          remaining / sessions_left)
+            probe_budget = max(
+                _OVERVIEW_PROBE_FLOOR_SECONDS,
+                min(_OVERVIEW_PROBE_BUDGET_SECONDS, remaining - reserve))
+            data_budget = max(
+                0.0, min(_OVERVIEW_DATA_HEALTH_BUDGET_SECONDS,
+                         remaining - probe_budget))
             items.append(_session_item(
-                db, s, now,
-                data_budget=deadline - _monotonic(),
+                db, s, now, data_budget=data_budget,
                 probe_deadline=_monotonic() + probe_budget))
     finally:
         db.close()
@@ -290,7 +312,13 @@ def overview(session_factory=None, now: Optional[datetime] = None) -> dict:
     watchdog = _watchdog_status()
     notify = _notify_state()
     disk = _disk_state()
-    channels = _safe("channel_status", live_service.channel_status, {}) or {}
+    # 全局通道卡：逐会话聚合后再探，只能占用收尾预留的 0.5s 额度——超出即沿用
+    # 缓存/上次已知状态并标注降级，避免默认通道是慢桥时把整体拖过硬截止。
+    channels = _safe(
+        "channel_status",
+        lambda: live_service.channel_status(
+            probe_deadline=deadline + _OVERVIEW_PROBE_FLOOR_SECONDS),
+        {}) or {}
 
     totals = {"open_decisions": 0, "deferred_orders": 0,
               "pending_approvals": 0}
@@ -367,6 +395,9 @@ def overview(session_factory=None, now: Optional[datetime] = None) -> dict:
 
     return {
         "generated_at": now.isoformat(),
+        # 便于现场核对硬截止是否生效（耗时应在 budget_seconds 内）。
+        "budget_seconds": _OVERVIEW_TOTAL_BUDGET_SECONDS,
+        "elapsed_seconds": round(_monotonic() - started_at, 2),
         "level": level,
         "problems": problems,
         "partial": bool(incomplete_sessions),
