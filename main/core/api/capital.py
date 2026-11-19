@@ -10,9 +10,12 @@
 推导口径与 ``core.engine.capital_quota`` 同源（纯函数），本模块只做 DB 只读装配。
 """
 import logging
+from datetime import date, datetime
+from decimal import Decimal
 from typing import Optional
 
 from fastapi import APIRouter, Depends, Query
+from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from core.api.response import err, ok
@@ -35,10 +38,12 @@ from core.engine.capital_reserve import (
 from core.models import (
     BacktestDailySnapshot,
     BacktestRecord,
+    CashOutlet,
     LivePortfolioDaily,
     PortfolioStrategy,
     Strategy,
 )
+from core.services import cash_outlet_service
 
 logger = logging.getLogger(__name__)
 
@@ -189,3 +194,168 @@ def capital_utilization(
         "session_id": used if source == "live" else None,
     })
     return ok(data)
+
+
+# ---------------------------------------------------------------------------
+# 现金出口白名单（0021 C4，只读影子：登记 + C1–C8 判据，不下单）
+# ---------------------------------------------------------------------------
+
+class CashOutletRequest(BaseModel):
+    code: Optional[str] = None
+    name: Optional[str] = None
+    category: Optional[str] = None
+    channel: Optional[str] = None
+    channel_order_enabled: Optional[bool] = None
+    yield_source: Optional[str] = None
+    yield_freq: Optional[str] = None
+    yield_history_days: Optional[int] = None
+    liquidity: Optional[str] = None
+    term_days: Optional[int] = None
+    settlement_max_days: Optional[int] = None
+    holiday_postpone: Optional[bool] = None
+    min_amount: Optional[str] = None
+    max_single_amount: Optional[str] = None
+    max_daily_amount: Optional[str] = None
+    min_increment: Optional[str] = None
+    redeemable_early: Optional[bool] = None
+    early_redeem_penalty: Optional[str] = None
+    auto_mature_return: Optional[bool] = None
+    fast_redeem_limit: Optional[str] = None
+    risk_level: Optional[str] = None
+    principal_guaranteed: Optional[bool] = None
+    arrival_buffer_days: Optional[int] = None
+    inflow_certainty: Optional[str] = None
+    status: Optional[str] = None
+    notes: Optional[str] = None
+
+
+class CashOutletEvaluateRequest(BaseModel):
+    need_date: Optional[date] = None
+    required_amount: Optional[str] = None
+
+
+class CashOutletVerifyRequest(BaseModel):
+    amount: str
+    result: str
+    verified_at: Optional[datetime] = None
+    valid_days: int = 365
+
+
+def _outlet_switches() -> CapitalPoolSwitches:
+    return CapitalPoolSwitches.from_config(load_config() or {})
+
+
+def _outlet_disabled():
+    return ok(_disabled_payload(
+        ["现金出口开关未启用（capital_pool.cash_outlet_enabled=false）"]))
+
+
+def _get_outlet(db: Session, outlet_id: int) -> CashOutlet:
+    outlet = db.get(CashOutlet, outlet_id)
+    if outlet is None:
+        raise LookupError(f"现金出口不存在：{outlet_id}")
+    return outlet
+
+
+@router.get("/outlets")
+def list_outlets(
+    category: Optional[str] = Query(None, description="repo|etf_money|other"),
+    status: Optional[str] = Query(None, description="active|archived"),
+    db: Session = Depends(get_db),
+):
+    """现金出口白名单（只读列表）。"""
+    if not _outlet_switches().cash_outlet_enabled:
+        return _outlet_disabled()
+    q = db.query(CashOutlet)
+    if category:
+        q = q.filter(CashOutlet.category == category)
+    if status:
+        q = q.filter(CashOutlet.status == status)
+    rows = q.order_by(CashOutlet.code).all()
+    return ok({"enabled": True, "items": [
+        cash_outlet_service.serialize_outlet(o) for o in rows]})
+
+
+@router.get("/outlets/{outlet_id}")
+def get_outlet(outlet_id: int, db: Session = Depends(get_db)):
+    """单个现金出口配置（只读）。"""
+    if not _outlet_switches().cash_outlet_enabled:
+        return _outlet_disabled()
+    try:
+        outlet = _get_outlet(db, outlet_id)
+    except LookupError as exc:
+        return err(404, str(exc))
+    return ok({"enabled": True,
+               "item": cash_outlet_service.serialize_outlet(outlet)})
+
+
+@router.post("/outlets")
+def create_outlet(payload: CashOutletRequest, db: Session = Depends(get_db)):
+    """登记一个出口（仅配置，不下单）。"""
+    if not _outlet_switches().cash_outlet_enabled:
+        return _outlet_disabled()
+    try:
+        outlet = cash_outlet_service.create_outlet(
+            db, payload.model_dump(exclude_unset=True))
+    except ValueError as exc:
+        return err(422, str(exc))
+    return ok({"enabled": True,
+               "item": cash_outlet_service.serialize_outlet(outlet)})
+
+
+@router.put("/outlets/{outlet_id}")
+def update_outlet(outlet_id: int, payload: CashOutletRequest,
+                  db: Session = Depends(get_db)):
+    """更新出口配置（仅配置，不影响已有验证证据以外的状态）。"""
+    if not _outlet_switches().cash_outlet_enabled:
+        return _outlet_disabled()
+    try:
+        outlet = _get_outlet(db, outlet_id)
+    except LookupError as exc:
+        return err(404, str(exc))
+    outlet = cash_outlet_service.update_outlet(
+        db, outlet, payload.model_dump(exclude_unset=True))
+    return ok({"enabled": True,
+               "item": cash_outlet_service.serialize_outlet(outlet)})
+
+
+@router.post("/outlets/{outlet_id}/evaluate")
+def evaluate_outlet(outlet_id: int, payload: CashOutletEvaluateRequest,
+                    db: Session = Depends(get_db)):
+    """按 C1–C8 判定出口是否可借（只读，可复现）。"""
+    if not _outlet_switches().cash_outlet_enabled:
+        return _outlet_disabled()
+    try:
+        outlet = _get_outlet(db, outlet_id)
+    except LookupError as exc:
+        return err(404, str(exc))
+    result = cash_outlet_service.evaluate_outlet(
+        outlet,
+        need_date=payload.need_date,
+        required_amount=payload.required_amount,
+    )
+    result["enabled"] = True
+    return ok(result)
+
+
+@router.post("/outlets/{outlet_id}/verify")
+def verify_outlet(outlet_id: int, payload: CashOutletVerifyRequest,
+                  db: Session = Depends(get_db)):
+    """登记 C8 通道验证证据（只记录小额实盘结果，不发起交易）。"""
+    if not _outlet_switches().cash_outlet_enabled:
+        return _outlet_disabled()
+    try:
+        outlet = _get_outlet(db, outlet_id)
+    except LookupError as exc:
+        return err(404, str(exc))
+    try:
+        amount = Decimal(str(payload.amount))
+    except Exception:  # noqa: BLE001
+        return err(422, f"验证金额非法：{payload.amount}")
+    if not amount.is_finite() or amount <= 0:
+        return err(422, f"验证金额必须 >0：{payload.amount}")
+    outlet = cash_outlet_service.verify_outlet(
+        db, outlet, amount=amount, result=payload.result,
+        verified_at=payload.verified_at, valid_days=payload.valid_days)
+    return ok({"enabled": True,
+               "item": cash_outlet_service.serialize_outlet(outlet)})

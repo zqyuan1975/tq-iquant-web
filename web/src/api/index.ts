@@ -3410,3 +3410,81 @@ export async function getPairingLoanModelPlan(planId: number) {
   const res = await api.get<ApiResponse<Record<string, unknown>>>(`/pairing/plans/${planId}/loan-model-plan`)
   return res.data.data
 }
+
+// ---------------------------------------------------------------------------
+// 现金出口（0021 C4，只读影子；未验证一律 OUTLET_NOT_VERIFIED）
+// ---------------------------------------------------------------------------
+
+export interface CashOutletItem {
+  id: number
+  code: string
+  name: string
+  category: string
+  channel: string
+  channel_order_enabled: boolean
+  yield_source: string | null
+  yield_freq: string | null
+  yield_history_days: number | null
+  liquidity: string
+  term_days: number | null
+  settlement_max_days: number
+  holiday_postpone: boolean
+  min_amount: string | null
+  max_single_amount: string | null
+  max_daily_amount: string | null
+  min_increment: string | null
+  redeemable_early: boolean
+  early_redeem_penalty: string | null
+  auto_mature_return: boolean
+  fast_redeem_limit: string | null
+  risk_level: string | null
+  principal_guaranteed: boolean
+  arrival_buffer_days: number
+  inflow_certainty: string | null
+  verified: boolean
+  verified_at: string | null
+  verify_amount: string | null
+  verify_result: string | null
+  verify_expires_at: string | null
+  status: string
+  notes: string | null
+  created_at: string | null
+  updated_at: string | null
+}
+
+export interface CashOutletCheck {
+  code: string
+  name: string
+  state: 'pass' | 'warn' | 'fail'
+  detail: string
+}
+
+export interface CashOutletEvaluation {
+  enabled?: boolean
+  version: string
+  outlet_id: number
+  code: string
+  name: string
+  status: 'READY' | 'BLOCKED'
+  codes: string[]
+  checks: CashOutletCheck[]
+  warnings: string[]
+  yield_backtestable: boolean
+  needed_amount: string | null
+  need_date: string | null
+  decided_at: string
+}
+
+export async function listCashOutlets(params?: { category?: string; status?: string }) {
+  const res = await api.get<ApiResponse<{ enabled: boolean; items?: CashOutletItem[]; status?: string }>>(
+    '/capital/outlets', { params })
+  return res.data.data
+}
+
+export async function evaluateCashOutlet(
+  outletId: number, payload: { need_date?: string; required_amount?: string } = {},
+) {
+  const res = await api.post<ApiResponse<CashOutletEvaluation>>(
+    `/capital/outlets/${outletId}/evaluate`, payload)
+  return res.data.data
+}

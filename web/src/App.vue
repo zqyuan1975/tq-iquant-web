@@ -13,6 +13,7 @@ const titles: Record<string, string> = {
   'dashboard': '状态总览', 'stock-pools': '备选股池', 'formulas': '公式管理', 'portfolios': '组合策略',
   'backtest': '回测管理', 'backtest-analysis': '回归验证', 'incremental': '增量回测', 'live': '实盘交易',
   'health': '健康总览', 'system': '系统配置', 'events': '关键事件检索', 'troubleshooting': '故障向导',
+  'cash-outlets': '现金出口',
 }
 
 interface NavEntry { to: string; label: string; icon: string }
@@ -37,6 +38,7 @@ const NAV_GROUPS: NavGroup[] = [
       { to: '/backtest/analysis', label: '回归验证', icon: 'backtest' },
       { to: '/incremental', label: '增量回测', icon: 'backtest' },
       { to: '/live', label: '实盘交易', icon: 'live' },
+      { to: '/cash-outlets', label: '现金出口', icon: 'portfolio' },
     ],
   },
   {

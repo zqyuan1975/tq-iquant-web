@@ -51,6 +51,7 @@ from .live_global_switch import LiveGlobalSwitch
 from .capital_pairing import (
     CapitalPairingPlan, CapitalPairing, CapitalPairingEval,
 )
+from .cash_outlet import CashOutlet
 
 __all__ = [
     "Base",
@@ -104,4 +105,5 @@ __all__ = [
     "CapitalPairingPlan",
     "CapitalPairing",
     "CapitalPairingEval",
+    "CashOutlet",
 ]
