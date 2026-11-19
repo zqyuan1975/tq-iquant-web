@@ -122,7 +122,7 @@ def get_config_path() -> Path:
 
 def _defaults() -> dict:
     return {
-        "tdx_path": "",
+        "tdx_path": "D:\\zd_zyb",
         "iquant_path": "",
         "max_concurrent_backtest": 1,
         # P2-7：TQ 全局锁（_tdx_lock）获取超时（秒）。通达信卡住/长任务占用时，

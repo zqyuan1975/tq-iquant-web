@@ -14227,3 +14227,31 @@ def test_recheck_unconfirmed_skips_unknown_portfolio_and_young_orders():
             - timedelta(seconds=30))])
     assert calls2 == []
 
+
+def test_on_daily_update_uses_market_value_not_cost():
+    """#8: daily_loss uses latest known market value, not cost basis."""
+    from decimal import Decimal as _D
+    from datetime import date as _date, datetime as _dt
+    from core.engine.position import Position
+
+    factory, _ = _db_factory()
+    engine, port = _breaker_engine(factory)
+    ctx = port.strategies[0]
+    code = "000002.SZ"
+    pos = Position(code)
+    pos.buy(100, _D("10"), _dt(2026, 8, 20))
+    ctx.positions[code] = pos
+    port._price_snapshot[code] = _D("12")
+
+    captured = {}
+    orig = port.risk_manager.update_daily
+
+    def spy(total, today, init, **kwargs):
+        captured["total"] = total
+        return orig(total, today, init, **kwargs)
+
+    port.risk_manager.update_daily = spy
+    engine._breaker.on_daily_update(port, _date(2026, 8, 21))
+
+    assert captured["total"] == port.account.cash + _D("1200")
+

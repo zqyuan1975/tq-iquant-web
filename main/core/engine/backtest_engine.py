@@ -122,6 +122,7 @@ class BacktestEngine:
         klines: dict = None,
         signal_cache: dict = None,
         benchmark_data: object = None,
+        on_progress: Callable[[int], None] = None,
         regime_tracker=None,
         gate_tracker=None,
         daily_close_peak_enabled: bool = False,
@@ -137,6 +138,7 @@ class BacktestEngine:
         klines: {stock_code: {period: pl.DataFrame}}，DataFrame 含 datetime + Open/High/Low/Close/Volume 列。
         成交时机：上一 bar 触发的订单在下一 bar open 成交（pending_orders 队列），
         成交价取 price_index 中该 bar 的 Open（open_prices 死参数已移除，#12）。
+        on_progress：进度回调（#10），0–100 递增整数，末值 100，节流至最多约 100 次。
         regime_tracker：B5 可选因果市场状态跟踪器（CausalRegimeTracker，默认 None
         不启用）；逐 bar 喂当日基准收盘并把标签注入 portfolio.current_regime。
         gate_tracker：市场多空门控跟踪器（MarketGateTracker，默认 None 不启用）；
@@ -180,6 +182,8 @@ class BacktestEngine:
         portfolio.current_market_gate = gate_tracker
 
         times = self._build_timeline(klines)
+        total_bars = len(times)
+        report_every = max(1, total_bars // 100)
         price_index = self._build_price_index(klines)
         pending_orders: List[OrderEvent] = list(initial_pending_orders or [])
         # 续跑带入的在途单：checkpoint 序列化了 pending_since 时沿用（跨段累计
@@ -742,6 +746,10 @@ class BacktestEngine:
 
             # 6. 前收表（涨跌停基准）已在 run 开头按 (code, 交易日) 预计算好，日内恒定，
             #    无需逐 bar 刷新（旧实现此处覆写导致分钟策略前收取错，见上方依据注释）。
+
+            # 7. 进度上报：节流至最多约 100 次，末根 bar 必报 100（#10）。
+            if on_progress is not None and (i % report_every == 0 or i == total_bars - 1):
+                on_progress(int((i + 1) * 100 / total_bars))
 
         # 6. flush 最后一日的 pending 快照（无后续跨日触发）
         if pending_snap is not None:

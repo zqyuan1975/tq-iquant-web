@@ -142,9 +142,8 @@ class BreakerService:
             if total_value is not None and rm.peak_value > 0:
                 dd_pct = (rm.peak_value - total_value) / rm.peak_value * 100
                 detail = (
-                    " total=%s peak=%s drawdown=%s threshold=%s"
-                    % (fmt_money(total_value), fmt_money(rm.peak_value),
-                       fmt_pct(dd_pct / 100), fmt_pct(rm.max_drawdown))
+                    " total=%s peak=%s drawdown=%.2f%% threshold=%s"
+                    % (total_value, rm.peak_value, dd_pct, rm.max_drawdown)
                 )
             else:
                 detail = ""
@@ -466,7 +465,8 @@ class BreakerService:
         """日终对单个组合推进日内亏损：update_daily + daily_loss 触发/次日恢复 + risk 事件。
 
         搬自 _maybe_daily_close 的 per-portfolio 循环体。日终总市值用组合最新现金 + 持仓市值
-        （无最新 bar 时以当前持仓成本近似；有 bar 由 on_bar_update(update_peak) 已覆盖）。
+        （最近已知价口径，与回测统一为市值基准 #8；_price_snapshot 由 on_bar_update 每 bar
+        刷新，无价回退持仓成本）。
 
         resume_after（P1-1）：14:30 触发时把暂停解除门槛推到**次一交易日**，让尾盘
         触发的日亏暂停延续次日整日（D+2 首 bar 才恢复），与回测「上一日收盘判日亏 →
@@ -498,9 +498,8 @@ class BreakerService:
                     pnl = total - prev
                     loss_pct = abs(pnl) / base * 100
                     detail = (
-                        " total=%s prev_close=%s pnl=%s loss=%s threshold=%s"
-                        % (fmt_money(total), fmt_money(prev), fmt_money(pnl),
-                           fmt_pct(loss_pct / 100), fmt_pct(dpm.daily_loss_limit))
+                        " total=%s prev_close=%s pnl=%s loss=%.2f%% threshold=%s"
+                        % (total, prev, pnl, loss_pct, dpm.daily_loss_limit)
                     )
                 else:
                     detail = ""

@@ -18,7 +18,7 @@ import logging
 import math
 from datetime import datetime, date, timedelta, timezone
 from decimal import Decimal
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Union
 
 import pandas as pd
 import polars as pl
@@ -88,6 +88,9 @@ from core.engine.tdx_formula import (
     evaluate_outputs,
     xref_names_of,
 )
+
+logger = logging.getLogger(__name__)
+
 
 logger = logging.getLogger(__name__)
 
@@ -1997,14 +2000,15 @@ _EVALUATION_FIELDS = (
 )
 
 
-def recompute_evaluation(db: Session, record_id: int) -> Optional[dict]:
+def recompute_evaluation(db: Session, record_id: int) -> Union[None, str, dict]:
     """从 DB 快照 + 成交离线重算评估并 upsert（老记录补新增指标用）。
 
     不重跑回测、不触碰行情；相对指标依赖快照 benchmark_value（老记录已落该列）。
     组合级：直接重算。策略级：策略快照未落 benchmark_value（历史），按日注入组合
     快照的基准值后重算——相对/磨损/路径指标可补；持仓结构仍依赖 positions_json，
     老快照无此列时保持 None（前端提示「仅影响老记录」）。
-    记录不存在返回 None（路由 404）；快照不足返回 failed 状态。
+    记录不存在返回 None（路由 404）；running 返回字符串 "running"（路由 409）；
+    快照不足返回 failed 状态。
     """
     from types import SimpleNamespace
     from collections import defaultdict
@@ -2012,6 +2016,8 @@ def recompute_evaluation(db: Session, record_id: int) -> Optional[dict]:
     rec = db.get(BacktestRecord, record_id)
     if rec is None:
         return None
+    if rec.status == "running":
+        return "running"
 
     snaps = (
         db.query(BacktestDailySnapshot)
@@ -2180,6 +2186,12 @@ def _convert_formula_output(
             for var_name, val_list in stock_data.items():
                 if var_name in _FORMULA_META_KEYS or not isinstance(val_list, list):
                     continue
+                if len(val_list) != len(bar_times):
+                    logger.warning(
+                        "公式 %s 输出长度 %d != bar 数 %d（code=%s），"
+                        "按日期+日内索引对齐，多余输出丢弃",
+                        var_name, len(val_list), len(bar_times), code,
+                    )
                 day_counter: Dict[date, int] = {}
                 for entry in val_list:
                     if not isinstance(entry, dict):
@@ -4644,7 +4656,8 @@ def run_backtest(db: Session, ps: PortfolioStrategy, req,
 
     try:
         t0 = datetime.now()
-        portfolio = _assemble_portfolio(ps, strategies, db)
+        portfolio = _assemble_portfolio(
+            ps, strategies, db, enable_manual_recovery=False)
         # 公司行为（J1/J2，默认关）：timeline=None 时引擎整段跳过，行为不变。
         if ca_timeline is not None and len(ca_timeline):
             portfolio.corporate_timeline = ca_timeline
@@ -4788,11 +4801,18 @@ def run_backtest(db: Session, ps: PortfolioStrategy, req,
         # .pending_order_max_days，缺键=20（引擎常量同值），<=0 不限。停牌/连板时
         # 防止 deferred 单无限顺延、几个月后按恢复日开盘价补做早已过期的决策。
         _bt_cfg = (load_config() or {}).get("backtest") or {}
+
+        def _on_progress(pct):
+            # 引擎已节流（至多约 100 次），此处逐次提交，运行中 progress 真实递增（#10）。
+            rec.progress = pct
+            db.commit()
+
         result = engine.run(
             portfolio,
             klines=klines,
             signal_cache=signal_cache,
             benchmark_data=benchmark_data,
+            on_progress=_on_progress,
             regime_tracker=regime_tracker,
             gate_tracker=gate_tracker,
             daily_close_peak_enabled=daily_close_peak_enabled,
@@ -5050,7 +5070,8 @@ def run_multi_backtest(db: Session, portfolios: list, req) -> dict:
             db.query(Strategy).filter_by(portfolio_id=ps.id)
             .order_by(Strategy.id).all()
         )
-        portfolio = _assemble_portfolio(ps, strategies, db)
+        portfolio = _assemble_portfolio(
+            ps, strategies, db, enable_manual_recovery=False)
         exact_mode = dividend_mode == "exact"
         ca_enabled = (
             bool(getattr(ps, "corporate_actions_enabled", False)) or exact_mode)
@@ -5350,3 +5371,15 @@ def get_run_group(db: Session, group_id: int) -> Optional[dict]:
     )
     payload["records"] = [_serialize_record(r) for r in rows]
     return payload
+
+
+def recover_stale_running(db: Session, max_age_minutes: int = 30) -> int:
+    """启动时把超时仍 running 的记录置 failed（进程崩溃/重启恢复，#5）。"""
+    cutoff = datetime.now() - timedelta(minutes=max_age_minutes)
+    rows = db.query(BacktestRecord).filter(
+        BacktestRecord.status == "running", BacktestRecord.created_at < cutoff
+    ).all()
+    for r in rows:
+        r.status = "failed"
+    db.commit()
+    return len(rows)

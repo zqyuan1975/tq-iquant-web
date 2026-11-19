@@ -31,6 +31,7 @@ def assemble_portfolio(
     ps: PortfolioStrategy, strategies: List[Strategy], db: Session,
     initial_capital_override=None,
     sell_scope: str = "full",
+    enable_manual_recovery: bool = True,
 ) -> Portfolio:
     """组装 Portfolio + 各 StrategyContext（信号配置 + 策略风控）。
 
@@ -43,6 +44,9 @@ def assemble_portfolio(
     配置（资金占比/单仓/敞口/熔断分母）等比缩放。实盘启动后继承持仓的市值由
     LiveEngine 从起账现金中扣除（见 _import_external_positions），避免与基准双计；
     回测调用点不传（无继承持仓），行为不变。
+
+    enable_manual_recovery：实盘 True（累计 3 次熔断转手动）；回测 False
+    （无人工恢复入口，避免永久停机，由 run_backtest 调用点显式传入）。
     """
     initial_capital = (
         Decimal(str(initial_capital_override))
@@ -54,6 +58,7 @@ def assemble_portfolio(
         daily_loss_limit=Decimal(str(ps.daily_loss_limit)),
         # D4（2026-11-18）：熔断/日亏处置动作，默认 halt（仅停开仓）
         breaker_action=getattr(ps, "breaker_action", None) or "halt",
+        enable_manual_recovery=enable_manual_recovery,
     )
     # 日内亏损熔断分母：equity（默认）=上一交易日收盘净值；initial=初始资金（旧口径）。
     # 回测/实盘共用，故口径在此统一注入。

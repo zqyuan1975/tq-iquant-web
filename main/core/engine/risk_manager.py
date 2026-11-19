@@ -60,7 +60,8 @@ class StrategyRiskManager:
 
 class PortfolioRiskManager:
     def __init__(self, max_drawdown: Decimal, daily_loss_limit: Decimal,
-                 breaker_action: str = "halt"):
+                 breaker_action: str = "halt",
+                 enable_manual_recovery: bool = True):
         self.max_drawdown = max_drawdown
         self.daily_loss_limit = daily_loss_limit
         # D4（2026-11-18）：熔断/日亏触发后的处置动作（默认 halt = 仅停开仓）。
@@ -71,6 +72,9 @@ class PortfolioRiskManager:
         if self.breaker_action not in ("notify", "halt", "half", "liquidate"):
             self.breaker_action = "halt"
         self.pending_disposal: Optional[str] = None
+        # 回测模式（False）：累计 3 次不转手动永久锁，始终「触发次日恢复」。
+        # 回测无人工恢复入口，一旦转手动即永久停机（真机 bug 实证 6 年空仓）。
+        self.enable_manual_recovery = enable_manual_recovery
         self.consecutive_drawdown_triggers = 0
         self.circuit_breaker_active = False
         # 熔断接线新增状态（AGENTS.md §88）
@@ -231,7 +235,7 @@ class PortfolioRiskManager:
                 self.circuit_breaker_active = True
                 self.breaker_trigger_date = current_date
                 self.consecutive_drawdown_triggers += 1
-                if self.consecutive_drawdown_triggers >= 3:
+                if self.enable_manual_recovery and self.consecutive_drawdown_triggers >= 3:
                     self.manual_recovery = True
                 if self.breaker_action in ("half", "liquidate"):
                     self.pending_disposal = self.breaker_action
