@@ -453,6 +453,14 @@ describe('liveWorkbench', () => {
 
       expect(parseStartConflict(new Error('桥未启动')).message).toBe('桥未启动')
     })
+
+    it('请求超时（无响应体）→ 给可执行的提示，不暴露 axios 英文 message', () => {
+      const err = Object.assign(new Error('timeout of 180000ms exceeded'), { code: 'ECONNABORTED' })
+      const r = parseStartConflict(err)
+      expect(r.rule).toBe('timeout')
+      expect(r.message).toContain('启动请求超时')
+      expect(r.message).toContain('勿重复点击')
+    })
   })
 
   describe('baselineResetAllowed', () => {

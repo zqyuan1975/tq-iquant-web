@@ -697,6 +697,14 @@ export function parseStartConflict(err: unknown): StartConflict {
   const backendMsg = body && typeof body.message === 'string' ? body.message.trim() : ''
   // 参数漂移需按字段中文名重排（后端 message 只列英文 key），故跳过直取
   if (backendMsg && rule !== 'params_drift') return { rule, message: backendMsg }
+  // 请求超时（后端仍在执行）不能只抛 axios 的英文 message，否则用户只看到「没反应」
+  const rawMsg = e?.message?.trim() || ''
+  if (!body && (rawMsg.toLowerCase().includes('timeout') || (err as any)?.code === 'ECONNABORTED')) {
+    return {
+      rule: 'timeout',
+      message: '启动请求超时：后端仍在处理（可能卡在行情体检或桥查询），请稍后刷新列表确认会话状态，勿重复点击',
+    }
+  }
   const occ = data?.occupied_by ?? null
   const who = occ ? `会话 ${occ.session_id}「${occ.name}」` : '另一会话'
   const engineText = ENGINE_TEXT[occ?.engine] || occ?.engine || '该'

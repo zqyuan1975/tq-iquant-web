@@ -2705,7 +2705,7 @@ export async function startLiveSession(id: number, opts?: { ack_keyboard_risk?: 
     account_key?: string | null
     account_key_source?: string | null
     warnings?: string[]   // 通道建议类告警（如推荐通道与所选引擎不一致）
-  }>>(`/live/sessions/${id}/start`, opts?.ack_keyboard_risk ? { ack_keyboard_risk: true } : undefined)
+  }>>(`/live/sessions/${id}/start`, opts?.ack_keyboard_risk ? { ack_keyboard_risk: true } : undefined, { timeout: 180_000 })
   return res.data.data
 }
 

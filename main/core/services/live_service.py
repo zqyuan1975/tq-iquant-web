@@ -4464,6 +4464,13 @@ def _backfill_live_daily_from_account_snapshots(
     return created
 
 
+# 启动前数据体检限流：体检只是告警，不能把启动请求卡在同步取数上。
+# 实测掘金桥单只 /quote 约 8s，496 只全池串行约 66 分钟；期间 start_session
+# 持有 _START_LOCK，会让其它会话的启动请求排队且无任何返回。
+_START_HEALTH_MAX_CODES = 30
+_START_HEALTH_TIME_BUDGET_SECONDS = 3.0
+
+
 def start_session(
     db: Session,
     session_id: int,
@@ -4679,6 +4686,8 @@ def start_session(
         health = run_health_check(
             engine.dispatcher, sorted(pool_codes), health_periods,
             auto_fill=True, calendar=getattr(engine, "_calendar", None),
+            max_codes=_START_HEALTH_MAX_CODES,
+            time_budget_seconds=_START_HEALTH_TIME_BUDGET_SECONDS,
         )["health"]
         if not health.get("healthy"):
             msg = health_summary_text(health)

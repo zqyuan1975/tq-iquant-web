@@ -116,6 +116,8 @@ const accountPreviewError = ref('')
 const createError = ref('')
 // start 409 的行内红字（按 data.rule 给指名占用者的不同话术）
 const startErrors = ref<Record<number, string>>({})
+// 启动中的行（防止重复点击 + 给出明确「启动中…」反馈；后端可能因数据体检耗时）
+const startingIds = ref<Set<number>>(new Set())
 // C3 键鼠冲突二次确认（tdx ↔ ths 同时启动）
 const keyboardRisk = ref<{ session: LiveSessionItem; opponents: SessionOccupancy[] } | null>(null)
 const ackKeyboardRisk = ref(false)
@@ -1272,7 +1274,9 @@ function startSession(id: number, ack = false) {
 }
 
 async function doStart(id: number, ack: boolean) {
+  if (startingIds.value.has(id)) return
   clearStartError(id)
+  startingIds.value = new Set(startingIds.value).add(id)
   try {
     const r = ack
       ? await startLiveSession(id, { ack_keyboard_risk: true })
@@ -1287,6 +1291,10 @@ async function doStart(id: number, ack: boolean) {
     const info = parseStartConflict(e)
     startErrors.value = { ...startErrors.value, [id]: info.message }
     alert(info.message)
+  } finally {
+    const next = new Set(startingIds.value)
+    next.delete(id)
+    startingIds.value = next
   }
 }
 
@@ -1896,7 +1904,8 @@ onUnmounted(() => {
             >{{ sellScopeBusy === s.id ? '切换中…' : (sellScopeOf(s) === 'full' ? '关闭' : '开启') }}</button>
           </td>
           <td>
-            <button v-if="s.status === 'stopped'" @click="startSession(s.id)" class="btn btn-sm btn-primary">启动</button>
+            <button v-if="s.status === 'stopped'" @click="startSession(s.id)" class="btn btn-sm btn-primary"
+              :disabled="startingIds.has(s.id)">{{ startingIds.has(s.id) ? '启动中…' : '启动' }}</button>
             <button v-if="s.status === 'running'" @click="stopSession(s.id)" class="btn btn-sm btn-danger">停止</button>
             <button v-if="s.status === 'stopping'" class="btn btn-sm" disabled
               title="引擎正在退出中，停止完成后才会释放引擎/账户占用">停止中…</button>

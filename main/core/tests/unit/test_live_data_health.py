@@ -139,3 +139,45 @@ def test_run_health_check_healthy_skips_fill():
     assert out["health"]["healthy"] is True
     assert out["auto_fill"] is None
     assert h.health_summary_text(out["health"]) == "数据体检通过"
+
+
+def test_check_data_health_max_codes_truncates_without_scanning_pool():
+    # 启动链路必须限流：全池 496 只逐个 /quote（掘金桥单只 ~8s）会卡住启动
+    codes = ["600000.SH", "000001.SZ", "600519.SH"]
+    disp = _Disp({c: _bars(date(2026, 11, 18)) for c in codes})
+    health = h.check_data_health(disp, codes, ["1d"], now=_NOW_OFF, calendar=_CAL,
+                                 max_codes=2)
+    assert health["truncated"] is True
+    assert health["requested_codes"] == 3
+    assert health["checked_codes"] == 2
+    assert len(disp.calls) == 2  # 未读取第 3 只
+    assert health["healthy"] is False  # 未全量校验，不能报「通过」
+    assert "未完成" in h.health_summary_text(health)
+
+
+def test_check_data_health_time_budget_stops_early(monkeypatch):
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(h._time, "monotonic", lambda: clock["t"])
+
+    class _SlowDisp(_Disp):
+        def query_quote(self, code, period="1d", count=1):
+            self.calls.append((code, period, count))
+            clock["t"] += 10.0
+            return _bars(date(2026, 11, 18))
+
+    disp = _SlowDisp()
+    health = h.check_data_health(disp, ["A", "B", "C"], ["1d"], now=_NOW_OFF,
+                                 calendar=_CAL, time_budget_seconds=3)
+    assert health["truncated"] is True
+    assert health["checked_codes"] == 1
+    assert len(disp.calls) == 1
+
+
+def test_run_health_check_truncated_skips_fill():
+    # 超预算后不再补齐（否则同等规模的串行读取会继续拖住启动链）
+    disp = _Disp({})
+    out = h.run_health_check(disp, ["A", "B"], ["1d"], auto_fill=True,
+                             now=_NOW_OFF, calendar=_CAL, max_codes=1)
+    assert out["health"]["truncated"] is True
+    assert out["auto_fill"]["reason"] == "budget_exhausted"
+    assert len(disp.calls) == 1

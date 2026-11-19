@@ -1209,6 +1209,31 @@ describe('LiveSessions.vue 启动 409 与键鼠冲突确认（C2/C3）', () => {
   })
 })
 
+describe('LiveSessions.vue 启动中反馈', () => {
+  it('启动请求未返回时按钮显示「启动中…」并禁用，重复点击不会二次提交', async () => {
+    ;(getLiveSessions as any).mockResolvedValue([stoppedSession])
+    let resolveStart!: (v: any) => void
+    ;(startLiveSession as any).mockImplementation(() => new Promise((r) => { resolveStart = r }))
+    const w = mount(LiveSessions)
+    await flushPromises()
+
+    const startBtn = w.findAll('button').find((b) => b.text().trim() === '启动')!
+    await startBtn.trigger('click')
+    await flushPromises()
+
+    const busyBtn = w.findAll('button').find((b) => b.text().includes('启动中…'))!
+    expect(busyBtn).toBeTruthy()
+    expect((busyBtn.element as HTMLButtonElement).disabled).toBe(true)
+
+    await busyBtn.trigger('click')
+    expect(startLiveSession).toHaveBeenCalledTimes(1)
+
+    resolveStart({ id: 8, status: 'running' })
+    await flushPromises()
+    w.unmount()
+  })
+})
+
 describe('LiveSessions.vue 执行通道条', () => {
   it('显示当前引擎并支持只读测试连接', async () => {
     ;(getLiveChannel as any).mockResolvedValue({

@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import logging
+import time as _time
 from datetime import date, datetime, time, timedelta
 from typing import Dict, List, Optional
 
@@ -111,32 +112,52 @@ def classify_bar_freshness(period: str, bars, expected_date: date) -> dict:
 
 
 def check_data_health(dispatcher, codes, periods, *, now: datetime = None,
-                      calendar=None) -> dict:
+                      calendar=None, max_codes: Optional[int] = None,
+                      time_budget_seconds: Optional[float] = None) -> dict:
     """逐 code × period 读取最新 bar 并汇总健康度（只读）。
+
+    ``max_codes`` / ``time_budget_seconds`` 用于启动链路：体检只是告警，
+    不允许串行遍历全池把启动请求长时间卡住（掘金桥单只 /quote 实测 ~8s）。
+    超出预算时提前收尾，并置 ``truncated=True`` 且 ``healthy=False``。
 
     返回结构（可直接 JSON 序列化）：
     {version, checked_at, intraday, expected_dates, healthy, unavailable,
+     truncated, requested_codes, checked_codes,
      periods: {p: {total, ok, stale, empty, error, stale_codes, empty_codes,
                    error_codes, stale_count, empty_count, error_count}},
      missing_codes: [...], missing_count}
     """
     now = now or now_shanghai()
-    codes = [str(c) for c in (codes or []) if str(c)]
+    requested_codes = [str(c) for c in (codes or []) if str(c)]
+    codes = requested_codes
     periods = [str(p) for p in (periods or []) if str(p)]
+    truncated = False
+    if max_codes is not None and max_codes > 0 and len(codes) > max_codes:
+        codes = codes[:max_codes]
+        truncated = True
+    deadline = None
+    if time_budget_seconds is not None and time_budget_seconds > 0:
+        deadline = _time.monotonic() + float(time_budget_seconds)
     intraday = is_intraday(now, calendar)
     expected = {p: expected_bar_date(p, now, calendar) for p in periods}
     per_period: Dict[str, dict] = {}
     all_missing: List[str] = []
+    checked_codes: set = set()
     total_checks = 0
     total_errors = 0
+    budget_exhausted = False
     for period in periods:
         stats = {"total": 0, "ok": 0, "stale": 0, "empty": 0, "error": 0,
                  "stale_codes": [], "empty_codes": [], "error_codes": []}
         for code in codes:
             if not code:
                 continue
+            if deadline is not None and _time.monotonic() >= deadline:
+                budget_exhausted = True
+                break
             stats["total"] += 1
             total_checks += 1
+            checked_codes.add(code)
             try:
                 bars = dispatcher.query_quote(code, period=period, count=_CHECK_COUNT)
             except Exception as exc:  # noqa: BLE001 — 桥离线/通道异常都不阻断体检
@@ -158,7 +179,10 @@ def check_data_health(dispatcher, codes, periods, *, now: datetime = None,
             for code in stats[key]:
                 if code not in all_missing:
                     all_missing.append(code)
-    healthy = all(
+        if budget_exhausted:
+            break
+    truncated = truncated or budget_exhausted
+    healthy = (not truncated) and all(
         stats["stale"] == 0 and stats["empty"] == 0 and stats["error"] == 0
         for stats in per_period.values()
     )
@@ -169,6 +193,9 @@ def check_data_health(dispatcher, codes, periods, *, now: datetime = None,
         "expected_dates": {p: d.isoformat() for p, d in expected.items()},
         "healthy": healthy,
         "unavailable": bool(total_checks) and total_errors == total_checks,
+        "truncated": truncated,
+        "requested_codes": len(requested_codes),
+        "checked_codes": len(checked_codes),
         "periods": per_period,
         "missing_codes": all_missing[:_MAX_CODES],
         "missing_count": len(all_missing),
@@ -176,13 +203,16 @@ def check_data_health(dispatcher, codes, periods, *, now: datetime = None,
 
 
 def auto_fill_missing(dispatcher, health: dict, codes, periods, *,
-                      now: datetime = None, calendar=None) -> dict:
+                      now: datetime = None, calendar=None,
+                      max_pairs: Optional[int] = None,
+                      time_budget_seconds: Optional[float] = None) -> dict:
     """非盘中自动补齐：对缺失 (code, period) 用更大 count 重读一次。
 
     盘中禁止自动补齐（只报告）；非交易日 / 盘前盘后允许。重读只唤醒桥端/TQ
     已落盘数据，不触发通达信下载（平台无该能力）。
-    返回 {triggered, reason, requested, warmed, failed, after?}；
-    ``after`` 是补齐后的新体检结果（仅在 triggered 时附带）。
+    ``max_pairs`` / ``time_budget_seconds`` 用于启动链路限流，超预算即收尾。
+    返回 {triggered, reason, requested, warmed, failed, truncated?, after?}；
+    ``after`` 是补齐后的新体检结果（仅在 triggered 且未超预算时附带）。
     """
     now = now or now_shanghai()
     if is_intraday(now, calendar):
@@ -198,9 +228,20 @@ def auto_fill_missing(dispatcher, health: dict, codes, periods, *,
     if not pairs:
         return {"triggered": False, "reason": "healthy_or_no_missing",
                 "requested": 0, "warmed": 0, "failed": 0}
+    requested_pairs = len(pairs)
+    truncated = False
+    if max_pairs is not None and max_pairs > 0 and len(pairs) > max_pairs:
+        pairs = pairs[:max_pairs]
+        truncated = True
+    deadline = None
+    if time_budget_seconds is not None and time_budget_seconds > 0:
+        deadline = _time.monotonic() + float(time_budget_seconds)
     warmed = 0
     failed = 0
     for code, period in pairs:
+        if deadline is not None and _time.monotonic() >= deadline:
+            truncated = True
+            break
         try:
             bars = dispatcher.query_quote(code, period=period, count=_WARM_COUNT)
             if bars:
@@ -210,20 +251,38 @@ def auto_fill_missing(dispatcher, health: dict, codes, periods, *,
         except Exception:  # noqa: BLE001 — 补齐失败只计数，不阻断
             failed += 1
             logger.debug("数据补齐失败 code=%s period=%s", code, period, exc_info=True)
+    if truncated:
+        return {"triggered": True, "reason": "budget_exhausted",
+                "requested": requested_pairs, "warmed": warmed, "failed": failed,
+                "truncated": True}
     after = check_data_health(dispatcher, codes, periods, now=now, calendar=calendar)
-    return {"triggered": True, "reason": "off_hours", "requested": len(pairs),
+    return {"triggered": True, "reason": "off_hours", "requested": requested_pairs,
             "warmed": warmed, "failed": failed, "after": after}
 
 
 def run_health_check(dispatcher, codes, periods, *, auto_fill: bool = True,
-                     now: datetime = None, calendar=None) -> dict:
-    """体检 + 可选非盘中补齐；返回 {health, auto_fill}（health 为补齐后结果）。"""
+                     now: datetime = None, calendar=None,
+                     max_codes: Optional[int] = None,
+                     time_budget_seconds: Optional[float] = None) -> dict:
+    """体检 + 可选非盘中补齐；返回 {health, auto_fill}（health 为补齐后结果）。
+
+    启动链路应传 ``max_codes`` / ``time_budget_seconds``，保证体检不会把
+    启动请求卡在同步取数上；超预算时跳过补齐，直接返回部分结果。
+    """
     now = now or now_shanghai()
-    health = check_data_health(dispatcher, codes, periods, now=now, calendar=calendar)
+    health = check_data_health(dispatcher, codes, periods, now=now, calendar=calendar,
+                               max_codes=max_codes,
+                               time_budget_seconds=time_budget_seconds)
     result = {"health": health, "auto_fill": None}
+    if health.get("truncated"):
+        result["auto_fill"] = {"triggered": False, "reason": "budget_exhausted",
+                               "requested": 0, "warmed": 0, "failed": 0}
+        return result
     if auto_fill and not health.get("healthy"):
         fill = auto_fill_missing(dispatcher, health, codes, periods,
-                                 now=now, calendar=calendar)
+                                 now=now, calendar=calendar,
+                                 max_pairs=max_codes,
+                                 time_budget_seconds=time_budget_seconds)
         after = fill.pop("after", None)
         result["auto_fill"] = fill
         if after is not None:
@@ -235,6 +294,10 @@ def health_summary_text(health: dict) -> str:
     """体检结论 → 一句话（启动告警/通知复用）。"""
     if health.get("unavailable"):
         return "数据体检失败：行情通道不可用，无法读取本地数据"
+    if health.get("truncated"):
+        return "数据体检未完成：仅抽查 %s/%s 只（已到启动等待预算，未阻塞启动）；未抽查部分未校验" % (
+            health.get("checked_codes", 0), health.get("requested_codes", 0),
+        )
     parts: List[str] = []
     for period, stats in (health.get("periods") or {}).items():
         bad = int(stats.get("stale", 0)) + int(stats.get("empty", 0))
