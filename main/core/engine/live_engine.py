@@ -858,6 +858,12 @@ class LiveEngine:
             db_session_factory=db_session_factory,
             code_period_count=code_period_count,
             clock=now_shanghai,
+            # stop_session 会先同步置 _running=False/_stop_requested=True；长循环
+            # （日终全池拉日线）据此尽快让出 executor，engine.stop() 才能收敛。
+            stop_requested=lambda: (
+                getattr(self, "_stop_requested", False)
+                or not getattr(self, "_running", True)
+            ),
         )
         # 卖出范围（存量/外部仓是否代卖）：初始取 build_engine 已解析的会话档位，
         # 之后由 _refresh_sell_scope 每轮 tick 重读会话列（运行中可切，无需重启）。
@@ -1964,6 +1970,13 @@ class LiveEngine:
             ("daily_bars", self._maybe_daily_bars),
             ("advance_close", self._maybe_advance_daily_close),
         ):
+            # stop 已同步置 _running=False/_stop_requested=True：剩余段不再执行，
+            # 否则引擎主线程会让 engine.stop() 的收尾任务一直排队。
+            if self._stop_requested or not self._running:
+                logger.info(
+                    "stop requested, skip remaining daily schedule from %s (session %s)",
+                    name, self.session_id)
+                break
             try:
                 fn()
             except BridgeUnavailableError as e:

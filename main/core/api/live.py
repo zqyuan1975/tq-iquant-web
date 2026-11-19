@@ -33,21 +33,61 @@ router = APIRouter(prefix="/api/live", tags=["live"])
 # 并发真实下单（同 session 重复下单 / 跨 session 击穿 B6）。启动稀有，临界区串行可接受。
 _START_LOCK = asyncio.Lock()
 
+# stop 收敛的时间预算：正常几百毫秒~十几秒（等当前一只 /quote 返回）；超过则先
+# 把 DB 置 stopped 释放界面与占用，engine.stop() 的清理继续在后台收敛，不能让
+# 会话无限停在 stopping。
+_STOP_CONVERGE_TIMEOUT_SECONDS = 120.0
+
+# 后台 stop 任务强引用：事件循环只持弱引用，任务可能被 GC 中断（导致永远
+# stopping）。收敛中的 stop 任务与超时后转后台的 engine.stop() 都必须留引用。
+_STOP_TASKS: set = set()
+
+
+def _on_stop_task_done(task: asyncio.Task, session_id: int) -> None:
+    _STOP_TASKS.discard(task)
+    try:
+        task.result()
+        logger.info("stop 后台收敛完成：会话 %s（%s）", session_id,
+                    runtime.process_tag())
+    except asyncio.CancelledError:
+        logger.warning("stop 后台收敛被取消：会话 %s（%s）", session_id,
+                       runtime.process_tag())
+    except Exception:  # noqa: BLE001
+        logger.exception("stop 后台收敛失败 (session %s)", session_id)
+
 
 async def _stop_and_finalize(engine, session_id: int) -> None:
     """stop 的收尾协程：先让引擎 stop() 收敛（含异常），再把 stopping → stopped。
 
     收尾用独立 DB session（请求 Session 已随响应关闭）；失败只记日志，
     由下次启动的 recover_stale_running_live_sessions / 僵尸抢占兜底。
+    engine.stop() 超过时间预算时不取消它（取消会跳过撤单/持久化/通道关闭），
+    而是先置 stopped 释放界面与占用，任务转后台继续收敛。
     """
+    stop_task = asyncio.create_task(engine.stop())
+    _STOP_TASKS.add(stop_task)
     try:
         logger.info(
             "stop 收敛开始：会话 %s engine.stop()（%s）", session_id,
             runtime.process_tag())
-        await engine.stop()
+        try:
+            await asyncio.wait_for(
+                asyncio.shield(stop_task),
+                timeout=_STOP_CONVERGE_TIMEOUT_SECONDS,
+            )
+        except asyncio.TimeoutError:
+            logger.error(
+                "engine.stop() 超时（%.0fs）：会话 %s 先置 stopped 释放占用，"
+                "清理转后台继续收敛（%s）",
+                _STOP_CONVERGE_TIMEOUT_SECONDS, session_id,
+                runtime.process_tag())
+            stop_task.add_done_callback(
+                lambda t: _on_stop_task_done(t, session_id))
     except Exception:  # noqa: BLE001
         logger.exception("engine.stop() failed (session %s)", session_id)
     finally:
+        if stop_task.done():
+            _STOP_TASKS.discard(stop_task)
         try:
             await run_in_threadpool(svc.finalize_stopped, session_id)
             logger.info(
@@ -482,7 +522,9 @@ async def stop_session(session_id: int, db: Session = Depends(get_db)):
                 engine._stop_requested = True
             # stopping 中间态（2026-11-16）：引擎 stop() 收敛（含异常）后才置
             # stopped 并释放 C1/C2 占用；期间另有会话启动会被 409 拦。
-            asyncio.create_task(_stop_and_finalize(engine, session_id))
+            task = asyncio.create_task(_stop_and_finalize(engine, session_id))
+            _STOP_TASKS.add(task)
+            task.add_done_callback(_STOP_TASKS.discard)
         return ok({"id": session_id, "status": session.status})
 
 

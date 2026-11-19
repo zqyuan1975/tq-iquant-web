@@ -43,6 +43,7 @@ class EngineContext:
         db_session_factory: Callable[[], Session],
         code_period_count: Optional[Dict[tuple, int]] = None,
         clock: Optional[Callable[[], datetime]] = None,
+        stop_requested: Optional[Callable[[], bool]] = None,
     ) -> None:
         self.session_id: int = session_id
         self.portfolios: List[Portfolio] = portfolios
@@ -53,3 +54,6 @@ class EngineContext:
         # 可注入时钟：默认上海时区当前时间；协作者统一经 self.ctx.clock() 取"现在"，
         # 测试注入固定时钟即可，不再 monkeypatch 模块级 datetime。
         self.clock: Callable[[], datetime] = clock or now_shanghai
+        # 停止请求探针：协作者在长循环（如日终全池拉日线）里定期询问，
+        # 命中后立即收尾，避免 engine.stop() 排队等整个全池遍历结束。
+        self.stop_requested: Callable[[], bool] = stop_requested or (lambda: False)

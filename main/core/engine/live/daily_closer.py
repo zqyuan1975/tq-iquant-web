@@ -345,6 +345,12 @@ class DailyCloser:
         # 长度/去重规则 **同启动预热（preheat）**。
         md = self._market_data
         bars_by_code = self._fetch_1d_bars()
+        # 停止中：本次拉取只是被中断的部分结果，绝不拿残缺池驱动信号/下单
+        if self._stop_requested():
+            logger.info(
+                "stop requested, skip daily bar drive (session %s)",
+                self._ctx.session_id)
+            return
         if not bars_by_code:
             # P2-11：取数为空同样意味着「今天日线策略没跑」，补事件让工作台可见。
             self._note_daily_freshness_skip(today, stale=0, total=0)
@@ -450,11 +456,29 @@ class DailyCloser:
         )
 
     # ---------------- 14:50 提前收盘价（仅 1d）----------------
+    def _stop_requested(self) -> bool:
+        """停止请求探针：长循环里定期检查，命中即收尾。"""
+        fn = getattr(self._ctx, "stop_requested", None)
+        if fn is None:
+            return False
+        try:
+            return bool(fn())
+        except Exception:  # noqa: BLE001 — 探针异常不得影响日终流程
+            return False
+
     def _fetch_1d_bars(self) -> Dict[str, list]:
         """拉股票池 1d 快照（长度/去重同启动预热）。桥离线返回 {}（已标记离线）。"""
         md = self._market_data
         bars_by_code: Dict[str, list] = {}
-        for code in md._bar_poller.stock_codes:
+        codes = list(md._bar_poller.stock_codes)
+        for idx, code in enumerate(codes):
+            # 停止中不再遍历全池：单只 /quote 最坏可等满桥超时（掘金 ~8s/只），
+            # 496 只全池会让 engine.stop() 排队数十分钟、状态永远停在 stopping。
+            if self._stop_requested():
+                logger.info(
+                    "stop requested, abort daily bars fetch (session %s): %d/%d code(s)",
+                    self._ctx.session_id, idx, len(codes))
+                break
             count = self._ctx.code_period_count.get(
                 (code, "1d"), md._period_count.get("1d", md._formula_count)
             )
@@ -532,6 +556,11 @@ class DailyCloser:
         # 14:53 起主取仍缺失则回退 14:51 起始 bar；两者都缺失的 code 本日不下单。
         exec_prices, used_fallback, missing = self._advance_exec_prices(
             list(prices), today, hhmm)
+        if self._stop_requested():
+            logger.info(
+                "stop requested, skip advance-close order drive (session %s)",
+                self._ctx.session_id)
+            return
         if hhmm < _ADVANCE_EXEC_FALLBACK_TIME and set(exec_prices) != set(prices):
             # 14:52 分钟 bar 刚起步（forming 尚未建立）：等下一轮 60s，不告警。
             if self._advance_exec_wait_warned_date != today:
@@ -663,6 +692,11 @@ class DailyCloser:
             return prices
         lo = target - timedelta(seconds=90)
         for code in codes:
+            if self._stop_requested():
+                logger.info(
+                    "stop requested, abort advance-close quote fetch (session %s)",
+                    self._ctx.session_id)
+                break
             try:
                 rows = self._ctx.dispatcher.query_quote(code, period="1m", count=10)
             except BridgeUnavailableError:

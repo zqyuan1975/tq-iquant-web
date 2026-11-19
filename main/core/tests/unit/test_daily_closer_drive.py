@@ -134,3 +134,25 @@ def test_all_portfolios_driven_marks_done():
     assert sorted(driven) == [(1, "1d"), (2, "1d")]
     assert offline == []
     assert closer._daily_bars_done(_TODAY) is True
+
+
+def test_fetch_1d_bars_aborts_on_stop_request():
+    """停止中必须中断全池日线拉取：否则 engine.stop() 排队等全池遍历，
+    会话永远停在 stopping（掘金桥单只 ~8s，496 只可达数十分钟）。"""
+    closer, _ = _mk_closer(lambda *a, **k: None)
+    calls = []
+
+    class _CountingDisp(_Disp):
+        def query_quote(self, code, period="1d", count=250):
+            calls.append(code)
+            return self.bars
+
+    closer._market_data._bar_poller = SimpleNamespace(
+        stock_codes=["600000.SH", "000001.SZ", "600519.SH"])
+    closer._ctx.dispatcher = _CountingDisp()
+    closer._ctx.stop_requested = lambda: len(calls) >= 1
+
+    out = closer._fetch_1d_bars()
+
+    assert calls == ["600000.SH"]  # 第一只后立即收尾，不再遍历全池
+    assert list(out) == ["600000.SH"]

@@ -1207,6 +1207,19 @@ async function load() {
   loadChannel(target?.engine)
   // 参数漂移（绑定回测记录时）：随列表刷新，drifted 才出横幅
   void loadParamsDrift()
+  scheduleStoppingRefresh()
+}
+
+// stopping 是后端中间态：engine.stop() 收敛完成后 DB 才置 stopped。
+// 本页列表没有自动轮询，不补一个短轮询会让「停止中…」永远停在那里。
+let stoppingTimer: ReturnType<typeof setTimeout> | null = null
+function scheduleStoppingRefresh() {
+  if (stoppingTimer !== null) return
+  if (!sessions.value.some((s) => s.status === 'stopping')) return
+  stoppingTimer = setTimeout(async () => {
+    stoppingTimer = null
+    await load()
+  }, 5000)
 }
 
 function openCreate() {
@@ -1776,6 +1789,10 @@ onUnmounted(() => {
   if (bridgeTimer !== null) {
     clearInterval(bridgeTimer)
     bridgeTimer = null
+  }
+  if (stoppingTimer !== null) {
+    clearTimeout(stoppingTimer)
+    stoppingTimer = null
   }
   // 启动告警自动收起计时器：组件销毁时清掉，避免定时器悬挂
   startWarningTimers.forEach((t) => clearTimeout(t))
