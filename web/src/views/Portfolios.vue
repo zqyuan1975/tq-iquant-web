@@ -243,7 +243,7 @@ const STRATEGY_GROUPS: { title: string; hint?: string; fields: FieldMeta[] }[] =
     { key: 'split_order_interval_seconds', label: '子单间隔（秒）', span: 1, type: 'number', placeholder: '留空=成交驱动立即续发', hint: '成交后额外等待再发下一笔；受主循环 60s 粒度限制' },
     { key: 'split_order_interval_jitter', label: '间隔随机化', span: 1, type: 'switch', hint: '间隔按 0.5–1.5 倍随机，避免固定节奏被识别' },
     { key: 'split_order_volume_pct', label: '单笔量占 bar 比例', span: 1, type: 'number', placeholder: '留空=不限', hint: '0–1：单笔不超过最近完成 1m bar 成交量 × 比例；与阈值共同决定笔数（取更大）' },
-    { key: 'risk_timing', label: '风控执行时点', span: 2, type: 'select', options: 'riskTimings', hint: '按子策略生效（不是全局），仅实盘生效、回测不读该键。next_day=次一交易日执行：盘前集合竞价开启时优先在 09:15–09:20（截止 pre_open_auction_end_time）报出，未报成才回落到首根分钟 bar（约 09:31）；immediate=当 bar 即提交。只有 1d/1w/1mon 且 bar_time 为 00:00 的日线信号才进这道闸——分钟周期策略的风控单 signal_bar_date 为空，两种取值没有差别' },
+    { key: 'risk_timing', label: '风控执行时点', span: 2, type: 'select', options: 'riskTimings', hint: '按子策略生效（不是全局）。只影响实盘日线信号的提交时点，回测不读该键：next_day=顺延次一交易日（盘前竞价开启时优先 09:15–09:20 报出，否则首根分钟 bar 约 09:31）；immediate=当 bar 即提交。分钟周期 bar 的 signal_bar_date 为空，两种取值没有差别。盘中逐 1m 风控（止损/止盈/移动止损）由实盘会话的「错周期风控」开关控制（含分钟策略时自动开启），与本项不是同一机制。' },
   ]},
 ]
 

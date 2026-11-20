@@ -519,8 +519,8 @@ class Portfolio:
         mismatched_risk：错周期 bar 是否跑风控。False 时周期不匹配的策略只更新
         价格快照，不评估止损/止盈/移动止损（周线/月线同样只在自身周期边界评估）。
         默认 False：回测与实盘同口径（实盘由会话三态
-        `live_sessions.intraday_mismatched_risk_enabled`（NULL 跟随全局
-        `tq_trade.intraday_mismatched_risk_enabled`，默认 False）解析后传入；
+        `live_sessions.intraday_mismatched_risk_enabled` 解析后传入：NULL 时按
+        会话内子策略周期自动推导——含分钟策略则开，否则关；显式值优先。
         14:51 提前收盘价轮次同样显式传 False）。
         inflight_risk_sells：strategy_id → 在途未结清的风控卖单股票集合（回测
         BacktestEngine 从 deferred 队列注入，含缩量未成交残量）。命中时该票本 bar

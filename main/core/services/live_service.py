@@ -1274,6 +1274,7 @@ def resolve_stock_codes(db: Session, portfolio_strategy_id: int) -> list:
 
 
 def _session_strategies(db: Session, session_id: int):
+    """session 下全部 (组合 id, 子策略) 行。"""
     links = (
         db.query(LiveSessionPortfolio)
         .filter(LiveSessionPortfolio.session_id == session_id)
@@ -1289,6 +1290,31 @@ def _session_strategies(db: Session, session_id: int):
         )
         rows.extend((link.portfolio_strategy_id, st) for st in strategies)
     return rows
+
+
+MINUTE_STRATEGY_PERIODS = ("1m", "5m", "15m", "30m", "1h")
+
+
+def _minute_strategy_periods(db: Session, session_id: int) -> List[str]:
+    """会话内实际用到的分钟级子策略周期（去重排序）。"""
+    return sorted({
+        str(st.period) for _, st in _session_strategies(db, session_id)
+        if str(st.period) in MINUTE_STRATEGY_PERIODS
+    })
+
+
+def resolve_mismatched_risk(session, minute_periods: List[str]) -> tuple:
+    """错周期逐 1m 风控的生效值与来源（会话三态）。
+
+    显式 true/false 永远优先；NULL（未显式设置）时按会话内子策略周期自动推导：
+    存在分钟级策略 → True，全是日线及以上 → False。
+    """
+    explicit = getattr(session, "intraday_mismatched_risk_enabled", None)
+    if explicit is not None:
+        return bool(explicit), "explicit"
+    if minute_periods:
+        return True, "auto_minute"
+    return False, "auto_no_minute"
 
 
 def _preflight_tq_alert():
@@ -1820,10 +1846,31 @@ def build_engine(
     # G2：会话级盘前参数覆盖（NULL=跟随全局；非空=本会话覆盖）。
     _pre_open_cfg, _pre_open_overrides = resolve_pre_open_auction_config(
         session_row, _tq_cfg)
-    # 错周期 bar 风控：会话三态 NULL → 跟随全局默认（默认 False，对齐回测）
+    # 错周期 bar 风控：会话三态 NULL → 按会话内子策略周期自动推导
+    # （存在分钟级策略 → 开；全是日线及以上 → 关）；显式 true/false 永远优先。
+    _minute_periods = sorted({
+        str(getattr(st, "period", "")) for port in portfolios
+        for st in getattr(port, "strategies", [])
+        if str(getattr(st, "period", "")) in MINUTE_STRATEGY_PERIODS
+    })
     if session_mismatch_risk is None:
-        session_mismatch_risk = bool(
-            _tq_cfg.get("intraday_mismatched_risk_enabled", False))
+        session_mismatch_risk, _mismatch_source = resolve_mismatched_risk(
+            session_row, _minute_periods)
+    else:
+        _mismatch_source = "explicit"
+    if _minute_periods and session_mismatch_risk:
+        logger.info(
+            "会话 %s 含分钟策略 %s：逐 1m 风控已启用（来源=%s）",
+            session_id, ",".join(_minute_periods), _mismatch_source)
+    elif _minute_periods:
+        logger.warning(
+            "会话 %s 含分钟策略 %s，但逐 1m 风控关闭（来源=%s）：止损/止盈/"
+            "移动止损只在本周期 bar 收盘评估",
+            session_id, ",".join(_minute_periods), _mismatch_source)
+    else:
+        logger.info(
+            "会话 %s 无分钟级策略：逐 1m 风控=%s（来源=%s）",
+            session_id, session_mismatch_risk, _mismatch_source)
     _calendar_fallbacks = []
     if _engine_key != "goldminer":
         _calendar_fallbacks.append(("goldminer_bridge", goldminer_calendar_provider))
@@ -2057,6 +2104,25 @@ def list_sessions(db: Session, engines: Optional[Dict[int, LiveEngine]] = None) 
         by_session.setdefault(l.session_id, []).append(
             {"portfolio_id": l.portfolio_strategy_id, "status": l.status}
         )
+    # 各会话的分钟级子策略周期（逐 1m 风控自动推导 + 界面确认提示用）
+    minute_periods_by_session: Dict[int, set] = {}
+    for sid, period in (
+        db.query(LiveSessionPortfolio.session_id, Strategy.period)
+        .join(Strategy, Strategy.portfolio_id
+              == LiveSessionPortfolio.portfolio_strategy_id)
+        .filter(Strategy.period.in_(MINUTE_STRATEGY_PERIODS))
+        .all()
+    ):
+        minute_periods_by_session.setdefault(int(sid), set()).add(str(period))
+
+    def _risk_view(sess) -> dict:
+        periods = sorted(minute_periods_by_session.get(sess.id, ()))
+        effective, source = resolve_mismatched_risk(sess, periods)
+        return {
+            "minute_strategy_periods": periods,
+            "intraday_mismatched_risk_effective": effective,
+            "intraday_mismatched_risk_source": source,
+        }
     # H2：各会话待补发拆单剩余笔数（仅 pending；列表/编辑弹窗提示用）
     split_counts: Dict[int, int] = dict(
         db.query(LiveSessionPendingChange.live_session_id,
@@ -2087,9 +2153,10 @@ def list_sessions(db: Session, engines: Optional[Dict[int, LiveEngine]] = None) 
             "advance_close_enabled": bool(s.advance_close_enabled),
             "advance_close_time": s.advance_close_time or "14:51",
             "advance_close_done_date": s.advance_close_done_date,
-            # 错周期 bar 风控（三态原始值：None=跟随全局，true/false=会话覆盖）
+            # 错周期 bar 风控（三态原始值：None=未显式设置，true/false=会话覆盖）
             "intraday_mismatched_risk_enabled":
                 s.intraday_mismatched_risk_enabled,
+            **_risk_view(s),
             # E1：执行前重判门控（默认关）
             "gate_recheck_on_execute": bool(
                 getattr(s, "gate_recheck_on_execute", False)),
@@ -2488,7 +2555,8 @@ def normalize_advance_close(data: dict) -> tuple:
 
 
 def normalize_mismatched_risk(value) -> Optional[bool]:
-    """错周期风控三态归一：None/auto → NULL（跟随全局）；0/1/true/false 显式覆盖。"""
+    """错周期风控三态归一：None/auto → NULL（未显式设置，按策略周期自动推导）；
+    0/1/true/false 显式覆盖。"""
     if value is None:
         return None
     if isinstance(value, bool):
@@ -2733,7 +2801,8 @@ def create_session(db: Session, data: dict, mode: str) -> dict:
         # 14:50 提前收盘价（仅 1d）：默认关 + 14:51
         advance_close_enabled=advance_close_enabled,
         advance_close_time=advance_close_time,
-        # 错周期 bar 风控（三态）：NULL=跟随全局默认，0/1=会话覆盖
+        # 错周期 bar 风控（三态）：NULL=未显式设置（按子策略周期自动推导），
+        # 0/1=会话显式覆盖
         intraday_mismatched_risk_enabled=normalize_mismatched_risk(
             data.get("intraday_mismatched_risk_enabled")),
         # E1：执行前重判门控（默认关）
@@ -2800,6 +2869,10 @@ def get_session(db: Session, session_id: int, engine: Optional[LiveEngine] = Non
     )
     # ③ 外部现金流累计净流入（一次查询，供各组合展示）
     net_map = cash_flow_net_inflow(db, session_id)
+    # 逐 1m 错周期风控：生效值 + 来源（NULL 时按子策略周期自动推导）
+    _minute_periods = _minute_strategy_periods(db, session_id)
+    _mismatch_effective, _mismatch_source = resolve_mismatched_risk(
+        session, _minute_periods)
     data = {
         "id": session.id,
         "name": session.name,
@@ -2854,9 +2927,13 @@ def get_session(db: Session, session_id: int, engine: Optional[LiveEngine] = Non
         "advance_close_enabled": bool(session.advance_close_enabled),
         "advance_close_time": session.advance_close_time or "14:51",
         "advance_close_done_date": session.advance_close_done_date,
-        # 错周期 bar 风控（三态原始值：None=跟随全局，true/false=会话覆盖）
+        # 错周期 bar 风控（三态原始值：None=未显式设置，true/false=会话覆盖）
         "intraday_mismatched_risk_enabled":
             session.intraday_mismatched_risk_enabled,
+        # 生效值与来源：NULL 时按子策略周期自动推导（auto_minute/auto_no_minute）
+        "intraday_mismatched_risk_effective": _mismatch_effective,
+        "intraday_mismatched_risk_source": _mismatch_source,
+        "minute_strategy_periods": _minute_periods,
         # E1：执行前重判门控（默认关）
         "gate_recheck_on_execute": bool(
             getattr(session, "gate_recheck_on_execute", False)),

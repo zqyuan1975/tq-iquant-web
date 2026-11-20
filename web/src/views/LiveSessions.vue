@@ -106,9 +106,9 @@ const form = ref({
   // 提前收盘价轮次时点 HH:MM（默认 14:51，限定 14:51–14:59；委托价需要 14:52
   // 起始 1m bar 的开盘价，故实际轮次不早于 14:52）
   advance_close_time: '14:51' as string,
-  // 错周期风控三态：null=跟随全局（tq_trade.intraday_mismatched_risk_enabled，默认
-  // False=对齐回测：错周期 bar 只更新价格快照，不评估止损/止盈/移动止损）/
-  // true=强制开启（任意 bar 都跑风控）/ false=强制关闭
+  // 错周期风控三态：null=未显式设置（按会话内子策略周期自动推导：含分钟策略→开，
+  // 否则关；显式 true/false 永远优先）/ true=强制开启（任意 bar 都跑风控）/
+  // false=强制关闭
   intraday_mismatched_risk_enabled: null as boolean | null,
   // E1：执行前重判门控（默认关）——顺延次日单/盘前竞价单提交前再判一次
   gate_recheck_on_execute: false as boolean,
@@ -218,6 +218,33 @@ const minuteLivePeriods = computed(() => {
   return Array.from(hit).sort()
 })
 const minuteNoticeDismissed = ref(false)
+// 逐 1m 错周期风控：会话含分钟策略但该字段为 NULL（未显式设置）→ 提示确认一次并落库。
+// 运行时已按策略周期自动判定（auto_minute），这里只负责把隐式值固化为显式值。
+const riskSavingId = ref<number | null>(null)
+const riskAutoSessions = computed(() =>
+  sessions.value.filter((s) =>
+    (s.minute_strategy_periods?.length ?? 0) > 0
+    && (s.intraday_mismatched_risk_enabled === null
+        || s.intraday_mismatched_risk_enabled === undefined)))
+// 分钟策略 + 显式关闭：界面留痕说明「止损只在本周期 bar 收盘评估」
+const riskOffMinuteSessions = computed(() =>
+  sessions.value.filter((s) =>
+    (s.minute_strategy_periods?.length ?? 0) > 0
+    && s.intraday_mismatched_risk_enabled === false))
+async function confirmMismatchRisk(s: LiveSessionItem, enabled: boolean) {
+  if (riskSavingId.value !== null) return
+  riskSavingId.value = s.id
+  try {
+    await updateLiveSession(s.id, {
+      intraday_mismatched_risk_enabled: enabled,
+    } as any)
+    await load()
+  } catch (e) {
+    alert(`保存失败：${String(e)}`)
+  } finally {
+    riskSavingId.value = null
+  }
+}
 // C4：多账户并行横幅文案（<2 个 running 或同账户 → null）
 const multiAccountBanner = computed(() => multiAccountBannerText(sessions.value))
 // 重置窗口：交易日 15:00 前禁用（后端 403 兜底半日市/临时休市）
@@ -1940,6 +1967,38 @@ onUnmounted(() => {
     <button class="btn btn-sm" @click="minuteNoticeDismissed = true">关闭</button>
   </div>
 
+  <!-- 逐 1m 风控固化提示：分钟策略 + 未显式设置时提示确认一次（不阻断任何操作） -->
+  <div v-if="riskAutoSessions.length" class="card minute-live-banner" data-test="risk-auto-banner">
+    <div>
+      <strong>分钟策略：请确认「盘中逐 1m 风控」</strong>
+      <div class="minute-live-body">
+        以下会话含分钟级子策略，但未显式设置逐 1m 错周期风控。运行时会按策略周期自动判定为
+        <b>开启</b>（5m 策略也逐 1m 评估止损/止盈/移动止损）；确认后将写入会话显式值，
+        显式值永远优先。运行中的会话下次启动生效。
+        <div v-for="s in riskAutoSessions" :key="s.id" style="margin-top:6px">
+          <span>{{ s.name }}（{{ (s.minute_strategy_periods || []).join(' / ') }}，
+            当前生效：{{ s.intraday_mismatched_risk_effective ? '开' : '关' }}）</span>
+          <button class="btn btn-sm" :disabled="riskSavingId === s.id"
+                  @click="confirmMismatchRisk(s, true)">启用并固化</button>
+          <button class="btn btn-sm" :disabled="riskSavingId === s.id"
+                  @click="confirmMismatchRisk(s, false)">固化关闭</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- 分钟策略 + 显式关闭逐 1m 风控：留痕说明原因（不阻断） -->
+  <div v-if="riskOffMinuteSessions.length" class="card minute-live-banner">
+    <div class="minute-live-body">
+      <b>分钟策略但逐 1m 风控已关闭</b>：
+      <span v-for="s in riskOffMinuteSessions" :key="s.id">
+        {{ s.name }}（{{ (s.minute_strategy_periods || []).join(' / ') }}）
+      </span>
+      止损/止盈/移动止损只在本周期 bar 收盘评估；如需盘中逐 1m 评估，请在会话设置里改为
+      「强制开启」或「未显式设置」。
+    </div>
+  </div>
+
   <!-- C4 多账户并行提示：不阻断任何操作，可关闭 -->
   <div v-if="multiAccountBanner && !bannerDismissed" class="card multi-account-banner" data-test="multi-account-banner">
     <span>{{ multiAccountBanner }}</span>
@@ -3081,12 +3140,15 @@ onUnmounted(() => {
       </template>
       <label>错周期风控</label>
       <select v-model="form.intraday_mismatched_risk_enabled" data-field="intraday_mismatched_risk_enabled">
-        <option :value="null">跟随全局（默认关闭，对齐回测）</option>
+        <option :value="null">未显式设置（按策略周期自动：含分钟策略→开，否则关）</option>
         <option :value="true">强制开启（任意 bar 都跑风控）</option>
         <option :value="false">强制关闭</option>
       </select>
       <p style="font-size:12px;color:var(--ink-faint);margin:2px 0 12px">
-        关闭时（全局默认）止损/止盈/移动止损只在策略<strong>自身周期</strong>的边界 bar 上评估：1m/5m 等错周期 bar 只更新价格快照，周线/月线同样只在自身边界评估——与回测口径一致。开启则任何 bar 到达都按收盘价评估持仓风险（旧行为，盘中反应更早但回测无法复现）。历史会话（未设置）恒跟随全局。
+        会话为「未显式设置」时按会话内子策略周期自动推导：只要存在 1m/5m/15m/30m/1h 策略就开启，
+        全为日线及以上则关闭。显式 true/false 永远优先，且不会被自动推导覆盖。
+        自身周期的 bar 恒评估；开启后错周期 bar（如 1m bar 驱动 5m/日线策略）也逐根按收盘价评估
+        止损/止盈/移动止损。运行中会话改动<b>下次启动生效</b>。
       </p>
       <label style="display:flex;align-items:center;gap:8px">
         <input v-model="form.gate_recheck_on_execute" type="checkbox" style="width:auto" data-field="gate_recheck_on_execute" />
@@ -3514,10 +3576,11 @@ onUnmounted(() => {
               顺延到 09:30 之后）。盘前单<b>按单</b>下发 price_type=limit，
               <b>无需</b>会话级或 config.yaml 里的 price_type=limit；HTTP 桥通道的闸门判据为桥 /ping 自述支持 limit 或提供
               /price_limit（通达信/同花顺按各自通道能力），若本会话盘前单 /order 回显非 limit 则直接拦下该单。</p>
-            <p class="guide-note">· <b>错周期风控</b>（会话三态 intraday_mismatched_risk_enabled / 全局
-              tq_trade.intraday_mismatched_risk_enabled，默认 false＝对齐回测）：关闭时止损/止盈/移动止损只在
-              策略自身周期的边界 bar 上评估，1m/5m 等错周期 bar 只更新价格快照（周线/月线同样只在自身边界评估）；
-              会话置 true 可恢复「任意 bar 都跑风控」的旧行为。会话级 NULL＝跟随全局。</p>
+            <p class="guide-note">· <b>错周期风控</b>（会话三态 intraday_mismatched_risk_enabled）：显式 true/false
+              永远优先；<b>NULL＝未显式设置</b>时按会话内子策略周期自动推导（含 1m/5m/15m/30m/1h 策略→开，
+              全为日线及以上→关），不再跟随 config.yaml 的全局开关。关闭时止损/止盈/移动止损只在策略
+              自身周期的边界 bar 上评估，错周期 bar 只更新价格快照；开启后任意 bar 到达都按收盘价评估。
+              自身周期 bar 始终评估。运行中会话改动下次启动生效。</p>
             <p class="guide-note">· <b>桥超时</b>：live.bridge_read_timeout_seconds=15（单次读取）、
               bridge_connect_timeout_seconds=3（建连）、bridge_timeout_seconds=90（持续离线判死阈值，语义不同）；
               iquant_bridge.request_timeout_seconds 默认 15，掘金保持 30（/quote 首次走云端历史服务慢）。</p>
