@@ -128,6 +128,7 @@ from .live.daily_closer import DailyCloser
 from .market_rules import session_allows_bar, tick_size
 from .decision import DecisionRecorder
 from .capital_shadow import build_shadow_payload
+from .capital_enforce import portfolio_delta, release_all
 from .regime import CausalRegimeTracker
 from ..config import load_config
 from ..services.notify_service import notify
@@ -708,6 +709,10 @@ class LiveEngine:
         # F3 影子（0021，默认 None=关闭）：只在每根 bar 末尾追加
         # live_capital_shadow 一行，不参与任何交易决策；结构上不触下单入口。
         capital_shadow: Optional[dict] = None,
+        # G1 资金强制（0021，默认关）：绑定拼盘时把借据净额计入组合可用现金与
+        # 真实侧占比；开关 False 时两个入口的返回值与改动前逐字一致。
+        capital_enforce: Optional[dict] = None,
+        capital_enforce_enabled: bool = False,
         backup_engine: Optional[str] = None,
         failover_enabled: bool = False,
     ):
@@ -832,6 +837,13 @@ class LiveEngine:
         self._capital_pool_day: Optional[date] = None
         # F3 影子：None=关闭（默认路径不取任何新数据、不写库）。
         self._capital_shadow = capital_shadow if isinstance(capital_shadow, dict) else None
+        # G1 资金强制：配置只在绑定拼盘时构建；开关默认 False（零行为变化），
+        # 运行中由会话列 30s 节流刷新 + API 写入即时同步，关闭即释放全部借据。
+        self._capital_enforce = (
+            capital_enforce if isinstance(capital_enforce, dict) else None)
+        self._capital_enforce_enabled = bool(
+            capital_enforce_enabled and self._capital_enforce)
+        self._capital_enforce_checked_at = 0.0
         # B2 主备通道：主通道心跳失败时逐日写一条建议切换事件（不自动热切换；
         # 运行中切换必须经 stop/start 重建 dispatcher，由人工确认后走待生效队列）。
         self.backup_engine = backup_engine or None
@@ -7377,6 +7389,73 @@ class LiveEngine:
         self._global_halt = bool(halted)
         self._global_switch_checked_at = time.monotonic()
 
+    def _refresh_capital_enforce_switch(self, force: bool = False) -> None:
+        """G1：会话级资金强制开关（30s 节流；读取失败保持旧值，不阻断交易）。"""
+        if self._capital_enforce is None:
+            return
+        now = time.monotonic()
+        if not force and now - self._capital_enforce_checked_at < 30:
+            return
+        self._capital_enforce_checked_at = now
+        db = self._db_session_factory()
+        if db is None:
+            return
+        try:
+            from core.models import LiveSession
+            row = db.query(LiveSession).filter(
+                LiveSession.id == self.session_id).first()
+            self._set_capital_enforce_enabled(
+                bool(getattr(row, "capital_enforce_enabled", False)))
+        except Exception:  # noqa: BLE001 — 开关读取失败保持旧值
+            logger.warning("capital enforce switch refresh failed (session %s)",
+                           self.session_id, exc_info=True)
+        finally:
+            db.close()
+
+    def set_capital_enforce_enabled(self, enabled: bool) -> bool:
+        """G1：API 写入后即时同步；关闭当根 bar 起回到现有资金口径。"""
+        self._capital_enforce_checked_at = time.monotonic()
+        return self._set_capital_enforce_enabled(enabled)
+
+    def _set_capital_enforce_enabled(self, enabled: bool) -> bool:
+        """切换强制态；关闭时全额释放借据（只回收不新增）。
+
+        额度按借据未归还余额实时计算，因此释放后 ``_buy_available_cash`` /
+        ``_capital_share`` 立即恢复改动前口径，无需等待下次启动。
+        """
+        target = bool(enabled and self._capital_enforce)
+        if target == self._capital_enforce_enabled:
+            return target
+        self._capital_enforce_enabled = target
+        if not target:
+            released = release_all(self._capital_enforce, self.ctx.clock())
+            if released:
+                self._emit("risk", {
+                    "gate": "capital_enforce",
+                    "rule": "kill_switch",
+                    "action": "release",
+                    "session_id": self.session_id,
+                    "final_qty": None,
+                    "message": ("资金强制已关闭：释放 %d 笔借据，停止新增借出，"
+                                "立即回到原资金口径" % released),
+                })
+        else:
+            self._emit("risk", {
+                "gate": "capital_enforce",
+                "rule": "enable",
+                "action": "activate",
+                "session_id": self.session_id,
+                "final_qty": None,
+                "message": "资金强制已开启：按借据未归还余额计入组合可用资金",
+            })
+        return target
+
+    def _capital_enforce_net(self, portfolio_id: int) -> Decimal:
+        """该组合借据净额；强制关闭或未绑定拼盘时恒为 0（逐字原行为）。"""
+        if not self._capital_enforce_enabled or self._capital_enforce is None:
+            return Decimal("0")
+        return portfolio_delta(self._capital_enforce, portfolio_id)
+
     def emergency_liquidate_all(self, reason: Optional[str] = None) -> dict:
         """M2 一键全平：逐组合逐持仓生成 SELL CLOSE，走既有提交闸门链。
 
@@ -8269,6 +8348,8 @@ class LiveEngine:
         self._note_minute_bar_date(bar)
         # M2（2026-11-18）：全局应急开关 30s 节流刷新；关闭时订单列表零变化。
         self._refresh_global_switch()
+        # G1（2026-11-20）：会话级资金强制开关 30s 节流刷新；关闭时零行为变化。
+        self._refresh_capital_enforce_switch()
         # 公司行为（J1/J2，默认关）：specs 为空时立即返回。必须在镜面刷新与信号
         # 评估之前——停牌闸（suspended_codes）与分红入账要先于本根 bar 生效。
         self._maybe_apply_corporate_actions(bar.bar_time)
@@ -9730,22 +9811,32 @@ class LiveEngine:
         total = Decimal("0")
         for p in self.portfolios:
             try:
-                cap = getattr(p, "initial_capital", None)
-                if cap is None:
-                    cap = p.account.initial_capital
-                total += Decimal(str(cap))
+                total += self._effective_capital(p)
             except Exception:  # noqa: BLE001
                 continue
         if total <= 0:
             return Decimal("1")
         try:
-            cap = getattr(portfolio, "initial_capital", None)
-            if cap is None:
-                cap = portfolio.account.initial_capital
-            share = Decimal(str(cap)) / total
+            cap = self._effective_capital(portfolio)
+            share = cap / total
         except Exception:  # noqa: BLE001
             return Decimal("1")
         return share if share > 0 else Decimal("0")
+
+    def _effective_capital(self, portfolio: Portfolio) -> Decimal:
+        """配置资金 + G1 借据净额（借入为 +、贷出为 −，下限 0）。
+
+        强制关闭时净额恒为 0，与改动前口径一致。
+        """
+        try:
+            base = portfolio.capital_base()
+        except AttributeError:
+            cap = getattr(portfolio, "initial_capital", None)
+            if cap is None:
+                cap = portfolio.account.initial_capital
+            base = Decimal(str(cap))
+        cap = base + self._capital_enforce_net(portfolio.portfolio_id)
+        return cap if cap > 0 else Decimal("0")
 
     def _note_cash_share_scale(self, portfolio: Portfolio, real_cap: Decimal,
                                share: Decimal, shared_cap: Decimal) -> None:
@@ -9790,9 +9881,14 @@ class LiveEngine:
           * 两者都没有 → 只受账本现金约束（旧行为）。
         真实侧额度再按**该组合配置资金占全会话配置资金的比重**切分：真实账户
         缩水时各组合等比缩量（不按先到先得吃满），并记 `cash_share_scale` 事件。
+
+        G1（默认关）：绑定拼盘且会话开关打开时，再叠加借据净额（借入 + /
+        贷出 −）；借据按未归还余额实时计算，kill switch 释放后立即归零。
         """
-        avail = portfolio.account.cash - self._reserved_buy_cash(
-            portfolio.portfolio_id)
+        avail = (portfolio.account.cash
+                 - self._reserved_buy_cash(portfolio.portfolio_id)
+                 # G1：拼盘借据净额（借入 + / 贷出 −）；强制关闭时为 0
+                 + self._capital_enforce_net(portfolio.portfolio_id))
         if avail < 0:
             avail = Decimal("0")
         real_cap: Optional[Decimal] = None

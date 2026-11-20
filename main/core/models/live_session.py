@@ -99,6 +99,11 @@ class LiveSession(Base):
         String(16), nullable=False, server_default="off", default="off")
     capital_pool_rebalance_enabled = Column(
         Boolean, nullable=False, server_default="0", default=False)
+    # ---- G1 资金强制（0021，2026-11-20）----
+    # 会话级 kill switch：默认关（零行为变化）。开启后绑定拼盘的借据净额计入
+    # 组合可用现金与真实侧占比；关闭当根 bar 即释放全部借据、只回收不新增。
+    capital_enforce_enabled = Column(
+        Boolean, nullable=False, server_default="0", default=False)
     # ---- G2 盘前集合竞价参数会话级覆盖（2026-11-18）----
     # 三列均可空：NULL = 跟随 config.tq_trade.pre_open_auction_* 全局值；
     # 非空 = 本会话显式覆盖（仅作用于本会话，不改全局配置）。

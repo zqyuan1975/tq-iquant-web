@@ -84,6 +84,7 @@ from core.engine.live.fallback_quote import FallbackQuoteDispatcher
 from core.engine.live.timing import now_shanghai
 from core.services import portfolio_settings
 from core.services import capital_inheritance
+from core.engine import capital_enforce
 from core.services.pairing_service import binding_snapshot, build_loan_model_plan
 from core.services.live_data_health import (
     health_summary_text,
@@ -1784,6 +1785,9 @@ def build_engine(
     # F3 影子（默认关）：仅在会话绑定拼盘/运行组时构建；失败只关闭影子，
     # 不影响引擎启动与交易。影子不触下单入口，只逐 bar 追加只读记录。
     _capital_shadow = None
+    # G1 资金强制（默认关）：同一绑定计划构建借据配置；由会话开关决定是否生效，
+    # 构建失败只退回原资金口径（不半强制）。
+    _capital_enforce = None
     if (getattr(session_row, "pairing_plan_id", None)
             or getattr(session_row, "backtest_run_group_id", None)):
         try:
@@ -1836,10 +1840,23 @@ def build_engine(
                     "warning_codes": sorted(
                         {w["code"] for w in _report["warnings"]}),
                 }
+                # G1：同一借款计划落成借据额度（组合级）；开关关闭时零行为变化
+                _strategy_portfolio = {}
+                for _p in portfolios:
+                    for _ctx in (getattr(_p, "strategies", None) or []):
+                        _sid = getattr(_ctx, "strategy_id", None)
+                        if _sid is not None:
+                            _strategy_portfolio[int(_sid)] = _p.portfolio_id
+                _capital_enforce = capital_enforce.build_enforce_config(
+                    loan_plan=_loan_plan,
+                    haircut=_report["haircut"],
+                    strategy_portfolio=_strategy_portfolio,
+                )
         except Exception:  # noqa: BLE001
             logger.exception(
                 "capital shadow setup failed (session %s); 影子关闭", session_id)
             _capital_shadow = None
+            _capital_enforce = None
     eng = LiveEngine(
         session_id=session_id,
         portfolios=portfolios,
@@ -1922,6 +1939,10 @@ def build_engine(
             getattr(session_row, "capital_pool_rebalance_enabled", False)),
         # F3 影子：绑定拼盘/运行组时逐 bar 追加只读记录；None=默认关闭
         capital_shadow=_capital_shadow,
+        # G1 资金强制：绑定拼盘时的借据额度配置 + 会话级开关（默认关）
+        capital_enforce=_capital_enforce,
+        capital_enforce_enabled=bool(
+            getattr(session_row, "capital_enforce_enabled", False)),
         # B2 主备通道：主通道心跳失败时按需写建议切换事件（不自动热切换）
         backup_engine=getattr(session_row, "backup_engine", None),
         failover_enabled=bool(getattr(session_row, "failover_enabled", False)),
@@ -2010,6 +2031,9 @@ def list_sessions(db: Session, engines: Optional[Dict[int, LiveEngine]] = None) 
             "capital_pool_mode": getattr(s, "capital_pool_mode", None) or "off",
             "capital_pool_rebalance_enabled": bool(
                 getattr(s, "capital_pool_rebalance_enabled", False)),
+            # G1 资金强制会话级 kill switch（默认关；关闭即释放借据）
+            "capital_enforce_enabled": bool(
+                getattr(s, "capital_enforce_enabled", False)),
             # B2 主备通道
             "backup_engine": getattr(s, "backup_engine", None),
             "failover_enabled": bool(getattr(s, "failover_enabled", False)),
@@ -2575,6 +2599,8 @@ def create_session(db: Session, data: dict, mode: str) -> dict:
         # A1 资金池：off 默认（分账不分池）；其余模式首 bar 按权重分配
         capital_pool_mode=pool_mode,
         capital_pool_rebalance_enabled=pool_rebalance,
+        # G1 资金强制（默认关；开启需已绑定拼盘，否则引擎侧无借据配置）
+        capital_enforce_enabled=bool(data.get("capital_enforce_enabled")),
         live_capital=baseline_value,
         baseline_mode=baseline_mode,
         baseline_value=baseline_value,
@@ -2621,6 +2647,8 @@ def create_session(db: Session, data: dict, mode: str) -> dict:
             "pairing_plan_id": binding["pairing_plan_id"],
             "capital_pool_mode": pool_mode,
             "capital_pool_rebalance_enabled": pool_rebalance,
+            "capital_enforce_enabled": bool(
+                session.capital_enforce_enabled),
             "gate_recheck_on_execute": bool(
                 session.gate_recheck_on_execute),
             # G2：盘前参数（原始三态 + 生效值）
@@ -2675,6 +2703,9 @@ def get_session(db: Session, session_id: int, engine: Optional[LiveEngine] = Non
         "capital_pool_mode": getattr(session, "capital_pool_mode", None) or "off",
         "capital_pool_rebalance_enabled": bool(
             getattr(session, "capital_pool_rebalance_enabled", False)),
+        # G1 资金强制会话级 kill switch（默认关；关闭即释放借据）
+        "capital_enforce_enabled": bool(
+            getattr(session, "capital_enforce_enabled", False)),
         # B2 主备通道（默认 NULL / 0）
         "backup_engine": getattr(session, "backup_engine", None),
         "failover_enabled": bool(getattr(session, "failover_enabled", False)),
@@ -2794,6 +2825,7 @@ SESSION_EDIT_FIELDS = (
     "advance_close_enabled", "advance_close_time",
     "intraday_mismatched_risk_enabled", "capital_pool_mode",
     "capital_pool_rebalance_enabled", "portfolio_ids",
+    "capital_enforce_enabled",
     "gate_recheck_on_execute",
     # 理论 vs 实盘面板的回测基准绑定（纯观测字段，不影响交易语义）
     "backtest_record_id", "backtest_run_group_id", "pairing_plan_id",
@@ -2802,8 +2834,10 @@ SESSION_EDIT_FIELDS = (
     "pre_open_auction_price_bias_pct",
 )
 #: 运行中立即生效的字段（纯展示/观测，不影响已加载的交易配置）。
+#: G1 例外：capital_enforce_enabled 是安全开关，运行中必须即时生效（关闭即释放
+#: 借据并回到原资金口径），因此列入立即生效。
 SESSION_IMMEDIATE_FIELDS = frozenset({
-    "name", *SESSION_BINDING_FIELDS})
+    "name", *SESSION_BINDING_FIELDS, "capital_enforce_enabled"})
 #: 运行中只能「下次启动生效」的字段。
 SESSION_NEXT_START_FIELDS = frozenset(SESSION_EDIT_FIELDS) - SESSION_IMMEDIATE_FIELDS
 
@@ -2908,6 +2942,10 @@ def _normalize_session_patch(db: Session, data: dict,
     if "capital_pool_rebalance_enabled" in data:
         patch["capital_pool_rebalance_enabled"] = bool(
             data.get("capital_pool_rebalance_enabled"))
+    if "capital_enforce_enabled" in data:
+        # G1 kill switch：运行中也立即生效（关闭即释放借据、回到原口径）
+        patch["capital_enforce_enabled"] = bool(
+            data.get("capital_enforce_enabled"))
     if "gate_recheck_on_execute" in data:
         patch["gate_recheck_on_execute"] = bool(
             data.get("gate_recheck_on_execute"))
@@ -3005,6 +3043,17 @@ def update_session(db: Session, session_id: int, data: dict,
             _apply_session_field(db, session, field, value)
             applied.append(field)
     db.commit()
+    # G1：kill switch 即时同步运行中的引擎（不必等 30s 节流刷新）
+    if "capital_enforce_enabled" in applied:
+        eng = engines.get(session_id)
+        if eng is not None and hasattr(eng, "set_capital_enforce_enabled"):
+            try:
+                eng.set_capital_enforce_enabled(
+                    bool(session.capital_enforce_enabled))
+            except Exception:  # noqa: BLE001 — 内存同步失败由 30s 刷新兜底
+                logger.warning(
+                    "capital enforce sync to engine failed (session %s)",
+                    session_id, exc_info=True)
     result = get_session(db, session_id, engines.get(session_id))
     return True, {
         "session": result,

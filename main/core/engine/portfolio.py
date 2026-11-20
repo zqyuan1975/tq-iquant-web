@@ -916,6 +916,14 @@ class Portfolio:
             message="现金管理增强为预留接口，待实现",
         )
 
+    def capital_base(self) -> Decimal:
+        """组合配置资金口径（起账资金）。
+
+        真实侧占比缩量（live_engine._capital_share）与 G1 资金强制共用同一
+        口径；借据净额（借入/贷出）由引擎在此基数上叠加，不回写本方法。
+        """
+        return self.account.initial_capital
+
     def _strategy_fund(self, ctx: StrategyContext) -> Decimal:
         """策略可分配资金（下单量基准）。
 
