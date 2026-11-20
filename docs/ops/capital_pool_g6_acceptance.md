@@ -68,6 +68,22 @@ main\.venv\Scripts\python.exe -m pytest main/core/tests -q -p no:cacheprovider
 - KPI 对照结论：**未达标**。利用率 18.62% 低于 35%–45% 下限；最大回撤 8.41% 高于 ≤8% 上限（超 0.41pp）。
 - 可比性说明（未自行放宽）：区间一致，但 PS3 配置在 id=4 之后已变更——`max_positions` 10 → 20、`single_open_ratio` 10% → 5%、`dividend_mode` back → front、`fee_reserve_enabled` true → false。故 31 与 4/26 只能按区间对照，不能视为同参数 A/B；利用率下降与回撤上升主要来自上述配置差异，不能单独归因于资金池机制。
 
+### 3.2 #4 真注入重跑（2026-11-20，run_group 1 / 记录 32+33）
+
+- 注入路径：`loan_model_plan` 要求借款方与出资方同属一个组合，生产库 3 个组合均为单策略（策略 1/2/3），无法成立；改用等价的 E2 多组合计划——`POST /api/backtest/run-multi`，`portfolio_strategy_ids=[2,3]`（PS2 创懿题材 + PS3 创懿全量股池，#4 组合在池内），2014-01-01 → 2026-11-19，`dividend_mode=front`，`capital_pool_plan={enabled:true, min_share:0.05, max_share:1.0, min_cash_reserve_pct:0.03}`。请求 12:39:27 发起、12:45:36 返回（约 6 分钟，含两组合数据准备）；记录 32/33 于 12:45:10 创建、12:45:34/35 完成，`backtest_run_groups` id=1 `G6-#4-pool-inject-20261120` completed；新开记录 id=32（PS2）/ id=33（PS3），既有 28 条未动（现共 30 条）。
+- **注入已生效的证据**（不是版本戳）：引擎每日首 bar 按「目标仓位 − 持仓市值」水位分配额度并支持跨组合闲置现金临时拆借；记录 33 产生 499 条额度约束事件（`capital_quota_shrink` 157 / `capital_quota_exhausted` 112 / `capital_quota_below_lot` 230），最高策略额度 53,889,509.66（单组合记录 31 同类事件为 **0** 条，因其 `capital_pool` 块只是 A5 版本戳）。
+- 指标（逐日 `market_value/total_value` 均值；`total_value` 峰值回撤；池化 = 两组合同日「市值和 / 净值和」，缺日按前值携带）：
+
+| 口径 | 平均利用率 | 最大回撤 | 期末净值 |
+|---|---|---|---|
+| **池化（PS2+PS3 共享资金池）** | **16.73%** | **5.65%** | 93,875,396.95 |
+| 池内 PS3（记录 33） | 18.25% | 6.26% | 81,072,576.13 |
+| 池内 PS2（记录 32） | 11.95% | 5.48% | 12,802,820.83 |
+
+- KPI 对照结论：**利用率未达标、回撤达标**。池化 16.73%、池内 PS3 18.25%，均低于 35%–45% 下限；回撤 5.65% / 6.26% 均在 ≤8% 以内。根因是策略本身不把现金打满（期末池内现金占比 96.3%，池内 PS3 利用率中位数仅 13.83%、PS2 9.48%），资金池额度在绝大多数年份不构成约束，注入只带来极小的边际变化（PS3：18.62% → 18.25%，MDD 8.41% → 6.26%）。
+- 与 id=4 / id=26 是否可比：**不可比（仅同区间）**。①PS3 参数已变更（`max_positions` 10→20、`single_open_ratio` 10%→5%、`dividend_mode` back→front、`fee_reserve_enabled` true→false）；②池化口径额外并入 PS2，分母含其 200 万初始资金，利用率天然被摊薄；③id=4/26 为单组合、未开池。若要严格同参数 A/B，需先恢复 id=4 时的 PS3 配置并单独授权改动组合参数，本轮未改。
+- 结论：资金池注入链路（额度分配 + 真注入证据）已验证可用；在现有策略配置下无法达到 35%–45% 利用率目标，属策略仓位/信号约束，不是池机制缺陷。是否调整 PS3 参数（如提高单笔开仓比例、放宽持仓上限）以逼近 KPI，待拍板。
+
 ## 4. 默认路径与 kill switch 回归
 
 - 资金池相关回归组（`capital` / `theory_vs_live` / `shadow_mode`）：**214 passed**，5.06 s。覆盖额度推导、LoanLot、预算闸、门控释放/召回、对账恒等式、健康状态机、强制借贷、影子、现金出口、API 默认关闭语义。
@@ -137,7 +153,7 @@ main\.venv\Scripts\python.exe -m pytest main/core/tests -q -p no:cacheprovider
 
 ## 7. 未覆盖项与需拍板事项
 
-1. **#4 业务 KPI（已执行，未达标）**：§3.3 要求「#4 类组合利用率 24.5% → 35%–45%，最大回撤 ≤ 8%」。2026-11-20 已按用户授权新开记录 31 实测：利用率 18.62%、最大回撤 8.41%，两项均未达标；区间与 #4 一致但策略参数已变更，不能视为同参数 A/B（详见 §3.1）。单组合回测的 `capital_pool` 块只是版本戳、不注入额度，真注入需 `loan_model_plan` 双策略或 E2 多组合计划，见 §3.2。
+1. **#4 业务 KPI（已执行两轮，利用率未达标 / 回撤达标）**：§3.3 要求「#4 类组合利用率 24.5% → 35%–45%，最大回撤 ≤ 8%」。①记录 31（单组合、开资金池参数）：18.62% / 8.41%，两项未达标；②记录 32+33（E2 多组合真注入，池化）：16.73% / 5.65%，池内 PS3 18.25% / 6.26%——利用率未达标、回撤达标；注入链路已验证（499 条额度约束事件，单组合为 0）。与 id=4/26 不可比（参数已变 + 池化并入 PS2）。是否调整 PS3 参数以逼近利用率目标，待拍板。
 2. **F3 影子偏差**：「计划 vs 实际偏差 < 5%、门控一致 100%」仍需实盘影子期数据。会话级开关 `capital_shadow_enabled` 已补（见 §6），计划于 15:05 收盘清扫后重启并开启会话 1，从下一交易日开始采样；无计划侧时只采实际侧并带 `no_pairing_plan` 告警。
 3. **召回次数 ≤ 12 次/年、shortfall ≤ 2%/年**：需要实盘或长周期回测样本，当前无数据源。
 4. **恒等式 (1)(3)(9)**：运行时因「持久化虚拟现金账本 / 当日开盘现金 / 会话级策略预算」数据源缺失记 `skipped`（G2 已记录），模块层有用例覆盖；按手册口径，`skipped` 不等于账平。
@@ -150,8 +166,8 @@ main\.venv\Scripts\python.exe -m pytest main/core/tests -q -p no:cacheprovider
 | `alembic_version` | `g4a5b6c7d8e9`（`h5b6c7d8e9f0` 已写好，待下次重启 upgrade） |
 | `PRAGMA quick_check` | `ok` |
 | `live_sessions` | 01 `running`（`auto` / tdx，11:45:54 启动）、02 / 03 `stopped`；三会话均 `capital_enforce_enabled=0`、`cash_outlet_mode=OFF`、`capital_shadow_enabled=0` |
-| `capital_pairing_plans` / `capital_pairings` / `backtest_run_groups` | 0 / 0 / 0 行（F3 无绑定来源） |
-| `backtest_records` | 28 条（新增 id=31 `G6-#4-capital-pool-20261120`，既有 27 条未动） |
+| `capital_pairing_plans` / `capital_pairings` | 0 / 0 行（F3 绑定入口无来源，改走会话级开关） |
+| `backtest_records` / `backtest_run_groups` | 30 条 / 1 组（新增 id=31 单组合、id=32/33 + run_group 1 池化注入；既有 28 条未动） |
 | `cash_outlet_ops` | 0 行 |
 | `live_capital_shadow` | 0 行 |
 | `capital_pairing_health_daily` | 0 行 |
