@@ -206,3 +206,74 @@ def test_health_record_suspend_and_resume_flow(client, monkeypatch):
     assert body["code"] == 0
     assert body["data"]["plan_status"] == "RETIRED"
     assert body["data"]["retire_reason"]["reason"] == "测试退役"
+
+
+# ---------------------------------------------------------------------------
+# G4 现金出口执行台账（默认关闭；P1 人工确认 → 回流 → 对账）
+# ---------------------------------------------------------------------------
+def _seed_outlet(Session) -> int:
+    from core.tests.unit.test_cash_outlet import _outlet
+    db = Session()
+    outlet = _outlet()
+    outlet.id = None
+    db.add(outlet)
+    db.commit()
+    oid = outlet.id
+    db.close()
+    return oid
+
+
+def _enable_outlet(monkeypatch):
+    monkeypatch.setattr(
+        "core.api.capital.load_config",
+        lambda: {"capital_pool": {"cash_outlet_enabled": True}},
+    )
+
+
+def test_outlet_ops_disabled_by_default(client, monkeypatch):
+    c, Session = client
+    _seed_outlet(Session)
+    monkeypatch.setattr("core.api.capital.load_config", lambda: {})
+    body = c.get("/api/capital/outlet-ops").json()
+    assert body["code"] == 0
+    assert body["data"]["enabled"] is False
+
+
+def test_outlet_ops_p1_confirm_return_flow(client, monkeypatch):
+    c, Session = client
+    oid = _seed_outlet(Session)
+    _enable_outlet(monkeypatch)
+
+    body = c.post("/api/capital/outlet-ops", json={
+        "outlet_id": oid, "amount": "10000", "mode": "P1",
+        "idempotency_key": "api-op-1",
+    }).json()
+    assert body["code"] == 0
+    op = body["data"]
+    assert op["status"] == "PENDING_CONFIRM"
+
+    body = c.post(f"/api/capital/outlet-ops/{op['id']}/confirm",
+                  json={"approved_by": "tester"}).json()
+    assert body["data"]["status"] == "EXECUTED"
+
+    body = c.post(f"/api/capital/outlet-ops/{op['id']}/return",
+                  json={"principal_returned": "10000",
+                        "yield_amount": "12.3"}).json()
+    assert body["data"]["status"] == "RETURNED"
+    assert body["data"]["yield_amount"] == "12.30"
+
+    listed = c.get("/api/capital/outlet-ops").json()["data"]
+    assert listed["summary"]["yield_contribution"] == "12.30"
+    assert listed["summary"]["returned_count"] == 1
+    rec = c.get("/api/capital/outlet-ops/reconcile").json()["data"]
+    assert rec["ok"] is True
+
+    # P3 未绑定会话 → 422；随后用 P1 重复幂等键 → 返回同一笔
+    body = c.post("/api/capital/outlet-ops", json={
+        "outlet_id": oid, "amount": "10000", "mode": "P3"}).json()
+    assert body["code"] == 422
+    body = c.post("/api/capital/outlet-ops", json={
+        "outlet_id": oid, "amount": "10000", "mode": "P1",
+        "idempotency_key": "api-op-1"}).json()
+    assert body["data"]["id"] == op["id"]
+    assert body["data"]["deduplicated"] is True

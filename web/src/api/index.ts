@@ -3743,6 +3743,88 @@ export async function evaluateCashOutlet(
   return res.data.data
 }
 
+// 0021 G4：现金出口执行台账（只记账，不划转、不改策略归因）
+export interface CashOutletOp {
+  id: number
+  outlet_id: number
+  live_session_id: number | null
+  mode: string
+  amount: string
+  status: string
+  idempotency_key: string | null
+  executed_at: string | null
+  expected_return_date: string | null
+  returned_at: string | null
+  principal_returned: string | null
+  yield_amount: string
+  shortfall_amount: string
+  shortfall_reason: string | null
+  approved_by: string | null
+  notes: string | null
+  created_at: string | null
+}
+
+export interface CashOutletOpsSummary {
+  outstanding_principal: string
+  returned_principal: string
+  yield_contribution: string
+  shortfall_total: string
+  pending_count: number
+  executed_count: number
+  returned_count: number
+}
+
+export interface CashOutletOpsList {
+  enabled?: boolean
+  items: CashOutletOp[]
+  summary: CashOutletOpsSummary
+}
+
+export async function listCashOutletOps(params?: {
+  outlet_id?: number; live_session_id?: number; status?: string; limit?: number
+}) {
+  const res = await api.get<ApiResponse<CashOutletOpsList | { enabled: boolean }>>(
+    '/capital/outlet-ops', { params })
+  return res.data.data
+}
+
+export async function createCashOutletOp(payload: {
+  outlet_id: number; amount: string; mode?: string
+  live_session_id?: number; need_date?: string
+  idempotency_key?: string; notes?: string
+}) {
+  const res = await api.post<ApiResponse<CashOutletOp & { auto?: boolean; auto_blocked_reasons?: string[] }>>(
+    '/capital/outlet-ops', payload)
+  return res.data.data
+}
+
+export async function confirmCashOutletOp(opId: number, approvedBy: string) {
+  const res = await api.post<ApiResponse<CashOutletOp>>(
+    `/capital/outlet-ops/${opId}/confirm`, { approved_by: approvedBy })
+  return res.data.data
+}
+
+export async function rejectCashOutletOp(opId: number, reason: string) {
+  const res = await api.post<ApiResponse<CashOutletOp>>(
+    `/capital/outlet-ops/${opId}/reject`, { reason })
+  return res.data.data
+}
+
+export async function returnCashOutletOp(
+  opId: number,
+  payload: { principal_returned: string; yield_amount?: string; shortfall_reason?: string },
+) {
+  const res = await api.post<ApiResponse<CashOutletOp>>(
+    `/capital/outlet-ops/${opId}/return`, payload)
+  return res.data.data
+}
+
+export async function reconcileCashOutletOps() {
+  const res = await api.get<ApiResponse<Record<string, unknown>>>(
+    '/capital/outlet-ops/reconcile')
+  return res.data.data
+}
+
 // 0021 C2：历史利用率分位（只读，可复算）
 export interface CapitalUtilizationSeriesPoint {
   date: string | null

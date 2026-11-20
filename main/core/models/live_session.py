@@ -104,6 +104,11 @@ class LiveSession(Base):
     # 组合可用现金与真实侧占比；关闭当根 bar 即释放全部借据、只回收不新增。
     capital_enforce_enabled = Column(
         Boolean, nullable=False, server_default="0", default=False)
+    # ---- G4 现金出口分级执行（0021，2026-11-20）----
+    # OFF/P1/P2/P3；默认 OFF（只记账不投放）。P1 逐笔人工确认，P2 服务计划
+    # + 人工确认，P3 仅对已验证、T+0/≤7 天的出口自动放行（仍只写台账）。
+    cash_outlet_mode = Column(
+        String(5), nullable=False, server_default="OFF", default="OFF")
     # ---- G2 盘前集合竞价参数会话级覆盖（2026-11-18）----
     # 三列均可空：NULL = 跟随 config.tq_trade.pre_open_auction_* 全局值；
     # 非空 = 本会话显式覆盖（仅作用于本会话，不改全局配置）。

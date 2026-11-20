@@ -53,7 +53,7 @@ from .capital_pairing import (
     CapitalPairingPlan, CapitalPairing, CapitalPairingEval,
     CapitalPairingHealthDaily,
 )
-from .cash_outlet import CashOutlet
+from .cash_outlet import CashOutlet, CashOutletOp
 
 __all__ = [
     "Base",
@@ -110,4 +110,5 @@ __all__ = [
     "CapitalPairingEval",
     "CapitalPairingHealthDaily",
     "CashOutlet",
+    "CashOutletOp",
 ]

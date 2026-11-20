@@ -3,8 +3,13 @@ import { ref, onMounted } from 'vue'
 import PageHeader from '../components/PageHeader.vue'
 import {
   listCashOutlets, evaluateCashOutlet,
+  listCashOutletOps, createCashOutletOp, confirmCashOutletOp,
+  rejectCashOutletOp, returnCashOutletOp, reconcileCashOutletOps,
 } from '../api'
-import type { CashOutletItem, CashOutletEvaluation } from '../api'
+import type {
+  CashOutletItem, CashOutletEvaluation,
+  CashOutletOp, CashOutletOpsSummary,
+} from '../api'
 
 const items = ref<CashOutletItem[]>([])
 const loading = ref(true)
@@ -23,6 +28,20 @@ const CATEGORY_LABEL: Record<string, string> = {
 const LIQUIDITY_LABEL: Record<string, string> = {
   t0: 'T+0', t1: 'T+1', term: '到期',
 }
+const OP_STATUS_LABEL: Record<string, string> = {
+  PENDING_CONFIRM: '待确认', EXECUTED: '已投放',
+  RETURNED: '已回流', REJECTED: '已驳回', CANCELLED: '已取消',
+}
+
+// G4 执行台账（只记账，不划转；出口收益不进入策略归因）
+const ops = ref<CashOutletOp[]>([])
+const opsSummary = ref<CashOutletOpsSummary | null>(null)
+const opsError = ref('')
+const opsBusy = ref(false)
+const opOutletId = ref<number | null>(null)
+const opAmount = ref('')
+const opMode = ref('P1')
+const opSessionId = ref('')
 
 function errMsg(e: unknown): string {
   const anyErr = e as any
@@ -36,10 +55,105 @@ async function load() {
     const data = await listCashOutlets()
     disabled.value = data.enabled === false
     items.value = data.items ?? []
+    if (opOutletId.value === null && items.value.length) {
+      opOutletId.value = items.value[0].id
+    }
+    if (!disabled.value) await loadOps()
   } catch (e) {
     errorMessage.value = errMsg(e)
   } finally {
     loading.value = false
+  }
+}
+
+async function loadOps() {
+  opsError.value = ''
+  try {
+    const data = await listCashOutletOps({ limit: 100 })
+    if ((data as any).enabled === false) return
+    const list = data as { items: CashOutletOp[]; summary: CashOutletOpsSummary }
+    ops.value = list.items ?? []
+    opsSummary.value = list.summary ?? null
+  } catch (e) {
+    opsError.value = errMsg(e)
+  }
+}
+
+async function submitOp() {
+  if (!opOutletId.value) return
+  opsBusy.value = true
+  opsError.value = ''
+  try {
+    const created = await createCashOutletOp({
+      outlet_id: opOutletId.value,
+      amount: opAmount.value,
+      mode: opMode.value,
+      live_session_id: opSessionId.value ? Number(opSessionId.value) : undefined,
+    })
+    if (created.auto_blocked_reasons?.length) {
+      opsError.value = `P3 条件不满足，已转人工确认：${created.auto_blocked_reasons.join('、')}`
+    }
+    opAmount.value = ''
+    await loadOps()
+  } catch (e) {
+    opsError.value = errMsg(e)
+  } finally {
+    opsBusy.value = false
+  }
+}
+
+async function confirmOp(row: CashOutletOp) {
+  const who = prompt('确认操作人（必填）：')
+  if (!who || !who.trim()) return
+  try {
+    await confirmCashOutletOp(row.id, who.trim())
+    await loadOps()
+  } catch (e) {
+    opsError.value = errMsg(e)
+  }
+}
+
+async function rejectOp(row: CashOutletOp) {
+  const reason = prompt('驳回理由（必填）：')
+  if (!reason || !reason.trim()) return
+  try {
+    await rejectCashOutletOp(row.id, reason.trim())
+    await loadOps()
+  } catch (e) {
+    opsError.value = errMsg(e)
+  }
+}
+
+async function returnOp(row: CashOutletOp) {
+  const principal = prompt(`登记回流本金（计划 ${row.amount}）：`, row.amount)
+  if (principal === null || !principal.trim()) return
+  const gain = prompt('出口收益（元，可留空）：', '0') || '0'
+  const shortfall = Number(row.amount) - Number(principal)
+  let reason: string | undefined
+  if (shortfall > 0) {
+    const text = prompt(`存在短款 ${shortfall.toFixed(2)}，请填写原因（必填）：`)
+    if (!text || !text.trim()) return
+    reason = text.trim()
+  }
+  try {
+    await returnCashOutletOp(row.id, {
+      principal_returned: principal.trim(),
+      yield_amount: gain.trim() || '0',
+      shortfall_reason: reason,
+    })
+    await loadOps()
+  } catch (e) {
+    opsError.value = errMsg(e)
+  }
+}
+
+async function checkOps() {
+  try {
+    const result = await reconcileCashOutletOps()
+    opsError.value = result.ok ? '台账对账通过：无逾期、无未说明短款'
+      : `对账异常：${JSON.stringify(result.overdue || [])} ${JSON.stringify(result.anomalies || [])}`
+  } catch (e) {
+    opsError.value = errMsg(e)
   }
 }
 
@@ -159,6 +273,90 @@ onMounted(load)
         <div class="muted">
           收益率可回测：{{ evaluation.yield_backtestable ? '是' : '否' }}；
           判定时间 {{ evaluation.decided_at }}
+        </div>
+      </div>
+
+      <!-- 0021 G4：执行台账（只记账，不划转；出口收益单列） -->
+      <div class="card panel">
+        <div class="eval-bar">
+          <label>出口
+            <select v-model="opOutletId">
+              <option v-for="row in items" :key="row.id" :value="row.id">
+                {{ row.code }} {{ row.name }}
+              </option>
+            </select>
+          </label>
+          <label>金额（元）<input v-model="opAmount" placeholder="如 10000" /></label>
+          <label>模式
+            <select v-model="opMode">
+              <option value="P1">P1 人工</option>
+              <option value="P2">P2 半自动</option>
+              <option value="P3">P3 自动</option>
+            </select>
+          </label>
+          <label>会话 ID（P3 必填）<input v-model="opSessionId" placeholder="可留空" /></label>
+          <button class="btn btn-primary" :disabled="opsBusy || !opAmount" @click="submitOp">
+            登记计划
+          </button>
+          <button class="btn" @click="checkOps">台账对账</button>
+        </div>
+        <div class="muted">
+          P1/P2 登记后需人工确认；P3 仅对已验证、T+0/≤7 天出口自动放行。
+          台账不划转、不下单，出口收益单独统计，不进入策略归因。
+        </div>
+      </div>
+
+      <div v-if="opsError" class="card panel error">{{ opsError }}</div>
+
+      <div v-if="opsSummary" class="card panel">
+        <div class="eval-head">
+          <span>在途本金 <b class="num">{{ opsSummary.outstanding_principal }}</b></span>
+          <span>已回流 <b class="num">{{ opsSummary.returned_principal }}</b></span>
+          <span>出口收益（单列）<b class="num">{{ opsSummary.yield_contribution }}</b></span>
+          <span :class="{ error: opsSummary.shortfall_total !== '0' && opsSummary.shortfall_total !== '0.00' }">
+            短款合计 <b class="num">{{ opsSummary.shortfall_total }}</b>
+          </span>
+          <span class="muted">待确认 {{ opsSummary.pending_count }} / 已投放 {{ opsSummary.executed_count }}</span>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>ID</th><th>出口</th><th>模式</th><th>金额</th><th>状态</th>
+                <th>预计回流</th><th>已回本金</th><th>收益</th><th>短款</th><th>操作</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr v-if="!ops.length"><td colspan="10" class="muted">暂无出口台账</td></tr>
+              <tr v-for="op in ops" :key="op.id">
+                <td class="num">{{ op.id }}</td>
+                <td class="num">{{ op.outlet_id }}</td>
+                <td>{{ op.mode }}</td>
+                <td class="num">{{ op.amount }}</td>
+                <td>{{ OP_STATUS_LABEL[op.status] || op.status }}</td>
+                <td>{{ op.expected_return_date || '—' }}</td>
+                <td class="num">{{ op.principal_returned || '—' }}</td>
+                <td class="num">{{ op.yield_amount }}</td>
+                <td class="num">
+                  {{ op.shortfall_amount }}
+                  <span v-if="op.shortfall_reason" class="muted">（{{ op.shortfall_reason }}）</span>
+                </td>
+                <td>
+                  <template v-if="op.status === 'PENDING_CONFIRM'">
+                    <button class="btn" @click="confirmOp(op)">确认</button>
+                    <button class="btn" @click="rejectOp(op)">驳回</button>
+                  </template>
+                  <button v-else-if="op.status === 'EXECUTED'" class="btn" @click="returnOp(op)">
+                    登记回流
+                  </button>
+                  <span v-else class="muted">—</span>
+                </td>
+              </tr>
+            </tbody>
+          </table>
         </div>
       </div>
     </template>

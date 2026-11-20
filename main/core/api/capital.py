@@ -40,6 +40,7 @@ from core.models import (
     BacktestRecord,
     CashOutlet,
     LivePortfolioDaily,
+    LiveSession,
     PortfolioStrategy,
     Strategy,
 )
@@ -359,3 +360,147 @@ def verify_outlet(outlet_id: int, payload: CashOutletVerifyRequest,
         verified_at=payload.verified_at, valid_days=payload.valid_days)
     return ok({"enabled": True,
                "item": cash_outlet_service.serialize_outlet(outlet)})
+
+
+# ---------------------------------------------------------------------------
+# G4 现金出口执行台账（P1 人工 / P2 半自动 / P3 自动）
+# ---------------------------------------------------------------------------
+class CashOutletOpRequest(BaseModel):
+    outlet_id: int
+    amount: str
+    mode: str = "P1"
+    live_session_id: Optional[int] = None
+    need_date: Optional[date] = None
+    idempotency_key: Optional[str] = None
+    notes: Optional[str] = None
+
+
+class CashOutletOpConfirmRequest(BaseModel):
+    approved_by: str
+
+
+class CashOutletOpRejectRequest(BaseModel):
+    reason: str
+
+
+class CashOutletOpReturnRequest(BaseModel):
+    principal_returned: str
+    yield_amount: str = "0"
+    shortfall_reason: Optional[str] = None
+    returned_at: Optional[datetime] = None
+
+
+def _outlet_ops_guard(session_id: Optional[int], mode: str) -> Optional[str]:
+    """校验会话分级开关；返回错误信息或 None。"""
+    if session_id is None:
+        return None if mode.upper() in ("P1", "P2") else \
+            "P3 自动模式必须绑定实盘会话（会话级 cash_outlet_mode=P3）"
+    return None
+
+
+@router.get("/outlet-ops")
+def list_cash_outlet_ops(
+    outlet_id: Optional[int] = Query(None, ge=1),
+    live_session_id: Optional[int] = Query(None, ge=1),
+    status: Optional[str] = Query(None),
+    limit: int = Query(100, ge=1, le=500),
+    db: Session = Depends(get_db),
+):
+    if not _outlet_switches().cash_outlet_enabled:
+        return _outlet_disabled()
+    return ok(cash_outlet_service.list_ops(
+        db, outlet_id=outlet_id, live_session_id=live_session_id,
+        status=status, limit=limit))
+
+
+@router.get("/outlet-ops/reconcile")
+def reconcile_cash_outlet_ops(db: Session = Depends(get_db)):
+    if not _outlet_switches().cash_outlet_enabled:
+        return _outlet_disabled()
+    return ok(cash_outlet_service.reconcile_ops(db))
+
+
+@router.post("/outlet-ops")
+def create_cash_outlet_op(payload: CashOutletOpRequest,
+                          db: Session = Depends(get_db)):
+    """登记出口计划：P1/P2 待人工确认，P3 满足硬条件才自动放行。
+
+    只写台账，不划转、不下单、不改变组合现金与策略归因。
+    """
+    if not _outlet_switches().cash_outlet_enabled:
+        return _outlet_disabled()
+    try:
+        mode = cash_outlet_service.normalize_mode(payload.mode)
+    except cash_outlet_service.OutletOpsError as exc:
+        return err(422, str(exc))
+    guard = _outlet_ops_guard(payload.live_session_id, mode)
+    if guard:
+        return err(422, guard)
+    if payload.live_session_id is not None:
+        session = db.get(LiveSession, payload.live_session_id)
+        if session is None:
+            return err(404, f"实盘会话不存在：{payload.live_session_id}")
+        if not cash_outlet_service.mode_allows(
+                getattr(session, "cash_outlet_mode", "OFF"), mode):
+            return err(
+                422,
+                "会话分级开关不允许 %s（当前 %s）"
+                % (mode, getattr(session, "cash_outlet_mode", "OFF")))
+    try:
+        outlet = _get_outlet(db, payload.outlet_id)
+        return ok(cash_outlet_service.plan_outlet_op(
+            db, outlet, amount=payload.amount, mode=mode,
+            live_session_id=payload.live_session_id,
+            need_date=payload.need_date,
+            idempotency_key=payload.idempotency_key,
+            notes=payload.notes))
+    except LookupError as exc:
+        return err(404, str(exc))
+    except cash_outlet_service.OutletOpsError as exc:
+        return err(422, str(exc))
+
+
+@router.post("/outlet-ops/{op_id}/confirm")
+def confirm_cash_outlet_op(op_id: int, payload: CashOutletOpConfirmRequest,
+                           db: Session = Depends(get_db)):
+    if not _outlet_switches().cash_outlet_enabled:
+        return _outlet_disabled()
+    try:
+        return ok(cash_outlet_service.confirm_op(
+            db, op_id, approved_by=payload.approved_by))
+    except LookupError as exc:
+        return err(404, str(exc))
+    except cash_outlet_service.OutletOpsError as exc:
+        return err(409, str(exc))
+
+
+@router.post("/outlet-ops/{op_id}/reject")
+def reject_cash_outlet_op(op_id: int, payload: CashOutletOpRejectRequest,
+                          db: Session = Depends(get_db)):
+    if not _outlet_switches().cash_outlet_enabled:
+        return _outlet_disabled()
+    try:
+        return ok(cash_outlet_service.reject_op(
+            db, op_id, reason=payload.reason))
+    except LookupError as exc:
+        return err(404, str(exc))
+    except cash_outlet_service.OutletOpsError as exc:
+        return err(409, str(exc))
+
+
+@router.post("/outlet-ops/{op_id}/return")
+def return_cash_outlet_op(op_id: int, payload: CashOutletOpReturnRequest,
+                          db: Session = Depends(get_db)):
+    """登记回流；出口收益只写台账（yield_contribution），不进策略归因。"""
+    if not _outlet_switches().cash_outlet_enabled:
+        return _outlet_disabled()
+    try:
+        return ok(cash_outlet_service.record_return(
+            db, op_id, principal_returned=payload.principal_returned,
+            yield_amount=payload.yield_amount,
+            shortfall_reason=payload.shortfall_reason,
+            returned_at=payload.returned_at))
+    except LookupError as exc:
+        return err(404, str(exc))
+    except cash_outlet_service.OutletOpsError as exc:
+        return err(409, str(exc))

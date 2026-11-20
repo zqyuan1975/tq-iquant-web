@@ -1943,6 +1943,9 @@ def build_engine(
         capital_enforce=_capital_enforce,
         capital_enforce_enabled=bool(
             getattr(session_row, "capital_enforce_enabled", False)),
+        # G4 现金出口分级模式（默认 OFF；只影响台账放行级别，不改委托路径）
+        cash_outlet_mode=(
+            getattr(session_row, "cash_outlet_mode", None) or "OFF"),
         # B2 主备通道：主通道心跳失败时按需写建议切换事件（不自动热切换）
         backup_engine=getattr(session_row, "backup_engine", None),
         failover_enabled=bool(getattr(session_row, "failover_enabled", False)),
@@ -2034,6 +2037,8 @@ def list_sessions(db: Session, engines: Optional[Dict[int, LiveEngine]] = None) 
             # G1 资金强制会话级 kill switch（默认关；关闭即释放借据）
             "capital_enforce_enabled": bool(
                 getattr(s, "capital_enforce_enabled", False)),
+            # G4 现金出口分级模式（OFF/P1/P2/P3）
+            "cash_outlet_mode": getattr(s, "cash_outlet_mode", None) or "OFF",
             # B2 主备通道
             "backup_engine": getattr(s, "backup_engine", None),
             "failover_enabled": bool(getattr(s, "failover_enabled", False)),
@@ -2601,6 +2606,11 @@ def create_session(db: Session, data: dict, mode: str) -> dict:
         capital_pool_rebalance_enabled=pool_rebalance,
         # G1 资金强制（默认关；开启需已绑定拼盘，否则引擎侧无借据配置）
         capital_enforce_enabled=bool(data.get("capital_enforce_enabled")),
+        # G4 现金出口分级模式（默认 OFF；仅台账放行级别）
+        cash_outlet_mode=(
+            str(data.get("cash_outlet_mode") or "OFF").upper()
+            if str(data.get("cash_outlet_mode") or "OFF").upper()
+            in ("OFF", "P1", "P2", "P3") else "OFF"),
         live_capital=baseline_value,
         baseline_mode=baseline_mode,
         baseline_value=baseline_value,
@@ -2649,6 +2659,9 @@ def create_session(db: Session, data: dict, mode: str) -> dict:
             "capital_pool_rebalance_enabled": pool_rebalance,
             "capital_enforce_enabled": bool(
                 session.capital_enforce_enabled),
+            # G4 现金出口分级模式（OFF/P1/P2/P3；只影响台账放行级别）
+            "cash_outlet_mode": getattr(
+                session, "cash_outlet_mode", None) or "OFF",
             "gate_recheck_on_execute": bool(
                 session.gate_recheck_on_execute),
             # G2：盘前参数（原始三态 + 生效值）
@@ -2706,6 +2719,8 @@ def get_session(db: Session, session_id: int, engine: Optional[LiveEngine] = Non
         # G1 资金强制会话级 kill switch（默认关；关闭即释放借据）
         "capital_enforce_enabled": bool(
             getattr(session, "capital_enforce_enabled", False)),
+        # G4 现金出口分级模式（OFF/P1/P2/P3）
+        "cash_outlet_mode": getattr(session, "cash_outlet_mode", None) or "OFF",
         # B2 主备通道（默认 NULL / 0）
         "backup_engine": getattr(session, "backup_engine", None),
         "failover_enabled": bool(getattr(session, "failover_enabled", False)),
@@ -2826,6 +2841,8 @@ SESSION_EDIT_FIELDS = (
     "intraday_mismatched_risk_enabled", "capital_pool_mode",
     "capital_pool_rebalance_enabled", "portfolio_ids",
     "capital_enforce_enabled",
+    # G4 现金出口分级模式：运行中即时生效（只影响台账放行级别）
+    "cash_outlet_mode",
     "gate_recheck_on_execute",
     # 理论 vs 实盘面板的回测基准绑定（纯观测字段，不影响交易语义）
     "backtest_record_id", "backtest_run_group_id", "pairing_plan_id",
@@ -2837,7 +2854,8 @@ SESSION_EDIT_FIELDS = (
 #: G1 例外：capital_enforce_enabled 是安全开关，运行中必须即时生效（关闭即释放
 #: 借据并回到原资金口径），因此列入立即生效。
 SESSION_IMMEDIATE_FIELDS = frozenset({
-    "name", *SESSION_BINDING_FIELDS, "capital_enforce_enabled"})
+    "name", *SESSION_BINDING_FIELDS, "capital_enforce_enabled",
+    "cash_outlet_mode"})
 #: 运行中只能「下次启动生效」的字段。
 SESSION_NEXT_START_FIELDS = frozenset(SESSION_EDIT_FIELDS) - SESSION_IMMEDIATE_FIELDS
 
@@ -2946,6 +2964,11 @@ def _normalize_session_patch(db: Session, data: dict,
         # G1 kill switch：运行中也立即生效（关闭即释放借据、回到原口径）
         patch["capital_enforce_enabled"] = bool(
             data.get("capital_enforce_enabled"))
+    if "cash_outlet_mode" in data:
+        # G4：只允许 OFF/P1/P2/P3；非法值回落 OFF
+        mode = str(data.get("cash_outlet_mode") or "OFF").upper()
+        patch["cash_outlet_mode"] = (
+            mode if mode in ("OFF", "P1", "P2", "P3") else "OFF")
     if "gate_recheck_on_execute" in data:
         patch["gate_recheck_on_execute"] = bool(
             data.get("gate_recheck_on_execute"))
@@ -3053,6 +3076,16 @@ def update_session(db: Session, session_id: int, data: dict,
             except Exception:  # noqa: BLE001 — 内存同步失败由 30s 刷新兜底
                 logger.warning(
                     "capital enforce sync to engine failed (session %s)",
+                    session_id, exc_info=True)
+    # G4：现金出口分级模式即时同步（只影响台账放行级别）
+    if "cash_outlet_mode" in applied:
+        eng = engines.get(session_id)
+        if eng is not None and hasattr(eng, "set_cash_outlet_mode"):
+            try:
+                eng.set_cash_outlet_mode(session.cash_outlet_mode)
+            except Exception:  # noqa: BLE001 — 内存同步失败由 30s 刷新兜底
+                logger.warning(
+                    "cash outlet mode sync to engine failed (session %s)",
                     session_id, exc_info=True)
     result = get_session(db, session_id, engines.get(session_id))
     return True, {

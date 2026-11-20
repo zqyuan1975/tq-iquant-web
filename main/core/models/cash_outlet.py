@@ -1,5 +1,6 @@
 from sqlalchemy import (
-    Boolean, Column, Date, DateTime, Integer, Numeric, String, Text,
+    Boolean, Column, Date, DateTime, ForeignKey, Index, Integer, Numeric,
+    String, Text,
 )
 from sqlalchemy.sql import func
 
@@ -80,3 +81,56 @@ class CashOutlet(Base):
     created_at = Column(DateTime, nullable=False, server_default=func.now())
     updated_at = Column(DateTime, nullable=False, server_default=func.now(),
                         onupdate=func.now())
+
+
+class CashOutletOp(Base):
+    """现金出口执行台账（0021 G4）。
+
+    只记录「计划 → 人工确认 → 已投放 → 已回流」的运维事实，**不写组合/策略
+    现金与净值**：出口收益单独记在本表 ``yield_amount``，避免污染策略归因。
+    ``shortfall_amount`` 与 ``shortfall_reason`` 保证少还/晚还可追溯。
+
+    模式：``P1`` 纯人工（逐笔确认）、``P2`` 半自动（服务计划 + 人工确认）、
+    ``P3`` 自动（仅限已验证、T+0/≤7 天、限额内的出口，服务直接放行）。
+    """
+
+    __tablename__ = "cash_outlet_ops"
+
+    id = Column(Integer, primary_key=True)
+    live_session_id = Column(
+        Integer, ForeignKey("live_sessions.id", ondelete="SET NULL"),
+        nullable=True, index=True)
+    outlet_id = Column(
+        Integer, ForeignKey("cash_outlets.id", ondelete="RESTRICT"),
+        nullable=False, index=True)
+    mode = Column(String(5), nullable=False, default="P1",
+                  server_default="P1")
+    amount = Column(Numeric(18, 2), nullable=False)
+    status = Column(String(20), nullable=False, default="PENDING_CONFIRM",
+                    server_default="PENDING_CONFIRM")
+    idempotency_key = Column(String(80), nullable=True, unique=True)
+
+    executed_at = Column(DateTime, nullable=True)
+    expected_return_date = Column(Date, nullable=True)
+    returned_at = Column(DateTime, nullable=True)
+    principal_returned = Column(Numeric(18, 2), nullable=True)
+    # 出口收益单列；不进入组合现金/净值（不污染策略归因）
+    yield_amount = Column(Numeric(18, 2), nullable=False, default=0,
+                          server_default="0")
+    shortfall_amount = Column(Numeric(18, 2), nullable=False, default=0,
+                              server_default="0")
+    shortfall_reason = Column(String(200), nullable=True)
+
+    approved_by = Column(String(50), nullable=True)
+    approved_at = Column(DateTime, nullable=True)
+    notes = Column(Text, nullable=True)
+    created_at = Column(DateTime, nullable=False, server_default=func.now())
+    updated_at = Column(DateTime, nullable=False, server_default=func.now(),
+                        onupdate=func.now())
+
+    __table_args__ = (
+        Index("ix_cash_outlet_ops_session_status",
+              "live_session_id", "status"),
+        Index("ix_cash_outlet_ops_outlet_executed",
+              "outlet_id", "executed_at"),
+    )

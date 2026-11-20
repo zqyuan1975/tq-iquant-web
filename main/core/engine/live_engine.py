@@ -714,6 +714,9 @@ class LiveEngine:
         # 真实侧占比；开关 False 时两个入口的返回值与改动前逐字一致。
         capital_enforce: Optional[dict] = None,
         capital_enforce_enabled: bool = False,
+        # G4 现金出口分级执行（0021）：OFF/P1/P2/P3；台账由
+        # cash_outlet_service 写入，引擎只保存/刷新模式，不划转、不下单。
+        cash_outlet_mode: str = "OFF",
         backup_engine: Optional[str] = None,
         failover_enabled: bool = False,
     ):
@@ -848,6 +851,11 @@ class LiveEngine:
         # G3：拼盘健康状态为 SUSPENDED/RETIRED 时暂停新增借出（不释放已有借据，
         # 也不强制平仓）；恢复由人工确认后下一次节流刷新自动解除。
         self._capital_health_blocked = False
+        # G4：现金出口分级模式；只是运维台账的放行级别，不改变委托路径。
+        self._cash_outlet_mode = str(cash_outlet_mode or "OFF").upper()
+        if self._cash_outlet_mode not in ("OFF", "P1", "P2", "P3"):
+            self._cash_outlet_mode = "OFF"
+        self._cash_outlet_checked_at = 0.0
         # G2 对账：只读恒等式，30s 节流；(2)(3)(4)(6) 失败 → 停止新增买入。
         self._capital_reconcile_at = 0.0
         self._capital_reconcile_block = ""
@@ -7439,6 +7447,47 @@ class LiveEngine:
         finally:
             db.close()
 
+    def set_cash_outlet_mode(self, mode: str) -> str:
+        """G4：API 写入后即时同步；非法值回落 OFF（不影响交易链路）。"""
+        target = str(mode or "OFF").upper()
+        if target not in ("OFF", "P1", "P2", "P3"):
+            target = "OFF"
+        if target != self._cash_outlet_mode:
+            previous = self._cash_outlet_mode
+            self._cash_outlet_mode = target
+            self._emit("risk", {
+                "gate": "cash_outlet",
+                "rule": "mode_change",
+                "action": "%s->%s" % (previous, target),
+                "session_id": self.session_id,
+                "final_qty": None,
+                "message": "现金出口分级模式切换：%s → %s（仅台账放行级别）"
+                           % (previous, target),
+            })
+        self._cash_outlet_checked_at = time.monotonic()
+        return self._cash_outlet_mode
+
+    def _refresh_cash_outlet_mode(self, force: bool = False) -> None:
+        """G4：会话级出口模式（30s 节流；读取失败保持旧值）。"""
+        now = time.monotonic()
+        if not force and now - self._cash_outlet_checked_at < 30:
+            return
+        self._cash_outlet_checked_at = now
+        db = self._db_session_factory()
+        if db is None:
+            return
+        try:
+            from core.models import LiveSession
+            row = db.query(LiveSession.cash_outlet_mode).filter(
+                LiveSession.id == self.session_id).first()
+            if row is not None:
+                self.set_cash_outlet_mode(row[0])
+        except Exception:  # noqa: BLE001 — 开关读取失败保持旧值
+            logger.warning("cash outlet mode refresh failed (session %s)",
+                           self.session_id, exc_info=True)
+        finally:
+            db.close()
+
     def set_capital_enforce_enabled(self, enabled: bool) -> bool:
         """G1：API 写入后即时同步；关闭当根 bar 起回到现有资金口径。"""
         self._capital_enforce_checked_at = time.monotonic()
@@ -8474,6 +8523,8 @@ class LiveEngine:
         self._refresh_global_switch()
         # G1（2026-11-20）：会话级资金强制开关 30s 节流刷新；关闭时零行为变化。
         self._refresh_capital_enforce_switch()
+        # G4（2026-11-20）：现金出口分级模式 30s 节流刷新；只影响台账放行级别。
+        self._refresh_cash_outlet_mode()
         # 公司行为（J1/J2，默认关）：specs 为空时立即返回。必须在镜面刷新与信号
         # 评估之前——停牌闸（suspended_codes）与分红入账要先于本根 bar 生效。
         self._maybe_apply_corporate_actions(bar.bar_time)

@@ -14,7 +14,7 @@ from typing import Any, Dict, List, Optional
 
 from sqlalchemy.orm import Session
 
-from core.models import CashOutlet
+from core.models import CashOutlet, CashOutletOp
 
 logger = logging.getLogger(__name__)
 
@@ -336,3 +336,340 @@ def verify_outlet(db: Session, outlet: CashOutlet, *,
     db.commit()
     db.refresh(outlet)
     return outlet
+
+
+# ---------------------------------------------------------------------------
+# G4 现金出口执行台账（人工 → 半自动 → 自动）
+# ---------------------------------------------------------------------------
+OUTLET_OPS_VERSION = "cash-outlet-ops-g4"
+MODE_OFF = "OFF"
+MODE_P1 = "P1"
+MODE_P2 = "P2"
+MODE_P3 = "P3"
+MODE_ORDER = {MODE_OFF: 0, MODE_P1: 1, MODE_P2: 2, MODE_P3: 3}
+
+OP_PENDING = "PENDING_CONFIRM"
+OP_EXECUTED = "EXECUTED"
+OP_RETURNED = "RETURNED"
+OP_REJECTED = "REJECTED"
+OP_CANCELLED = "CANCELLED"
+OP_ACTIVE = (OP_PENDING, OP_EXECUTED)
+OP_STATUSES = (OP_PENDING, OP_EXECUTED, OP_RETURNED, OP_REJECTED, OP_CANCELLED)
+
+
+class OutletOpsError(ValueError):
+    """现金出口操作被拒；``codes`` 保留 C1–C8 原因码，便于追溯。"""
+
+    def __init__(self, message: str, codes: Optional[List[str]] = None):
+        super().__init__(message)
+        self.codes = list(codes or [])
+
+
+def normalize_mode(value: Any) -> str:
+    mode = str(value or MODE_OFF).upper()
+    if mode not in MODE_ORDER:
+        raise OutletOpsError("模式非法：%r（仅 OFF/P1/P2/P3）" % value)
+    return mode
+
+
+def mode_allows(session_mode: Any, requested: Any) -> bool:
+    """会话分级开关是否允许该操作模式（OFF 一律不允许）。"""
+    try:
+        return MODE_ORDER.get(normalize_mode(session_mode), 0) >= \
+            MODE_ORDER[normalize_mode(requested)]
+    except OutletOpsError:
+        return False
+
+
+def p3_eligible(outlet: CashOutlet, now: Optional[datetime] = None) -> tuple:
+    """P3 自动放行的硬条件；返回 (是否满足, 原因列表)。"""
+    now = now or datetime.now()
+    result = evaluate_outlet(outlet, now=now)
+    reasons = list(result["codes"])
+    channel = (outlet.channel or "manual").lower()
+    liquidity = (outlet.liquidity or "").lower()
+    term = int(outlet.term_days or 0)
+    settle = int(outlet.settlement_max_days or 0)
+    if channel not in ALLOWED_CHANNELS:
+        reasons.append(CHANNEL_UNSUPPORTED)
+    if (outlet.risk_level or "").upper() not in ALLOWED_RISK_LEVELS:
+        reasons.append(RISK_LEVEL_HIGH)
+    if liquidity == "term" and (term <= 0 or term > MAX_TERM_DAYS
+                                or settle > MAX_TERM_DAYS):
+        reasons.append(LIQUIDITY_MISMATCH)
+    if liquidity not in ("t0", "t1", "term"):
+        reasons.append(LIQUIDITY_MISMATCH)
+    if (outlet.inflow_certainty or "").lower() == "probable":
+        reasons.append(SETTLEMENT_UNCERTAIN)
+    return (not reasons), sorted(set(reasons))
+
+
+def _dec_amount(value: Any) -> Decimal:
+    amount = _dec(value)
+    if amount is None or not amount.is_finite() or amount <= 0:
+        raise OutletOpsError("金额非法：%r" % (value,))
+    return amount
+
+
+def _serialize_op(op: CashOutletOp) -> Dict[str, Any]:
+    return {
+        "id": op.id,
+        "version": OUTLET_OPS_VERSION,
+        "live_session_id": op.live_session_id,
+        "outlet_id": op.outlet_id,
+        "mode": op.mode,
+        "amount": _num_str(op.amount),
+        "status": op.status,
+        "idempotency_key": op.idempotency_key,
+        "executed_at": op.executed_at.isoformat(sep=" ") if op.executed_at else None,
+        "expected_return_date": op.expected_return_date.isoformat()
+        if op.expected_return_date else None,
+        "returned_at": op.returned_at.isoformat(sep=" ") if op.returned_at else None,
+        "principal_returned": _num_str(op.principal_returned),
+        "yield_amount": _num_str(op.yield_amount) or "0",
+        "shortfall_amount": _num_str(op.shortfall_amount) or "0",
+        "shortfall_reason": op.shortfall_reason,
+        "approved_by": op.approved_by,
+        "approved_at": op.approved_at.isoformat(sep=" ") if op.approved_at else None,
+        "notes": op.notes,
+        "created_at": op.created_at.isoformat(sep=" ") if op.created_at else None,
+    }
+
+
+def _daily_planned(db: Session, outlet_id: int, day: date) -> Decimal:
+    rows = (db.query(CashOutletOp)
+            .filter(CashOutletOp.outlet_id == outlet_id,
+                    CashOutletOp.status.in_(OP_ACTIVE))
+            .all())
+    total = Decimal("0")
+    for row in rows:
+        stamp = row.executed_at or row.created_at
+        if stamp is not None and stamp.date() == day:
+            total += row.amount or Decimal("0")
+    return total
+
+
+def plan_outlet_op(db: Session, outlet: CashOutlet, *, amount: Any,
+                   mode: Any = MODE_P1,
+                   live_session_id: Optional[int] = None,
+                   need_date: Optional[date] = None,
+                   idempotency_key: Optional[str] = None,
+                   notes: Optional[str] = None,
+                   now: Optional[datetime] = None) -> Dict[str, Any]:
+    """登记一笔出口计划；P3 满足硬条件才自动放行，否则转人工确认。
+
+    只写 ``cash_outlet_ops``，不划转、不下单、不改组合现金/净值。
+    """
+    now = now or datetime.now()
+    mode = normalize_mode(mode)
+    if mode == MODE_OFF:
+        raise OutletOpsError("模式 OFF 不允许登记现金出口操作")
+    amount = _dec_amount(amount)
+
+    key = (idempotency_key or "").strip() or None
+    if key:
+        existing = (db.query(CashOutletOp)
+                    .filter(CashOutletOp.idempotency_key == key).first())
+        if existing is not None:
+            data = _serialize_op(existing)
+            data["deduplicated"] = True
+            return data
+
+    result = evaluate_outlet(
+        outlet, need_date=need_date, required_amount=amount, now=now)
+    if result["status"] == STATUS_BLOCKED:
+        raise OutletOpsError(
+            "出口 %s 未通过 C1–C8：%s" % (outlet.code, "；".join(result["codes"])),
+            result["codes"])
+
+    max_daily = _dec(outlet.max_daily_amount)
+    if max_daily is not None:
+        planned = _daily_planned(db, outlet.id, now.date())
+        if planned + amount > max_daily:
+            raise OutletOpsError(
+                "超过单日上限：已计划 %s + 本次 %s > %s"
+                % (planned, amount, max_daily), [LIMIT_TOO_SMALL])
+
+    settle = int(outlet.settlement_max_days or 0)
+    term = int(outlet.term_days or 0) \
+        if (outlet.liquidity or "").lower() == "term" else 0
+    arrival = max(settle, term) + int(outlet.arrival_buffer_days or 0)
+    expected = now.date() + timedelta(days=arrival)
+
+    auto = False
+    auto_reasons: List[str] = []
+    if mode == MODE_P3:
+        auto, auto_reasons = p3_eligible(outlet, now=now)
+
+    op = CashOutletOp(
+        live_session_id=live_session_id, outlet_id=outlet.id, mode=mode,
+        amount=amount,
+        status=OP_EXECUTED if auto else OP_PENDING,
+        idempotency_key=key,
+        executed_at=now if auto else None,
+        expected_return_date=expected,
+        approved_by="auto:p3" if auto else None,
+        approved_at=now if auto else None,
+        notes=(notes or "") if auto else (
+            (notes or "") if not auto_reasons else
+            ((notes + "；") if notes else "")
+            + "P3 条件不满足，转人工确认：" + "/".join(auto_reasons)),
+    )
+    db.add(op)
+    db.commit()
+    db.refresh(op)
+    data = _serialize_op(op)
+    data["auto"] = auto
+    data["auto_blocked_reasons"] = auto_reasons
+    data["evaluation"] = result
+    return data
+
+
+def confirm_op(db: Session, op_id: int, *, approved_by: str,
+               now: Optional[datetime] = None) -> Dict[str, Any]:
+    """人工确认待投放计划；确认只代表台账放行，不产生真实下单。"""
+    op = db.get(CashOutletOp, op_id)
+    if op is None:
+        raise LookupError("出口操作不存在：%s" % op_id)
+    if op.status != OP_PENDING:
+        raise OutletOpsError("仅待确认状态可确认，当前 %s" % op.status)
+    if not (approved_by or "").strip():
+        raise OutletOpsError("确认必须填写操作人")
+    now = now or datetime.now()
+    op.status = OP_EXECUTED
+    op.executed_at = now
+    op.approved_by = approved_by.strip()
+    op.approved_at = now
+    db.commit()
+    db.refresh(op)
+    return _serialize_op(op)
+
+
+def reject_op(db: Session, op_id: int, *, reason: str,
+              now: Optional[datetime] = None) -> Dict[str, Any]:
+    op = db.get(CashOutletOp, op_id)
+    if op is None:
+        raise LookupError("出口操作不存在：%s" % op_id)
+    if op.status != OP_PENDING:
+        raise OutletOpsError("仅待确认状态可驳回，当前 %s" % op.status)
+    if not (reason or "").strip():
+        raise OutletOpsError("驳回必须填写理由")
+    op.status = OP_REJECTED
+    op.notes = ((op.notes + "；") if op.notes else "") + "驳回：" + reason.strip()
+    db.commit()
+    db.refresh(op)
+    return _serialize_op(op)
+
+
+def record_return(db: Session, op_id: int, *, principal_returned: Any,
+                  yield_amount: Any = 0,
+                  shortfall_reason: Optional[str] = None,
+                  returned_at: Optional[datetime] = None) -> Dict[str, Any]:
+    """登记回流：收益只写本表，短款必须带原因（可追溯）。"""
+    op = db.get(CashOutletOp, op_id)
+    if op is None:
+        raise LookupError("出口操作不存在：%s" % op_id)
+    if op.status != OP_EXECUTED:
+        raise OutletOpsError("仅已投放状态可登记回流，当前 %s" % op.status)
+    principal = _dec(principal_returned)
+    if principal is None or not principal.is_finite() or principal < 0:
+        raise OutletOpsError("回流本金非法：%r" % (principal_returned,))
+    gain = _dec(yield_amount) or Decimal("0")
+    if not gain.is_finite() or gain < 0:
+        raise OutletOpsError("出口收益非法：%r" % (yield_amount,))
+    shortfall = (op.amount or Decimal("0")) - principal
+    if shortfall > 0 and not (shortfall_reason or "").strip():
+        raise OutletOpsError(
+            "存在短款 %s，必须填写 shortfall_reason" % shortfall)
+    now = returned_at or datetime.now()
+    op.status = OP_RETURNED
+    op.returned_at = now
+    op.principal_returned = principal
+    op.yield_amount = gain
+    op.shortfall_amount = max(Decimal("0"), shortfall)
+    op.shortfall_reason = (shortfall_reason or "").strip() or None
+    db.commit()
+    db.refresh(op)
+    return _serialize_op(op)
+
+
+def list_ops(db: Session, *, outlet_id: Optional[int] = None,
+             live_session_id: Optional[int] = None,
+             status: Optional[str] = None, limit: int = 100) -> Dict[str, Any]:
+    q = db.query(CashOutletOp)
+    if outlet_id is not None:
+        q = q.filter(CashOutletOp.outlet_id == outlet_id)
+    if live_session_id is not None:
+        q = q.filter(CashOutletOp.live_session_id == live_session_id)
+    if status:
+        q = q.filter(CashOutletOp.status == status)
+    rows = q.order_by(CashOutletOp.id.desc()).limit(max(1, int(limit))).all()
+    summary = ops_summary(db, outlet_id=outlet_id,
+                          live_session_id=live_session_id)
+    return {"version": OUTLET_OPS_VERSION, "items": [
+        _serialize_op(op) for op in rows], "summary": summary}
+
+
+def ops_summary(db: Session, *, outlet_id: Optional[int] = None,
+                live_session_id: Optional[int] = None) -> Dict[str, Any]:
+    q = db.query(CashOutletOp)
+    if outlet_id is not None:
+        q = q.filter(CashOutletOp.outlet_id == outlet_id)
+    if live_session_id is not None:
+        q = q.filter(CashOutletOp.live_session_id == live_session_id)
+    rows = q.all()
+    outstanding = sum((op.amount or Decimal("0") for op in rows
+                       if op.status == OP_EXECUTED), Decimal("0"))
+    returned = sum((op.principal_returned or Decimal("0") for op in rows
+                    if op.status == OP_RETURNED), Decimal("0"))
+    yield_total = sum((op.yield_amount or Decimal("0") for op in rows
+                       if op.status == OP_RETURNED), Decimal("0"))
+    shortfall = sum((op.shortfall_amount or Decimal("0") for op in rows
+                     if op.status == OP_RETURNED), Decimal("0"))
+    return {
+        "version": OUTLET_OPS_VERSION,
+        # 出口收益单列，绝不并入策略/组合归因
+        "outstanding_principal": _num_str(outstanding) or "0",
+        "returned_principal": _num_str(returned) or "0",
+        "yield_contribution": _num_str(yield_total) or "0",
+        "shortfall_total": _num_str(shortfall) or "0",
+        "pending_count": sum(1 for op in rows if op.status == OP_PENDING),
+        "executed_count": sum(1 for op in rows if op.status == OP_EXECUTED),
+        "returned_count": sum(1 for op in rows if op.status == OP_RETURNED),
+    }
+
+
+def reconcile_ops(db: Session, *, today: Optional[date] = None) -> Dict[str, Any]:
+    """台账对账：逾期未回、短款未说明、金额异常，全部给出可追溯 id。"""
+    today = today or datetime.now().date()
+    rows = db.query(CashOutletOp).all()
+    overdue = []
+    shortfalls = []
+    anomalies = []
+    for op in rows:
+        if op.status == OP_EXECUTED and op.expected_return_date \
+                and op.expected_return_date < today:
+            overdue.append({
+                "id": op.id, "outlet_id": op.outlet_id,
+                "amount": _num_str(op.amount),
+                "expected_return_date": op.expected_return_date.isoformat(),
+            })
+        if op.status == OP_RETURNED and (op.shortfall_amount or 0) > 0:
+            shortfalls.append({
+                "id": op.id, "outlet_id": op.outlet_id,
+                "shortfall_amount": _num_str(op.shortfall_amount),
+                "shortfall_reason": op.shortfall_reason,
+            })
+        if (op.amount or Decimal("0")) <= 0:
+            anomalies.append({"id": op.id, "reason": "amount<=0"})
+        if op.status == OP_RETURNED and (op.shortfall_amount or 0) > 0 \
+                and not op.shortfall_reason:
+            anomalies.append({"id": op.id, "reason": "shortfall_without_reason"})
+    return {
+        "version": OUTLET_OPS_VERSION,
+        "ok": not overdue and not anomalies,
+        "overdue": overdue,
+        "shortfalls": shortfalls,
+        "anomalies": anomalies,
+        "checked_at": datetime.now().isoformat(sep=" ", timespec="seconds"),
+    }
