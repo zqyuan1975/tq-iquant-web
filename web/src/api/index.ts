@@ -611,6 +611,7 @@ export interface BacktestDetailItem {
   persistence: PersistenceAnalysis | null  // 持续性检验（阿尔法衰减 vs 风格钟摆）
   acceptance: AcceptanceResult              // B6 考核口径验收（absolute/relative）
   cost_capacity: BacktestCostCapacity | null  // K5 成本与容量（详情现算，不落库）
+  gate_release?: GateReleaseResult | null     // 0021 D4：门控释放/召回时间轴（只读）
 }
 
 // K5 成本与容量（对齐 backtest_service.build_cost_capacity）
@@ -1317,7 +1318,30 @@ export interface BacktestRequest {
   daily_loss_basis?: 'equity' | 'initial' | null   // 日内亏损分母 run 级覆盖（null/undefined=跟随组合）
   market_gate_enabled?: boolean | null             // 市场多空门控 run 级三态覆盖（null/undefined=跟随组合）
   loan_model_plan?: Record<string, unknown>        // 资金池 B3：L2 拼盘借贷计划（默认不带）
+  gate_release_plan?: Record<string, unknown>      // 资金池 D3/D4：门控释放/召回（默认不带）
   pairing_plan_id?: number                         // 资金池 B6：回测完成后绑定该拼盘
+}
+
+// 资金池 D4：门控释放/召回时间轴（只读；None=未启用）
+export interface GateReleaseEvent {
+  day: string
+  gate: string          // OPEN / CLOSED / UNKNOWN
+  status: string        // IDLE / PENDING_RELEASE / RELEASED / REOPENING
+  release_amount: string | null
+  recalled: string[]
+  shortfall: string
+  reasons: string[]     // 原因码（gate_closed_confirmed / release_done / ...）
+  budgets?: Record<string, string>
+  due_recalled?: string[]
+}
+export interface GateReleaseResult {
+  version: string
+  lender_strategy_id: number
+  borrower_strategy_id: number
+  events: GateReleaseEvent[]
+  states: Record<string, unknown>
+  final_budgets: Record<string, string>
+  loan_book: Record<string, unknown>
 }
 
 // C7 IS/OOS 采纳门槛评估结果（回测完成时返回；未启用为 null）
@@ -1330,6 +1354,7 @@ export interface BacktestRunResult {
   record_id: number
   warnings: string[]
   gate: BacktestGateResult | null
+  gate_release?: GateReleaseResult | null
 }
 
 export async function runBacktest(req: BacktestRequest) {

@@ -4030,6 +4030,10 @@ def get_record_detail(
         "acceptance": acceptance,
         # K5 成本与容量：按 trades+snapshots 现算，不改落库结构
         "cost_capacity": cost_capacity,
+        # 0021 D4：门控释放/召回时间轴（None=未启用），只读
+        "gate_release": (
+            json.loads(rec.gate_release_json) if rec.gate_release_json else None
+        ),
     }
 
 
@@ -4835,6 +4839,8 @@ def run_backtest(db: Session, ps: PortfolioStrategy, req,
         # NULL 表示按 0.95 缺省（A2），不改变任何既有回测结果。
         portfolio.target_utilization = getattr(ps, "target_utilization", None)
         _loan_plan = getattr(req, "loan_model_plan", None)
+        # 门控释放/召回（0021 D3/D4，默认 None=不启用）：需 L2 借据已成立
+        _gate_release_plan = getattr(req, "gate_release_plan", None)
         # 现金出口收益率（0021 C5，默认 None=不启用）：只读日终现金，单列返回
         _cash_outlet_plan = getattr(req, "cash_outlet_plan", None)
         # 层 1 容量模型（run 级，仅本轮内存生效）：sqrt 时启用参与率预算 +
@@ -4968,6 +4974,7 @@ def run_backtest(db: Session, ps: PortfolioStrategy, req,
             cancel_check=cancel_event.is_set,
             loan_model_plan=_loan_plan,
             cash_outlet_plan=_cash_outlet_plan,
+            gate_release_plan=_gate_release_plan,
         )
         t7 = datetime.now()
         _log_timing(f"[回测#{record_id}] 引擎逐bar回测: {(t7-t6).total_seconds():.1f}s")
@@ -5065,6 +5072,12 @@ def run_backtest(db: Session, ps: PortfolioStrategy, req,
             build_validation_verdict(result, klines, ps, db),
             ensure_ascii=False, default=str,
         )
+        # 门控释放/召回时间轴（0021 D4）：仅启用时冻结，只读展示
+        _gate_release = result.get("gate_release")
+        rec.gate_release_json = (
+            json.dumps(_gate_release, ensure_ascii=False, default=str)
+            if _gate_release else None
+        )
         rec.completed_at = datetime.now(timezone.utc).replace(tzinfo=None)  # naive UTC，与原 utcnow() 语义一致（Python 3.13 已弃用 utcnow）
         db.commit()
     except Exception as e:
@@ -5128,6 +5141,8 @@ def run_backtest(db: Session, ps: PortfolioStrategy, req,
         "gate": gate,
         # 0021 C5：现金出口利息（None=未启用），与策略指标分离
         "cash_yield_contribution": result.get("cash_yield_contribution"),
+        # 0021 D4：门控释放/召回时间轴（None=未启用），只读
+        "gate_release": result.get("gate_release"),
     }
 
 

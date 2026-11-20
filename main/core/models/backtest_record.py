@@ -44,5 +44,8 @@ class BacktestRecord(Base):
     # F1 数据质量（2026-11-18）：JSON 汇总（覆盖率/缺根/伪影价与无成交假 bar 剔除数/
     # 整只缺失股票）。只做观测展示，不参与回测判定；历史记录为 NULL。
     data_quality_json = Column(Text, nullable=True)
+    # 门控释放/召回（0021 D4）：JSON（事件时间轴/状态/最终额度/借据）。
+    # 仅启用 gate_release_plan 的 run 有值，其余 NULL；只读展示，不参与判定。
+    gate_release_json = Column(Text, nullable=True)
     created_at = Column(DateTime, server_default=func.now())
     completed_at = Column(DateTime, nullable=True)

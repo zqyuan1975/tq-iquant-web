@@ -120,6 +120,10 @@ class BacktestRequest(BaseModel):
     # 现金出口收益率建模（0021 C5，默认 None=不启用）：只估利息与可用时点，
     # 单列返回 cash_yield_contribution，不并入净值/成交/策略指标。
     cash_outlet_plan: dict | None = None
+    # 门控释放/召回建模（0021 D3/D4，默认 None=不启用）：需 loan_model_plan 已成立。
+    # {"enabled": bool, "portfolio_gate_enabled": bool?, "release_delay_days": int?,
+    #  "reopen_confirm_days": int?, "due_days": int?}。只读时间轴落 gate_release_json。
+    gate_release_plan: dict | None = None
     # 资金池拼盘（0021 B6）：由 L2 拼盘向导带出；回测成功后把记录绑到拼盘头。
     pairing_plan_id: int | None = None
 

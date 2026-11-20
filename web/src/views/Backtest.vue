@@ -34,6 +34,7 @@ import type {
   CapitalUtilizationStats,
   CashOutletItem, CashOutletEvaluation,
   PairingPlanSummary, PairingPlanDetail,
+  GateReleaseResult,
 } from '../api'
 import { gateLabel, LAYER_LABEL, ACTION_LABEL } from '../utils/liveEvents'
 import { deriveBlockCode } from '../utils/blockCode'
@@ -139,6 +140,42 @@ const errorMsg = ref('')
 const acceptanceProfile = ref<'absolute' | 'relative'>('absolute')
 const acceptance = computed<AcceptanceResult | null>(() => detail.value?.acceptance ?? null)
 const showAcceptance = ref(false)
+
+// ===== 门控释放/召回时间轴（0021 D4，只读）=====
+const gateRelease = computed<GateReleaseResult | null>(
+  () => detail.value?.gate_release ?? null,
+)
+const GATE_RELEASE_STATUS_TEXT: Record<string, string> = {
+  IDLE: '空闲',
+  PENDING_RELEASE: '待释放（延迟期）',
+  RELEASED: '已释放',
+  REOPENING: '召回中',
+}
+const GATE_RELEASE_REASON_TEXT: Record<string, string> = {
+  gate_closed_confirmed: '门控关闭确认',
+  release_delayed: '释放延迟中',
+  release_done: '释放生效',
+  release_held_unknown: '门控不可判定，暂缓释放',
+  release_cancelled_gate_reopened: '门控恢复，未释放额作废',
+  recall_issued: '恢复确认，发起召回',
+  recall_complete: '召回完成',
+  recall_shortfall: '召回逾期未归还',
+  gate_unknown_no_release: '门控不可判定（不释放）',
+  no_change: '无变化',
+}
+function gateReleaseStatusText(status: string): string {
+  return GATE_RELEASE_STATUS_TEXT[status] || status
+}
+function gateReleaseReasonText(reason: string): string {
+  return GATE_RELEASE_REASON_TEXT[reason] || reason
+}
+const gateReleaseEvents = computed(() => {
+  const events = gateRelease.value?.events || []
+  // 只展示有动作的时点（no_change 日不堆表），最多保留最近 60 条
+  return events
+    .filter(e => (e.reasons || []).some(r => r !== 'no_change'))
+    .slice(-60)
+})
 
 // ===== 资金池额度推导（0021 A4，只读；按钮触发，避免进详情即发请求）=====
 const capitalDerive = ref<CapitalQuotaDerivation | null>(null)
@@ -1661,6 +1698,9 @@ async function submit() {
           ...(form.value.loan_model_plan
             ? {
                 loan_model_plan: form.value.loan_model_plan,
+                // 0021 D3：拼盘回测默认开启门控释放/召回建模（是否真正释放
+                // 仍由组合 market_gate_enabled / 策略 gate_mode 决定）
+                gate_release_plan: { enabled: true },
                 pairing_plan_id: form.value.pairing_plan_id,
               }
             : {}),
@@ -4361,7 +4401,7 @@ watch(theme, () => {
                 {{ h.code }} {{ h.state === 'pass' ? '通过' : h.state === 'fail' ? '失败' : '待定' }}：{{ h.message }}
               </li>
               <li v-for="s in pairingDetail.eval.soft" :key="s.feature">
-                {{ s.feature }}：{{ s.message }}<span v-if="s.pending_code">（{{ s.pending_code }}）</span>
+                {{ s.feature }}（{{ s.state === 'pass' ? '通过' : s.state === 'fail' ? '不通过' : s.state === 'warn' ? '警告' : '待定' }}）：{{ s.message }}<span v-if="s.pending_code">（{{ s.pending_code }}）</span>
               </li>
             </ul>
           </div>
@@ -4670,6 +4710,62 @@ watch(theme, () => {
       <p v-else-if="!outletsDisabled && !outletsLoading" style="font-size:12px;color:var(--ink-soft);margin:0">
         暂无已登记的现金出口。
       </p>
+    </div>
+
+    <!-- 0021 D4：门控释放/召回时间轴（只读，不改变成交） -->
+    <div class="card" style="margin-top:12px;padding:14px">
+      <div style="display:flex;align-items:center;gap:8px;margin-bottom:10px;flex-wrap:wrap">
+        <span style="font-weight:600;font-size:14px">🔁 门控释放/召回时间轴（只读）</span>
+        <span style="font-size:12px;color:var(--ink-soft)">
+          D 阶段：按日快照 gate_state 推进，只调额度上限与借据，不改变成交
+        </span>
+      </div>
+      <p v-if="!gateRelease" style="font-size:12px;color:var(--ink-soft);margin:0">
+        本次回测未启用门控释放/召回建模（gate_release_plan）。
+      </p>
+      <template v-else>
+        <div style="display:flex;flex-wrap:wrap;gap:18px;font-size:13px;margin-bottom:8px">
+          <span>版本 <b>{{ gateRelease.version }}</b></span>
+          <span>
+            出借方 <b>{{ gateRelease.lender_strategy_id }}</b> →
+            借款方 <b>{{ gateRelease.borrower_strategy_id }}</b>
+          </span>
+          <span v-for="(v, k) in gateRelease.final_budgets" :key="k">
+            最终额度 #{{ k }} <b>{{ fmtMoney(Number(v)) }}</b>
+          </span>
+        </div>
+        <p v-if="!gateReleaseEvents.length"
+           style="font-size:12px;color:var(--ink-soft);margin:0">
+          区间内没有释放/召回动作（门控未关闭或资金池未启用）。
+        </p>
+        <table v-else style="margin-top:6px">
+          <thead><tr>
+            <th>日期</th><th>门控</th><th>状态</th><th>原因码</th>
+            <th>释放额</th><th>召回</th><th>缺口</th>
+          </tr></thead>
+          <tbody>
+            <tr v-for="(e, i) in gateReleaseEvents" :key="`${e.day}-${i}`">
+              <td>{{ e.day }}</td>
+              <td>{{ e.gate }}</td>
+              <td>{{ gateReleaseStatusText(e.status) }}</td>
+              <td style="font-size:12px;color:var(--ink-soft)">
+                {{ (e.reasons || []).map(gateReleaseReasonText).join('、') }}
+              </td>
+              <td>{{ e.release_amount ? fmtMoney(Number(e.release_amount)) : '—' }}</td>
+              <td style="font-size:12px">
+                {{ e.recalled.length ? `${e.recalled.length} 笔` : '—' }}
+                <span v-if="e.due_recalled && e.due_recalled.length"
+                      style="color:var(--ink-soft)">（含到期）</span>
+              </td>
+              <td>{{ Number(e.shortfall) > 0 ? fmtMoney(Number(e.shortfall)) : '—' }}</td>
+            </tr>
+          </tbody>
+        </table>
+        <p style="font-size:12px;color:var(--ink-soft);margin:8px 0 0">
+          口径：T+1 确认关闭 → T+2 释放闲置额度；恢复确认后立即召回并冻结对方额度；
+          已持仓不强制卖出，只禁止新增。本卡片只读，不改变既有回测结果。
+        </p>
+      </template>
     </div>
 
     <!-- 回测告警：completed 但存在行情跳过/公式报错/输出线缺失/区间零信号 -->
