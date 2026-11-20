@@ -1917,7 +1917,7 @@ onUnmounted(() => {
           如需与回测同源，在 config.yaml 设置 <code>live.native_minute.enabled: true</code>
           （可选 <code>stall_timeout_seconds</code>，默认 180）并<b>重启实盘会话</b>生效。
           开启后：1m 读本地原生 <code>.lc1</code>、5m 读 <code>.lc5</code>，15m/30m/1h 走原生周期；
-          只使用标签 ≤ 当前墙钟的已闭合 bar（未完成桶不进入信号与风控）；判新只看 bar 标签前进；
+          只使用已闭合 bar；判新只看 bar 标签前进；
           原生数据超过阈值不前进会自动回落快照合成并留痕。
         </template>
         <template v-else-if="minuteSourceAlert">
@@ -1943,26 +1943,19 @@ onUnmounted(() => {
   <div v-if="minuteLivePeriods.length && !minuteNoticeDismissed" class="card minute-live-banner"
        data-test="minute-live-banner">
     <div>
-      <strong v-if="minuteSource?.enabled && !minuteSourceAlert">分钟级策略：实盘已启用原生分钟数据源（.lc1/.lc5），与回测同源</strong>
-      <strong v-else>分钟级策略：实盘用快照合成 bar，与回测 TQ 原生 1m 不等价</strong>
-      <div v-if="minuteSource?.enabled && !minuteSourceAlert" class="minute-live-body">
-        实盘 1m 读本地原生 .lc1、5m 读 .lc5、15m/30m/1h 走原生周期，只使用已闭合 bar
-        （未完成桶不进入信号与风控）。成交按信号 bar 收盘价挂限价且默认不追价，
-        成交时点与均价仍可能与回测不同；回测绑定不继承风控执行时点 / 追价 / 单笔上限 / 复权口径。
-        <b>原生分钟源只决定 bar 来源，不改变风控执行时点，也不会自动开启「盘中逐 1m 风控」。</b>
-      </div>
-      <div v-else class="minute-live-body">
-        当前组合含 {{ minuteLivePeriods.join(' / ') }} 周期。当前未启用原生分钟源（默认）：
-        实盘 1m 由行情快照合成（约 5–30s 采样、60s 发布、只发已完成 bar），缺采样会整根丢 bar，
-        恢复后首根可能是半根，成交量按日累计差分、跨分钟边界会串位；5m/15m/30m/1h 由 1m 聚合，
-        缺一分钟整桶丢弃。开启 live.native_minute.enabled 后改为 1m 读 .lc1、5m 读 .lc5、
-        15m/30m/1h 走原生周期（与回测同源），只取已闭合 bar，上述采样类问题消失。原生源午休边界与快照
-        不同：1m 上午止于 11:29、下午 13:01 起（全天 239 根），多分钟周期也没有 11:30 桶，属通达信原生
-        形态、不是缺数据；只有下载工具停写/漏写才会真正缺 bar。
-        成交按信号 bar 收盘价挂限价且默认不追价（180s 超时撤单），离线统计约 7.2% 买单 /
-        7.9% 卖单在信号价无成交，成交均价系统性劣于回测（回测按下一根开盘必成交）。
-        回测绑定只是绑定关系，不继承策略 / 周期 / 风控执行时点 / 追价 / 单笔上限 / 复权口径。
-        <b>原生分钟源只决定 bar 来源，不改变风控执行时点，也不会自动开启「盘中逐 1m 风控」。</b>
+      <strong>分钟级策略：回测与实盘口径差异</strong>
+      <div class="minute-live-body">
+        <p>分钟级回测与实盘存在差异，主要有三处：</p>
+        <ol>
+          <li><b>数据源</b>：回测取 TQ 原生分钟线；实盘默认由行情快照合成（5–30s 采样、60s 发布），
+            可能丢 bar、首根不完整、成交量跨分钟串位。开启原生分钟源后与回测同源，但依赖外部 TDX
+            数据工具持续写盘，停写超过 180 秒会自动回落快照并留痕。</li>
+          <li><b>成交</b>：回测按下一根开盘必成交；实盘按信号 bar 收盘价挂限价、默认不追价、
+            180 秒未成交撤单，实测约 7.2% 买单、7.9% 卖单在信号价未成交，成交均价偏劣。</li>
+          <li><b>部署绑定</b>：只建立绑定关系，实盘按当前策略行重建，不继承策略、周期、risk_timing、
+            追价开关、单笔上限、复权口径；分钟策略的「次日执行」不生效。</li>
+        </ol>
+        <p>另外：风控何时评估由策略周期和会话「盘中逐 1m 风控」开关决定，与数据源无关。</p>
       </div>
     </div>
     <button class="btn btn-sm" @click="minuteNoticeDismissed = true">关闭</button>
