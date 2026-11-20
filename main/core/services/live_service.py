@@ -2668,9 +2668,8 @@ def _normalize_session_patch(db: Session, data: dict,
             return None, (400, "execution_mode 非法，仅支持 alert / auto / manual / shadow")
         patch["execution_mode"] = execution_mode
     if "signal_file_path" in data:
-        raw = data.get("signal_file_path")
-        patch["signal_file_path"] = (
-            str(raw).strip() or None if raw is not None else None)
+        patch["signal_file_path"] = normalize_signal_file_path(
+            data.get("signal_file_path"))
     if "advance_close_enabled" in data:
         patch["advance_close_enabled"] = bool(data.get("advance_close_enabled"))
     if "advance_close_time" in data:

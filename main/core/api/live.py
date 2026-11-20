@@ -113,6 +113,7 @@ from core.services.live_service import (  # noqa: E402
     aggregate_positions_from_trades as _aggregate_positions_from_trades,
     engine_virtual_positions as _engine_virtual_positions,
     normalize_pre_open_overrides,
+    normalize_signal_file_path,
 )
 
 
@@ -206,10 +207,9 @@ def create_session(data: dict, db: Session = Depends(get_db)):
         data["backtest_record_id"] = None
     # 外部信号注入（0011）：通达信「条件预警」输出文件路径；空串/缺省 → None（不启用，
     # 走 TQ 公式计算）。填写后该会话信号来源改为文件，停用 TQ 公式链路（二者互斥）。
-    signal_file_path = data.get("signal_file_path")
-    if signal_file_path is not None:
-        signal_file_path = str(signal_file_path).strip() or None
-    data["signal_file_path"] = signal_file_path
+    # 归一化（去引号 / 展开 %VAR% 与 ~）统一在 service 层，避免多入口各写一份。
+    data["signal_file_path"] = normalize_signal_file_path(
+        data.get("signal_file_path"))
     # 14:50 提前收盘价（仅 1d）：开关默认 false；时点默认 14:51，限定 14:51–14:59
     # （须晚于 14:50 分钟 bar 闭合、早于收盘）。周线/月线不提前，回测忽略。
     data["advance_close_enabled"] = bool(data.get("advance_close_enabled"))
