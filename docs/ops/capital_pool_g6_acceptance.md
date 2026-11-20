@@ -188,6 +188,14 @@ main\.venv\Scripts\python.exe -m pytest main/core/tests -q -p no:cacheprovider
 | 三项开关 | `capital_enforce_enabled=0`、`cash_outlet_mode=OFF`、`sell_scope=platform_only`（全局，会话列仍 NULL） |
 | `alembic_version` | `h5b6c7d8e9f0` |
 
+### 6.4 15:10 备份/续跑锁争用修复（2026-11-20 收盘后）
+
+- 现象：15:10:13 / 15:10:31 两次 `account snapshot capture error ... database is locked`（15:10:49 自愈，快照未断）。
+- 根因（只读核对 + 日志时序）：续跑在判废处 `db.delete(ckpt); db.flush()` 即开启 SQLite 库级写事务，锁一直持有到函数末尾 commit，横跨整个回测计算（本次 session 1 约 15:10:04→15:10:15、session 3 15:10:20→15:10:40）；同一分钟自动备份 `VACUUM INTO`（读事务，15:10:03→15:10:20）又把 WAL 收敛拖到最后。实盘快照写入 `busy_timeout=5000ms`，等不到写锁即报错。备份用 `VACUUM INTO`（一致性快照，非文件拷贝），本身不持写锁，但会显著延长争用窗口。
+- 修复（不改业务语义/回测结果/订单与撮合）：① 判废事件与旧 checkpoint 删除推迟到计算完成后的写库段（同一事务，失败仍整体回滚）；② 新增进程内 `db.MAINTENANCE_GATE`，自动备份与增量回测互斥——抢不到就让出本轮（不落记录、不跳过当日备份，60s 后重试），手动备份最多等 120s。
+- 验证：新增 3 个用例（计算期间无 DML、备份持闸时续跑让出、续跑持闸时备份让出且随后正常产出），`test_backup_service.py` / `test_incremental_checkpoint_rebuild.py` / `test_incremental_backtest.py` 共 70 passed。原争用可在单测中按同一机制复现（旧实现于计算前即 emit DELETE）。
+- 生效条件：调度线程在 API 进程内，需重启后端后生效；本报告落笔时未重启。
+
 ## 7. 未覆盖项与需拍板事项
 
 1. **#4 业务 KPI（判据已按 0021 §3.3 修订）**：35%–45% 降为参考区间，正式判据三条——

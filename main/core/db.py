@@ -1,6 +1,7 @@
 import logging
 import os
 import sys
+import threading
 from pathlib import Path
 from sqlalchemy import create_engine, event
 from sqlalchemy.orm import sessionmaker
@@ -45,6 +46,13 @@ engine = create_engine(
     connect_args={"check_same_thread": False, "timeout": 5},
 )
 SessionLocal = sessionmaker(bind=engine)
+
+#: 进程内「长耗时库任务」互斥闸：自动备份（VACUUM INTO 长读事务）与增量回测
+#: （跨计算的写事务）都由 15:10 的调度线程触发，同分钟撞车时会与实盘快照写入
+#: 抢 SQLite 写锁（busy_timeout 5s 超时报 database is locked，2026-11-20 实测）。
+#: 约定：两类任务开始前非阻塞抢闸，抢不到就让本轮调度跳过（60s 后重试），
+#: 二者永不同时运行；闸只保护这两类维护任务，不介入实盘订单/撮合路径。
+MAINTENANCE_GATE = threading.Lock()
 
 
 @event.listens_for(engine, "connect")

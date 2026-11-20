@@ -552,3 +552,28 @@ def test_restore_api_reports_refusal(monkeypatch):
     ver, res = asyncio.run(_call())
     assert ver.json()["code"] == 400 and "不存在" in ver.json()["message"]
     assert res.json()["code"] == 400 and "未启用" in res.json()["message"]
+
+
+# ---------------------------------------------------------------- 与增量回测错开（2026-11-20）
+def test_auto_backup_defers_when_incremental_holds_gate(
+        tmp_path, session_factory, live_db):
+    """增量回测持闸时自动备份让出：不落记录、不产生半成品，稍后重试。"""
+    db, _conn = live_db
+    dest = tmp_path / "backup"
+    from core.db import MAINTENANCE_GATE
+
+    assert MAINTENANCE_GATE.acquire(blocking=False)
+    try:
+        r = _run(bs.KIND_AUTO, db, dest, session_factory)
+    finally:
+        MAINTENANCE_GATE.release()
+
+    assert r["status"] == bs.STATUS_DEFERRED and r["id"] is None
+    assert not dest.exists() or not list(dest.glob("*"))
+    with session_factory() as s:
+        assert s.query(bs.DataBackupRecord).count() == 0
+
+    # 让出后下一轮正常出备份（闸已释放）
+    r2 = _run(bs.KIND_AUTO, db, dest, session_factory)
+    assert r2["status"] == bs.STATUS_SUCCESS
+    assert Path(r2["path"]).exists()

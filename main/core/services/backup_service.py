@@ -25,7 +25,7 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from core.config import app_root, load_config, use_app_root
-from core.db import SessionLocal, engine
+from core.db import SessionLocal, engine, MAINTENANCE_GATE
 from core.engine.live.timing import now_shanghai
 from core.models import DataBackupRecord, LiveSession
 
@@ -37,6 +37,8 @@ KIND_MANUAL = "manual"
 STATUS_SUCCESS = "success"
 STATUS_SKIPPED = "skipped"
 STATUS_FAILED = "failed"
+#: 本轮让出（增量回测正在写库），不落记录、不消耗当日自动备份机会，60s 后重试。
+STATUS_DEFERRED = "deferred"
 
 DEFAULT_ENABLED = True
 DEFAULT_DAILY_AT = "15:10"
@@ -306,11 +308,31 @@ def cleanup_auto(dest_dir: Path, stem: str, keep: int) -> list:
     return removed
 
 
-def run_backup(kind: str = KIND_MANUAL, *, db_path=None, backup_dir=None,
-               cfg: Optional[dict] = None, session_factory=None,
-               now_fn: Callable[[], datetime] = now_shanghai,
-               free_mb_fn: Callable[[Path], float] = free_disk_mb) -> dict:
-    """执行一次备份（手动/自动共用同一实现），返回记录 dict。
+def run_backup(kind: str = KIND_MANUAL, **kwargs) -> dict:
+    """执行一次备份（手动/自动共用入口），返回记录 dict。
+
+    与增量回测通过 ``MAINTENANCE_GATE`` 互斥（2026-11-20 15:10 争用）：自动备份
+    抢不到就让出本轮（返回 ``status=deferred``、不落记录，调度器 60s 后重试，
+    不会跳过当日备份）；手动备份最多等 120s，仍拿不到才让出。
+    抢到后在 finally 释放，保证 VACUUM INTO 半途失败也不会把闸永久占死。
+    """
+    timeout = 0.0 if kind == KIND_AUTO else 120.0
+    if not MAINTENANCE_GATE.acquire(timeout=timeout):
+        logger.info("增量回测写入中，%s备份本轮延后（60s 后重试）",
+                    "自动" if kind == KIND_AUTO else "手动")
+        return {"id": None, "kind": kind, "status": STATUS_DEFERRED,
+                "message": "增量回测写入中，本轮让出，稍后重试"}
+    try:
+        return _run_backup_impl(kind, **kwargs)
+    finally:
+        MAINTENANCE_GATE.release()
+
+
+def _run_backup_impl(kind: str = KIND_MANUAL, *, db_path=None, backup_dir=None,
+                     cfg: Optional[dict] = None, session_factory=None,
+                     now_fn: Callable[[], datetime] = now_shanghai,
+                     free_mb_fn: Callable[[Path], float] = free_disk_mb) -> dict:
+    """备份的实际执行体（只在持有 ``MAINTENANCE_GATE`` 时调用）。
 
     失败/跳过都会落记录并写日志，绝不假装成功；调用方按 ``status`` 判定。
     """

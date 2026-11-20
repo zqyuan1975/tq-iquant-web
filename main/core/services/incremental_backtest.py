@@ -34,7 +34,7 @@ from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from core.config import load_config
-from core.db import SessionLocal
+from core.db import SessionLocal, MAINTENANCE_GATE
 from core.engine.backtest_engine import BacktestEngine, build_prev_close_by_day
 from core.engine.bar_poller import parse_bar_time, to_ohlcv
 from core.engine.event import OrderEvent
@@ -84,6 +84,10 @@ from core.services.notify_service import notify
 from tq_iquant_shared.constants import SignalType, TradeType
 
 logger = logging.getLogger(__name__)
+
+#: 抢 ``MAINTENANCE_GATE`` 的最长等待（秒）：备份 VACUUM INTO 约 15–20s，
+#: 等一轮即可，超时就让出本轮（调度器 60s 后重试）。
+GATE_WAIT_SECONDS = 30.0
 
 _TZ = ZoneInfo("Asia/Shanghai")
 
@@ -1498,9 +1502,20 @@ def run_incremental(db: Session, session_id: int, portfolio_strategy_id: int,
     now = now or datetime.now(_TZ)
     today = today or now.date()
     cfg = _cfg()
-    with _INCR_LOCK:
-        return _run_incremental_locked(db, session_id, portfolio_strategy_id,
-                                       today, cfg, force_rebuild=force_rebuild)
+    # 与自动备份互斥（2026-11-20 15:10 争用）：备份正在 VACUUM INTO 时不进入
+    # 计算+写库，本轮直接让出，调度器 60s 后会重试；不阻塞、不丢任务。
+    if not MAINTENANCE_GATE.acquire(timeout=GATE_WAIT_SECONDS):
+        logger.info(
+            "incremental backtest deferred (session %s, ps %s): 自动备份进行中",
+            session_id, portfolio_strategy_id)
+        return {"status": "deferred",
+                "reason": "自动备份进行中，本轮跳过（调度器稍后重试）"}
+    try:
+        with _INCR_LOCK:
+            return _run_incremental_locked(db, session_id, portfolio_strategy_id,
+                                           today, cfg, force_rebuild=force_rebuild)
+    finally:
+        MAINTENANCE_GATE.release()
 
 
 def _run_incremental_locked(db: Session, session_id: int,
@@ -1553,6 +1568,9 @@ def _run_incremental_locked(db: Session, session_id: int,
     )
     state = None
     invalidated: Optional[dict] = None
+    #: 判废的旧 checkpoint 与事件文案推迟到写库阶段落库（见「判废落库」块）。
+    stale_ckpt = None
+    invalidation_message = ""
     if ckpt is not None:
         try:
             state = json.loads(ckpt.state_json)
@@ -1575,23 +1593,14 @@ def _run_incremental_locked(db: Session, session_id: int,
                 session_id, ps_id, ckpt.as_of_date, "；".join(reasons))
             # K3：判废即落决策事件（工作台红标 + 事后追溯，随重建事务一并提交；
             # 重建失败回滚时事件同步回滚，避免「未真正作废」的假告警）。
-            db.add(LiveDecisionEvent(
-                live_session_id=session_id,
-                gate="incremental_checkpoint",
-                layer="live_gate",
-                action="invalidated",
-                param_name="portfolio_strategy_id",
-                actual_value=float(ps_id),
-                message=("；".join(reasons))[:200],
-            ))
-            # 作废 checkpoint 与随后的重建放在**同一事务**（flush 不 commit）：
-            # 旧实现先 delete+commit，若本轮重建在取数/引擎处失败（提前 return），
-            # 库里只剩空 checkpoint——旧 as_of/days/validations 不清、摘要继续按
-            # 旧口径展示。flush 立刻执行 DELETE（SQLAlchemy 同 flush 内 INSERT
-            # 先于 DELETE，不 flush 会撞 (session, ps) 唯一键），提交由本函数末尾
-            # 的事务统一完成；中途失败则回滚，旧 checkpoint 原样保留。
-            db.delete(ckpt)
-            db.flush()
+            #
+            # 2026-11-20 15:10 争用修复：此处只记文案，事件与旧 checkpoint 删除
+            # 都推迟到写库阶段（见下方「判废落库」块）。SQLite 是库级写锁，原实现
+            # 在这里 flush 后锁会横跨整个回测计算（数秒到数十秒），与自动备份
+            # 同分钟触发时，实盘快照写入 busy_timeout=5s 超时即报 database is locked。
+            # 事务边界不变：事件/删除/新 checkpoint/逐日行仍在同一事务内提交。
+            invalidation_message = ("；".join(reasons))[:200]
+            stale_ckpt = ckpt
             ckpt = None
             state = None
 
@@ -1755,6 +1764,23 @@ def _run_incremental_locked(db: Session, session_id: int,
     # 分项指纹随 checkpoint 落盘：下次作废时据此定位「哪一类变化」（旧 checkpoint
     # 无该字段 → 日志标注按参数变化处理）。
     payload["params_fp_parts"] = fp["parts"]
+    # 「判废落库」：计算全部完成后才真正写库，写锁只覆盖本段与末尾 commit。
+    # 与判废事件、新 checkpoint、逐日行同一事务；中途失败仍整体回滚（旧 checkpoint
+    # 原样保留、事件不落库），与推迟前的语义一致。
+    if stale_ckpt is not None:
+        db.add(LiveDecisionEvent(
+            live_session_id=session_id,
+            gate="incremental_checkpoint",
+            layer="live_gate",
+            action="invalidated",
+            param_name="portfolio_strategy_id",
+            actual_value=float(ps_id),
+            message=invalidation_message,
+        ))
+        # SQLAlchemy 同 flush 内 INSERT 先于 DELETE，这里先 flush DELETE，
+        # 避免新 checkpoint 的 (session, ps) 唯一键与旧行相撞。
+        db.delete(stale_ckpt)
+        db.flush()
     if ckpt is None:
         ckpt = IncrementalBacktestCheckpoint(
             session_id=session_id, portfolio_strategy_id=ps_id,
