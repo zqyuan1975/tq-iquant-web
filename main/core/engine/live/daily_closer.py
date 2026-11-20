@@ -439,6 +439,16 @@ class DailyCloser:
                         period, portfolio.portfolio_id, daily_time,
                     )
                     continue
+                # 停止请求可能在驱动途中到达（2026-11-19 实证：15:06:22 停止会话，
+                # _on_bar 因停止闸直接短路、并未做信号/风控判定，但旧实现仍记
+                # 已驱动并标 daily_bars_done_date）。此时立即收尾，绝不标记完成，
+                # 让账面如实反映「本轮未跑」而不是「已跑过」。
+                if self._stop_requested():
+                    logger.warning(
+                        "daily bar drive truncated by stop request (session %s, %s, "
+                        "portfolio %s): 不标记日线完成，留待重启后重跑",
+                        self._ctx.session_id, daily_time, portfolio.portfolio_id)
+                    return
                 self._daily_driven_keys.add(done_key)
         if undriven:
             logger.warning(
@@ -446,6 +456,13 @@ class DailyCloser:
                 "skipped by bridge offline, 不标记完成，下一轮 60s tick 重试",
                 self._ctx.session_id, daily_time, undriven,
             )
+            return
+        # 收尾前再确认一次：停止请求若在最后一个组合驱动后、标记前到达，同样不能
+        # 落「已完成」——否则风控被短路却看起来跑过了。
+        if self._stop_requested():
+            logger.warning(
+                "daily bar drive truncated by stop request before mark-done "
+                "(session %s, %s): 不标记日线完成", self._ctx.session_id, daily_time)
             return
         self._mark_daily_bars_done(today)
         logger.info(

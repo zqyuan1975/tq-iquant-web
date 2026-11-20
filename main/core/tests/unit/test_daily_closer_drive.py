@@ -136,6 +136,48 @@ def test_all_portfolios_driven_marks_done():
     assert closer._daily_bars_done(_TODAY) is True
 
 
+def test_stop_during_drive_does_not_mark_done_and_stops_remaining():
+    """停止请求在驱动途中到达：立即收尾，不驱动剩余组合，也不标完成。
+
+    2026-11-19 实证：15:06:22 停止会话，_handle_bar 因停止闸直接短路（信号/风控
+    都没跑），但旧实现仍把 (周期,组合) 记为已驱动并在收尾标 daily_bars_done_date，
+    账面看起来「日终轮跑过了」。
+    """
+    driven = []
+    state = {"stop": False}
+
+    def on_bar(portfolio, bar_event, **kw):
+        driven.append(portfolio.portfolio_id)
+        state["stop"] = True  # 模拟驱动途中收到停止请求
+
+    closer, offline = _mk_closer(on_bar)
+    closer._ctx.stop_requested = lambda: state["stop"]
+    closer.maybe_daily_bars(_NOW)
+
+    assert driven == [1]  # 停止后不再驱动组合 2
+    assert offline == []
+    assert closer.last_daily_bar_date is None
+    assert closer._daily_bars_done(_TODAY) is False
+
+
+def test_stop_after_last_portfolio_still_does_not_mark_done():
+    """最后一个组合刚驱动完就收到停止：收尾前的二次确认同样不能标完成。"""
+    driven = []
+    state = {"stop": False}
+
+    def on_bar(portfolio, bar_event, **kw):
+        driven.append(portfolio.portfolio_id)
+        state["stop"] = portfolio.portfolio_id == 2
+
+    closer, _ = _mk_closer(on_bar)
+    closer._ctx.stop_requested = lambda: state["stop"]
+    closer.maybe_daily_bars(_NOW)
+
+    assert driven == [1, 2]
+    assert closer.last_daily_bar_date is None
+    assert closer._daily_bars_done(_TODAY) is False
+
+
 def test_fetch_1d_bars_aborts_on_stop_request():
     """停止中必须中断全池日线拉取：否则 engine.stop() 排队等全池遍历，
     会话永远停在 stopping（掘金桥单只 ~8s，496 只可达数十分钟）。"""
