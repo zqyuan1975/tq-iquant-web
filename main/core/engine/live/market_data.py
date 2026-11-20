@@ -28,6 +28,7 @@ from ..event import BarEvent
 from ..http_bridge_dispatcher import BridgeUnavailableError
 from ...tq.utils import TDXLockTimeout
 from ..bar_poller import parse_bar_time, to_ohlcv, latest_completed_bar
+from .native_minute import latest_closed_bar
 from ..portfolio import Portfolio
 from .context import EngineContext
 from .timing import _to_int
@@ -73,6 +74,11 @@ class MarketDataService:
             _poller_dispatcher = getattr(bar_poller, "_dispatcher", None)
             snapshot_synth = getattr(_poller_dispatcher, "synthesizer", None)
         self._snapshot_synth = snapshot_synth
+        # 原生分钟数据源健康态（开关 live.native_minute.enabled 打开时由
+        # NativeMinuteDispatcher 挂出）：周期派发据此决定「用原生还是回落聚合」。
+        # 关闭时 dispatcher 为 SnapshotQuoteDispatcher，无该属性 → None，行为不变。
+        self._native_minute = getattr(
+            getattr(bar_poller, "_dispatcher", None), "minute_health", None)
         # 驱动一根 bar 的 on_bar 管线（引擎传入 self._handle_bar 绑定方法）；本服务
         # 不反向 import LiveEngine，周期/日终 bar 经此回调交回引擎完成下单/风控。
         self._on_bar = on_bar
@@ -260,6 +266,11 @@ class MarketDataService:
             return "no_strategy"
         gate_freshness = period in _FRESHNESS_GATED_PERIODS
         today = boundary_time.date()
+        native = self._native_minute
+        # 原生分钟源已判定停滞（下载工具未开/被关/清单未更新）→ 本轮不派发
+        # 原生周期 bar，直接走下方快照聚合兜底；留痕由 NativeMinuteDispatcher
+        # 的状态机统一发出（回落/恢复都写 WARNING/INFO + risk 事件）。
+        native_stalled = native is not None and native.is_fallback(boundary_time)
         bars_by_code: Dict[str, list] = {}
         stocks: Dict[str, dict] = {}
         stale: List[tuple] = []  # [(code, bar_time)]：最新完成 bar 非当日，被闸拦下
@@ -273,9 +284,17 @@ class MarketDataService:
             cp_counts[code] = cp_count
             bars = self.get_bars_with_increment(code, period, cp_count)
             if not bars:
+                if native_stalled:
+                    stale.append((code, None))
                 continue
             bars_by_code[code] = bars
-            cb = latest_completed_bar(bars)
+            if native_stalled:
+                stale.append((code, None))
+                continue
+            # 原生开关打开：按墙钟只取已闭合 bar（标签 <= 边界时刻），未完成桶
+            # 不进入信号/风控；关闭时保持旧语义（最新一根一律当 forming 丢掉）。
+            cb = (latest_closed_bar(bars, boundary_time)
+                  if native is not None else latest_completed_bar(bars))
             if cb is None:
                 continue
             bt = parse_bar_time(cb)

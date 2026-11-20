@@ -849,6 +849,25 @@ def _live_bridge_online(engine) -> bool:
     return bool(engine.dispatcher.heartbeat())
 
 
+def _native_minute_status(engine) -> dict:
+    """原生分钟数据源运行态（未启用/未运行 → ``{"enabled": False}``）。
+
+    数据来自 BarPoller 的 ``NativeMinuteDispatcher.minute_health``：最后前进
+    时刻、滞后秒数、是否已回落快照合成及原因。工作台常驻提示据此升级告警。
+    """
+    if engine is None:
+        return {"enabled": False}
+    try:
+        poller = getattr(engine, "_bar_poller", None)
+        dispatcher = getattr(poller, "_dispatcher", None)
+        health = getattr(dispatcher, "minute_health", None)
+        if health is None:
+            return {"enabled": False}
+        return health.status()
+    except Exception:  # noqa: BLE001 — 观测字段异常不影响会话详情
+        return {"enabled": False}
+
+
 def _engine_state_freshness(engine) -> Tuple[Optional[str], bool]:
     """引擎状态新鲜度：(checked_at, stale)。
 
@@ -1692,6 +1711,9 @@ def build_engine(
     # 轮询（盘中 1m 退化，行为同旧版）。
     snapshot_synth = None
     poller = None
+    # 原生分钟数据源健康态（开关 live.native_minute.enabled；None=未启用/构建失败
+    # → 沿用快照合成）。引擎创建后挂 on_transition，回落/恢复写 risk 事件留痕。
+    _native_minute_health = None
     try:
         from core.tq.data import TQData
         from core.engine.live.snapshot_bars import (
@@ -1712,8 +1734,33 @@ def build_engine(
                 fetch_snapshot=lambda codes: TQData().get_market_snapshot_batch(
                     list(codes), []),
             )
+            _poller_dispatcher = SnapshotQuoteDispatcher(snapshot_synth)
+            # 可选开关（默认关）：1m/5m 读原生 .lc1/.lc5，停滞自动回落上面的
+            # 快照合成。开关打开但构建失败 → 记异常并保持快照合成（默认路径）。
+            _live_cfg = load_config().get("live") or {}
+            _native_cfg = _live_cfg.get("native_minute") or {}
+            if bool(_native_cfg.get("enabled", False)):
+                try:
+                    from core.engine.live.native_minute import (
+                        MinuteSourceHealth, NativeMinuteDispatcher,
+                    )
+                    _native_minute_health = MinuteSourceHealth(
+                        stall_timeout_seconds=float(
+                            _native_cfg.get("stall_timeout_seconds", 180) or 180),
+                    )
+                    _poller_dispatcher = NativeMinuteDispatcher(
+                        health=_native_minute_health,
+                        fallback=_poller_dispatcher,
+                    )
+                    logger.info(
+                        "原生分钟数据源已启用（stall_timeout=%ss）：1m 读 .lc1，"
+                        "5m 读 .lc5，15m/30m/1h 走原生周期",
+                        _native_minute_health.stall_timeout_seconds)
+                except Exception:
+                    logger.exception("原生分钟数据源构建失败，沿用快照合成")
+                    _native_minute_health = None
             poller = BarPoller(
-                SnapshotQuoteDispatcher(snapshot_synth), poll_codes,
+                _poller_dispatcher, poll_codes,
                 period="1m", count=10,
             )
     except Exception:
@@ -1950,6 +1997,11 @@ def build_engine(
         backup_engine=getattr(session_row, "backup_engine", None),
         failover_enabled=bool(getattr(session_row, "failover_enabled", False)),
     )
+    # 原生分钟数据源回落/恢复 → risk 事件留痕（回落不能静默）。引擎刚创建，
+    # 回调在此挂；开关关闭时为 None，零行为变化。
+    if _native_minute_health is not None:
+        _native_minute_health.on_transition = lambda payload: eng._emit(
+            "risk", dict(payload, session_id=session_id, engine=_engine_key))
     # 桥慢响应告警接引擎事件流（risk/bridge_slow，dispatcher 侧已按 endpoint
     # 冷却去重）；仅 HTTP 桥 dispatcher 有 on_slow 钩子，其它通道不受影响。
     if hasattr(dispatcher, "on_slow"):
@@ -2797,11 +2849,15 @@ def get_session(db: Session, session_id: int, engine: Optional[LiveEngine] = Non
         cal = getattr(engine, "_calendar", None)
         data["trading_calendar"] = (
             cal.status() if cal is not None and hasattr(cal, "status") else None)
+        # 原生分钟数据源（开关 live.native_minute.enabled）：最后前进时刻 /
+        # 滞后秒数 / 是否已回落快照合成；未启用或未运行 {"enabled": False}。
+        data["minute_source"] = _native_minute_status(engine)
     else:
         data["bridge_online"] = None
         data["pending_orders"] = 0
         data["last_backfill_time"] = None
         data["reconcile_mismatches"] = []
+        data["minute_source"] = {"enabled": False}
         data["signal_source"] = (
             {"enabled": False, "path": session.signal_file_path,
              "note": "会话未运行：信号链路状态需启动后可见"}

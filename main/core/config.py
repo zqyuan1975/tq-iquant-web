@@ -277,6 +277,16 @@ def _defaults() -> dict:
                 "enabled": False,
                 "chain": ["tq", "iquant", "goldminer"],
             },
+            # 原生分钟数据源（2026-11-20，默认关闭）：开启后实盘盘中 1m 读
+            # 本地原生 .lc1、5m 读 .lc5，15m/30m/1h 走原生周期（与回测同源），
+            # 只取标签 <= 当前墙钟的已闭合 bar（未完成桶丢弃）；判新只看 bar
+            # 标签前进。原生数据超过 stall_timeout_seconds 未前进（下载工具
+            # 未开/被关）→ 自动回落快照合成并留痕（回落/恢复都有 WARNING 日志
+            # 与 risk 事件）。关闭 → 行为与接入前逐字一致（快照合成）。
+            "native_minute": {
+                "enabled": False,
+                "stall_timeout_seconds": 180,
+            },
             # F4（2026-11-18）：收盘后抽样交叉校验（默认关闭）。15:05 收盘清扫后
             # 抽样若干代码，比较两路日线收盘价，偏差超 max_dev_pct 记 risk 事件
             # （gate=data_cross_check）。只观测，不影响交易判定。

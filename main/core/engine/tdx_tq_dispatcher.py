@@ -158,6 +158,61 @@ def _call(fn, *args, **kwargs):
             return fn(*args, **kwargs)
 
 
+def raw_to_bars(raw: dict, period: str) -> Dict[str, list]:
+    """TQ ``get_history_raw`` 原始数据 → ``{code: [bar, ...]}``（模块级复用）。
+
+    ``query_quote``（单股）、``query_quotes_batch``（批量）与实盘原生分钟
+    数据源（``core.engine.live.native_minute``）共用，保证取数/字段口径
+    与主通道逐字一致。无该周期 Close/空 → ``{}``；单字段缺帧按 0.0；
+    stime 非 14 位丢弃。
+    """
+    out: Dict[str, list] = {}
+    block = raw.get(period) or {}
+    close = block.get("Close")
+    if close is None or getattr(close, "empty", True):
+        return out
+
+    def _value(field: str, code: str, ts) -> float:
+        frame = block.get(field)
+        if frame is None:
+            return 0.0
+        try:
+            v = float(frame.at[ts, code])
+        except Exception:
+            return 0.0
+        # 批量失败走 _fetch_per_stock 逐只拉取 + pd.concat(axis=1) 时，
+        # 各股票日期区间不同会产生 NaN 行；NaN 会毒化下游指标与价格。
+        return 0.0 if v != v else v
+
+    for col in getattr(close, "columns", []):
+        code = str(col)
+        bars = []
+        for ts in close.index:
+            try:
+                stime = ts.strftime("%Y%m%d%H%M%S")
+            except Exception:
+                digits = re.sub(r"\D", "", str(ts))
+                stime = digits[:14] if len(digits) >= 14 else ""
+            if len(stime) != 14:
+                continue
+            cl = _value("Close", code, ts)
+            # 收盘价缺失/NaN/≤0 的 bar 无意义（停牌或拼接产物），丢弃
+            # 以免污染信号与实时估值。
+            if cl <= 0:
+                continue
+            bars.append({
+                "stime": stime,
+                "open": _value("Open", code, ts),
+                "high": _value("High", code, ts),
+                "low": _value("Low", code, ts),
+                "close": cl,
+                "volume": _value("Volume", code, ts),
+                "amount": _value("Amount", code, ts),
+            })
+        out[code] = bars
+    return out
+
+
 class TdxTqDispatcher(OrderDispatcher):
     """通达信 TQ 官方接口下单通道（同进程直连通达信客户端）。"""
 
@@ -693,57 +748,8 @@ class TdxTqDispatcher(OrderDispatcher):
         return out
 
     def _raw_to_bars(self, raw: dict, period: str) -> Dict[str, list]:
-        """TQ get_history_raw 原始数据 → {code: [bar, ...]}。
-
-        query_quote（单股）与 query_quotes_batch（批量）共用的转换逻辑，
-        bar 字段规则与原 query_quote 逐字一致：无该周期 Close/空 → {}；
-        单字段缺帧按 0.0；stime 非 14 位丢弃。
-        """
-        out: Dict[str, list] = {}
-        block = raw.get(period) or {}
-        close = block.get("Close")
-        if close is None or getattr(close, "empty", True):
-            return out
-
-        def _value(field: str, code: str, ts) -> float:
-            frame = block.get(field)
-            if frame is None:
-                return 0.0
-            try:
-                v = float(frame.at[ts, code])
-            except Exception:
-                return 0.0
-            # 批量失败走 _fetch_per_stock 逐只拉取 + pd.concat(axis=1) 时，
-            # 各股票日期区间不同会产生 NaN 行；NaN 会毒化下游指标与价格。
-            return 0.0 if v != v else v
-
-        for col in getattr(close, "columns", []):
-            code = str(col)
-            bars = []
-            for ts in close.index:
-                try:
-                    stime = ts.strftime("%Y%m%d%H%M%S")
-                except Exception:
-                    digits = re.sub(r"\D", "", str(ts))
-                    stime = digits[:14] if len(digits) >= 14 else ""
-                if len(stime) != 14:
-                    continue
-                cl = _value("Close", code, ts)
-                # 收盘价缺失/NaN/≤0 的 bar 无意义（停牌或拼接产物），丢弃
-                # 以免污染信号与实时估值。
-                if cl <= 0:
-                    continue
-                bars.append({
-                    "stime": stime,
-                    "open": _value("Open", code, ts),
-                    "high": _value("High", code, ts),
-                    "low": _value("Low", code, ts),
-                    "close": cl,
-                    "volume": _value("Volume", code, ts),
-                    "amount": _value("Amount", code, ts),
-                })
-            out[code] = bars
-        return out
+        """兼容既有调用点：转调模块级 ``raw_to_bars``（实盘原生源共用）。"""
+        return raw_to_bars(raw, period)
 
     def query_quote(self, code: str, period: str = "1m", count: int = 10) -> list:
         """行情复用 Core 同进程内嵌的 TQ 模块（与回测取数口径一致）。
