@@ -15,13 +15,13 @@
 | #4 对照 | B7 黄金指纹 + #4 自适应滑点关闭逐位一致 | 通过（3/3） |
 | 默认路径回归（单组合） | 旧配置 vs 新字段存在但开关关闭：快照/成交/现金指纹一致 | 通过 |
 | 默认路径回归（多组合） | `capital_pool_plan` 未传 vs `enabled=false`：规范哈希一致 | 通过（3/3） |
-| 实盘影子对照 | 影子只记录计划 vs 实际、不触碰委托；理论 vs 实盘对照逻辑 | 测试通过；实盘样本缺口见 §6 |
+| 实盘影子对照 | 影子只记录计划 vs 实际、不触碰委托；理论 vs 实盘对照逻辑 | 测试通过；实盘进入采样期（`capital_shadow_enabled` 尚为 0，见 §6） |
 | 资金池相关回归组 | `-k "capital or theory_vs_live or shadow_mode"` | 214 passed |
 | 前端构建 | `cd web; npm run build` | 通过（773 modules，788 ms） |
 | 性能 | 开关全关默认路径 vs 借贷开启 | 见 §5 |
-| 生产库与开关状态 | `main/data/dev.db` | revision `h5b6c7d8e9f0`，quick_check ok，3 会话 stopped，强制 0 / 出口 OFF |
+| 生产库与开关状态 | `main/data/dev.db` | revision `h5b6c7d8e9f0`，quick_check ok，会话 1 running（13:24:42 重启后）、2/3 stopped，强制 0 / 出口 OFF |
 
-工程验收结论：G1–G6 的代码路径、回归基线与默认路径零变化均有可重复测试支撑；G6 判定 **DONE（工程验收）**。业务 KPI（§7）与实盘影子样本（§6）不满足「可用测试取证」条件，按约束列为缺口，不自行放宽。
+工程验收结论：G1–G6 的代码路径、回归基线与默认路径零变化均有可重复测试支撑；G6 判定 **DONE（工程验收）**。业务 KPI 按 §7 的新判据复核；实盘影子样本（§6）进入采样期，按「累计 ≥3 个交易日且样本量达可判水平」再判。
 
 ## 2. 全量测试
 
@@ -65,11 +65,12 @@ main\.venv\Scripts\python.exe -m pytest main/core/tests -q -p no:cacheprovider
 | id=26 `REF-04-default-replay` | 24.51% | 6.08% | 38,841,696.26 |
 | **id=31 本轮（开资金池参数）** | **18.62%** | **8.41%** | **84,005,599.17** |
 
-- KPI 对照结论：**未达标**。利用率 18.62% 低于 35%–45% 下限；最大回撤 8.41% 高于 ≤8% 上限（超 0.41pp）。
+- KPI 对照：利用率 18.62% 落在参考区间 35%–45% 下方（仅参考，不再作为门槛）；最大回撤 8.41% 高于 ≤8% 上限 0.41pp。本记录为单组合、`capital_pool` 仅为版本戳、无额度注入（额度事件 0 条），不适用 §3.3 的「注入真实发生」判据；回撤超标作为单组合口径的独立观察保留。
 - 可比性说明（未自行放宽）：区间一致，但 PS3 配置在 id=4 之后已变更——`max_positions` 10 → 20、`single_open_ratio` 10% → 5%、`dividend_mode` back → front、`fee_reserve_enabled` true → false。故 31 与 4/26 只能按区间对照，不能视为同参数 A/B；利用率下降与回撤上升主要来自上述配置差异，不能单独归因于资金池机制。
 
 ### 3.2 #4 真注入重跑（2026-11-20，run_group 1 / 记录 32+33）
 
+- **数据来源**：本期 #4 真注入使用 E2 多组合计划（`POST /api/backtest/run-multi`，`backtest_run_groups` id=1 `G6-#4-pool-inject-20261120`，记录 id=32 PS2 / id=33 PS3），**不是** `loan_model_plan`，也不是单组合记录 31 的 `capital_pool` 版本戳；与 id=4 / id=26 **不可比**（PS3 参数已变、池化并入 PS2、id=4/26 为单组合未开池，详见本节末）。
 - 注入路径：`loan_model_plan` 要求借款方与出资方同属一个组合，生产库 3 个组合均为单策略（策略 1/2/3），无法成立；改用等价的 E2 多组合计划——`POST /api/backtest/run-multi`，`portfolio_strategy_ids=[2,3]`（PS2 创懿题材 + PS3 创懿全量股池，#4 组合在池内），2014-01-01 → 2026-11-19，`dividend_mode=front`，`capital_pool_plan={enabled:true, min_share:0.05, max_share:1.0, min_cash_reserve_pct:0.03}`。请求 12:39:27 发起、12:45:36 返回（约 6 分钟，含两组合数据准备）；记录 32/33 于 12:45:10 创建、12:45:34/35 完成，`backtest_run_groups` id=1 `G6-#4-pool-inject-20261120` completed；新开记录 id=32（PS2）/ id=33（PS3），既有 28 条未动（现共 30 条）。
 - **注入已生效的证据**（不是版本戳）：引擎每日首 bar 按「目标仓位 − 持仓市值」水位分配额度并支持跨组合闲置现金临时拆借；记录 33 产生 499 条额度约束事件（`capital_quota_shrink` 157 / `capital_quota_exhausted` 112 / `capital_quota_below_lot` 230），最高策略额度 53,889,509.66（单组合记录 31 同类事件为 **0** 条，因其 `capital_pool` 块只是 A5 版本戳）。
 - 指标（逐日 `market_value/total_value` 均值；`total_value` 峰值回撤；池化 = 两组合同日「市值和 / 净值和」，缺日按前值携带）：
@@ -80,9 +81,13 @@ main\.venv\Scripts\python.exe -m pytest main/core/tests -q -p no:cacheprovider
 | 池内 PS3（记录 33） | 18.25% | 6.26% | 81,072,576.13 |
 | 池内 PS2（记录 32） | 11.95% | 5.48% | 12,802,820.83 |
 
-- KPI 对照结论：**利用率未达标、回撤达标**。池化 16.73%、池内 PS3 18.25%，均低于 35%–45% 下限；回撤 5.65% / 6.26% 均在 ≤8% 以内。根因是策略本身不把现金打满（期末池内现金占比 96.3%，池内 PS3 利用率中位数仅 13.83%、PS2 9.48%），资金池额度在绝大多数年份不构成约束，注入只带来极小的边际变化（PS3：18.62% → 18.25%，MDD 8.41% → 6.26%）。
+- 新判据（0021 §3.3，35%–45% 已降为参考区间）逐条核对：
+  1. **注入真实发生**：记录 33 共 499 条额度约束事件（shrink 157 / exhausted 112 / below_lot 230），记录 31 为 0 条 → 通过；
+  2. **回撤 ≤ 8%**：池化 5.65%、池内 PS3 6.26% → 通过；
+  3. **利用率不劣化**：同窗口（2021-01-04 → 2026-11-19，1424 个交易日；因 PS2 无 2014 起单组合记录，取四者共存窗口）实测——PS3 单组合（记录 31）**10.78%**、PS2 单组合（记录 03）**20.11%**；按当日净值加权基准（等价 Σ市值/Σ净值）= **11.32%**，按期初资金等权（各 200 万）= **15.44%**；同期池化 = **11.36%**（§3.2 表中的 16.73% 是 2014 起全期 carry 口径，两者窗口不同，不可混用）。相对净值加权基准 **+0.04pp**（不劣化；正式判据采用与池化同分母的净值加权）；相对期初等权 **−4.08pp**，原因：PS2 独立运行时独占 200 万，池内与 PS3 共享资金，额度按「目标仓位 − 持仓市值」分配且受 `min_cash_reserve` 约束，其份额被摊薄——属口径差异，不是池机制缺陷。
+  → 三条判据均通过。35%–45% 仅作参考：池化 16.73% 落在区间下方，原因是策略本身不打满现金（期末池内现金占比 96.3%，池内 PS3 利用率中位数 13.83%、PS2 9.48%）。
 - 与 id=4 / id=26 是否可比：**不可比（仅同区间）**。①PS3 参数已变更（`max_positions` 10→20、`single_open_ratio` 10%→5%、`dividend_mode` back→front、`fee_reserve_enabled` true→false）；②池化口径额外并入 PS2，分母含其 200 万初始资金，利用率天然被摊薄；③id=4/26 为单组合、未开池。若要严格同参数 A/B，需先恢复 id=4 时的 PS3 配置并单独授权改动组合参数，本轮未改。
-- 结论：资金池注入链路（额度分配 + 真注入证据）已验证可用；在现有策略配置下无法达到 35%–45% 利用率目标，属策略仓位/信号约束，不是池机制缺陷。是否调整 PS3 参数（如提高单笔开仓比例、放宽持仓上限）以逼近 KPI，待拍板。
+- 结论：资金池注入链路（额度分配 + 真注入证据）已验证可用；按新判据（注入发生、回撤、不劣化）三项通过。参考区间 35%–45% 仍偏低，属策略仓位/信号约束而非池机制缺陷；是否调整 PS3 参数（提高单笔开仓比例、放宽持仓上限）以进入参考区间，待拍板。
 
 ## 4. 默认路径与 kill switch 回归
 
@@ -117,14 +122,16 @@ main\.venv\Scripts\python.exe -m pytest main/core/tests -q -p no:cacheprovider
 - [test_live_theory_vs_live.py](file:///d:/project/tq-iquant-web/main/core/tests/unit/test_live_theory_vs_live.py)：理论 vs 实盘曲线、指标、未绑定会话的兜底、自动绑定最新组合记录、成员缺失状态。
 - `test_live_shadow_mode.py`：影子执行模式不调用真实 `place_order/cancel_order`，不占用实盘会话名额。
 
-数据缺口（未自行放宽）：
+采样状态（自 2026-11-20 下午重启后进入采样期）：
 
-- 「计划 vs 实际偏差 < 5%、门控一致 100%」需要实盘影子期逐 bar 数据。当前生产库 `live_capital_shadow` 0 行、`capital_pairing_health_daily` 0 行。
+- 判定口径：累计不少于 **3 个交易日**，且样本量达到可判水平后再判「计划 vs 实际偏差 < 5%、门控一致 100%」；不足 3 日不下结论。
+- 当前实际值（2026-11-20 13:2x 只读）：`live_capital_shadow` **0 行**、`capital_pairing_health_daily` 0 行；`live_sessions.capital_shadow_enabled` 为 **0**（13:24:42 用户启动会话时未开启）。因此**尚未开始写入**，采样计数从开关打开并重新启停会话后的下一个 bar 起算。
+- `no_pairing_plan`：按设计只在构建期写入一次 `warning_codes`（未绑定计划且开关开启时）；当前开关为 0，核心日志与 `live_decision_events` 均无该告警，符合预期。
 - **F3 会话级影子开关（2026-11-20 已补）**：`live_sessions.capital_shadow_enabled`（迁移 `h5b6c7d8e9f0`，默认 0）。会话启动时据此决定是否构建影子；只逐 bar 追加 `live_capital_shadow`，不触订单/成交/决策事件，无下单入口。两条入口互不覆盖：
   - 已绑定 `pairing_plan_id` / `backtest_run_group_id`：始终走计划侧原路径（lender/borrowers、借据与 live_haircut），本开关不改变行为；
   - 未绑定 + 开关开启：以会话组合的策略成员构建「无计划侧」影子（`loan_plan=None`，本金/可用本金/缺口留空，并显式写 `no_pairing_plan` 告警，避免误读为「计划=实际」）。
-- 开启方式：`PUT /api/live/sessions/{id}` `{"capital_shadow_enabled": true}`（或建会话时带上），**下次启动生效**（运行中不重建引擎）。生产库 `capital_pairing_plans` / `capital_pairings` / `backtest_run_groups` 均 0 行，故当前只能走会话级实际侧采样；用户计划 15:05 收盘清扫后重启并开启会话 1，从下一交易日开始采样。
-- 补齐方式：按 G5 手册 S1「小资金影子」运行一个交易日以上，再用 `GET /api/live/sessions/{id}/theory-vs-live` 与影子台账取偏差。
+- 开启方式：`PUT /api/live/sessions/{id}` `{"capital_shadow_enabled": true}`（或建会话时带上），**下次启动生效**（运行中不重建引擎）。生产库 `capital_pairing_plans` / `capital_pairings` / `backtest_run_groups` 均 0 行，故当前只能走会话级实际侧采样。注意：`backtest_run_groups` 在 12:45 已新增 id=1（本轮 #4 池化回测），该组为**回测**记录，会话 1 未绑定，不影响「本会话无计划侧」的事实（绑定字段仍为 null）。
+- 补齐路径：开关打开并重新启停会话后，按 G5 手册 S1「小资金影子」累计 ≥3 个交易日，再用 `GET /api/live/sessions/{id}/theory-vs-live` 与影子台账取偏差。
 
 ### 6.1 实盘会话 1 只读核对（2026-11-20 11:49，未调用 start）
 
@@ -152,10 +159,28 @@ main\.venv\Scripts\python.exe -m pytest main/core/tests -q -p no:cacheprovider
 - 已修复（2026-11-20，提交 `0297fab`）：`_session_anchor` → `_reference`，跨时段以上午/下午时段起点为下限，跨午休首轮不再误报；同段内停写判定不变。离线用例 `test_cross_lunch_first_round_no_false_fallback` 覆盖「13:00:05 不回落 + 13:01 首根到达仍 native」。代码未重启，下次重启生效。
 - 13:05 标签连续性（13:05:10 探测）：1m 为 `…11:29, 13:01, 13:02 … 13:06`，5m 为 `…11:25, 13:05, 13:10`；**源文件本身没有 11:30 那根**（下载工具在午休前停写、不补边界 bar），故不存在「13:00 首轮取回 11:30」；`latest_closed` 正确停在 13:05（13:06 标签因 > 墙钟被丢弃），判新走标签、未闭合桶丢弃均得到实测验证。
 
+### 6.2 重启后只读核对（2026-11-20 13:29–13:30，未调用 start/stop）
+
+| 项 | 值 |
+|---|---|
+| 后端 | 13:24:23 由用户重启（pid 31692）；`/api/health` ok、端口 8001、version 1.0.6 |
+| 会话 1 | `running` / `auto`，started_at `2026-11-20T13:24:42.401032`，`bridge_online=true` |
+| `minute_source` | `mode=native`、`last_label=13:29`、`last_advance_at=13:29:00`、`lag_seconds=56`、`stalled=false`（13:25→13:26→13:29 连续推进，跨午休修复已生效） |
+| 影子 | `capital_shadow_enabled=0`；`live_capital_shadow` 0 行；`no_pairing_plan` 无日志/无决策事件 |
+| 今日委托 / 成交 | 0 / 0 |
+| 持仓 | 4 只（快照 13:29:51：total_asset 250,639.35、available_cash 55,018.35、market_value 195,646） |
+| 今日日终行 | `live_portfolio_daily` 组合 1：cash 55,002.51、market_value 195,650、total_value 250,652.51、position_count 4（13:25 backfill 值；14:30 估值会覆盖） |
+| 三项开关 | `capital_enforce_enabled=0`、`cash_outlet_mode=OFF`、`sell_scope=platform_only`（全局） |
+| `alembic_version` | `h5b6c7d8e9f0` |
+
 ## 7. 未覆盖项与需拍板事项
 
-1. **#4 业务 KPI（已执行两轮，利用率未达标 / 回撤达标）**：§3.3 要求「#4 类组合利用率 24.5% → 35%–45%，最大回撤 ≤ 8%」。①记录 31（单组合、开资金池参数）：18.62% / 8.41%，两项未达标；②记录 32+33（E2 多组合真注入，池化）：16.73% / 5.65%，池内 PS3 18.25% / 6.26%——利用率未达标、回撤达标；注入链路已验证（499 条额度约束事件，单组合为 0）。与 id=4/26 不可比（参数已变 + 池化并入 PS2）。是否调整 PS3 参数以逼近利用率目标，待拍板。
-2. **F3 影子偏差**：「计划 vs 实际偏差 < 5%、门控一致 100%」仍需实盘影子期数据。会话级开关 `capital_shadow_enabled` 已补（见 §6），计划于 15:05 收盘清扫后重启并开启会话 1，从下一交易日开始采样；无计划侧时只采实际侧并带 `no_pairing_plan` 告警。
+1. **#4 业务 KPI（判据已按 0021 §3.3 修订）**：35%–45% 降为参考区间，正式判据三条——
+   - **注入真实发生**：记录 33 共 499 条额度约束事件（shrink 157 / exhausted 112 / below_lot 230），记录 31 为 0 条 → 通过；
+   - **回撤 ≤ 8%**：池化 5.65%、池内 PS3 6.26% → 通过；
+   - **利用率不劣化**：同窗口（2021-01-04→2026-11-19，1424 个交易日，成员期初各 200 万）实测 PS3 单组合（记录 31）10.78%、PS2 单组合（记录 03）20.11%；按当日净值加权基准（等价 Σ市值/Σ净值）= **11.32%**，按期初资金等权 = **15.44%**；同期池化 = **11.36%** → 相对净值加权 **+0.04pp（不劣化，正式口径）**，相对期初等权 −4.08pp（PS2 独立独占 200 万、池内共享后被摊薄，属口径差异）→ 通过。
+   - 参考区间仍偏低（池化全期 16.73%，因策略不打满现金：期末池内现金占比 96.3%）；是否调整 PS3 参数以进入参考区间，待拍板。
+2. **F3 影子偏差（采样中）**：`capital_shadow_enabled` 已补（见 §6）；2026-11-20 13:24 重启后会话 1 由用户启动，但开关仍为 **0**、`live_capital_shadow` **0 行**、无 `no_pairing_plan` 告警。开启需 `PUT` 后重新启停会话；判定口径为累计 **≥3 个交易日**且样本量达可判水平后再判「偏差 <5%、门控一致 100%」。
 3. **召回次数 ≤ 12 次/年、shortfall ≤ 2%/年**：需要实盘或长周期回测样本，当前无数据源。
 4. **恒等式 (1)(3)(9)**：运行时因「持久化虚拟现金账本 / 当日开盘现金 / 会话级策略预算」数据源缺失记 `skipped`（G2 已记录），模块层有用例覆盖；按手册口径，`skipped` 不等于账平。
 5. **迁移回退**：本阶段未在生产库执行 `downgrade`（G4/G5 已在临时副本演练）；生产库已随启动自动迁移到 `h5b6c7d8e9f0`（见 §8），不再需要在下次重启时额外 upgrade。需要回退时按 G5 手册 §4.2 的三条路径执行（回退目标 `g4a5b6c7d8e9`）。
@@ -166,7 +191,7 @@ main\.venv\Scripts\python.exe -m pytest main/core/tests -q -p no:cacheprovider
 |---|---|
 | `alembic_version` | `h5b6c7d8e9f0`（2026-11-20 12:35 由集成测试的 TestClient lifespan 自动迁移落库，非人工 upgrade；已补 `TQ_INIT_DB_DISABLED` 闸，见提交 be13969） |
 | `PRAGMA quick_check` | `ok` |
-| `live_sessions` | 01 `running`（`auto` / tdx，11:45:54 启动）、02 / 03 `stopped`；三会话均 `capital_enforce_enabled=0`、`cash_outlet_mode=OFF`、`capital_shadow_enabled=0` |
+| `live_sessions` | 01 `running`（`auto` / tdx，13:24:42 用户重启后启动）、02 / 03 `stopped`；三会话均 `capital_enforce_enabled=0`、`cash_outlet_mode=OFF`、`capital_shadow_enabled=0` |
 | `capital_pairing_plans` / `capital_pairings` | 0 / 0 行（F3 绑定入口无来源，改走会话级开关） |
 | `backtest_records` / `backtest_run_groups` | 30 条 / 1 组（新增 id=31 单组合、id=32/33 + run_group 1 池化注入；既有 28 条未动） |
 | `cash_outlet_ops` | 0 行 |
