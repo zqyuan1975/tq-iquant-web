@@ -6,6 +6,7 @@ B4b：/orders、/trades、/positions 三个历史查询端点。
 """
 from datetime import datetime
 from decimal import Decimal
+import json
 import logging
 import time
 
@@ -26,6 +27,14 @@ from core.models import (
 from core.engine.position import Position
 import core.api.live as live_api
 from core.services import live_service as live_svc
+
+
+@pytest.fixture(autouse=True)
+def _isolate_stop_audit(tmp_path, monkeypatch):
+    """stop 审计重定向到测试临时目录（不污染真实 logs/stop_audit.jsonl）。"""
+    audit = tmp_path / "stop_audit.jsonl"
+    monkeypatch.setattr(live_api, "_stop_audit_path", lambda: audit)
+    return audit
 
 
 @pytest.fixture
@@ -471,6 +480,56 @@ def test_stop_session_is_idempotent(client, mock_bridge):
     assert resp.json()["data"]["status"] == "stopped"
 
 
+def test_stop_writes_structured_audit(client, mock_bridge, _isolate_stop_audit):
+    """/stop 落一条结构化审计：会话/来源 IP:port/结果/停止前状态/无鉴权说明。"""
+    c, Session = client
+    db = Session()
+    ps_id = _seed(db)
+    db.close()
+
+    sid = _create_session(c, portfolio_ids=(ps_id,))
+    c.post("/api/live/sessions/%d/start" % sid)
+    c.post("/api/live/sessions/%d/stop" % sid)
+
+    lines = _isolate_stop_audit.read_text(encoding="utf-8").splitlines()
+    assert len(lines) == 1
+    row = json.loads(lines[0])
+    assert row["session_id"] == sid
+    assert row["session_name"] == "live-test"
+    assert row["result"] == "success"
+    assert row["status_before"] == "running"
+    assert row["status_after"] == "stopping"
+    assert row["operator"] == "无鉴权，无法识别操作者"
+    assert row["source_ip"] == "testclient"
+    assert row["source_port"] is not None
+    assert "命中引擎" in row["reason"]
+    assert row["process"].startswith("pid=")
+    assert row["ts"]
+
+    # 留痕可从接口查到（与直接看 logs/stop_audit.jsonl 等价）
+    resp = c.get("/api/live/sessions/%d/stop-audits" % sid)
+    items = resp.json()["data"]["items"]
+    assert len(items) == 1
+    assert items[0]["session_id"] == sid
+
+
+def test_stop_audit_records_failure_for_missing_session(
+        client, _isolate_stop_audit):
+    """会话不存在 → 请求失败也要留痕（result=failed + 原因），不伪造状态。"""
+    c, _Session = client
+    resp = c.post("/api/live/sessions/999999/stop")
+    assert resp.status_code == 200
+    assert resp.json()["code"] == 404
+
+    lines = _isolate_stop_audit.read_text(encoding="utf-8").splitlines()
+    row = json.loads(lines[-1])
+    assert row["session_id"] == 999999
+    assert row["result"] == "failed"
+    assert row["status_before"] is None
+    assert row["status_after"] is None
+    assert "不存在" in row["reason"]
+
+
 def test_stop_with_missing_engine_warns_process_tag(client, caplog):
     """DB 显示 running 但本进程无引擎（另一进程持有）→ 必须 WARNING 带 pid/port。"""
     c, Session = client
@@ -491,8 +550,10 @@ def test_stop_with_missing_engine_warns_process_tag(client, caplog):
     assert resp.json()["code"] == 0
     assert resp.json()["data"]["status"] == "stopped"
 
+    # 只看「stop 请求」诊断行：审计 JSON 里也会带同样的原因文字（不参与本断言）
     msgs = [r.getMessage() for r in caplog.records
-            if "注册表未找到" in r.getMessage()]
+            if r.getMessage().startswith("stop 请求")
+            and "注册表未找到" in r.getMessage()]
     assert len(msgs) == 1
     assert "pid=" in msgs[0] and "port=" in msgs[0]
     assert "另一后端进程" in msgs[0]

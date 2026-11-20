@@ -2,7 +2,9 @@ import asyncio
 import json
 import logging
 import os
+import threading
 from datetime import date, datetime, timedelta
+from pathlib import Path
 from typing import Dict, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Request
@@ -476,8 +478,58 @@ async def start_session(session_id: int, data: Optional[dict] = None,
         })
 
 
+_STOP_AUDIT_OPERATOR = "无鉴权，无法识别操作者"
+_STOP_AUDIT_FILENAME = "stop_audit.jsonl"
+_STOP_AUDIT_LOCK = threading.Lock()
+
+
+def _stop_audit_path() -> Path:
+    """审计文件：与 core.log/access.log 同目录（开发态仓库 logs/，打包态可写根 logs/）。"""
+    from core.logging_config import _log_dir
+    return _log_dir() / _STOP_AUDIT_FILENAME
+
+
+def _write_stop_audit(request: Request, session_id: int,
+                      session_name: Optional[str], status_before: Optional[str],
+                      status_after: Optional[str], result: str,
+                      reason: str) -> None:
+    """POST /stop 的结构化审计留痕（JSONL，一行一次请求；2026-11-20）。
+
+    系统无鉴权：``operator`` 固定记录「无鉴权，无法识别操作者」，不伪造身份。
+    写文件失败只告警，绝不影响停止本身（审计不得改变交易结果）。
+    查询：``GET /api/live/sessions/{id}/stop-audits`` 或直接看 ``logs/stop_audit.jsonl``。
+    """
+    client = getattr(request, "client", None)
+    record = {
+        "ts": datetime.now().isoformat(timespec="seconds"),
+        "event": "live_session_stop_request",
+        "session_id": session_id,
+        "session_name": session_name,
+        "source_ip": getattr(client, "host", None),
+        "source_port": getattr(client, "port", None),
+        "operator": _STOP_AUDIT_OPERATOR,
+        "result": result,
+        "reason": reason,
+        "status_before": status_before,
+        "status_after": status_after,
+        "process": runtime.process_tag(),
+    }
+    line = json.dumps(record, ensure_ascii=False)
+    try:
+        path = _stop_audit_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with _STOP_AUDIT_LOCK:
+            with path.open("a", encoding="utf-8") as fh:
+                fh.write(line + "\n")
+        # 同一条记录也进 core.log（WARNING），便于与状态变更行按时间对齐排查
+        logger.warning("stop 审计：%s", line)
+    except Exception:  # noqa: BLE001 — 留痕失败不得影响停止
+        logger.exception("stop 审计写入失败（session %s）", session_id)
+
+
 @router.post("/sessions/{session_id}/stop")
-async def stop_session(session_id: int, db: Session = Depends(get_db)):
+async def stop_session(session_id: int, request: Request,
+                       db: Session = Depends(get_db)):
     """停止会话。幂等：已停止的会话重复调用仍返回 200（此前返回 404）。
 
     与 start 共用 _START_LOCK：start 的建引擎/心跳在 threadpool 里是秒级的，
@@ -487,17 +539,31 @@ async def stop_session(session_id: int, db: Session = Depends(get_db)):
     async with _START_LOCK:
         session = db.query(LiveSession).filter(LiveSession.id == session_id).first()
         if not session:
+            _write_stop_audit(
+                request, session_id, None, None, None,
+                "failed", "会话不存在")
             return err(404, "资源不存在")
         if session_id not in _ENGINES and session.status not in ("running", "stopping"):
+            _write_stop_audit(
+                request, session_id, session.name,
+                session.status, session.status,
+                "success", "已停止且本进程无引擎，幂等返回")
             logger.info(
                 "stop 请求：会话 %s 已是 %s 且本进程无引擎，按幂等成功返回（%s）",
                 session_id, session.status, runtime.process_tag())
             return ok({"id": session_id, "status": "stopped"})
         prev_status = session.status
-        engine = svc.stop_session(db, session_id, _ENGINES)
+        try:
+            engine = svc.stop_session(db, session_id, _ENGINES)
+        except Exception as exc:  # noqa: BLE001 — 先留痕再抛给上层
+            _write_stop_audit(
+                request, session_id, session.name, prev_status, None,
+                "failed", "停止处理异常：%s" % exc)
+            raise
         if engine is None:
             # 关键诊断：本进程没有该会话的引擎却仍把 DB 置 stopped——若另一进程
             # 持有引擎，它会继续写快照/可能继续交易（2026-11-18 实证形态）。
+            reason = "本进程注册表未找到引擎（另一进程可能持有），仅置 DB stopped"
             logger.warning(
                 "stop 请求：本进程注册表未找到会话 %s 的引擎（%s，"
                 "registry_sessions=%s，db_status_before=%s）——仍置 stopped；"
@@ -505,10 +571,14 @@ async def stop_session(session_id: int, db: Session = Depends(get_db)):
                 session_id, runtime.process_tag(), sorted(_ENGINES),
                 prev_status)
         else:
+            reason = "本进程注册表命中引擎，已置 stopping 并调度收敛"
             logger.info(
                 "stop 请求：本进程注册表命中会话 %s 的引擎（%s，"
                 "db_status_before=%s），置 _running=False 并调度收敛",
                 session_id, runtime.process_tag(), prev_status)
+        _write_stop_audit(
+            request, session_id, session.name, prev_status, session.status,
+            "success", reason)
         # 先同步置 _running=False，缩小「已置 stopped 但旧循环仍在轮询」的窗口，
         # 避免用户立刻 start 后新旧引擎并存各下一笔委托。
         if engine is not None:
@@ -524,6 +594,39 @@ async def stop_session(session_id: int, db: Session = Depends(get_db)):
             _STOP_TASKS.add(task)
             task.add_done_callback(_STOP_TASKS.discard)
         return ok({"id": session_id, "status": session.status})
+
+
+@router.get("/sessions/{session_id}/stop-audits")
+def list_stop_audits(session_id: int, limit: int = 50):
+    """查询该会话的 stop 请求留痕（读 ``logs/stop_audit.jsonl``，最新在前）。
+
+    系统无鉴权，``operator`` 恒为「无鉴权，无法识别操作者」。这也是留痕的查询
+    入口，等价于直接查看 ``logs/stop_audit.jsonl``（一行一条 JSON）。
+    """
+    try:
+        limit = max(1, min(int(limit), 500))
+    except (TypeError, ValueError):
+        limit = 50
+    path = _stop_audit_path()
+    if not path.exists():
+        return ok({"items": [], "path": str(path)})
+    try:
+        with _STOP_AUDIT_LOCK:
+            lines = path.read_text(encoding="utf-8").splitlines()
+        items = []
+        for line in reversed(lines):
+            try:
+                row = json.loads(line)
+            except ValueError:
+                continue
+            if row.get("session_id") == session_id:
+                items.append(row)
+                if len(items) >= limit:
+                    break
+        return ok({"items": items, "path": str(path)})
+    except Exception:  # noqa: BLE001 — 读审计失败按 500 语义返回，不影响其它接口
+        logger.exception("stop 审计读取失败（session %s）", session_id)
+        return err(500, "审计读取失败")
 
 
 @router.post("/sessions/{session_id}/portfolios/{portfolio_id}/recover")
