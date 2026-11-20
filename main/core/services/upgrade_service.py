@@ -1,11 +1,13 @@
 # -*- coding: utf-8 -*-
-"""升级 / 回滚路径（批次22 L5）：只读版本校验 + 升级前强制备份。
+"""升级 / 回滚路径（批次22 L5）：启动后只读版本复核 + 升级前强制备份。
 
 设计边界
 --------
-- **绝不自动升级**：本模块只读取 Alembic 版本与脚本链，不执行 ``upgrade``；
-  真正升级仍由人工按台账步骤执行。
-- **默认关闭**：``upgrade.enabled``（默认 false）只控制启动时版本校验日志与
+- **启动自动迁移（真实行为）**：``core.main`` 的 lifespan 会调用 ``core.db.init_db()``，
+  后者执行 ``alembic upgrade head``——即**应用每次启动都会把库迁移到代码 head**
+  （失败则 fail-fast 阻断启动；``TQ_INIT_DB_DISABLED=1`` 可关闭，测试进程默认开启）。
+  本模块**不执行迁移**，只做迁移后的只读复核、升级前清单与备份。
+- **默认关闭**：``upgrade.enabled``（默认 false）只控制启动复核日志与
   「升级前备份」动作；关闭时新增入口不产生任何日志 / 写库。
 - **只读检查**：``preflight`` 仅读 ``alembic_version`` 表与备份记录，供系统配置页展示。
 - 备份复用 ``backup_service.run_backup``（VACUUM INTO 一致性副本），不触碰业务数据。
@@ -200,7 +202,12 @@ def preflight(now: Optional[datetime] = None,
 
 
 def startup_check() -> dict:
-    """启动时版本校验：仅在 ``upgrade.enabled=true`` 时输出告警，关闭时无副作用。"""
+    """启动后版本复核：init_db 已自动迁移，这里只做只读比对（不迁移）。
+
+    仅在 ``upgrade.enabled=true`` 时输出日志；关闭时无副作用。复核结果落后说明
+    启动迁移未执行成功（或被 ``TQ_INIT_DB_DISABLED=1`` 跳过），此时高亮告警，
+    但本函数绝不自行 upgrade。
+    """
     settings = guard_settings()
     if not settings["enabled"]:
         return {"enabled": False}
@@ -211,11 +218,13 @@ def startup_check() -> dict:
     if not status.get("at_head"):
         logger.warning(
             "升级检查：数据库版本 %s 落后于代码 head %s（待执行 %d 条迁移）；"
-            "请先备份再按台账执行 alembic upgrade head，本进程不会自动升级",
+            "正常情况下启动时 init_db 已自动迁移，若仍落后请检查迁移是否失败、"
+            "是否被 TQ_INIT_DB_DISABLED=1 跳过，或命令行迁移指向了别的库（TQ_DB_PATH）",
             status.get("current") or "空", status.get("heads"),
             status.get("pending_count"))
     else:
-        logger.info("升级检查：数据库版本已在 head（%s）", status.get("heads"))
+        logger.info("升级检查：数据库版本已在 head（%s，启动自动迁移后复核）",
+                    status.get("heads"))
     return {"enabled": True, **status}
 
 

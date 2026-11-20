@@ -1,3 +1,4 @@
+import logging
 import os
 import sys
 from pathlib import Path
@@ -5,6 +6,8 @@ from sqlalchemy import create_engine, event
 from sqlalchemy.orm import sessionmaker
 
 from core.config import app_root, is_frozen_app, load_config, use_app_root
+
+logger = logging.getLogger(__name__)
 
 # 锚定到 main/ 目录（本文件位于 main/core/db.py），让 sqlite_path 无论
 # 从哪个 cwd 启动都解析到同一绝对路径，消除对进程工作目录的依赖。
@@ -59,6 +62,15 @@ def _enable_sqlite_fk(dbapi_conn, connection_record):
     cursor.close()
 
 
+def _alembic_revisions() -> str:
+    """只读读取当前 alembic 版本（多 head 用逗号拼接），供启动迁移日志取证。"""
+    from alembic.runtime.migration import MigrationContext
+
+    with engine.connect() as conn:
+        current = sorted(MigrationContext.configure(conn).get_current_heads())
+    return ",".join(current) if current else "空"
+
+
 def init_db():
     """应用数据库迁移（Alembic upgrade head），替代原 Base.metadata.create_all。
 
@@ -97,7 +109,15 @@ def init_db():
         if (packaged / "env.py").exists():
             script_dir = packaged
     cfg.set_main_option("script_location", str(script_dir))
+    before = _alembic_revisions()
     command.upgrade(cfg, "head")
+    after = _alembic_revisions()
+    if after != before:
+        # 自动迁移必须留痕：否则「库怎么变了」只能靠 alembic 的 console 日志
+        # （pytest 下没有 FileHandler，真实迁移会完全无痕）。
+        logger.warning("init_db：启动自动迁移 %s → %s（已对齐 head）", before, after)
+    else:
+        logger.info("init_db：数据库已在 head（%s）", after)
 
 
 def get_db():
