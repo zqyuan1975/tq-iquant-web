@@ -519,8 +519,8 @@ class Portfolio:
         mismatched_risk：错周期 bar 是否跑风控。False 时周期不匹配的策略只更新
         价格快照，不评估止损/止盈/移动止损（周线/月线同样只在自身周期边界评估）。
         默认 False：回测与实盘同口径（实盘由会话三态
-        `live_sessions.intraday_mismatched_risk_enabled` 解析后传入：NULL 时按
-        会话内子策略周期自动推导——含分钟策略则开，否则关；显式值优先。
+        `live_sessions.intraday_mismatched_risk_enabled` 解析后传入：NULL（未显式设置）
+        一律为关闭，不因会话内存在分钟策略自动开启；显式值优先。
         14:51 提前收盘价轮次同样显式传 False）。
         inflight_risk_sells：strategy_id → 在途未结清的风控卖单股票集合（回测
         BacktestEngine 从 deferred 队列注入，含缩量未成交残量）。命中时该票本 bar
@@ -1274,7 +1274,13 @@ class Portfolio:
             quantity=quantity,
             price=_order_price(bar, sig.stock_code, close),
             bar_time=bar.bar_time,
-            signal_bar_date=_signal_bar_date_for(ctx.period, bar),
+            # 风控单（止损/止盈/移动止损）是保护性离场，**不走 risk_timing 顺延**：
+            # 触发即当日提交（若 bar 已在 15:00 之后，仍由 _submit_one_order 的收盘
+            # 守卫转 deferred——交易所已闭市）。普通信号单保持原有未来函数闸门口径。
+            signal_bar_date=(
+                None if sig.signal_type in _RISK_PRIORITY
+                else _signal_bar_date_for(ctx.period, bar)
+            ),
             period=bar.period,
         )]
 
