@@ -41,6 +41,12 @@ class LiveSession(Base):
     # 绑定某条回测记录后，启动时把 backtest_records.params_snapshot 与当前组合
     # 参数比对；差异默认只告警（决策事件 params_drift），不做 FK/不强阻断。
     backtest_record_id = Column(Integer, nullable=True)
+    # ---- F1 拼盘 / 运行组绑定（0021，2026-11-20）----
+    # 与 backtest_record_id 三选一（至多一个非空）：单记录 / 多组合运行组 /
+    # L2·L3 拼盘。软引用（不设 FK）：被引用对象删除不影响会话；仅作理论 vs 实盘
+    # 对照基准，不影响交易语义。
+    backtest_run_group_id = Column(Integer, nullable=True)
+    pairing_plan_id = Column(Integer, nullable=True)
     # 执行模式：alert（半自动，只预警不下单）/ auto（现有自动交易）。
     # 迁移前历史会话写 auto；新建会话由 live_service 显式写 alert。
     execution_mode = Column(String(10), nullable=False, server_default="auto")

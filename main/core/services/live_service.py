@@ -50,8 +50,8 @@ from core.models import (
     LivePositionPeak,
     LiveSessionPendingChange,
     LiveGlobalSwitch,
-    IncrementalBacktestCheckpoint, BacktestRecord,
-    BacktestDailySnapshot, BacktestTrade,
+    IncrementalBacktestCheckpoint, BacktestRecord, BacktestDailySnapshot,
+    BacktestTrade, BacktestRunGroup, CapitalPairingPlan,
 )
 from core.engine.portfolio_builder import assemble_portfolio
 try:
@@ -1979,6 +1979,8 @@ def list_sessions(db: Session, engines: Optional[Dict[int, LiveEngine]] = None) 
             "baseline_version": int(getattr(s, "baseline_version", 0) or 0),
             "portfolio_ids": sorted(p["portfolio_id"] for p in by_session.get(s.id, [])),
             "backtest_record_id": getattr(s, "backtest_record_id", None),
+            "backtest_run_group_id": getattr(s, "backtest_run_group_id", None),
+            "pairing_plan_id": getattr(s, "pairing_plan_id", None),
             "portfolios": by_session.get(s.id, []),
             # I-7（audit）：运行中引擎最近一次对账差异摘要；未运行（无引擎）为 []
             "reconcile_mismatches": (
@@ -2347,6 +2349,55 @@ def normalize_signal_file_path(raw) -> Optional[str]:
     return text or None
 
 
+#: 会话回测绑定三选一（0021 F1）：单记录 / 多组合运行组 / L2·L3 拼盘。
+SESSION_BINDING_FIELDS = ("backtest_record_id", "backtest_run_group_id",
+                          "pairing_plan_id")
+_BINDING_TARGETS = {
+    "backtest_record_id": (BacktestRecord, "回测记录"),
+    "backtest_run_group_id": (BacktestRunGroup, "回测运行组"),
+    "pairing_plan_id": (CapitalPairingPlan, "拼盘"),
+}
+
+
+def parse_session_binding(raw, field: str):
+    """解析单个绑定字段：空 → None；非整数/非正数 → (None, 400 错误)。"""
+    if raw is None or str(raw).strip() == "":
+        return None, None
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return None, (400, "%s 必须为整数或 null" % field)
+    if value <= 0:
+        return None, (400, "%s 必须为正整数" % field)
+    return value, None
+
+
+def validate_session_binding(db: Session, values: dict):
+    """三选一 + 引用存在性校验；返回 (ok, (status, message) | None)。
+
+    ``values`` 为三个绑定字段的生效值（缺省视为 None）。软引用只校验存在性，
+    不建 FK：被引用对象删除后会话仍可读取，仅提示基准缺失。
+    """
+    active = [f for f in SESSION_BINDING_FIELDS if values.get(f)]
+    if len(active) > 1:
+        return False, (400, "回测绑定三选一，不能同时设置：%s"
+                       % " / ".join(active))
+    for field in active:
+        model, label = _BINDING_TARGETS[field]
+        if db.query(model.id).filter(model.id == values[field]).first() is None:
+            return False, (400, "%s不存在：%s" % (label, values[field]))
+    return True, None
+
+
+def effective_session_binding(session, patch: dict) -> dict:
+    """合并 patch 与会话当前值，得到三个绑定字段的生效值。"""
+    return {
+        field: (patch[field] if field in patch
+                else getattr(session, field, None))
+        for field in SESSION_BINDING_FIELDS
+    }
+
+
 def create_session(db: Session, data: dict, mode: str) -> dict:
     """创建 session。新会话默认 alert；老会话由迁移保持 auto。"""
     execution_mode = data.get("execution_mode") or "alert"
@@ -2366,14 +2417,16 @@ def create_session(db: Session, data: dict, mode: str) -> dict:
         baseline_mode = "total_asset"
     if baseline_mode not in ("total_asset", "manual"):
         baseline_mode = "manual" if baseline_value is not None else "total_asset"
-    # H2 参数绑定（A7）：绑定某条回测记录后，启动时比对 params_snapshot 与实际参数。
-    # 软引用（不设 FK）：回测记录被删不影响会话；非法值静默忽略（API 层已校验存在性）。
-    backtest_record_id = data.get("backtest_record_id")
-    if backtest_record_id is not None:
-        try:
-            backtest_record_id = int(backtest_record_id)
-        except (TypeError, ValueError):
-            backtest_record_id = None
+    # H2/F1 绑定（三选一）：单记录 / 多组合运行组 / 拼盘。软引用（不设 FK）：
+    # 被引用对象被删不影响会话；非法值归一为 None，冲突组合直接拒绝
+    # （API 层已先行 400 校验，这里是服务层兜底，不落非法绑定）。
+    binding = {}
+    for field in SESSION_BINDING_FIELDS:
+        value, _ = parse_session_binding(data.get(field), field)
+        binding[field] = value
+    binding_ok, binding_error = validate_session_binding(db, binding)
+    if not binding_ok:
+        raise ValueError(binding_error[1])
     # A1 资金池模式（默认 off；非法值静默回退 off，API 层已做 400 校验）
     pool_mode = str(data.get("capital_pool_mode") or "off").strip()
     if pool_mode not in ("off", "equal", "risk_budget", "priority"):
@@ -2412,7 +2465,9 @@ def create_session(db: Session, data: dict, mode: str) -> dict:
         # 卖出范围：创建时把全局值固化为本会话初始档位（默认 platform_only=关闭）。
         # 之后全局配置变化不影响本会话，会话内切换也不反向改写全局。
         sell_scope=live_sell_scope(),
-        backtest_record_id=backtest_record_id,
+        backtest_record_id=binding["backtest_record_id"],
+        backtest_run_group_id=binding["backtest_run_group_id"],
+        pairing_plan_id=binding["pairing_plan_id"],
     )
     db.add(session)
     db.flush()
@@ -2425,7 +2480,9 @@ def create_session(db: Session, data: dict, mode: str) -> dict:
     return {"id": session.id, "status": session.status,
             "engine": session_engine(session),
             "execution_mode": session.execution_mode,
-            "backtest_record_id": backtest_record_id,
+            "backtest_record_id": binding["backtest_record_id"],
+            "backtest_run_group_id": binding["backtest_run_group_id"],
+            "pairing_plan_id": binding["pairing_plan_id"],
             "capital_pool_mode": pool_mode,
             "capital_pool_rebalance_enabled": pool_rebalance,
             "gate_recheck_on_execute": bool(
@@ -2470,6 +2527,9 @@ def get_session(db: Session, session_id: int, engine: Optional[LiveEngine] = Non
             getattr(session, "adopt_inherited_positions", True)),
         # H2 参数绑定（A7）：绑定的回测记录 + 当前参数与快照差异（None=未绑定）
         "backtest_record_id": getattr(session, "backtest_record_id", None),
+        "backtest_run_group_id": getattr(
+            session, "backtest_run_group_id", None),
+        "pairing_plan_id": getattr(session, "pairing_plan_id", None),
         "params_drift": compute_params_drift(db, session),
         # 外部信号注入（0011）：None=不启用
         "signal_file_path": session.signal_file_path,
@@ -2598,13 +2658,14 @@ SESSION_EDIT_FIELDS = (
     "capital_pool_rebalance_enabled", "portfolio_ids",
     "gate_recheck_on_execute",
     # 理论 vs 实盘面板的回测基准绑定（纯观测字段，不影响交易语义）
-    "backtest_record_id",
+    "backtest_record_id", "backtest_run_group_id", "pairing_plan_id",
     # G2：盘前参数会话级覆盖（NULL=跟随全局）
     "pre_open_auction_enabled", "pre_open_auction_end_time",
     "pre_open_auction_price_bias_pct",
 )
 #: 运行中立即生效的字段（纯展示/观测，不影响已加载的交易配置）。
-SESSION_IMMEDIATE_FIELDS = frozenset({"name", "backtest_record_id"})
+SESSION_IMMEDIATE_FIELDS = frozenset({
+    "name", *SESSION_BINDING_FIELDS})
 #: 运行中只能「下次启动生效」的字段。
 SESSION_NEXT_START_FIELDS = frozenset(SESSION_EDIT_FIELDS) - SESSION_IMMEDIATE_FIELDS
 
@@ -2635,7 +2696,8 @@ def _apply_session_field(db: Session, session: LiveSession, field: str, value) -
 
 
 def _normalize_session_patch(db: Session, data: dict,
-                             current_engine: Optional[str] = None):
+                             current_engine: Optional[str] = None,
+                             session: Optional[LiveSession] = None):
     """校验并归一 PUT body；返回 (patch, (status, message) | None)。"""
     patch: dict = {}
     if "name" in data:
@@ -2711,22 +2773,22 @@ def _normalize_session_patch(db: Session, data: dict,
     if "gate_recheck_on_execute" in data:
         patch["gate_recheck_on_execute"] = bool(
             data.get("gate_recheck_on_execute"))
-    if "backtest_record_id" in data:
-        raw = data.get("backtest_record_id")
-        if raw is None or str(raw).strip() == "":
-            patch["backtest_record_id"] = None
-        else:
-            try:
-                rec_id = int(raw)
-            except (TypeError, ValueError):
-                return None, (400, "backtest_record_id 必须为整数或 null")
-            if rec_id <= 0:
-                return None, (400, "backtest_record_id 必须为正整数")
-            exists = db.query(BacktestRecord.id).filter(
-                BacktestRecord.id == rec_id).first()
-            if exists is None:
-                return None, (400, "回测记录 #%d 不存在" % rec_id)
-            patch["backtest_record_id"] = rec_id
+    # F1 绑定三选一：单记录 / 运行组 / 拼盘（可空=解除绑定）。合并会话当前值
+    # 后校验，避免「只改其中一个」绕过互斥。
+    binding_patch: dict = {}
+    for field in SESSION_BINDING_FIELDS:
+        if field not in data:
+            continue
+        value, error = parse_session_binding(data.get(field), field)
+        if error:
+            return None, error
+        patch[field] = value
+        binding_patch[field] = value
+    if binding_patch and session is not None:
+        binding_ok, binding_error = validate_session_binding(
+            db, effective_session_binding(session, binding_patch))
+        if not binding_ok:
+            return None, binding_error
     if "portfolio_ids" in data:
         pids = data.get("portfolio_ids")
         if not isinstance(pids, list):
@@ -2789,7 +2851,8 @@ def update_session(db: Session, session_id: int, data: dict,
     session = db.query(LiveSession).filter(LiveSession.id == session_id).first()
     if session is None:
         return False, (404, "资源不存在")
-    patch, error = _normalize_session_patch(db, data, session_engine(session))
+    patch, error = _normalize_session_patch(
+        db, data, session_engine(session), session)
     if error:
         return False, error
     running = (session_id in engines
