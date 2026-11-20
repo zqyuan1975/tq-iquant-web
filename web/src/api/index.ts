@@ -3553,6 +3553,88 @@ export async function getPairingLoanModelPlan(planId: number) {
 }
 
 // ---------------------------------------------------------------------------
+// G3 拼盘健康指标（0020 §5.5；开关关闭时返回 enabled=false）
+// ---------------------------------------------------------------------------
+export interface PairingHealthItem {
+  code: string
+  label: string
+  value: number | boolean | null
+  state: string        // normal|watch|suspend|skipped
+  message: string
+  threshold: string
+}
+
+export interface PairingHealthRecord {
+  id: number
+  pairing_plan_id: number
+  pairing_id: number | null
+  as_of: string
+  status: string      // ACTIVE|WATCH|SUSPENDED|INSUFFICIENT
+  health_version: string | null
+  metrics: Record<string, unknown>
+  items: PairingHealthItem[]
+  streaks: Record<string, number>
+  reasons: string[]
+  normal_streak: number
+  evaluated_at: string | null
+}
+
+export interface PairingHealthHistory {
+  plan_id: number
+  plan_status: string
+  latest: PairingHealthRecord | null
+  history: PairingHealthRecord[]
+  retire_reason?: Record<string, unknown> | null
+  resume?: Record<string, unknown> | null
+}
+
+export interface PairingHealthEntry {
+  plan_id: number
+  name: string
+  scope: string
+  plan_status: string
+  latest: PairingHealthRecord | null
+}
+
+export async function listPairingHealth() {
+  const res = await api.get<ApiResponse<PairingHealthEntry[] | { enabled: boolean }>>('/pairing/health')
+  return res.data.data
+}
+
+export async function getPairingHealth(planId: number, limit = 30) {
+  const res = await api.get<ApiResponse<PairingHealthHistory>>(
+    `/pairing/plans/${planId}/health`, { params: { limit } })
+  return res.data.data
+}
+
+export async function recordPairingHealth(
+  planId: number,
+  metrics: Record<string, unknown>,
+  options?: { as_of?: string; pairing_id?: number },
+) {
+  const res = await api.post<ApiResponse<PairingHealthRecord>>(
+    `/pairing/plans/${planId}/health`, { metrics, ...(options || {}) })
+  return res.data.data
+}
+
+export async function resumePairingHealth(
+  planId: number, reason: string,
+  options?: { valid_until?: string; operator?: string },
+) {
+  const res = await api.post<ApiResponse<PairingHealthHistory>>(
+    `/pairing/plans/${planId}/health/resume`, { reason, ...(options || {}) })
+  return res.data.data
+}
+
+export async function retirePairingHealth(
+  planId: number, reason: string, operator?: string,
+) {
+  const res = await api.post<ApiResponse<PairingHealthHistory>>(
+    `/pairing/plans/${planId}/health/retire`, { reason, operator })
+  return res.data.data
+}
+
+// ---------------------------------------------------------------------------
 // 多组合回测批（0021 E3/E5，只读；聚合落库后冻结）
 // ---------------------------------------------------------------------------
 

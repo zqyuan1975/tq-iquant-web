@@ -845,6 +845,9 @@ class LiveEngine:
         self._capital_enforce_enabled = bool(
             capital_enforce_enabled and self._capital_enforce)
         self._capital_enforce_checked_at = 0.0
+        # G3：拼盘健康状态为 SUSPENDED/RETIRED 时暂停新增借出（不释放已有借据，
+        # 也不强制平仓）；恢复由人工确认后下一次节流刷新自动解除。
+        self._capital_health_blocked = False
         # G2 对账：只读恒等式，30s 节流；(2)(3)(4)(6) 失败 → 停止新增买入。
         self._capital_reconcile_at = 0.0
         self._capital_reconcile_block = ""
@@ -7405,11 +7408,31 @@ class LiveEngine:
         if db is None:
             return
         try:
-            from core.models import LiveSession
+            from core.models import CapitalPairingPlan, LiveSession
             row = db.query(LiveSession).filter(
                 LiveSession.id == self.session_id).first()
-            self._set_capital_enforce_enabled(
-                bool(getattr(row, "capital_enforce_enabled", False)))
+            enabled = bool(getattr(row, "capital_enforce_enabled", False))
+            self._set_capital_enforce_enabled(enabled)
+            # G3：健康暂停只停“新增借出”，不释放已有借据（人工恢复即恢复）。
+            plan_id = (self._capital_enforce or {}).get("plan_id")
+            blocked = False
+            if plan_id is not None:
+                plan_row = db.query(CapitalPairingPlan.status).filter(
+                    CapitalPairingPlan.id == int(plan_id)).first()
+                blocked = bool(plan_row and plan_row[0] in (
+                    "SUSPENDED", "RETIRED"))
+            if blocked != self._capital_health_blocked:
+                self._capital_health_blocked = blocked
+                self._emit("risk", {
+                    "gate": "capital_health",
+                    "rule": "health_suspend" if blocked else "health_resume",
+                    "action": "block_new_lending" if blocked else "restore",
+                    "session_id": self.session_id,
+                    "final_qty": None,
+                    "message": ("拼盘健康状态为暂停/退役：停止新增借出，"
+                                "存量借据按到期/召回自然回收" if blocked else
+                                "拼盘健康状态恢复：重新允许借据计入可用资金"),
+                })
         except Exception:  # noqa: BLE001 — 开关读取失败保持旧值
             logger.warning("capital enforce switch refresh failed (session %s)",
                            self.session_id, exc_info=True)
@@ -7456,8 +7479,10 @@ class LiveEngine:
         return target
 
     def _capital_enforce_net(self, portfolio_id: int) -> Decimal:
-        """该组合借据净额；强制关闭或未绑定拼盘时恒为 0（逐字原行为）。"""
+        """该组合借据净额；强制关闭、未绑定拼盘或健康暂停时恒为 0。"""
         if not self._capital_enforce_enabled or self._capital_enforce is None:
+            return Decimal("0")
+        if self._capital_health_blocked:
             return Decimal("0")
         return portfolio_delta(self._capital_enforce, portfolio_id)
 

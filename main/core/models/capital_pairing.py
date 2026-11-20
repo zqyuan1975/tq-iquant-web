@@ -1,5 +1,5 @@
 from sqlalchemy import (
-    Column, DateTime, ForeignKey, Integer, Numeric, String, Text,
+    Column, Date, DateTime, ForeignKey, Index, Integer, Numeric, String, Text,
 )
 from sqlalchemy.sql import func
 
@@ -93,6 +93,42 @@ class CapitalPairing(Base):
     effective_to = Column(DateTime, nullable=True)
     created_by = Column(String(50), nullable=True)
     created_at = Column(DateTime, server_default=func.now())
+
+
+class CapitalPairingHealthDaily(Base):
+    """实盘健康指标日快照（0020 §5.5 / 0021 G3）。
+
+    每个交易日一行：原始观测值 + 逐指标判定 + 连续计数 + 当日结论。
+    ``status`` 是拼盘健康状态（ACTIVE/WATCH/SUSPENDED），``INSUFFICIENT``
+    表示当日无任何可用观测（不改变既有状态，避免“没数据”被当成“恢复”）。
+    暂停只停新增借出，不强制平仓；恢复必须人工确认（见 ``resume_plan``）。
+    """
+
+    __tablename__ = "capital_pairing_health_daily"
+
+    id = Column(Integer, primary_key=True)
+    pairing_plan_id = Column(
+        Integer, ForeignKey("capital_pairing_plans.id", ondelete="CASCADE"),
+        nullable=False, index=True)
+    pairing_id = Column(
+        Integer, ForeignKey("capital_pairings.id", ondelete="SET NULL"),
+        nullable=True)
+    as_of = Column(Date, nullable=False, index=True)
+    status = Column(String(15), nullable=False)
+    health_version = Column(String(40), nullable=True)
+    metrics_json = Column(Text, nullable=True)
+    items_json = Column(Text, nullable=True)
+    streaks_json = Column(Text, nullable=True)
+    reasons_json = Column(Text, nullable=True)
+    normal_streak = Column(Integer, nullable=False, default=0,
+                           server_default="0")
+    evaluated_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, server_default=func.now())
+
+    __table_args__ = (
+        Index("ix_capital_pairing_health_plan_time",
+              "pairing_plan_id", "as_of"),
+    )
 
 
 class CapitalPairingEval(Base):

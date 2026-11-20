@@ -8,10 +8,19 @@
 - ``DELETE /api/pairing/plans/{id}``：仅草稿/归档可删；
 - ``GET  /api/pairing/plans/{id}/loan-model-plan``：给回测用的 B3 计划。
 
+G3 健康指标（0020 §5.5）：
+
+- ``GET  /api/pairing/health``：当前批准/观察/暂停/退役拼盘的最新健康；
+- ``GET  /api/pairing/plans/{id}/health``：单拼盘健康历史（含恢复/退役记录）；
+- ``POST /api/pairing/plans/{id}/health``：写入当日观测并判定（WATCH/SUSPENDED）；
+- ``POST /api/pairing/plans/{id}/health/resume``：人工恢复（连续 5 日正常 + 理由）；
+- ``POST /api/pairing/plans/{id}/health/retire``：永久退役（保留历史账本）。
+
 开关关闭（``capital_pool.enabled`` 或 ``pairing_enabled``，默认）一律返回
 ``enabled=false`` 且不读写业务表；拼盘操作不触碰实盘会话与交易链路。
 """
 import logging
+from datetime import date
 from typing import Optional
 
 from fastapi import APIRouter, Depends, Query
@@ -22,7 +31,7 @@ from core.api.response import err, ok
 from core.config import load_config
 from core.db import get_db
 from core.engine.capital_contracts import CapitalPoolSwitches, STATUS_DISABLED
-from core.services import pairing_service
+from core.services import capital_health, pairing_service
 from core.services.pairing_eligibility import evaluate_eligibility
 
 logger = logging.getLogger(__name__)
@@ -159,3 +168,92 @@ def pairing_loan_model_plan(plan_id: int, db: Session = Depends(get_db)):
         return err(404, str(exc))
     except pairing_service.PairingError as exc:
         return err(422, str(exc))
+
+
+# ---------------------------------------------------------------------------
+# G3 健康指标与自动暂停（0020 §5.5）
+# ---------------------------------------------------------------------------
+class HealthObservationRequest(BaseModel):
+    as_of: Optional[date] = None
+    pairing_id: Optional[int] = Field(None, ge=1)
+    metrics: dict = Field(default_factory=dict,
+                          description="当日观测：corr_20d/corr_60d/drawdown_excess_pp/"
+                                      "adv_participation/grab_ratio_month/"
+                                      "recall_per_year/shortfall_ratio/"
+                                      "shortfall_quarter_count/borrower_fill_rate/"
+                                      "lender_recovery_fill_rate/params_hash_match/"
+                                      "reconcile_failed")
+
+
+class HealthResumeRequest(BaseModel):
+    reason: str = Field(..., min_length=1, max_length=500)
+    valid_until: Optional[str] = Field(
+        None, description="恢复有效期（ISO 日期/时间，仅记录）")
+    operator: Optional[str] = Field(None, max_length=50)
+
+
+class HealthRetireRequest(BaseModel):
+    reason: str = Field(..., min_length=1, max_length=500)
+    operator: Optional[str] = Field(None, max_length=50)
+
+
+@router.get("/health")
+def list_pairing_health(db: Session = Depends(get_db)):
+    if _disabled_reasons():
+        return _disabled()
+    return ok(capital_health.list_health(db))
+
+
+@router.get("/plans/{plan_id}/health")
+def get_pairing_health(plan_id: int, limit: int = Query(30, ge=1, le=365),
+                       db: Session = Depends(get_db)):
+    if _disabled_reasons():
+        return _disabled()
+    try:
+        return ok(capital_health.health_history(db, plan_id, limit=limit))
+    except LookupError as exc:
+        return err(404, str(exc))
+
+
+@router.post("/plans/{plan_id}/health")
+def record_pairing_health(plan_id: int, payload: HealthObservationRequest,
+                          db: Session = Depends(get_db)):
+    if _disabled_reasons():
+        return _disabled()
+    try:
+        return ok(capital_health.record_health(
+            db, plan_id, payload.metrics, as_of=payload.as_of,
+            pairing_id=payload.pairing_id))
+    except LookupError as exc:
+        return err(404, str(exc))
+    except capital_health.HealthError as exc:
+        return err(409, str(exc))
+
+
+@router.post("/plans/{plan_id}/health/resume")
+def resume_pairing_health(plan_id: int, payload: HealthResumeRequest,
+                          db: Session = Depends(get_db)):
+    if _disabled_reasons():
+        return _disabled()
+    try:
+        return ok(capital_health.resume_plan(
+            db, plan_id, reason=payload.reason,
+            valid_until=payload.valid_until, operator=payload.operator))
+    except LookupError as exc:
+        return err(404, str(exc))
+    except capital_health.HealthError as exc:
+        return err(409, str(exc))
+
+
+@router.post("/plans/{plan_id}/health/retire")
+def retire_pairing_health(plan_id: int, payload: HealthRetireRequest,
+                          db: Session = Depends(get_db)):
+    if _disabled_reasons():
+        return _disabled()
+    try:
+        return ok(capital_health.retire_plan(
+            db, plan_id, reason=payload.reason, operator=payload.operator))
+    except LookupError as exc:
+        return err(404, str(exc))
+    except capital_health.HealthError as exc:
+        return err(409, str(exc))

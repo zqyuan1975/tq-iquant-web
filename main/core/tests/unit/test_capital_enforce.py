@@ -72,6 +72,7 @@ def _engine(cfg, enabled, ports):
         _capital_enforce_checked_at=0.0,
         _capital_reconcile_at=0.0,
         _capital_reconcile_block="",
+        _capital_health_blocked=False,
         _reserved_buy_cash=lambda pid: Decimal("0"),
         _latest_account_cash=None,
         _account_total_capital=None,
@@ -171,3 +172,23 @@ def test_capital_share_uses_effective_capital_and_restores_on_kill_switch():
     # 再次开启不会复借（只回收不新增）
     engine.set_capital_enforce_enabled(True)
     assert engine._capital_share(ports[1]) == Decimal("0.25")
+
+
+def test_health_suspend_blocks_new_lending_without_releasing_lots():
+    """G3：健康暂停只让借据净额为 0，不产生释放/新借记。"""
+    cfg = _build()
+    ports = [_port(1, 50000), _port(2, 10000), _port(3, 10000)]
+    engine = _engine(cfg, True, ports)
+    assert engine._buy_available_cash(ports[1]) == Decimal("64000.00")
+    outstanding = cfg["book"].total_outstanding()
+
+    engine._capital_health_blocked = True
+    assert engine._buy_available_cash(ports[1]) == Decimal("10000")
+    assert engine._buy_available_cash(ports[0]) == Decimal("50000")
+    # 借据仍在，暂停不强制平仓
+    assert cfg["book"].total_outstanding() == outstanding
+    assert cfg["book"].check_invariants() == []
+
+    engine._capital_health_blocked = False
+    assert engine._buy_available_cash(ports[1]) == Decimal("64000.00")
+    assert cfg["book"].total_outstanding() == outstanding

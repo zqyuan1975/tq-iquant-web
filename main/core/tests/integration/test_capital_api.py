@@ -128,3 +128,81 @@ def test_derive_not_derivable_returns_422(client, monkeypatch):
     body = c.get("/api/capital/derive", params={"portfolio_id": pid}).json()
     assert body["code"] == 422
     assert body["data"]["status"] == "not_derivable"
+
+
+# ---------------------------------------------------------------------------
+# G3 拼盘健康接口（默认关闭；开启后可写入观测、暂停、恢复、退役）
+# ---------------------------------------------------------------------------
+def _enable_pairing(monkeypatch):
+    monkeypatch.setattr(
+        "core.api.pairing.load_config",
+        lambda: {"capital_pool": {"enabled": True, "pairing_enabled": True}},
+    )
+
+
+def _seed_plan(Session) -> int:
+    db = Session()
+    from core.models import CapitalPairingPlan
+    plan = CapitalPairingPlan(
+        name="健康测试拼盘", scope="L2", status="APPROVED",
+        portfolio_strategy_id=1, lender_strategy_id=1, max_borrowers=1,
+        principal=Decimal("100000"))
+    db.add(plan)
+    db.commit()
+    pid = plan.id
+    db.close()
+    return pid
+
+
+def _normal_metrics():
+    return {
+        "corr_60d": 0.2, "drawdown_excess_pp": 0.5,
+        "adv_participation": 0.005, "grab_ratio_month": 0.01,
+        "recall_per_year": 4, "shortfall_ratio": 0.005,
+        "borrower_fill_rate": 0.98, "lender_recovery_fill_rate": 0.95,
+        "params_hash_match": True, "reconcile_failed": False,
+    }
+
+
+def test_health_disabled_by_default(client, monkeypatch):
+    c, Session = client
+    pid = _seed_plan(Session)
+    monkeypatch.setattr("core.api.pairing.load_config", lambda: {})
+    body = c.get("/api/pairing/health").json()
+    assert body["code"] == 0
+    assert body["data"]["enabled"] is False
+    body = c.post(f"/api/pairing/plans/{pid}/health",
+                  json={"metrics": _normal_metrics()}).json()
+    assert body["data"]["enabled"] is False
+
+
+def test_health_record_suspend_and_resume_flow(client, monkeypatch):
+    c, Session = client
+    pid = _seed_plan(Session)
+    _enable_pairing(monkeypatch)
+
+    body = c.post(f"/api/pairing/plans/{pid}/health",
+                  json={"metrics": _normal_metrics()}).json()
+    assert body["code"] == 0
+    assert body["data"]["status"] == "ACTIVE"
+
+    bad = dict(_normal_metrics(), shortfall_ratio=0.06)
+    body = c.post(f"/api/pairing/plans/{pid}/health",
+                  json={"metrics": bad}).json()
+    assert body["data"]["status"] == "SUSPENDED"
+    assert body["data"]["plan_status"] == "SUSPENDED"
+
+    body = c.post(f"/api/pairing/plans/{pid}/health/resume",
+                  json={"reason": "提前恢复"}).json()
+    assert body["code"] == 409
+
+    listed = c.get("/api/pairing/health").json()["data"]
+    assert listed[0]["plan_id"] == pid
+    assert listed[0]["plan_status"] == "SUSPENDED"
+    assert listed[0]["latest"]["status"] == "SUSPENDED"
+
+    body = c.post(f"/api/pairing/plans/{pid}/health/retire",
+                  json={"reason": "测试退役", "operator": "tester"}).json()
+    assert body["code"] == 0
+    assert body["data"]["plan_status"] == "RETIRED"
+    assert body["data"]["retire_reason"]["reason"] == "测试退役"

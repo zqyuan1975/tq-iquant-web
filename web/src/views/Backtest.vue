@@ -15,6 +15,7 @@ import {
   evaluateCashOutlet,
   listPairingPlans, createPairingPlan, evaluatePairingPlan,
   approvePairingPlan, deletePairingPlan, getPairingPlan,
+  getPairingHealth, resumePairingHealth, retirePairingHealth,
   listBacktestRunGroups, getBacktestRunGroup,
 } from '../api'
 import type {
@@ -34,7 +35,7 @@ import type {
   CapitalQuotaDerivation,
   CapitalUtilizationStats,
   CashOutletItem, CashOutletEvaluation,
-  PairingPlanSummary, PairingPlanDetail,
+  PairingPlanSummary, PairingPlanDetail, PairingHealthHistory,
   BacktestRunGroupSummary, BacktestRunGroupDetail,
   GateReleaseResult,
 } from '../api'
@@ -1490,6 +1491,7 @@ const PAIRING_STATUS_TEXT: Record<string, string> = {
   ARCHIVED: '已归档',
   QUEUED: '排队中',
   EXPIRED: '已过期',
+  RETIRED: '已退役',
 }
 function pairingStatusText(status: string): string {
   return PAIRING_STATUS_TEXT[status] || status
@@ -1717,6 +1719,63 @@ async function applyPairingToBacktest(plan: PairingPlanSummary) {
   } catch (e) {
     pairingError.value = errMsg(e)
   }
+}
+
+// ---- 0021 G3：健康指标、暂停/恢复/退役（恢复必须人工确认）----
+const pairingHealth = ref<PairingHealthHistory | null>(null)
+const pairingHealthBusy = ref(false)
+
+async function openPairingHealth(plan: PairingPlanSummary) {
+  pairingHealthBusy.value = true
+  pairingError.value = ''
+  try {
+    pairingHealth.value = await getPairingHealth(plan.id)
+  } catch (e) {
+    pairingError.value = errMsg(e)
+    pairingHealth.value = null
+  } finally {
+    pairingHealthBusy.value = false
+  }
+}
+
+async function resumePairingHealthAction() {
+  const detail = pairingHealth.value
+  if (!detail) return
+  const reason = prompt('恢复理由（必填）：')
+  if (!reason || !reason.trim()) return
+  const validUntil = prompt('恢复有效期（可选，如 2026-12-31）：') || undefined
+  pairingHealthBusy.value = true
+  try {
+    pairingHealth.value = await resumePairingHealth(
+      detail.plan_id, reason.trim(), { valid_until: validUntil })
+    await loadPairingPlans()
+  } catch (e) {
+    pairingError.value = errMsg(e)
+  } finally {
+    pairingHealthBusy.value = false
+  }
+}
+
+async function retirePairingHealthAction() {
+  const detail = pairingHealth.value
+  if (!detail) return
+  if (!confirm(`永久退役拼盘 #${detail.plan_id}？退役后不再新增借出，历史账本保留。`)) return
+  const reason = prompt('退役理由（必填）：')
+  if (!reason || !reason.trim()) return
+  pairingHealthBusy.value = true
+  try {
+    pairingHealth.value = await retirePairingHealth(
+      detail.plan_id, reason.trim())
+    await loadPairingPlans()
+  } catch (e) {
+    pairingError.value = errMsg(e)
+  } finally {
+    pairingHealthBusy.value = false
+  }
+}
+
+function healthStateText(state: string): string {
+  return ({ normal: '正常', watch: '预警', suspend: '暂停', skipped: '缺观测' } as Record<string, string>)[state] || state
 }
 
 // ---- 0021 E5：多组合回测批（运行组）折叠与钻取 ----
@@ -4659,7 +4718,7 @@ watch(theme, () => {
             <label class="group-label">已建拼盘</label>
             <div class="table-wrap">
               <table>
-                <thead><tr><th>ID</th><th>类型</th><th>名称</th><th>成员</th><th>状态</th><th>评估</th><th>本金</th><th>操作</th></tr></thead>
+                <thead><tr><th>ID</th><th>类型</th><th>名称</th><th>成员</th><th>状态</th><th>健康</th><th>评估</th><th>本金</th><th>操作</th></tr></thead>
                 <tbody>
                   <template v-for="p in pairingPlans" :key="p.id">
                     <tr>
@@ -4679,6 +4738,11 @@ watch(theme, () => {
                           排队 #{{ p.queue.position }}<template v-if="p.queue.expires_at"> · 至 {{ p.queue.expires_at }}</template>
                         </span>
                       </td>
+                      <td>
+                        <button class="btn btn-sm" :disabled="pairingHealthBusy"
+                                title="健康指标与暂停/恢复/退役"
+                                @click="openPairingHealth(p)">查看</button>
+                      </td>
                       <td :style="{ color: p.eval?.status === 'GO' ? 'var(--green)' : p.eval?.status === 'NO_GO' ? 'var(--red)' : 'var(--ink-soft)' }">
                         {{ p.eval?.status || '—' }}
                       </td>
@@ -4695,7 +4759,7 @@ watch(theme, () => {
                       </td>
                     </tr>
                     <tr v-if="pairingExpandedId === p.id">
-                      <td colspan="8" style="background:var(--bg-soft)">
+                      <td colspan="9" style="background:var(--bg-soft)">
                         <div v-if="!p.borrowers.length" class="note">无借款方边（排队中不建边）。</div>
                         <table v-else style="width:100%">
                           <thead><tr><th>借款方</th><th>所属组合</th><th>最大占比</th><th>边状态</th><th>评估</th></tr></thead>
@@ -4748,6 +4812,55 @@ watch(theme, () => {
                 {{ s.feature }}（{{ s.state === 'pass' ? '通过' : s.state === 'fail' ? '不通过' : s.state === 'warn' ? '警告' : '待定' }}）：{{ s.message }}<span v-if="s.pending_code">（{{ s.pending_code }}）</span>
               </li>
             </ul>
+          </div>
+
+          <!-- 0021 G3：健康指标与暂停/恢复/退役 -->
+          <div v-if="pairingHealth" class="card" style="padding:10px">
+            <div style="display:flex;align-items:center;justify-content:space-between;gap:8px">
+              <p style="margin:0 0 6px">
+                拼盘 #{{ pairingHealth.plan_id }} 健康：
+                <b>{{ pairingHealth.latest ? pairingHealth.latest.status : '无快照' }}</b>
+                <span class="note">（拼盘状态 {{ pairingStatusText(pairingHealth.plan_status) }}）</span>
+              </p>
+              <span class="note" v-if="pairingHealth.latest">
+                截至 {{ pairingHealth.latest.as_of }} · 连续正常 {{ pairingHealth.latest.normal_streak }} 日
+              </span>
+            </div>
+            <div v-if="pairingHealth.latest" class="table-wrap">
+              <table>
+                <thead><tr><th>指标</th><th>数值</th><th>判定</th><th>阈值</th><th>说明</th></tr></thead>
+                <tbody>
+                  <tr v-for="it in pairingHealth.latest.items" :key="it.code">
+                    <td>{{ it.label }}</td>
+                    <td>{{ it.value === null ? '—' : it.value }}</td>
+                    <td :style="{ color: it.state === 'suspend' ? 'var(--red)' : it.state === 'watch' ? 'var(--yellow)' : 'var(--ink-soft)' }">
+                      {{ healthStateText(it.state) }}
+                    </td>
+                    <td class="note">{{ it.threshold }}</td>
+                    <td>{{ it.message }}</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+            <div v-else class="note">
+              暂无健康快照：需由运维按日写入观测（相关性/回撤/ADV/抢单/召回/成交率/对账）。
+            </div>
+            <div v-if="pairingHealth.resume" class="note" style="margin-top:6px">
+              上次恢复：{{ pairingHealth.resume.reason }}
+              <template v-if="pairingHealth.resume.valid_until"> · 有效期 {{ pairingHealth.resume.valid_until }}</template>
+            </div>
+            <div v-if="pairingHealth.retire_reason" class="note" style="margin-top:6px">
+              退役：{{ pairingHealth.retire_reason.reason }}
+            </div>
+            <div style="display:flex;gap:6px;margin-top:8px">
+              <button v-if="['WATCH', 'SUSPENDED'].includes(pairingHealth.plan_status)"
+                      class="btn btn-sm" :disabled="pairingHealthBusy"
+                      @click="resumePairingHealthAction">人工恢复</button>
+              <button v-if="pairingHealth.plan_status !== 'RETIRED'"
+                      class="btn btn-sm" :disabled="pairingHealthBusy"
+                      @click="retirePairingHealthAction">退役</button>
+              <button class="btn btn-sm" @click="pairingHealth = null">收起</button>
+            </div>
           </div>
         </div>
         <div class="modal-actions">
