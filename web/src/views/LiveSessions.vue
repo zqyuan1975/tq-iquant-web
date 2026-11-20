@@ -403,6 +403,18 @@ const sessionChannelBadgeTitle = computed(() => {
   const channels = [...new Set(watchdogAlarms.value.map((a) => a.channel).filter(Boolean))]
   return channels.length > 0 ? `${base}。活跃告警通道：${channels.join(' / ')}` : base
 })
+// 原生分钟数据源（会话详情 minute_source）：默认关闭时展示启用说明；开启后
+// 常驻展示最后前进时刻，停顿时按滞后秒数升级为醒目告警。
+const minuteSource = ref<any>(null)
+const minuteSourceAlert = computed(
+  () => minuteSource.value?.enabled === true && minuteSource.value?.stalled === true,
+)
+const minuteSourceText = computed(() => {
+  const s = minuteSource.value || {}
+  const last = s.last_advance_at ? String(s.last_advance_at) : '从未前进'
+  const lag = typeof s.lag_seconds === 'number' ? `${s.lag_seconds} 秒` : '未知'
+  return { last, lag }
+})
 let bridgeTimer: ReturnType<typeof setInterval> | null = null
 
 /** 单年日历摘要：正常=来源/交易日数/覆盖区间；退化=来源+标记。 */
@@ -1795,18 +1807,21 @@ async function refreshBridgeOnline() {
   if (id === null) {
     bridgeOnline.value = null
     watchdogAlarms.value = []
+    minuteSource.value = null
     return
   }
   const target = sessions.value.find((s) => s.id === id)
   if (!target || target.status !== 'running') {
     bridgeOnline.value = null
     watchdogAlarms.value = []
+    minuteSource.value = null
     return
   }
   try {
     const d = await getLiveSession(id)
     if (activeSessionId !== id) return  // 在途期间已切走 → 丢弃
     bridgeOnline.value = typeof d?.bridge_online === 'boolean' ? d.bridge_online : null
+    minuteSource.value = (d as any)?.minute_source ?? null
   } catch { /* 保持现状 */ }
   try {
     const w = await getWatchdogStatus()
@@ -1863,6 +1878,35 @@ onUnmounted(() => {
     <button @click="openCreate" class="btn btn-primary">+ 新建实盘</button>
   </PageHeader>
 
+  <!-- 盘中数据轮询常驻提示（不可关闭）：默认关闭原生源时给出启用方式与差异；
+       开启后展示最后前进时刻，minute_source.stalled 时升级为醒目告警。 -->
+  <div class="card minute-source-banner"
+       :class="{ 'minute-source-alert': minuteSourceAlert }"
+       data-test="minute-source-banner">
+    <div>
+      <strong>盘中数据轮询，请确认已启用数据下载工具</strong>
+      <div class="minute-source-body">
+        <template v-if="!minuteSource?.enabled">
+          当前为默认快照合成：1m 由行情快照合成，5m/15m/30m/1h 由 1m 聚合，与回测原生 K 线不等价。
+          如需与回测同源，在 config.yaml 设置 <code>live.native_minute.enabled: true</code>
+          （可选 <code>stall_timeout_seconds</code>，默认 180）并<b>重启实盘会话</b>生效。
+          开启后：1m 读本地原生 <code>.lc1</code>、5m 读 <code>.lc5</code>，15m/30m/1h 走原生周期；
+          只使用标签 ≤ 当前墙钟的已闭合 bar（未完成桶不进入信号与风控）；判新只看 bar 标签前进；
+          原生数据超过阈值不前进会自动回落快照合成并留痕。
+        </template>
+        <template v-else-if="minuteSourceAlert">
+          <b>原生分钟数据已停止前进</b>：最后前进 {{ minuteSourceText.last }}，已滞后
+          {{ minuteSourceText.lag }}，已自动回落快照合成。请检查「TDX数据工具.exe」是否在运行、
+          清单 CCJX.blk 是否已更新；恢复前进后自动切回原生。
+        </template>
+        <template v-else>
+          原生分钟数据源已启用：最后前进 {{ minuteSourceText.last }}
+          （滞后 {{ minuteSourceText.lag }}），当前 1m/5m 读本地原生文件；停滞将自动回落快照合成。
+        </template>
+      </div>
+    </div>
+  </div>
+
   <!-- A1 新建会话软告警（如目标引擎已被其它会话占用）：不阻断，但必须可见 -->
   <div v-if="createWarnings.length" class="card create-warning-banner" data-test="create-warnings">
     <div v-for="w in createWarnings" :key="w">{{ w }}</div>
@@ -1873,8 +1917,14 @@ onUnmounted(() => {
   <div v-if="minuteLivePeriods.length && !minuteNoticeDismissed" class="card minute-live-banner"
        data-test="minute-live-banner">
     <div>
-      <strong>分钟级策略：实盘用快照合成 bar，与回测 TQ 原生 1m 不等价</strong>
-      <div class="minute-live-body">
+      <strong v-if="minuteSource?.enabled && !minuteSourceAlert">分钟级策略：实盘已启用原生分钟数据源（.lc1/.lc5），与回测同源</strong>
+      <strong v-else>分钟级策略：实盘用快照合成 bar，与回测 TQ 原生 1m 不等价</strong>
+      <div v-if="minuteSource?.enabled && !minuteSourceAlert" class="minute-live-body">
+        实盘 1m 读本地原生 .lc1、5m 读 .lc5、15m/30m/1h 走原生周期，只使用已闭合 bar
+        （未完成桶不进入信号与风控）。成交按信号 bar 收盘价挂限价且默认不追价，
+        成交时点与均价仍可能与回测不同；回测绑定不继承风控执行时点 / 追价 / 单笔上限 / 复权口径。
+      </div>
+      <div v-else class="minute-live-body">
         当前组合含 {{ minuteLivePeriods.join(' / ') }} 周期。实盘 1m 由行情快照合成
         （约 5–30s 采样、60s 发布、只发已完成 bar）：缺采样会整根丢 bar，恢复后首根可能是半根，
         成交量按日累计差分、跨分钟边界会串位。成交按信号 bar 收盘价挂限价且默认不追价，
@@ -3577,6 +3627,12 @@ onUnmounted(() => {
               live.cross_check.enabled 默认 false、sample_size=5、max_dev_pct=1.0（次日生效，关闭＝不校验）；
               backtest.kline_cache.enabled 默认 false、dir=data/kline_cache、today_ttl_seconds=300
               （每次回测即时读取，关闭＝每次直连数据源）。</p>
+            <p class="guide-step"><b>原生分钟数据源（可选，默认关）</b>：live.native_minute.enabled
+              默认 false、stall_timeout_seconds=180（<b>需重启会话</b>）。开启＝盘中 1m 读本地原生
+              .lc1、5m 读 .lc5、15m/30m/1h 走原生周期（与回测同源），只取标签 ≤ 墙钟的已闭合 bar，
+              判新只看 bar 标签前进；依赖外部「TDX数据工具.exe」持续写入 D:\zd_zyb 且清单已更新，
+              超过 stall_timeout_seconds 不前进 → 自动回落快照合成并留痕（WARNING + risk 事件），
+              恢复前进自动切回。关闭＝行为与接入前一致（快照合成）。</p>
             <p class="guide-step"><b>会话级默认（重启会话生效）</b>：execution_mode 新建默认 alert（历史会话
               auto），shadow 仅影子记账不下单，manual 才启用审批队列；gate_recheck_on_execute=0（关闭＝按信号日
               决策执行）；account_risk_enabled=0、account_max_drawdown/account_daily_loss_limit=NULL（回退
@@ -3666,6 +3722,27 @@ onUnmounted(() => {
 }
 .minute-live-banner strong { display: block; margin-bottom: 4px; }
 .minute-live-body { color: var(--ink-soft); }
+/* 盘中数据轮询常驻提示：默认中性；原生分钟源停滞时升级为红色告警 */
+.minute-source-banner {
+  padding: 10px 14px;
+  margin-bottom: 12px;
+  font-size: 12px;
+  line-height: 1.6;
+  border-left: 4px solid var(--line, #555);
+  background: rgba(140, 140, 140, 0.08);
+}
+.minute-source-banner strong { display: block; margin-bottom: 4px; }
+.minute-source-body { color: var(--ink-soft); }
+.minute-source-banner code {
+  padding: 0 3px;
+  border-radius: 3px;
+  background: rgba(255, 255, 255, 0.08);
+}
+.minute-source-alert {
+  border-left-color: var(--red, #d93026);
+  background: rgba(217, 48, 38, 0.14);
+}
+.minute-source-alert strong { color: var(--red, #d93026); }
 /* 引擎下拉占用引导（C1） */
 .engine-occupied-hint {
   display: flex;
