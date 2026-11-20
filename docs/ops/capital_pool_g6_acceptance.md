@@ -19,7 +19,7 @@
 | 资金池相关回归组 | `-k "capital or theory_vs_live or shadow_mode"` | 214 passed |
 | 前端构建 | `cd web; npm run build` | 通过（773 modules，788 ms） |
 | 性能 | 开关全关默认路径 vs 借贷开启 | 见 §5 |
-| 生产库与开关状态 | `main/data/dev.db` | revision `g4a5b6c7d8e9`，quick_check ok，3 会话 stopped，强制 0 / 出口 OFF |
+| 生产库与开关状态 | `main/data/dev.db` | revision `h5b6c7d8e9f0`，quick_check ok，3 会话 stopped，强制 0 / 出口 OFF |
 
 工程验收结论：G1–G6 的代码路径、回归基线与默认路径零变化均有可重复测试支撑；G6 判定 **DONE（工程验收）**。业务 KPI（§7）与实盘影子样本（§6）不满足「可用测试取证」条件，按约束列为缺口，不自行放宽。
 
@@ -158,13 +158,13 @@ main\.venv\Scripts\python.exe -m pytest main/core/tests -q -p no:cacheprovider
 2. **F3 影子偏差**：「计划 vs 实际偏差 < 5%、门控一致 100%」仍需实盘影子期数据。会话级开关 `capital_shadow_enabled` 已补（见 §6），计划于 15:05 收盘清扫后重启并开启会话 1，从下一交易日开始采样；无计划侧时只采实际侧并带 `no_pairing_plan` 告警。
 3. **召回次数 ≤ 12 次/年、shortfall ≤ 2%/年**：需要实盘或长周期回测样本，当前无数据源。
 4. **恒等式 (1)(3)(9)**：运行时因「持久化虚拟现金账本 / 当日开盘现金 / 会话级策略预算」数据源缺失记 `skipped`（G2 已记录），模块层有用例覆盖；按手册口径，`skipped` 不等于账平。
-5. **迁移回退**：本阶段未在生产库执行 `downgrade`（G4/G5 已在临时副本演练）；生产库保持在 `g4a5b6c7d8e9`，`h5b6c7d8e9f0` 待下次重启时 upgrade。需要回退时按 G5 手册 §4.2 的三条路径执行。
+5. **迁移回退**：本阶段未在生产库执行 `downgrade`（G4/G5 已在临时副本演练）；生产库已随启动自动迁移到 `h5b6c7d8e9f0`（见 §8），不再需要在下次重启时额外 upgrade。需要回退时按 G5 手册 §4.2 的三条路径执行（回退目标 `g4a5b6c7d8e9`）。
 
 ## 8. 生产库快照（只读核对）
 
 | 项 | 值 |
 |---|---|
-| `alembic_version` | `g4a5b6c7d8e9`（`h5b6c7d8e9f0` 已写好，待下次重启 upgrade） |
+| `alembic_version` | `h5b6c7d8e9f0`（2026-11-20 12:35 由集成测试的 TestClient lifespan 自动迁移落库，非人工 upgrade；已补 `TQ_INIT_DB_DISABLED` 闸，见提交 be13969） |
 | `PRAGMA quick_check` | `ok` |
 | `live_sessions` | 01 `running`（`auto` / tdx，11:45:54 启动）、02 / 03 `stopped`；三会话均 `capital_enforce_enabled=0`、`cash_outlet_mode=OFF`、`capital_shadow_enabled=0` |
 | `capital_pairing_plans` / `capital_pairings` | 0 / 0 行（F3 绑定入口无来源，改走会话级开关） |
