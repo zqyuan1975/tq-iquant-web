@@ -26,14 +26,14 @@ def test_baseline_then_advance(caplog):
     with caplog.at_level(logging.INFO, logger="core.engine.live.tq_minute_probe"):
         ch = probe.tick()
         assert ch == {"600000.SH": (None, T0)}
-        assert "基线" in caplog.text and "未切换" in caplog.text
+        assert "基线" in caplog.text and "不参与 1m 选源" in caplog.text
 
         caplog.clear()
         mono[0] = 301.0
         box["ts"] = T1
         ch = probe.tick()
         assert ch == {"600000.SH": (T0, T1)}
-        assert "有新数据" in caplog.text and "仅留痕" in caplog.text
+        assert "有新数据" in caplog.text and "不参与 1m 选源" in caplog.text
 
 
 def test_unchanged_and_throttle(caplog):

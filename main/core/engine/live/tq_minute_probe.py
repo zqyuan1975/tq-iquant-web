@@ -170,7 +170,7 @@ class TqMinuteProbe:
             lag = (self._clock() - cur).total_seconds()
             logger.info(
                 "[tq-1m-probe] session=%s TQ 1m 有新数据: %d/%d 只；样本 %s %s → %s，"
-                "滞后 %.0fs（仅留痕，数据源仍为快照合成）",
+                "滞后 %.0fs（仅探测 TQ 1m 进度，不参与 1m 选源）",
                 self._session_id, len(advances), len(codes), code, prev, cur, lag)
             self._baseline_logged = True
 
@@ -179,7 +179,7 @@ class TqMinuteProbe:
             lag = (self._clock() - newest).total_seconds()
             logger.info(
                 "[tq-1m-probe] session=%s 基线: TQ 1m 最新 %s（%d/%d 只有数据），"
-                "滞后 %.0fs；数据源仍为快照合成，未切换",
+                "滞后 %.0fs；本探测只记录 TQ 1m 最新时间戳，不参与 1m 选源",
                 self._session_id, newest, len(latest), len(codes), lag)
             self._baseline_logged = True
 
