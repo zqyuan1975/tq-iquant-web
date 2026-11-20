@@ -2031,7 +2031,12 @@ def test_params_snapshot_round_trips_source_attributes(db_session, monkeypatch):
     _patch_data_layer(monkeypatch, _NO_TRADES_RESULT)
     rid = svc.run_backtest(db_session, ps, _req(name="snap_rt"))["record_id"]
     data = json.loads(db_session.get(BacktestRecord, rid).params_snapshot)
-    assert set(data) == _SNAPSHOT_KEYS
+    expected_keys = set(_SNAPSHOT_KEYS)
+    if "capital_pool" in data:
+        # 0021 A5：总开关开启时 params_snapshot 冻结资金池版本块；
+        # config.yaml 属部署配置，测试需同时兼容开启/关闭两种状态。
+        expected_keys.add("capital_pool")
+    assert set(data) == expected_keys
     # 默认不选新口径：写入 same_day_bar（与改动前一致，禁止默认走 prev5d）
     assert data["liquidity_caliber"] == "same_day_bar"
     assert data["benchmark_index"] == ps.benchmark_index

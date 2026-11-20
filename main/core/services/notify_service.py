@@ -606,10 +606,12 @@ class Notifier:
     def _log_fail(self, cfg: NotifyConfig, exc: BaseException) -> None:
         now = self._mono()
         if now - self._last_fail_log >= FAIL_LOG_INTERVAL_SECONDS:
-            self._last_fail_log = now
             logger.warning(
                 "notify: 告警外发失败（%s）；已节流日志 %d 秒，交易主链路不受影响",
                 _sanitize(str(exc), cfg), int(FAIL_LOG_INTERVAL_SECONDS))
+            # 先写日志再记时间戳：测试据此等待时不会读到「时间戳已更新、
+            # 日志记录尚未入 handler」的中间态（发送线程内串行调用，无并发影响）。
+            self._last_fail_log = now
 
 
 #: 进程内单例（惰性创建；配置每次重新读，便于改 config.yaml 即时生效）

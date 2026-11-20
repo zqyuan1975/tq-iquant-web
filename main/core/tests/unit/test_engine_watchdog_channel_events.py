@@ -242,6 +242,9 @@ def _bare_engine(factory):
     eng._dispatcher = _Dispatcher("tdx_tq")
     eng._bridge_online = True
     eng._offline_since = None
+    # B2 主备通道：__init__ 才赋值；裸构造需补齐，否则离线转场读不到。
+    eng._failover_enabled = False
+    eng.backup_engine = None
     return eng
 
 
