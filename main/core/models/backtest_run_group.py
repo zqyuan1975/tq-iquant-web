@@ -23,6 +23,8 @@ class BacktestRunGroup(Base):
     status = Column(String(10), nullable=False, default="running",
                     server_default="running")
     error_message = Column(Text, nullable=True)
+    # 0021 E3：绑定 L2 拼盘头（可空；普通多组合回测为 NULL）。
+    pairing_plan_id = Column(Integer, nullable=True)
     params_snapshot = Column(Text, nullable=True)
     aggregate_json = Column(Text, nullable=True)
     started_at = Column(DateTime, server_default=func.now())

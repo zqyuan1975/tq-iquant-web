@@ -5376,6 +5376,7 @@ def run_multi_backtest(db: Session, portfolios: list, req) -> dict:
     group = BacktestRunGroup(
         name=getattr(req, "name", "") or "多组合回测",
         status="running",
+        pairing_plan_id=getattr(req, "pairing_plan_id", None),
         params_snapshot=json.dumps({
             "start_date": start_date.isoformat(),
             "end_date": end_date.isoformat(),
@@ -5572,9 +5573,40 @@ def _serialize_run_group(g) -> dict:
         "name": g.name,
         "status": g.status,
         "error_message": g.error_message,
+        "pairing_plan_id": getattr(g, "pairing_plan_id", None),
+        # 0021 E3：聚合曲线一旦落库即为冻结只读，接口不再重算。
+        "aggregate_frozen": bool(g.aggregate_json),
         "params_snapshot": json.loads(g.params_snapshot) if g.params_snapshot else None,
         "started_at": g.started_at,
         "finished_at": g.finished_at,
+    }
+
+
+def cancel_run_group(db: Session, group_id: int) -> Optional[dict]:
+    """组级取消（0021 E3）：对组内所有运行中成员置位取消令牌。
+
+    成员共享同一个取消事件，任一成员取消都会中止整批；本函数把「组级入口」
+    显式化。返回 ``None``=组不存在；``cancel_requested=[]``=没有可取消成员。
+    """
+    from core.models import BacktestRunGroup
+
+    g = db.get(BacktestRunGroup, group_id)
+    if g is None:
+        return None
+    rows = (
+        db.query(BacktestRecord)
+        .filter(BacktestRecord.run_group_id == group_id,
+                BacktestRecord.status == "running")
+        .order_by(BacktestRecord.id)
+        .all()
+    )
+    requested = [r.id for r in rows if backtest_cancel.cancel(r.id)]
+    return {
+        "group_id": group_id,
+        "status": g.status,
+        "running_members": [r.id for r in rows],
+        "cancel_requested": requested,
+        "all_batch": True,
     }
 
 

@@ -154,6 +154,8 @@ class MultiBacktestRequest(BaseModel):
     # 0021 E2 会话池动态额度（None/未启用=各组合现金独立、旧行为）：
     # {enabled, min_share?, max_share?, min_cash_reserve_pct?}
     capital_pool_plan: dict | None = None
+    # 0021 E3：绑定 L2 拼盘头（可空；普通多组合回测不传）。
+    pairing_plan_id: int | None = None
 
 
 class PoolCompareRequest(BaseModel):
@@ -243,6 +245,7 @@ from core.services.backtest_service import (  # noqa: E402
     run_multi_backtest as _svc_run_multi_backtest,
     list_run_groups as _svc_list_run_groups,
     get_run_group as _svc_get_run_group,
+    cancel_run_group as _svc_cancel_run_group,
 )
 from core.services.walk_forward_service import (  # noqa: E402
     run_walk_forward as _svc_run_walk_forward,
@@ -717,6 +720,19 @@ def get_run_group_aggregate(group_id: int, db: Session = Depends(get_db)):
     if payload is None:
         return err(404, "多组合回测批不存在")
     return ok(payload.get("aggregate") or {})
+
+
+@router.post("/run-groups/{group_id}/cancel")
+def cancel_run_group(group_id: int, db: Session = Depends(get_db)):
+    """组级取消（0021 E3）：取消组内任一成员即中止整批。"""
+    payload = _svc_cancel_run_group(db, group_id)
+    if payload is None:
+        return err(404, "多组合回测批不存在")
+    if not payload.get("running_members"):
+        return err(409, f"该批当前没有运行中的成员（状态 {payload.get('status')}）")
+    if not payload.get("cancel_requested"):
+        return err(409, "运行中成员均未在本进程注册，无法取消")
+    return ok(payload)
 
 
 # ---------------------------------------------------------------------------
