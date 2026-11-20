@@ -220,17 +220,27 @@ def test_handle_bar_signal_to_trade_persisted():
 
 
 # ---- 交易日历下单总闸（#144）----
-def _calendar_engine(factory, port, disp, trading_dates, stock, engine_key=""):
-    """构造带注入假日历的 LiveEngine（假日历不经桥，直接给日期列表）。"""
+def _calendar_engine(factory, port, disp, trading_dates, stock, engine_key="",
+                     running=False):
+    """构造带注入假日历的 LiveEngine（假日历不经桥，直接给日期列表）。
+
+    running=True：把「构造但未 start」的引擎显式标记为运行中。92db395 给
+    EngineContext.stop_requested 增加 `not _running` 项后，未 start 的引擎会被
+    日终/提前收盘轮次判定为「停止中」而直接跳过；直调这些方法的用例需声明运行中
+    （生产路径由 start() 置位）。
+    """
     from core.engine.trading_calendar import TradingCalendar
     from core.engine.bar_poller import BarPoller
     poller = BarPoller(disp, [stock], period="1m", count=10)
     cal = TradingCalendar(lambda: list(trading_dates))
-    return LiveEngine(
+    engine = LiveEngine(
         session_id=1, portfolios=[port], dispatcher=disp,
         bar_poller=poller, db_session_factory=factory,
         trading_calendar=cal, engine_key=engine_key,
     )
+    if running:
+        engine._running = True
+    return engine
 
 
 def test_handle_bar_blocks_order_on_non_trading_day():
@@ -3630,16 +3640,23 @@ from core.engine.live_engine import periods_on_boundary  # noqa: E402
 
 
 def _make_engine_formula_portfolio(disp, factory, port, formula_by_strategy,
-                                   formula_count=200, formula_count_by_name=None):
-    """构造带 tq_formula + formula_by_strategy 且含组合的 LiveEngine（C6 注入/分发用）。"""
+                                   formula_count=200, formula_count_by_name=None,
+                                   running=False):
+    """构造带 tq_formula + formula_by_strategy 且含组合的 LiveEngine（C6 注入/分发用）。
+
+    running=True：直调日终方法的用例需声明引擎在运行，理由见 _calendar_engine。
+    """
     from core.engine.bar_poller import BarPoller
     poller = BarPoller(disp, ["600000.SH"], period="1m", count=10)
-    return LiveEngine(
+    engine = LiveEngine(
         session_id=1, portfolios=[port], dispatcher=disp,
         bar_poller=poller, db_session_factory=factory,
         tq_formula=TQFormula(), formula_by_strategy=formula_by_strategy,
         formula_count=formula_count, formula_count_by_name=formula_count_by_name,
     )
+    if running:
+        engine._running = True
+    return engine
 
 
 def _respond_quote_bars(stock, bars, fail_orders=False):
@@ -3851,7 +3868,8 @@ def test_maybe_daily_bars_1505_drives_1d_strategy():
     ]
     rec = _Recorder(respond=_respond_quote_bars(stock, daily_bars))
     disp, _ = _make_dispatcher(rec)
-    engine = _make_engine_formula_portfolio(disp, factory, port, {1: "MA_CROSS"})
+    engine = _make_engine_formula_portfolio(disp, factory, port, {1: "MA_CROSS"},
+                                            running=True)
     engine._tq_formula.compute_injected_batch =lambda **kw: {
         stock: {"open_sig": [{"Date": "20260810", "Value": 1}], "ErrorId": 0}
     }
@@ -3904,6 +3922,8 @@ def test_maybe_daily_bars_1d_uses_code_period_count_and_dedup():
         formula_count=200, formula_count_by_name={"MA_CROSS": 3},
         code_period_count={(stock, "1d"): 3},
     )
+    # 直调日终方法：显式声明引擎在运行（92db395 后停止探针含 `not _running`）
+    engine._running = True
     captured = {}
 
     def spy(**kw):
@@ -3970,8 +3990,11 @@ class _SynthStub:
 
 
 def _make_advance_engine(disp, factory, port, stock, synth, trading_dates,
-                         **extra):
-    """构造开启 14:50 提前收盘价的 LiveEngine（注入假日历 + 快照合成器桩）。"""
+                         running=False, **extra):
+    """构造开启 14:50 提前收盘价的 LiveEngine（注入假日历 + 快照合成器桩）。
+
+    running=True：直调提前收盘轮次的用例需声明引擎在运行，理由见 _calendar_engine。
+    """
     from core.engine.bar_poller import BarPoller
     from core.engine.trading_calendar import TradingCalendar
     poller = BarPoller(disp, [stock], period="1m", count=10)
@@ -3982,6 +4005,8 @@ def _make_advance_engine(disp, factory, port, stock, synth, trading_dates,
         snapshot_synth=synth, **extra,
     )
     engine._calendar = TradingCalendar(lambda: list(trading_dates))
+    if running:
+        engine._running = True
     return engine
 
 
@@ -4052,7 +4077,7 @@ def test_advance_close_drives_1d_with_1450_close_price():
          "low": 9.65, "close": 9.75, "volume": 300, "amount": 2900.0},
     ]})
     engine = _make_advance_engine(disp, factory, port, stock, synth,
-                                  [date(2026, 8, 10)])
+                                  [date(2026, 8, 10)], running=True)
     daily_time = datetime(2026, 8, 10, 0, 0)
     engine.signal_cache = {(1, stock, daily_time): [{"name": "open_sig", "value": 1}]}
     seen = []
@@ -4167,7 +4192,7 @@ def test_advance_close_missing_1450_bar_fails_closed():
         "low": 9.2, "close": 9.6, "volume": 500, "amount": 4800.0,
     }]})
     engine = _make_advance_engine(disp, factory, port, stock, synth,
-                                  [date(2026, 8, 10)])
+                                  [date(2026, 8, 10)], running=True)
     engine.signal_cache = {}
     q = asyncio.Queue()
     engine._stream_subscribers.append(q)
@@ -4207,7 +4232,7 @@ def test_advance_close_exec_price_falls_back_to_1451_bar():
          "low": 9.5, "close": 9.58, "volume": 400, "amount": 3800.0},
     ]})
     engine = _make_advance_engine(disp, factory, port, stock, synth,
-                                  [date(2026, 8, 10)])
+                                  [date(2026, 8, 10)], running=True)
     daily_time = datetime(2026, 8, 10, 0, 0)
     engine.signal_cache = {(1, stock, daily_time): [{"name": "open_sig", "value": 1}]}
     q = asyncio.Queue()
@@ -4244,7 +4269,7 @@ def test_advance_close_exec_price_missing_fails_closed():
          "low": 9.2, "close": 9.6, "volume": 500, "amount": 4800.0},
     ]})
     engine = _make_advance_engine(disp, factory, port, stock, synth,
-                                  [date(2026, 8, 10)])
+                                  [date(2026, 8, 10)], running=True)
     daily_time = datetime(2026, 8, 10, 0, 0)
     engine.signal_cache = {(1, stock, daily_time): [{"name": "open_sig", "value": 1}]}
     q = asyncio.Queue()
@@ -4317,6 +4342,7 @@ def test_advance_enabled_falls_back_to_post_close_1d_when_advance_failed():
     from core.tq.formula import TQFormula
     engine = _make_advance_engine(
         disp, factory, port, stock, synth, [date(2026, 8, 10)],
+        running=True,
         tq_formula=TQFormula(), formula_by_strategy={1: "MA_CROSS"},
     )
     engine._tq_formula.compute = MagicMock(return_value={})
@@ -4349,7 +4375,8 @@ def test_maybe_daily_bars_period_end_drives_1w_1mon():
                    "low": 9.0, "close": 9.2, "volume": 10000, "amount": 92000.0}]
     rec = _Recorder(respond=_respond_quote_bars(stock, daily_bars))
     disp, _ = _make_dispatcher(rec)
-    engine = _make_engine_formula_portfolio(disp, factory, port, {1: "MA_CROSS"})
+    engine = _make_engine_formula_portfolio(disp, factory, port, {1: "MA_CROSS"},
+                                            running=True)
     engine._tq_formula.compute = MagicMock(return_value={})
     engine._tq_formula.compute_injected_batch = MagicMock(return_value=None)
     seen_periods = []
@@ -4393,7 +4420,8 @@ def test_maybe_daily_bars_drives_1w_from_prefilled_cache():
     daily_bars = [{"stime": "20260814000000", "open": 9.0, "high": 9.3, "low": 9.0, "close": 9.2, "volume": 10000, "amount": 92000.0}]
     rec = _Recorder(respond=_respond_quote_bars(stock, daily_bars))
     disp, _ = _make_dispatcher(rec)
-    engine = _make_engine_formula_portfolio(disp, factory, port, {1: "MA_CROSS"})
+    engine = _make_engine_formula_portfolio(disp, factory, port, {1: "MA_CROSS"},
+                                            running=True)
     daily_time = datetime(2026, 8, 14, 0, 0)
     engine.signal_cache[(1, stock, daily_time)] = [{"name": "open_sig", "value": 1}]
     engine._tq_formula.compute_injected_batch =MagicMock(return_value=None)
@@ -4418,7 +4446,8 @@ def test_maybe_daily_bars_day_rollover_reinjects_1w():
     daily_bars = [{"stime": "20260814000000", "open": 9.0, "high": 9.3, "low": 9.0, "close": 9.2, "volume": 10000, "amount": 92000.0}]
     rec = _Recorder(respond=_respond_quote_bars(stock, daily_bars))
     disp, _ = _make_dispatcher(rec)
-    engine = _make_engine_formula_portfolio(disp, factory, port, {1: "MA_CROSS"})
+    engine = _make_engine_formula_portfolio(disp, factory, port, {1: "MA_CROSS"},
+                                            running=True)
     # 启动注入在 08-13，日终落在 08-14 → 新 daily_time cache miss
     old_daily_time = datetime(2026, 8, 13, 0, 0)
     new_daily_time = datetime(2026, 8, 14, 0, 0)
@@ -8513,13 +8542,15 @@ def test_maybe_daily_bars_logs_info(caplog):
          "close": 9.2, "volume": 10000, "amount": 92000.0},
     ]))
     disp, _ = _make_dispatcher(rec)
-    engine = _make_engine_formula_portfolio(disp, factory, port, {1: "MA_CROSS"})
+    engine = _make_engine_formula_portfolio(disp, factory, port, {1: "MA_CROSS"},
+                                            running=True)
     engine._tq_formula.compute_injected_batch =lambda **kw: {
         stock: {"ErrorId": 0},
     }
     with caplog.at_level(logging.INFO, logger="core.engine.live.daily_closer"):
         engine._maybe_daily_bars(now=datetime(2026, 8, 24, 15, 5))
-    assert any("daily bar" in m for m in _log_msgs(caplog)), _log_msgs(caplog)
+    # 必须命中成功路径专属日志；"daily bar" 会被停止/中断分支的日志命中（假绿）
+    assert any("daily bar driven" in m for m in _log_msgs(caplog)), _log_msgs(caplog)
 
 
 def test_close_sweep_no_pending_logs_info(caplog):
@@ -12441,8 +12472,12 @@ def test_tdx_untraceable_still_rejects_without_bridge_untraceable_events():
 # 行情轮询窗口：收盘后停拉行情（config.live.quote_polling）
 # ===========================================================================
 def _window_engine(monkeypatch, fixed, trading_dates, codes=("600000.SH",),
-                   quote_polling=None, code_period_count=None, respond=None):
-    """带假日历 + 指定轮询窗口的 LiveEngine（行情轮询窗口用例专用）。"""
+                   quote_polling=None, code_period_count=None, respond=None,
+                   running=False):
+    """带假日历 + 指定轮询窗口的 LiveEngine（行情轮询窗口用例专用）。
+
+    running=True：直调 _tick_main 日终段的用例需声明引擎在运行，理由见 _calendar_engine。
+    """
     from core.engine.bar_poller import BarPoller
     from core.engine.trading_calendar import TradingCalendar
 
@@ -12460,6 +12495,8 @@ def _window_engine(monkeypatch, fixed, trading_dates, codes=("600000.SH",),
         code_period_count=code_period_count,
         quote_polling=quote_polling,
     )
+    if running:
+        engine._running = True
     return engine, poller, rec
 
 
@@ -12752,7 +12789,7 @@ def test_close_sweep_and_daily_closer_still_run_when_polling_paused(monkeypatch)
         return httpx.Response(404, json={"ok": False})
 
     engine, poller, rec = _window_engine(
-        monkeypatch, fixed, [date(2026, 8, 5)], respond=respond)
+        monkeypatch, fixed, [date(2026, 8, 5)], respond=respond, running=True)
     engine._last_reconcile_date = fixed.date()  # 隔离收盘对账复查
     called = {}
 
@@ -14041,7 +14078,8 @@ def test_stale_daily_bars_emit_freshness_risk_event_once():
               "low": 9.0, "close": 9.2, "volume": 10000, "amount": 92000.0}]
     rec = _Recorder(respond=_respond_quote_bars(stock, stale))
     disp, _ = _make_dispatcher(rec)
-    engine = _calendar_engine(factory, port, disp, [date(2026, 8, 10)], stock)
+    engine = _calendar_engine(factory, port, disp, [date(2026, 8, 10)], stock,
+                              running=True)
     q = asyncio.Queue()
     engine._stream_subscribers.append(q)
 
