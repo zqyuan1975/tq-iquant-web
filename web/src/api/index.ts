@@ -143,6 +143,8 @@ export interface BacktestRecordItem {
   validation: ValidationVerdict | null
   // F1 数据质量（覆盖率/缺根/被剔除假 bar），老记录为 null
   data_quality: DataQuality | null
+  // 0021 E5：所属多组合回测批（拼盘成员），单组合为 null
+  run_group_id: number | null
 }
 
 // K2 多记录横向对比（对齐 backtest_service.compare_records）
@@ -3358,14 +3360,34 @@ export interface PairingEvalResult {
   counts: Record<string, number>
 }
 
+export interface PairingBorrowerEdge {
+  id: number
+  lender_id: number
+  borrower_id: number
+  status: string
+  borrower_record_id: number | null
+  max_share: string | null
+  evaluation_id: number | null
+}
+
+export interface PairingQueueMeta {
+  position: number
+  expires_at?: string | null
+  expired_at?: string | null
+  [key: string]: unknown
+}
+
 export interface PairingPlanSummary {
   id: number
   name: string
-  scope: string
-  status: string       // DRAFT|APPROVED|WATCH|SUSPENDED|ARCHIVED
+  scope: string        // L2（同组合）| L3（跨组合）
+  status: string       // DRAFT|APPROVED|WATCH|SUSPENDED|ARCHIVED|QUEUED|EXPIRED
   portfolio_strategy_id: number
   lender_strategy_id: number | null
   borrower_strategy_id: number | null
+  borrower_count: number
+  borrowers: PairingBorrowerEdge[]
+  queue: PairingQueueMeta | null
   principal: string | null
   loan_term_days: number
   pairing_version: string | null
@@ -3378,22 +3400,25 @@ export interface PairingPlanSummary {
 export interface PairingPlanDetail extends PairingPlanSummary {
   binding: Record<string, unknown>
   evidence: Record<string, unknown>
-  edge: {
-    id: number
-    lender_id: number
-    borrower_id: number
-    status: string
-    max_share: string | null
-    evaluation_id: number | null
-  } | null
-  loan_model_plan: Record<string, unknown>
+  edge: PairingBorrowerEdge | null
+  edges: PairingBorrowerEdge[]
+  loan_model_plan: Record<string, unknown> | null
+}
+
+export interface PairingBorrowerInput {
+  portfolio_strategy_id: number
+  strategy_id: number
+  max_share?: number
 }
 
 export async function createPairingPlan(payload: {
   name: string
   portfolio_strategy_id: number
   lender_strategy_id: number
-  borrower_strategy_ids: number[]
+  borrower_strategy_ids?: number[]
+  borrowers?: PairingBorrowerInput[]
+  queue_policy?: 'queue' | 'reject'
+  queue_ttl_days?: number
   principal: number
   loan_term_days?: number
   recall_notice_days?: number
@@ -3433,6 +3458,37 @@ export async function deletePairingPlan(planId: number) {
 
 export async function getPairingLoanModelPlan(planId: number) {
   const res = await api.get<ApiResponse<Record<string, unknown>>>(`/pairing/plans/${planId}/loan-model-plan`)
+  return res.data.data
+}
+
+// ---------------------------------------------------------------------------
+// 多组合回测批（0021 E3/E5，只读；聚合落库后冻结）
+// ---------------------------------------------------------------------------
+
+export interface BacktestRunGroupSummary {
+  id: number
+  name: string
+  status: string       // running|completed|failed|canceled
+  error_message: string | null
+  pairing_plan_id: number | null
+  aggregate_frozen: boolean
+  params_snapshot: Record<string, unknown> | null
+  started_at: string | null
+  finished_at: string | null
+}
+
+export interface BacktestRunGroupDetail extends BacktestRunGroupSummary {
+  aggregate: Record<string, unknown> | null
+  records: BacktestRecordItem[]
+}
+
+export async function listBacktestRunGroups() {
+  const res = await api.get<ApiResponse<BacktestRunGroupSummary[]>>('/backtest/run-groups')
+  return res.data.data
+}
+
+export async function getBacktestRunGroup(groupId: number) {
+  const res = await api.get<ApiResponse<BacktestRunGroupDetail>>(`/backtest/run-groups/${groupId}`)
   return res.data.data
 }
 

@@ -15,6 +15,7 @@ import {
   evaluateCashOutlet,
   listPairingPlans, createPairingPlan, evaluatePairingPlan,
   approvePairingPlan, deletePairingPlan, getPairingPlan,
+  listBacktestRunGroups, getBacktestRunGroup,
 } from '../api'
 import type {
   BacktestRecordItem, BacktestDetailItem, PortfolioItem,
@@ -34,6 +35,7 @@ import type {
   CapitalUtilizationStats,
   CashOutletItem, CashOutletEvaluation,
   PairingPlanSummary, PairingPlanDetail,
+  BacktestRunGroupSummary, BacktestRunGroupDetail,
   GateReleaseResult,
 } from '../api'
 import { gateLabel, LAYER_LABEL, ACTION_LABEL } from '../utils/liveEvents'
@@ -1092,6 +1094,25 @@ async function load() {
 
 // ---- K2 多记录横向对比 ----
 const recordCompareSelected = ref<number[]>([])
+// 0021 E5：拼盘/多组合批成员默认不参与单记录对比，避免成员与聚合重复计数
+const recordCompareIncludeMembers = ref(false)
+const memberRecordIds = computed(() => new Set(
+  records.value.filter(r => r.run_group_id !== null).map(r => r.id)))
+watch(recordCompareIncludeMembers, (include) => {
+  if (include) return
+  recordCompareSelected.value = recordCompareSelected.value
+    .filter(id => !memberRecordIds.value.has(id))
+})
+watch(records, () => {
+  if (recordCompareIncludeMembers.value) return
+  recordCompareSelected.value = recordCompareSelected.value
+    .filter(id => !memberRecordIds.value.has(id))
+})
+const recordCompareCount = computed(() => (
+  recordCompareIncludeMembers.value
+    ? recordCompareSelected.value.length
+    : recordCompareSelected.value.filter(id => !memberRecordIds.value.has(id)).length
+))
 const showRecordCompare = ref(false)
 const recordCompareLoading = ref(false)
 const recordCompareError = ref('')
@@ -1165,13 +1186,16 @@ function renderRecordCompareChart() {
 }
 
 async function openRecordCompare() {
-  if (recordCompareSelected.value.length < 2) return
+  const ids = recordCompareIncludeMembers.value
+    ? recordCompareSelected.value
+    : recordCompareSelected.value.filter(id => !memberRecordIds.value.has(id))
+  if (ids.length < 2) return
   recordCompareError.value = ''
   recordCompareData.value = null
   showRecordCompare.value = true
   recordCompareLoading.value = true
   try {
-    recordCompareData.value = await compareBacktestRecords([...recordCompareSelected.value])
+    recordCompareData.value = await compareBacktestRecords([...ids])
   } catch (e) {
     recordCompareError.value = '对比失败：' + errMsg(e)
   } finally {
@@ -1433,26 +1457,70 @@ function scrollToCapacityStructure() {
     ?.scrollIntoView({ behavior: 'smooth', block: 'center' })
 }
 
-// ---- 资金池 L2 拼盘（0021 B6）----
+// ---- 资金池拼盘（0021 B6 L2 / E4 L3）----
 const showPairing = ref(false)
 const pairingPlans = ref<PairingPlanSummary[]>([])
 const pairingDetail = ref<PairingPlanDetail | null>(null)
 const pairingBusy = ref(false)
 const pairingError = ref('')
+const pairingExpandedId = ref<number | null>(null)
 const pairingForm = ref({
   name: '',
+  scope: 'L2' as 'L2' | 'L3',
   portfolio_strategy_id: 0,
   lender_strategy_id: 0,
   borrower_strategy_id: 0,
+  borrowers: [] as Array<{
+    portfolio_strategy_id: number
+    strategy_id: number
+    max_share: number
+  }>,
+  queue_policy: 'queue' as 'queue' | 'reject',
+  queue_ttl_days: 20,
   principal: 100000,
   loan_term_days: 365,
   recall_notice_days: 2,
 })
 
+const PAIRING_STATUS_TEXT: Record<string, string> = {
+  DRAFT: '草稿',
+  APPROVED: '已批准',
+  WATCH: '观察',
+  SUSPENDED: '暂停',
+  ARCHIVED: '已归档',
+  QUEUED: '排队中',
+  EXPIRED: '已过期',
+}
+function pairingStatusText(status: string): string {
+  return PAIRING_STATUS_TEXT[status] || status
+}
+
 const pairingStrategies = computed(() => {
   const p = portfolios.value.find(it => it.id === pairingForm.value.portfolio_strategy_id)
   return (p?.strategies || []) as Array<{ id: number; name: string }>
 })
+
+function strategiesOfPortfolio(portfolioId: number) {
+  const p = portfolios.value.find(it => it.id === portfolioId)
+  return (p?.strategies || []) as Array<{ id: number; name: string }>
+}
+
+function pairingStrategyName(id: number | null): string {
+  if (!id) return '—'
+  for (const p of portfolios.value) {
+    const hit = (p.strategies || []).find(s => s.id === id)
+    if (hit) return hit.name
+  }
+  return `#${id}`
+}
+
+function pairingStrategyPortfolioName(id: number | null): string {
+  if (!id) return '—'
+  for (const p of portfolios.value) {
+    if ((p.strategies || []).some(s => s.id === id)) return p.name
+  }
+  return '—'
+}
 
 function resetPairingMembers() {
   const list = pairingStrategies.value
@@ -1460,18 +1528,49 @@ function resetPairingMembers() {
   pairingForm.value.borrower_strategy_id = list[1]?.id || 0
 }
 
+function addPairingBorrower() {
+  const f = pairingForm.value
+  if (f.borrowers.length >= 3) return
+  const used = new Set(f.borrowers.map(b => b.strategy_id))
+  const first = portfolios.value[0]
+  const pool = strategiesOfPortfolio(first?.id || 0)
+  const pick = pool.find(s => !used.has(s.id) && s.id !== f.lender_strategy_id)
+  f.borrowers.push({
+    portfolio_strategy_id: first?.id || 0,
+    strategy_id: pick?.id || 0,
+    max_share: 1,
+  })
+}
+
+function removePairingBorrower(idx: number) {
+  pairingForm.value.borrowers.splice(idx, 1)
+}
+
+function initPairingBorrowers() {
+  const f = pairingForm.value
+  f.borrowers = []
+  addPairingBorrower()
+  // L3 至少 2 个借款方
+  if (f.borrowers.length === 1) addPairingBorrower()
+}
+
 function openPairing() {
   const p = portfolios.value[0]
   pairingForm.value = {
     name: '',
+    scope: 'L2',
     portfolio_strategy_id: p?.id || 0,
     lender_strategy_id: 0,
     borrower_strategy_id: 0,
+    borrowers: [],
+    queue_policy: 'queue',
+    queue_ttl_days: 20,
     principal: 100000,
     loan_term_days: 365,
     recall_notice_days: 2,
   }
   resetPairingMembers()
+  initPairingBorrowers()
   pairingError.value = ''
   pairingDetail.value = null
   showPairing.value = true
@@ -1494,25 +1593,70 @@ async function loadPairingPlans() {
   }
 }
 
+function togglePairingPlan(plan: PairingPlanSummary) {
+  pairingExpandedId.value = pairingExpandedId.value === plan.id ? null : plan.id
+}
+
 async function createPairing() {
   const f = pairingForm.value
   if (!f.portfolio_strategy_id) { alert('请选择组合'); return }
-  if (!f.lender_strategy_id || !f.borrower_strategy_id) { alert('请选择出借方与借款方策略'); return }
-  if (f.lender_strategy_id === f.borrower_strategy_id) { alert('出借方与借款方不能是同一策略'); return }
+  if (!f.lender_strategy_id) { alert('请选择出借方策略'); return }
   if (!(f.principal > 0)) { alert('借出本金必须大于 0'); return }
-  pairingBusy.value = true
-  pairingError.value = ''
-  try {
-    pairingDetail.value = await createPairingPlan({
+  let payload: Parameters<typeof createPairingPlan>[0]
+  if (f.scope === 'L3') {
+    if (f.borrowers.length < 2 || f.borrowers.length > 3) {
+      alert('L3 拼盘需要 2–3 个借款方'); return
+    }
+    for (const b of f.borrowers) {
+      if (!b.portfolio_strategy_id || !b.strategy_id) {
+        alert('请为每个借款方选择组合与策略'); return
+      }
+      if (b.strategy_id === f.lender_strategy_id) {
+        alert('借款方不能与出借方是同一策略'); return
+      }
+      if (!(b.max_share > 0 && b.max_share <= 1)) {
+        alert('借款方最大占比须在 (0,1]'); return
+      }
+    }
+    if (new Set(f.borrowers.map(b => b.strategy_id)).size !== f.borrowers.length) {
+      alert('借款方策略不能重复'); return
+    }
+    payload = {
+      name: f.name.trim() || 'L3 拼盘',
+      scope: 'L3',
+      portfolio_strategy_id: f.portfolio_strategy_id,
+      lender_strategy_id: f.lender_strategy_id,
+      borrowers: f.borrowers.map(b => ({
+        portfolio_strategy_id: b.portfolio_strategy_id,
+        strategy_id: b.strategy_id,
+        max_share: Number(b.max_share),
+      })),
+      queue_policy: f.queue_policy,
+      queue_ttl_days: Number(f.queue_ttl_days) || 20,
+      principal: Number(f.principal),
+      loan_term_days: Number(f.loan_term_days) || 365,
+      recall_notice_days: Number(f.recall_notice_days) || 2,
+    }
+  } else {
+    if (!f.borrower_strategy_id) { alert('请选择借款方策略'); return }
+    if (f.lender_strategy_id === f.borrower_strategy_id) {
+      alert('出借方与借款方不能是同一策略'); return
+    }
+    payload = {
       name: f.name.trim() || 'L2 拼盘',
+      scope: 'L2',
       portfolio_strategy_id: f.portfolio_strategy_id,
       lender_strategy_id: f.lender_strategy_id,
       borrower_strategy_ids: [f.borrower_strategy_id],
       principal: Number(f.principal),
       loan_term_days: Number(f.loan_term_days) || 365,
       recall_notice_days: Number(f.recall_notice_days) || 2,
-      scope: 'L2',
-    })
+    }
+  }
+  pairingBusy.value = true
+  pairingError.value = ''
+  try {
+    pairingDetail.value = await createPairingPlan(payload)
     await loadPairingPlans()
   } catch (e) {
     pairingError.value = errMsg(e)
@@ -1567,12 +1711,53 @@ async function applyPairingToBacktest(plan: PairingPlanSummary) {
     openForm()
     form.value.portfolio_strategy_id = detail.portfolio_strategy_id
     form.value.name = `${detail.name}-合并回测`
-    form.value.loan_model_plan = detail.loan_model_plan
+    form.value.loan_model_plan = detail.loan_model_plan || undefined
     form.value.pairing_plan_id = detail.id
     showPairing.value = false
   } catch (e) {
     pairingError.value = errMsg(e)
   }
+}
+
+// ---- 0021 E5：多组合回测批（运行组）折叠与钻取 ----
+const runGroups = ref<BacktestRunGroupSummary[]>([])
+const runGroupsError = ref('')
+const runGroupOpen = ref(false)
+const runGroupExpandedId = ref<number | null>(null)
+const runGroupDetail = ref<BacktestRunGroupDetail | null>(null)
+const runGroupDetailBusy = ref(false)
+
+async function loadRunGroups() {
+  try {
+    runGroups.value = await listBacktestRunGroups()
+    runGroupsError.value = ''
+  } catch (e) {
+    runGroups.value = []
+    runGroupsError.value = errMsg(e)
+  }
+}
+
+async function toggleRunGroup(group: BacktestRunGroupSummary) {
+  if (runGroupExpandedId.value === group.id) {
+    runGroupExpandedId.value = null
+    runGroupDetail.value = null
+    return
+  }
+  runGroupExpandedId.value = group.id
+  runGroupDetail.value = null
+  runGroupDetailBusy.value = true
+  try {
+    runGroupDetail.value = await getBacktestRunGroup(group.id)
+  } catch (e) {
+    runGroupsError.value = errMsg(e)
+  } finally {
+    runGroupDetailBusy.value = false
+  }
+}
+
+async function toggleRunGroups() {
+  runGroupOpen.value = !runGroupOpen.value
+  if (runGroupOpen.value) await loadRunGroups()
 }
 
 function openForm() {
@@ -3749,9 +3934,14 @@ watch(theme, () => {
   <!-- ============ 列表视图 ============ -->
   <div v-if="!currentRecord">
     <PageHeader title="回测管理">
-      <button class="btn btn-sm" :disabled="recordCompareSelected.length < 2" @click="openRecordCompare"
+      <label class="btn btn-sm" style="display:inline-flex;align-items:center;gap:4px;cursor:pointer"
+             title="拼盘/多组合批成员默认不参与单记录对比，避免与聚合重复计数">
+        <input type="checkbox" v-model="recordCompareIncludeMembers" style="width:auto;margin:0" />
+        含拼盘成员
+      </label>
+      <button class="btn btn-sm" :disabled="recordCompareCount < 2" @click="openRecordCompare"
               title="勾选 2~10 条已完成记录，对比净值曲线 / 指标 / 参数 / 成交差异">
-        对比所选{{ recordCompareSelected.length ? ` (${recordCompareSelected.length})` : '' }}
+        对比所选{{ recordCompareCount ? ` (${recordCompareCount})` : '' }}
       </button>
       <button class="btn btn-sm" @click="openReplay"
               title="重算指定组合区间的公式信号，可选与实盘委托按日期/股票/方向对照">
@@ -3786,6 +3976,53 @@ watch(theme, () => {
       <span v-if="gateBanner.reasons.length">（{{ gateBanner.reasons.join('；') }}）</span>
     </div>
 
+    <!-- 0021 E5：多组合回测批（运行组）折叠；成员记录不重复计数 -->
+    <div class="card" style="padding:12px;margin-bottom:12px" data-test="run-groups">
+      <div style="display:flex;align-items:center;justify-content:space-between;gap:8px">
+        <strong>多组合回测批（{{ runGroups.length }}）</strong>
+        <button class="btn btn-sm" @click="toggleRunGroups">
+          {{ runGroupOpen ? '收起' : '展开' }}
+        </button>
+      </div>
+      <div v-if="runGroupOpen" style="margin-top:8px">
+        <div v-if="runGroupsError" style="color:var(--red);margin-bottom:6px">{{ runGroupsError }}</div>
+        <div v-if="!runGroups.length" class="note">暂无运行组。发起多组合回测或 L3 拼盘回测后在此出现。</div>
+        <div v-for="g in runGroups" :key="g.id" style="border-top:1px solid var(--line);padding:8px 0">
+          <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+            <button class="btn btn-sm" @click="toggleRunGroup(g)">
+              {{ runGroupExpandedId === g.id ? '▾' : '▸' }} #{{ g.id }}
+            </button>
+            <span>{{ g.name }}</span>
+            <span class="badge" :class="g.status === 'completed' ? 'badge-green' : g.status === 'running' ? 'badge-blue' : 'badge-gray'">
+              {{ STATUS_LABEL[g.status] || g.status }}
+            </span>
+            <span v-if="g.pairing_plan_id" class="badge badge-blue">拼盘 #{{ g.pairing_plan_id }}</span>
+            <span v-if="g.aggregate_frozen" class="badge badge-gray" title="聚合指标落库后冻结，只读">聚合已冻结</span>
+          </div>
+          <div v-if="runGroupExpandedId === g.id" style="margin:6px 0 0 18px">
+            <div v-if="runGroupDetailBusy" class="note">加载成员…</div>
+            <template v-else-if="runGroupDetail && runGroupDetail.id === g.id">
+              <div v-if="!runGroupDetail.records.length" class="note">该批没有成员记录。</div>
+              <table v-else>
+                <thead><tr><th>成员记录</th><th>名称</th><th>组合</th><th>状态</th><th>操作</th></tr></thead>
+                <tbody>
+                  <tr v-for="m in runGroupDetail.records" :key="m.id">
+                    <td>#{{ m.id }}</td>
+                    <td>{{ m.name }}</td>
+                    <td>{{ poolName(m.portfolio_strategy_id) }}</td>
+                    <td>{{ STATUS_LABEL[m.status] || m.status }}</td>
+                    <td>
+                      <button class="btn btn-sm" :disabled="m.status !== 'completed'" @click="openDetail(m.id)">查看</button>
+                    </td>
+                  </tr>
+                </tbody>
+              </table>
+            </template>
+          </div>
+        </div>
+      </div>
+    </div>
+
     <div v-if="loading" class="card" style="padding:12px"><p>加载中…</p></div>
     <div v-else class="card table-wrap">
       <table>
@@ -3794,10 +4031,15 @@ watch(theme, () => {
           <tr v-for="r in records" :key="r.id">
             <td>
               <input type="checkbox" :value="r.id" v-model="recordCompareSelected"
-                     :disabled="r.status !== 'completed'" title="勾选参与横向对比" />
+                     :disabled="r.status !== 'completed' || (!recordCompareIncludeMembers && r.run_group_id !== null)"
+                     :title="r.run_group_id !== null ? '拼盘成员默认不参与对比，可勾选上方「含拼盘成员」' : '勾选参与横向对比'" />
             </td>
             <td style="color:var(--ink-faint)">#{{ r.id }}</td>
-            <td>{{ r.name }}</td>
+            <td>
+              {{ r.name }}
+              <span v-if="r.run_group_id !== null" class="badge badge-blue" style="margin-left:6px"
+                    :title="`所属运行组 #${r.run_group_id}`">拼盘成员</span>
+            </td>
             <td>{{ poolName(r.portfolio_strategy_id) }}</td>
             <td style="color:var(--ink-soft);font-size:12px">{{ r.start_date }} ~ {{ r.end_date }}</td>
             <td><span class="badge" :class="r.status === 'completed' ? 'badge-green' : r.status === 'running' ? 'badge-blue' : 'badge-gray'">{{ STATUS_LABEL[r.status] || r.status }}</span></td>
@@ -4322,11 +4564,12 @@ watch(theme, () => {
     <!-- ============ 资金池 L2 拼盘（0021 B6）Modal ============ -->
     <div v-if="showPairing" class="modal-overlay modal-lg" @click.self="showPairing = false">
       <div class="modal-content">
-        <h3 style="margin:0">新建 L2 拼盘（同组合内出资 / 借款）</h3>
+        <h3 style="margin:0">新建拼盘（L2 同组合 / L3 跨组合）</h3>
         <div class="modal-body">
           <div v-if="pairingError" style="color:var(--red);margin-bottom:8px">{{ pairingError }}</div>
           <p style="color:var(--ink-soft);margin:4px 0 12px">
-            阶段 B 仅同组合、1 个借款方；评估通过只代表可进入合并回测，不会启动实盘。
+            L2：同组合内 1 个借款方；L3：可跨组合 2–3 个借款方，第 4 个按队列/拒绝策略处理。
+            评估通过只代表可进入合并回测，不会启动实盘。
           </p>
           <div class="form-group">
             <label class="group-label">拼盘配置</label>
@@ -4336,7 +4579,14 @@ watch(theme, () => {
                 <input v-model="pairingForm.name" placeholder="例如：主策略 + 搭配策略" />
               </div>
               <div class="field-row field-span-2">
-                <span class="field-label">组合</span>
+                <span class="field-label">类型</span>
+                <select v-model="pairingForm.scope">
+                  <option value="L2">L2 同组合内拼盘</option>
+                  <option value="L3">L3 跨组合拼盘（2–3 借款方）</option>
+                </select>
+              </div>
+              <div class="field-row field-span-2">
+                <span class="field-label">出借方组合</span>
                 <select v-model="pairingForm.portfolio_strategy_id" @change="resetPairingMembers">
                   <option :value="0" disabled>请选择组合</option>
                   <option v-for="p in portfolios" :key="p.id" :value="p.id">{{ p.name }}</option>
@@ -4348,12 +4598,52 @@ watch(theme, () => {
                   <option v-for="s in pairingStrategies" :key="s.id" :value="s.id">{{ s.name }}</option>
                 </select>
               </div>
-              <div class="field-row">
-                <span class="field-label">借款方策略</span>
-                <select v-model="pairingForm.borrower_strategy_id">
-                  <option v-for="s in pairingStrategies" :key="s.id" :value="s.id">{{ s.name }}</option>
-                </select>
-              </div>
+
+              <template v-if="pairingForm.scope === 'L2'">
+                <div class="field-row">
+                  <span class="field-label">借款方策略</span>
+                  <select v-model="pairingForm.borrower_strategy_id">
+                    <option v-for="s in pairingStrategies" :key="s.id" :value="s.id">{{ s.name }}</option>
+                  </select>
+                </div>
+              </template>
+
+              <template v-else>
+                <div class="field-row field-span-2">
+                  <span class="field-label">借款方（2–3 个，可跨组合）</span>
+                  <div style="width:100%">
+                    <div v-for="(b, i) in pairingForm.borrowers" :key="i"
+                         style="display:flex;gap:6px;align-items:center;margin-bottom:6px;flex-wrap:wrap">
+                      <select v-model="b.portfolio_strategy_id" style="flex:1 1 120px">
+                        <option :value="0" disabled>组合</option>
+                        <option v-for="p in portfolios" :key="p.id" :value="p.id">{{ p.name }}</option>
+                      </select>
+                      <select v-model="b.strategy_id" style="flex:1 1 120px">
+                        <option :value="0" disabled>策略</option>
+                        <option v-for="s in strategiesOfPortfolio(b.portfolio_strategy_id)" :key="s.id" :value="s.id">{{ s.name }}</option>
+                      </select>
+                      <input type="number" v-model.number="b.max_share" min="0.01" max="1" step="0.05"
+                             style="width:90px" title="最大占比（0–1）" />
+                      <button class="btn btn-sm" :disabled="pairingForm.borrowers.length <= 2"
+                              @click="removePairingBorrower(i)">移除</button>
+                    </div>
+                    <button class="btn btn-sm" :disabled="pairingForm.borrowers.length >= 3"
+                            @click="addPairingBorrower">+ 借款方</button>
+                  </div>
+                </div>
+                <div class="field-row">
+                  <span class="field-label">超额策略</span>
+                  <select v-model="pairingForm.queue_policy">
+                    <option value="queue">排队（第 4 个按 TTL 等待）</option>
+                    <option value="reject">直接拒绝</option>
+                  </select>
+                </div>
+                <div class="field-row">
+                  <span class="field-label">排队 TTL（交易日）</span>
+                  <input type="number" v-model.number="pairingForm.queue_ttl_days" min="1" />
+                </div>
+              </template>
+
               <div class="field-row">
                 <span class="field-label">借出本金</span>
                 <input type="number" v-model.number="pairingForm.principal" min="0" />
@@ -4369,25 +4659,75 @@ watch(theme, () => {
             <label class="group-label">已建拼盘</label>
             <div class="table-wrap">
               <table>
-                <thead><tr><th>ID</th><th>名称</th><th>状态</th><th>评估</th><th>本金</th><th>操作</th></tr></thead>
+                <thead><tr><th>ID</th><th>类型</th><th>名称</th><th>成员</th><th>状态</th><th>评估</th><th>本金</th><th>操作</th></tr></thead>
                 <tbody>
-                  <tr v-for="p in pairingPlans" :key="p.id">
-                    <td>{{ p.id }}</td>
-                    <td>{{ p.name }}</td>
-                    <td>{{ p.status }}</td>
-                    <td :style="{ color: p.eval?.status === 'GO' ? 'var(--green)' : p.eval?.status === 'NO_GO' ? 'var(--red)' : 'var(--ink-soft)' }">
-                      {{ p.eval?.status || '—' }}
-                    </td>
-                    <td>{{ p.principal || '—' }}</td>
-                    <td style="white-space:nowrap">
-                      <button class="btn btn-sm" :disabled="pairingBusy" @click="evaluatePairing(p)">重新评估</button>
-                      <button class="btn btn-sm" :disabled="pairingBusy || p.status !== 'DRAFT'" @click="approvePairing(p)">批准</button>
-                      <button class="btn btn-sm" :disabled="pairingBusy" @click="applyPairingToBacktest(p)">带入回测</button>
-                      <button class="btn btn-sm" :disabled="pairingBusy || p.status !== 'DRAFT'" @click="removePairing(p)">删除</button>
-                    </td>
-                  </tr>
+                  <template v-for="p in pairingPlans" :key="p.id">
+                    <tr>
+                      <td>{{ p.id }}</td>
+                      <td><span class="badge" :class="p.scope === 'L3' ? 'badge-blue' : 'badge-gray'">{{ p.scope }}</span></td>
+                      <td>{{ p.name }}</td>
+                      <td>
+                        <button class="btn btn-sm" @click="togglePairingPlan(p)"
+                                :title="`借款方 ${p.borrower_count} 个（拼盘只计一次）`">
+                          {{ pairingExpandedId === p.id ? '▾' : '▸' }} {{ p.borrower_count }}
+                        </button>
+                      </td>
+                      <td>
+                        {{ pairingStatusText(p.status) }}
+                        <span v-if="p.status === 'QUEUED' && p.queue" class="badge badge-blue"
+                              style="margin-left:4px">
+                          排队 #{{ p.queue.position }}<template v-if="p.queue.expires_at"> · 至 {{ p.queue.expires_at }}</template>
+                        </span>
+                      </td>
+                      <td :style="{ color: p.eval?.status === 'GO' ? 'var(--green)' : p.eval?.status === 'NO_GO' ? 'var(--red)' : 'var(--ink-soft)' }">
+                        {{ p.eval?.status || '—' }}
+                      </td>
+                      <td>{{ p.principal || '—' }}</td>
+                      <td style="white-space:nowrap">
+                        <button class="btn btn-sm" :disabled="pairingBusy" @click="evaluatePairing(p)">重新评估</button>
+                        <button class="btn btn-sm" :disabled="pairingBusy || p.status !== 'DRAFT'" @click="approvePairing(p)">批准</button>
+                        <button class="btn btn-sm" :disabled="pairingBusy" @click="applyPairingToBacktest(p)">带入回测</button>
+                        <button class="btn btn-sm" :disabled="pairingBusy || p.status !== 'DRAFT'" @click="removePairing(p)">删除</button>
+                      </td>
+                    </tr>
+                    <tr v-if="pairingExpandedId === p.id">
+                      <td colspan="8" style="background:var(--bg-soft)">
+                        <div v-if="!p.borrowers.length" class="note">无借款方边（排队中不建边）。</div>
+                        <table v-else style="width:100%">
+                          <thead><tr><th>借款方</th><th>所属组合</th><th>最大占比</th><th>边状态</th><th>评估</th></tr></thead>
+                          <tbody>
+                            <tr v-for="e in p.borrowers" :key="e.id">
+                              <td>{{ pairingStrategyName(e.borrower_id) }}</td>
+                              <td>{{ pairingStrategyPortfolioName(e.borrower_id) }}</td>
+                              <td>{{ e.max_share || '—' }}</td>
+                              <td>{{ e.status }}</td>
+                              <td>{{ e.evaluation_id ? `#${e.evaluation_id}` : '—' }}</td>
+                            </tr>
+                          </tbody>
+                        </table>
+                      </td>
+                    </tr>
+                  </template>
                 </tbody>
               </table>
+            </div>
+          </div>
+
+          <div v-if="pairingDetail" class="card" style="padding:10px;margin-bottom:10px">
+            <p style="margin:0 0 6px">
+              拼盘 #{{ pairingDetail.id }} · {{ pairingDetail.scope }} ·
+              {{ pairingStatusText(pairingDetail.status) }}
+              <span v-if="pairingDetail.queue" class="badge badge-blue" style="margin-left:4px">
+                排队 #{{ pairingDetail.queue.position }}<template v-if="pairingDetail.queue.expires_at"> · 至 {{ pairingDetail.queue.expires_at }}</template>
+              </span>
+            </p>
+            <div v-for="e in pairingDetail.edges" :key="e.id"
+                 style="border-top:1px solid var(--line);padding:6px 0">
+              借款方 <b>{{ pairingStrategyName(e.borrower_id) }}</b>
+              （组合 {{ pairingStrategyPortfolioName(e.borrower_id) }}，占比 {{ e.max_share || '—' }}）
+              · 边状态 {{ e.status }}
+              · 评估 {{ e.evaluation_id ? `#${e.evaluation_id}` : '—' }}
+              <span v-if="e.borrower_record_id" class="note"> · 记录 #{{ e.borrower_record_id }}</span>
             </div>
           </div>
 

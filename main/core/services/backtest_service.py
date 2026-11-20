@@ -3081,6 +3081,8 @@ def _serialize_record(r: BacktestRecord) -> dict:
         ),
         "created_at": r.created_at.isoformat() if r.created_at else None,
         "completed_at": r.completed_at.isoformat() if r.completed_at else None,
+        # 0021 E5：拼盘/多组合批成员标记，供前端折叠与对比默认排除
+        "run_group_id": getattr(r, "run_group_id", None),
     }
 
 
