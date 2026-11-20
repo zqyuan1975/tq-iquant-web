@@ -31,6 +31,10 @@ def alembic_cfg(tmp_path, monkeypatch):
         "core.config.load_config",
         lambda: {"database": {"sqlite_path": str(db_file)}},
     )
+    # TQ_DB_PATH 在 env.py 里优先于 load_config（与 core.db 同源规则），
+    # 测试进程的 conftest 也设了它；这里必须同步改到本次 tmp 库，否则迁移
+    # 会落到共用的测试库，报 "table ... already exists"。
+    monkeypatch.setenv("TQ_DB_PATH", str(db_file))
     return Config(str(_MAIN_DIR / "alembic.ini"))
 
 
