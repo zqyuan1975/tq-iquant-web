@@ -222,7 +222,7 @@ def create_session(data: dict, db: Session = Depends(get_db)):
     if not (14 * 60 + 51 <= minutes <= 14 * 60 + 59):
         return err(400, "advance_close_time 仅支持 14:51–14:59（14:50 bar 闭合后、收盘前）")
     data["advance_close_time"] = advance_close_time
-    # 错周期 bar 风控（nullable 三态）：null/缺省=未显式设置（按子策略周期自动推导）；
+    # 错周期 bar 风控（nullable 三态）：null/缺省=未显式设置（生效＝关闭，纯用户控制）；
     # true/false=会话覆盖，永远优先。
     mismatch = data.get("intraday_mismatched_risk_enabled")
     if mismatch is None:

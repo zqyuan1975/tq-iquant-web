@@ -1296,25 +1296,27 @@ MINUTE_STRATEGY_PERIODS = ("1m", "5m", "15m", "30m", "1h")
 
 
 def _minute_strategy_periods(db: Session, session_id: int) -> List[str]:
-    """会话内实际用到的分钟级子策略周期（去重排序）。"""
+    """会话内实际用到的分钟级子策略周期（去重排序；仅用于界面建议，不参与生效值）。"""
     return sorted({
         str(st.period) for _, st in _session_strategies(db, session_id)
         if str(st.period) in MINUTE_STRATEGY_PERIODS
     })
 
 
-def resolve_mismatched_risk(session, minute_periods: List[str]) -> tuple:
-    """错周期逐 1m 风控的生效值与来源（会话三态）。
+def resolve_mismatched_risk(session) -> tuple:
+    """错周期逐 1m 风控的生效值与来源（会话三态，纯用户控制）。
 
-    显式 true/false 永远优先；NULL（未显式设置）时按会话内子策略周期自动推导：
-    存在分钟级策略 → True，全是日线及以上 → False。
+    显式 true/false 直接生效；NULL（未显式设置）**一律视为关闭**——不因会话内
+    存在分钟策略自动开启，与接入该开关前的实际行为一致。会话内是否存在分钟策略
+    只用于界面建议提示（``minute_strategy_periods``），不参与本函数判定。
+
+    返回 ``(effective, source)``；source ∈ {"explicit", "unset"}，供界面一眼区分
+    「用户显式设置」与「未设置（默认关闭）」。
     """
     explicit = getattr(session, "intraday_mismatched_risk_enabled", None)
     if explicit is not None:
         return bool(explicit), "explicit"
-    if minute_periods:
-        return True, "auto_minute"
-    return False, "auto_no_minute"
+    return False, "unset"
 
 
 def _preflight_tq_alert():
@@ -1846,26 +1848,23 @@ def build_engine(
     # G2：会话级盘前参数覆盖（NULL=跟随全局；非空=本会话覆盖）。
     _pre_open_cfg, _pre_open_overrides = resolve_pre_open_auction_config(
         session_row, _tq_cfg)
-    # 错周期 bar 风控：会话三态 NULL → 按会话内子策略周期自动推导
-    # （存在分钟级策略 → 开；全是日线及以上 → 关）；显式 true/false 永远优先。
+    # 错周期 bar 风控：纯用户控制——显式 true/false 直接生效；NULL（未显式设置）
+    # 一律关闭（与接入前一致），不因存在分钟策略自动开启。分钟周期只用于界面建议
+    # 与日志提示，不参与生效值判定。
     _minute_periods = sorted({
         str(getattr(st, "period", "")) for port in portfolios
         for st in getattr(port, "strategies", [])
         if str(getattr(st, "period", "")) in MINUTE_STRATEGY_PERIODS
     })
-    if session_mismatch_risk is None:
-        session_mismatch_risk, _mismatch_source = resolve_mismatched_risk(
-            session_row, _minute_periods)
-    else:
-        _mismatch_source = "explicit"
-    if _minute_periods and session_mismatch_risk:
+    session_mismatch_risk, _mismatch_source = resolve_mismatched_risk(session_row)
+    if session_mismatch_risk:
         logger.info(
-            "会话 %s 含分钟策略 %s：逐 1m 风控已启用（来源=%s）",
-            session_id, ",".join(_minute_periods), _mismatch_source)
+            "会话 %s 逐 1m 风控已显式开启（来源=%s，分钟策略=%s）",
+            session_id, _mismatch_source, ",".join(_minute_periods) or "-")
     elif _minute_periods:
-        logger.warning(
-            "会话 %s 含分钟策略 %s，但逐 1m 风控关闭（来源=%s）：止损/止盈/"
-            "移动止损只在本周期 bar 收盘评估",
+        logger.info(
+            "会话 %s 含分钟策略 %s，但逐 1m 风控未开启（来源=%s）：默认继承回测的"
+            "次日执行；如需盘中逐 1m 评估，请在会话设置中显式开启",
             session_id, ",".join(_minute_periods), _mismatch_source)
     else:
         logger.info(
@@ -2117,7 +2116,7 @@ def list_sessions(db: Session, engines: Optional[Dict[int, LiveEngine]] = None) 
 
     def _risk_view(sess) -> dict:
         periods = sorted(minute_periods_by_session.get(sess.id, ()))
-        effective, source = resolve_mismatched_risk(sess, periods)
+        effective, source = resolve_mismatched_risk(sess)
         return {
             "minute_strategy_periods": periods,
             "intraday_mismatched_risk_effective": effective,
@@ -2869,10 +2868,9 @@ def get_session(db: Session, session_id: int, engine: Optional[LiveEngine] = Non
     )
     # ③ 外部现金流累计净流入（一次查询，供各组合展示）
     net_map = cash_flow_net_inflow(db, session_id)
-    # 逐 1m 错周期风控：生效值 + 来源（NULL 时按子策略周期自动推导）
+    # 逐 1m 错周期风控：生效值 + 来源（NULL=未设置→关闭；分钟周期仅作界面建议）
     _minute_periods = _minute_strategy_periods(db, session_id)
-    _mismatch_effective, _mismatch_source = resolve_mismatched_risk(
-        session, _minute_periods)
+    _mismatch_effective, _mismatch_source = resolve_mismatched_risk(session)
     data = {
         "id": session.id,
         "name": session.name,
@@ -2930,7 +2928,7 @@ def get_session(db: Session, session_id: int, engine: Optional[LiveEngine] = Non
         # 错周期 bar 风控（三态原始值：None=未显式设置，true/false=会话覆盖）
         "intraday_mismatched_risk_enabled":
             session.intraday_mismatched_risk_enabled,
-        # 生效值与来源：NULL 时按子策略周期自动推导（auto_minute/auto_no_minute）
+        # 生效值与来源：NULL=未显式设置→关闭（explicit / unset；纯用户控制）
         "intraday_mismatched_risk_effective": _mismatch_effective,
         "intraday_mismatched_risk_source": _mismatch_source,
         "minute_strategy_periods": _minute_periods,

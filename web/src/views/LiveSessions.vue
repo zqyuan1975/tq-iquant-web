@@ -106,9 +106,8 @@ const form = ref({
   // 提前收盘价轮次时点 HH:MM（默认 14:51，限定 14:51–14:59；委托价需要 14:52
   // 起始 1m bar 的开盘价，故实际轮次不早于 14:52）
   advance_close_time: '14:51' as string,
-  // 错周期风控三态：null=未显式设置（按会话内子策略周期自动推导：含分钟策略→开，
-  // 否则关；显式 true/false 永远优先）/ true=强制开启（任意 bar 都跑风控）/
-  // false=强制关闭
+  // 错周期风控三态：null=未显式设置（生效＝关闭；分钟策略仅作界面建议）/
+  // true=强制开启（任意 bar 都跑风控）/ false=强制关闭；显式值永远优先
   intraday_mismatched_risk_enabled: null as boolean | null,
   // E1：执行前重判门控（默认关）——顺延次日单/盘前竞价单提交前再判一次
   gate_recheck_on_execute: false as boolean,
@@ -218,8 +217,8 @@ const minuteLivePeriods = computed(() => {
   return Array.from(hit).sort()
 })
 const minuteNoticeDismissed = ref(false)
-// 逐 1m 错周期风控：会话含分钟策略但该字段为 NULL（未显式设置）→ 提示确认一次并落库。
-// 运行时已按策略周期自动判定（auto_minute），这里只负责把隐式值固化为显式值。
+// 逐 1m 错周期风控：分钟策略 + 字段未设置 → 仅界面建议「可考虑开启」。
+// 未设置＝关闭；不写库、不影响 effective，只有点按钮才固化为显式值。
 const riskSavingId = ref<number | null>(null)
 const riskAutoSessions = computed(() =>
   sessions.value.filter((s) =>
@@ -1950,6 +1949,7 @@ onUnmounted(() => {
         实盘 1m 读本地原生 .lc1、5m 读 .lc5、15m/30m/1h 走原生周期，只使用已闭合 bar
         （未完成桶不进入信号与风控）。成交按信号 bar 收盘价挂限价且默认不追价，
         成交时点与均价仍可能与回测不同；回测绑定不继承风控执行时点 / 追价 / 单笔上限 / 复权口径。
+        <b>原生分钟源只决定 bar 来源，不改变风控执行时点，也不会自动开启「盘中逐 1m 风控」。</b>
       </div>
       <div v-else class="minute-live-body">
         当前组合含 {{ minuteLivePeriods.join(' / ') }} 周期。当前未启用原生分钟源（默认）：
@@ -1962,26 +1962,28 @@ onUnmounted(() => {
         成交按信号 bar 收盘价挂限价且默认不追价（180s 超时撤单），离线统计约 7.2% 买单 /
         7.9% 卖单在信号价无成交，成交均价系统性劣于回测（回测按下一根开盘必成交）。
         回测绑定只是绑定关系，不继承策略 / 周期 / 风控执行时点 / 追价 / 单笔上限 / 复权口径。
+        <b>原生分钟源只决定 bar 来源，不改变风控执行时点，也不会自动开启「盘中逐 1m 风控」。</b>
       </div>
     </div>
     <button class="btn btn-sm" @click="minuteNoticeDismissed = true">关闭</button>
   </div>
 
-  <!-- 逐 1m 风控固化提示：分钟策略 + 未显式设置时提示确认一次（不阻断任何操作） -->
+  <!-- 逐 1m 风控建议提示：分钟策略 + 未显式设置时只给建议（不阻断、不写库） -->
   <div v-if="riskAutoSessions.length" class="card minute-live-banner" data-test="risk-auto-banner">
     <div>
-      <strong>分钟策略：请确认「盘中逐 1m 风控」</strong>
+      <strong>分钟策略：可考虑开启「盘中逐 1m 风控」</strong>
       <div class="minute-live-body">
-        以下会话含分钟级子策略，但未显式设置逐 1m 错周期风控。运行时会按策略周期自动判定为
-        <b>开启</b>（5m 策略也逐 1m 评估止损/止盈/移动止损）；确认后将写入会话显式值，
-        显式值永远优先。运行中的会话下次启动生效。
+        以下会话含分钟级子策略，但该开关未显式设置。<b>未设置＝关闭</b>：默认继承回测的
+        次日执行（日线策略止损在 15:05 收盘落定、次日首根 bar 提交）。如需盘中逐 1m 评估
+        止损/止盈/移动止损，可点「启用并固化」。未点击按钮不会写入数据库，也不会改变当前
+        生效值；运行中的会话下次启动生效；日线策略会话不会出现本提示。
         <div v-for="s in riskAutoSessions" :key="s.id" style="margin-top:6px">
           <span>{{ s.name }}（{{ (s.minute_strategy_periods || []).join(' / ') }}，
-            当前生效：{{ s.intraday_mismatched_risk_effective ? '开' : '关' }}）</span>
+            当前生效：{{ s.intraday_mismatched_risk_effective ? '开' : '关（未设置）' }}）</span>
           <button class="btn btn-sm" :disabled="riskSavingId === s.id"
                   @click="confirmMismatchRisk(s, true)">启用并固化</button>
           <button class="btn btn-sm" :disabled="riskSavingId === s.id"
-                  @click="confirmMismatchRisk(s, false)">固化关闭</button>
+                  @click="confirmMismatchRisk(s, false)">保持关闭并固化</button>
         </div>
       </div>
     </div>
@@ -1990,12 +1992,12 @@ onUnmounted(() => {
   <!-- 分钟策略 + 显式关闭逐 1m 风控：留痕说明原因（不阻断） -->
   <div v-if="riskOffMinuteSessions.length" class="card minute-live-banner">
     <div class="minute-live-body">
-      <b>分钟策略但逐 1m 风控已关闭</b>：
+      <b>分钟策略但逐 1m 风控已显式关闭</b>：
       <span v-for="s in riskOffMinuteSessions" :key="s.id">
         {{ s.name }}（{{ (s.minute_strategy_periods || []).join(' / ') }}）
       </span>
-      止损/止盈/移动止损只在本周期 bar 收盘评估；如需盘中逐 1m 评估，请在会话设置里改为
-      「强制开启」或「未显式设置」。
+      止损/止盈/移动止损只在本周期 bar 收盘评估；默认继承回测的次日执行。如需盘中逐 1m 评估，
+      请在会话设置里改为「强制开启」。
     </div>
   </div>
 
@@ -3140,13 +3142,14 @@ onUnmounted(() => {
       </template>
       <label>错周期风控</label>
       <select v-model="form.intraday_mismatched_risk_enabled" data-field="intraday_mismatched_risk_enabled">
-        <option :value="null">未显式设置（按策略周期自动：含分钟策略→开，否则关）</option>
+        <option :value="null">未显式设置（默认关闭；有分钟策略时界面会提示可开启）</option>
         <option :value="true">强制开启（任意 bar 都跑风控）</option>
         <option :value="false">强制关闭</option>
       </select>
       <p style="font-size:12px;color:var(--ink-faint);margin:2px 0 12px">
-        会话为「未显式设置」时按会话内子策略周期自动推导：只要存在 1m/5m/15m/30m/1h 策略就开启，
-        全为日线及以上则关闭。显式 true/false 永远优先，且不会被自动推导覆盖。
+        「未显式设置」＝<b>关闭</b>：不因会话内存在分钟策略自动开启，默认继承回测的次日执行
+        （日线策略止损在 15:05 收盘落定、次日首根 bar 提交）。显式 true/false 直接生效，永远优先。
+        自动推导仅用于界面建议（有分钟策略时提示「可考虑开启」），不写库、不影响生效值。
         自身周期的 bar 恒评估；开启后错周期 bar（如 1m bar 驱动 5m/日线策略）也逐根按收盘价评估
         止损/止盈/移动止损。运行中会话改动<b>下次启动生效</b>。
       </p>
@@ -3576,11 +3579,13 @@ onUnmounted(() => {
               顺延到 09:30 之后）。盘前单<b>按单</b>下发 price_type=limit，
               <b>无需</b>会话级或 config.yaml 里的 price_type=limit；HTTP 桥通道的闸门判据为桥 /ping 自述支持 limit 或提供
               /price_limit（通达信/同花顺按各自通道能力），若本会话盘前单 /order 回显非 limit 则直接拦下该单。</p>
-            <p class="guide-note">· <b>错周期风控</b>（会话三态 intraday_mismatched_risk_enabled）：显式 true/false
-              永远优先；<b>NULL＝未显式设置</b>时按会话内子策略周期自动推导（含 1m/5m/15m/30m/1h 策略→开，
-              全为日线及以上→关），不再跟随 config.yaml 的全局开关。关闭时止损/止盈/移动止损只在策略
-              自身周期的边界 bar 上评估，错周期 bar 只更新价格快照；开启后任意 bar 到达都按收盘价评估。
-              自身周期 bar 始终评估。运行中会话改动下次启动生效。</p>
+            <p class="guide-note">· <b>错周期风控</b>（会话三态 intraday_mismatched_risk_enabled）：纯用户控制——
+              <b>NULL＝未显式设置＝关闭</b>（与接入前一致，不因存在分钟策略自动开启）；显式 true/false 直接生效，
+              永远优先，也不跟随 config.yaml 的全局开关。默认继承回测的次日执行（日线策略止损在 15:05 收盘落定、
+              次日首根 bar 提交）；自动推导仅在界面提示「该会话有分钟策略，可考虑开启」，不写库、不影响生效值。
+              关闭时止损/止盈/移动止损只在策略自身周期的边界 bar 上评估，错周期 bar 只更新价格快照；
+              开启后任意 bar 到达都按收盘价评估（1m bar 也可驱动日线策略风控）。自身周期 bar 始终评估。
+              运行中会话改动下次启动生效。</p>
             <p class="guide-note">· <b>桥超时</b>：live.bridge_read_timeout_seconds=15（单次读取）、
               bridge_connect_timeout_seconds=3（建连）、bridge_timeout_seconds=90（持续离线判死阈值，语义不同）；
               iquant_bridge.request_timeout_seconds 默认 15，掘金保持 30（/quote 首次走云端历史服务慢）。</p>
@@ -3636,7 +3641,9 @@ onUnmounted(() => {
               次日开盘执行）/ immediate（当日确认当日执行，仅盘中周期有效；15:05 收盘落定轮次与
               提前收盘价之外的日线单仍按本设置）。仅实盘生效，回测忽略（回测固定 T+1）；
               15:05 收盘落定轮次产生的单<b>强制次日执行</b>（收盘后报单报不进交易所，immediate 也不例外）；
-              开启「14:50 提前收盘价」后，该轮 1d 信号固定当日提交，不受此设置影响（见第三节）。</p>
+              开启「14:50 提前收盘价」后，该轮 1d 信号固定当日提交，不受此设置影响（见第三节）。
+              盘中逐 1m 风控是<b>可选增强</b>（默认继承上述次日执行），由会话三态开关显式开启，
+              开启需下次启动生效；本策略级 risk_timing 不控制它，二者独立。</p>
             <p class="guide-note">· 上述默认关闭 = 与回测行为一致；开启后建议先仿真观察。</p>
             <p class="guide-note">· <b>卖出同票在途去重</b>（gate=inflight_sell）：同（策略, 代码）已有未结卖单时，
               目标量先减在途未成交量——≤0 整单跳过，&gt;0 按差额收窄（收窄后记 reduce）。</p>
@@ -3700,7 +3707,9 @@ onUnmounted(() => {
               .lc1、5m 读 .lc5、15m/30m/1h 走原生周期（与回测同源），只取标签 ≤ 墙钟的已闭合 bar，
               判新只看 bar 标签前进；依赖外部「TDX数据工具.exe」持续写入 D:\zd_zyb 且清单已更新，
               超过 stall_timeout_seconds 不前进 → 自动回落快照合成并留痕（WARNING + risk 事件），
-              恢复前进自动切回。关闭＝行为与接入前一致（快照合成）。</p>
+              恢复前进自动切回。关闭＝行为与接入前一致（快照合成）。
+              注意：原生源只统一 bar 来源，<b>不会自动开启逐 1m 风控</b>；风控评估时机由策略周期与
+              会话三态开关决定，两者彼此独立。</p>
             <p class="guide-step"><b>会话级默认（重启会话生效）</b>：execution_mode 新建默认 alert（历史会话
               auto），shadow 仅影子记账不下单，manual 才启用审批队列；gate_recheck_on_execute=0（关闭＝按信号日
               决策执行）；account_risk_enabled=0、account_max_drawdown/account_daily_loss_limit=NULL（回退

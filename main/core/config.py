@@ -337,9 +337,8 @@ def _defaults() -> dict:
             # 阈值判定（止损/止盈/回撤）仍按整仓成本，本项只收窄卖出数量。
             "live_sell_scope": "platform_only",
             # 错周期 bar 是否跑风控（历史全局默认，仅兼容保留）：
-            # 自 2026-11-20 起，会话 NULL（未显式设置）按会话内子策略周期自动推导
-            # （含 1m/5m/15m/30m/1h 策略→开，否则关），不再读取本键；
-            # 会话显式 true/false 永远优先。
+            # 自 2026-11-20 起该键不参与会话判定：会话 NULL（未显式设置）一律关闭，
+            # 不因存在分钟策略自动开启；仅会话显式 true/false 生效。
             "intraday_mismatched_risk_enabled": False,
             # 09:31 deferred 兜底放行的「保证成交」开关：False（默认，可复现优先）
             # → 限价 = 当日首根 1m bar 开盘价（夹涨跌停、quantize 到分）；True →

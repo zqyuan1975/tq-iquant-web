@@ -2250,11 +2250,11 @@ export interface LiveSessionItem {
   advance_close_enabled?: boolean  // 14:50 提前收盘价（B 可选增强，仅 1d）是否开启
   advance_close_time?: string      // 提前收盘价轮次时点（默认 14:51，实际不早于 14:52）
   advance_close_done_date?: string | null  // 提前收盘价轮次已执行日期（幂等标记）
-  // 错周期风控三态（原始值）：null=未显式设置（按策略周期自动推导）/ true=强制开启 / false=强制关闭
+  // 错周期风控三态（原始值）：null=未显式设置（生效＝关闭，纯用户控制）/ true=强制开启 / false=强制关闭
   intraday_mismatched_risk_enabled?: boolean | null
-  // 逐 1m 风控生效值与来源（auto_minute / auto_no_minute / explicit）
+  // 逐 1m 风控生效值与来源（explicit=用户显式设置 / unset=未设置→关闭）
   intraday_mismatched_risk_effective?: boolean
-  intraday_mismatched_risk_source?: 'explicit' | 'auto_minute' | 'auto_no_minute'
+  intraday_mismatched_risk_source?: 'explicit' | 'unset'
   minute_strategy_periods?: string[]
   // A1 资金池（列表/详情回显）
   capital_pool_mode?: 'off' | 'equal' | 'risk_budget' | 'priority'

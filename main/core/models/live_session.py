@@ -70,9 +70,9 @@ class LiveSession(Base):
     # 幂等标记：该交易日 15:05「收盘落定」日线级别轮次（1d/1w/1mon）已执行
     # （YYYY-MM-DD，跨重启不重复跑；B 开启时只用于 1w/1mon 周期末轮次）
     daily_bars_done_date = Column(String(10), nullable=True)
-    # 错周期 bar 是否跑风控（nullable 三态，2026-11-11；2026-11-20 改默认推导）：
-    #   NULL = 未显式设置 → 按会话内子策略周期自动推导：存在 1m/5m/15m/30m/1h
-    #          策略则开启，全为日线及以上则关闭（不再读全局开关）
+    # 错周期 bar 是否跑风控（nullable 三态，2026-11-11；2026-11-20 收口为纯用户控制）：
+    #   NULL = 未显式设置 → **生效＝关闭**（与接入前一致；不因存在分钟策略自动开启，
+    #          也不再读全局开关）；分钟策略仅触发界面建议，不写库、不影响生效值
     #   0/1  = 本会话显式覆盖，永远优先（关闭时错周期 bar 只更新价格快照、不跑风控）
     intraday_mismatched_risk_enabled = Column(Boolean, nullable=True)
     # ---- E1 执行前重判门控（2026-11-18，默认关闭）----
