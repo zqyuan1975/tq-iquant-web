@@ -19,7 +19,7 @@
 | 资金池相关回归组 | `-k "capital or theory_vs_live or shadow_mode"` | 214 passed |
 | 前端构建 | `cd web; npm run build` | 通过（773 modules，788 ms） |
 | 性能 | 开关全关默认路径 vs 借贷开启 | 见 §5 |
-| 生产库与开关状态 | `main/data/dev.db` | revision `h5b6c7d8e9f0`，quick_check ok，会话 1 running（15:09:27 收盘后重启并启动，`capital_shadow_enabled=1`）、2/3 stopped，强制 0 / 出口 OFF |
+| 生产库与开关状态 | `main/data/dev.db` | revision `h5b6c7d8e9f0`，quick_check ok，会话 1 running（15:13:02 收盘后重启并启动，`capital_shadow_enabled=1`）、2/3 stopped，强制 0 / 出口 OFF |
 
 工程验收结论：G1–G6 的代码路径、回归基线与默认路径零变化均有可重复测试支撑；G6 判定 **DONE（工程验收）**。业务 KPI 按 §7 的新判据复核；实盘影子样本（§6）进入采样期，按「累计 ≥3 个交易日且样本量达可判水平」再判。
 
@@ -177,14 +177,14 @@ main\.venv\Scripts\python.exe -m pytest main/core/tests -q -p no:cacheprovider
 
 | 项 | 值 |
 |---|---|
-| 后端 | 15:09:03 重启（pid 26612）；`/api/health` ok、端口 8001、version 1.0.6；日志 `init_db：数据库已在 head（h5b6c7d8e9f0）` |
-| 会话 1 | `running` / `auto`，started_at `2026-11-20T15:09:27.544552`，`bridge_online=true`；启动告警仅「数据体检 30/251（预算内未阻塞）」 |
+| 后端 | 15:09:03 首次重启（pid 26612）；15:12:38 交接为独立进程（health pid 2828）；`/api/health` ok、端口 8001、version 1.0.6；日志 `init_db：数据库已在 head（h5b6c7d8e9f0）` |
+| 会话 1 | `running` / `auto`（15:09:27 首次启动，交接后 15:13:02 重新启动），`bridge_online=true`；启动告警仅「数据体检 30/251（预算内未阻塞）」 |
 | 待生效队列 | `live_session_pending_changes` id=1 `capital_shadow_enabled` true → `applied`（15:09:26），启动前应用 |
-| 影子开关 / 台账 | `capital_shadow_enabled=1`；`live_capital_shadow` **0 行**（收盘后无 bar，自 2026-11-23 起算）；`no_pairing_plan` 仅构建期 1 条 |
-| `minute_source` | `enabled=true`、`mode=native`、`last_advance_at=null`（收盘后无新 bar）、`lag_seconds=39`、`stalled=false` |
-| 今日委托 / 成交 | 委托 **1** 笔 / 成交 **0** 笔：id=14 `600211.SH` 卖 1300 @37.94（`trailing_stop`，15:06:36 由 15:05 日线 bar 生成）状态 `deferred`，次日首 bar 提交 |
-| 今日日终行（定稿） | `live_portfolio_daily` id=8 组合 1：cash 55,002.51、market_value 193,454、total_value **248,456.51**、position_count 4（15:09:27 启动时按收盘价重估） |
-| 账户快照 | 15:11:00 total_asset 248,472.35、available_cash 55,018.35、market_value 193,454；15:10:13 / 15:10:31 两次 `database is locked`（自动备份 + 增量回测争用），15:10:49 起恢复 |
+| 影子开关 / 台账 | `capital_shadow_enabled=1`（两次启动日志均 `capital shadow enabled (session 1): 未绑定拼盘，只采实际侧`）；`live_capital_shadow` **0 行**（收盘后无 bar，自 2026-11-23 起算）；`no_pairing_plan` 仅构建期 1 条 |
+| `minute_source` | `enabled=true`、`mode=native`、`last_advance_at=null`（收盘后无新 bar）、`stalled=false`；收盘后 `_in_session=false` 不做停滞判定，不会误回落 |
+| 今日委托 / 成交 | 委托 **1** 笔 / 成交 **0** 笔：id=14 `600211.SH` 卖 1300 @37.94（`trailing_stop`，15:06:36 由 15:05 日线 bar 生成）状态 `deferred`，次日首 bar 提交；两次重启均 `1 deferred daily-signal order(s) restored, 0 stale dropped, 0 duplicate dropped` |
+| 今日日终行（定稿） | `live_portfolio_daily` id=8 组合 1：cash 55,002.51、market_value 193,454、total_value **248,456.51**、position_count 4（15:09:27 / 15:13:02 启动时按收盘价重估，两次结果一致） |
+| 账户快照 | 15:13:07 total_asset 248,472.35、available_cash 55,018.35、market_value 193,454；15:10:13 / 15:10:31 两次 `database is locked`（自动备份 + 增量回测争用），15:10:49 起恢复 |
 | 三项开关 | `capital_enforce_enabled=0`、`cash_outlet_mode=OFF`、`sell_scope=platform_only`（全局，会话列仍 NULL） |
 | `alembic_version` | `h5b6c7d8e9f0` |
 
@@ -206,7 +206,7 @@ main\.venv\Scripts\python.exe -m pytest main/core/tests -q -p no:cacheprovider
 |---|---|
 | `alembic_version` | `h5b6c7d8e9f0`（2026-11-20 12:35 由集成测试的 TestClient lifespan 自动迁移落库，非人工 upgrade；已补 `TQ_INIT_DB_DISABLED` 闸，见提交 be13969） |
 | `PRAGMA quick_check` | `ok` |
-| `live_sessions` | 01 `running`（`auto` / tdx，15:09:27 收盘后重启并启动，`capital_shadow_enabled=1`）、02 / 03 `stopped`；三会话均 `capital_enforce_enabled=0`、`cash_outlet_mode=OFF` |
+| `live_sessions` | 01 `running`（`auto` / tdx，15:13:02 收盘后重启并启动，`capital_shadow_enabled=1`）、02 / 03 `stopped`；三会话均 `capital_enforce_enabled=0`、`cash_outlet_mode=OFF` |
 | `capital_pairing_plans` / `capital_pairings` | 0 / 0 行（F3 绑定入口无来源，改走会话级开关） |
 | `backtest_records` / `backtest_run_groups` | 30 条 / 1 组（新增 id=31 单组合、id=32/33 + run_group 1 池化注入；既有 28 条未动） |
 | `cash_outlet_ops` | 0 行 |
