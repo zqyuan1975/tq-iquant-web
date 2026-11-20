@@ -2662,3 +2662,153 @@ def test_loan_model_clamps_principal_to_lendable():
     assert state["budgets"] == {"1": "0.00", "2": "32000.00"}
     assert lender.capital_budget == Decimal("0")
     assert any(d["gate"] == "capital_loan_clamped" for d in result["decisions"])
+
+
+# ---------------------------------------------------------------------------
+# 资金池 D3 门控释放/召回接入（gate_release_plan 默认关闭）
+# ---------------------------------------------------------------------------
+
+class _StubGateTracker:
+    """最小门控桩：只在指定日期返回关闭（-1），其余多头（1）。"""
+
+    def __init__(self, closed_days=()):
+        self.closed = {d for d in closed_days}
+
+    def state_for(self, day):
+        return -1 if day in self.closed else 1
+
+    def strength_for(self, day):
+        return -50.0 if day in self.closed else 50.0
+
+    def blocks(self, day):
+        return day in self.closed
+
+
+def _release_plan(**overrides):
+    plan = {"enabled": True, "portfolio_gate_enabled": True,
+            "release_confirm_days": 1, "release_delay_days": 1,
+            "reopen_confirm_days": 1, "recall_notice_days": 1}
+    plan.update(overrides)
+    return plan
+
+
+def test_gate_release_default_off_keeps_results_identical():
+    """gate_release_plan=None 与 enabled=False 一致，结果无 gate_release 键。"""
+    klines, cache = _loan_klines_and_cache()
+    closed = {_LOAN_DAYS[1].date(), _LOAN_DAYS[2].date()}
+    port_a, _, _ = _loan_setup()
+    res_a = BacktestEngine().run(
+        port_a, klines=klines, signal_cache=dict(cache),
+        gate_tracker=_StubGateTracker(closed),
+        loan_model_plan={"lender_strategy_id": 1, "borrower_strategy_id": 2,
+                         "principal": 10000})
+
+    port_b, _, _ = _loan_setup()
+    res_b = BacktestEngine().run(
+        port_b, klines=klines, signal_cache=dict(cache),
+        gate_tracker=_StubGateTracker(closed),
+        loan_model_plan={"lender_strategy_id": 1, "borrower_strategy_id": 2,
+                         "principal": 10000},
+        gate_release_plan={"enabled": False})
+
+    assert res_a["gate_release"] is None and res_b["gate_release"] is None
+    assert all("gate_release" not in s for s in res_a["snapshots"])
+    assert res_a["snapshots"] == res_b["snapshots"]
+    assert res_a["loan_model"] == res_b["loan_model"]
+
+
+def test_gate_release_closed_then_reopen_recalls():
+    """关闭 → T+2 释放闲置额度 → 恢复确认立即召回，上限回到 B3 起点。"""
+    klines, cache = _loan_klines_and_cache()
+    closed = {_LOAN_DAYS[1].date(), _LOAN_DAYS[2].date()}
+    port, lender, borrower = _loan_setup()
+    result = BacktestEngine().run(
+        port, klines=klines, signal_cache=dict(cache),
+        gate_tracker=_StubGateTracker(closed),
+        loan_model_plan={"lender_strategy_id": 1, "borrower_strategy_id": 2,
+                         "principal": 10000, "due_days": 30},
+        gate_release_plan=_release_plan())
+
+    release = result["gate_release"]
+    assert release["version"] == "gate-release-d3"
+    assert "_ledger" not in result["loan_model"]     # 账本对象不进入结果
+
+    events = {e["day"]: e for e in release["events"]}
+    d0, d1, d2, d3 = (x.date().isoformat() for x in _LOAN_DAYS[:4])
+    assert events[d0]["gate"] == "OPEN"              # 无前视：后续关闭不影响首日
+    assert events[d1]["status"] == "PENDING_RELEASE"
+    assert "gate_closed_confirmed" in events[d1]["reasons"]
+    assert events[d2]["status"] == "RELEASED"
+    assert events[d2]["release_amount"] == "1000.00"  # 16000 − 持仓 5000 − 已借 10000
+    assert events[d2]["budgets"] == {"1": "5000.00", "2": "27000.00"}
+    assert d3 in events and events[d3]["recalled"]
+
+    # 恢复后上限回到 B3 起点（已持仓不强制卖出）
+    assert release["final_budgets"] == {"1": "6000.00", "2": "26000.00"}
+    assert lender.capital_budget == Decimal("6000")
+    assert borrower.capital_budget == Decimal("26000")
+    # 借据全部进入召回，恢复预留归原策略
+    lots = release["loan_book"]["lots"]
+    assert len(lots) == 2
+    assert all(x["status"] == "recall_pending" for x in lots)
+    state = release["states"]["strategy:1"]
+    assert Decimal(state["reopen_reserve"]) > 0
+    assert port.account.cash >= 0
+    assert any(d["gate"] == "capital_gate_release"
+               for d in result["decisions"])
+
+
+def test_gate_release_snapshot_carries_daily_summary():
+    klines, cache = _loan_klines_and_cache()
+    closed = {_LOAN_DAYS[1].date(), _LOAN_DAYS[2].date()}
+    port, _, _ = _loan_setup()
+    result = BacktestEngine().run(
+        port, klines=klines, signal_cache=dict(cache),
+        gate_tracker=_StubGateTracker(closed),
+        loan_model_plan={"lender_strategy_id": 1, "borrower_strategy_id": 2,
+                         "principal": 10000},
+        gate_release_plan=_release_plan())
+
+    snaps = result["snapshots"]
+    assert snaps[0]["gate_release"]["status"] == "IDLE"
+    statuses = [s["gate_release"]["status"] for s in snaps]
+    assert "PENDING_RELEASE" in statuses and "RELEASED" in statuses
+    assert all("pending_release" in s["gate_release"] for s in snaps)
+
+
+def test_gate_release_unknown_gate_never_releases():
+    """取不到门控 → UNKNOWN：交易侧不报错，但资金上不释放。"""
+    klines, cache = _loan_klines_and_cache()
+    port, lender, _ = _loan_setup()
+    result = BacktestEngine().run(
+        port, klines=klines, signal_cache=dict(cache),
+        loan_model_plan={"lender_strategy_id": 1, "borrower_strategy_id": 2,
+                         "principal": 10000},
+        gate_release_plan=_release_plan())
+
+    release = result["gate_release"]
+    assert all(e["gate"] == "UNKNOWN" for e in release["events"])
+    assert all(e["release_amount"] is None for e in release["events"])
+    assert all(e["status"] == "IDLE" for e in release["events"])
+    assert release["final_budgets"] == {"1": "6000.00", "2": "26000.00"}
+
+
+def test_gate_release_due_loan_is_recalled():
+    """借期约束：到期借据发起召回并收回释放上限。"""
+    klines, cache = _loan_klines_and_cache()
+    port, _, _ = _loan_setup()
+    result = BacktestEngine().run(
+        port, klines=klines, signal_cache=dict(cache),
+        gate_tracker=_StubGateTracker(),
+        loan_model_plan={"lender_strategy_id": 1, "borrower_strategy_id": 2,
+                         "principal": 10000, "due_days": 1},
+        gate_release_plan=_release_plan())
+
+    release = result["gate_release"]
+    due_events = [e for e in release["events"] if e.get("due_recalled")]
+    assert due_events and _LOAN_DAYS[1].date().isoformat() == due_events[0]["day"]
+    assert release["final_budgets"] == {"1": "6000.00", "2": "26000.00"}
+    assert any(d["gate"] == "capital_loan_due_recall"
+               for d in result["decisions"])
+    assert all(x["status"] == "recall_pending"
+               for x in release["loan_book"]["lots"])

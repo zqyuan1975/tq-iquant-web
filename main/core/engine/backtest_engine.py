@@ -46,6 +46,7 @@ from .capital_contracts import (
     to_decimal,
 )
 from .capital_loan import LoanBook, Owner, REASON_MANUAL, SCOPE_PORTFOLIO
+from .capital_gate_release import GateReleaseBook, resolve_gate_status
 from .capital_quota import derive_portfolio_quota
 from tq_iquant_shared.constants import SignalType, TradeType
 
@@ -242,6 +243,8 @@ def apply_loan_model(portfolio, plan, recorder, at: datetime) -> Optional[dict]:
         "loan_book": book.snapshot(),
         "violations": book.check_invariants(),
     }
+    # D3：把账本对象交给 run() 的释放/召回链路；不进入结果序列化（run 会弹出）。
+    state["_ledger"] = book
     if clamped:
         recorder.record(
             gate="capital_loan_clamped", layer="capital_gate", action="clamp",
@@ -253,6 +256,170 @@ def apply_loan_model(portfolio, plan, recorder, at: datetime) -> Optional[dict]:
                     % (dec_str(requested), dec_str(amount)),
         )
     return state
+
+
+GATE_RELEASE_MODEL_VERSION = "gate-release-d3"
+
+
+class _GateReleaseRunner:
+    """D3：把 D2 状态机接到单组合回测（默认不构造，plan=None 时零改动）。
+
+    只调整 B2 ``capital_budget`` 上限与借据账本，不搬运现金、不强制卖出：
+    门控关闭确认后把「额度 − 持仓市值 − 已借出」的闲置额在 T+2 释放为对
+    借款方的新借据（借款方上限提高、出借方上限等额下降）；恢复确认后立即
+    召回，上限回到 B3 起点（已持仓不受影响，只禁新增）。到期借据同样发起
+    召回并收回上限。所有输入只用当日及之前的门控状态与持仓，无前视。
+    """
+
+    def __init__(self, portfolio, loan_state, ledger, plan, gate_tracker,
+                 trading_days, recorder) -> None:
+        self.portfolio = portfolio
+        self.plan = plan
+        self.tracker = gate_tracker
+        self.recorder = recorder
+        self.book: LoanBook = ledger
+        self.lender_id = loan_state["lender_strategy_id"]
+        self.borrower_id = loan_state["borrower_strategy_id"]
+        self.lender = portfolio._find_strategy_by_id(self.lender_id)
+        self.borrower = portfolio._find_strategy_by_id(self.borrower_id)
+        self.lender_owner = Owner("strategy", self.lender_id)
+        self.borrower_owner = Owner("strategy", self.borrower_id)
+        self.base_lender_budget = Decimal(
+            loan_state["budgets"][str(self.lender_id)])
+        self.base_borrower_budget = Decimal(
+            loan_state["budgets"][str(self.borrower_id)])
+        self.entitlement = Decimal(
+            loan_state["entitlements"][str(self.lender_id)])
+        self.mode = (plan.get("lender_gate_mode")
+                     or getattr(self.lender, "market_gate_mode", None))
+        self.portfolio_gate_enabled = bool(plan.get(
+            "portfolio_gate_enabled",
+            getattr(portfolio, "market_gate_enabled", False)))
+        try:
+            self.due_days = int(plan.get("due_days") or 365)
+        except (TypeError, ValueError):
+            self.due_days = 365
+        self.machine = GateReleaseBook(
+            trading_days,
+            release_confirm_days=int(plan.get("release_confirm_days") or 1),
+            release_delay_days=int(plan.get("release_delay_days", 1)),
+            reopen_confirm_days=int(plan.get("reopen_confirm_days") or 1),
+            recall_notice_days=int(plan.get("recall_notice_days") or 1),
+        )
+        self.extra_released = Decimal(0)
+        self.events: List[dict] = []
+        self._by_day: Dict[date, dict] = {}
+
+    # ---- 每日推进 -------------------------------------------------------
+    def on_day(self, day: date, at: datetime) -> None:
+        gate = resolve_gate_status(
+            self.mode, self.portfolio_gate_enabled,
+            self.tracker.state_for(day) if self.tracker is not None else None)
+        idle = (self.entitlement - self.portfolio._holdings_value(self.lender)
+                - self.book.outstanding_for_lender(self.lender_owner))
+        if idle < 0:
+            idle = Decimal(0)
+        event = self.machine.observe(
+            self.lender_owner, day, gate, idle_amount=idle,
+            loan_book=self.book, now=at, scope=SCOPE_PORTFOLIO)
+
+        released = Decimal(event.get("release_amount") or 0)
+        if released > 0:
+            self._lend_released(released, at, event)
+        if event.get("recalled"):
+            self._restore_budgets()
+        self._recall_due(day, at, event)
+        self._record(event, at)
+
+        state = self.machine.state(self.lender_owner)
+        self._by_day[day] = {
+            "gate": gate,
+            "status": state.status,
+            "pending_release": dec_str(state.pending_amount),
+            "reopen_reserve": dec_str(state.reopen_reserve),
+        }
+        self._by_day[day]["budgets"] = {
+            str(self.lender_id): dec_str(self.lender.capital_budget),
+            str(self.borrower_id): dec_str(self.borrower.capital_budget),
+        }
+
+    def day_summary(self, day: date) -> Optional[dict]:
+        return self._by_day.get(day)
+
+    # ---- 明细 -----------------------------------------------------------
+    def _lend_released(self, amount: Decimal, at: datetime,
+                       event: dict) -> None:
+        released = self.book.credit(self.borrower_owner) + amount
+        self.book.grant_credit(self.borrower_owner, released)
+        self.book.lend(
+            lender=self.lender_owner, borrower=self.borrower_owner,
+            principal=amount, scope=SCOPE_PORTFOLIO, created_at=at,
+            due_at=at + timedelta(days=self.due_days),
+            reason="gate_closed")
+        self.extra_released += amount
+        self.lender.capital_budget = max(
+            Decimal(0), self.base_lender_budget - self.extra_released)
+        self.borrower.capital_budget = (
+            self.base_borrower_budget + self.extra_released)
+        event["budgets"] = {
+            str(self.lender_id): dec_str(self.lender.capital_budget),
+            str(self.borrower_id): dec_str(self.borrower.capital_budget),
+        }
+
+    def _restore_budgets(self) -> None:
+        self.extra_released = Decimal(0)
+        self.lender.capital_budget = self.base_lender_budget
+        self.borrower.capital_budget = self.base_borrower_budget
+
+    def _recall_due(self, day: date, at: datetime, event: dict) -> None:
+        overdue = self.book.overdue_lots(at)
+        if not overdue:
+            return
+        deadline = at + timedelta(days=1)
+        for lot in overdue:
+            try:
+                self.book.request_recall(lot.loan_id, at=at, deadline=deadline)
+            except Exception:  # noqa: BLE001 - 借据状态机拒绝即跳过
+                continue
+        self._restore_budgets()
+        event.setdefault("due_recalled", [x.loan_id for x in overdue])
+        self.recorder.record(
+            gate="capital_loan_due_recall", layer="capital_gate",
+            action="recall", portfolio_id=getattr(self.portfolio, "portfolio_id", None),
+            strategy_id=self.lender_id, bar_time=at,
+            param_name="due_days", param_value=float(self.due_days),
+            message="到期借据 %d 笔发起召回，额度上限回到 B3 起点"
+                    % len(overdue),
+        )
+
+    def _record(self, event: dict, at: datetime) -> None:
+        self.events.append(dict(event))
+        if not event["reasons"] or event["reasons"] == ["no_change"]:
+            return
+        self.recorder.record(
+            gate="capital_gate_release", layer="capital_gate",
+            action=event["status"], portfolio_id=getattr(
+                self.portfolio, "portfolio_id", None),
+            strategy_id=self.lender_id, bar_time=at,
+            param_name="gate", param_value=float(
+                {"CLOSED": -1, "OPEN": 1}.get(event["gate"], 0)),
+            message=("门控释放/召回：%s（%s）"
+                     % (event["status"], ",".join(event["reasons"])))[:200],
+        )
+
+    def result(self) -> dict:
+        return {
+            "version": GATE_RELEASE_MODEL_VERSION,
+            "lender_strategy_id": self.lender_id,
+            "borrower_strategy_id": self.borrower_id,
+            "events": self.events,
+            "states": self.machine.snapshot(),
+            "final_budgets": {
+                str(self.lender_id): dec_str(self.lender.capital_budget),
+                str(self.borrower_id): dec_str(self.borrower.capital_budget),
+            },
+            "loan_book": self.book.snapshot(),
+        }
 
 
 def build_prev_close_by_day(klines: dict) -> Dict[tuple, Decimal]:
@@ -362,6 +529,7 @@ class BacktestEngine:
         cancel_check: Optional[Callable[[], bool]] = None,
         loan_model_plan: Optional[dict] = None,
         cash_outlet_plan: Optional[dict] = None,
+        gate_release_plan: Optional[dict] = None,
     ) -> dict:
         """逐 bar 回测主链路。
 
@@ -404,6 +572,11 @@ class BacktestEngine:
         cash_outlet_plan：现金出口收益率建模（0021 C5，默认 None=不启用）。只按
         日终闲置现金估算利息与可用时点，结果单列在 ``cash_yield_contribution``，
         不改现金/净值/成交/策略指标；plan 非法时降级为 ``enabled=False``。
+        gate_release_plan：门控释放/召回接入（0021 D3，默认 None=不启用）。要求
+        ``loan_model_plan`` 已生成 L2 借据；逐日按当日生效 gate_state 推进 D2
+        状态机，关闭确认后 T+2 把闲置额释放给借款方、恢复确认后召回并收回
+        额度上限。只调整 ``capital_budget`` 上限与借据，不搬现金、不强制卖出；
+        结果单列 ``gate_release``，快照追加 ``gate_release`` 当日摘要。
         """
         run_options = run_options or {}
         _first_bar_no_fill = bool(run_options.get("first_bar_no_fill", False))
@@ -428,9 +601,14 @@ class BacktestEngine:
         # 资金池 L2 借据（0021 B3，默认关闭）：权益取 run 起点首个 bar 时间作为
         # 起算时点（不用墙钟，回测可复现）；失败只落状态/事件，不改交易链路。
         loan_state = None
+        gate_release_runner: Optional[_GateReleaseRunner] = None
         if times:
             loan_state = apply_loan_model(
                 portfolio, loan_model_plan, recorder, times[0][0])
+            ledger = None
+            if loan_state is not None:
+                # 账本对象不进入结果序列化（B3 既有结果结构保持不变）
+                ledger = loan_state.pop("_ledger", None)
             if loan_state is not None and loan_state.get("status") != "applied":
                 recorder.record(
                     gate="capital_loan_rejected", layer="capital_gate",
@@ -439,6 +617,12 @@ class BacktestEngine:
                     bar_time=times[0][0],
                     message=(loan_state.get("message") or "")[:200],
                 )
+            elif (ledger is not None and gate_release_plan
+                  and gate_release_plan.get("enabled") is not False):
+                gate_release_runner = _GateReleaseRunner(
+                    portfolio, loan_state, ledger, gate_release_plan,
+                    gate_tracker,
+                    sorted({t[0].date() for t in times}), recorder)
         report_every = max(1, total_bars // 100)
         price_index = self._build_price_index(klines)
         # #2 成交量闸门分母（可选新口径）：成交日之前 5 个交易日日均量
@@ -484,6 +668,8 @@ class BacktestEngine:
         # W4.5 regime：喂入"前一交易日"基准收盘（消除当日未来数据），逐日推进。
         last_regime_date: Optional[date] = None
         last_enter_date: Optional[date] = None
+        # D3 门控释放/召回：每交易日只推进一次（混合周期多 bar/日不重复释放）
+        _gate_release_day: Optional[date] = None
         # 公司行为（J1/J2，默认未启用）：上次生效日（保证每事件只生效一次、非交易日
         # 顺延）与当日待执行的再投资意图（日终收盘价成交）。
         last_action_date: Optional[date] = None
@@ -565,6 +751,12 @@ class BacktestEngine:
                 is_first_bar_of_day = True
             else:
                 is_first_bar_of_day = False
+
+            # 0a. 门控释放/召回（D3，默认不启用）：当日首根 bar、成交与 on_bar
+            #     之前推进，只用当日生效 gate_state 与当前持仓，无前视。
+            if gate_release_runner is not None and _gate_release_day != t.date():
+                gate_release_runner.on_day(t.date(), t)
+                _gate_release_day = t.date()
 
             # 0b. 公司行为（J1/J2，默认未启用 —— timeline=None 时整段跳过）。
             #     必须在成交步之前：当日待成交的顺延单若碰上送转，股数要先调整，
@@ -1128,6 +1320,10 @@ class BacktestEngine:
                 if gate_tracker is not None:
                     snap["gate_state"] = gate_tracker.state_for(t.date())
                     snap["gate_strength"] = gate_tracker.strength_for(t.date())
+                if gate_release_runner is not None:
+                    summary = gate_release_runner.day_summary(t.date())
+                    if summary is not None:
+                        snap["gate_release"] = dict(summary)
 
                 # 4b. 策略层快照：共享现金按 capital_ratio 归一化分摊，保证可加性
                 #     Σ(策略总净值) == 组合总净值。供策略层独立净值曲线与评估。
@@ -1258,6 +1454,9 @@ class BacktestEngine:
             "execution_stats": run_stats,
             # 资金池 L2 借据（0021 B3）：None=未启用/未成立，不影响任何旧消费方
             "loan_model": loan_state,
+            # 门控释放/召回（0021 D3）：None=未启用；只含上限变化与借据时间线
+            "gate_release": (gate_release_runner.result()
+                             if gate_release_runner is not None else None),
             # 现金出口利息（0021 C5）：None=未启用；与策略指标分离
             "cash_yield_contribution": cash_yield,
         }
