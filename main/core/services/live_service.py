@@ -83,6 +83,8 @@ from core.engine.live.market_data import MarketDataService
 from core.engine.live.fallback_quote import FallbackQuoteDispatcher
 from core.engine.live.timing import now_shanghai
 from core.services import portfolio_settings
+from core.services import capital_inheritance
+from core.services.pairing_service import binding_snapshot
 from core.services.live_data_health import (
     health_summary_text,
     run_health_check,
@@ -2398,6 +2400,79 @@ def effective_session_binding(session, patch: dict) -> dict:
     }
 
 
+# ---------------------------------------------------------------------------
+# F2：拼盘 → 实盘继承矩阵 / live_haircut（只读）
+# ---------------------------------------------------------------------------
+
+def _resolve_bound_pairing_plan(db: Session, session: LiveSession):
+    """会话绑定 → 拼盘头。优先 pairing_plan_id，其次运行组的拼盘。"""
+    plan_id = getattr(session, "pairing_plan_id", None)
+    if plan_id:
+        try:
+            return db.get(CapitalPairingPlan, int(plan_id))
+        except (TypeError, ValueError):
+            return None
+    group_id = getattr(session, "backtest_run_group_id", None)
+    if group_id:
+        try:
+            group = db.get(BacktestRunGroup, int(group_id))
+        except (TypeError, ValueError):
+            return None
+        if group is not None and group.pairing_plan_id:
+            return db.get(CapitalPairingPlan, int(group.pairing_plan_id))
+    return None
+
+
+def _live_haircut_overrides() -> dict:
+    """读 ``capital_pool.live_haircut``（可选）；缺失/非法 → 全默认。"""
+    cfg = load_config()
+    pool = cfg.get("capital_pool") if isinstance(cfg, dict) else None
+    value = pool.get("live_haircut") if isinstance(pool, dict) else None
+    return value if isinstance(value, dict) else {}
+
+
+def capital_inheritance_report(db: Session, session: LiveSession) -> dict:
+    """F2：按会话绑定生成只读继承报告（未绑定 → enabled=False）。
+
+    - 拼盘/运行组缺失：``found=False`` + ``pairing_plan_missing`` 告警；
+    - 策略缺失：逐项 ``strategy_missing`` 告警，不阻断读取；
+    - 参数漂移与 live_haircut 明细原样返回，供 F3 影子与前端只读展示。
+    """
+    plan_binding_id = getattr(session, "pairing_plan_id", None)
+    group_binding_id = getattr(session, "backtest_run_group_id", None)
+    if not plan_binding_id and not group_binding_id:
+        return {"enabled": False, "reason": "session_not_bound"}
+    source = "pairing_plan" if plan_binding_id else "backtest_run_group"
+    plan = _resolve_bound_pairing_plan(db, session)
+    if plan is None:
+        return {
+            "enabled": True, "found": False,
+            "version": capital_inheritance.INHERITANCE_VERSION,
+            "source": source,
+            "plan_id": plan_binding_id,
+            "run_group_id": group_binding_id,
+            "warnings": [{"code": "pairing_plan_missing"}],
+        }
+    snapshots = {}
+    for sid in capital_inheritance.binding_strategy_ids(plan.binding_json):
+        strategy = db.get(Strategy, sid)
+        if strategy is not None:
+            snapshots[sid] = binding_snapshot(strategy)
+    report = capital_inheritance.build_report(
+        plan.binding_json, snapshots,
+        pairing_version=plan.pairing_version,
+        overrides=_live_haircut_overrides(),
+    )
+    report.update({
+        "source": source,
+        "plan_id": plan.id,
+        "plan_status": plan.status,
+        "run_group_id": group_binding_id,
+        "found": True,
+    })
+    return report
+
+
 def create_session(db: Session, data: dict, mode: str) -> dict:
     """创建 session。新会话默认 alert；老会话由迁移保持 auto。"""
     execution_mode = data.get("execution_mode") or "alert"
@@ -2531,6 +2606,8 @@ def get_session(db: Session, session_id: int, engine: Optional[LiveEngine] = Non
             session, "backtest_run_group_id", None),
         "pairing_plan_id": getattr(session, "pairing_plan_id", None),
         "params_drift": compute_params_drift(db, session),
+        # F2：绑定拼盘/运行组时的只读继承矩阵与 live_haircut（未绑定 enabled=False）
+        "capital_inheritance": capital_inheritance_report(db, session),
         # 外部信号注入（0011）：None=不启用
         "signal_file_path": session.signal_file_path,
         # A1 资金池模式与日再平衡开关（默认 off/false）
