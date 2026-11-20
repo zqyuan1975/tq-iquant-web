@@ -51,7 +51,7 @@ from core.models import (
     LiveSessionPendingChange,
     LiveGlobalSwitch,
     IncrementalBacktestCheckpoint, BacktestRecord, BacktestDailySnapshot,
-    BacktestTrade, BacktestRunGroup, CapitalPairingPlan,
+    BacktestTrade, BacktestRunGroup, CapitalPairingPlan, CapitalPairing,
 )
 from core.engine.portfolio_builder import assemble_portfolio
 try:
@@ -7611,6 +7611,248 @@ def _snapshot_dividend_mode(raw) -> Optional[str]:
     return None
 
 
+def _pairing_role_map(plan) -> Tuple[List[int], Dict[int, str]]:
+    """拼盘冻结绑定的成员顺序与角色；缺失/非法绑定返回空。"""
+    order: List[int] = []
+    roles: Dict[int, str] = {}
+    try:
+        binding = capital_inheritance.normalize_binding(plan.binding_json)
+    except Exception:  # noqa: BLE001
+        binding = {"lender": {}, "borrowers": [], "loan": {}}
+
+    def _add(raw, role: str) -> None:
+        try:
+            sid = int(raw)
+        except (TypeError, ValueError):
+            return
+        if sid in roles:
+            return
+        roles[sid] = role
+        order.append(sid)
+
+    _add(binding["lender"].get("strategy_id"), "lender")
+    for borrower in binding["borrowers"]:
+        _add(borrower["binding"].get("strategy_id"), "borrower")
+    return order, roles
+
+
+def _strategy_ps_id(db: Session, strategy_id: int,
+                    allowed: set) -> Optional[int]:
+    """策略所属组合 id（PortfolioStrategy.id）；不在会话组合内返回 None。"""
+    row = db.query(Strategy.portfolio_id).filter(
+        Strategy.id == strategy_id).first()
+    if row is None:
+        return None
+    ps_id = int(row[0])
+    return ps_id if ps_id in allowed else None
+
+
+def _pairing_member_record(db: Session, plan, group_id: Optional[int],
+                           strategy_id: int, ps_id: Optional[int]):
+    """成员理论记录：运行组成员记录优先，其次拼盘边/头记录。"""
+    if group_id and ps_id is not None:
+        rec = (
+            db.query(BacktestRecord)
+            .filter(BacktestRecord.run_group_id == group_id,
+                    BacktestRecord.portfolio_strategy_id == ps_id)
+            .order_by(BacktestRecord.id.desc())
+            .first()
+        )
+        if rec is not None:
+            return rec
+    if plan is None:
+        return None
+    if (plan.lender_strategy_id == strategy_id
+            and plan.lender_record_id):
+        return db.get(BacktestRecord, int(plan.lender_record_id))
+    edges = (
+        db.query(CapitalPairing)
+        .filter(CapitalPairing.pairing_plan_id == plan.id,
+                CapitalPairing.borrower_id == strategy_id)
+        .all()
+    )
+    for edge in edges:
+        if edge.borrower_record_id:
+            return db.get(BacktestRecord, int(edge.borrower_record_id))
+    if plan.backtest_record_id:
+        return db.get(BacktestRecord, int(plan.backtest_record_id))
+    return None
+
+
+def _member_theory_curve(db: Session, record_id: int,
+                         start_date: Optional[date],
+                         end_date: Optional[date]) -> list:
+    q = db.query(BacktestDailySnapshot).filter_by(
+        backtest_record_id=record_id, target_type="portfolio")
+    if start_date:
+        q = q.filter(BacktestDailySnapshot.snap_date >= start_date)
+    if end_date:
+        q = q.filter(BacktestDailySnapshot.snap_date <= end_date)
+    rows = q.order_by(BacktestDailySnapshot.snap_date).all()
+    return _curve_points([(r.snap_date, r.total_value) for r in rows])
+
+
+def _member_live_curve(db: Session, session_id: int, ps_id: Optional[int],
+                       start_date: Optional[date],
+                       end_date: Optional[date]) -> list:
+    if ps_id is None:
+        return []
+    q = db.query(LivePortfolioDaily).filter(
+        LivePortfolioDaily.live_session_id == session_id,
+        LivePortfolioDaily.portfolio_strategy_id == ps_id)
+    if start_date:
+        q = q.filter(LivePortfolioDaily.trade_date >= start_date)
+    if end_date:
+        q = q.filter(LivePortfolioDaily.trade_date <= end_date)
+    rows = q.order_by(LivePortfolioDaily.trade_date).all()
+    return _curve_points([(r.trade_date, r.total_value) for r in rows])
+
+
+def _overlap_deviation(theory_curve: list, live_curve: list) -> Optional[dict]:
+    """成员级偏差：只用两侧同日点，不足 2 天返回 None（不给假 0）。"""
+    theory = {p["date"]: p["total_value"] for p in theory_curve}
+    live = {p["date"]: p["total_value"] for p in live_curve}
+    common = sorted(set(theory) & set(live))
+    if len(common) < 2:
+        return None
+    t_metrics = _curve_metrics([{"total_value": theory[d]} for d in common])
+    l_metrics = _curve_metrics([{"total_value": live[d]} for d in common])
+    return {
+        "common_days": len(common),
+        "window_start": common[0],
+        "window_end": common[-1],
+        "return_gap": (
+            round(l_metrics["total_return"] - t_metrics["total_return"], 6)
+            if (l_metrics.get("total_return") is not None
+                and t_metrics.get("total_return") is not None) else None),
+        "max_drawdown_gap": (
+            round(l_metrics["max_drawdown"] - t_metrics["max_drawdown"], 6)
+            if (l_metrics.get("max_drawdown") is not None
+                and t_metrics.get("max_drawdown") is not None) else None),
+    }
+
+
+def compute_pairing_theory_vs_live(
+    db: Session, session, portfolio_id: Optional[int] = None,
+    start_date: Optional[date] = None, end_date: Optional[date] = None,
+) -> Optional[dict]:
+    """F4：拼盘/运行组会话按成员对比理论 vs 实盘。
+
+    非拼盘会话返回 ``None``（继续走 N2 单记录对照）；拼盘会话返回成员列表，
+    每个成员独立给出理论曲线、实盘曲线、同日偏差与缺失提示。
+    """
+    plan_binding_id = getattr(session, "pairing_plan_id", None)
+    group_id = getattr(session, "backtest_run_group_id", None)
+    if not plan_binding_id and not group_id:
+        return None
+    source = "pairing_plan" if plan_binding_id else "backtest_run_group"
+    plan = _resolve_bound_pairing_plan(db, session)
+    if plan is None:
+        return {
+            "bound": True, "found": False, "source": source,
+            "plan_id": plan_binding_id, "run_group_id": group_id,
+            "members": [], "theory_series_status": "record_missing",
+            "warnings": [{
+                "code": "pairing_plan_missing",
+                "message": "绑定的拼盘不存在：无法按成员对比理论侧，"
+                           "实盘侧仍按会话展示",
+            }],
+        }
+
+    allowed = set(_session_portfolio_ids(db, session.id))
+    if portfolio_id:
+        allowed = {portfolio_id} if portfolio_id in allowed else set()
+    order, roles = _pairing_role_map(plan)
+    warnings: List[dict] = []
+    if not order:
+        warnings.append({
+            "code": "pairing_members_missing",
+            "message": "拼盘未冻结成员绑定（binding_json 为空），无法按成员对比",
+        })
+
+    members: List[dict] = []
+    for sid in order:
+        ps_id = _strategy_ps_id(db, sid, allowed)
+        if portfolio_id and ps_id != portfolio_id:
+            continue
+        name_row = db.query(Strategy.name).filter(Strategy.id == sid).first()
+        name = name_row[0] if name_row else None
+        member_warnings: List[dict] = []
+
+        rec = _pairing_member_record(db, plan, group_id, sid, ps_id)
+        theory_curve: list = []
+        if rec is None:
+            theory_status = "record_missing"
+            member_warnings.append({
+                "code": "member_record_missing",
+                "message": f"缺少成员回测记录：策略 #{sid}（{name or '-'}），"
+                           "理论侧无法生成",
+            })
+        else:
+            theory_curve = _member_theory_curve(
+                db, rec.id, start_date, end_date)
+            if not theory_curve:
+                theory_status = "empty"
+                member_warnings.append({
+                    "code": "member_theory_empty",
+                    "message": f"成员回测记录 #{rec.id} 在窗口内无日快照",
+                })
+            elif len(theory_curve) < 2:
+                theory_status = "insufficient"
+            else:
+                theory_status = "ok"
+
+        live_curve = _member_live_curve(
+            db, session.id, ps_id, start_date, end_date)
+        live_status = "ok" if len(live_curve) >= 2 else (
+            "insufficient" if live_curve else "missing")
+        if not live_curve:
+            member_warnings.append({
+                "code": "member_live_missing",
+                "message": f"成员策略 #{sid}（{name or '-'}）暂无实盘日序列",
+            })
+
+        members.append({
+            "strategy_id": sid,
+            "strategy_name": name,
+            "role": roles.get(sid),
+            "portfolio_strategy_id": ps_id,
+            "theory": {
+                "record_id": int(rec.id) if rec is not None else None,
+                "record_name": getattr(rec, "name", None),
+                "status": theory_status,
+                "curve": theory_curve,
+                "metrics": _curve_metrics(theory_curve),
+            },
+            "live": {
+                "status": live_status,
+                "curve": live_curve,
+                "metrics": _curve_metrics(live_curve),
+            },
+            "deviation": _overlap_deviation(theory_curve, live_curve),
+            "warnings": member_warnings,
+        })
+        warnings.extend(member_warnings)
+
+    statuses = [m["theory"]["status"] for m in members]
+    if not members:
+        theory_status = "record_missing"
+    elif any(s == "ok" for s in statuses):
+        theory_status = "ok"
+    elif all(s == "record_missing" for s in statuses):
+        theory_status = "record_missing"
+    else:
+        theory_status = "empty"
+    return {
+        "bound": True, "found": True, "source": source,
+        "plan_id": plan.id, "plan_name": plan.name,
+        "plan_status": plan.status, "run_group_id": group_id,
+        "members": members,
+        "theory_series_status": theory_status,
+        "warnings": warnings,
+    }
+
+
 def compute_theory_vs_live(
     db: Session, session, portfolio_id: Optional[int] = None,
     start_date: Optional[date] = None, end_date: Optional[date] = None,
@@ -7700,6 +7942,22 @@ def compute_theory_vs_live(
                       if live_orders else None),
     })
     result["live"] = {"curve": live_curve, "metrics": live_metrics}
+
+    # F4：拼盘/运行组会话按成员对比；非拼盘会话继续走 N2 单记录路径。
+    pairing = compute_pairing_theory_vs_live(
+        db, session, portfolio_id=portfolio_id,
+        start_date=start_date, end_date=end_date)
+    if pairing is not None:
+        result["pairing"] = pairing
+        result["bound"] = bool(pairing.get("found"))
+        result["binding_source"] = pairing.get("source")
+        result["backtest_record_id"] = None
+        result["backtest_name"] = pairing.get("plan_name")
+        result["theory_series_status"] = pairing.get("theory_series_status")
+        result["warnings"].extend(
+            w.get("message") for w in (pairing.get("warnings") or [])
+            if w.get("message"))
+        return result
 
     rec_id = getattr(session, "backtest_record_id", None)
     rec = None

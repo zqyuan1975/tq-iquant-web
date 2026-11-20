@@ -720,6 +720,7 @@ def session_theory_vs_live(
 
     实盘侧来自 ``live_portfolio_daily`` / ``live_trades`` / ``live_orders``；
     未绑定回测记录时 bound=False，仍返回实际侧（实盘页可常驻展示）。
+    F4：会话绑定拼盘/运行组时按成员对比，额外返回 ``pairing.members``。
     """
     session = db.query(LiveSession).filter(LiveSession.id == session_id).first()
     if session is None:

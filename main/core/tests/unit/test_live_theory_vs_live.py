@@ -11,10 +11,12 @@ from sqlalchemy.pool import StaticPool
 
 from core.models import (
     Base, BacktestRecord, BacktestDailySnapshot, BacktestTrade,
-    LiveSession, LiveSessionPortfolio, LivePortfolioDaily, LiveTrade, LiveOrder,
+    BacktestRunGroup, CapitalPairingPlan, LiveSession, LiveSessionPortfolio,
+    LivePortfolioDaily, LiveTrade, LiveOrder, PortfolioStrategy, Strategy,
     LiveAccountSnapshot, LiveAccountPositionSnapshot,
 )
 from core.services import live_service as svc
+from core.services.pairing_service import binding_snapshot
 
 
 @pytest.fixture
@@ -204,3 +206,131 @@ def test_theory_vs_live_auto_binds_latest_completed_portfolio_record(db_session)
     assert out["backtest_record_id"] == new_rec.id
     assert out["theory_series_status"] == "ok"
     assert out["theory"]["curve"][-1]["index_value"] == pytest.approx(1.12)
+
+
+# ---------------------------------------------------------------------------
+# F4：拼盘会话按成员对比
+# ---------------------------------------------------------------------------
+
+def _seed_pairing(db, *, with_group=True, with_records=True):
+    ps = PortfolioStrategy(name="拼盘组合", stock_pool_id=1,
+                           initial_capital=200000)
+    db.add(ps)
+    db.flush()
+    lender = Strategy(portfolio_id=ps.id, name="主", formula_id=1,
+                      period="1d", role="主")
+    borrower = Strategy(portfolio_id=ps.id, name="从", formula_id=1,
+                        period="1d", role="从")
+    db.add_all([lender, borrower])
+    db.flush()
+
+    group = None
+    if with_group:
+        group = BacktestRunGroup(name="拼盘运行组", status="completed")
+        db.add(group)
+        db.flush()
+    rec = None
+    if with_records:
+        rec = BacktestRecord(
+            portfolio_strategy_id=ps.id, name="拼盘回测", status="completed",
+            start_date=date(2026, 7, 29), end_date=date(2026, 7, 31),
+            run_group_id=group.id if group else None,
+            params_snapshot=json.dumps({"dividend_mode": "front"}),
+        )
+        db.add(rec)
+        db.flush()
+        for i, value in enumerate((200000, 205000, 210000)):
+            db.add(BacktestDailySnapshot(
+                backtest_record_id=rec.id, target_type="portfolio",
+                target_id=ps.id,
+                snap_date=date(2026, 7, 29) + timedelta(days=i),
+                total_value=Decimal(str(value)), cash=Decimal("0"),
+                market_value=Decimal(str(value)),
+            ))
+    plan = CapitalPairingPlan(
+        name="拼盘", portfolio_strategy_id=ps.id, status="APPROVED",
+        lender_strategy_id=lender.id,
+        binding_json=json.dumps({
+            "lender": binding_snapshot(lender),
+            "borrower": binding_snapshot(borrower),
+            "loan": {"principal": "50000"},
+        }),
+    )
+    db.add(plan)
+    db.flush()
+    session = LiveSession(
+        name="拼盘实盘", mode="paper", status="running",
+        pairing_plan_id=plan.id,
+        backtest_run_group_id=group.id if group else None,
+    )
+    db.add(session)
+    db.flush()
+    db.add(LiveSessionPortfolio(
+        session_id=session.id, portfolio_strategy_id=ps.id, status="active"))
+    # 实盘：180000 → 189000（+5%）
+    for i, value in enumerate((180000, 184500, 189000)):
+        db.add(LivePortfolioDaily(
+            live_session_id=session.id, portfolio_strategy_id=ps.id,
+            trade_date=date(2026, 7, 29) + timedelta(days=i),
+            total_value=Decimal(str(value)),
+            risk_value=Decimal(str(value)),
+        ))
+    db.commit()
+    return session, plan, lender, borrower, rec
+
+
+def test_pairing_session_compares_members(db_session):
+    session, plan, lender, borrower, rec = _seed_pairing(db_session)
+
+    out = svc.compute_theory_vs_live(db_session, session)
+
+    assert out["bound"] is True
+    assert out["binding_source"] == "pairing_plan"
+    pair = out["pairing"]
+    assert pair["found"] is True and pair["plan_id"] == plan.id
+    assert pair["run_group_id"] == session.backtest_run_group_id
+    assert [m["strategy_id"] for m in pair["members"]] == [
+        lender.id, borrower.id]
+    assert [m["role"] for m in pair["members"]] == ["lender", "borrower"]
+    for member in pair["members"]:
+        assert member["theory"]["record_id"] == rec.id
+        assert member["theory"]["status"] == "ok"
+        assert member["live"]["status"] == "ok"
+        # 理论 +5%，实盘 +5% → 同日偏差为 0
+        assert member["deviation"]["common_days"] == 3
+        assert member["deviation"]["return_gap"] == pytest.approx(0.0)
+
+
+def test_pairing_session_missing_member_record_is_explicit(db_session):
+    session, *_ = _seed_pairing(
+        db_session, with_group=False, with_records=False)
+
+    out = svc.compute_theory_vs_live(db_session, session)
+
+    pair = out["pairing"]
+    assert pair["theory_series_status"] == "record_missing"
+    for member in pair["members"]:
+        assert member["theory"]["status"] == "record_missing"
+        assert member["theory"]["record_id"] is None
+        codes = [w["code"] for w in member["warnings"]]
+        assert "member_record_missing" in codes
+    assert any("缺少成员回测记录" in w for w in out["warnings"])
+
+
+def test_pairing_session_missing_plan_is_explicit(db_session):
+    session, plan, *_ = _seed_pairing(db_session)
+    session.pairing_plan_id = 99999
+    db_session.commit()
+
+    out = svc.compute_theory_vs_live(db_session, session)
+
+    pair = out["pairing"]
+    assert pair["found"] is False
+    assert pair["warnings"][0]["code"] == "pairing_plan_missing"
+    assert any("绑定的拼盘不存在" in w for w in out["warnings"])
+
+
+def test_non_pairing_session_has_no_pairing_block(db_session):
+    session, _ = _seed(db_session)
+    out = svc.compute_theory_vs_live(db_session, session)
+    assert "pairing" not in out
