@@ -84,7 +84,7 @@ from core.engine.live.fallback_quote import FallbackQuoteDispatcher
 from core.engine.live.timing import now_shanghai
 from core.services import portfolio_settings
 from core.services import capital_inheritance
-from core.services.pairing_service import binding_snapshot
+from core.services.pairing_service import binding_snapshot, build_loan_model_plan
 from core.services.live_data_health import (
     health_summary_text,
     run_health_check,
@@ -1781,6 +1781,65 @@ def build_engine(
         _calendar_fallbacks.append(("goldminer_bridge", goldminer_calendar_provider))
     trading_calendar = TradingCalendar(
         dispatcher.query_calendar, fallback_providers=_calendar_fallbacks)
+    # F3 影子（默认关）：仅在会话绑定拼盘/运行组时构建；失败只关闭影子，
+    # 不影响引擎启动与交易。影子不触下单入口，只逐 bar 追加只读记录。
+    _capital_shadow = None
+    if (getattr(session_row, "pairing_plan_id", None)
+            or getattr(session_row, "backtest_run_group_id", None)):
+        try:
+            _plan = _resolve_bound_pairing_plan(db, session_row)
+            if _plan is not None:
+                _binding = capital_inheritance.normalize_binding(
+                    _plan.binding_json)
+                _members = []
+                _sides = [("lender", _binding["lender"])] + [
+                    ("borrowers[%d]" % i, b["binding"])
+                    for i, b in enumerate(_binding["borrowers"])
+                ]
+                for _label, _b in _sides:
+                    try:
+                        _sid = int(_b.get("strategy_id"))
+                    except (TypeError, ValueError):
+                        continue
+                    _members.append({
+                        "strategy_id": _sid,
+                        "side": _label,
+                        "role": _b.get("role"),
+                        "max_order_amount": _b.get("max_order_amount"),
+                    })
+                _loan_plan = None
+                try:
+                    _loan_plan = build_loan_model_plan(db, _plan.id)
+                    _loan_plan["plan_id"] = _plan.id
+                    _loan_plan["recall_notice_days"] = getattr(
+                        _plan, "recall_notice_days", None)
+                except Exception:  # noqa: BLE001
+                    logger.info(
+                        "capital shadow: loan plan unavailable (plan=%s)",
+                        _plan.id, exc_info=True)
+                _snapshots = {}
+                for _sid in capital_inheritance.binding_strategy_ids(
+                        _plan.binding_json):
+                    _st = db.get(Strategy, _sid)
+                    if _st is not None:
+                        _snapshots[_sid] = binding_snapshot(_st)
+                _report = capital_inheritance.build_report(
+                    _plan.binding_json, _snapshots,
+                    pairing_version=_plan.pairing_version,
+                    overrides=_live_haircut_overrides())
+                _capital_shadow = {
+                    "plan_id": _plan.id,
+                    "loan_plan": _loan_plan,
+                    "members": _members,
+                    "haircut": _report["haircut"],
+                    "drift_fields": _report["drift_fields"],
+                    "warning_codes": sorted(
+                        {w["code"] for w in _report["warnings"]}),
+                }
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                "capital shadow setup failed (session %s); 影子关闭", session_id)
+            _capital_shadow = None
     eng = LiveEngine(
         session_id=session_id,
         portfolios=portfolios,
@@ -1861,6 +1920,8 @@ def build_engine(
         capital_pool_mode=(getattr(session_row, "capital_pool_mode", None) or "off"),
         capital_pool_rebalance_enabled=bool(
             getattr(session_row, "capital_pool_rebalance_enabled", False)),
+        # F3 影子：绑定拼盘/运行组时逐 bar 追加只读记录；None=默认关闭
+        capital_shadow=_capital_shadow,
         # B2 主备通道：主通道心跳失败时按需写建议切换事件（不自动热切换）
         backup_engine=getattr(session_row, "backup_engine", None),
         failover_enabled=bool(getattr(session_row, "failover_enabled", False)),

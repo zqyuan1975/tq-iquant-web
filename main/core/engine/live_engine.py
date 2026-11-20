@@ -127,6 +127,7 @@ from .live.account_risk import AccountRiskService
 from .live.daily_closer import DailyCloser
 from .market_rules import session_allows_bar, tick_size
 from .decision import DecisionRecorder
+from .capital_shadow import build_shadow_payload
 from .regime import CausalRegimeTracker
 from ..config import load_config
 from ..services.notify_service import notify
@@ -134,7 +135,7 @@ from core.models import (
     LiveAccountPositionSnapshot, LiveAccountSnapshot, LiveCashFlow,
     LiveDecisionEvent, LiveBarOrderMark, LiveOrder, LivePositionPeak,
     LiveSession, LiveSessionPortfolio, LiveSignal, LiveTrade,
-    LiveCorporateAction,
+    LiveCorporateAction, LiveCapitalShadow,
     LiveApprovalQueue, LiveManualAction, LiveOutOfPoolDecision,
     LivePortfolioDaily,
     LiveSessionPendingChange,
@@ -704,6 +705,9 @@ class LiveEngine:
         # rebalance_enabled=True 时每交易日首 bar 再平衡（默认关闭）。
         capital_pool_mode: str = "off",
         capital_pool_rebalance_enabled: bool = False,
+        # F3 影子（0021，默认 None=关闭）：只在每根 bar 末尾追加
+        # live_capital_shadow 一行，不参与任何交易决策；结构上不触下单入口。
+        capital_shadow: Optional[dict] = None,
         backup_engine: Optional[str] = None,
         failover_enabled: bool = False,
     ):
@@ -826,6 +830,8 @@ class LiveEngine:
             else "off")
         self._capital_pool_rebalance = bool(capital_pool_rebalance_enabled)
         self._capital_pool_day: Optional[date] = None
+        # F3 影子：None=关闭（默认路径不取任何新数据、不写库）。
+        self._capital_shadow = capital_shadow if isinstance(capital_shadow, dict) else None
         # B2 主备通道：主通道心跳失败时逐日写一条建议切换事件（不自动热切换；
         # 运行中切换必须经 stop/start 重建 dispatcher，由人工确认后走待生效队列）。
         self.backup_engine = backup_engine or None
@@ -8511,6 +8517,8 @@ class LiveEngine:
                 db.commit()
             # 决策闸门事件随本 bar 统一落库 + SSE 推送（含 orders 为空时的 halt/strip 事件）。
             self._drain_decisions(db, portfolio)
+            # F3 影子（默认关）：只追加 live_capital_shadow，失败不影响交易。
+            self._maybe_record_capital_shadow(db, portfolio, bar)
         except Exception:
             db.rollback()
             # P3（2026-11-09）：放行即从 _signal_bar_deferred 摘除，若提交链抛异常，
@@ -8519,6 +8527,55 @@ class LiveEngine:
             raise
         finally:
             db.close()
+
+    def _maybe_record_capital_shadow(self, db, portfolio: Portfolio,
+                                     bar: BarEvent) -> None:
+        """F3 影子：追加一行「计划 vs 实际」，不参与任何交易决策。
+
+        关闭时（默认 ``None``）第一行返回：不取市值、不写库，默认路径零变化。
+        开启时也只读 ``portfolio.account.cash`` / ``total_value``；异常只回滚
+        本行并记日志，绝不影响委托、事件与账本。
+        """
+        shadow = self._capital_shadow
+        if not shadow:
+            return
+        member_ids = {
+            int(m["strategy_id"])
+            for m in (shadow.get("members") or [])
+            if m.get("strategy_id") is not None
+        }
+        held_ids = {ctx.strategy_id for ctx in getattr(portfolio, "strategies", [])}
+        if not member_ids & held_ids:
+            return
+        try:
+            total = portfolio.total_value(bar)
+            payload = build_shadow_payload(
+                portfolio_id=portfolio.portfolio_id,
+                bar_time=bar.bar_time,
+                loan_plan=shadow.get("loan_plan"),
+                members=shadow.get("members"),
+                cash=portfolio.account.cash,
+                total_value=total,
+                haircut=shadow.get("haircut"),
+                drift_fields=shadow.get("drift_fields"),
+                warning_codes=shadow.get("warning_codes"),
+            )
+            db.add(LiveCapitalShadow(
+                live_session_id=self.session_id,
+                portfolio_id=portfolio.portfolio_id,
+                bar_time=bar.bar_time,
+                payload_json=json.dumps(payload, ensure_ascii=False),
+                version=payload["version"],
+            ))
+            db.commit()
+        except Exception:  # noqa: BLE001
+            db.rollback()
+            logger.exception(
+                "capital shadow record failed (trading unaffected): "
+                "session=%s portfolio=%s bar=%s",
+                self.session_id, getattr(portfolio, "portfolio_id", None),
+                getattr(bar, "bar_time", None),
+            )
 
     def _restore_released_orders(self, released) -> None:
         """放行单提交过程异常时回滚队列（幂等：已在队列/已提交的不重复放回）。"""

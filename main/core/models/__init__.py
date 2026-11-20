@@ -48,6 +48,7 @@ from .live_portfolio_daily import LivePortfolioDaily
 from .live_gate_snapshot import LiveGateSnapshot
 from .live_pending_change import LiveSessionPendingChange
 from .live_global_switch import LiveGlobalSwitch
+from .live_capital_shadow import LiveCapitalShadow
 from .capital_pairing import (
     CapitalPairingPlan, CapitalPairing, CapitalPairingEval,
 )
@@ -102,6 +103,7 @@ __all__ = [
     "LiveGateSnapshot",
     "LiveSessionPendingChange",
     "LiveGlobalSwitch",
+    "LiveCapitalShadow",
     "CapitalPairingPlan",
     "CapitalPairing",
     "CapitalPairingEval",
