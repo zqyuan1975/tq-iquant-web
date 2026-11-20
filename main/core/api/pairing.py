@@ -48,7 +48,11 @@ class PairingPlanRequest(BaseModel):
     name: str = Field(..., min_length=1, max_length=100)
     portfolio_strategy_id: int = Field(..., ge=1)
     lender_strategy_id: int = Field(..., ge=1)
-    borrower_strategy_ids: list[int] = Field(..., min_length=1)
+    borrower_strategy_ids: list[int] | None = None
+    # 0021 E4：L3 跨组合借款方（2–3 个）；给了 borrowers 时可省略 ids 列表。
+    borrowers: list[dict] | None = None
+    queue_policy: str = "queue"  # queue（默认）/ reject
+    queue_ttl_days: int = 20
     principal: float = Field(..., gt=0)
     scope: str = "L2"
     loan_term_days: int = 365

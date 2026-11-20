@@ -12,7 +12,7 @@
 import hashlib
 import json
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from statistics import median
 from typing import Dict, List, Optional
@@ -48,6 +48,15 @@ PLAN_APPROVED = "APPROVED"
 PLAN_WATCH = "WATCH"
 PLAN_SUSPENDED = "SUSPENDED"
 PLAN_ARCHIVED = "ARCHIVED"
+PLAN_QUEUED = "QUEUED"
+PLAN_EXPIRED = "EXPIRED"
+
+# 0020 §2：L3 硬上限 3 个借款方；超出默认排队，队列 TTL 20 个交易日。
+MIN_L3_BORROWERS = 2
+MAX_L3_BORROWERS = 3
+QUEUE_TTL_TRADING_DAYS = 20
+# 交易日→自然日近似（每周 5/7），只用于队列过期比较，不参与收益计算。
+_TRADING_TO_CALENDAR = 7.0 / 5.0
 
 STATUS_GO = "GO"
 STATUS_NO_GO = "NO_GO"
@@ -412,6 +421,99 @@ def _latest_eval(db: Session, plan_id: int) -> Optional[CapitalPairingEval]:
     )
 
 
+def _edges_of(db: Session, plan_id: int) -> List[CapitalPairing]:
+    return (
+        db.query(CapitalPairing)
+        .filter(CapitalPairing.pairing_plan_id == plan_id)
+        .order_by(CapitalPairing.id)
+        .all()
+    )
+
+
+def _latest_eval_for(db: Session, plan_id: int,
+                     borrower_id: int) -> Optional[CapitalPairingEval]:
+    return (
+        db.query(CapitalPairingEval)
+        .filter(CapitalPairingEval.pairing_plan_id == plan_id,
+                CapitalPairingEval.borrower_strategy_id == borrower_id)
+        .order_by(CapitalPairingEval.id.desc())
+        .first()
+    )
+
+
+def _borrower_specs(payload: dict, scope: str,
+                    lender_portfolio_id: int) -> List[dict]:
+    """归一化借款方入参：L3 支持显式 borrowers，也兼容 id 列表（同组合）。"""
+    raw = payload.get("borrowers")
+    specs: List[dict] = []
+    if raw:
+        for item in raw:
+            if isinstance(item, dict):
+                pid = item.get("portfolio_strategy_id") or lender_portfolio_id
+                sid = item.get("strategy_id") or item.get("borrower_strategy_id")
+                share = item.get("max_share", payload.get("max_share"))
+            else:
+                pid, sid, share = lender_portfolio_id, item, payload.get("max_share")
+            specs.append({"portfolio_strategy_id": pid, "strategy_id": sid,
+                          "max_share": share})
+        return specs
+
+    ids = payload.get("borrower_strategy_ids") or []
+    if isinstance(ids, (int, str)):
+        ids = [ids]
+    for sid in ids:
+        specs.append({"portfolio_strategy_id": lender_portfolio_id,
+                      "strategy_id": sid,
+                      "max_share": payload.get("max_share")})
+    return specs
+
+
+def _queue_expires(now: datetime, ttl_trading_days: int) -> datetime:
+    return now + timedelta(days=ttl_trading_days * _TRADING_TO_CALENDAR)
+
+
+def _expire_queued(db: Session, now: datetime) -> int:
+    """把超过 TTL 的排队草稿标 EXPIRED（只改状态，不删记录）。"""
+    rows = (db.query(CapitalPairingPlan)
+            .filter(CapitalPairingPlan.status == PLAN_QUEUED).all())
+    expired = 0
+    for plan in rows:
+        binding = _load(plan.binding_json)
+        queue = binding.get("queue") or {}
+        raw = queue.get("expires_at")
+        if not raw:
+            continue
+        try:
+            expires_at = datetime.fromisoformat(raw)
+        except ValueError:
+            continue
+        if expires_at <= now:
+            queue["expired_at"] = now.isoformat(sep=" ", timespec="seconds")
+            binding["queue"] = queue
+            plan.binding_json = _dump(binding)
+            plan.status = PLAN_EXPIRED
+            expired += 1
+    if expired:
+        db.commit()
+    return expired
+
+
+def _queue_meta(db: Session, plan: CapitalPairingPlan) -> Optional[dict]:
+    queue = _load(plan.binding_json).get("queue")
+    if not queue:
+        return None
+    position = 1 + (
+        db.query(CapitalPairingPlan)
+        .filter(CapitalPairingPlan.status == PLAN_QUEUED,
+                CapitalPairingPlan.id < plan.id,
+                CapitalPairingPlan.scope == plan.scope)
+        .count()
+    )
+    data = dict(queue)
+    data["position"] = position
+    return data
+
+
 # ---------------------------------------------------------------------------
 # CRUD
 # ---------------------------------------------------------------------------
@@ -425,7 +527,7 @@ def _require_strategy(db: Session, strategy_id, portfolio_id: int,
     if strategy is None:
         raise LookupError("%s 策略不存在：%s" % (label, sid))
     if strategy.portfolio_id != portfolio_id:
-        raise PairingError("%s 不属于该组合（阶段 B 仅同组合 L2）" % label)
+        raise PairingError("%s 不属于该组合（%s）" % (label, portfolio_id))
     return strategy
 
 
@@ -433,25 +535,17 @@ def create_plan(db: Session, payload: dict,
                 now: Optional[datetime] = None) -> dict:
     now = now or datetime.now()
     scope = str(payload.get("scope") or "L2").upper()
-    if scope != "L2":
-        raise PairingError("阶段 B 仅支持 L2（同组合）；跨组合 L3 在阶段 E 开放")
-    portfolio_id = payload.get("portfolio_strategy_id")
+    if scope not in ("L2", "L3"):
+        raise PairingError("scope 仅支持 L2（同组合）/ L3（跨组合）")
+    portfolio_id = (payload.get("portfolio_strategy_id")
+                    or payload.get("lender_portfolio_strategy_id"))
     ps = db.get(PortfolioStrategy, portfolio_id) if portfolio_id else None
     if ps is None:
         raise LookupError("组合不存在：%s" % portfolio_id)
-    borrower_ids = payload.get("borrower_strategy_ids") or []
-    if isinstance(borrower_ids, (int, str)):
-        borrower_ids = [borrower_ids]
-    borrower_ids = list(borrower_ids)
-    if len(borrower_ids) != 1:
-        raise PairingError("阶段 B 仅支持 1 个借款方；多借款方在阶段 E 开放")
     lender_id = payload.get("lender_strategy_id")
     if not lender_id:
         raise PairingError("缺少出借方策略")
     lender = _require_strategy(db, lender_id, portfolio_id, "出借方")
-    borrower = _require_strategy(db, borrower_ids[0], portfolio_id, "借款方")
-    if lender.id == borrower.id:
-        raise PairingError("出借方与借款方不能是同一策略")
 
     principal = _dec(payload.get("principal"))
     if principal is None or principal <= 0:
@@ -463,26 +557,91 @@ def create_plan(db: Session, payload: dict,
     if not (Decimal("0") < max_share <= Decimal("1")):
         raise PairingError("借款方最大占比须在 (0,1]")
 
+    specs = _borrower_specs(payload, scope, portfolio_id)
+    if scope == "L2":
+        if len(specs) != 1:
+            raise PairingError("L2 拼盘仅支持 1 个借款方；多借款方请用 L3")
+    else:
+        if len(specs) < MIN_L3_BORROWERS:
+            raise PairingError(
+                "L3 拼盘至少 %d 个借款方" % MIN_L3_BORROWERS)
+        if len(specs) > MAX_L3_BORROWERS:
+            policy = str(payload.get("queue_policy") or "queue").lower()
+            if policy == "reject":
+                raise PairingError(
+                    "BORROWER_LIMIT_REACHED：L3 最多 %d 个借款方，第 %d 个被拒绝"
+                    % (MAX_L3_BORROWERS, MAX_L3_BORROWERS + 1))
+            return _create_queued_plan(
+                db, payload, now, scope, portfolio_id, lender,
+                principal, loan_term_days, recall_notice_days,
+                release_delay_days, max_share, specs)
+
+    seen = set()
+    pairs = []
+    for spec in specs:
+        sid = spec["strategy_id"]
+        if sid is None:
+            raise PairingError("借款方策略缺失")
+        if sid in seen:
+            raise PairingError("借款方重复：%s" % sid)
+        seen.add(sid)
+        borrower = _require_strategy(
+            db, sid, spec["portfolio_strategy_id"], "借款方")
+        if borrower.id == lender.id:
+            raise PairingError("出借方与借款方不能是同一策略")
+        share = _dec(spec.get("max_share")) or max_share
+        if not (Decimal("0") < share <= Decimal("1")):
+            raise PairingError("借款方 %s 最大占比须在 (0,1]" % borrower.id)
+        record_b = _latest_record(db, spec["portfolio_strategy_id"])
+        pairs.append((borrower, share, record_b))
+
     record = _latest_record(db, portfolio_id)
     lender_binding = binding_snapshot(lender)
-    borrower_binding = binding_snapshot(borrower)
+    borrower_bindings = [binding_snapshot(b) for b, _, _ in pairs]
     loan = {
         "principal": str(principal), "loan_term_days": loan_term_days,
         "recall_notice_days": recall_notice_days,
         "release_delay_days": release_delay_days,
         "max_share": str(max_share),
+        "max_borrowers": len(pairs),
     }
-    binding = {
-        "binding_version": BINDING_VERSION,
-        "lender": lender_binding, "borrower": borrower_binding, "loan": loan,
-    }
+    if scope == "L3":
+        binding = {
+            "binding_version": BINDING_VERSION,
+            "lender": lender_binding,
+            "borrowers": [
+                {"portfolio_strategy_id": spec["portfolio_strategy_id"],
+                 "strategy_id": b.id, "binding": bind}
+                for spec, (b, _, _), bind in zip(specs, pairs, borrower_bindings)
+            ],
+            "loan": loan,
+        }
+        pairing_version = _hash({
+            "binding_version": BINDING_VERSION, "scope": scope,
+            "lender": {k: lender_binding.get(k) for k in BINDING_FIELDS},
+            "borrowers": [
+                {"portfolio_strategy_id": spec["portfolio_strategy_id"],
+                 "binding": {k: bind.get(k) for k in BINDING_FIELDS}}
+                for spec, bind in zip(specs, borrower_bindings)
+            ],
+            "loan": loan,
+        })
+    else:
+        binding = {
+            "binding_version": BINDING_VERSION,
+            "lender": lender_binding, "borrower": borrower_bindings[0],
+            "loan": loan,
+        }
+        pairing_version = _pairing_version(
+            scope, lender_binding, borrower_bindings[0], loan)
+
     plan = CapitalPairingPlan(
-        name=str(payload.get("name") or "L2 拼盘").strip(),
+        name=str(payload.get("name") or ("%s 拼盘" % scope)).strip(),
         scope=scope, status=PLAN_DRAFT,
         portfolio_strategy_id=portfolio_id,
         lender_strategy_id=lender.id,
         lender_record_id=record.id if record else None,
-        max_borrowers=1, principal=principal,
+        max_borrowers=len(pairs), principal=principal,
         loan_term_days=loan_term_days,
         recall_notice_days=recall_notice_days,
         release_delay_days=release_delay_days,
@@ -492,38 +651,106 @@ def create_plan(db: Session, payload: dict,
         gate_hysteresis_days=payload.get("gate_hysteresis_days"),
         cash_outlet_enabled=0,
         binding_json=_dump(binding),
-        pairing_version=_pairing_version(scope, lender_binding, borrower_binding, loan),
-        params_hash=_hash({"lender": lender_binding, "borrower": borrower_binding}),
+        pairing_version=pairing_version,
+        params_hash=_hash({"lender": lender_binding,
+                           "borrowers": borrower_bindings}),
         created_by=payload.get("created_by"),
     )
     db.add(plan)
     db.flush()
-    edge = CapitalPairing(
-        pairing_plan_id=plan.id, scope=scope,
-        lender_type="strategy", lender_id=lender.id,
-        lender_record_id=plan.lender_record_id,
-        borrower_type="strategy", borrower_id=borrower.id,
-        borrower_record_id=None, status="ACTIVE",
-        max_share=max_share, loan_term_days=loan_term_days,
+
+    for (borrower, share, record_b) in pairs:
+        edge = CapitalPairing(
+            pairing_plan_id=plan.id, scope=scope,
+            lender_type="strategy", lender_id=lender.id,
+            lender_record_id=plan.lender_record_id,
+            borrower_type="strategy", borrower_id=borrower.id,
+            borrower_record_id=record_b.id if record_b else None,
+            status="ACTIVE",
+            max_share=share, loan_term_days=loan_term_days,
+            recall_notice_days=recall_notice_days,
+            release_delay_days=release_delay_days,
+            eligibility_backtest_id=(
+                record_b.id if record_b else plan.lender_record_id),
+            params_hash=plan.params_hash, pairing_version=plan.pairing_version,
+            binding_json=_dump({"lender": lender_binding,
+                                "borrower": binding_snapshot(borrower)}),
+            created_by=payload.get("created_by"),
+        )
+        db.add(edge)
+        db.flush()
+        result = _precheck(db, plan, lender, borrower, now)
+        row = _store_eval(db, plan, result, lender.id, borrower.id, now)
+        edge.evaluation_id = row.id
+
+    db.commit()
+    return get_plan(db, plan.id)
+
+
+def _create_queued_plan(db: Session, payload: dict, now: datetime,
+                        scope: str, portfolio_id: int, lender: Strategy,
+                        principal: Decimal, loan_term_days: int,
+                        recall_notice_days: int, release_delay_days: int,
+                        max_share: Decimal, specs: List[dict]) -> dict:
+    """超过 3 个借款方：整个申请进入 QUEUED，不预分配额度/不建边。"""
+    ttl = int(payload.get("queue_ttl_days") or QUEUE_TTL_TRADING_DAYS)
+    if ttl <= 0:
+        ttl = QUEUE_TTL_TRADING_DAYS
+    expires_at = _queue_expires(now, ttl)
+    binding = {
+        "binding_version": BINDING_VERSION,
+        "lender": binding_snapshot(lender),
+        "borrowers": [
+            {"portfolio_strategy_id": s["portfolio_strategy_id"],
+             "strategy_id": s["strategy_id"],
+             "max_share": str(_dec(s.get("max_share")) or max_share)}
+            for s in specs
+        ],
+        "loan": {
+            "principal": str(principal), "loan_term_days": loan_term_days,
+            "recall_notice_days": recall_notice_days,
+            "release_delay_days": release_delay_days,
+            "max_share": str(max_share),
+        },
+        "queue": {
+            "policy": "queue",
+            "requested": len(specs),
+            "limit": MAX_L3_BORROWERS,
+            "ttl_trading_days": ttl,
+            "enqueued_at": now.isoformat(sep=" ", timespec="seconds"),
+            "expires_at": expires_at.isoformat(sep=" ", timespec="seconds"),
+        },
+    }
+    plan = CapitalPairingPlan(
+        name=str(payload.get("name") or "L3 拼盘（排队）").strip(),
+        scope=scope, status=PLAN_QUEUED,
+        portfolio_strategy_id=portfolio_id,
+        lender_strategy_id=lender.id,
+        lender_record_id=None,
+        max_borrowers=MAX_L3_BORROWERS, principal=principal,
+        loan_term_days=loan_term_days,
         recall_notice_days=recall_notice_days,
         release_delay_days=release_delay_days,
-        eligibility_backtest_id=plan.lender_record_id,
-        params_hash=plan.params_hash, pairing_version=plan.pairing_version,
-        binding_json=_dump({"lender": lender_binding,
-                            "borrower": borrower_binding}),
+        pool_scope=payload.get("pool_scope"),
+        ownership_policy=payload.get("ownership_policy"),
+        no_cap_reserve_policy=payload.get("no_cap_reserve_policy"),
+        gate_hysteresis_days=payload.get("gate_hysteresis_days"),
+        cash_outlet_enabled=0,
+        binding_json=_dump(binding),
+        pairing_version=_hash(binding),
+        params_hash=_hash({"lender": binding["lender"],
+                           "borrowers": binding["borrowers"]}),
         created_by=payload.get("created_by"),
     )
-    db.add(edge)
-    db.flush()
-    result = _precheck(db, plan, lender, borrower, now)
-    row = _store_eval(db, plan, result, lender.id, borrower.id, now)
-    edge.evaluation_id = row.id
+    db.add(plan)
     db.commit()
     return get_plan(db, plan.id)
 
 
 def list_plans(db: Session, scope: Optional[str] = None,
-               status: Optional[str] = None) -> list:
+               status: Optional[str] = None,
+               now: Optional[datetime] = None) -> list:
+    _expire_queued(db, now or datetime.now())
     q = db.query(CapitalPairingPlan)
     if scope:
         q = q.filter(CapitalPairingPlan.scope == scope)
@@ -533,15 +760,29 @@ def list_plans(db: Session, scope: Optional[str] = None,
     return [_plan_summary(db, row) for row in rows]
 
 
+def _edge_payload(edge: CapitalPairing) -> dict:
+    return {
+        "id": edge.id, "lender_id": edge.lender_id,
+        "borrower_id": edge.borrower_id, "status": edge.status,
+        "borrower_record_id": edge.borrower_record_id,
+        "max_share": str(edge.max_share) if edge.max_share is not None else None,
+        "evaluation_id": edge.evaluation_id,
+    }
+
+
 def _plan_summary(db: Session, plan: CapitalPairingPlan) -> dict:
     edge = _edge_of(db, plan.id)
     latest = _latest_eval(db, plan.id)
+    edges = _edges_of(db, plan.id)
     return {
         "id": plan.id, "name": plan.name, "scope": plan.scope,
         "status": plan.status,
         "portfolio_strategy_id": plan.portfolio_strategy_id,
         "lender_strategy_id": plan.lender_strategy_id,
         "borrower_strategy_id": edge.borrower_id if edge else None,
+        "borrower_count": len(edges),
+        "borrowers": [_edge_payload(e) for e in edges],
+        "queue": _queue_meta(db, plan) if plan.status == PLAN_QUEUED else None,
         "principal": str(plan.principal) if plan.principal is not None else None,
         "loan_term_days": plan.loan_term_days,
         "pairing_version": plan.pairing_version,
@@ -556,18 +797,16 @@ def get_plan(db: Session, plan_id: int) -> dict:
     plan = db.get(CapitalPairingPlan, plan_id)
     if plan is None:
         raise LookupError("拼盘不存在：%s" % plan_id)
-    edge = _edge_of(db, plan.id)
-    latest = _latest_eval(db, plan.id)
+    edges = _edges_of(db, plan.id)
     data = _plan_summary(db, plan)
     data["binding"] = _load(plan.binding_json)
     data["evidence"] = _load(plan.evidence_json)
-    data["edge"] = {
-        "id": edge.id, "lender_id": edge.lender_id,
-        "borrower_id": edge.borrower_id, "status": edge.status,
-        "max_share": str(edge.max_share) if edge.max_share is not None else None,
-        "evaluation_id": edge.evaluation_id,
-    } if edge else None
-    data["loan_model_plan"] = build_loan_model_plan(db, plan_id)
+    data["edge"] = _edge_payload(edges[0]) if edges else None
+    data["edges"] = [_edge_payload(e) for e in edges]
+    try:
+        data["loan_model_plan"] = build_loan_model_plan(db, plan_id)
+    except PairingError:
+        data["loan_model_plan"] = None
     return data
 
 
@@ -576,16 +815,28 @@ def build_loan_model_plan(db: Session, plan_id: int) -> dict:
     plan = db.get(CapitalPairingPlan, plan_id)
     if plan is None:
         raise LookupError("拼盘不存在：%s" % plan_id)
-    edge = _edge_of(db, plan.id)
-    if edge is None:
+    edges = _edges_of(db, plan.id)
+    if not edges:
         raise PairingError("拼盘缺少借款方边，无法生成回测计划")
+    borrowers = []
+    for edge in edges:
+        strategy = db.get(Strategy, edge.borrower_id)
+        borrowers.append({
+            "portfolio_strategy_id": (
+                strategy.portfolio_id if strategy else plan.portfolio_strategy_id),
+            "strategy_id": edge.borrower_id,
+            "borrower_record_id": edge.borrower_record_id,
+            "max_share": (
+                str(edge.max_share) if edge.max_share is not None else None),
+        })
     return {
         "enabled": True,
         "lender_strategy_id": plan.lender_strategy_id,
-        "borrower_strategy_id": edge.borrower_id,
+        "borrower_strategy_id": edges[0].borrower_id,
         "principal": str(plan.principal) if plan.principal is not None else None,
         "due_days": plan.loan_term_days,
         "pairing_version": plan.pairing_version,
+        "borrowers": borrowers,
     }
 
 
@@ -597,10 +848,17 @@ def approve_plan(db: Session, plan_id: int,
         raise LookupError("拼盘不存在：%s" % plan_id)
     if plan.status not in (PLAN_DRAFT, PLAN_WATCH):
         raise PairingError("仅草稿/观察状态可批准，当前 %s" % plan.status)
-    latest = _latest_eval(db, plan.id)
-    if latest is None or latest.status != STATUS_GO:
-        raise PairingError(
-            "评估未通过（%s），不能批准" % (latest.status if latest else "无评估"))
+    edges = _edges_of(db, plan.id)
+    if not edges:
+        raise PairingError("拼盘缺少借款方边，不能批准")
+    # L3：每个借款方都必须有自己的最新 GO 评估，任一 NO_GO 即整盘不可批。
+    for edge in edges:
+        latest = _latest_eval_for(db, plan.id, edge.borrower_id)
+        if latest is None or latest.status != STATUS_GO:
+            raise PairingError(
+                "借款方 %s 评估未通过（%s），不能批准"
+                % (edge.borrower_id,
+                   latest.status if latest else "无评估"))
     if not plan.lender_record_id:
         raise PairingError("缺少资格回测记录，不能批准")
     plan.status = PLAN_APPROVED

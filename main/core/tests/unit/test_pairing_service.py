@@ -8,7 +8,8 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
 from core.models import (
-    Base, BacktestRecord, BacktestTrade, CapitalPairingPlan, Strategy,
+    Base, BacktestRecord, BacktestTrade, CapitalPairingPlan,
+    PortfolioStrategy, Strategy,
 )
 from core.services import pairing_service
 from core.services.backtest_service import (
@@ -91,7 +92,11 @@ def test_create_plan_and_detail():
     assert plan["loan_model_plan"] == {
         "enabled": True, "lender_strategy_id": master.id,
         "borrower_strategy_id": slave.id, "principal": "100000.00",
-        "due_days": 365, "pairing_version": plan["pairing_version"]}
+        "due_days": 365, "pairing_version": plan["pairing_version"],
+        "borrowers": [{
+            "portfolio_strategy_id": ps.id, "strategy_id": slave.id,
+            "borrower_record_id": rec.id, "max_share": "1.0000",
+        }]}
 
     listed = list_plans(db)
     assert len(listed) == 1 and listed[0]["id"] == plan["id"]
@@ -192,3 +197,107 @@ def test_loan_model_plan_rejects_missing_plan():
     db = _db()
     with pytest.raises(LookupError):
         build_loan_model_plan(db, 9999)
+
+
+# ---------------- 0021 E4：L3 跨组合 2–3 借款方 / 队列 TTL ----------------
+def _l3_case(db):
+    db, ps, rec, master, slave = _pair(db)
+    ps2 = PortfolioStrategy(
+        name="组合二", stock_pool_id=ps.stock_pool_id,
+        initial_capital=Decimal("1000000"), max_holdings=10,
+        max_drawdown=Decimal("0.2"), daily_loss_limit=Decimal("0.05"))
+    db.add(ps2)
+    db.flush()
+    s2 = Strategy(portfolio_id=ps2.id, name="借款二", formula_id=1,
+                  period="1d", role="slave")
+    s3 = Strategy(portfolio_id=ps2.id, name="借款三", formula_id=1,
+                  period="1d", role="slave")
+    db.add_all([s2, s3])
+    db.commit()
+    return db, ps, ps2, master, slave, s2, s3
+
+
+def _l3_payload(ps, master, pairs, **over):
+    data = {
+        "name": "L3 跨组合拼盘", "portfolio_strategy_id": ps.id,
+        "lender_strategy_id": master.id, "scope": "L3",
+        "borrowers": [
+            {"portfolio_strategy_id": pid, "strategy_id": sid,
+             "max_share": share}
+            for pid, sid, share in pairs
+        ],
+        "principal": 300000, "loan_term_days": 365,
+        "recall_notice_days": 2, "created_by": "tester",
+    }
+    data.update(over)
+    return data
+
+
+def test_l3_creates_three_borrower_edges_across_portfolios():
+    db, ps, ps2, master, slave, s2, s3 = _l3_case(_db())
+    plan = create_plan(db, _l3_payload(ps, master, [
+        (ps.id, slave.id, 1.0), (ps2.id, s2.id, 0.6), (ps2.id, s3.id, 0.45),
+    ]))
+
+    assert plan["scope"] == "L3"
+    assert plan["borrower_count"] == 3
+    assert len(plan["edges"]) == 3
+    shares = {e["borrower_id"]: e["max_share"] for e in plan["edges"]}
+    assert shares[slave.id] == "1.0000"
+    assert shares[s2.id] == "0.6000"
+    assert shares[s3.id] == "0.4500"
+    assert {b["portfolio_strategy_id"]
+            for b in plan["loan_model_plan"]["borrowers"]} == {ps.id, ps2.id}
+
+
+def test_l3_fourth_borrower_queues_with_ttl():
+    db, ps, ps2, master, slave, s2, s3 = _l3_case(_db())
+    s4 = Strategy(portfolio_id=ps2.id, name="借款四", formula_id=1,
+                  period="1d", role="slave")
+    db.add(s4)
+    db.commit()
+
+    queued = create_plan(db, _l3_payload(ps, master, [
+        (ps.id, slave.id, 1.0), (ps2.id, s2.id, 0.6),
+        (ps2.id, s3.id, 0.45), (ps2.id, s4.id, 1.0),
+    ]))
+
+    assert queued["status"] == "QUEUED"
+    assert queued["borrower_count"] == 0
+    assert queued["queue"]["policy"] == "queue"
+    assert queued["queue"]["requested"] == 4
+    assert queued["queue"]["position"] == 1
+    assert queued["queue"]["expires_at"] > queued["queue"]["enqueued_at"]
+
+
+def test_l3_fourth_borrower_rejected_when_policy_reject():
+    db, ps, ps2, master, slave, s2, s3 = _l3_case(_db())
+    s4 = Strategy(portfolio_id=ps2.id, name="借款四", formula_id=1,
+                  period="1d", role="slave")
+    db.add(s4)
+    db.commit()
+
+    with pytest.raises(PairingError, match="BORROWER_LIMIT_REACHED"):
+        create_plan(db, _l3_payload(ps, master, [
+            (ps.id, slave.id, 1.0), (ps2.id, s2.id, 0.6),
+            (ps2.id, s3.id, 0.45), (ps2.id, s4.id, 1.0),
+        ], queue_policy="reject"))
+
+
+def test_l3_queued_plan_expires_after_ttl():
+    db, ps, ps2, master, slave, s2, s3 = _l3_case(_db())
+    s4 = Strategy(portfolio_id=ps2.id, name="借款四", formula_id=1,
+                  period="1d", role="slave")
+    db.add(s4)
+    db.commit()
+    queued = create_plan(db, _l3_payload(ps, master, [
+        (ps.id, slave.id, 1.0), (ps2.id, s2.id, 0.6),
+        (ps2.id, s3.id, 0.45), (ps2.id, s4.id, 1.0),
+    ]))
+
+    far_future = datetime.now() + timedelta(days=60)
+    rows = list_plans(db, now=far_future)
+    row = next(p for p in rows if p["id"] == queued["id"])
+    assert row["status"] == "EXPIRED"
+    assert row["queue"] is None
+
