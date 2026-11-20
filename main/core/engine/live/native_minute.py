@@ -144,19 +144,33 @@ class MinuteSourceHealth:
         """按墙钟判定停滞；非交易时段（午休/收盘）不判。"""
         if not self._in_session(now) or self.in_fallback:
             return
-        ref = self.last_advanced_at or self._session_anchor(now)
+        ref = self._reference(now)
         if (now - ref).total_seconds() > self.stall_timeout_seconds:
             self._transition(True, now, "no_advance")
 
+    def _session_start(self, now: datetime) -> datetime:
+        """当前交易时段起点时刻（09:30 / 13:00）。"""
+        start = _AM_OPEN if now.time() < _AM_CLOSE else _PM_OPEN
+        return datetime.combine(now.date(), start)
+
     def _session_anchor(self, now: datetime) -> datetime:
         """本交易时段起点（09:30 / 13:00），但不早于会话启动时刻。"""
-        start = _AM_OPEN if now.time() < _AM_CLOSE else _PM_OPEN
-        anchor = datetime.combine(now.date(), start)
-        return max(anchor, self.started_at)
+        return max(self._session_start(now), self.started_at)
+
+    def _reference(self, now: datetime) -> datetime:
+        """停滞/滞后参考点：最后前进时刻；跨时段时以下一时段起点为下限。
+
+        上午最后一根标签（如 11:30）在午休后仍会被 13:00 首轮取回；若直接
+        拿它作参考，会把整段午休算成停滞并误报回落。此时改用下午开盘作
+        参考。同一时段内的判定不变（仍按标签时刻起算，可识别中途停写）。
+        """
+        ref = self.last_advanced_at or self._session_anchor(now)
+        if ref < self._session_start(now):
+            return self._session_anchor(now)
+        return ref
 
     def _lag_seconds(self, now: datetime) -> int:
-        ref = self.last_advanced_at or self._session_anchor(now)
-        return max(int((now - ref).total_seconds()), 0)
+        return max(int((now - self._reference(now)).total_seconds()), 0)
 
     # --- 状态 ---
 

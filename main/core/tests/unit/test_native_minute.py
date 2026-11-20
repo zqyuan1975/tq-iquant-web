@@ -155,3 +155,36 @@ def test_first_observation_stale_falls_back_immediately():
         in_session=lambda dt: True)
     health.observe([datetime(2026, 11, 20, 10, 30)])
     assert health.is_fallback() is True
+
+
+def test_cross_lunch_first_round_no_false_fallback():
+    """跨午休首轮：上午 11:30 标签不得把午休算成停滞；下午首根到达仍为原生。"""
+    now = [datetime(2026, 11, 20, 13, 0, 5)]
+    bars = {STOCK: [_bar((11, 29)), _bar((11, 30))]}
+
+    def fetch(codes, period, count):
+        return bars
+
+    fallback = _Fallback()
+    events = []
+    # 默认 in_session：午休 11:30–13:00 不判，13:00 起属下午交易时段
+    health = MinuteSourceHealth(stall_timeout_seconds=180, clock=lambda: now[0])
+    health.on_transition = events.append
+    d = NativeMinuteDispatcher(
+        health=health, fallback=fallback,
+        fetch_batch=fetch, clock=lambda: now[0])
+
+    out = d.query_quotes_batch([STOCK])
+    assert out[STOCK][-1]["stime"] == "20261120113000"
+    assert fallback.calls == []          # 不误报回落
+    assert events == []
+    assert health.status(now[0])["lag_seconds"] <= 5
+
+    # 下午首根闭合 bar 到达 → 仍为原生、滞后归零
+    bars[STOCK] = [_bar((11, 30)), _bar((13, 1))]
+    now[0] = datetime(2026, 11, 20, 13, 1, 20)
+    out = d.query_quotes_batch([STOCK])
+    assert out[STOCK][-1]["stime"] == "20261120130100"
+    assert health.is_fallback() is False
+    assert health.status(now[0])["mode"] == "native"
+    assert events == []
