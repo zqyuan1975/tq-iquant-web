@@ -294,12 +294,19 @@ class ManualActionError(RuntimeError):
 
 
 def _expected_minute_labels(start: Optional[datetime],
-                            end: Optional[datetime]) -> List[datetime]:
+                            end: Optional[datetime], *,
+                            has_1130_bar: bool = True) -> List[datetime]:
     """(start, end] 内属于 A 股连续竞价时段的 1m bar 标签（P2-6 缺口审计用）。
 
     bar 标签是分钟**终点**（09:31 表示 09:30–09:31 这根）：只统计
     09:30 < t ≤ 11:30 与 13:00 < t ≤ 15:00。跨日返回空（跨日缺口不做逐分钟
     期望，调用方按「跨日」语义记录起止即可）。上限 300 根防异常输入死循环。
+
+    ``has_1130_bar``：按数据源形态区分上午收尾根。QMT/掘金桥源上午确有
+    11:30 这根（09:31–11:30、13:01–15:00 各 120 根），保持 ``(9:30, 11:30]``，
+    缺 11:30 仍算真缺口；TDX 原生 `.lc1` 与快照合成源上午最后一根是 11:29
+    （全天 239 根），用 ``(9:30, 11:29]``，不把源里本就不存在的 11:30 计为
+    应有根。13:00 只是桶锚点、不是 bar 标签，下午首根为 13:01。
 
     P1-2（2026-11-12）：正在形成的分钟（其完成时刻 = 下一分钟整点）不能计入
     「应有分钟」，否则每轮审计必缺 1 根、`action` 恒为 `partial`。该保护由调用方
@@ -310,12 +317,13 @@ def _expected_minute_labels(start: Optional[datetime],
     """
     if start is None or end is None or start.date() != end.date():
         return []
+    am_close = (11, 30) if has_1130_bar else (11, 29)
     labels: List[datetime] = []
     t = start.replace(second=0, microsecond=0) + timedelta(minutes=1)
     stop = end.replace(second=0, microsecond=0)
     while t <= stop and len(labels) <= 300:
         hm = (t.hour, t.minute)
-        if (9, 30) < hm <= (11, 30) or (13, 0) < hm <= (15, 0):
+        if (9, 30) < hm <= am_close or (13, 0) < hm <= (15, 0):
             labels.append(t)
         t += timedelta(minutes=1)
     return labels
@@ -2351,7 +2359,11 @@ class LiveEngine:
         # 否则审计每轮必缺 1 根 → action 恒 partial）。
         plan = {"gap_start": gap_start,
                 "gap_end": (now - timedelta(seconds=1)).replace(
-                    second=0, microsecond=0)}
+                    second=0, microsecond=0),
+                # 桥源上午有 11:30 根；TDX 原生 .lc1 与快照源止于 11:29
+                # （见 _expected_minute_labels 的 has_1130_bar）
+                "has_1130_bar": bool(getattr(self._bar_poller,
+                                              "supports_backfill", False))}
         if not getattr(self._bar_poller, "supports_backfill", False):
             plan.update(action="unrecoverable", reason="snapshot_source")
             return plan
@@ -2383,7 +2395,8 @@ class LiveEngine:
             self._bar_poller.reset_baseline()
             if plan is not None:
                 expected = _expected_minute_labels(
-                    plan["gap_start"], plan["gap_end"])
+                    plan["gap_start"], plan["gap_end"],
+                    has_1130_bar=plan.get("has_1130_bar", True))
                 self._emit_gap_event(
                     plan, plan.get("action", "unrecoverable"),
                     expected=len(expected), replayed=0,
@@ -2407,7 +2420,9 @@ class LiveEngine:
         self._backfill_retry_reported = False
         if not plan:
             return
-        expected = _expected_minute_labels(plan["gap_start"], plan["gap_end"])
+        expected = _expected_minute_labels(
+            plan["gap_start"], plan["gap_end"],
+            has_1130_bar=plan.get("has_1130_bar", True))
         replayed_times = {b.bar_time for b in triggered}
         missing = [t for t in expected if t not in replayed_times]
         replayed = len(expected) - len(missing)

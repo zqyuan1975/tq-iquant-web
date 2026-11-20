@@ -141,6 +141,73 @@ def test_expected_minute_labels_skips_lunch_break():
     ]
 
 
+def test_expected_minute_labels_tdx_form_ends_at_1129():
+    """TDX 原生/快照源：上午最后一根是 11:29，11:30 不计为应有根。"""
+    labels = _expected_minute_labels(
+        datetime(2026, 8, 25, 11, 25), datetime(2026, 8, 25, 11, 29),
+        has_1130_bar=False)
+    assert [t.strftime("%H:%M") for t in labels] == [
+        "11:26", "11:27", "11:28", "11:29",
+    ]
+
+
+def test_expected_minute_labels_bridge_form_keeps_1130():
+    """QMT/掘金桥源：上午确有 11:30 这根，缺它仍是真缺口。"""
+    labels = _expected_minute_labels(
+        datetime(2026, 8, 25, 11, 25), datetime(2026, 8, 25, 11, 30),
+        has_1130_bar=True)
+    assert [t.strftime("%H:%M") for t in labels] == [
+        "11:26", "11:27", "11:28", "11:29", "11:30",
+    ]
+
+
+def _audit_stub(plan):
+    events = []
+    stub = LiveEngine.__new__(LiveEngine)
+    stub._gap_recovery_plan = plan
+    stub.ctx = SimpleNamespace(session_id=7)
+    stub._engine_key = "iquant"
+    stub._emit = lambda kind, payload: events.append((kind, payload))
+    return stub, events
+
+
+def test_audit_tdx_form_no_missing_at_1129_close():
+    """快照/原生源：补到 11:29 即完整，不报 11:30 缺失。"""
+    plan = {"gap_start": datetime(2026, 8, 25, 11, 20),
+            "gap_end": datetime(2026, 8, 25, 11, 29),
+            "reason": "snapshot_source", "has_1130_bar": False}
+    stub, events = _audit_stub(plan)
+    replayed = [SimpleNamespace(bar_time=datetime(2026, 8, 25, 11, 20)
+                                + timedelta(minutes=i))
+                for i in range(1, 10)]        # 11:21–11:29
+    LiveEngine._audit_gap_recovery(
+        stub, datetime(2026, 8, 25, 11, 29), replayed)
+
+    _, payload = events[-1]
+    assert payload["action"] == "replay"
+    assert payload["gap_bars"] == 9
+    assert payload["missing_bars"] == 0
+
+
+def test_audit_bridge_form_reports_missing_1130():
+    """桥源：同样只补到 11:29 → 11:30 缺失，action=partial。"""
+    plan = {"gap_start": datetime(2026, 8, 25, 11, 20),
+            "gap_end": datetime(2026, 8, 25, 11, 30),
+            "reason": "bridge_recovered", "has_1130_bar": True}
+    stub, events = _audit_stub(plan)
+    replayed = [SimpleNamespace(bar_time=datetime(2026, 8, 25, 11, 20)
+                                + timedelta(minutes=i))
+                for i in range(1, 10)]        # 11:21–11:29
+    LiveEngine._audit_gap_recovery(
+        stub, datetime(2026, 8, 25, 11, 30), replayed)
+
+    _, payload = events[-1]
+    assert payload["action"] == "partial"
+    assert payload["gap_bars"] == 10
+    assert payload["missing_bars"] == 1
+    assert payload["missing_first"] == "2026-08-25T11:30:00"
+
+
 def test_audit_partial_emits_missing_bounds():
     """补派只覆盖部分（桥 count 上限截断）→ action=partial + 缺口首末。"""
     events = []
