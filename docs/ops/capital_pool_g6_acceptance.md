@@ -15,11 +15,11 @@
 | #4 对照 | B7 黄金指纹 + #4 自适应滑点关闭逐位一致 | 通过（3/3） |
 | 默认路径回归（单组合） | 旧配置 vs 新字段存在但开关关闭：快照/成交/现金指纹一致 | 通过 |
 | 默认路径回归（多组合） | `capital_pool_plan` 未传 vs `enabled=false`：规范哈希一致 | 通过（3/3） |
-| 实盘影子对照 | 影子只记录计划 vs 实际、不触碰委托；理论 vs 实盘对照逻辑 | 测试通过；实盘进入采样期（`capital_shadow_enabled` 尚为 0，见 §6） |
+| 实盘影子对照 | 影子只记录计划 vs 实际、不触碰委托；理论 vs 实盘对照逻辑 | 测试通过；实盘影子已于 2026-11-20 收盘后开启（`capital_shadow_enabled=1`），自下一交易日起算采样（见 §6） |
 | 资金池相关回归组 | `-k "capital or theory_vs_live or shadow_mode"` | 214 passed |
 | 前端构建 | `cd web; npm run build` | 通过（773 modules，788 ms） |
 | 性能 | 开关全关默认路径 vs 借贷开启 | 见 §5 |
-| 生产库与开关状态 | `main/data/dev.db` | revision `h5b6c7d8e9f0`，quick_check ok，会话 1 running（13:24:42 重启后）、2/3 stopped，强制 0 / 出口 OFF |
+| 生产库与开关状态 | `main/data/dev.db` | revision `h5b6c7d8e9f0`，quick_check ok，会话 1 running（15:09:27 收盘后重启并启动，`capital_shadow_enabled=1`）、2/3 stopped，强制 0 / 出口 OFF |
 
 工程验收结论：G1–G6 的代码路径、回归基线与默认路径零变化均有可重复测试支撑；G6 判定 **DONE（工程验收）**。业务 KPI 按 §7 的新判据复核；实盘影子样本（§6）进入采样期，按「累计 ≥3 个交易日且样本量达可判水平」再判。
 
@@ -122,11 +122,11 @@ main\.venv\Scripts\python.exe -m pytest main/core/tests -q -p no:cacheprovider
 - [test_live_theory_vs_live.py](file:///d:/project/tq-iquant-web/main/core/tests/unit/test_live_theory_vs_live.py)：理论 vs 实盘曲线、指标、未绑定会话的兜底、自动绑定最新组合记录、成员缺失状态。
 - `test_live_shadow_mode.py`：影子执行模式不调用真实 `place_order/cancel_order`，不占用实盘会话名额。
 
-采样状态（自 2026-11-20 下午重启后进入采样期）：
+采样状态（2026-11-20 收盘后开启，自下一交易日起算）：
 
 - 判定口径：累计不少于 **3 个交易日**，且样本量达到可判水平后再判「计划 vs 实际偏差 < 5%、门控一致 100%」；不足 3 日不下结论。
-- 当前实际值（2026-11-20 13:2x 只读）：`live_capital_shadow` **0 行**、`capital_pairing_health_daily` 0 行；`live_sessions.capital_shadow_enabled` 为 **0**（13:24:42 用户启动会话时未开启）。因此**尚未开始写入**，采样计数从开关打开并重新启停会话后的下一个 bar 起算。
-- `no_pairing_plan`：按设计只在构建期写入一次 `warning_codes`（未绑定计划且开关开启时）；当前开关为 0，核心日志与 `live_decision_events` 均无该告警，符合预期。
+- 采样起点：13:33 以 `PUT /api/live/sessions/1 {"capital_shadow_enabled": true}` 写入待生效队列（运行中不重建引擎），15:09:26 会话 1 重新启动时应用——日志 `pending changes applied before start (session 1): 1`、`capital shadow enabled (session 1): 未绑定拼盘，只采实际侧`，库内 `live_sessions.capital_shadow_enabled=1`、队列行 `applied`。开启时点已在收盘后，当日无新 bar，`live_capital_shadow` 仍 **0 行**、`capital_pairing_health_daily` 0 行；**采样自 2026-11-23（下一交易日）首个盘中 bar 起算**。
+- `no_pairing_plan`：按设计只在构建期写入一次 `warning_codes`（未绑定计划且开关开启时），并随每行影子 payload 落到 `warnings`，不是逐 bar 的决策事件；本次启动日志仅 1 条，`live_decision_events` 无该告警，符合预期。
 - **F3 会话级影子开关（2026-11-20 已补）**：`live_sessions.capital_shadow_enabled`（迁移 `h5b6c7d8e9f0`，默认 0）。会话启动时据此决定是否构建影子；只逐 bar 追加 `live_capital_shadow`，不触订单/成交/决策事件，无下单入口。两条入口互不覆盖：
   - 已绑定 `pairing_plan_id` / `backtest_run_group_id`：始终走计划侧原路径（lender/borrowers、借据与 live_haircut），本开关不改变行为；
   - 未绑定 + 开关开启：以会话组合的策略成员构建「无计划侧」影子（`loan_plan=None`，本金/可用本金/缺口留空，并显式写 `no_pairing_plan` 告警，避免误读为「计划=实际」）。
@@ -169,8 +169,23 @@ main\.venv\Scripts\python.exe -m pytest main/core/tests -q -p no:cacheprovider
 | 影子 | `capital_shadow_enabled=0`；`live_capital_shadow` 0 行；`no_pairing_plan` 无日志/无决策事件 |
 | 今日委托 / 成交 | 0 / 0 |
 | 持仓 | 4 只（快照 13:29:51：total_asset 250,639.35、available_cash 55,018.35、market_value 195,646） |
-| 今日日终行 | `live_portfolio_daily` 组合 1：cash 55,002.51、market_value 195,650、total_value 250,652.51、position_count 4（13:25 backfill 值；14:30 估值会覆盖） |
+| 今日日终行 | `live_portfolio_daily` 组合 1：cash 55,002.51、market_value 195,650、total_value 250,652.51、position_count 4（13:25 backfill 值）；14:30 估值 249,759.51，15:09 重启启动后按收盘价重估为 **248,456.51**（见 §6.3） |
 | 三项开关 | `capital_enforce_enabled=0`、`cash_outlet_mode=OFF`、`sell_scope=platform_only`（全局） |
+| `alembic_version` | `h5b6c7d8e9f0` |
+
+### 6.3 收盘后重启并启动会话 1 的只读核对（2026-11-20 15:09–15:11）
+
+| 项 | 值 |
+|---|---|
+| 后端 | 15:09:03 重启（pid 26612）；`/api/health` ok、端口 8001、version 1.0.6；日志 `init_db：数据库已在 head（h5b6c7d8e9f0）` |
+| 会话 1 | `running` / `auto`，started_at `2026-11-20T15:09:27.544552`，`bridge_online=true`；启动告警仅「数据体检 30/251（预算内未阻塞）」 |
+| 待生效队列 | `live_session_pending_changes` id=1 `capital_shadow_enabled` true → `applied`（15:09:26），启动前应用 |
+| 影子开关 / 台账 | `capital_shadow_enabled=1`；`live_capital_shadow` **0 行**（收盘后无 bar，自 2026-11-23 起算）；`no_pairing_plan` 仅构建期 1 条 |
+| `minute_source` | `enabled=true`、`mode=native`、`last_advance_at=null`（收盘后无新 bar）、`lag_seconds=39`、`stalled=false` |
+| 今日委托 / 成交 | 委托 **1** 笔 / 成交 **0** 笔：id=14 `600211.SH` 卖 1300 @37.94（`trailing_stop`，15:06:36 由 15:05 日线 bar 生成）状态 `deferred`，次日首 bar 提交 |
+| 今日日终行（定稿） | `live_portfolio_daily` id=8 组合 1：cash 55,002.51、market_value 193,454、total_value **248,456.51**、position_count 4（15:09:27 启动时按收盘价重估） |
+| 账户快照 | 15:11:00 total_asset 248,472.35、available_cash 55,018.35、market_value 193,454；15:10:13 / 15:10:31 两次 `database is locked`（自动备份 + 增量回测争用），15:10:49 起恢复 |
+| 三项开关 | `capital_enforce_enabled=0`、`cash_outlet_mode=OFF`、`sell_scope=platform_only`（全局，会话列仍 NULL） |
 | `alembic_version` | `h5b6c7d8e9f0` |
 
 ## 7. 未覆盖项与需拍板事项
@@ -180,7 +195,7 @@ main\.venv\Scripts\python.exe -m pytest main/core/tests -q -p no:cacheprovider
    - **回撤 ≤ 8%**：池化 5.65%、池内 PS3 6.26% → 通过；
    - **利用率不劣化**：同窗口（2021-01-04→2026-11-19，1424 个交易日，成员期初各 200 万）实测 PS3 单组合（记录 31）10.78%、PS2 单组合（记录 03）20.11%；按当日净值加权基准（等价 Σ市值/Σ净值）= **11.32%**，按期初资金等权 = **15.44%**；同期池化 = **11.36%** → 相对净值加权 **+0.04pp（不劣化，正式口径）**，相对期初等权 −4.08pp（PS2 独立独占 200 万、池内共享后被摊薄，属口径差异）→ 通过。
    - 参考区间仍偏低（池化全期 16.73%，因策略不打满现金：期末池内现金占比 96.3%）；是否调整 PS3 参数以进入参考区间，待拍板。
-2. **F3 影子偏差（采样中）**：`capital_shadow_enabled` 已补（见 §6）；2026-11-20 13:24 重启后会话 1 由用户启动，但开关仍为 **0**、`live_capital_shadow` **0 行**、无 `no_pairing_plan` 告警。开启需 `PUT` 后重新启停会话；判定口径为累计 **≥3 个交易日**且样本量达可判水平后再判「偏差 <5%、门控一致 100%」。
+2. **F3 影子偏差（采样中）**：`capital_shadow_enabled` 已开启（见 §6）：13:33 `PUT` 入待生效队列，15:09:26 会话 1 重启启动时应用，库内为 **1**；因收盘后无新 bar，`live_capital_shadow` 仍 **0 行**，`no_pairing_plan` 仅构建期 1 条。**采样起点为 2026-11-20 收盘后开启、自 2026-11-23 起算**；判定口径为累计 **≥3 个交易日**且样本量达可判水平后再判「偏差 <5%、门控一致 100%」。
 3. **召回次数 ≤ 12 次/年、shortfall ≤ 2%/年**：需要实盘或长周期回测样本，当前无数据源。
 4. **恒等式 (1)(3)(9)**：运行时因「持久化虚拟现金账本 / 当日开盘现金 / 会话级策略预算」数据源缺失记 `skipped`（G2 已记录），模块层有用例覆盖；按手册口径，`skipped` 不等于账平。
 5. **迁移回退**：本阶段未在生产库执行 `downgrade`（G4/G5 已在临时副本演练）；生产库已随启动自动迁移到 `h5b6c7d8e9f0`（见 §8），不再需要在下次重启时额外 upgrade。需要回退时按 G5 手册 §4.2 的三条路径执行（回退目标 `g4a5b6c7d8e9`）。
@@ -191,7 +206,7 @@ main\.venv\Scripts\python.exe -m pytest main/core/tests -q -p no:cacheprovider
 |---|---|
 | `alembic_version` | `h5b6c7d8e9f0`（2026-11-20 12:35 由集成测试的 TestClient lifespan 自动迁移落库，非人工 upgrade；已补 `TQ_INIT_DB_DISABLED` 闸，见提交 be13969） |
 | `PRAGMA quick_check` | `ok` |
-| `live_sessions` | 01 `running`（`auto` / tdx，13:24:42 用户重启后启动）、02 / 03 `stopped`；三会话均 `capital_enforce_enabled=0`、`cash_outlet_mode=OFF`、`capital_shadow_enabled=0` |
+| `live_sessions` | 01 `running`（`auto` / tdx，15:09:27 收盘后重启并启动，`capital_shadow_enabled=1`）、02 / 03 `stopped`；三会话均 `capital_enforce_enabled=0`、`cash_outlet_mode=OFF` |
 | `capital_pairing_plans` / `capital_pairings` | 0 / 0 行（F3 绑定入口无来源，改走会话级开关） |
 | `backtest_records` / `backtest_run_groups` | 30 条 / 1 组（新增 id=31 单组合、id=32/33 + run_group 1 池化注入；既有 28 条未动） |
 | `cash_outlet_ops` | 0 行 |
