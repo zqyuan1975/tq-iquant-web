@@ -70,6 +70,8 @@ def _engine(cfg, enabled, ports):
         _capital_enforce=cfg,
         _capital_enforce_enabled=enabled,
         _capital_enforce_checked_at=0.0,
+        _capital_reconcile_at=0.0,
+        _capital_reconcile_block="",
         _reserved_buy_cash=lambda pid: Decimal("0"),
         _latest_account_cash=None,
         _account_total_capital=None,

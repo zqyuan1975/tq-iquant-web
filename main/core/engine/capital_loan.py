@@ -189,6 +189,9 @@ class LoanBook:
         self._credit: Dict[Owner, Decimal] = {}
         self._frozen: Dict[Owner, str] = {}
         self._deposited = Decimal(0)
+        # 分 owner 的累计存入（只增不减）：G2 恒等式 (5) 判断单一贷出方是否
+        # 超发；与全局 _deposited 并行，不影响既有借还逻辑。
+        self._deposited_by: Dict[Owner, Decimal] = {}
         self._withdrawn = Decimal(0)
         self._seq = 0
 
@@ -197,7 +200,12 @@ class LoanBook:
         amt = _check_positive(amount)
         self._lendable[owner] = self._lendable.get(owner, Decimal(0)) + amt
         self._deposited += amt
+        self._deposited_by[owner] = self._deposited_by.get(owner, Decimal(0)) + amt
         return self._lendable[owner]
+
+    def deposited_for(self, owner: Owner) -> Decimal:
+        """该 owner 历史累计存入的可借额度（只增不减，G2 恒等式 (5) 用）。"""
+        return self._deposited_by.get(owner, Decimal(0))
 
     def withdraw_lendable(self, owner: Owner, amount: Any) -> Decimal:
         amt = _check_positive(amount)

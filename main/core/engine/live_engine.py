@@ -129,6 +129,7 @@ from .market_rules import session_allows_bar, tick_size
 from .decision import DecisionRecorder
 from .capital_shadow import build_shadow_payload
 from .capital_enforce import portfolio_delta, release_all
+from .capital_reconcile import reconcile as reconcile_capital
 from .regime import CausalRegimeTracker
 from ..config import load_config
 from ..services.notify_service import notify
@@ -844,6 +845,9 @@ class LiveEngine:
         self._capital_enforce_enabled = bool(
             capital_enforce_enabled and self._capital_enforce)
         self._capital_enforce_checked_at = 0.0
+        # G2 对账：只读恒等式，30s 节流；(2)(3)(4)(6) 失败 → 停止新增买入。
+        self._capital_reconcile_at = 0.0
+        self._capital_reconcile_block = ""
         # B2 主备通道：主通道心跳失败时逐日写一条建议切换事件（不自动热切换；
         # 运行中切换必须经 stop/start 重建 dispatcher，由人工确认后走待生效队列）。
         self.backup_engine = backup_engine or None
@@ -7429,6 +7433,7 @@ class LiveEngine:
         self._capital_enforce_enabled = target
         if not target:
             released = release_all(self._capital_enforce, self.ctx.clock())
+            self._capital_reconcile_block = ""
             if released:
                 self._emit("risk", {
                     "gate": "capital_enforce",
@@ -7455,6 +7460,100 @@ class LiveEngine:
         if not self._capital_enforce_enabled or self._capital_enforce is None:
             return Decimal("0")
         return portfolio_delta(self._capital_enforce, portfolio_id)
+
+    def _capital_reconcile_inputs(self) -> dict:
+        """G2：把内存态整理成对账入参（只读，不改账）。"""
+        ports: list = []
+        for p in self.portfolios:
+            positions: dict = {}
+            for ctx in (getattr(p, "strategies", None) or []):
+                for code, pos in (getattr(ctx, "positions", None) or {}).items():
+                    positions[code] = (positions.get(code, Decimal("0"))
+                                       + getattr(pos, "market_value",
+                                                 Decimal("0")))
+            try:
+                total_value = p.current_value()
+            except Exception:  # noqa: BLE001 — 无持仓快照时退回现金
+                total_value = p.account.cash
+            floor = Decimal("0")
+            pct = getattr(p, "min_cash_reserve_pct", None)
+            if pct:
+                floor = (total_value * Decimal(str(pct))).quantize(
+                    Decimal("0.01"))
+            ports.append({
+                "portfolio_id": p.portfolio_id,
+                "cash": p.account.cash,
+                "total_value": total_value,
+                "positions": positions,
+                "cash_floor": floor,
+                "reserved_buy": self._reserved_buy_cash(p.portfolio_id),
+            })
+        real_available = self._latest_account_cash or self._account_total_capital
+        real_quotas = None
+        if real_available is not None:
+            base = (Decimal(str(real_available)) * Decimal("0.98")).quantize(
+                Decimal("0.01"))
+            real_quotas = {
+                p.portfolio_id: (base * self._capital_share(p)).quantize(
+                    Decimal("0.01"))
+                for p in self.portfolios
+            }
+        limits = [
+            getattr(p, "max_single_position_pct", None)
+            for p in self.portfolios
+        ]
+        limits = [x for x in limits if x is not None and x > 0]
+        return {
+            "portfolios": ports,
+            "loan_book": (self._capital_enforce or {}).get("book"),
+            "real_available": real_available,
+            "real_quotas": real_quotas,
+            "concentration_limit": max(limits) if limits else None,
+        }
+
+    def _maybe_reconcile_capital(self, bar) -> None:
+        """G2：强开时 30s 节流跑 0019 恒等式；阻断类失败 → 停止新增买入。
+
+        失败只影响买入额度，不撤单、不强平；恢复通过自动消除（下一轮对账）。
+        开关关闭时完全不执行（零开销、零行为变化）。
+        """
+        if not self._capital_enforce_enabled or self._capital_enforce is None:
+            return
+        now = time.monotonic()
+        if now - self._capital_reconcile_at < 30:
+            return
+        self._capital_reconcile_at = now
+        try:
+            report = reconcile_capital(**self._capital_reconcile_inputs())
+        except Exception:  # noqa: BLE001 — 对账异常不阻断交易，保持旧态
+            logger.warning("capital reconcile failed (session %s)",
+                           self.session_id, exc_info=True)
+            return
+        block = ",".join(str(i) for i in report["blocking"])
+        if block == self._capital_reconcile_block:
+            return
+        self._capital_reconcile_block = block
+        if block:
+            names = [it["name"] for it in report["items"]
+                     if it["id"] in report["blocking"]]
+            self._emit("risk", {
+                "gate": "capital_reconcile",
+                "rule": "identity_block",
+                "action": "block",
+                "session_id": self.session_id,
+                "final_qty": None,
+                "message": ("资金对账失败（%s）：%s；停止新增买入"
+                            % (block, "、".join(names))),
+            })
+        else:
+            self._emit("risk", {
+                "gate": "capital_reconcile",
+                "rule": "identity_block",
+                "action": "resume",
+                "session_id": self.session_id,
+                "final_qty": None,
+                "message": "资金对账通过，恢复新增买入",
+            })
 
     def emergency_liquidate_all(self, reason: Optional[str] = None) -> dict:
         """M2 一键全平：逐组合逐持仓生成 SELL CLOSE，走既有提交闸门链。
@@ -8608,6 +8707,8 @@ class LiveEngine:
             self._drain_decisions(db, portfolio)
             # F3 影子（默认关）：只追加 live_capital_shadow，失败不影响交易。
             self._maybe_record_capital_shadow(db, portfolio, bar)
+            # G2（2026-11-20）：资金对账（仅强开时，30s 节流）；阻断类失败停新增买入。
+            self._maybe_reconcile_capital(bar)
         except Exception:
             db.rollback()
             # P3（2026-11-09）：放行即从 _signal_bar_deferred 摘除，若提交链抛异常，
@@ -9884,7 +9985,12 @@ class LiveEngine:
 
         G1（默认关）：绑定拼盘且会话开关打开时，再叠加借据净额（借入 + /
         贷出 −）；借据按未归还余额实时计算，kill switch 释放后立即归零。
+
+        G2（默认关）：强开状态下对账失败（(2)(3)(4)(6)）期间返回 0，停止新增
+        买入；不撤单、不强平，下一轮对账通过后自动恢复。
         """
+        if self._capital_enforce_enabled and self._capital_reconcile_block:
+            return Decimal("0")
         avail = (portfolio.account.cash
                  - self._reserved_buy_cash(portfolio.portfolio_id)
                  # G1：拼盘借据净额（借入 + / 贷出 −）；强制关闭时为 0
