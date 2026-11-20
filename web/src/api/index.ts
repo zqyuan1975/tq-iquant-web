@@ -2282,6 +2282,50 @@ export interface LiveSessionItem {
   sell_scope?: 'full' | 'platform_only'
   sell_scope_source?: 'session' | 'global'
   sell_scope_global?: 'full' | 'platform_only'
+  // F1 拼盘/运行组绑定：与 backtest_record_id 三选一（至多一个非空）
+  backtest_run_group_id?: number | null
+  pairing_plan_id?: number | null
+  // F2 只读继承报告（未绑定 enabled=false；不参与交易）
+  capital_inheritance?: CapitalInheritanceReport | null
+}
+
+// F2 实盘继承矩阵（计划 → 会话；只读）
+export interface CapitalInheritanceItem {
+  side: string
+  field: string
+  mode: 'inherit' | 'confirm' | 'haircut'
+  plan: unknown
+  live: unknown
+  status: 'match' | 'drift' | 'missing' | 'confirm'
+}
+
+export interface CapitalInheritanceReport {
+  enabled: boolean
+  found?: boolean
+  reason?: string
+  version?: string
+  source?: 'pairing_plan' | 'backtest_run_group'
+  plan_id?: number | null
+  plan_status?: string | null
+  run_group_id?: number | null
+  pairing_version?: string | null
+  matrix?: { key: string; mode: string; note: string }[]
+  items?: CapitalInheritanceItem[]
+  drift_fields?: string[]
+  drift_count?: number
+  haircut?: {
+    version: string
+    composite: number
+    factors: {
+      key: string
+      factor: number
+      default: number
+      overridden: boolean
+      reason: string
+    }[]
+    warnings: { code: string; key?: string }[]
+  }
+  warnings?: { code: string; message?: string; side?: string; field?: string }[]
 }
 
 // H2 拆单剩余量（停会话时未提交的子单快照）
@@ -2355,6 +2399,9 @@ export interface LiveSessionCreate {
   pre_open_auction_enabled?: boolean | null
   pre_open_auction_end_time?: string | null
   pre_open_auction_price_bias_pct?: number | null
+  // F1 拼盘/运行组绑定（三选一；空=不绑定）
+  backtest_run_group_id?: number | null
+  pairing_plan_id?: number | null
 }
 
 /** 真实总资产预览（GET /live/account-preview）：只读；通道未就绪时后端 503。 */
@@ -2472,12 +2519,54 @@ export interface TheoryVsLiveSlippagePair {
   deviation_bps: number
 }
 
+export interface PairingMemberCompare {
+  strategy_id: number
+  strategy_name: string | null
+  role: 'lender' | 'borrower' | null
+  portfolio_strategy_id: number | null
+  theory: {
+    record_id: number | null
+    record_name: string | null
+    status: 'ok' | 'empty' | 'insufficient' | 'record_missing'
+    curve: TheoryVsLiveCurvePoint[]
+    metrics: Record<string, number | null>
+  }
+  live: {
+    status: 'ok' | 'missing' | 'insufficient'
+    curve: TheoryVsLiveCurvePoint[]
+    metrics: Record<string, number | null>
+  }
+  deviation: null | {
+    common_days: number
+    window_start: string
+    window_end: string
+    return_gap: number | null
+    max_drawdown_gap: number | null
+  }
+  warnings: { code: string; message?: string }[]
+}
+
+// F4 拼盘会话按成员对比
+export interface PairingTheoryVsLive {
+  bound: boolean
+  found: boolean
+  source: 'pairing_plan' | 'backtest_run_group'
+  plan_id: number | null
+  plan_name?: string | null
+  plan_status?: string | null
+  run_group_id?: number | null
+  members: PairingMemberCompare[]
+  theory_series_status: string
+  warnings: { code: string; message?: string }[]
+}
+
 export interface TheoryVsLiveResult {
   bound: boolean
   backtest_record_id: number | null
   backtest_name: string | null
-  // manual=会话显式绑定；auto=按会话组合自动关联最近一次已完成回测
-  binding_source: 'manual' | 'auto' | null
+  // manual=会话显式绑定；auto=按会话组合自动关联最近一次已完成回测；
+  // F4 起拼盘会话为 pairing_plan / backtest_run_group
+  binding_source: 'manual' | 'auto' | 'pairing_plan' | 'backtest_run_group' | null
   binding_note: string | null
   live_series_status: 'missing' | 'ok'
   theory_series_status: 'no_binding' | 'record_missing' | 'empty' | 'insufficient' | 'ok'
@@ -2495,6 +2584,8 @@ export interface TheoryVsLiveResult {
     }
   }
   warnings: string[]
+  // F4：绑定拼盘/运行组时的成员对照；非拼盘会话为 null/缺省
+  pairing?: PairingTheoryVsLive | null
 }
 
 export async function getTheoryVsLive(

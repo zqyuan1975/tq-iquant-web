@@ -4686,6 +4686,10 @@ watch(theme, () => {
                       <td style="white-space:nowrap">
                         <button class="btn btn-sm" :disabled="pairingBusy" @click="evaluatePairing(p)">重新评估</button>
                         <button class="btn btn-sm" :disabled="pairingBusy || p.status !== 'DRAFT'" @click="approvePairing(p)">批准</button>
+                        <!-- F5：部署到实盘会话属于阶段 G，先禁用占位，避免误触强制借贷 -->
+                        <button class="btn btn-sm" disabled
+                                title="阶段 G 才开放：实盘强制借贷与资金池执行"
+                                data-test="pairing-deploy-disabled">部署实盘（阶段 G）</button>
                         <button class="btn btn-sm" :disabled="pairingBusy" @click="applyPairingToBacktest(p)">带入回测</button>
                         <button class="btn btn-sm" :disabled="pairingBusy || p.status !== 'DRAFT'" @click="removePairing(p)">删除</button>
                       </td>
@@ -5042,7 +5046,7 @@ watch(theme, () => {
             </td>
             <td>
               <button class="btn btn-sm" disabled
-                      title="C 阶段只读：未接实盘，不能下单或划转">执行（未开放）</button>
+                      title="阶段 G 才开放：现金出口执行需人工/半自动/自动三档与对账">执行（阶段 G）</button>
             </td>
           </tr>
         </tbody>

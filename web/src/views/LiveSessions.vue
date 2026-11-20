@@ -35,8 +35,9 @@ import {
   recoverLiveBreaker, getLiveChannel, testLiveChannel, sendUserBlock, getFormulas, getWatchdogStatus,
   getLiveAccountPreview, resetLiveBaseline,
   getLiveParamsDrift, getLiveCashFlows, createLiveCashFlow,
-  getTheoryVsLive, getBacktestRecords,
-  type TheoryVsLiveResult, type BacktestRecordItem,
+  getTheoryVsLive, getBacktestRecords, listPairingPlans,
+  type TheoryVsLiveResult, type BacktestRecordItem, type PairingPlanSummary,
+  type CapitalInheritanceReport,
   type PortfolioItem, type LiveSessionItem,
   type LiveChannelInfo, type LiveChannelEngine, type LiveEngineKey, type LiveExecutionMode, type LiveSignalItem,
   type FormulaItem, type WatchdogAlarm, type ParamsDrift, type LiveCashFlowList, type LiveCashFlowType,
@@ -53,6 +54,22 @@ const channelTesting = ref(false)
 const channelTestMsg = ref<{ ok: boolean; text: string } | null>(null)
 const portfolios = ref<PortfolioItem[]>([])  // 全量组合策略,供新建实盘多选 + 会话列表解析名称
 const formulas = ref<FormulaItem[]>([])  // 公式列表（formula_id → name 映射，用于组合策略标注公式名）
+// F5 拼盘会话：仅展示已批准（APPROVED）的拼盘，供新建/编辑绑定
+const pairingPlans = ref<PairingPlanSummary[]>([])
+const pairingPlansLoading = ref(false)
+async function loadPairingPlans(force = false) {
+  if (pairingPlansLoading.value) return
+  if (!force && pairingPlans.value.length > 0) return
+  pairingPlansLoading.value = true
+  try {
+    const data = await listPairingPlans({ status: 'APPROVED' })
+    pairingPlans.value = Array.isArray(data) ? data : []
+  } catch {
+    pairingPlans.value = []
+  } finally {
+    pairingPlansLoading.value = false
+  }
+}
 const showCreate = ref(false)
 // M2 实盘配置指南弹窗
 const showGuide = ref(false)
@@ -99,6 +116,8 @@ const form = ref({
   pre_open_auction_enabled: null as boolean | null,
   pre_open_auction_end_time: '' as string,
   pre_open_auction_price_bias_pct: null as number | string | null,
+  // F1/F5：绑定已批准拼盘（三选一；空=不绑定，走普通实盘）
+  pairing_plan_id: null as number | null,
 })
 
 /** live_capital 归一化：空串/未填 → null（以真实总资产为基准），否则转数值透传。 */
@@ -1028,6 +1047,8 @@ const showTvl = ref(false)
 const tvlLoading = ref(false)
 const tvlError = ref('')
 const theoryVsLive = ref<TheoryVsLiveResult | null>(null)
+// F5 影子健康（只读）：继承矩阵漂移 + live_haircut，不提供任何写操作
+const tvlInheritance = ref<CapitalInheritanceReport | null>(null)
 // 面板内绑定：auto=按会话组合自动关联；数字字符串=显式绑定记录 id
 const tvlRecords = ref<BacktestRecordItem[]>([])
 const tvlRecordsLoading = ref(false)
@@ -1079,9 +1100,14 @@ async function openTheoryVsLive() {
   tvlError.value = ''
   tvlBindingMsg.value = ''
   theoryVsLive.value = null
+  tvlInheritance.value = null
   await loadTvlRecords()
   try {
     theoryVsLive.value = await getTheoryVsLive(sid)
+    // F5：拼盘会话顺带取只读继承/影子健康；失败不阻断对照主视图
+    getLiveSession(sid).then((d) => {
+      tvlInheritance.value = (d as LiveSessionItem).capital_inheritance ?? null
+    }).catch(() => { tvlInheritance.value = null })
     // 显式绑定才回填下拉；自动关联保持 auto，切回自动即清除绑定
     tvlBindingValue.value = (
       theoryVsLive.value.binding_source === 'manual' && theoryVsLive.value.backtest_record_id
@@ -1243,9 +1269,10 @@ function openCreate() {
   const engine = (!occ[preferred]
     ? preferred
     : (engines.find((e) => e.configured && !occ[e.key])?.key as LiveEngineKey | undefined)) || preferred
-  form.value = { name: '', mode: 'simulation', engine, execution_mode: 'alert', capital_pool_mode: 'off', capital_pool_rebalance_enabled: false, portfolio_ids: [], live_capital: null, signal_file_path: '', advance_close_enabled: false, advance_close_time: '14:51', intraday_mismatched_risk_enabled: null, gate_recheck_on_execute: false, pre_open_auction_enabled: null, pre_open_auction_end_time: '', pre_open_auction_price_bias_pct: null }
+  form.value = { name: '', mode: 'simulation', engine, execution_mode: 'alert', capital_pool_mode: 'off', capital_pool_rebalance_enabled: false, portfolio_ids: [], live_capital: null, signal_file_path: '', advance_close_enabled: false, advance_close_time: '14:51', intraday_mismatched_risk_enabled: null, gate_recheck_on_execute: false, pre_open_auction_enabled: null, pre_open_auction_end_time: '', pre_open_auction_price_bias_pct: null, pairing_plan_id: null }
   createError.value = ''
   showCreate.value = true
+  void loadPairingPlans()
   loadAccountPreview(engine)
 }
 
@@ -1280,7 +1307,7 @@ async function create() {
     // A1 软校验：目标引擎已被其它会话占用等提示（不阻断创建，但必须让用户看见）
     createWarnings.value = Array.isArray(res?.warnings) ? res.warnings : []
     showCreate.value = false
-    form.value = { name: '', mode: 'simulation', engine: defaultEngineKey(), execution_mode: 'alert', capital_pool_mode: 'off', capital_pool_rebalance_enabled: false, portfolio_ids: [], live_capital: null, signal_file_path: '', advance_close_enabled: false, advance_close_time: '14:51', intraday_mismatched_risk_enabled: null, gate_recheck_on_execute: false, pre_open_auction_enabled: null, pre_open_auction_end_time: '', pre_open_auction_price_bias_pct: null }
+    form.value = { name: '', mode: 'simulation', engine: defaultEngineKey(), execution_mode: 'alert', capital_pool_mode: 'off', capital_pool_rebalance_enabled: false, portfolio_ids: [], live_capital: null, signal_file_path: '', advance_close_enabled: false, advance_close_time: '14:51', intraday_mismatched_risk_enabled: null, gate_recheck_on_execute: false, pre_open_auction_enabled: null, pre_open_auction_end_time: '', pre_open_auction_price_bias_pct: null, pairing_plan_id: null }
     load()
   } catch (e: any) {
     // 后端参数校验失败（名称空/资金≤0 等）返回 code!==0 → 拦截器 reject，
@@ -1648,6 +1675,8 @@ const editForm = ref({
   pre_open_auction_end_time: '',
   pre_open_auction_price_bias_pct: null as number | string | null,
   portfolio_ids: [] as number[],
+  // F1/F5：拼盘绑定（与回测记录三选一；空=不绑定）
+  pairing_plan_id: null as number | null,
 })
 const editHealth = ref<LiveSessionChannelHealth | null>(null)
 const editSwitching = ref(false)
@@ -1678,8 +1707,10 @@ function openEdit(s: LiveSessionItem) {
     pre_open_auction_end_time: s.pre_open_auction_end_time || '',
     pre_open_auction_price_bias_pct: s.pre_open_auction_price_bias_pct ?? null,
     portfolio_ids: [...(s.portfolio_ids || [])],
+    pairing_plan_id: s.pairing_plan_id ?? null,
   }
   loadEditHealth(s.id)
+  void loadPairingPlans()
 }
 async function switchToBackup() {
   if (!editModal.value || !editForm.value.backup_engine) return
@@ -1720,6 +1751,10 @@ async function submitEdit() {
         editForm.value.pre_open_auction_price_bias_pct === null
           ? null : Number(editForm.value.pre_open_auction_price_bias_pct)),
       portfolio_ids: editForm.value.portfolio_ids,
+      // F5：绑定拼盘时同时清空单记录绑定，避免三选一冲突被后端 400
+      pairing_plan_id: editForm.value.pairing_plan_id,
+      ...(editForm.value.pairing_plan_id
+        ? { backtest_record_id: null, backtest_run_group_id: null } : {}),
     })
     editResult.value = { effective_at: res.effective_at, message: res.message }
     load()
@@ -2657,6 +2692,75 @@ onUnmounted(() => {
         <div v-if="tvlLoading"><p>加载中…</p></div>
         <div v-else-if="tvlError" style="color:var(--red)">{{ tvlError }}</div>
         <template v-else-if="theoryVsLive">
+          <!-- F5：拼盘/运行组会话按成员对照（只读）；单记录绑定区不适用 -->
+          <template v-if="theoryVsLive.pairing?.bound">
+            <div class="baseline-preview" data-test="pairing-compare">
+              <div>
+                拼盘对照：
+                {{ theoryVsLive.pairing.source === 'pairing_plan' ? '拼盘' : '运行组' }}
+                #{{ theoryVsLive.pairing.plan_id }} {{ theoryVsLive.pairing.plan_name || '' }}
+                <span class="badge badge-gray">{{ theoryVsLive.pairing.plan_status || '—' }}</span>
+                <span v-if="theoryVsLive.pairing.run_group_id" class="label-note">
+                  运行组 #{{ theoryVsLive.pairing.run_group_id }}
+                </span>
+              </div>
+              <div v-if="!theoryVsLive.pairing.found" class="note" style="color:var(--red)">
+                绑定的拼盘已缺失：理论侧无法生成，实盘侧仍按会话展示。
+              </div>
+            </div>
+            <div v-if="tvlInheritance?.enabled" class="baseline-preview" data-test="shadow-health">
+              <div>
+                影子健康（只读）：
+                <span class="badge" :class="tvlInheritance.drift_count ? 'badge-orange' : 'badge-green'">
+                  漂移 {{ tvlInheritance.drift_count ?? 0 }} 项
+                </span>
+                <span v-if="tvlInheritance.haircut">
+                  合成折扣 {{ tvlInheritance.haircut.composite }}
+                </span>
+                <span v-if="tvlInheritance.found === false" class="badge badge-red">拼盘缺失</span>
+              </div>
+              <div v-if="tvlInheritance.drift_fields?.length" class="note" style="color:var(--orange)">
+                漂移字段：{{ tvlInheritance.drift_fields.join('、') }}
+              </div>
+              <div v-for="(w, i) in tvlInheritance.warnings || []" :key="i" class="note" style="color:var(--orange)">
+                {{ w.message || w.code }}<span v-if="w.field">（{{ w.field }}）</span>
+              </div>
+            </div>
+            <div class="table-container" data-test="pairing-members">
+              <table>
+                <thead>
+                  <tr><th>成员</th><th>理论</th><th>实盘</th><th>同日收益差</th><th>同日回撤差</th><th>提示</th></tr>
+                </thead>
+                <tbody>
+                  <tr v-for="m in theoryVsLive.pairing.members" :key="m.strategy_id">
+                    <td>
+                      {{ m.role === 'lender' ? '出借方' : '借款方' }}
+                      #{{ m.strategy_id }} {{ m.strategy_name || '' }}
+                    </td>
+                    <td>
+                      <span v-if="m.theory.record_id">#{{ m.theory.record_id }}</span>
+                      <span v-else>—</span>
+                      <span class="label-note">{{ m.theory.status }}</span>
+                    </td>
+                    <td>{{ m.live.status }}（{{ m.live.curve.length }} 天）</td>
+                    <td>{{ _tvlPct(m.deviation?.return_gap ?? null) }}</td>
+                    <td>{{ _tvlPct(m.deviation?.max_drawdown_gap ?? null) }}</td>
+                    <td>
+                      <span v-for="(w, i) in m.warnings" :key="i" class="note" style="color:var(--orange)">
+                        {{ w.message || w.code }}
+                      </span>
+                      <span v-if="!m.warnings.length">—</span>
+                    </td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+            <p class="note">
+              拼盘会话只做成员级对照，不做顶层聚合；实盘借据与强制借贷在阶段 G 才启用。
+            </p>
+          </template>
+
+          <template v-if="!theoryVsLive.pairing?.bound">
           <div class="tvl-bind">
             <label>理论基准</label>
             <select v-model="tvlBindingValue" :disabled="tvlRecordsLoading || tvlBindingSaving">
@@ -2797,6 +2901,7 @@ onUnmounted(() => {
                 </tbody>
               </table>
             </div>
+          </template>
           </template>
         </template>
       </div>
@@ -2950,6 +3055,17 @@ onUnmounted(() => {
       <div v-if="portfolios.length === 0" class="empty-state" style="padding:8px">
         <p>暂无组合策略，请先在"组合管理"页创建</p>
       </div>
+      <label>绑定拼盘<span class="label-note">（阶段 F 影子，可选）</span></label>
+      <select v-model="form.pairing_plan_id" :disabled="pairingPlansLoading" data-field="pairing-plan">
+        <option :value="null">不绑定（普通实盘）</option>
+        <option v-for="p in pairingPlans" :key="p.id" :value="p.id">
+          #{{ p.id }} {{ p.name }}（{{ p.scope }} · {{ p.status }}）
+        </option>
+      </select>
+      <p style="font-size:12px;color:var(--ink-faint);margin:2px 0 8px">
+        绑定后仅用于理论 vs 实盘按成员对照与影子健康记录；不改下单、数量、拆单或审批。
+        与「理论基准」单回测绑定三选一，绑定拼盘会清空单回测绑定。阶段 G 前不执行强制借贷。
+      </p>
       </div>
       <div class="modal-actions">
         <button @click="create" class="btn btn-primary">确认</button>
@@ -3118,6 +3234,17 @@ onUnmounted(() => {
             <span v-if="portfolioFormulas(p.id)" class="formula-tag">{{ portfolioFormulas(p.id) }}</span>
           </label>
         </div>
+        <label>绑定拼盘<span class="label-note">（阶段 F 影子，可选；运行中立即生效）</span></label>
+        <select v-model="editForm.pairing_plan_id" :disabled="pairingPlansLoading" data-field="edit-pairing-plan">
+          <option :value="null">不绑定（普通实盘）</option>
+          <option v-for="p in pairingPlans" :key="p.id" :value="p.id">
+            #{{ p.id }} {{ p.name }}（{{ p.scope }} · {{ p.status }}）
+          </option>
+        </select>
+        <p style="font-size:12px;color:var(--ink-faint);margin:2px 0 8px">
+          绑定拼盘会同时清空「理论基准」的单回测绑定（三选一）。只影响对照与影子记录，
+          不改下单/数量/审批；阶段 G 前不执行强制借贷。
+        </p>
         <p v-if="editError" class="form-error" data-test="session-edit-error">{{ editError }}</p>
         <p v-if="editResult" class="baseline-preview" data-test="session-edit-result">
           {{ editResult.message }}
