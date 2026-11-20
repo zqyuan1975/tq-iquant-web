@@ -145,11 +145,12 @@ main\.venv\Scripts\python.exe -m pytest main/core/tests -q -p no:cacheprovider
 - 持仓 4 只 `.lc1` mtime 11:29:45–11:33:45，今日在写；最新闭合标签 1m=11:29、5m=11:25，均 ≤ 墙钟，`latest_closed_bar` 正确丢弃未闭合桶，判新只看标签。
 - 会话启动时正处于午休，行情轮询整段暂停（日志：`行情轮询已暂停（会话 1）：午休 11:30–13:00…下次恢复 2026-11-20 13:00`），`MinuteSourceHealth` 尚无观测，故 `last_label/last_advance_at` 为 null、`lag_seconds=0`、非回落——属预期，不是停滞。
 
-已知风险（离线复现，待 13:00 实测确认）：
+已知风险（13:05 实测确认 + 已修复）：
 
-- 跨午休首轮误判：13:00:05 首次 `observe` 看到的最大闭合标签仍是 11:30，`_evaluate` 以该标签为参考，会立即判 `no_advance`（lag 5405s）→ WARNING + risk 事件 + 回落快照合成；13:01 首根下午 bar 到达后自动恢复（回落约 1 分钟，自愈）。用注入时钟复现结果：13:00:05 `mode=fallback/stalled=true`，13:01:20 `mode=native/stalled=false`。
-- 影响面：回落期间仅行情取数走快照合成（与默认行为一致），不影响下单/日终；但会产生一次误报的回落留痕。建议保留 `native_minute.enabled=true`（自愈且日终不受影响）。**未自行改回 false**。
+- 跨午休首轮误判：13:00:56 首次 `observe` 看到的最大闭合标签仍是 11:29，旧代码以该标签为参考 → `no_advance`（log：`最后前进 11:29:00，已滞后 5515 秒`）→ 回落快照合成；13:01:56 看到标签 13:01 自动恢复（log：`原生分钟数据恢复前进（最后标签 13:01）`），回落约 60 秒、自愈。13:05:10 状态：`mode=native`、`last_advance_at=13:04:00`、`last_label=13:04`、`lag_seconds=70`、`stalled=false`、`reason=native_recovered`。
+- 影响面：回落期间仅行情取数走快照合成（与默认行为一致），不影响下单/日终；留痕在 core.log 与 SSE risk 事件（`_emit("risk")` 只走事件流/交接文件，不落 `live_decision_events`，故 DB 查不到）。建议保留 `native_minute.enabled=true`（自愈且日终不受影响）。**未自行改回 false**。
 - 已修复（2026-11-20，提交 `0297fab`）：`_session_anchor` → `_reference`，跨时段以上午/下午时段起点为下限，跨午休首轮不再误报；同段内停写判定不变。离线用例 `test_cross_lunch_first_round_no_false_fallback` 覆盖「13:00:05 不回落 + 13:01 首根到达仍 native」。代码未重启，下次重启生效。
+- 13:05 标签连续性（13:05:10 探测）：1m 为 `…11:29, 13:01, 13:02 … 13:06`，5m 为 `…11:25, 13:05, 13:10`；**源文件本身没有 11:30 那根**（下载工具在午休前停写、不补边界 bar），故不存在「13:00 首轮取回 11:30」；`latest_closed` 正确停在 13:05（13:06 标签因 > 墙钟被丢弃），判新走标签、未闭合桶丢弃均得到实测验证。
 
 ## 7. 未覆盖项与需拍板事项
 
