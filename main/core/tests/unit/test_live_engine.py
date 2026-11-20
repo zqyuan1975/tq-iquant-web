@@ -5808,6 +5808,65 @@ def test_reconcile_positions_offline_skips():
     assert engine._reconcile_mismatches == []
 
 
+def _empty_positions_respond(account_rows):
+    """空持仓 + 指定 /account 应答（模拟收盘后空读/真实空仓两种形态）。"""
+    def respond(request):
+        path = request.url.path
+        if path == "/positions":
+            return httpx.Response(200, json={"ok": True, "data": []})
+        if path == "/account":
+            return httpx.Response(200, json={"ok": True, "data": account_rows})
+        return httpx.Response(404, json={"ok": False, "error": "unknown"})
+    return respond
+
+
+def test_reconcile_skips_untrusted_empty_read():
+    """2026-11-19 实证：空持仓 + 资产字段缺失（ErrorId/Value）→ 不可信，跳过对账，
+    不得把虚拟持仓按 real=0 清零。"""
+    factory, _ = _db_factory()
+    engine, _, ctx = _reconcile_engine(
+        factory, 5300,
+        respond=_empty_positions_respond(
+            [{"ErrorId": 0, "Value": "与通达信客户端建立连接失败"}]),
+    )
+
+    assert ctx.positions["600000.SH"].quantity == 5300  # 绝不清零
+    assert engine._reconcile_mismatches == []           # 不产生 real=0 差异
+    assert engine._reconcile_positions() is False
+
+
+def test_reconcile_accepts_trusted_empty_read():
+    """真实空仓（总资产/可用可读且市值≈0）仍按 real=0 对账，正常路径不变。"""
+    factory, _ = _db_factory()
+    engine, _, _ = _reconcile_engine(
+        factory, 5300,
+        respond=_empty_positions_respond(
+            [{"total_asset": 10000, "available": 10000, "market_value": 0}]),
+    )
+
+    assert engine._reconcile_positions() is True
+    assert engine._reconcile_mismatches[0]["real"] == 0
+    assert engine._reconcile_mismatches[0]["diff"] == 5300
+
+
+def test_close_reconcile_does_not_clear_on_untrusted_read():
+    """不可信读数 → 收盘对账不进入柜台口径清零，也不落「今日已对账」。"""
+    factory, _ = _db_factory()
+    engine, _, ctx = _reconcile_engine(
+        factory, 5300,
+        respond=_empty_positions_respond([{"ErrorId": 0, "Value": "connect failed"}]),
+    )
+    calls = []
+    engine._apply_close_counter_correction = lambda *a, **k: calls.append(1)
+    engine._last_close_sweep_date = datetime(2026, 11, 20).date()
+
+    engine._maybe_reconcile_after_close(now=datetime(2026, 11, 20, 15, 10))
+
+    assert calls == []
+    assert engine._last_reconcile_date is None
+    assert ctx.positions["600000.SH"].quantity == 5300
+
+
 # ---------------- B5 SSE 事件流（signal/order/trade/position/risk 推送）----------------
 def _ss_engine(factory, port=None):
     """B5 辅助：单组合引擎 + 独立订阅队列，返回 (engine, q)。"""
@@ -10249,7 +10308,12 @@ def test_close_reconcile_runs_once_after_sweep_completes():
     disp, _ = _make_dispatcher(rec)
     engine = _make_engine(disp, factory, port)
     calls = []
-    engine._reconcile_positions = lambda: calls.append(1)
+
+    def _fake_reconcile():
+        calls.append(1)
+        return True
+
+    engine._reconcile_positions = _fake_reconcile
 
     # 清扫未完成（closer 未置当日标记）→ 不触发
     engine._maybe_reconcile_after_close(now=datetime(2026, 8, 5, 15, 6))

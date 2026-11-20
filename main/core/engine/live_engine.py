@@ -4419,10 +4419,19 @@ class LiveEngine:
             return None
         if not isinstance(positions, list):
             positions = []
+        asset = self._read_account_asset()
+        self._note_account_read_shape(asset, positions)
+        return asset, positions
+
+    def _read_account_asset(self) -> dict:
+        """读取账户资产字典（get_asset / get_account 通道差异归一）。
+
+        失败或缺端点返回 {}（调用方按「字段缺失」处理，不抛异常）。
+        """
         asset = {}
-        asset_fn = getattr(d, "get_asset", None)
+        asset_fn = getattr(self._dispatcher, "get_asset", None)
         if not callable(asset_fn):
-            asset_fn = getattr(d, "get_account", None)
+            asset_fn = getattr(self._dispatcher, "get_account", None)
         if callable(asset_fn):
             try:
                 raw = asset_fn()
@@ -4434,8 +4443,7 @@ class LiveEngine:
                 logger.warning(
                     "account snapshot asset read failed (session %s)",
                     self.session_id, exc_info=True)
-        self._note_account_read_shape(asset, positions)
-        return asset, positions
+        return asset
 
     def _note_account_read_shape(self, asset: dict, positions: list) -> None:
         """静默空读留痕（纯观测：不改变 ``_account_read_trustworthy`` 判定，也不
@@ -14075,7 +14083,7 @@ class LiveEngine:
         # D3：虚拟持仓 vs 桥实际 /positions 对账（仅告警不修正，见 _reconcile_positions）
         self._reconcile_positions()
 
-    def _reconcile_positions(self) -> None:
+    def _reconcile_positions(self) -> bool:
         """D3：对账——虚拟持仓(按 code 聚合) vs 桥实际 /positions，不一致仅记录+告警。
 
         recover 重建的虚拟持仓以 live_trades 为唯一源；桥 /positions 是账户真实持仓。
@@ -14085,19 +14093,36 @@ class LiveEngine:
         在途单未回填/桥行情延迟期可能假不一致，自动修正反而引入错账；真机跑顺后
         如需自动校准再放开）。桥离线 → 记日志跳过（保留上次差异结果，不闪空）。
         附加提示：实际有仓但虚拟无仓（如 Core 宕机期手动下单）也记录，供人工核对。
+
+        返回本轮是否成功算得差异（True）还是因读数不可用/不可信而跳过（False）。
+        跳过时不清空也不改写 `_reconcile_mismatches`，且调用方不得据此清账。
         """
         try:
             rows = self._dispatcher.query_positions()
         except BridgeUnavailableError:
             logger.warning("reconcile skipped: bridge offline (session %s)", self.session_id)
-            return
+            return False
         if rows is None:
             # 读失败 ≠ 真空仓：保留上次对账结果，不能把 real 当 0 算差异。
             logger.warning(
                 "reconcile skipped: positions unavailable (session %s): %s",
                 self.session_id,
                 getattr(self._dispatcher, "last_error", "") or "unknown")
-            return
+            return False
+        if not rows:
+            # 空表 ≠ 真空仓（2026-11-19 实证：收盘后 TQ 静默返回空持仓 + 资产字段
+            # 缺失，旧实现把 real 当 0 → 收盘对账把四只虚拟持仓按「人工清仓」清零）。
+            # 与快照同判据：空持仓必须资产可读且能证明「全部为现金/市值≈0」才可信；
+            # 否则跳过对账、留痕，绝不作为清账依据。
+            asset = self._read_account_asset()
+            if not self._account_read_trustworthy(asset, rows):
+                logger.warning(
+                    "reconcile skipped: untrusted empty account read (session %s): "
+                    "positions=0 row(s), asset_keys=%s → 不按空持仓清账；"
+                    "上次对账结果保留",
+                    self.session_id,
+                    sorted(asset.keys()) if isinstance(asset, dict) else [])
+                return False
         real: Dict[str, int] = {}
         for r in rows:
             inst = r.get("instrument")
@@ -14133,6 +14158,7 @@ class LiveEngine:
                 self.session_id, code, v, r, v - r,
             )
         self._set_reconcile_mismatches(diffs)
+        return True
 
     def _set_reconcile_mismatches(
         self, diffs, computed_at: Optional[datetime] = None
@@ -14227,8 +14253,14 @@ class LiveEngine:
             return
         if self._last_close_sweep_date != today:
             return
+        # 读数不可用/不可信时本轮跳过：不落「今日已对账」标记（下一轮 tick 重试），
+        # 也绝不进入柜台口径清零——不可信读数不能作为清账依据（2026-11-19 实证）。
+        if not self._reconcile_positions():
+            logger.warning(
+                "close reconcile deferred (session %s, %s): 账户读数不可用/不可信，"
+                "本轮跳过柜台口径清零，下一轮 tick 重试", self.session_id, today)
+            return
         self._last_reconcile_date = today
-        self._reconcile_positions()
         # 人工干预收口（2026-11-11）：收盘后把「虚拟有、柜台整行缺失」的仓按柜台
         # 口径清零并留审计；只修正这一方向，不做反向写入或对池外仓动手。
         self._apply_close_counter_correction(now)
