@@ -10,6 +10,7 @@ from .position import Position, is_convertible_bond, lot_size_for
 from .execution_engine import ExecutionEngine, SimulatedDispatcher, SimulatedT1Checker
 from .cash_allocator import MIN_FILL_RATIO, allocate_batch_buys
 from .capacity import CapacityBudget
+from .session_pool import PoolMember, allocate_session_pool
 from .cash_outlet_model import (
     CASH_OUTLET_MODEL_VERSION,
     CashOutletPlanError,
@@ -54,6 +55,8 @@ logger = logging.getLogger(__name__)
 
 # 资金池 L2 借据建模版本（0021 B3）：随快照写入，便于回测/实盘对照。
 LOAN_MODEL_VERSION = "loan-model-b3"
+# 会话池动态额度（0021 E2）：仅 run_multi 在显式 plan 下启用，默认 None。
+CAPITAL_POOL_MULTI_VERSION = "capital-pool-e2"
 
 
 # W4 按周期路由：同一时间戳可能同时存在多个周期（1d/1w/1mon 均为 00:00）。
@@ -1473,6 +1476,7 @@ class BacktestEngine:
         pending_order_max_days: int = PENDING_ORDER_MAX_DAYS,
         run_options: Optional[dict] = None,
         cancel_check: Optional[Callable[[], bool]] = None,
+        capital_pool_plan: Optional[dict] = None,
     ) -> Dict[int, dict]:
         """多组合共享现金回测（N1，2026-11-18）。
 
@@ -1487,14 +1491,30 @@ class BacktestEngine:
           * 收集到的新买单一律交给 ``cash_allocator.allocate_batch_buys`` 统一
             逐笔审批（80% 门槛、按组合/信号顺序、不做等比缩量），拒绝单记
             ``insufficient_cash``；
-          * 成交时若本组合现金不足，从其他组合账户转移差额（Σ 现金不变），
-            保证共享账户语义与账本一致性。
+          * 默认各组合现金独立、不跨组合划转（以代码为准；旧注释所述
+            「成交时自动转账」不在默认路径实现）。
 
         返回 ``{portfolio_id: run() 同构结果}``（不含聚合，聚合由服务层拼）。
         取消（K1，``cancel_check``）命中时返回 ``{"_canceled": True,
         "_progress": {...}, "_decisions": []}``，服务层据此把整批标 canceled。
+
+        ``capital_pool_plan``（0021 E2，默认 None=旧行为）：显式开启会话池动态
+        额度。每个交易日首 bar 用 ``session_pool.allocate_session_pool`` 按
+        「目标仓位 − 持仓市值」的需求做水位分配，把额度写到各策略
+        ``capital_budget``；组合自身现金不足时，成交前从其他组合的闲置现金
+        临时拆借（只借预算内差额，成交后多借部分立即退回），全程 Σ 现金守恒、
+        任一账户现金不为负。关闭或 None 时不计算、不改额度、不转账。
         """
         run_options = run_options or {}
+        _pool_plan = capital_pool_plan if isinstance(capital_pool_plan, dict) else None
+        _pool_enabled = bool(_pool_plan and _pool_plan.get("enabled") is True)
+        _pool_min_share = (
+            _pool_plan.get("min_share", "0.05") if _pool_enabled else None)
+        _pool_max_share = (
+            _pool_plan.get("max_share", "1.0") if _pool_enabled else None)
+        _pool_reserve_pct = (
+            _pool_plan.get("min_cash_reserve_pct", "0.03")
+            if _pool_enabled else None)
         _first_bar_no_fill = bool(run_options.get("first_bar_no_fill", False))
         _partial_fill = bool(run_options.get("partial_fill_enabled", False))
         # 流动性口径：默认 same_day_bar（改动前行为），prev5d_avg 需显式选择
@@ -1560,6 +1580,18 @@ class BacktestEngine:
                 "last_action_date": None,
                 "last_regime_date": None,
                 "ca_reinvest": [],
+                # 0021 E2：会话池动态额度（仅 _pool_enabled 时读写）
+                "last_equity": portfolio.account.initial_capital,
+                "pool_budget": Decimal(0),
+                "pool_own_available": Decimal(0),
+                "pool_reserve": Decimal(0),
+                "pool_borrow_left": Decimal(0),
+                "pool_borrow_used": Decimal(0),
+                "pool_lent": Decimal(0),
+                "pool_borrow_hist": Decimal(0),
+                "pool_lent_hist": Decimal(0),
+                "pool_total": Decimal(0),
+                "pool_days": [],
             })
 
         def _own_available(portfolio: Portfolio, pending,
@@ -1578,6 +1610,156 @@ class BacktestEngine:
                 if o.trade_type == TradeType.BUY and o.price:
                     reserved += o.price * Decimal(int(o.quantity or 0))
             return max(portfolio.account.cash - reserved, Decimal("0"))
+
+        # ---- 0021 E2：会话池动态额度（默认不进入任何分支）----
+        def _as_dec(value, default: str = "0") -> Decimal:
+            try:
+                return Decimal(str(value))
+            except Exception:
+                return Decimal(default)
+
+        def _apply_session_pool_day(day) -> None:
+            """每个交易日首 bar 分配一次额度（需求=目标仓位−持仓，无前视）。"""
+            members = []
+            for s in states:
+                p = s["portfolio"]
+                equity = _as_dec(s.get("last_equity")
+                                 or p.account.initial_capital or 0)
+                reserve = max(Decimal("0"), equity * _as_dec(_pool_reserve_pct))
+                own = _own_available(p, s["pending"])
+                own = max(Decimal("0"), own - reserve)
+                target = _as_dec(
+                    p.target_utilization
+                    if p.target_utilization is not None else "0.95")
+                target = max(Decimal("0"), min(Decimal("1"), target))
+                holdings = p._holdings_value()
+                # fixed 仓位模型按初始资金定量（与 _strategy_fund 同口径）；
+                # dynamic 按上一日收盘净值，均无前视。
+                capital_base = (
+                    _as_dec(p.account.initial_capital)
+                    if getattr(p, "position_sizing", "dynamic") == "fixed"
+                    else equity)
+                need = max(Decimal("0"), target * capital_base - holdings)
+                s["pool_own_available"] = own
+                s["pool_reserve"] = reserve
+                s["pool_borrow_used"] = Decimal("0")
+                s["pool_lent"] = Decimal("0")
+                members.append(PoolMember(
+                    p.portfolio_id,
+                    raw_weight=need,
+                    need=need,
+                    utilization_cap=target * capital_base,
+                ))
+
+            total = sum((s["pool_own_available"] for s in states), Decimal("0"))
+            plan = allocate_session_pool(
+                total, members,
+                min_share=_pool_min_share,
+                max_share=_pool_max_share,
+            )
+            by_id = {m.portfolio_id: m for m in plan.members}
+            for s in states:
+                p = s["portfolio"]
+                budget = by_id[p.portfolio_id].budget
+                s["pool_budget"] = budget
+                s["pool_total"] = total
+                s["pool_borrow_left"] = max(
+                    Decimal("0"), budget - s["pool_own_available"])
+                ratios = [_as_dec(getattr(ctx, "capital_ratio", 0))
+                          for ctx in p.strategies]
+                ratio_sum = sum((max(Decimal("0"), r) for r in ratios),
+                                Decimal("0"))
+                for idx, ctx in enumerate(p.strategies):
+                    if ratio_sum > 0:
+                        share = max(Decimal("0"), ratios[idx]) / ratio_sum
+                    else:
+                        share = (Decimal(1) / Decimal(len(p.strategies))
+                                 if p.strategies else Decimal("0"))
+                    ctx.capital_budget = budget * share
+                s["pool_days"].append({
+                    "date": day.isoformat(),
+                    "budget": f"{budget:f}",
+                    "own_available": f"{s['pool_own_available']:f}",
+                    "borrow_limit": f"{s['pool_borrow_left']:f}",
+                    "session_total": f"{total:f}",
+                })
+
+        def _borrow_cash_for_buy(s, order):
+            """成交前从其他组合闲置现金拆借预算内差额；无则返回 None。"""
+            p = s["portfolio"]
+            qty = int(order.quantity or 0)
+            price = order.price
+            if qty <= 0 or not price:
+                return None
+            estimate = _as_dec(price) * qty * Decimal("1.002") + Decimal("5")
+            own_before = p.account.cash
+            short = estimate - own_before
+            if short <= 0:
+                return None
+            short = min(short, s["pool_borrow_left"])
+            if short <= 0:
+                return None
+
+            moved = Decimal("0")
+            donors = []
+            for ds in sorted(states, key=lambda x: str(x["portfolio"].portfolio_id)):
+                d = ds["portfolio"]
+                if d is p:
+                    continue
+                available = _own_available(d, ds["pending"])
+                available = max(Decimal("0"), available - ds["pool_reserve"])
+                take = min(short - moved, available)
+                if take <= 0:
+                    continue
+                d.account.cash -= take
+                p.account.cash += take
+                moved += take
+                ds["pool_lent"] += take
+                donors.append((ds, d, take))
+                if moved >= short:
+                    break
+
+            if moved <= 0:
+                return None
+            s["pool_borrow_left"] -= moved
+            s["pool_borrow_used"] += moved
+            recorder.record(
+                gate="capital_pool_borrow", layer="capital_pool",
+                action="borrow",
+                portfolio_id=p.portfolio_id or 0,
+                strategy_id=order.strategy_id,
+                stock_code=order.stock_code,
+                bar_time=t,
+                param_name="borrowed_cash",
+                param_value=float(moved),
+                message="会话池拆借 %.2f 元用于买入（预算内，成交后多借部分退回）"
+                        % float(moved),
+            )
+            return own_before, moved, donors
+
+        def _settle_pool_borrow(s, borrow) -> None:
+            """成交后只保留实际占用，多借部分立即原路退回。"""
+            own_before, moved, donors = borrow
+            p = s["portfolio"]
+            spend = own_before + moved - p.account.cash
+            borrow_used = (
+                max(Decimal("0"), spend - own_before) if spend > 0
+                else Decimal("0"))
+            borrow_used = min(borrow_used, moved)
+            excess = moved - borrow_used
+            if excess > 0:
+                for ds, d, take in reversed(donors):
+                    refund = min(excess, take)
+                    d.account.cash += refund
+                    p.account.cash -= refund
+                    ds["pool_lent"] -= refund
+                    excess -= refund
+                    if excess <= 0:
+                        break
+            s["pool_borrow_used"] -= (moved - borrow_used)
+            s["pool_borrow_left"] += (moved - borrow_used)
+
+        _pool_day = None
 
         day_end_steps = set()
         _cur_date = _cur_t = None
@@ -1637,6 +1819,10 @@ class BacktestEngine:
                         a for a in _ca_actions if a.kind == KIND_REINVEST)
                     self._apply_corporate_actions(
                         portfolio, _ca_actions, t, s["trades"], recorder)
+
+            if _pool_enabled and _pool_day != t.date():
+                _apply_session_pool_day(t.date())
+                _pool_day = t.date()
 
             # 1. 成交上一 bar 的在途单（共享价格表；每个组合各自 pending）
             deferred_by_state = []
@@ -1903,10 +2089,16 @@ class BacktestEngine:
                                 order.stock_code, portfolio.bond_lot_enabled),
                         )
                         ctx.positions[order.stock_code] = pos
-                    # 各组合虚拟现金独立：不从其他组合划转（0010 §5.1 明确不做）
+                    # 各组合虚拟现金默认独立；仅在 E2 显式开启时按预算临时拆借
+                    _pool_borrow = (
+                        _borrow_cash_for_buy(s, order)
+                        if _pool_enabled and order.trade_type == TradeType.BUY
+                        else None)
                     trade = engine.execute(
                         order, portfolio.account, pos,
                         **self._exposure_kwargs(portfolio, ctx))
+                    if _pool_borrow is not None:
+                        _settle_pool_borrow(s, _pool_borrow)
                     if trade is not None:
                         s["trades"].append(trade)
                         portfolio.note_trade(trade)
@@ -2008,6 +2200,9 @@ class BacktestEngine:
                     continue
                 avail = _own_available(
                     portfolio, s["pending"], {id(o) for o in own_new})
+                if _pool_enabled:
+                    # E2：审批可用额 = 自有可用 + 会话池预算内可借额
+                    avail += s["pool_borrow_left"]
                 decisions = allocate_batch_buys(
                     own_new, avail, lot_of=lot_of,
                     sort_key=lambda o: (o.bar_time or datetime.min,),
@@ -2067,6 +2262,18 @@ class BacktestEngine:
                         portfolio, bar, t.date())
                     for s_snap in day_strategy_snaps:
                         s_snap["benchmark_value"] = snap["benchmark_value"]
+                    if _pool_enabled:
+                        snap["capital_pool"] = {
+                            "version": CAPITAL_POOL_MULTI_VERSION,
+                            "session_total": f"{s['pool_total']:f}",
+                            "budget": f"{s['pool_budget']:f}",
+                            "own_available": f"{s['pool_own_available']:f}",
+                            "borrowed": f"{s['pool_borrow_used']:f}",
+                            "lent": f"{s['pool_lent']:f}",
+                        }
+                        s["pool_borrow_hist"] += s["pool_borrow_used"]
+                        s["pool_lent_hist"] += s["pool_lent"]
+                        s["last_equity"] = total_value
                 portfolio.maybe_cash_enhancement(bar, total_value)
                 if (s["last_snap_date"] is not None
                         and t.date() != s["last_snap_date"]):
@@ -2117,6 +2324,15 @@ class BacktestEngine:
                 "pending_orders": s["pending"],
                 "pending_order_count": len(s["pending"]),
             }
+            if _pool_enabled:
+                results[portfolio.portfolio_id]["capital_pool"] = {
+                    "version": CAPITAL_POOL_MULTI_VERSION,
+                    "days": s["pool_days"],
+                    "borrowed_total": f"{s['pool_borrow_hist']:f}",
+                    "lent_total": f"{s['pool_lent_hist']:f}",
+                }
+                for ctx in portfolio.strategies:
+                    ctx.capital_budget = None
         results["_decisions"] = [ev.to_dict() for ev in recorder.drain()]
         results["execution_stats"] = run_stats
         return results

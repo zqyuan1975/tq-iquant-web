@@ -5389,6 +5389,8 @@ def run_multi_backtest(db: Session, portfolios: list, req) -> dict:
             "multi_portfolio_version": MULTI_PORTFOLIO_VERSION,
             # 流动性口径（2026-11-19）：组内各记录同口径，缺键=旧口径 same_day_bar。
             "liquidity_caliber": liquidity_caliber,
+            # 0021 E2：会话池动态额度（缺键/None=旧行为）。
+            "capital_pool_plan": getattr(req, "capital_pool_plan", None),
         }, ensure_ascii=False, sort_keys=True),
     )
     db.add(group)
@@ -5459,6 +5461,7 @@ def run_multi_backtest(db: Session, portfolios: list, req) -> dict:
             pending_order_max_days=int(_bt_cfg.get("pending_order_max_days", 20)),
             run_options=exec_flags,
             cancel_check=cancel_event.is_set,
+            capital_pool_plan=getattr(req, "capital_pool_plan", None),
         )
         if results.get("_canceled"):
             progress = results.get("_progress") or {}

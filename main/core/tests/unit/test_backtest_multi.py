@@ -31,11 +31,14 @@ def _klines(code=CODE):
     return {code: {"1d": df}}
 
 
-def _portfolio(pid, sid, capital, ratio="1"):
+def _portfolio(pid, sid, capital, ratio="1", fixed=False, cash=None):
     pm = PortfolioRiskManager(
         max_drawdown=Decimal("0.5"), daily_loss_limit=Decimal("0.5"))
     port = Portfolio(
-        portfolio_id=pid, initial_capital=Decimal(capital), risk_manager=pm)
+        portfolio_id=pid, initial_capital=Decimal(capital), risk_manager=pm,
+        position_sizing=("fixed" if fixed else "dynamic"))
+    if cash is not None:
+        port.account.cash = Decimal(cash)
     ctx = StrategyContext(
         strategy_id=sid, period="1d",
         capital_ratio=Decimal(ratio), max_positions=5,
@@ -118,3 +121,77 @@ def test_run_multi_returns_snapshots_and_evaluations_per_portfolio():
     assert len(res["snapshots"]) == 3
     assert isinstance(res["evaluations"], dict)
     assert "total_return" in res["evaluations"]
+
+
+# ---------------- 0021 E2：会话池动态额度 ----------------
+def _pool_case():
+    """组合 1 闲置 10 万无信号；组合 2 初始 1 万但现金仅 7 千，信号买 900 股。"""
+    p1 = _portfolio(1, 1, "100000", fixed=True)
+    p1.strategies[0].formula_signals = []
+    p2 = _portfolio(2, 2, "10000", fixed=True, cash="7000")
+    cache = _cache([2])
+    return p1, p2, cache
+
+
+def test_capital_pool_disabled_matches_legacy_independent_cash():
+    """enabled=False 与不传 plan 逐位一致（旧结果不变）。"""
+    p1, p2, cache = _pool_case()
+    base = BacktestEngine().run_multi(
+        [p1, p2], klines=_klines(), signal_cache=cache)
+    q1, q2, cache2 = _pool_case()
+    off = BacktestEngine().run_multi(
+        [q1, q2], klines=_klines(), signal_cache=cache2,
+        capital_pool_plan={"enabled": False})
+
+    for pid in (1, 2):
+        assert base[pid]["trades"] == off[pid]["trades"]
+        assert base[pid]["snapshots"] == off[pid]["snapshots"]
+        assert "capital_pool" not in base[pid]
+        assert "capital_pool" not in off[pid]
+
+
+def test_capital_pool_borrows_idle_cash_and_keeps_cash_non_negative():
+    """组合 2 自有现金不足，从组合 1 闲置现金拆借；Σ 现金守恒且无负现金。"""
+    p1, p2, cache = _pool_case()
+    cash_before = p1.account.cash + p2.account.cash
+    result = BacktestEngine().run_multi(
+        [p1, p2], klines=_klines(), signal_cache=cache,
+        capital_pool_plan={"enabled": True, "max_share": "1.0"})
+
+    trades = result[2]["trades"]
+    assert len(trades) == 1
+    assert trades[0].quantity >= 900
+    assert p1.account.cash < Decimal("100000"), "出借方现金应减少"
+    assert p1.account.cash >= 0
+    assert p2.account.cash >= 0
+
+    # Σ 现金 = 初始 Σ 现金 − 成交金额（费用另计，用成交额近似上界）
+    spent = trades[0].price * trades[0].quantity
+    assert p1.account.cash + p2.account.cash <= cash_before - spent + Decimal("100")
+
+    pool = result[2]["capital_pool"]
+    assert pool["version"] == "capital-pool-e2"
+    assert Decimal(pool["borrowed_total"]) > 0
+    assert Decimal(result[1]["capital_pool"]["lent_total"]) > 0
+    snap_30 = next(s for s in result[2]["snapshots"]
+                   if str(s["snap_date"]).startswith("2026-07-30"))
+    assert snap_30["capital_pool"]["borrowed"] != "0"
+    borrow_events = [d for d in result["_decisions"]
+                     if d.get("gate") == "capital_pool_borrow"]
+    assert borrow_events and borrow_events[0]["portfolio_id"] == 2
+
+
+def test_capital_pool_increases_deployable_cash_vs_independent():
+    """同一需求下，动态池能成交而独立现金因不足被拒（可复现对比）。"""
+    p1, p2, cache = _pool_case()
+    independent = BacktestEngine().run_multi(
+        [p1, p2], klines=_klines(), signal_cache=cache)
+    assert independent[2]["trades"] == []
+
+    q1, q2, cache2 = _pool_case()
+    pooled = BacktestEngine().run_multi(
+        [q1, q2], klines=_klines(), signal_cache=cache2,
+        capital_pool_plan={"enabled": True, "max_share": "1.0"})
+    assert len(pooled[2]["trades"]) == 1
+    assert q1.account.cash + q2.account.cash >= 0
+

@@ -151,6 +151,9 @@ class MultiBacktestRequest(BaseModel):
     capacity_impact_k: float | None = None
     # 成交量闸门流动性口径（None=same_day_bar 旧口径；prev5d_avg 需显式选择）
     liquidity_caliber: str | None = None
+    # 0021 E2 会话池动态额度（None/未启用=各组合现金独立、旧行为）：
+    # {enabled, min_share?, max_share?, min_cash_reserve_pct?}
+    capital_pool_plan: dict | None = None
 
 
 class PoolCompareRequest(BaseModel):
