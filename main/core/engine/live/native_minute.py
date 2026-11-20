@@ -133,7 +133,9 @@ class MinuteSourceHealth:
             self.last_label is None or max_label > self.last_label
         ):
             self.last_label = max_label
-            self.last_advanced_at = now
+            # 以标签时刻作为「最后前进」起算点：会话中途启动时若工具已停，
+            # 直接按真实数据时刻判定停滞，不会把启动时刻误当成前进时刻。
+            self.last_advanced_at = max_label
             if self.in_fallback:
                 self._transition(False, now, "native_recovered")
         self._evaluate(now)

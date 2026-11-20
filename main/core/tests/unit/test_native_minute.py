@@ -145,3 +145,13 @@ def test_no_stall_outside_session():
     health.observe([datetime(2026, 11, 20, 11, 30)])
     now[0] = datetime(2026, 11, 20, 11, 45, 0)
     assert health.is_fallback() is False
+
+
+def test_first_observation_stale_falls_back_immediately():
+    """会话中途启动且工具已停：首轮按标签时刻起算，不等一个阈值才回落。"""
+    now = [datetime(2026, 11, 20, 10, 40, 0)]
+    health = MinuteSourceHealth(
+        stall_timeout_seconds=60, clock=lambda: now[0],
+        in_session=lambda dt: True)
+    health.observe([datetime(2026, 11, 20, 10, 30)])
+    assert health.is_fallback() is True
