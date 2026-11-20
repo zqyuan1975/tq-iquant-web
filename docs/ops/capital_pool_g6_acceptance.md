@@ -104,7 +104,10 @@ main\.venv\Scripts\python.exe -m pytest main/core/tests -q -p no:cacheprovider
 数据缺口（未自行放宽）：
 
 - 「计划 vs 实际偏差 < 5%、门控一致 100%」需要实盘影子期逐 bar 数据。当前生产库 `live_capital_shadow` 0 行、`capital_pairing_health_daily` 0 行。
-- **F3 会话级影子开关不存在**：`live_service.start_session` 仅在会话绑定 `pairing_plan_id`（或 `backtest_run_group_id` → 组上计划）时才构建 `capital_shadow`；`capital_pool_mode` 取值 off/equal/risk_budget/priority，不是影子开关。生产库 `capital_pairing_plans` / `capital_pairings` / `backtest_run_groups` 均 0 行，故 F3 无法在会话 1 单独开启。用户拍板选 A：先以实盘 auto 启动会话 1、不启 F3，F3 记为待补缺口（待有真实拼盘或运行组再补），不计通过。
+- **F3 会话级影子开关（2026-11-20 已补）**：`live_sessions.capital_shadow_enabled`（迁移 `h5b6c7d8e9f0`，默认 0）。会话启动时据此决定是否构建影子；只逐 bar 追加 `live_capital_shadow`，不触订单/成交/决策事件，无下单入口。两条入口互不覆盖：
+  - 已绑定 `pairing_plan_id` / `backtest_run_group_id`：始终走计划侧原路径（lender/borrowers、借据与 live_haircut），本开关不改变行为；
+  - 未绑定 + 开关开启：以会话组合的策略成员构建「无计划侧」影子（`loan_plan=None`，本金/可用本金/缺口留空，并显式写 `no_pairing_plan` 告警，避免误读为「计划=实际」）。
+- 开启方式：`PUT /api/live/sessions/{id}` `{"capital_shadow_enabled": true}`（或建会话时带上），**下次启动生效**（运行中不重建引擎）。生产库 `capital_pairing_plans` / `capital_pairings` / `backtest_run_groups` 均 0 行，故当前只能走会话级实际侧采样；用户计划 15:05 收盘清扫后重启并开启会话 1，从下一交易日开始采样。
 - 补齐方式：按 G5 手册 S1「小资金影子」运行一个交易日以上，再用 `GET /api/live/sessions/{id}/theory-vs-live` 与影子台账取偏差。
 
 ### 6.1 实盘会话 1 只读核对（2026-11-20 11:49，未调用 start）
@@ -129,22 +132,24 @@ main\.venv\Scripts\python.exe -m pytest main/core/tests -q -p no:cacheprovider
 已知风险（离线复现，待 13:00 实测确认）：
 
 - 跨午休首轮误判：13:00:05 首次 `observe` 看到的最大闭合标签仍是 11:30，`_evaluate` 以该标签为参考，会立即判 `no_advance`（lag 5405s）→ WARNING + risk 事件 + 回落快照合成；13:01 首根下午 bar 到达后自动恢复（回落约 1 分钟，自愈）。用注入时钟复现结果：13:00:05 `mode=fallback/stalled=true`，13:01:20 `mode=native/stalled=false`。
-- 影响面：回落期间仅行情取数走快照合成（与默认行为一致），不影响下单/日终；但会产生一次误报的回落留痕。建议保留 `native_minute.enabled=true`（自愈且日终不受影响），后续单独修 `_session_anchor` 跨午休参考点（以下午 13:00 为锚）。**未自行改回 false**。
+- 影响面：回落期间仅行情取数走快照合成（与默认行为一致），不影响下单/日终；但会产生一次误报的回落留痕。建议保留 `native_minute.enabled=true`（自愈且日终不受影响）。**未自行改回 false**。
+- 已修复（2026-11-20，提交 `0297fab`）：`_session_anchor` → `_reference`，跨时段以上午/下午时段起点为下限，跨午休首轮不再误报；同段内停写判定不变。离线用例 `test_cross_lunch_first_round_no_false_fallback` 覆盖「13:00:05 不回落 + 13:01 首根到达仍 native」。代码未重启，下次重启生效。
 
 ## 7. 未覆盖项与需拍板事项
 
-1. **#4 业务 KPI（已执行，未达标）**：§3.3 要求「#4 类组合利用率 24.5% → 35%–45%，最大回撤 ≤ 8%」。2026-11-20 已按用户授权新开记录 31 实测：利用率 18.62%、最大回撤 8.41%，两项均未达标；区间与 #4 一致但策略参数已变更，不能视为同参数 A/B（详见 §3.1）。是否在恢复 id=4 参数后重跑，待拍板。
-2. **召回次数 ≤ 12 次/年、shortfall ≤ 2%/年**：需要实盘或长周期回测样本，当前无数据源。
-3. **恒等式 (1)(3)(9)**：运行时因「持久化虚拟现金账本 / 当日开盘现金 / 会话级策略预算」数据源缺失记 `skipped`（G2 已记录），模块层有用例覆盖；按手册口径，`skipped` 不等于账平。
-4. **迁移回退**：本阶段未在生产库执行 `downgrade`（G4/G5 已在临时副本演练）；生产库保持在 `g4a5b6c7d8e9`。需要回退时按 G5 手册 §4.2 的三条路径执行。
+1. **#4 业务 KPI（已执行，未达标）**：§3.3 要求「#4 类组合利用率 24.5% → 35%–45%，最大回撤 ≤ 8%」。2026-11-20 已按用户授权新开记录 31 实测：利用率 18.62%、最大回撤 8.41%，两项均未达标；区间与 #4 一致但策略参数已变更，不能视为同参数 A/B（详见 §3.1）。单组合回测的 `capital_pool` 块只是版本戳、不注入额度，真注入需 `loan_model_plan` 双策略或 E2 多组合计划，见 §3.2。
+2. **F3 影子偏差**：「计划 vs 实际偏差 < 5%、门控一致 100%」仍需实盘影子期数据。会话级开关 `capital_shadow_enabled` 已补（见 §6），计划于 15:05 收盘清扫后重启并开启会话 1，从下一交易日开始采样；无计划侧时只采实际侧并带 `no_pairing_plan` 告警。
+3. **召回次数 ≤ 12 次/年、shortfall ≤ 2%/年**：需要实盘或长周期回测样本，当前无数据源。
+4. **恒等式 (1)(3)(9)**：运行时因「持久化虚拟现金账本 / 当日开盘现金 / 会话级策略预算」数据源缺失记 `skipped`（G2 已记录），模块层有用例覆盖；按手册口径，`skipped` 不等于账平。
+5. **迁移回退**：本阶段未在生产库执行 `downgrade`（G4/G5 已在临时副本演练）；生产库保持在 `g4a5b6c7d8e9`，`h5b6c7d8e9f0` 待下次重启时 upgrade。需要回退时按 G5 手册 §4.2 的三条路径执行。
 
 ## 8. 生产库快照（只读核对）
 
 | 项 | 值 |
 |---|---|
-| `alembic_version` | `g4a5b6c7d8e9` |
+| `alembic_version` | `g4a5b6c7d8e9`（`h5b6c7d8e9f0` 已写好，待下次重启 upgrade） |
 | `PRAGMA quick_check` | `ok` |
-| `live_sessions` | 01 `running`（`auto` / tdx，11:45:54 启动）、02 / 03 `stopped`；三会话均 `capital_enforce_enabled=0`、`cash_outlet_mode=OFF` |
+| `live_sessions` | 01 `running`（`auto` / tdx，11:45:54 启动）、02 / 03 `stopped`；三会话均 `capital_enforce_enabled=0`、`cash_outlet_mode=OFF`、`capital_shadow_enabled=0` |
 | `capital_pairing_plans` / `capital_pairings` / `backtest_run_groups` | 0 / 0 / 0 行（F3 无绑定来源） |
 | `backtest_records` | 28 条（新增 id=31 `G6-#4-capital-pool-20261120`，既有 27 条未动） |
 | `cash_outlet_ops` | 0 行 |

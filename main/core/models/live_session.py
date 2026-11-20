@@ -104,6 +104,14 @@ class LiveSession(Base):
     # 组合可用现金与真实侧占比；关闭当根 bar 即释放全部借据、只回收不新增。
     capital_enforce_enabled = Column(
         Boolean, nullable=False, server_default="0", default=False)
+    # ---- F3 资金影子会话级开关（0021，2026-11-20）----
+    # 默认关：会话启动时决定是否构建影子账本（只逐 bar 追加
+    # live_capital_shadow，不触订单/成交/决策事件，无下单入口）。
+    # 与拼盘绑定入口互不覆盖：绑定了 pairing_plan_id / backtest_run_group_id
+    # 的会话始终走计划侧（原路径，不受本开关影响）；未绑定时本开关打开，
+    # 以会话组合的策略成员构建「无计划侧」影子（只采实际侧）。
+    capital_shadow_enabled = Column(
+        Boolean, nullable=False, server_default="0", default=False)
     # ---- G4 现金出口分级执行（0021，2026-11-20）----
     # OFF/P1/P2/P3；默认 OFF（只记账不投放）。P1 逐笔人工确认，P2 服务计划
     # + 人工确认，P3 仅对已验证、T+0/≤7 天的出口自动放行（仍只写台账）。

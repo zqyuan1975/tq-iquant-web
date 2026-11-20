@@ -1829,14 +1829,19 @@ def build_engine(
         _calendar_fallbacks.append(("goldminer_bridge", goldminer_calendar_provider))
     trading_calendar = TradingCalendar(
         dispatcher.query_calendar, fallback_providers=_calendar_fallbacks)
-    # F3 影子（默认关）：仅在会话绑定拼盘/运行组时构建；失败只关闭影子，
-    # 不影响引擎启动与交易。影子不触下单入口，只逐 bar 追加只读记录。
+    # F3 影子（默认关）：两个互不覆盖的入口——
+    # 1) 绑定拼盘/运行组：沿用计划侧（原路径，优先级最高，不受会话开关影响）；
+    # 2) 会话级开关 capital_shadow_enabled：仅在未绑定时生效，用会话组合的
+    #    策略成员构建「无计划侧」影子（只采实际侧，仍只写 live_capital_shadow）。
+    # 两条入口都不触下单路径，失败只关闭影子，不影响引擎启动与交易。
     _capital_shadow = None
     # G1 资金强制（默认关）：同一绑定计划构建借据配置；由会话开关决定是否生效，
     # 构建失败只退回原资金口径（不半强制）。
     _capital_enforce = None
-    if (getattr(session_row, "pairing_plan_id", None)
-            or getattr(session_row, "backtest_run_group_id", None)):
+    _bound_plan = bool(
+        getattr(session_row, "pairing_plan_id", None)
+        or getattr(session_row, "backtest_run_group_id", None))
+    if _bound_plan:
         try:
             _plan = _resolve_bound_pairing_plan(db, session_row)
             if _plan is not None:
@@ -1904,6 +1909,28 @@ def build_engine(
                 "capital shadow setup failed (session %s); 影子关闭", session_id)
             _capital_shadow = None
             _capital_enforce = None
+    elif bool(getattr(session_row, "capital_shadow_enabled", False)):
+        # F3 会话级入口：未绑定拼盘/运行组时，按会话组合的策略成员采样实际侧。
+        # 无计划侧（loan_plan=None）→ 本金/可用本金/缺口留空，并显式打
+        # no_pairing_plan 告警，避免把「没有计划」误读成「计划=实际」。
+        try:
+            _members = _session_shadow_members(portfolios)
+            if _members:
+                _capital_shadow = {
+                    "plan_id": None,
+                    "loan_plan": None,
+                    "members": _members,
+                    "haircut": None,
+                    "drift_fields": [],
+                    "warning_codes": ["no_pairing_plan"],
+                }
+                logger.info(
+                    "capital shadow enabled (session %s): 未绑定拼盘，只采实际侧",
+                    session_id)
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                "capital shadow setup failed (session %s); 影子关闭", session_id)
+            _capital_shadow = None
     eng = LiveEngine(
         session_id=session_id,
         portfolios=portfolios,
@@ -2089,6 +2116,9 @@ def list_sessions(db: Session, engines: Optional[Dict[int, LiveEngine]] = None) 
             # G1 资金强制会话级 kill switch（默认关；关闭即释放借据）
             "capital_enforce_enabled": bool(
                 getattr(s, "capital_enforce_enabled", False)),
+            # F3 资金影子会话级开关（默认关；下次启动生效）
+            "capital_shadow_enabled": bool(
+                getattr(s, "capital_shadow_enabled", False)),
             # G4 现金出口分级模式（OFF/P1/P2/P3）
             "cash_outlet_mode": getattr(s, "cash_outlet_mode", None) or "OFF",
             # B2 主备通道
@@ -2573,6 +2603,33 @@ def _live_haircut_overrides() -> dict:
     return value if isinstance(value, dict) else {}
 
 
+def _session_shadow_members(portfolios) -> List[dict]:
+    """F3 会话级影子成员表：会话组合内的全部策略（去重，side=session）。
+
+    仅用于「未绑定拼盘/运行组 + capital_shadow_enabled」入口；绑定入口仍
+    按拼盘 binding_json 生成 lender/borrowers[%d]，两条路径互不覆盖。
+    影子只读 total_value/cash，不参与任何交易决策。
+    """
+    members: List[dict] = []
+    seen = set()
+    for portfolio in portfolios or []:
+        for ctx in (getattr(portfolio, "strategies", None) or []):
+            try:
+                sid = int(getattr(ctx, "strategy_id"))
+            except (TypeError, ValueError):
+                continue
+            if sid in seen:
+                continue
+            seen.add(sid)
+            members.append({
+                "strategy_id": sid,
+                "side": "session",
+                "role": None,
+                "max_order_amount": None,
+            })
+    return members
+
+
 def capital_inheritance_report(db: Session, session: LiveSession) -> dict:
     """F2：按会话绑定生成只读继承报告（未绑定 → enabled=False）。
 
@@ -2658,6 +2715,8 @@ def create_session(db: Session, data: dict, mode: str) -> dict:
         capital_pool_rebalance_enabled=pool_rebalance,
         # G1 资金强制（默认关；开启需已绑定拼盘，否则引擎侧无借据配置）
         capital_enforce_enabled=bool(data.get("capital_enforce_enabled")),
+        # F3 资金影子会话级开关（默认关；仅在未绑定拼盘/运行组时生效）
+        capital_shadow_enabled=bool(data.get("capital_shadow_enabled")),
         # G4 现金出口分级模式（默认 OFF；仅台账放行级别）
         cash_outlet_mode=(
             str(data.get("cash_outlet_mode") or "OFF").upper()
@@ -2711,6 +2770,9 @@ def create_session(db: Session, data: dict, mode: str) -> dict:
             "capital_pool_rebalance_enabled": pool_rebalance,
             "capital_enforce_enabled": bool(
                 session.capital_enforce_enabled),
+            # F3 资金影子会话级开关（默认关；下次启动生效）
+            "capital_shadow_enabled": bool(
+                getattr(session, "capital_shadow_enabled", False)),
             # G4 现金出口分级模式（OFF/P1/P2/P3；只影响台账放行级别）
             "cash_outlet_mode": getattr(
                 session, "cash_outlet_mode", None) or "OFF",
@@ -2771,6 +2833,9 @@ def get_session(db: Session, session_id: int, engine: Optional[LiveEngine] = Non
         # G1 资金强制会话级 kill switch（默认关；关闭即释放借据）
         "capital_enforce_enabled": bool(
             getattr(session, "capital_enforce_enabled", False)),
+        # F3 资金影子会话级开关（默认关；下次启动生效）
+        "capital_shadow_enabled": bool(
+            getattr(session, "capital_shadow_enabled", False)),
         # G4 现金出口分级模式（OFF/P1/P2/P3）
         "cash_outlet_mode": getattr(session, "cash_outlet_mode", None) or "OFF",
         # B2 主备通道（默认 NULL / 0）
@@ -2897,6 +2962,8 @@ SESSION_EDIT_FIELDS = (
     "intraday_mismatched_risk_enabled", "capital_pool_mode",
     "capital_pool_rebalance_enabled", "portfolio_ids",
     "capital_enforce_enabled",
+    # F3 资金影子会话级开关（默认关；下次启动生效，仅未绑定拼盘时起作用）
+    "capital_shadow_enabled",
     # G4 现金出口分级模式：运行中即时生效（只影响台账放行级别）
     "cash_outlet_mode",
     "gate_recheck_on_execute",
@@ -3020,6 +3087,10 @@ def _normalize_session_patch(db: Session, data: dict,
         # G1 kill switch：运行中也立即生效（关闭即释放借据、回到原口径）
         patch["capital_enforce_enabled"] = bool(
             data.get("capital_enforce_enabled"))
+    if "capital_shadow_enabled" in data:
+        # F3：影子为构建期配置，只下次启动生效（运行中改不重建引擎）
+        patch["capital_shadow_enabled"] = bool(
+            data.get("capital_shadow_enabled"))
     if "cash_outlet_mode" in data:
         # G4：只允许 OFF/P1/P2/P3；非法值回落 OFF
         mode = str(data.get("cash_outlet_mode") or "OFF").upper()

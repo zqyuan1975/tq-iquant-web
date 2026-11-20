@@ -22,7 +22,7 @@ from core.db import get_db
 from core.models import (
     Base, StockPool, StockPoolStock, Formula, FormulaSignal,
     PortfolioStrategy, Strategy, LiveOrder, LiveTrade, LiveSessionPortfolio,
-    LiveDecisionEvent, LiveSession,
+    LiveDecisionEvent, LiveSession, CapitalPairingPlan,
 )
 from core.engine.position import Position
 import core.api.live as live_api
@@ -822,6 +822,101 @@ def test_build_engine_fills_formula_mapping(client, mock_bridge):
     assert engine._formula_count == 200
     # #27：formula_count 按公式配 → 引擎收到 {formula_name: count}（_seed 默认 200）
     assert engine._formula_count_by_name == {"open_formula": 200}
+
+
+# ---- F3 资金影子会话级开关（0021，2026-11-20）----
+
+def test_capital_shadow_default_off_builds_none(client, mock_bridge):
+    """默认关：未绑定拼盘 + 开关未开 → 引擎不构建影子（零行为变化）。"""
+    c, Session = client
+    db = Session()
+    ps_id = _seed(db)
+    db.close()
+    sid = _create_session(c, portfolio_ids=(ps_id,))
+
+    db2 = Session()
+    try:
+        engine = live_api._build_engine(sid, db2)
+    finally:
+        db2.close()
+    assert engine._capital_shadow is None
+    detail = c.get("/api/live/sessions/%d" % sid).json()["data"]
+    assert detail["capital_shadow_enabled"] is False
+
+
+def test_capital_shadow_session_switch_builds_actual_side(client, mock_bridge):
+    """开启后启动即建：未绑定拼盘 → 实际侧影子（无计划侧，显式告警）。"""
+    c, Session = client
+    db = Session()
+    ps_id = _seed(db)
+    db.close()
+    sid = _create_session(c, portfolio_ids=(ps_id,))
+    resp = c.put("/api/live/sessions/%d" % sid,
+                 json={"capital_shadow_enabled": True})
+    assert resp.status_code == 200
+    assert resp.json()["code"] == 0
+    assert c.get("/api/live/sessions/%d" % sid).json()["data"][
+        "capital_shadow_enabled"] is True
+
+    db3 = Session()
+    try:
+        engine = live_api._build_engine(sid, db3)
+    finally:
+        db3.close()
+    shadow = engine._capital_shadow
+    assert shadow is not None
+    assert shadow["plan_id"] is None
+    assert shadow["loan_plan"] is None
+    assert shadow["warning_codes"] == ["no_pairing_plan"]
+    assert shadow["members"]
+    assert all(m["side"] == "session" for m in shadow["members"])
+    # 影子不建立资金强制配置（不动下单口径）
+    assert engine._capital_enforce is None
+    assert engine._capital_enforce_enabled is False
+
+
+def test_capital_shadow_pairing_binding_unchanged_by_switch(client, mock_bridge):
+    """绑定拼盘时行为不变：开关同时为 true 仍走计划侧（lender/borrowers）。"""
+    c, Session = client
+    db = Session()
+    ps_id = _seed(db)
+    db.add(Strategy(
+        portfolio_id=ps_id, name="s2", formula_id=1, period="1m",
+        role="slave", capital_ratio=Decimal("0.4"), max_positions=5,
+        stop_loss_ratio=Decimal("0.05"), take_profit_ratio=Decimal("0.2"),
+        trailing_stop_ratio=Decimal("0"),
+    ))
+    plan = CapitalPairingPlan(
+        name="f3-plan", portfolio_strategy_id=ps_id,
+        pairing_version="v1", status="ACTIVE",
+        binding_json=json.dumps({
+            "lender": {"strategy_id": 1, "role": "lender"},
+            "borrowers": [{"strategy_id": 2, "role": "borrower"}],
+        }, ensure_ascii=False),
+    )
+    db.add(plan)
+    db.commit()
+    plan_id = plan.id
+    db.close()
+
+    sid = _create_session(c, portfolio_ids=(ps_id,))
+    db2 = Session()
+    row = db2.get(LiveSession, sid)
+    row.pairing_plan_id = plan_id
+    row.capital_shadow_enabled = True
+    db2.commit()
+    db2.close()
+
+    db3 = Session()
+    try:
+        engine = live_api._build_engine(sid, db3)
+    finally:
+        db3.close()
+    shadow = engine._capital_shadow
+    assert shadow is not None
+    assert shadow["plan_id"] == plan_id
+    assert {m["side"] for m in shadow["members"]} == {"lender", "borrowers[0]"}
+    assert "no_pairing_plan" not in shadow["warning_codes"]
 
 
 # ---- 0011 外部信号注入：signal_file_path → build_engine 接线 ----
