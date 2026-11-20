@@ -76,6 +76,8 @@ beforeEach(() => {
   vi.clearAllMocks()
   FakeEventSource.instances = []
   vi.stubGlobal('EventSource', FakeEventSource)
+  // 停止二次确认默认放行（个别用例改成 false 验证取消路径）
+  vi.stubGlobal('confirm', vi.fn(() => true))
   // 历史查询/组合默认空
   ;(getLiveSessions as any).mockResolvedValue([])
   ;(createLiveSession as any).mockResolvedValue({ id: 99, status: 'stopped' })
@@ -166,6 +168,27 @@ describe('LiveSessions.vue SSE 事件日志面板', () => {
     expect(stopLiveSession).toHaveBeenCalledWith(7)
     expect(es.close).toHaveBeenCalled()
     expect(w.text()).toContain('未连接')
+    w.unmount()
+  })
+
+  it('停止二次确认：取消 → 不发停止请求', async () => {
+    ;(getLiveSessions as any).mockResolvedValueOnce([runningSession])
+    const confirmSpy = vi.fn((_message?: string) => false)
+    vi.stubGlobal('confirm', confirmSpy)
+    const w = mount(LiveSessions)
+    await flushPromises()
+
+    const stopBtn = w.findAll('button').find((b) => b.text().includes('停止'))!
+    await stopBtn.trigger('click')
+    await flushPromises()
+
+    expect(confirmSpy).toHaveBeenCalledTimes(1)
+    const text = String(confirmSpy.mock.calls[0][0])
+    // 文案必须写清后果：跳过当日日终/收盘清扫/风控，且需重启才能补跑
+    expect(text).toContain('14:30')
+    expect(text).toContain('15:05')
+    expect(text).toContain('需重新启动')
+    expect(stopLiveSession).not.toHaveBeenCalled()
     w.unmount()
   })
 

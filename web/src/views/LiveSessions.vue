@@ -1516,6 +1516,15 @@ function netInflowOf(pid: number): string {
 }
 
 async function stopSession(id: number) {
+  // 二次确认（2026-11-20）：停止按钮紧挨会话行、一点就停，且停止会跳过当日日终，
+  // 必须先让操作者看到后果再发请求；取消则不发任何请求。
+  const name = sessions.value.find((s) => s.id === id)?.name
+  const label = name ? `「${name}」` : ` #${id}`
+  if (!window.confirm(
+    `确定停止会话${label}？\n\n`
+    + '停止后当日 14:30 日终估值与 15:05 收盘清扫、风控都不再执行；\n'
+    + '需重新启动该会话才能补跑。\n\n确认停止？'
+  )) return
   // 先停后端成功再关流（audit M3）：stop 后端会经流推 canceled 终态事件，
   // 先关流会错过清扫；API 失败则保持流开着（会话实际仍在运行）。
   try {
