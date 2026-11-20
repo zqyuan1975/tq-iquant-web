@@ -288,14 +288,24 @@ class SPAStaticFiles(StaticFiles):
     浏览器直接刷新不再返回 {"detail":"Not Found"}；/api 未知路径仍返回 JSON 404。"""
 
     async def get_response(self, path: str, scope):
+        # Windows 下 Starlette 会把路径分隔符转成反斜杠 → 归一化后再判断
+        normalized = path.replace("\\", "/").lstrip("/")
+        served_index = False
         try:
-            return await super().get_response(path, scope)
+            response = await super().get_response(path, scope)
         except _StarletteHTTPException as exc:
-            # Windows 下 Starlette 会把路径分隔符转成反斜杠 → 归一化后再判断
-            normalized = path.replace("\\", "/").lstrip("/")
             if exc.status_code == 404 and not normalized.startswith("api/"):
-                return await super().get_response("index.html", scope)
-            raise
+                response = await super().get_response("index.html", scope)
+                served_index = True
+            else:
+                raise
+        # 入口 HTML 不缓存（否则改了文案/资源哈希后浏览器仍拿旧入口）；
+        # 带内容哈希的 assets/* 长缓存 + immutable，内容变化必然换文件名。
+        if served_index or normalized in ("", ".", "index.html"):
+            response.headers["Cache-Control"] = "no-cache, must-revalidate, max-age=0"
+        elif normalized.startswith("assets/"):
+            response.headers["Cache-Control"] = "public, max-age=31536000, immutable"
+        return response
 
 def _is_frozen() -> bool:
     return hasattr(_sys, 'frozen') or (_sys.argv[0] and _sys.argv[0].endswith('.exe'))
