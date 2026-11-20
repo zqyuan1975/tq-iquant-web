@@ -1,3 +1,4 @@
+import os
 import sys
 from pathlib import Path
 from sqlalchemy import create_engine, event
@@ -11,7 +12,18 @@ _MAIN_DIR = Path(__file__).resolve().parent.parent
 
 
 def _db_path() -> Path:
-    """数据库路径：优先 config.yaml，fallback 到应用根目录（可写）。"""
+    """数据库路径：优先 config.yaml，fallback 到应用根目录（可写）。
+
+    ``TQ_DB_PATH`` 可显式覆盖（测试/演练用）：测试进程把它指到临时文件后，
+    任何走 ``SessionLocal`` 的 lifespan 逻辑（含 ``init_db``）都碰不到生产 dev.db。
+    相对路径锚定规则与 config.yaml 的 ``sqlite_path`` 完全一致。
+    """
+    override = os.environ.get("TQ_DB_PATH")
+    if override:
+        p = Path(override)
+        if not p.is_absolute():
+            p = (app_root() if use_app_root() else _MAIN_DIR) / p
+        return p
     cfg = load_config()
     sqlite_path = cfg.get("database", {}).get("sqlite_path", "data/dev.db")
     p = Path(sqlite_path)
@@ -53,12 +65,20 @@ def init_db():
     审计 #22：schema 变更必须全部走迁移链而非旁路建表，避免 create_all 与迁移链漂移。
     已迁移到 head 的库是 no-op；迁移失败则抛异常阻止应用启动（fail fast）。
 
+    **真实行为：应用每次启动都会自动迁移到 head**（`core.main` lifespan 调用本函数）。
+    测试进程必须设置 ``TQ_INIT_DB_DISABLED=1`` 跳过——否则 ``with TestClient(app)``
+    的 lifespan 会把真实 dev.db 静默升级（2026-11-20 12:35 实证：测试进程把生产库
+    从 g4a5b6c7d8e9 迁到 h5b6c7d8e9f0）。
+
     注意：刻意不加载 alembic.ini —— 否则 env.py 会执行 fileConfig()，其默认
     disable_existing_loggers=True 会禁用 core.* 等业务 logger，污染运行期日志与测试 caplog。
     用无参 Config + 绝对路径显式指定 script_location/prepend_sys_path；
-    url 由 alembic/env.py 的 _db_url() 从 config.yaml 读取并锚定 main/（与 db.py 同源），
-    因此无需 ini 的其余配置。
+    url 由 alembic/env.py 的 _db_url() 从 config.yaml / TQ_DB_PATH 读取并锚定 main/
+    （与 db.py 同源），因此无需 ini 的其余配置。
     """
+    if os.environ.get("TQ_INIT_DB_DISABLED") == "1":
+        return
+
     import sys
 
     from alembic import command

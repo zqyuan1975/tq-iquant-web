@@ -86,17 +86,22 @@ async def lifespan(app: FastAPI):
         # 目录移入 {work_dir}/_archive/<日期>/（空目录删除）。当前 running/stopping
         # 会话目录与引擎注册表键一律保留（cursor 仍在被消费的目录绝不动）；
         # 失败只告警，不得阻断启动。
-        try:
-            from core.engine.live.file_handoff import archive_stale_session_dirs
-            from core.services.live_service import ths_ui_config
-            from core.models import LiveSession as _LiveSession
-            active_ids = {
-                row.id for row in db.query(_LiveSession)
-                .filter(_LiveSession.status.in_(("running", "stopping"))).all()
-            } | set(ENGINES.keys())
-            archive_stale_session_dirs(ths_ui_config()["work_dir"], active_ids)
-        except Exception:  # noqa: BLE001 — 清理失败只告警
-            logger.warning("旧交接目录清理失败（忽略，不影响启动）", exc_info=True)
+        if os.environ.get("TQ_HANDOFF_ARCHIVE_DISABLED") == "1":
+            # 测试进程专用：conftest 把库切到临时文件后，这里读不到真实 running
+            # 会话，会把正在消费的会话目录误判为陈旧并归档（cursor 断供）。
+            logger.info("旧交接目录清理已禁用（TQ_HANDOFF_ARCHIVE_DISABLED=1）")
+        else:
+            try:
+                from core.engine.live.file_handoff import archive_stale_session_dirs
+                from core.services.live_service import ths_ui_config
+                from core.models import LiveSession as _LiveSession
+                active_ids = {
+                    row.id for row in db.query(_LiveSession)
+                    .filter(_LiveSession.status.in_(("running", "stopping"))).all()
+                } | set(ENGINES.keys())
+                archive_stale_session_dirs(ths_ui_config()["work_dir"], active_ids)
+            except Exception:  # noqa: BLE001 — 清理失败只告警
+                logger.warning("旧交接目录清理失败（忽略，不影响启动）", exc_info=True)
     # 进程内引擎存活监控（daemon 线程，30s 扫描）：只做「通道停摆 / 轮次卡住」
     # 的检测与告警（logger / SSE / live_decision_events），**不重启进程**——它随
     # 进程一起消失，没法救自己。进程级崩溃/无响应的自愈由 `--supervise` 父进程

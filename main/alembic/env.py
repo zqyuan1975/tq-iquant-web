@@ -1,4 +1,5 @@
 from logging.config import fileConfig
+import os
 from pathlib import Path
 
 from sqlalchemy import create_engine
@@ -25,7 +26,17 @@ _MAIN_DIR = Path(__file__).resolve().parent.parent
 
 
 def _db_url() -> str:
-    """从 config.yaml 读取数据库连接串，与 core.db 同源（打包版锚到可写根目录）。"""
+    """从 config.yaml 读取数据库连接串，与 core.db 同源（打包版锚到可写根目录）。
+
+    ``TQ_DB_PATH`` 覆盖规则与 ``core.db._db_path()`` 完全一致：命令行迁移与
+    应用运行期必须指向同一个库，否则会出现「迁移了 A 库、服务连 B 库」。
+    """
+    override = os.environ.get("TQ_DB_PATH")
+    if override:
+        db_file = Path(override)
+        if not db_file.is_absolute():
+            db_file = (app_root() if use_app_root() else _MAIN_DIR) / override
+        return f"sqlite:///{db_file.as_posix()}"
     cfg = load_config()
     sqlite_path = cfg.get("database", {}).get("sqlite_path", "data/dev.db")
     db_file = Path(sqlite_path)
