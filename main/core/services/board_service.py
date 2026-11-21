@@ -273,6 +273,54 @@ def _next_bar_label(ts: datetime) -> datetime:
     return datetime.combine(_next_trading_day(ts.date()), dtime(10, 0))
 
 
+def _prev_trading_day(day: date) -> date:
+    from core.engine.live.calendar import BUILTIN_CLOSURES
+
+    d = day - timedelta(days=1)
+    for _ in range(30):
+        if d.weekday() < 5 and d not in BUILTIN_CLOSURES.get(
+                d.year, frozenset()):
+            return d
+        d -= timedelta(days=1)
+    return d
+
+
+def _turn_bar_time(as_of: date, period: str, bull_dur: Optional[int],
+                   bar_closed_at: Optional[str]) -> Optional[str]:
+    """本轮「由空转多」那根 bar 的时间。
+
+    由 as_of / 最新 bar 往回推 bull_dur-1 根：日线按交易日回退，
+    30m 按 8 根/交易日 的 bar 序列回退，返回该 bar 的收盘时间。
+    """
+    if as_of is None or not bull_dur or int(bull_dur) <= 0:
+        return None
+    steps = int(bull_dur) - 1
+    if period != "30m":
+        d = as_of
+        for _ in range(steps):
+            d = _prev_trading_day(d)
+        return d.isoformat()
+    if not bar_closed_at:
+        return None
+    try:
+        ts = datetime.fromisoformat(str(bar_closed_at).replace(" ", "T"))
+    except ValueError:
+        return None
+    idx = len(_INTRADAY_SEQ) - 1
+    if ts.time() in _INTRADAY_SEQ:
+        idx = _INTRADAY_SEQ.index(ts.time())
+    d, rem = ts.date(), steps
+    while rem > 0:
+        if idx >= rem:
+            idx -= rem
+            rem = 0
+        else:
+            rem -= idx + 1
+            d = _prev_trading_day(d)
+            idx = len(_INTRADAY_SEQ) - 1
+    return datetime.combine(d, _INTRADAY_SEQ[idx]).isoformat(sep=" ")[:16]
+
+
 # ---------------- 快照计算 ----------------
 
 def _stale_flag(period: str, as_of: date, now: datetime) -> int:
@@ -713,7 +761,8 @@ def _bias_watch(bias_z, overbought, oversold) -> tuple:
 
 def serialize_industry(row: BoardIndustrySnapshot,
                        bench_bull: Optional[int] = None,
-                       rank: Optional[int] = None) -> dict:
+                       rank: Optional[int] = None,
+                       turn_at: Optional[str] = None) -> dict:
     lead = _lead_days(row.bull_dur, bench_bull)
     ob_watch, os_watch = _bias_watch(row.bias_z, row.overbought, row.oversold)
     return {
@@ -730,6 +779,7 @@ def serialize_industry(row: BoardIndustrySnapshot,
         "bull_dur": row.bull_dur,
         "bear_dur": row.bear_dur,
         "lead_days": lead,
+        "turned_at": turn_at,
         "bias": _f(row.bias),
         "bias_z": _f(row.bias_z),
         "overbought": bool(row.overbought),
@@ -836,8 +886,10 @@ def query_industries(db: Session, period: str, as_of: Optional[date] = None,
     return {
         "as_of": day.isoformat(),
         "benchmark_bull_dur": bench,
-        "rows": [serialize_industry(r, bench, i + 1)
-                 for i, r in enumerate(rows)],
+        "rows": [serialize_industry(
+            r, bench, i + 1,
+            _turn_bar_time(r.as_of, period, r.bull_dur, r.bar_closed_at))
+            for i, r in enumerate(rows)],
     }
 
 
@@ -855,8 +907,9 @@ def query_industry(db: Session, code: str, period: str,
     ).scalars().first()
     if row is None:
         return None
-    return serialize_industry(row,
-                              benchmark_bull_dur(db, period, benchmark, day))
+    return serialize_industry(
+        row, benchmark_bull_dur(db, period, benchmark, day), None,
+        _turn_bar_time(row.as_of, period, row.bull_dur, row.bar_closed_at))
 
 
 def query_stocks(db: Session, industry_code: str, period: str,

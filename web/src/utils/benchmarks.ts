@@ -16,6 +16,6 @@ export const BENCHMARKS: BenchmarkOption[] = [
   { code: '000852.SH', name: '中证1000' },
   { code: '000688.SH', name: '科创50' },
   { code: '399006.SZ', name: '创业板指' },
-  { code: '000001.SH', name: '上证指数' },
+  { code: '000016.SH', name: '上证50' },
   { code: '399001.SZ', name: '深证成指' },
 ]

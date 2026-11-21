@@ -57,6 +57,19 @@ function signed(v: number | null | undefined): string {
   return v > 0 ? `+${v}` : String(v)
 }
 
+function turnText(t: string | null): string {
+  if (!t) return '—'
+  return period.value === '1d' ? t.slice(0, 10) : t.slice(5, 16)
+}
+
+function turnTitle(t: string | null): string {
+  if (!t) return '本轮未由空转多'
+  const start = new Date(t.slice(0, 10) + 'T00:00:00')
+  const end = new Date((asOf.value || t.slice(0, 10)) + 'T00:00:00')
+  const days = Math.max(0, Math.round((end.getTime() - start.getTime()) / 86400000))
+  return `本轮转多起点：${t}（距最新数据 ${days} 天）`
+}
+
 function toneOf(row: BoardIndustryItem): string {
   return `dir-${gateDirectionTone(row.direction)}`
 }
@@ -274,7 +287,7 @@ onMounted(loadAll)
           <th class="sortable" @click="toggleSort('bias_z')">偏离 z{{ sortMark('bias_z') }}</th>
           <th>超买超卖</th>
           <th class="sortable" @click="toggleSort('lead_days')">领先大盘{{ sortMark('lead_days') }}</th>
-          <th>数据时间</th>
+          <th>发生时间</th>
         </tr>
       </thead>
       <tbody>
@@ -297,7 +310,7 @@ onMounted(loadAll)
             <span v-else class="muted">—</span>
           </td>
           <td class="num">{{ signed(r.lead_days) }}</td>
-          <td class="muted">{{ r.bar_closed_at || r.as_of || '—' }}</td>
+          <td class="muted turn-cell" :title="turnTitle(r.turned_at)">{{ turnText(r.turned_at) }}</td>
         </tr>
         <tr v-if="!industries.length">
           <td colspan="10" class="board-empty">
@@ -338,6 +351,12 @@ onMounted(loadAll)
         <div><span>JD 过滤</span><b class="num">{{ active.jd_filter > 0 ? '过热' : (active.jd_filter < 0 ? '过冷' : '中性') }}（{{ fmt(active.jd, 1) }}）</b></div>
         <div><span>轨道过滤</span><b>{{ active.channel_filter > 0 ? '上轨外' : (active.channel_filter < 0 ? '下轨外' : '轨内') }}</b></div>
         <div><span>领先大盘</span><b class="num">{{ signed(active.lead_days) }} 天</b></div>
+        <div>
+          <span>发生时间</span>
+          <b class="num" :title="turnTitle(active.turned_at)">
+            {{ active.turned_at || '—' }}
+          </b>
+        </div>
         <div><span>数据 / 生效</span><b class="num">{{ active.bar_closed_at || '—' }} → {{ active.effective_from || '—' }}</b></div>
       </div>
       <div class="drawer-sub">
@@ -445,6 +464,7 @@ onMounted(loadAll)
 .board-row:hover { background: var(--hover-bg); }
 .ind-name { font-weight: 600; }
 .ind-code { font-size: 10.5px; color: var(--ink-faint); }
+.turn-cell { font-size: 11.5px; white-space: nowrap; }
 .dir-badge { font-weight: 600; }
 .dir-bear { color: var(--green); }
 .dir-bull { color: var(--red); }

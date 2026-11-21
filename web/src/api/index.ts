@@ -890,6 +890,7 @@ export interface BoardIndustryItem {
   bull_dur: number | null
   bear_dur: number | null
   lead_days: number | null
+  turned_at: string | null
   bias: number | null
   bias_z: number | null
   overbought: boolean
