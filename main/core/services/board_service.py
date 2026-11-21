@@ -14,11 +14,13 @@ from __future__ import annotations
 import json
 import logging
 import re
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, time as dtime, timedelta
 from typing import Dict, Iterable, List, Optional, Tuple
 
+import pandas as pd
 import polars as pl
 from sqlalchemy import select
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
@@ -703,6 +705,9 @@ def latest_run(db: Session, period: str) -> Optional[BoardRun]:
 
 _BENCH_CACHE_TTL_SECONDS = 300
 _bench_cache: dict = {}
+_BREAKDOWN_TTL_SECONDS = 300
+_breakdown_cache: dict = {}
+_breakdown_lock = threading.Lock()
 
 
 def _benchmark_bull(code: str, day: date) -> Optional[int]:
@@ -724,6 +729,7 @@ def _benchmark_bull(code: str, day: date) -> Optional[int]:
 
 def clear_benchmark_cache() -> None:
     _bench_cache.clear()
+    _breakdown_cache.clear()
 
 
 def benchmark_bull_dur(db: Session, period: str,
@@ -928,6 +934,98 @@ def query_stocks(db: Session, industry_code: str, period: str,
     rows = list(db.execute(q.limit(limit)).scalars())
     return {"as_of": day.isoformat(),
             "rows": [serialize_stock(r, i + 1) for i, r in enumerate(rows)]}
+
+
+def _compute_breakdown(code: str, period: str, day: date) -> dict:
+    frames = _fetch_many([code], period, day)
+    df = frames.get(code)
+    if df is None or df.height == 0:
+        return {"available": False, "reason": "未取到行情数据", "bars": 0}
+    df = _truncate_as_of(df, day)
+    df, _, _ = _closed_bars(df, period, datetime.now())
+    if df.height == 0:
+        return {"available": False, "reason": "未取到已闭合行情", "bars": 0}
+    # min_bars=0 只用于取得真实根数，再自行判定 300 根门槛
+    frame = compute_rating_frame(df, min_bars=0)
+    if frame.empty:
+        return {"available": False, "reason": "行情不足，无法计算", "bars": 0}
+    last = frame.iloc[-1]
+    bars = int(last["bars"])
+    if bars < MIN_BARS:
+        return {"available": False,
+                "reason": f"有效根数 {bars} < 最少 {MIN_BARS} 根",
+                "bars": bars}
+    direction = int(last["direction"])
+    if direction == 0:
+        return {"available": False,
+                "reason": "当前方向未定（未形成多头/空头）", "bars": bars}
+    side = "up" if direction > 0 else "dn"
+    ma_count = int(last[f"{side}_ma_count"])
+    if side == "up":
+        volume_state = ("放量上涨" if bool(last["vol_up"])
+                        else ("多头量能（未放量）" if bool(last["up_enh"])
+                              else "无"))
+    else:
+        volume_state = ("放量下跌" if bool(last["vol_down"])
+                        else ("空头量能（未放量）" if bool(last["down_enh"])
+                              else "无"))
+
+    def item(key: str, label: str, col: str, mx: int) -> dict:
+        val = last[col]
+        return {"key": key, "label": label,
+                "score": round(float(val), 2) if pd.notna(val) else None,
+                "max": mx}
+
+    ts = last["date"]
+    if isinstance(ts, datetime):
+        as_of = ts.isoformat(sep=" ")
+    elif hasattr(ts, "isoformat"):
+        as_of = ts.isoformat()
+    else:
+        as_of = str(ts)
+    return {
+        "available": True,
+        "code": code,
+        "period": period,
+        "as_of": as_of,
+        "bars": bars,
+        "direction": direction,
+        "direction_label": "多头" if direction > 0 else "空头",
+        "side": side,
+        "strength": (round(float(last["cur_str"]), 2)
+                     if pd.notna(last["cur_str"]) else None),
+        "items": [
+            item("angle", "角度分", f"{side}_angle", 20),
+            item("ma", "均线分", f"{side}_ma", 25),
+            item("price", "价格分", f"{side}_price", 20),
+            item("bias", "偏离分", f"{side}_bias", 10),
+            item("pattern", "形态分", f"{side}_pattern", 10),
+            item("volume", "量能分", f"{side}_volume", 10),
+        ],
+        "ma_count": ma_count,
+        "ma_total": 3,
+        "volume_state": volume_state,
+    }
+
+
+def industry_breakdown(db: Session, code: str, period: str,
+                       as_of: Optional[date] = None) -> dict:
+    """单行业六项强度分解：按需重算 + 300s 缓存 + 全局串行限流。"""
+    day = resolve_as_of(db, period, as_of)
+    if day is None:
+        return {"available": False, "reason": "该周期暂无快照"}
+    key = (code, period, day)
+    hit = _breakdown_cache.get(key)
+    now = time.monotonic()
+    if hit is not None and now - hit[0] <= _BREAKDOWN_TTL_SECONDS:
+        return hit[1]
+    with _breakdown_lock:
+        hit = _breakdown_cache.get(key)
+        if hit is not None and time.monotonic() - hit[0] <= _BREAKDOWN_TTL_SECONDS:
+            return hit[1]
+        result = _compute_breakdown(code, period, day)
+        _breakdown_cache[key] = (time.monotonic(), result)
+        return result
 
 
 def query_leaders(db: Session, period: str, as_of: Optional[date] = None,

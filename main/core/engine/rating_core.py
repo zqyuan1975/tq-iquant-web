@@ -39,6 +39,11 @@ RATING_COLUMNS = [
     "up_str", "dn_str", "cur_str", "level",
     "overbought", "oversold", "jd_filter", "channel_filter",
     "bull_dur", "bear_dur",
+    # 六项强度分解（看板详情按需展示；不落库）
+    "up_angle", "up_ma", "up_price", "up_bias", "up_pattern", "up_volume",
+    "up_ma_count",
+    "dn_angle", "dn_ma", "dn_price", "dn_bias", "dn_pattern", "dn_volume",
+    "dn_ma_count", "vol_up", "vol_down",
 ]
 
 _LEVELS = ("strong_bull", "medium_bull", "weak_bull",
@@ -231,11 +236,15 @@ def compute_rating_frame(ohlcv, min_bars: int = MIN_BARS) -> pd.DataFrame:
                    + _lt(zo, co).astype(float)) / 3 * 25
     price_pts_long = (_gt(C, ao).astype(float) + _gt(C, bo).astype(float)
                       + _gt(C, zo).astype(float) + _gt(C, co).astype(float)) / 4 * 20
+    up_ma_count = (_lt(ao, bo).astype(float) + _lt(bo, zo).astype(float)
+                   + _lt(zo, co).astype(float))
+    up_pattern = _if(jj, 10, 0)
+    up_volume = _if(vol_up, 10, _if(up_enh, 5, 0))
     up_str = pd.Series(np.minimum(
         ang_long.fillna(0) + ma_pts_long.fillna(0) + price_pts_long
         + dev_long.fillna(0)
-        + _if(jj, 10, 0)
-        + _if(vol_up, 10, _if(up_enh, 5, 0)),
+        + up_pattern
+        + up_volume,
         100), index=idx)
 
     ang_short = _if(_ge(jd, -8), 0,
@@ -247,11 +256,15 @@ def compute_rating_frame(ohlcv, min_bars: int = MIN_BARS) -> pd.DataFrame:
                     + _gt(zo, co).astype(float)) / 3 * 25
     price_pts_short = (_lt(C, ao).astype(float) + _lt(C, bo).astype(float)
                        + _lt(C, zo).astype(float) + _lt(C, co).astype(float)) / 4 * 20
+    dn_ma_count = (_gt(ao, bo).astype(float) + _gt(bo, zo).astype(float)
+                   + _gt(zo, co).astype(float))
+    dn_pattern = _if(bear_pattern, 10, 0)
+    dn_volume = _if(vol_down, 10, _if(down_enh, 5, 0))
     dn_str = pd.Series(np.minimum(
         ang_short.fillna(0) + ma_pts_short.fillna(0) + price_pts_short
         + dev_short.fillna(0)
-        + _if(bear_pattern, 10, 0)
-        + _if(vol_down, 10, _if(down_enh, 5, 0)),
+        + dn_pattern
+        + dn_volume,
         100), index=idx)
 
     cur_str = _if(up_enh, up_str, _if(down_enh, dn_str, 0))
@@ -303,5 +316,21 @@ def compute_rating_frame(ohlcv, min_bars: int = MIN_BARS) -> pd.DataFrame:
         "channel_filter": channel_filter.to_numpy(),
         "bull_dur": bull_dur.to_numpy(),
         "bear_dur": bear_dur.to_numpy(),
+        "up_angle": ang_long.to_numpy(),
+        "up_ma": ma_pts_long.to_numpy(),
+        "up_price": price_pts_long.to_numpy(),
+        "up_bias": dev_long.to_numpy(),
+        "up_pattern": up_pattern.to_numpy(),
+        "up_volume": up_volume.to_numpy(),
+        "up_ma_count": up_ma_count.to_numpy(),
+        "dn_angle": ang_short.to_numpy(),
+        "dn_ma": ma_pts_short.to_numpy(),
+        "dn_price": price_pts_short.to_numpy(),
+        "dn_bias": dev_short.to_numpy(),
+        "dn_pattern": dn_pattern.to_numpy(),
+        "dn_volume": dn_volume.to_numpy(),
+        "dn_ma_count": dn_ma_count.to_numpy(),
+        "vol_up": vol_up.to_numpy(),
+        "vol_down": vol_down.to_numpy(),
     })
     return out[RATING_COLUMNS]

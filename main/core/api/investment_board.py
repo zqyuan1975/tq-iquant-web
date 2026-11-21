@@ -141,6 +141,17 @@ def get_industry(code: str, period: str = "1d", date: str = "",
     return ok(row)
 
 
+@router.get("/industries/{code}/breakdown")
+def get_industry_breakdown(code: str, period: str = "1d", date: str = "",
+                           db: Session = Depends(get_db)):
+    """单行业六项强度分解（按需重算，300s 缓存，不落库）。"""
+    try:
+        p = _check_period(period)
+    except ValueError as exc:
+        return err(422, str(exc))
+    return ok(svc.industry_breakdown(db, code.upper(), p, _parse_date(date)))
+
+
 @router.get("/industries/{code}/stocks")
 def get_industry_stocks(code: str, period: str = "1d", date: str = "",
                         sort: str = "lead_days", order: str = "desc",

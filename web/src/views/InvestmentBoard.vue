@@ -6,9 +6,9 @@ import { onMounted, ref } from 'vue'
 import PageHeader from '../components/PageHeader.vue'
 import MarketGatePanel from '../components/board/MarketGatePanel.vue'
 import {
-  getBoardIndustries, getBoardIndustry, getBoardIndustryStocks, getBoardRun,
-  getBoardLeaders, getBoardMeta, getBoardSummary, refreshBoard,
-  type BoardIndustryItem, type BoardMeta, type BoardStockItem,
+  getBoardBreakdown, getBoardIndustries, getBoardIndustry, getBoardIndustryStocks,
+  getBoardRun, getBoardLeaders, getBoardMeta, getBoardSummary, refreshBoard,
+  type BoardBreakdown, type BoardIndustryItem, type BoardMeta, type BoardStockItem,
 } from '../api'
 import { gateDirectionTone } from '../utils/marketGate'
 import { DEFAULT_BENCHMARK } from '../utils/benchmarks'
@@ -36,6 +36,8 @@ const active = ref<BoardIndustryItem | null>(null)
 const activeStocks = ref<BoardStockItem[]>([])
 const stocksReason = ref('')
 const drawerLoading = ref(false)
+const breakdown = ref<BoardBreakdown | null>(null)
+const breakdownLoading = ref(false)
 
 const refreshScope = ref<'industries' | 'all'>('industries')
 const refreshing = ref(false)
@@ -62,12 +64,14 @@ function turnText(t: string | null): string {
   return period.value === '1d' ? t.slice(0, 10) : t.slice(5, 16)
 }
 
-function turnTitle(t: string | null): string {
+function turnTitle(t: string | null, bullDur: number | null): string {
   if (!t) return '本轮未由空转多'
-  const start = new Date(t.slice(0, 10) + 'T00:00:00')
-  const end = new Date((asOf.value || t.slice(0, 10)) + 'T00:00:00')
-  const days = Math.max(0, Math.round((end.getTime() - start.getTime()) / 86400000))
-  return `本轮转多起点：${t}（距最新数据 ${days} 天）`
+  const n = bullDur ?? 0
+  const elapsed = Math.max(0, n - 1)
+  if (period.value === '1d') {
+    return `本轮转多起点：${t}；距今 ${elapsed} 个交易日（不含起点，含起点共 ${n} 根）`
+  }
+  return `本轮转多起点：${t}；距今 ${elapsed} 根 30m bar（不含起点，含起点共 ${n} 根）`
 }
 
 function toneOf(row: BoardIndustryItem): string {
@@ -131,30 +135,41 @@ async function openIndustry(row: BoardIndustryItem) {
   active.value = row
   activeStocks.value = []
   stocksReason.value = ''
+  breakdown.value = null
   drawerLoading.value = true
+  breakdownLoading.value = true
   try {
-    const [detail, stocks] = await Promise.all([
+    const [detail, stocks, bd] = await Promise.all([
       getBoardIndustry(row.code, { period: period.value, benchmark: benchmark.value }).catch(() => row),
       getBoardIndustryStocks(row.code, {
         period: period.value, sort: 'lead_days', limit: 200,
         // 30m 成分股不落全量快照，打开抽屉时按需计算（行业须 30m bull_dur=1）
         compute: period.value === '30m',
       }),
+      getBoardBreakdown(row.code, { period: period.value }).catch(() => null),
     ])
     active.value = detail || row
     activeStocks.value = stocks.rows
     stocksReason.value = stocks.reason || ''
+    breakdown.value = bd
   } catch (e) {
     errorMsg.value = '加载成分股失败：' + errMsg(e)
   } finally {
     drawerLoading.value = false
+    breakdownLoading.value = false
   }
+}
+
+function barWidth(it: { score: number | null; max: number }): string {
+  if (!it.score || it.max <= 0) return '0%'
+  return `${Math.min(100, Math.max(0, (it.score / it.max) * 100))}%`
 }
 
 function closeDrawer() {
   active.value = null
   activeStocks.value = []
   stocksReason.value = ''
+  breakdown.value = null
 }
 
 async function doRefresh() {
@@ -310,7 +325,7 @@ onMounted(loadAll)
             <span v-else class="muted">—</span>
           </td>
           <td class="num">{{ signed(r.lead_days) }}</td>
-          <td class="muted turn-cell" :title="turnTitle(r.turned_at)">{{ turnText(r.turned_at) }}</td>
+          <td class="muted turn-cell" :title="turnTitle(r.turned_at, r.bull_dur)">{{ turnText(r.turned_at) }}</td>
         </tr>
         <tr v-if="!industries.length">
           <td colspan="10" class="board-empty">
@@ -334,6 +349,8 @@ onMounted(loadAll)
       <div class="drawer-stats">
         <div><span>方向</span><b :class="`dir-${gateDirectionTone(active.direction)}`">{{ active.direction_label }}</b></div>
         <div><span>强度</span><b class="num">{{ fmt(active.strength) }}</b></div>
+        <div><span>多头强度</span><b class="num">{{ fmt(active.up_str, 1) }}</b></div>
+        <div><span>空头强度</span><b class="num">{{ fmt(active.dn_str, 1) }}</b></div>
         <div><span>等级</span><b>{{ active.level_label }}</b></div>
         <div><span>多头持续</span><b class="num">{{ fmt(active.bull_dur) }}</b></div>
         <div><span>偏离 z</span><b class="num">{{ fmt(active.bias_z, 2) }}</b></div>
@@ -353,11 +370,39 @@ onMounted(loadAll)
         <div><span>领先大盘</span><b class="num">{{ signed(active.lead_days) }} 天</b></div>
         <div>
           <span>发生时间</span>
-          <b class="num" :title="turnTitle(active.turned_at)">
+          <b class="num" :title="turnTitle(active.turned_at, active.bull_dur)">
             {{ active.turned_at || '—' }}
           </b>
         </div>
         <div><span>数据 / 生效</span><b class="num">{{ active.bar_closed_at || '—' }} → {{ active.effective_from || '—' }}</b></div>
+      </div>
+
+      <div class="drawer-note">总强度取当前方向那一侧：多头取多头强度，空头取空头强度。</div>
+
+      <div class="bd-card">
+        <div class="bd-head">
+          <span>强度分解</span>
+          <span class="bd-hint">上限：角度 20 / 均线 25 / 价格 20 / 偏离 10 / 形态 10 / 量能 10</span>
+        </div>
+        <div v-if="breakdownLoading" class="bd-note">正在重算该行业历史…</div>
+        <div v-else-if="!breakdown || !breakdown.available" class="bd-note bd-unavailable">
+          {{ breakdown?.reason || '强度分解暂不可用' }}
+        </div>
+        <template v-else>
+          <div v-for="it in (breakdown.items || [])" :key="it.key" class="bd-row">
+            <span class="bd-label">{{ it.label }}</span>
+            <div class="bd-track">
+              <div class="bd-fill" :class="breakdown.side === 'up' ? 'is-up' : 'is-dn'"
+                   :style="{ width: barWidth(it) }"></div>
+            </div>
+            <span class="bd-score num">{{ fmt(it.score, 1) }} / {{ it.max }}</span>
+          </div>
+          <div class="bd-meta">
+            <span>均线排列 {{ breakdown.ma_count }}/{{ breakdown.ma_total }}</span>
+            <span>量能状态 {{ breakdown.volume_state }}</span>
+            <span>{{ breakdown.direction_label }} · 有效根数 {{ breakdown.bars }} · {{ breakdown.as_of }}</span>
+          </div>
+        </template>
       </div>
       <div class="drawer-sub">
         成分股领先榜（相对行业指数）
@@ -512,6 +557,20 @@ onMounted(loadAll)
   text-align: left; padding: 7px 8px; border-top: 1px solid var(--line); vertical-align: top;
 }
 .drawer-table-wrap th { color: var(--ink-faint); font-size: 11px; font-weight: 600; }
+.drawer-note { font-size: 11px; color: var(--ink-faint); margin: -6px 0 10px; }
+.bd-card { border: 1px solid var(--line); border-radius: 8px; padding: 10px 14px; margin-bottom: 12px; }
+.bd-head { display: flex; justify-content: space-between; gap: 10px; font-size: 12.5px; font-weight: 700; margin-bottom: 8px; }
+.bd-hint { font-weight: 400; font-size: 10.5px; color: var(--ink-faint); }
+.bd-note { font-size: 12px; color: var(--ink-faint); padding: 4px 0 2px; }
+.bd-unavailable { color: var(--amber, #b7791f); }
+.bd-row { display: grid; grid-template-columns: 52px minmax(0, 1fr) 72px; align-items: center; gap: 10px; margin: 5px 0; }
+.bd-label { font-size: 11.5px; color: var(--ink-soft); }
+.bd-track { height: 7px; background: var(--line); border-radius: 99px; overflow: hidden; }
+.bd-fill { height: 100%; border-radius: 99px; }
+.bd-fill.is-up { background: var(--red); }
+.bd-fill.is-dn { background: var(--green); }
+.bd-score { font-size: 11px; color: var(--ink-soft); text-align: right; }
+.bd-meta { display: flex; flex-wrap: wrap; gap: 4px 14px; margin-top: 8px; font-size: 10.5px; color: var(--ink-faint); }
 
 @media (max-width: 900px) {
   .leader-grid { grid-template-columns: minmax(0, 1fr); }

@@ -1032,6 +1032,39 @@ export async function getBoardIndustryStocks(code: string, params: {
   return res.data.data
 }
 
+export interface BoardBreakdownItem {
+  key: string
+  label: string
+  score: number | null
+  max: number
+}
+
+export interface BoardBreakdown {
+  available: boolean
+  reason?: string
+  code?: string
+  period?: string
+  as_of?: string
+  bars?: number
+  direction?: number
+  direction_label?: string
+  side?: 'up' | 'dn'
+  strength?: number | null
+  items?: BoardBreakdownItem[]
+  ma_count?: number
+  ma_total?: number
+  volume_state?: string
+}
+
+export async function getBoardBreakdown(code: string, params: {
+  period?: string
+  date?: string
+} = {}) {
+  const res = await api.get<ApiResponse<BoardBreakdown>>(
+    `/investment-board/industries/${code}/breakdown`, { params })
+  return res.data.data
+}
+
 export async function getBoardLeaders(params: {
   period?: string
   date?: string
