@@ -2,13 +2,13 @@
 // 投资看板（只读）：市场多空状态（整体迁移自备选股池）+ 128 个 881 二级行业
 // 相对大盘的多头先后 + 行业成分股相对行业指数的领先 + 日线/30m 双视图。
 // 不接下单、不进 market_gate、不改变任何策略与风控行为。
-import { computed, onMounted, ref } from 'vue'
+import { onMounted, ref } from 'vue'
 import PageHeader from '../components/PageHeader.vue'
 import MarketGatePanel from '../components/board/MarketGatePanel.vue'
 import {
-  getBoardIndustries, getBoardIndustry, getBoardIndustryStocks,
-  getBoardLeaders, getBoardMeta, getBoardRun, getBoardSummary, refreshBoard,
-  type BoardIndustryItem, type BoardMeta, type BoardRunInfo, type BoardStockItem,
+  getBoardIndustries, getBoardIndustry, getBoardIndustryStocks, getBoardRun,
+  getBoardLeaders, getBoardMeta, getBoardSummary, refreshBoard,
+  type BoardIndustryItem, type BoardMeta, type BoardStockItem,
 } from '../api'
 import { gateDirectionTone } from '../utils/marketGate'
 
@@ -22,7 +22,6 @@ const leaders = ref<{ sustained: BoardIndustryItem[]; reversal: BoardIndustryIte
   sustained: [], reversal: [], excess: [],
 })
 const asOf = ref<string | null>(null)
-const effectiveFrom = ref<string | null>(null)
 const loading = ref(false)
 const errorMsg = ref('')
 
@@ -36,7 +35,6 @@ const drawerLoading = ref(false)
 
 const refreshScope = ref<'industries' | 'all'>('industries')
 const refreshing = ref(false)
-const run = ref<BoardRunInfo | null>(null)
 
 function errMsg(e: any): string {
   const d = e?.response?.data
@@ -59,18 +57,6 @@ function toneOf(row: BoardIndustryItem): string {
   return `dir-${gateDirectionTone(row.direction)}`
 }
 
-const dataTime = computed(() => {
-  if (!industries.value.length) return asOf.value || '—'
-  const row = industries.value[0]
-  return row.bar_closed_at || row.as_of || '—'
-})
-
-const universeText = computed(() => {
-  const u = meta.value?.universe
-  if (!u) return '—'
-  return `${u.count} / ${u.expected}${u.ok ? '' : '（名单不一致）'}`
-})
-
 async function loadAll() {
   loading.value = true
   errorMsg.value = ''
@@ -83,7 +69,6 @@ async function loadAll() {
     ])
     industries.value = ind.rows
     asOf.value = ind.as_of
-    effectiveFrom.value = ind.rows[0]?.effective_from || null
     leaders.value = { sustained: lead.sustained, reversal: lead.reversal, excess: lead.excess }
     meta.value = m
     const summary = await getBoardSummary({ period: p }).catch(() => null)
@@ -156,7 +141,6 @@ async function doRefresh() {
 async function pollRun(runId: number) {
   for (let i = 0; i < 180; i += 1) {
     const info = await getBoardRun(runId)
-    run.value = info
     if (info.status !== 'running') break
     await new Promise((resolve) => setTimeout(resolve, 2000))
   }
@@ -182,21 +166,6 @@ onMounted(loadAll)
       {{ refreshing ? '刷新中…' : '刷新' }}
     </button>
   </PageHeader>
-
-  <!-- A 口径条 -->
-  <div class="card board-meta">
-    <span class="meta-pill">公式 <b>{{ meta?.formula_version || '—' }}</b></span>
-    <span class="meta-pill">方向口径 <b>{{ meta?.direction_basis === 'm_enh' ? 'ENH' : (meta?.direction_basis || '—') }}</b></span>
-    <span class="meta-pill">超买超卖 <b>z({{ meta?.bias_z.window ?? 250 }}, k={{ meta?.bias_z.k ?? 2.5 }})</b></span>
-    <span class="meta-pill">最小根数 <b>{{ meta?.min_bars ?? 300 }}</b></span>
-    <span class="meta-pill">881 名单 <b>{{ universeText }}</b></span>
-    <span class="meta-pill">数据 <b>{{ dataTime }}</b></span>
-    <span v-if="effectiveFrom" class="meta-pill">生效 <b>{{ effectiveFrom }}</b></span>
-    <span v-if="run" class="meta-pill" :class="{ 'is-run': run.status === 'running' }">
-      任务 #{{ run.id }} <b>{{ run.status }}</b>
-      <template v-if="run.status === 'running' && run.total">（{{ run.ok }}/{{ run.total }}）</template>
-    </span>
-  </div>
 
   <div v-if="errorMsg" class="card board-error">{{ errorMsg }}</div>
 
@@ -400,15 +369,6 @@ onMounted(loadAll)
   height: 27px; padding: 0 8px; border: 1px solid var(--border);
   border-radius: var(--radius); background: var(--bg); color: var(--ink); font-size: 12px;
 }
-
-/* A 口径条 */
-.board-meta {
-  display: flex; flex-wrap: wrap; gap: 6px 10px; align-items: center;
-  padding: 9px 14px; margin-bottom: 12px; font-size: 11.5px; color: var(--ink-soft);
-}
-.meta-pill { padding: 2px 9px; border: 1px solid var(--line); border-radius: 99px; }
-.meta-pill b { font-weight: 600; color: var(--ink); }
-.meta-pill.is-run b { color: var(--accent); }
 
 .board-error {
   padding: 10px 14px; margin-bottom: 12px; color: var(--red);
