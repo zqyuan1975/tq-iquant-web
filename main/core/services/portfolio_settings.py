@@ -138,6 +138,22 @@ def _coerce_industry_value(key: str, value) -> object:
         return default
 
 
+def industry_data_needed(settings: Dict[str, object]) -> bool:
+    """任一需要行业日线数据的开关打开时返回 True（全关 → 不取数、零开销）。"""
+    cfg = dict(settings or {})
+    if str(cfg.get("industry_gate_mode") or "off") != "off":
+        return True
+    for key in ("industry_rank_enabled", "industry_weight_enabled",
+                "industry_overbought_block", "industry_trail_tighten_enabled",
+                "industry_divergence_hint"):
+        if bool(cfg.get(key, False)):
+            return True
+    try:
+        return float(cfg.get("industry_bear_reduce_ratio", 0) or 0) > 0
+    except (TypeError, ValueError):
+        return False
+
+
 def get_industry_settings(portfolio_id: int,
                           path: Optional[os.PathLike | str] = None) -> Dict[str, object]:
     """组合的行业层开关（缺失/非法一律回落默认=全部关闭）。"""

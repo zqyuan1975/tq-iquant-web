@@ -4692,7 +4692,7 @@ def run_backtest(db: Session, ps: PortfolioStrategy, req,
     _industry_settings = portfolio_settings.get_industry_settings(ps.id)
     industry_tracker = (
         build_industry_tracker(req.start_date, req.end_date)
-        if _industry_settings["industry_gate_mode"] != "off" else None
+        if portfolio_settings.industry_data_needed(_industry_settings) else None
     )
 
     # 公司行为（J1/J2，2026-11-18）：组合开关默认关。关闭时不读事件表、不注入
@@ -5331,7 +5331,7 @@ def run_multi_backtest(db: Session, portfolios: list, req) -> dict:
         # 行业层组合开关（默认全关）：任一组合开启即整批构建一份共享行业轴
         _industry_settings = portfolio_settings.get_industry_settings(ps.id)
         portfolio.configure_industry(_industry_settings)
-        if _industry_settings["industry_gate_mode"] != "off":
+        if portfolio_settings.industry_data_needed(_industry_settings):
             _industry_enabled = True
         # 层 1 容量模型（run 级；各组合共享同一 CapacityBudget 实现跨策略聚合）
         portfolio.capacity_model = capacity_model

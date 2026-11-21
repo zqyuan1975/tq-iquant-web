@@ -1564,7 +1564,7 @@ def build_engine(
         # 行业层组合开关：会话启动时一次性读入内存；全关时零开销、行为不变。
         _industry_settings = portfolio_settings.get_industry_settings(ps.id)
         port.configure_industry(_industry_settings)
-        if _industry_settings["industry_gate_mode"] != "off":
+        if portfolio_settings.industry_data_needed(_industry_settings):
             industry_specs[ps.id] = _industry_settings
         try:
             weight = float(ps.initial_capital or 0)

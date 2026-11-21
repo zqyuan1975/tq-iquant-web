@@ -190,6 +190,10 @@ class Portfolio:
         self.industry_divergence_hint: bool = False
         # 行业数据缺失 WARNING 去重（每只股票每进程只告警一次）
         self._industry_missing_warned: set = set()
+        # B 跨策略排序（默认关）：个股 OPEN 信号持续天数（首次出现日记起，缺席即清）
+        # 仅排序开启时读写；关闭时零开销。
+        self._open_signal_first_seen: Dict[tuple, date] = {}
+        self._open_signal_seen: set = set()
         # 公司行为（2026-11-18，J1/J2）：手工事件时间线，None = 未启用（默认）。
         # 由 backtest_service / live_service 在组合开关打开时注入；注入后
         # BacktestEngine / LiveEngine 每交易日调一次 corporate_actions.apply_day。
@@ -653,6 +657,11 @@ class Portfolio:
         if rot_cap:
             self._feed_price_history(bar, rot_cap + 2)
         orders: List[OrderEvent] = self._breaker_disposal_orders(bar)
+        # B 跨策略 OPEN 排序（默认关）：仅在开关打开且行业轴可用时收集延迟下单；
+        # 否则 open_sink=None，走原逐策略路径（行为逐位不变）。
+        rank_opens = bool(self.industry_rank_enabled
+                          and self.current_industry_gate is not None)
+        deferred_opens: Optional[list] = [] if rank_opens else None
         for ctx in self.strategies:
             skip_risk = (inflight_risk_sells or {}).get(ctx.strategy_id) or set()
             if period is not None and ctx.period != period:
@@ -667,7 +676,8 @@ class Portfolio:
                         skip_risk_codes=skip_risk))
                 continue
             strat_orders = self._process_strategy(
-                ctx, bar, signal_cache, inflight, skip_risk_codes=skip_risk)
+                ctx, bar, signal_cache, inflight, skip_risk_codes=skip_risk,
+                open_sink=deferred_opens)
             orders.extend(strat_orders)
             # follow_master 状态镜像：slave 处理完自身信号后，对"master 已不再持有"的
             # 持仓股全平（本 bar 已自行卖出的股票去重）。以 master 的已成交持仓为准，
@@ -678,6 +688,13 @@ class Portfolio:
                     if o.trade_type == TradeType.SELL
                 }
                 orders.extend(self._follow_master_state(ctx, bar, already_sold))
+        # B 跨策略排序：全部策略收集完成后统一排序下单（行业领先天数 → 强度 →
+        # 个股信号持续天数 → 信号时间），再交给原有 max_holdings/max_positions 闸门
+        # 截断。关闭时 deferred_opens=None，本段不执行。
+        if deferred_opens:
+            orders.extend(self._execute_ranked_opens(deferred_opens, bar, inflight))
+        if rank_opens:
+            self._prune_open_signals()
         # 主从同 bar 时序守卫：slave 的 OPEN 门禁查的是 master 的"已成交"持仓
         # （_has_position），当 master 在本 bar 也决定清仓某股时（其 SELL 尚未成交，
         # 门禁误判 master 仍持有）→ slave 会买入 master 正卖出的同一只股票，违背
@@ -805,10 +822,115 @@ class Portfolio:
                 self.portfolio_id, action, len(orders))
         return orders
 
+    def _note_open_signal(self, ctx: StrategyContext, sig: SignalEvent,
+                          bar: BarEvent) -> None:
+        """登记本 bar 出现的 OPEN 信号（用于「个股信号持续天数」排序键）。"""
+        key = (ctx.strategy_id, sig.stock_code)
+        day = bar.bar_time.date()
+        self._open_signal_first_seen.setdefault(key, day)
+        self._open_signal_seen.add(key)
+
+    def _open_signal_age(self, strategy_id: int, code: str, day: date) -> int:
+        first = self._open_signal_first_seen.get((strategy_id, code))
+        return max(0, (day - first).days) if first is not None else 0
+
+    def _prune_open_signals(self) -> None:
+        """清理本 bar 未再出现的信号持续天数，避免旧记录把天数虚高。"""
+        stale = [k for k in self._open_signal_first_seen
+                 if k not in self._open_signal_seen]
+        for key in stale:
+            self._open_signal_first_seen.pop(key, None)
+        self._open_signal_seen.clear()
+
+    def _industry_exposure(self, ind, inflight) -> Dict[str, int]:
+        """当前行业敞口（已有持仓 + 在途买单），用于同行业上限计数。"""
+        codes = set()
+        for ctx in self.strategies:
+            for code, pos in self._iter_positions(ctx):
+                if pos.quantity > 0:
+                    codes.add(code)
+        for pending in (inflight or {}).values():
+            codes.update(pending)
+        counts: Dict[str, int] = {}
+        for code in codes:
+            industry = ind.industry_of(code)
+            if industry:
+                counts[industry] = counts.get(industry, 0) + 1
+        return counts
+
+    def _execute_ranked_opens(self, candidates: list, bar: BarEvent,
+                              inflight: Dict[int, set]) -> List[OrderEvent]:
+        """B：跨策略 OPEN 统一排序后下单（仅 industry_rank_enabled 且行业轴可用时）。
+
+        排序键：行业领先天数↓ → 行业强度↓ → 个股信号持续天数↓ → 信号时间↑。
+        同行业持仓上限（含已有持仓与在途）在此处按排序结果逐个占用额度；
+        原 max_holdings/max_positions 闸门仍在 ``_signal_to_order`` 内生效。
+        """
+        ind = self.current_industry_gate
+        day = bar.bar_time.date()
+        cap = int(self.industry_max_per_industry or 0)
+        counts = self._industry_exposure(ind, inflight) if cap > 0 else {}
+
+        def _key(item):
+            ctx, sig = item
+            try:
+                lead = ind.bull_dur_for_stock(sig.stock_code, day)
+                strength = ind.strength_for_stock(sig.stock_code, day)
+            except Exception:  # noqa: BLE001
+                lead, strength = 0, 0.0
+            age = self._open_signal_age(ctx.strategy_id, sig.stock_code, day)
+            return (-lead, -strength, -age,
+                    getattr(sig, "bar_time", bar.bar_time), sig.stock_code)
+
+        orders: List[OrderEvent] = []
+        # 组合级名额：已成交持仓 + 本 bar 已排序下单的股票（排序后才截断，
+        # 即「6 选 5」的 5）。轮动换出全平则释放名额。
+        held_codes = {
+            code for c in self.strategies
+            for code, pos in self._iter_positions(c) if pos.quantity > 0
+        }
+        for ctx, sig in sorted(candidates, key=_key):
+            industry = ind.industry_of(sig.stock_code)
+            if (self.max_holdings and len(held_codes) >= self.max_holdings
+                    and sig.stock_code not in held_codes):
+                self._rec(
+                    "max_holdings", "portfolio", "block", ctx, sig, bar,
+                    param_name="max_holdings",
+                    param_value=float(self.max_holdings),
+                    actual_value=float(len(held_codes)),
+                    message="组合持仓数 %d/%d 已达上限，排序后 %s 不开新仓"
+                            % (len(held_codes), self.max_holdings, sig.stock_code),
+                )
+                continue
+            if cap > 0 and industry and counts.get(industry, 0) >= cap:
+                self._rec(
+                    "industry_cap", "signal_gate", "block", ctx, sig, bar,
+                    param_name="industry_max_per_industry",
+                    param_value=float(cap),
+                    actual_value=float(counts.get(industry, 0)),
+                    message="同行业持仓上限：行业 %s 已持有/在途 %d ≥ %d，%s 不开新仓"
+                            % (industry, counts.get(industry, 0), cap, sig.stock_code),
+                )
+                continue
+            new_orders = self._signal_to_order(ctx, sig, bar, inflight, set())
+            if not new_orders:
+                continue
+            orders.extend(new_orders)
+            for order in new_orders:
+                if order.trade_type == TradeType.BUY:
+                    held_codes.add(order.stock_code)
+                elif (order.trade_type == TradeType.SELL
+                      and order.signal_type in _FULL_CLOSE_TYPES):
+                    held_codes.discard(order.stock_code)
+            if industry:
+                counts[industry] = counts.get(industry, 0) + 1
+        return orders
+
     def _process_strategy(
         self, ctx: StrategyContext, bar: BarEvent, signal_cache,
         inflight: Dict[int, set], include_signals: bool = True,
         skip_risk_codes: Optional[set] = None,
+        open_sink: Optional[list] = None,
     ) -> List[OrderEvent]:
         """单策略 bar 处理：公式信号 + 风控检查 → 合并排序 → 转订单。
 
@@ -817,6 +939,8 @@ class Portfolio:
         （实盘快照合成 1m bar 盘中风控；信号周期锁不受影响）。
         skip_risk_codes：在途风控卖单未结清的股票（含缩量残量）→ 跳过风控评估，
         避免同一持仓重复触发；峰值仍由 _check_risks_locked 内部刷新。
+        open_sink：非 None 时（B 跨策略排序开启）把 OPEN 信号收集到该列表，
+        由 on_bar 在全部策略处理完后统一排序下单；其它类型信号仍即时转订单。
         """
         signals = (
             ctx.get_signal(bar, signal_cache=signal_cache)
@@ -839,6 +963,11 @@ class Portfolio:
         for sig in all_signals:
             if sig.stock_code in cleared:
                 # 该股票已清仓，跳过后续公式信号（风控信号不会重复，仍跳过）
+                continue
+            if open_sink is not None and sig.signal_type == SignalType.OPEN:
+                # B 跨策略排序：延迟到全部策略处理完，按行业强弱统一排序下单
+                open_sink.append((ctx, sig))
+                self._note_open_signal(ctx, sig, bar)
                 continue
             new_orders = self._signal_to_order(ctx, sig, bar, inflight, cleared)
             if not new_orders:
