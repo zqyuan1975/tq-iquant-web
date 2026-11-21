@@ -1517,6 +1517,9 @@ def build_engine(
     # build_engine 之后 commit/expire 触发 DetachedInstanceError）。
     # 只收集启用了门控的组合；未启用的组合不进 provider，零额外 TQ 取数。
     gate_specs: Dict[int, dict] = {}
+    # 行业层决策（2026-11-22）：组合 → 开关字典。只收集启用了行业门控的组合；
+    # 全部关闭时 provider=None、不取数，行为与接线前逐位一致。
+    industry_specs: Dict[int, dict] = {}
     # 公司行为（2026-11-18，J1/J2）：组合 → 标量配置；事件内容由 provider 现读
     # 手工事件表（同一张 corporate_actions，与回测同口径）。默认空 = 未启用。
     ca_specs: Dict[int, dict] = {}
@@ -1558,6 +1561,11 @@ def build_engine(
         # 改完需重启会话才生效（与 sell_scope 即时切换不同）。实盘只按 cap
         # 封顶（distribute 出金仅回测模拟，实盘不自动出金）。
         port.equity_cap_mode = portfolio_settings.get_equity_cap_mode(ps.id)
+        # 行业层组合开关：会话启动时一次性读入内存；全关时零开销、行为不变。
+        _industry_settings = portfolio_settings.get_industry_settings(ps.id)
+        port.configure_industry(_industry_settings)
+        if _industry_settings["industry_gate_mode"] != "off":
+            industry_specs[ps.id] = _industry_settings
         try:
             weight = float(ps.initial_capital or 0)
         except (TypeError, ValueError):
@@ -1715,6 +1723,20 @@ def build_engine(
         # 这里传 end_date-365 天 → 实际回看约 865 天（≈600 根日线），MA288 余量充足。
         return build_gate_tracker(
             SimpleNamespace(**spec), end_date - timedelta(days=365), end_date)
+
+    def _industry_gate_provider(portfolio_id: int, end_date):
+        """行业层决策数据：按需构建/命中进程内缓存（每组合每交易日一次）。
+
+        取数窗口 = end_date 前 500 自然日（覆盖 300 交易日预热）；构建失败或
+        行业不足 300 根由 industry_data 内部返回 error tracker，决策层 fail-open。
+        """
+        if portfolio_id not in industry_specs:
+            return None
+        from core.services.industry_data import (
+            INDUSTRY_LIVE_SPAN_DAYS, build_industry_tracker,
+        )
+        return build_industry_tracker(
+            end_date - timedelta(days=INDUSTRY_LIVE_SPAN_DAYS), end_date)
 
     def _corporate_timeline_provider(portfolio_id: int):
         """公司行为（J1/J2）：现读手工事件表返回时间线（每组合每日一次）。
@@ -1993,6 +2015,9 @@ def build_engine(
         benchmark_codes=benchmark_codes,
         gate_provider=_gate_provider if gate_specs else None,
         gate_portfolio_ids=set(gate_specs),
+        industry_gate_provider=(
+            _industry_gate_provider if industry_specs else None),
+        industry_gate_portfolio_ids=set(industry_specs),
         # E2：每日门控快照（带基准指数/引擎元信息）
         gate_specs=gate_specs,
         # E1（默认关）：顺延次日单/盘前竞价单提交前重判门控

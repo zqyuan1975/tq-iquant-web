@@ -523,6 +523,7 @@ class BacktestEngine:
         on_progress: Callable[[int], None] = None,
         regime_tracker=None,
         gate_tracker=None,
+        industry_tracker=None,
         daily_close_peak_enabled: bool = False,
         initial_pending_orders: Optional[List[OrderEvent]] = None,
         stock_names: Optional[dict] = None,
@@ -598,6 +599,8 @@ class BacktestEngine:
         portfolio.current_regime = None
         # 市场多空门控：默认不启用（None → _gate_blocks 恒 False，行为不变）
         portfolio.current_market_gate = gate_tracker
+        # 行业层决策数据（2026-11-22）：组合开关关闭时引擎传 None，行为逐位不变。
+        portfolio.current_industry_gate = industry_tracker
 
         times = self._build_timeline(klines)
         total_bars = len(times)
@@ -1473,6 +1476,7 @@ class BacktestEngine:
         stock_names: Optional[dict] = None,
         regime_trackers: Optional[Dict[int, object]] = None,
         gate_trackers: Optional[Dict[int, object]] = None,
+        industry_tracker=None,
         pending_order_max_days: int = PENDING_ORDER_MAX_DAYS,
         run_options: Optional[dict] = None,
         cancel_check: Optional[Callable[[], bool]] = None,
@@ -1566,6 +1570,7 @@ class BacktestEngine:
         for portfolio in portfolios:
             gate = (gate_trackers or {}).get(portfolio.portfolio_id)
             portfolio.current_market_gate = gate
+            portfolio.current_industry_gate = industry_tracker
             states.append({
                 "portfolio": portfolio,
                 "trades": [],

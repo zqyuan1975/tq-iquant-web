@@ -11,6 +11,7 @@ from .risk_manager import PortfolioRiskManager
 from .event import BarEvent, SignalEvent, OrderEvent
 from .decision import NULL_RECORDER
 from .format import fmt_money, fmt_pct, fmt_price
+from .industry_gate import INDUSTRY_MODES, INDUSTRY_RELIEF, INDUSTRY_STRICT
 from .market_rules import trading_days_between
 from tq_iquant_shared.constants import SignalType, TradeType
 
@@ -174,6 +175,21 @@ class Portfolio:
         self.gate_bear_reduce_ratio: Decimal = Decimal("0")
         # {(strategy_id, code)}：本空头连续段内已减过仓的持仓，转多/未定时清空。
         self._gate_bear_episode: set = set()
+        # 行业层决策（2026-11-22，全部默认关闭）：行业状态轴（IndustryTracker，由
+        # 引擎每日/每轮回测注入）+ 组合级开关。关闭时 _gate_decision 不读行业，
+        # 行为与接线前逐位一致。
+        self.current_industry_gate = None
+        self.industry_gate_mode: str = "off"   # off | industry_relief | industry_strict
+        self.industry_rank_enabled: bool = False
+        self.industry_max_per_industry: int = 0  # 0=不限（仅排序开启时生效）
+        self.industry_weight_enabled: bool = False
+        self.industry_overbought_block: bool = False
+        self.industry_trail_tighten_enabled: bool = False
+        self.industry_trail_tighten_ratio: Decimal = Decimal("0.015")
+        self.industry_bear_reduce_ratio: Decimal = Decimal("0")
+        self.industry_divergence_hint: bool = False
+        # 行业数据缺失 WARNING 去重（每只股票每进程只告警一次）
+        self._industry_missing_warned: set = set()
         # 公司行为（2026-11-18，J1/J2）：手工事件时间线，None = 未启用（默认）。
         # 由 backtest_service / live_service 在组合开关打开时注入；注入后
         # BacktestEngine / LiveEngine 每交易日调一次 corporate_actions.apply_day。
@@ -338,25 +354,117 @@ class Portfolio:
                           % (sig.stock_code, last, elapsed, days - elapsed, days))
         return True
 
-    def _gate_blocks(self, trade_time, ctx=None) -> bool:
-        """市场多空门控闸：基准指数空头状态 → True（禁止开仓/加仓）。
+    def _gate_decision(self, trade_time, ctx=None, stock_code=None):
+        """开仓/加仓闸门判定：None=放行 / "market"=大盘空头 / "industry"=行业非多头。
 
-        ``current_market_gate`` 为 None（未启用/注入失败）时恒 False，行为与
-        接线前逐字一致。tracker 内部右移一日（取严格早于 trade_time 日期的最
-        近状态日），因此本方法只用事实上的「昨日状态」，绝不使用当日收盘信息。
-        E3 策略级覆盖：ctx.market_gate_mode == "off" → 本策略不受门控。
+        大盘门控语义不变（右移一日、策略级 off 豁免、异常 fail-open）。
+        行业门控（2026-11-22，默认关闭）：
+        - ``industry_relief``：仅当大盘空头时生效——行业多头放行、行业非多头封堵；
+          大盘非空头时不读行业（与关闭时逐位一致）。
+        - ``industry_strict``：常开——行业非多头一律封堵；行业多头不覆盖大盘空头。
+        行业数据缺失（含个股无法映射）一律 fail-open 放行，并留 WARNING + 决策事件。
         """
         if ctx is not None and getattr(ctx, "market_gate_mode", "inherit") == "off":
-            return False
+            return None
+        day = trade_time.date() if hasattr(trade_time, "date") else trade_time
         tracker = self.current_market_gate
-        if tracker is None:
-            return False
+        market_blocked = False
+        if tracker is not None:
+            try:
+                market_blocked = bool(tracker.blocks(day))
+            except Exception:  # noqa: BLE001
+                # 门控查询异常一律放行（fail-open）：不能让基准状态问题变成"永不开仓"
+                logger.warning("市场门控查询异常，本次放行（fail-open）", exc_info=True)
+                market_blocked = False
+
+        mode = self.industry_gate_mode
+        ind = self.current_industry_gate
+        if mode == "off" or stock_code is None or ind is None:
+            return "market" if market_blocked else None
+        if mode == INDUSTRY_RELIEF and not market_blocked:
+            return None
         try:
-            return bool(tracker.blocks(trade_time.date()))
+            is_bull = ind.is_bull_for_stock(stock_code, day)
         except Exception:  # noqa: BLE001
-            # 门控查询异常一律放行（fail-open）：不能让基准状态问题变成"永不开仓"
-            logger.warning("市场门控查询异常，本次放行（fail-open）", exc_info=True)
-            return False
+            logger.warning("行业状态查询异常，本次放行（fail-open）：%s",
+                           stock_code, exc_info=True)
+            is_bull = None
+        if is_bull is None:
+            self._note_industry_missing(stock_code, day, trade_time, ind)
+            return "market" if market_blocked else None
+        if mode == INDUSTRY_RELIEF:
+            return None if is_bull else "industry"
+        # industry_strict：大盘空头仍优先，行业多头不覆盖
+        if market_blocked:
+            return "market"
+        return None if is_bull else "industry"
+
+    def _gate_blocks(self, trade_time, ctx=None, stock_code=None) -> bool:
+        """市场多空门控闸（含可选行业门控）：True=禁止开仓/加仓。"""
+        return self._gate_decision(trade_time, ctx, stock_code) is not None
+
+    def _industry_block_message(self, stock_code, bar, action: str) -> str:
+        """行业门控拦截事件文案（含所属行业与当日方向，便于回溯）。"""
+        ind = self.current_industry_gate
+        if ind is None:
+            return "行业门控：行业数据不可用，%s" % action
+        day = bar.bar_time.date() if hasattr(bar.bar_time, "date") else bar.bar_time
+        code = ind.industry_of(stock_code) or "未知"
+        state = ind.state_for_stock(stock_code, day)
+        direction = state.direction if state is not None else 0
+        return "行业门控(%s)：%s 所属行业 %s 非多头（方向 %d），%s" % (
+            self.industry_gate_mode, stock_code, code, direction, action)
+
+    def _note_industry_missing(self, stock_code, day, trade_time, tracker) -> None:
+        """行业数据缺失留痕（fail-open）：每只股票每进程一条 WARNING + 决策事件。"""
+        if stock_code in self._industry_missing_warned:
+            return
+        if len(self._industry_missing_warned) < 5000:
+            self._industry_missing_warned.add(stock_code)
+        reason = tracker.missing_for_stock(stock_code, day) or "行业数据缺失"
+        logger.warning("行业门控数据缺失，按 fail-open 放行：%s（%s）",
+                       stock_code, reason)
+        try:
+            self.recorder.record(
+                gate="industry_gate_missing",
+                layer="signal_gate",
+                action="skip",
+                portfolio_id=self.portfolio_id,
+                stock_code=stock_code,
+                bar_time=trade_time,
+                message=f"行业数据缺失，fail-open 放行：{reason}",
+            )
+        except Exception:  # noqa: BLE001
+            logger.debug("行业门控缺失事件记录失败", exc_info=True)
+
+    def configure_industry(self, settings) -> None:
+        """装配组合级行业开关（默认全部关闭 = 不改变任何既有结果）。"""
+        cfg = dict(settings or {})
+        mode = str(cfg.get("industry_gate_mode") or "off").strip().lower()
+        self.industry_gate_mode = mode if mode in INDUSTRY_MODES else "off"
+        self.industry_rank_enabled = bool(cfg.get("industry_rank_enabled", False))
+        try:
+            self.industry_max_per_industry = max(
+                0, int(cfg.get("industry_max_per_industry", 0) or 0))
+        except (TypeError, ValueError):
+            self.industry_max_per_industry = 0
+        self.industry_weight_enabled = bool(cfg.get("industry_weight_enabled", False))
+        self.industry_overbought_block = bool(
+            cfg.get("industry_overbought_block", False))
+        self.industry_trail_tighten_enabled = bool(
+            cfg.get("industry_trail_tighten_enabled", False))
+        try:
+            self.industry_trail_tighten_ratio = Decimal(
+                str(cfg.get("industry_trail_tighten_ratio", "0.015")))
+        except Exception:  # noqa: BLE001
+            self.industry_trail_tighten_ratio = Decimal("0.015")
+        try:
+            self.industry_bear_reduce_ratio = Decimal(
+                str(cfg.get("industry_bear_reduce_ratio", "0") or "0"))
+        except Exception:  # noqa: BLE001
+            self.industry_bear_reduce_ratio = Decimal("0")
+        self.industry_divergence_hint = bool(
+            cfg.get("industry_divergence_hint", False))
 
     def _gate_bear_reduce_signals(self, ctx: StrategyContext, bar: BarEvent) -> List[SignalEvent]:
         """E3 空头减仓档：空头连续段内每只持仓减仓一次（默认 0=关闭）。
@@ -1115,9 +1223,15 @@ class Portfolio:
             # 市场多空门控（2026-11-18）：基准指数空头状态禁止开新仓（持仓不强平）。
             # 放在冷静期之后、max_holdings/槽位闸之前——与冷静期同属"开新仓"闸；
             # 轮动换入（_try_rotation）同样受此闸约束。
-            if self._gate_blocks(bar.bar_time, ctx):
-                self._rec("market_gate", "signal_gate", "block", ctx, sig, bar,
-                          message="市场门控为空头，跳过开仓")
+            gate_reason = self._gate_decision(bar.bar_time, ctx, sig.stock_code)
+            if gate_reason is not None:
+                if gate_reason == "industry":
+                    self._rec("industry_gate", "signal_gate", "block", ctx, sig, bar,
+                              message=self._industry_block_message(
+                                  sig.stock_code, bar, "跳过开仓"))
+                else:
+                    self._rec("market_gate", "signal_gate", "block", ctx, sig, bar,
+                              message="市场门控为空头，跳过开仓")
                 return []
             # 组合级 max_holdings 闸（回测/实盘共用 on_bar，一处接线两端生效）：
             # 组合当前去重股票数（跨策略按 stock_code 去重，主从同票合并计数）
@@ -1217,9 +1331,15 @@ class Portfolio:
                 return []
             # 市场多空门控（2026-11-18）：基准指数空头状态禁止加仓（持仓不强平）。
             # 与 OPEN 同一闸；减仓/清仓/风控卖出不受影响。
-            if self._gate_blocks(bar.bar_time, ctx):
-                self._rec("market_gate", "signal_gate", "block", ctx, sig, bar,
-                          message="市场门控为空头，跳过加仓")
+            gate_reason = self._gate_decision(bar.bar_time, ctx, sig.stock_code)
+            if gate_reason is not None:
+                if gate_reason == "industry":
+                    self._rec("industry_gate", "signal_gate", "block", ctx, sig, bar,
+                              message=self._industry_block_message(
+                                  sig.stock_code, bar, "跳过加仓"))
+                else:
+                    self._rec("market_gate", "signal_gate", "block", ctx, sig, bar,
+                              message="市场门控为空头，跳过加仓")
                 return []
             if ctx.add_position_threshold != Decimal("-1"):
                 drop = (pos.avg_cost - close) / pos.avg_cost

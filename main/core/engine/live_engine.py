@@ -635,6 +635,10 @@ class LiveEngine:
         # 两者缺省(None/空)=不启用，行为与接线前逐字一致。
         gate_provider: Optional[Callable] = None,
         gate_portfolio_ids: Optional[set] = None,
+        # 行业层决策（2026-11-22，默认 None=不启用）：provider(portfolio_id, end_date)
+        # 返回 IndustryTracker；只对白名单组合每日更新，异常保留旧状态（fail-open）。
+        industry_gate_provider: Optional[Callable] = None,
+        industry_gate_portfolio_ids: Optional[set] = None,
         # E2：门控组合规格 {pid: {benchmark_index, market_gate_engine}}，
         # 用于每日门控快照落库；缺省不落快照。
         gate_specs: Optional[Dict[int, dict]] = None,
@@ -1041,6 +1045,12 @@ class LiveEngine:
         self._gate_portfolio_ids: set = set(gate_portfolio_ids or ())
         self._gate_specs: Dict[int, dict] = dict(gate_specs or {})
         self._gate_updated: Dict[int, date] = {}
+        # 行业层决策（默认关闭）：每组合每交易日首根 bar 重建/命中缓存后注入
+        # portfolio.current_industry_gate；provider=None 时整个分支零开销。
+        self._industry_gate_provider = industry_gate_provider
+        self._industry_gate_portfolio_ids: set = set(
+            industry_gate_portfolio_ids or ())
+        self._industry_gate_updated: Dict[int, date] = {}
         self._gate_recheck_on_execute = bool(gate_recheck_on_execute)
         # 公司行为（J1/J2，默认关）：组合标量配置 + 时间线提供者 + 每组合每日一次
         # 的应用水位；specs 为空时 _maybe_apply_corporate_actions 第一行即返回。
@@ -8202,6 +8212,32 @@ class LiveEngine:
                 pid, exc_info=True,
             )
 
+    def _maybe_update_industry_gate(self, portfolio: Portfolio,
+                                    bar_date: date) -> None:
+        """行业层决策数据：每日首根 bar 更新（默认关闭）。
+
+        跳过条件：provider 未注入 / 组合不在白名单 / 当日已更新。provider 异常或
+        返回 None 时保留旧状态（fail-open），与市场门控一致。
+        """
+        provider = self._industry_gate_provider
+        if provider is None:
+            return
+        pid = portfolio.portfolio_id
+        if pid not in self._industry_gate_portfolio_ids:
+            return
+        if self._industry_gate_updated.get(pid) == bar_date:
+            return
+        try:
+            tracker = provider(pid, bar_date)
+            if tracker is not None:
+                portfolio.current_industry_gate = tracker
+            self._industry_gate_updated[pid] = bar_date
+        except Exception:
+            logger.warning(
+                "portfolio %s 行业层决策数据更新失败，沿用旧状态（fail-open）",
+                pid, exc_info=True,
+            )
+
     def _persist_gate_snapshot(self, pid: int, bar_date: date,
                                tracker) -> None:
         """E2：每日每组合落一条门控快照（同键覆盖），失败只告警。
@@ -8707,6 +8743,8 @@ class LiveEngine:
             # 市场多空门控：必须在 deferred 放行（下一行）之前更新，
             # 保证当日首根 bar 放行的 deferred 单读到当日门控状态。
             self._maybe_update_gate(portfolio, bar.bar_time.date())
+            # 行业层决策数据（默认关闭）：与市场门控同水位，先于 deferred 放行。
+            self._maybe_update_industry_gate(portfolio, bar.bar_time.date())
         # B-1 未来函数闸门放行：跨日后释放 deferred 的日线信号订单（bar_time 更新为
         # 当前 bar——决策时间戳语义），与 on_bar 新单合并重走同一提交链
         # （approve/收盘/日历/去重/在途门全复用，且放行单先行——对齐回测

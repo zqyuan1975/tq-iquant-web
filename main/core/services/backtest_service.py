@@ -68,6 +68,7 @@ from core.engine.market_gate import (
 from core.services.acceptance import ACCEPTANCE_PROFILES, compute_acceptance
 from core.services import backtest_cancel
 from core.services import portfolio_settings
+from core.services.industry_data import build_industry_tracker
 from core.engine.regime_alpha import (
     QUADRANT_STYLE_INDICES,
     RegimeAlphaAnalyzer,
@@ -4685,6 +4686,15 @@ def run_backtest(db: Session, ps: PortfolioStrategy, req,
         ps, req.start_date, req.end_date, enabled=gate_enabled)
     gate_snapshot = gate_summary(gate_tracker, ps)
 
+    # 行业层决策数据（2026-11-22）：组合开关全关时不取数、不注入 → 行为逐位不变。
+    # 取数失败/行业不足 300 根由 build_industry_tracker 内部 fail-open（error tracker），
+    # 门控查询返回 None → 放行并留 WARNING + 决策事件。
+    _industry_settings = portfolio_settings.get_industry_settings(ps.id)
+    industry_tracker = (
+        build_industry_tracker(req.start_date, req.end_date)
+        if _industry_settings["industry_gate_mode"] != "off" else None
+    )
+
     # 公司行为（J1/J2，2026-11-18）：组合开关默认关。关闭时不读事件表、不注入
     # timeline、只写显式否定值——回测执行路径与改动前逐字一致。
     # J4 exact 档（opt-in）：不复权价空间必须配显式公司行为，故强制启用事件表
@@ -4837,6 +4847,8 @@ def run_backtest(db: Session, ps: PortfolioStrategy, req,
         if equity_cap is not None:
             portfolio.equity_cap = Decimal(str(equity_cap))
         portfolio.equity_cap_mode = equity_cap_mode
+        # 行业层组合开关（默认全关；关闭时不改变任何既有行为）
+        portfolio.configure_industry(_industry_settings)
         # 资金池 L2 借据（0021 B3，默认 None=不启用）：额度推导用组合级目标利用率；
         # NULL 表示按 0.95 缺省（A2），不改变任何既有回测结果。
         portfolio.target_utilization = getattr(ps, "target_utilization", None)
@@ -4968,6 +4980,7 @@ def run_backtest(db: Session, ps: PortfolioStrategy, req,
             on_progress=_on_progress,
             regime_tracker=regime_tracker,
             gate_tracker=gate_tracker,
+            industry_tracker=industry_tracker,
             daily_close_peak_enabled=daily_close_peak_enabled,
             stock_names=_pool_stock_names(ps, db),
             pending_order_max_days=int(
@@ -5271,6 +5284,8 @@ def run_multi_backtest(db: Session, portfolios: list, req) -> dict:
     # 抛 ValueError → 路由 400，不产生一条必然失败的 running 记录）
     entries = []
     gate_trackers: Dict[int, object] = {}
+    industry_tracker = None
+    _industry_enabled = False
     ca_timeline = None
     for ps in portfolios:
         strategies = (
@@ -5313,6 +5328,11 @@ def run_multi_backtest(db: Session, portfolios: list, req) -> dict:
         portfolio.risk_manager.daily_loss_on_equity_enabled = (_basis != "initial")
         # 上限处理模式（组合 JSON 侧配置；缺省 cap=旧行为）
         portfolio.equity_cap_mode = portfolio_settings.get_equity_cap_mode(ps.id)
+        # 行业层组合开关（默认全关）：任一组合开启即整批构建一份共享行业轴
+        _industry_settings = portfolio_settings.get_industry_settings(ps.id)
+        portfolio.configure_industry(_industry_settings)
+        if _industry_settings["industry_gate_mode"] != "off":
+            _industry_enabled = True
         # 层 1 容量模型（run 级；各组合共享同一 CapacityBudget 实现跨策略聚合）
         portfolio.capacity_model = capacity_model
         if capacity_impact_k is not None:
@@ -5335,6 +5355,10 @@ def run_multi_backtest(db: Session, portfolios: list, req) -> dict:
                 "interval_count": len(pit_timeline) if pit_timeline is not None else 0,
             },
         })
+
+    if _industry_enabled:
+        # 整批共享一份行业轴（同一运行区间）；取数失败内部 fail-open。
+        industry_tracker = build_industry_tracker(start_date, end_date)
 
     klines_by_ps: Dict[int, dict] = {}
     signal_by_ps: Dict[int, dict] = {}
@@ -5461,6 +5485,7 @@ def run_multi_backtest(db: Session, portfolios: list, req) -> dict:
             benchmark_data=benchmark_data,
             stock_names=names,
             gate_trackers=gate_trackers,
+            industry_tracker=industry_tracker,
             pending_order_max_days=int(_bt_cfg.get("pending_order_max_days", 20)),
             run_options=exec_flags,
             cancel_check=cancel_event.is_set,
