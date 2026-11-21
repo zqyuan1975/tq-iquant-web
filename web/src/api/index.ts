@@ -995,6 +995,7 @@ export async function getBoardIndustries(params: {
   order?: string
   level?: string
   limit?: number
+  benchmark?: string
 } = {}) {
   const res = await api.get<ApiResponse<{
     as_of: string | null
@@ -1007,6 +1008,7 @@ export async function getBoardIndustries(params: {
 export async function getBoardIndustry(code: string, params: {
   period?: string
   date?: string
+  benchmark?: string
 } = {}) {
   const res = await api.get<ApiResponse<BoardIndustryItem>>(
     `/investment-board/industries/${code}`, { params })
@@ -1033,6 +1035,7 @@ export async function getBoardLeaders(params: {
   period?: string
   date?: string
   limit?: number
+  benchmark?: string
 } = {}) {
   const res = await api.get<ApiResponse<{
     as_of: string | null

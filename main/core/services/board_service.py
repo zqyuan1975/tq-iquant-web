@@ -364,9 +364,10 @@ def _upsert_stock_snapshots(db: Session, rows: List[dict]) -> None:
     db.execute(stmt)
 
 
-def _benchmark_frame(as_of: date, now: datetime):
-    frames = _fetch_many([DEFAULT_GATE_INDEX], "1d", as_of)
-    got = _frame_for(frames.get(DEFAULT_GATE_INDEX), "1d", as_of, now)
+def _benchmark_frame(as_of: date, now: datetime,
+                     code: str = DEFAULT_GATE_INDEX):
+    frames = _fetch_many([code], "1d", as_of)
+    got = _frame_for(frames.get(code), "1d", as_of, now)
     if not got:
         return None
     frame, _, _ = got
@@ -652,15 +653,39 @@ def latest_run(db: Session, period: str) -> Optional[BoardRun]:
         .order_by(BoardRun.id.desc()).limit(1)).scalars().first()
 
 
-def benchmark_bull_dur(db: Session, period: str) -> Optional[int]:
-    run = latest_run(db, period)
-    if run is None or not run.stats_json:
+_BENCH_CACHE_TTL_SECONDS = 300
+_bench_cache: dict = {}
+
+
+def _benchmark_bull(code: str, day: date) -> Optional[int]:
+    """当前选定基准的日线 bull_dur（已闭合 bar）。
+
+    榜单领先天数以页面选定的基准为准，不再固定 000001.SH；
+    300s 进程内缓存，避免同一页面多次请求重复取基准历史。
+    """
+    key = (code, day)
+    now = time.monotonic()
+    hit = _bench_cache.get(key)
+    if hit is not None and now - hit[0] <= _BENCH_CACHE_TTL_SECONDS:
+        return hit[1]
+    bench = _benchmark_frame(day, datetime.now(), code)
+    val = int(bench["bull_dur"]) if bench is not None else None
+    _bench_cache[key] = (now, val)
+    return val
+
+
+def clear_benchmark_cache() -> None:
+    _bench_cache.clear()
+
+
+def benchmark_bull_dur(db: Session, period: str,
+                       benchmark: Optional[str] = None,
+                       as_of: Optional[date] = None) -> Optional[int]:
+    """选定基准的 bull_dur；未指定时沿用门控默认基准。"""
+    day = resolve_as_of(db, period, as_of)
+    if day is None:
         return None
-    try:
-        stats = json.loads(run.stats_json)
-    except ValueError:
-        return None
-    return (stats.get("industries") or {}).get("benchmark_bull_dur")
+    return _benchmark_bull((benchmark or DEFAULT_GATE_INDEX).strip().upper(), day)
 
 
 # ---------------- 查询与序列化 ----------------
@@ -793,7 +818,8 @@ _STOCK_SORTS = {
 def query_industries(db: Session, period: str, as_of: Optional[date] = None,
                      sort: str = "bull_dur", order: str = "desc",
                      level: Optional[str] = None,
-                     limit: int = 200) -> dict:
+                     limit: int = 200,
+                     benchmark: Optional[str] = None) -> dict:
     day = resolve_as_of(db, period, as_of)
     if day is None:
         return {"as_of": None, "rows": [], "benchmark_bull_dur": None}
@@ -806,7 +832,7 @@ def query_industries(db: Session, period: str, as_of: Optional[date] = None,
     q = q.order_by(col.desc() if order != "asc" else col.asc())
     limit = max(1, min(int(limit or 200), 200))
     rows = list(db.execute(q.limit(limit)).scalars())
-    bench = benchmark_bull_dur(db, period)
+    bench = benchmark_bull_dur(db, period, benchmark, day)
     return {
         "as_of": day.isoformat(),
         "benchmark_bull_dur": bench,
@@ -816,7 +842,8 @@ def query_industries(db: Session, period: str, as_of: Optional[date] = None,
 
 
 def query_industry(db: Session, code: str, period: str,
-                   as_of: Optional[date] = None) -> Optional[dict]:
+                   as_of: Optional[date] = None,
+                   benchmark: Optional[str] = None) -> Optional[dict]:
     day = resolve_as_of(db, period, as_of)
     if day is None:
         return None
@@ -828,7 +855,8 @@ def query_industry(db: Session, code: str, period: str,
     ).scalars().first()
     if row is None:
         return None
-    return serialize_industry(row, benchmark_bull_dur(db, period))
+    return serialize_industry(row,
+                              benchmark_bull_dur(db, period, benchmark, day))
 
 
 def query_stocks(db: Session, industry_code: str, period: str,
@@ -850,9 +878,10 @@ def query_stocks(db: Session, industry_code: str, period: str,
 
 
 def query_leaders(db: Session, period: str, as_of: Optional[date] = None,
-                  limit: int = 10) -> dict:
+                  limit: int = 10,
+                  benchmark: Optional[str] = None) -> dict:
     data = query_industries(db, period, as_of, sort="bull_dur",
-                            order="desc", limit=200)
+                            order="desc", limit=200, benchmark=benchmark)
     rows = data["rows"]
     sustained = [r for r in rows if (r["bull_dur"] or 0) > 0][:limit]
     reversal = sorted(

@@ -11,10 +11,12 @@ import {
   type BoardIndustryItem, type BoardMeta, type BoardStockItem,
 } from '../api'
 import { gateDirectionTone } from '../utils/marketGate'
+import { DEFAULT_BENCHMARK } from '../utils/benchmarks'
 
 type Period = '1d' | '30m'
 
 const period = ref<Period>('1d')
+const benchmark = ref(DEFAULT_BENCHMARK)
 const meta = ref<BoardMeta | null>(null)
 const levelCounts = ref<Record<string, number>>({})
 const watchCounts = ref<{ overbought: number; oversold: number }>({ overbought: 0, oversold: 0 })
@@ -65,8 +67,8 @@ async function loadAll() {
   try {
     const p = period.value
     const [ind, lead, m] = await Promise.all([
-      getBoardIndustries({ period: p, sort: sortKey.value, order: sortOrder.value, level: levelFilter.value, limit: 200 }),
-      getBoardLeaders({ period: p, limit: 5 }),
+      getBoardIndustries({ period: p, sort: sortKey.value, order: sortOrder.value, level: levelFilter.value, limit: 200, benchmark: benchmark.value }),
+      getBoardLeaders({ period: p, limit: 5, benchmark: benchmark.value }),
       meta.value ? Promise.resolve(meta.value) : getBoardMeta(),
     ])
     industries.value = ind.rows
@@ -90,6 +92,14 @@ function switchPeriod(p: Period) {
   loadAll()
 }
 
+async function onBenchmarkChange(code: string) {
+  if (!code || code === benchmark.value) return
+  benchmark.value = code
+  await loadAll()
+  // 抽屉里的领先天数依赖基准，切换后按新基准刷新
+  if (active.value) await openIndustry(active.value)
+}
+
 function toggleSort(key: string) {
   if (sortKey.value === key) {
     sortOrder.value = sortOrder.value === 'desc' ? 'asc' : 'desc'
@@ -111,7 +121,7 @@ async function openIndustry(row: BoardIndustryItem) {
   drawerLoading.value = true
   try {
     const [detail, stocks] = await Promise.all([
-      getBoardIndustry(row.code, { period: period.value }).catch(() => row),
+      getBoardIndustry(row.code, { period: period.value, benchmark: benchmark.value }).catch(() => row),
       getBoardIndustryStocks(row.code, {
         period: period.value, sort: 'lead_days', limit: 200,
         // 30m 成分股不落全量快照，打开抽屉时按需计算（行业须 30m bull_dur=1）
@@ -180,7 +190,7 @@ onMounted(loadAll)
   <div v-if="errorMsg" class="card board-error">{{ errorMsg }}</div>
 
   <!-- B 大盘多空状态卡 + 统一市场状态面板（整体迁移） -->
-  <MarketGatePanel />
+  <MarketGatePanel :benchmark="benchmark" @update:benchmark="onBenchmarkChange" />
 
   <!-- 周期切换 -->
   <div class="board-tabs">

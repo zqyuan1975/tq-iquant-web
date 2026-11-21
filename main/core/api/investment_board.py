@@ -58,6 +58,11 @@ def _check_period(period: Optional[str]) -> str:
     return p
 
 
+def _check_benchmark(raw: Optional[str]) -> str:
+    """页面选定基准；空值沿用门控默认基准（000001.SH）。"""
+    return (raw or "").strip().upper() or svc.DEFAULT_GATE_INDEX
+
+
 class RefreshReq(BaseModel):
     period: str = "1d"
     scope: str = "all"
@@ -106,26 +111,31 @@ def get_meta(db: Session = Depends(get_db)):
 @router.get("/industries")
 def get_industries(period: str = "1d", date: str = "", sort: str = "bull_dur",
                    order: str = "desc", level: str = "", limit: int = 200,
+                   benchmark: str = "",
                    db: Session = Depends(get_db)):
     try:
         p = _check_period(period)
     except ValueError as exc:
         return err(422, str(exc))
     day = _parse_date(date)
-    key = ("industries", p, day, sort, order, level, limit)
+    bench = _check_benchmark(benchmark)
+    key = ("industries", p, day, sort, order, level, limit, bench)
     return ok(_cached(key, lambda: svc.query_industries(
         db, p, day, sort=sort, order=order,
-        level=level or None, limit=limit)))
+        level=level or None, limit=limit, benchmark=bench)))
 
 
 @router.get("/industries/{code}")
 def get_industry(code: str, period: str = "1d", date: str = "",
-                 db: Session = Depends(get_db)):
+                 benchmark: str = "", db: Session = Depends(get_db)):
     try:
         p = _check_period(period)
     except ValueError as exc:
         return err(422, str(exc))
-    row = svc.query_industry(db, code.upper(), p, _parse_date(date))
+    bench = _check_benchmark(benchmark)
+    key = ("industry", code.upper(), p, _parse_date(date), bench)
+    row = _cached(key, lambda: svc.query_industry(
+        db, code.upper(), p, _parse_date(date), benchmark=bench))
     if row is None:
         return err(404, f"行业 {code} 在该周期/日期下无快照（请先刷新）")
     return ok(row)
@@ -169,14 +179,16 @@ def _industry_stocks(db: Session, code: str, period: str,
 
 @router.get("/leaders")
 def get_leaders(period: str = "1d", date: str = "", limit: int = 10,
-                db: Session = Depends(get_db)):
+                benchmark: str = "", db: Session = Depends(get_db)):
     try:
         p = _check_period(period)
     except ValueError as exc:
         return err(422, str(exc))
     day = _parse_date(date)
-    key = ("leaders", p, day, limit)
-    return ok(_cached(key, lambda: svc.query_leaders(db, p, day, limit=limit)))
+    bench = _check_benchmark(benchmark)
+    key = ("leaders", p, day, limit, bench)
+    return ok(_cached(key, lambda: svc.query_leaders(
+        db, p, day, limit=limit, benchmark=bench)))
 
 
 # ---------------- 刷新任务 ----------------
@@ -208,6 +220,7 @@ def post_refresh(req: RefreshReq, db: Session = Depends(get_db)):
         _refresh_lock.release()
         raise
     _cache.clear()
+    svc.clear_benchmark_cache()
 
     def _worker(run_id: int):
         try:

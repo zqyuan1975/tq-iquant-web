@@ -1,7 +1,7 @@
 <script setup lang="ts">
 // 市场多空状态卡 + 统一市场状态面板（自备选股池整体迁移，功能等价）：
 // 基准切换、刷新按钮、陈旧提示、转折记录、作用域/配置概览全部保留可操作。
-import { computed, ref, onMounted } from 'vue'
+import { computed, ref, onMounted, watch } from 'vue'
 import {
   getMarketGateStatus, getMarketGateOverview,
   type MarketGateStatusItem, type MarketGateOverview,
@@ -9,10 +9,26 @@ import {
 import { BENCHMARKS, DEFAULT_BENCHMARK } from '../../utils/benchmarks'
 import { gateDirectionLabel, gateDirectionTone } from '../../utils/marketGate'
 
-const gateBenchmark = ref(DEFAULT_BENCHMARK)
+const props = defineProps<{ benchmark?: string }>()
+const emit = defineEmits<{ 'update:benchmark': [code: string] }>()
+
+const gateBenchmark = ref(props.benchmark || DEFAULT_BENCHMARK)
 const gateStatus = ref<MarketGateStatusItem | null>(null)
 const gateLoading = ref(false)
 const gateError = ref('')
+
+watch(() => props.benchmark, (v) => {
+  if (!v || v === gateBenchmark.value) return
+  gateBenchmark.value = v
+  loadGateStatus(false)
+})
+
+function onBenchmarkChange(e: Event) {
+  const code = (e.target as HTMLSelectElement).value
+  gateBenchmark.value = code
+  emit('update:benchmark', code)
+  loadGateStatus(false)
+}
 
 const gateTone = computed(() => `gate-tone-${gateDirectionTone(gateStatus.value?.direction)}`)
 const gateCardTone = computed(() => `gate-card-${gateDirectionTone(gateStatus.value?.direction)}`)
@@ -74,7 +90,7 @@ onMounted(() => {
           v-model="gateBenchmark"
           class="field-select"
           data-field="gate-benchmark"
-          @change="loadGateStatus(false)"
+          @change="onBenchmarkChange"
         >
           <option v-for="b in BENCHMARKS" :key="b.code" :value="b.code">{{ b.name }}（{{ b.code }}）</option>
         </select>
