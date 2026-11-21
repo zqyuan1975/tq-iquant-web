@@ -894,6 +894,8 @@ export interface BoardIndustryItem {
   bias_z: number | null
   overbought: boolean
   oversold: boolean
+  overbought_watch: boolean
+  oversold_watch: boolean
   jd: number | null
   jd_filter: number
   channel_filter: number
@@ -925,6 +927,8 @@ export interface BoardStockItem {
   bias_z: number | null
   overbought: boolean
   oversold: boolean
+  overbought_watch: boolean
+  oversold_watch: boolean
   bars: number | null
   stale: boolean
   bar_closed_at: string | null
@@ -976,6 +980,7 @@ export async function getBoardSummary(params: {
     period: string
     as_of: string | null
     level_counts: Record<string, number>
+    watch_counts: { overbought: number; oversold: number }
     benchmark_bull_dur: number | null
     formula_version: string
     latest_run: BoardRunInfo | null

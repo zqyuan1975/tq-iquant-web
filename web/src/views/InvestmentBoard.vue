@@ -17,6 +17,7 @@ type Period = '1d' | '30m'
 const period = ref<Period>('1d')
 const meta = ref<BoardMeta | null>(null)
 const levelCounts = ref<Record<string, number>>({})
+const watchCounts = ref<{ overbought: number; oversold: number }>({ overbought: 0, oversold: 0 })
 const industries = ref<BoardIndustryItem[]>([])
 const leaders = ref<{ sustained: BoardIndustryItem[]; reversal: BoardIndustryItem[]; excess: BoardIndustryItem[] }>({
   sustained: [], reversal: [], excess: [],
@@ -74,6 +75,7 @@ async function loadAll() {
     meta.value = m
     const summary = await getBoardSummary({ period: p }).catch(() => null)
     levelCounts.value = summary?.level_counts || {}
+    watchCounts.value = summary?.watch_counts || { overbought: 0, oversold: 0 }
   } catch (e) {
     errorMsg.value = '加载失败：' + errMsg(e)
   } finally {
@@ -234,6 +236,8 @@ onMounted(loadAll)
         <span v-for="(n, lv) in levelCounts" :key="lv" class="badge badge-gray">
           {{ meta?.level_labels[lv] || lv }} {{ n }}
         </span>
+        <span v-if="watchCounts.overbought" class="watch-count">+{{ watchCounts.overbought }} 轻度超买</span>
+        <span v-if="watchCounts.oversold" class="watch-count">+{{ watchCounts.oversold }} 轻度超卖</span>
         <select v-model="levelFilter" class="board-select" @change="applyLevel">
           <option value="">全部等级</option>
           <option value="strong_bull">强多</option>
@@ -278,6 +282,8 @@ onMounted(loadAll)
           <td>
             <span v-if="r.overbought" class="flag flag-ob">超买</span>
             <span v-else-if="r.oversold" class="flag flag-os">超卖</span>
+            <span v-else-if="r.overbought_watch" class="flag flag-watch flag-watch-ob">轻度超买</span>
+            <span v-else-if="r.oversold_watch" class="flag flag-watch flag-watch-os">轻度超卖</span>
             <span v-else class="muted">—</span>
           </td>
           <td class="num">{{ signed(r.lead_days) }}</td>
@@ -298,9 +304,9 @@ onMounted(loadAll)
     <ul>
       <li><b>公式唯一来源</b>：本项目 <code>core/engine/rating_core.py</code>（{{ meta?.formula_version }}），方向取 ENH（<code>m_enh</code>）；不移植行业评级系统的 Python 版本。</li>
       <li><b>三处已修正缺陷</b>：<code>WO</code> 补 ROUND；角度用 <code>180/3.1416</code>；补 <code>偏离分_空</code>（<code>IF(偏差率&lt;-3,10,IF(偏差率&lt;-1,…))</code>）。</li>
-      <li><b>超买超卖重定义</b>：乖离率 250 日滚动 z 分数、不含当日、多空对称、k=2.5；JD 与 CH/CL 轨道只作二级过滤展示，不作必要条件。</li>
+      <li><b>超买超卖重定义</b>：乖离率 250 日滚动 z 分数、不含当日、多空对称、主档 k=2.5；2.0≤|z|&lt;2.5 仅作「轻度超买 / 轻度超卖」观察提示；JD 与 CH/CL 轨道只作二级过滤展示，不作必要条件。</li>
       <li><b>名单</b>：严格 128 个 881 二级行业（剔除 881999 类）；不足 {{ meta?.min_bars ?? 300 }} 根不输出方向。</li>
-      <li><b>30m</b>：只用已闭合 bar，闭合后下一根 bar 生效；个股 30m 仅计算「日线由空转多」的行业。</li>
+      <li><b>30m</b>：只用已闭合 bar，闭合后下一根 bar 生效；个股 30m 按需计算 30m「由空转多」行业的成分股。</li>
       <li>{{ meta?.caliber_note }}</li>
     </ul>
   </details>
@@ -321,6 +327,16 @@ onMounted(loadAll)
         <div><span>等级</span><b>{{ active.level_label }}</b></div>
         <div><span>多头持续</span><b class="num">{{ fmt(active.bull_dur) }}</b></div>
         <div><span>偏离 z</span><b class="num">{{ fmt(active.bias_z, 2) }}</b></div>
+        <div>
+          <span>超买超卖</span>
+          <b>
+            <span v-if="active.overbought" class="flag flag-ob">超买</span>
+            <span v-else-if="active.oversold" class="flag flag-os">超卖</span>
+            <span v-else-if="active.overbought_watch" class="flag flag-watch flag-watch-ob">轻度超买</span>
+            <span v-else-if="active.oversold_watch" class="flag flag-watch flag-watch-os">轻度超卖</span>
+            <span v-else class="muted">—</span>
+          </b>
+        </div>
         <div><span>乖离率</span><b class="num">{{ fmt(active.bias, 2) }}%</b></div>
         <div><span>JD 过滤</span><b class="num">{{ active.jd_filter > 0 ? '过热' : (active.jd_filter < 0 ? '过冷' : '中性') }}（{{ fmt(active.jd, 1) }}）</b></div>
         <div><span>轨道过滤</span><b>{{ active.channel_filter > 0 ? '上轨外' : (active.channel_filter < 0 ? '下轨外' : '轨内') }}</b></div>
@@ -351,6 +367,8 @@ onMounted(loadAll)
               <td>
                 <span v-if="s.overbought" class="flag flag-ob">超买</span>
                 <span v-else-if="s.oversold" class="flag flag-os">超卖</span>
+                <span v-else-if="s.overbought_watch" class="flag flag-watch flag-watch-ob">轻度超买</span>
+                <span v-else-if="s.oversold_watch" class="flag flag-watch flag-watch-os">轻度超卖</span>
                 <span v-else class="muted">—</span>
               </td>
             </tr>
@@ -441,6 +459,10 @@ onMounted(loadAll)
 .flag { font-size: 10.5px; padding: 1px 7px; border-radius: 99px; }
 .flag-ob { color: var(--red); background: var(--red-wash); }
 .flag-os { color: var(--green); background: var(--green-wash); }
+.flag-watch { font-size: 9.5px; padding: 0 5px; border: 1px solid var(--line); background: transparent; opacity: .72; }
+.flag-watch-ob { color: var(--red); }
+.flag-watch-os { color: var(--green); }
+.watch-count { font-size: 11px; color: var(--ink-faint); }
 .muted { color: var(--ink-faint); }
 .board-loading { padding: 18px 16px; font-size: 12.5px; color: var(--ink-soft); }
 .board-empty { padding: 20px 16px; text-align: center; color: var(--ink-faint); font-size: 12.5px; }

@@ -27,6 +27,7 @@ from sqlalchemy.orm import Session
 from core.engine.market_rules import trading_days_between
 from core.engine.rating_core import (
     BIAS_Z_K,
+    BIAS_Z_WATCH,
     BIAS_Z_WINDOW,
     MIN_BARS,
     RATING_FORMULA_VERSION,
@@ -675,10 +676,21 @@ def _lead_days(own_bull: Optional[int], ref_bull: Optional[int]) -> Optional[int
     return int(own_bull) - int(ref_bull or 0)
 
 
+def _bias_watch(bias_z, overbought, oversold) -> tuple:
+    """由既有 bias_z 派生观察档标记（2.0 <= |z| < 2.5），不改表结构。"""
+    z = _f(bias_z)
+    if z is None:
+        return False, False
+    ob = (not bool(overbought)) and BIAS_Z_WATCH <= z < BIAS_Z_K
+    os_ = (not bool(oversold)) and -BIAS_Z_K < z <= -BIAS_Z_WATCH
+    return ob, os_
+
+
 def serialize_industry(row: BoardIndustrySnapshot,
                        bench_bull: Optional[int] = None,
                        rank: Optional[int] = None) -> dict:
     lead = _lead_days(row.bull_dur, bench_bull)
+    ob_watch, os_watch = _bias_watch(row.bias_z, row.overbought, row.oversold)
     return {
         "rank": rank,
         "code": row.industry_code,
@@ -697,6 +709,8 @@ def serialize_industry(row: BoardIndustrySnapshot,
         "bias_z": _f(row.bias_z),
         "overbought": bool(row.overbought),
         "oversold": bool(row.oversold),
+        "overbought_watch": ob_watch,
+        "oversold_watch": os_watch,
         "jd": _f(row.jd),
         "jd_filter": row.jd_filter,
         "channel_filter": row.channel_filter,
@@ -713,6 +727,7 @@ def serialize_industry(row: BoardIndustrySnapshot,
 
 def serialize_stock(row: BoardStockSnapshot,
                     rank: Optional[int] = None) -> dict:
+    ob_watch, os_watch = _bias_watch(row.bias_z, row.overbought, row.oversold)
     return {
         "rank": rank,
         "code": row.stock_code,
@@ -732,6 +747,8 @@ def serialize_stock(row: BoardStockSnapshot,
         "bias_z": _f(row.bias_z),
         "overbought": bool(row.overbought),
         "oversold": bool(row.oversold),
+        "overbought_watch": ob_watch,
+        "oversold_watch": os_watch,
         "bars": row.bars,
         "stale": bool(row.stale),
         "bar_closed_at": row.bar_closed_at,
@@ -865,12 +882,33 @@ def level_counts(db: Session, period: str,
     return out
 
 
+def watch_counts(db: Session, period: str,
+                 as_of: Optional[date] = None) -> dict:
+    """观察档（2.0 <= |z| < 2.5）行业数，用于榜单折叠计数。"""
+    day = resolve_as_of(db, period, as_of)
+    if day is None:
+        return {"overbought": 0, "oversold": 0}
+    rows = db.execute(
+        select(BoardIndustrySnapshot.bias_z,
+               BoardIndustrySnapshot.overbought,
+               BoardIndustrySnapshot.oversold).where(
+            BoardIndustrySnapshot.period == period,
+            BoardIndustrySnapshot.as_of == day)).all()
+    ob = os_ = 0
+    for bias_z, overbought, oversold in rows:
+        w_ob, w_os = _bias_watch(bias_z, overbought, oversold)
+        ob += int(w_ob)
+        os_ += int(w_os)
+    return {"overbought": ob, "oversold": os_}
+
+
 def meta(db: Session) -> dict:
     return {
         "formula_version": RATING_FORMULA_VERSION,
         "direction_basis": "m_enh",
         "min_bars": MIN_BARS,
         "bias_z": {"window": BIAS_Z_WINDOW, "k": BIAS_Z_K,
+                   "watch": BIAS_Z_WATCH,
                    "include_today": False, "symmetric": True},
         "periods": list(BOARD_PERIODS),
         "universe": universe_status(db),
@@ -878,6 +916,7 @@ def meta(db: Session) -> dict:
         "level_labels": _LEVEL_LABELS,
         "caliber_note": (
             "强度/方向/超买超卖全部由本项目 rating_core 产出（tqgate_py_v2）；"
+            "超买超卖主档 k=2.5，2.0≤|z|<2.5 仅作轻度提示；"
             "行业评级系统仅提供榜单形态与 30m 切换的产品化参考。"
         ),
     }

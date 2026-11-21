@@ -86,6 +86,7 @@ def get_summary(period: str = "1d", benchmark_index: Optional[str] = None,
         "as_of": svc.latest_as_of(db, p).isoformat()
         if svc.latest_as_of(db, p) else None,
         "level_counts": svc.level_counts(db, p),
+        "watch_counts": svc.watch_counts(db, p),
         "benchmark_bull_dur": svc.benchmark_bull_dur(db, p),
         "formula_version": RATING_FORMULA_VERSION,
         "latest_run": svc.serialize_run(run) if run else None,

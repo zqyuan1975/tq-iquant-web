@@ -28,6 +28,8 @@ MIN_BARS = 300
 # 超买超卖：乖离率 250 日滚动 z 分数（不含当日），多空对称，k=2.5（§13 方案 A）
 BIAS_Z_WINDOW = 250
 BIAS_Z_K = 2.5
+# 观察档下限：2.0 <= |z| < 2.5 只作轻度提示，主档（k=2.5）语义不变
+BIAS_Z_WATCH = 2.0
 
 RATING_COLUMNS = [
     "date", "bars", "close",
