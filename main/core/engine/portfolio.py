@@ -419,6 +419,35 @@ class Portfolio:
         return "行业门控(%s)：%s 所属行业 %s 非多头（方向 %d），%s" % (
             self.industry_gate_mode, stock_code, code, direction, action)
 
+    def _industry_state(self, stock_code, bar):
+        """个股所属行业的当日生效状态（缺失/异常 → None，调用方按放行处理）。"""
+        ind = self.current_industry_gate
+        if ind is None:
+            return None
+        try:
+            day = (bar.bar_time.date() if hasattr(bar.bar_time, "date")
+                   else bar.bar_time)
+            return ind.state_for_stock(stock_code, day)
+        except Exception:  # noqa: BLE001
+            logger.warning("行业状态查询异常：%s", stock_code, exc_info=True)
+            return None
+
+    def _industry_open_weight(self, stock_code, bar) -> Decimal:
+        """C 行业强度仓位权重（默认关）：0.5 + 强度/100，夹取 [0.5, 1.5]。
+
+        仅在行业多头时生效；行业非多头/数据缺失 → 1（中性，不放大不缩小）。
+        """
+        if not self.industry_weight_enabled:
+            return Decimal("1")
+        state = self._industry_state(stock_code, bar)
+        if state is None or not state.is_bull:
+            return Decimal("1")
+        try:
+            weight = Decimal("0.5") + Decimal(str(state.strength)) / Decimal("100")
+        except Exception:  # noqa: BLE001
+            return Decimal("1")
+        return min(Decimal("1.5"), max(Decimal("0.5"), weight))
+
     def _note_industry_missing(self, stock_code, day, trade_time, tracker) -> None:
         """行业数据缺失留痕（fail-open）：每只股票每进程一条 WARNING + 决策事件。"""
         if stock_code in self._industry_missing_warned:
@@ -471,32 +500,56 @@ class Portfolio:
             cfg.get("industry_divergence_hint", False))
 
     def _gate_bear_reduce_signals(self, ctx: StrategyContext, bar: BarEvent) -> List[SignalEvent]:
-        """E3 空头减仓档：空头连续段内每只持仓减仓一次（默认 0=关闭）。
+        """空头减仓档：空头连续段内每只持仓减仓一次（默认 0=关闭）。
 
-        与开仓闸同源（tracker 右移一日）；策略级 market_gate_mode="off" 跳过。
+        大盘档（E3，gate_bear_reduce_ratio）与行业档（F，industry_bear_reduce_ratio）
+        共用本入口：同一持仓同日同时命中取 **max(ratio)**，绝不叠加；行业档默认
+        关。与开仓闸同源（tracker 右移一日）；策略级 market_gate_mode="off" 跳过。
         只产生 REDUCE 信号，实际数量/整手/T+1/卖出范围仍走既有卖出路径。
         """
         tracker = self.current_market_gate
-        ratio = self.gate_bear_reduce_ratio
-        if tracker is None or ratio is None or ratio <= 0:
+        market_ratio = self.gate_bear_reduce_ratio or Decimal("0")
+        industry_ratio = self.industry_bear_reduce_ratio or Decimal("0")
+        ind = self.current_industry_gate
+        use_market = tracker is not None and market_ratio > 0
+        use_industry = ind is not None and industry_ratio > 0
+        if not use_market and not use_industry:
             return []
         if getattr(ctx, "market_gate_mode", "inherit") == "off":
             return []
-        try:
-            blocked = bool(tracker.blocks(bar.bar_time.date()))
-        except Exception:  # noqa: BLE001
-            logger.warning("市场门控减仓查询异常，本 bar 跳过减仓（fail-open）",
-                           exc_info=True)
-            return []
-        if not blocked:
-            # 空头段结束：下次再进空头重新计一次
+        market_bear = False
+        if use_market:
+            try:
+                market_bear = bool(tracker.blocks(bar.bar_time.date()))
+            except Exception:  # noqa: BLE001
+                logger.warning("市场门控减仓查询异常，本 bar 跳过减仓（fail-open）",
+                               exc_info=True)
+                return []
+        if not market_bear and not use_industry:
+            # 空头段结束：下次再进空头重新计一次（大盘档单独启用时的原行为）
             self._gate_bear_episode.clear()
             return []
         out: List[SignalEvent] = []
+        visited: set = set()
         for stock_code, pos in self._iter_positions(ctx):
             if pos.quantity <= 0 or stock_code not in bar.stocks:
                 continue
             key = (ctx.strategy_id, stock_code)
+            visited.add(key)
+            # 有效减仓比例 = max(大盘档命中, 行业档命中)；禁止叠加。
+            ratio = Decimal("0")
+            source = None
+            if market_bear and market_ratio > 0:
+                ratio, source = market_ratio, "market"
+            if use_industry and industry_ratio > 0:
+                state = self._industry_state(stock_code, bar)
+                if (state is not None and state.is_bear
+                        and industry_ratio > ratio):
+                    ratio, source = industry_ratio, "industry"
+            if ratio <= 0:
+                # 该持仓已不在任何空头段：下次再进空头重新计一次
+                self._gate_bear_episode.discard(key)
+                continue
             if key in self._gate_bear_episode:
                 continue
             self._gate_bear_episode.add(key)
@@ -509,11 +562,23 @@ class Portfolio:
                 reduce_ratio=ratio,
             )
             out.append(sig)
-            self._rec("market_gate_bear_reduce", "signal_gate", "reduce",
-                      ctx, sig, bar,
-                      param_name="market_gate_bear_reduce_ratio",
-                      param_value=float(ratio),
-                      message="市场门控空头：本段首次按 %s 减仓" % fmt_pct(ratio))
+            if source == "industry":
+                self._rec("industry_bear_reduce", "signal_gate", "reduce",
+                          ctx, sig, bar,
+                          param_name="industry_bear_reduce_ratio",
+                          param_value=float(ratio),
+                          message="行业门控空头：本段首次按 %s 减仓" % fmt_pct(ratio))
+            else:
+                self._rec("market_gate_bear_reduce", "signal_gate", "reduce",
+                          ctx, sig, bar,
+                          param_name="market_gate_bear_reduce_ratio",
+                          param_value=float(ratio),
+                          message="市场门控空头：本段首次按 %s 减仓" % fmt_pct(ratio))
+        if use_industry:
+            # 已清仓的旧键清掉，避免同一股票日后重新买入时被"本段已减"误抑制
+            for stale in [k for k in self._gate_bear_episode
+                          if k[0] == ctx.strategy_id and k not in visited]:
+                self._gate_bear_episode.discard(stale)
         return out
 
     def _book_guard(self):
@@ -1052,6 +1117,13 @@ class Portfolio:
                     )
             # B5：移动止损阈值按市场状态解析（未开闸/非趋势态回落策略风控原值，行为不变）
             eff_trailing = ctx.effective_trailing_stop(self.current_regime)
+            # E 行业转空：该行业持仓移动止损收紧到配置比例（默认关；不改变
+            # 止损/止盈的判定顺序，只在原移动止损阈值上收紧）。
+            if (self.industry_trail_tighten_enabled
+                    and self.current_industry_gate is not None):
+                industry_state = self._industry_state(stock_code, bar)
+                if industry_state is not None and industry_state.is_bear:
+                    eff_trailing = self.industry_trail_tighten_ratio
             if skip_codes and stock_code in skip_codes:
                 # 在途风控卖单（含缩量未成交残量）未结清：本 bar 不重复评估/不重复
                 # 发 trigger，残量由原单在后续 bar 继续分批成交（对齐实盘
@@ -1362,6 +1434,20 @@ class Portfolio:
                     self._rec("market_gate", "signal_gate", "block", ctx, sig, bar,
                               message="市场门控为空头，跳过开仓")
                 return []
+            # D 行业超买（z>=2.5）不开新仓（默认关）：只拦 OPEN，不强平已有持仓。
+            if self.industry_overbought_block and self.current_industry_gate is not None:
+                state = self._industry_state(sig.stock_code, bar)
+                if state is not None and state.overbought:
+                    self._rec(
+                        "industry_overbought", "signal_gate", "block", ctx, sig, bar,
+                        param_name="industry_overbought_z",
+                        param_value=2.5,
+                        actual_value=(None if state.bias_z is None
+                                      else float(state.bias_z)),
+                        message="行业超买（z=%s ≥ 2.5），%s 不开新仓"
+                                % (state.bias_z, sig.stock_code),
+                    )
+                    return []
             # 组合级 max_holdings 闸（回测/实盘共用 on_bar，一处接线两端生效）：
             # 组合当前去重股票数（跨策略按 stock_code 去重，主从同票合并计数）
             # ≥ max_holdings → 拒绝新开仓。ADD/减仓/清仓类不受影响；
@@ -1419,7 +1505,10 @@ class Portfolio:
             if inflight is not None:
                 inflight.setdefault(ctx.strategy_id, set()).add(sig.stock_code)
             lot = self._lot(sig.stock_code)
-            quantity = int(ctx.single_open_ratio * strategy_fund / close / lot) * lot
+            # C 行业强度作仓位权重（默认关，weight=1 与改动前逐位一致）
+            weight = self._industry_open_weight(sig.stock_code, bar)
+            quantity = int(
+                ctx.single_open_ratio * strategy_fund * weight / close / lot) * lot
             if quantity < lot:
                 logger.debug(
                     "OPEN 拦截:计算量 %d <%d（%s ratio %s × 资金 %s / 价 %s）",
