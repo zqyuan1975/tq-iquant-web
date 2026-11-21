@@ -54,6 +54,12 @@ from .capital_pairing import (
     CapitalPairingHealthDaily,
 )
 from .cash_outlet import CashOutlet, CashOutletOp
+from .investment_board import (
+    BoardIndustry,
+    BoardRun,
+    BoardIndustrySnapshot,
+    BoardStockSnapshot,
+)
 
 __all__ = [
     "Base",
@@ -111,4 +117,8 @@ __all__ = [
     "CapitalPairingHealthDaily",
     "CashOutlet",
     "CashOutletOp",
+    "BoardIndustry",
+    "BoardRun",
+    "BoardIndustrySnapshot",
+    "BoardStockSnapshot",
 ]

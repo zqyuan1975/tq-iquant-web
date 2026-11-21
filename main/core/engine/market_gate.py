@@ -22,8 +22,7 @@ from datetime import date, datetime
 from itertools import pairwise
 from typing import TYPE_CHECKING, Optional
 
-import numpy as np
-import pandas as pd
+from core.engine.rating_core import compute_rating_frame
 
 if TYPE_CHECKING:
     import polars as pl
@@ -35,7 +34,7 @@ GATE_WARMUP_DAYS = 500          # 自然日取数余量（288 交易日 MA 预�
 GATE_TDX_COUNT_BARS = 400       # tdx 模式/实盘日更取的日线根数
 # 公式口径版本（冻结入 params_snapshot）：公式/常量任何改动都要改版本号，
 # 否则新旧回测结果会被误当作同口径直接比较。
-GATE_FORMULA_VERSION = "tqgate_py_v1"
+GATE_FORMULA_VERSION = "tqgate_py_v2"
 
 _TDX_LINES = ("多头强度", "空头强度", "强度线")
 
@@ -322,199 +321,27 @@ class CompositeGateTracker:
         return (min(s[0] for s in spans), max(s[1] for s in spans))
 
 
-# ---------------- TDX 数值语义辅助（numpy/pandas，NaN=null） ----------------
-
-def _round_half_away(x):
-    """TDX ROUND(x) 单参数：整数舍入，half away from zero。NaN 透传。
-
-    np.round 是 half-to-even，不能直接用；输入 Series 时返回同 index 的 Series。
-    """
-    a = np.asarray(x, dtype=float)
-    out = np.sign(a) * np.floor(np.abs(a) + 0.5)
-    if isinstance(x, pd.Series):
-        return pd.Series(out, index=x.index)
-    return out
-
-
-def _round2(x):
-    """ROUND(x*100)/100 技巧：两位小数。输入 Series 时保 index。"""
-    out = _round_half_away(np.asarray(x, dtype=float) * 100.0) / 100.0
-    if isinstance(x, pd.Series):
-        return pd.Series(out, index=x.index)
-    return out
-
-
-def _ma(s: pd.Series, n: int) -> pd.Series:
-    """TDX MA：min_periods=n，不足 NaN。"""
-    return s.rolling(n, min_periods=n).mean()
-
-
-def _ref(s: pd.Series, k: int = 1) -> pd.Series:
-    return s.shift(k)
-
-
-def _count(s: pd.Series, n: int) -> pd.Series:
-    """TDX COUNT(cond,n)：滚动窗内条件成立次数（cond 布尔 0/1，NaN→0）。"""
-    v = s.fillna(0.0).astype(float)
-    return v.rolling(n, min_periods=n).sum()
-
-
-def _if(cond: pd.Series, a, b) -> pd.Series:
-    """TDX IF：cond 为 NaN/False → b。"""
-    c = cond.fillna(False).astype(bool)
-    return pd.Series(np.where(c, a, b), index=cond.index)
-
-
-def _and(*series) -> pd.Series:
-    out = series[0].fillna(False).astype(bool)
-    for s in series[1:]:
-        out &= s.fillna(False).astype(bool)
-    return out
-
-
-def _or(*series) -> pd.Series:
-    out = series[0].fillna(False).astype(bool)
-    for s in series[1:]:
-        out |= s.fillna(False).astype(bool)
-    return out
-
-
-def _gt(s, x) -> pd.Series:
-    """NaN 参与比较 → False（TDX null 语义）。"""
-    return (s > x).fillna(False)
-
-
-def _lt(s, x) -> pd.Series:
-    return (s < x).fillna(False)
-
-
-def _le(s, x) -> pd.Series:
-    return (s <= x).fillna(False)
-
-
-def _ge(s, x) -> pd.Series:
-    return (s >= x).fillna(False)
+# TDX 数值语义辅助（_ma/_round2/_if/... ）统一由 core.engine.rating_core 提供，
+# 保证门控与投资看板共用同一套公式实现。
 
 
 # ---------------- compute_gate_states（Python 状态机） ----------------
 
 def compute_gate_states(ohlcv: pl.DataFrame) -> tuple[dict, dict]:
-    """M 状态机（设计文档附录 A 逐字语义）→ ({date: 方向}, {date: 强度})。
+    """评级内核（rating_core.compute_rating_frame）→ ({date: 方向}, {date: 强度})。
 
-    ohlcv: polars DataFrame，datetime 升序，列 Open/High/Low/Close/Volume。
+    方向取 ``m_enh``（§12 口径统一，原 ``多头强度:IF(UP_ENH,…)``），空头强度
+    含 ``偏离分_空``（tqgate_py_v2）。``min_bars=0``：门控保持原有 fail-open
+    行为——历史不足时逐日输出 0（未定、放行），而非直接报错；
+    「不足最小根数不输出方向」只约束投资看板（默认 ``MIN_BARS=300``）。
     """
-    df = ohlcv.sort("datetime")
-    dt_list = df.get_column("datetime").to_list()
-    idx = pd.Index(dt_list)
-
-    def _col(name: str) -> pd.Series:
-        return pd.Series(df.get_column(name).to_numpy(), index=idx, dtype=float)
-
-    C = _col("Close")
-    H = _col("High")
-    L = _col("Low")
-    O = _col("Open")
-    V = _col("Volume")
-
-    # 均线组（ROUND 两位小数）
-    ah = _round2(_ma(C, 26) * 1.006)
-    ao = _round2(_ma(C, 26))
-    al = _round2(_ma(C, 26) * 0.994)
-    bo = _round2(_ma(C, 55))
-    zo = _round2(_ma(C, 144))
-    ch = _round2(_ma(C, 288) * 1.006)
-    co = _round2(_ma(C, 288))
-    cl = _round2(_ma(C, 288) * 0.994)
-
-    # 信号与角度
-    avgp = (C + O + H + L) / 4
-    mavgp = _ma(avgp, 26)
-    # SIGNAL:=IF(C>=MAVGP,1,IF(C<MAVGP,-1,0))——MAVGP 为 NaN 时两条件均 False → 0
-    signal = _if(_ge(C, mavgp), 1, _if(_lt(C, mavgp), -1, 0))
-    s = _if(_gt(_ma(signal, 3), 0), 1, _if(_lt(_ma(signal, 3), 0), -1, 0))
-    s3 = _if(_lt(s, 0), 1, 0)
-    wo = _round_half_away(_ma(C, 13))
-    wo_prev = _ref(wo, 1)
-    jd = (np.arctan((wo / wo_prev - 1) * 100) * 180 / 3.1416)  # 附录 A 原文 3.1416
-    jd = pd.Series(jd, index=idx).replace([np.inf, -np.inf], np.nan)
-
-    s1 = _and(_gt(jd, 10), _gt(s, 0), _lt(_ref(s, 1), 0),
-              _gt(jd, _ref(jd, 1))).astype(float)
-    s2 = _and(_lt(jd, -10), _gt(s, 0), _lt(_ref(s, 1), 0),
-              _lt(jd, _ref(jd, 1))).astype(float)
-
-    d = _and(_ge(ah, _ref(ah, 1)), _gt(C, ah), s3 == 0)
-    e = _lt(C, al)
-    q = _and(_count(_ge(_ref(C, 1), _ref(ah, 1)).astype(float), 5) == 5,
-             _gt(L, al), _le(L, ah))
-    i = _and(_count(_ge(_ref(C, 1), _ref(co, 1)).astype(float), 5) == 0,
-             _gt(H, cl), _le(H, ch))
-
-    m_in = _or(_gt(s1, 0), _gt(s2, 0), d, q)
-    m_out = _or(s3.astype(bool), e, i)
-    m_now = _if(m_in, 1, _if(m_out, -1, 0))  # M_IN 优先（TDX IF 嵌套顺序）
-    # carry-forward：T_M := REF(M_NOW, BARSLAST(M_NOW)) ≡ ffill 最后一个非零值
-    m_now_f = m_now.replace(0, np.nan).ffill().fillna(0)
-    m1 = m_now.where(m_now != 0, m_now_f)
-    jj = _and(_count(_lt(_ref(C, 1), _ref(ah, 1)).astype(float), 5) == 5,
-              _lt(ao, bo), _lt(bo, zo), _lt(zo, co), _gt(C, bo))
-    m = _if(jj, 2, m1)
-
-    # 增强版（强度分母）
-    s1_enh = _and(_gt(jd, 10), _gt(s, 0), _lt(_ref(s, 1), 0))
-    d_enh = _and(_ge(ah, _ref(ah, 1)),
-                 _or(_gt(C, ah), _gt(_ref(C, 1), _ref(ah, 1))), s3 == 0)
-    m_in_enh = _or(s1_enh, s2.astype(bool), d_enh, q)
-    m_now_enh = _if(m_in_enh, 1, _if(m_out, -1, 0))
-    m1_enh = m_now_enh.replace(0, np.nan).ffill().fillna(0)
-    m_enh = _if(jj, 2, m1_enh)
-    up_enh = _or(m_enh == 1, m_enh == 2)
-    down_enh = (m_enh == -1)
-
-    # 强度计分（空头侧照录原文：不含偏离分_空）
-    vol_up = _and(_gt(V, _ma(V, 20)), _gt(C, _ref(C, 1)))
-    vol_down = _and(_gt(V, _ma(V, 20)), _lt(C, _ref(C, 1)))
-    bias = (C - ao) / ao * 100
-    bear_pattern = _and(_count(_gt(_ref(C, 1), _ref(al, 1)).astype(float), 5) == 5,
-                        _gt(ao, bo), _gt(bo, zo), _gt(zo, co), _lt(C, bo))
-
-    ang_long = _if(_le(jd, 8), 0,
-                   _if(_le(jd, 15), (jd - 8) / 7 * 10,
-                       np.minimum(20, 10 + (jd - 15) / 5 * 10)))
-    dev_long = _if(_gt(bias, 3), 10,
-                   _if(_gt(bias, 1), 5 + (bias - 1) * 2.5, 0))
-    ma_pts_long = (_lt(ao, bo).astype(float) + _lt(bo, zo).astype(float)
-                   + _lt(zo, co).astype(float)) / 3 * 25
-    price_pts_long = (_gt(C, ao).astype(float) + _gt(C, bo).astype(float)
-                      + _gt(C, zo).astype(float) + _gt(C, co).astype(float)) / 4 * 20
-    up_str = pd.Series(np.minimum(
-        ang_long.fillna(0) + ma_pts_long.fillna(0) + price_pts_long
-        + dev_long.fillna(0)
-        + _if(jj, 10, 0)
-        + _if(vol_up, 10, _if(up_enh, 5, 0)),
-        100), index=idx)
-
-    ang_short = _if(_ge(jd, -8), 0,
-                    _if(_ge(jd, -15), (-8 - jd) / 7 * 10,
-                        np.minimum(20, 10 + (-15 - jd) / 5 * 10)))
-    ma_pts_short = (_gt(ao, bo).astype(float) + _gt(bo, zo).astype(float)
-                    + _lt(zo, co).astype(float)) / 3 * 25
-    price_pts_short = (_lt(C, ao).astype(float) + _lt(C, bo).astype(float)
-                       + _lt(C, zo).astype(float) + _lt(C, co).astype(float)) / 4 * 20
-    dn_str = pd.Series(np.minimum(
-        ang_short.fillna(0) + ma_pts_short.fillna(0) + price_pts_short
-        + _if(bear_pattern, 10, 0)
-        + _if(vol_down, 10, _if(down_enh, 5, 0)),
-        100), index=idx)
-
-    cur_str = _if(up_enh, up_str, _if(down_enh, dn_str, 0))
-
-    states = {}
-    strengths = {}
-    for ts, mv, sv in zip(dt_list, m, cur_str):
-        key = ts.date() if isinstance(ts, datetime) else ts
-        states[key] = int(mv) if pd.notna(mv) else 0
-        strengths[key] = round(float(sv)) if pd.notna(sv) else 0
+    frame = compute_rating_frame(ohlcv, min_bars=0)
+    states: dict = {}
+    strengths: dict = {}
+    for row in frame.itertuples(index=False):
+        states[row.date] = int(row.direction)
+        strengths[row.date] = (round(float(row.cur_str))
+                               if row.cur_str == row.cur_str else 0)
     return states, strengths
 
 
