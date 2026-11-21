@@ -31,6 +31,7 @@ const levelFilter = ref('')
 
 const active = ref<BoardIndustryItem | null>(null)
 const activeStocks = ref<BoardStockItem[]>([])
+const stocksReason = ref('')
 const drawerLoading = ref(false)
 
 const refreshScope = ref<'industries' | 'all'>('industries')
@@ -104,14 +105,20 @@ function applyLevel() {
 async function openIndustry(row: BoardIndustryItem) {
   active.value = row
   activeStocks.value = []
+  stocksReason.value = ''
   drawerLoading.value = true
   try {
     const [detail, stocks] = await Promise.all([
       getBoardIndustry(row.code, { period: period.value }).catch(() => row),
-      getBoardIndustryStocks(row.code, { period: period.value, sort: 'lead_days', limit: 200 }),
+      getBoardIndustryStocks(row.code, {
+        period: period.value, sort: 'lead_days', limit: 200,
+        // 30m 成分股不落全量快照，打开抽屉时按需计算（行业须 30m bull_dur=1）
+        compute: period.value === '30m',
+      }),
     ])
     active.value = detail || row
     activeStocks.value = stocks.rows
+    stocksReason.value = stocks.reason || ''
   } catch (e) {
     errorMsg.value = '加载成分股失败：' + errMsg(e)
   } finally {
@@ -122,6 +129,7 @@ async function openIndustry(row: BoardIndustryItem) {
 function closeDrawer() {
   active.value = null
   activeStocks.value = []
+  stocksReason.value = ''
 }
 
 async function doRefresh() {
@@ -349,7 +357,11 @@ onMounted(loadAll)
             <tr v-if="!activeStocks.length">
               <td colspan="7" class="board-empty">
                 {{ period === '30m'
-                  ? '30m 个股未计算（仅计算日线由空转多行业的成分股）'
+                  ? (stocksReason === 'not_reversal'
+                      ? '该行业 30m 未「由空转多」（bull_dur ≠ 1），不计算成分股领先榜'
+                      : (stocksReason === 'no_industry'
+                          ? '暂无 30m 行业快照，请先刷新行业榜'
+                          : '暂无 30m 成分股数据'))
                   : '暂无成分股快照，请用「行业 + 成分股」刷新' }}
               </td>
             </tr>

@@ -1014,10 +1014,12 @@ export async function getBoardIndustryStocks(code: string, params: {
   sort?: string
   order?: string
   limit?: number
+  compute?: boolean
 } = {}) {
   const res = await api.get<ApiResponse<{
     as_of: string | null
     rows: BoardStockItem[]
+    reason?: string | null
   }>>(`/investment-board/industries/${code}/stocks`, { params })
   return res.data.data
 }

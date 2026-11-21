@@ -532,6 +532,41 @@ def compute_stocks(db: Session, period: str, as_of: date,
     }
 
 
+def ensure_industry_stock_snapshot(db: Session, code: str, period: str,
+                                   as_of: Optional[date] = None) -> str:
+    """按需补齐单个行业的成分股快照（仅 30m）。
+
+    30m 全市场个股取数成本高，默认只在用户打开行业抽屉时补齐：
+    行业须在 30m 层级「由空转多」（bull_dur == 1）；已有快照直接复用。
+    返回 ``ready`` / ``not_reversal`` / ``no_industry``。
+    """
+    if period != "30m":
+        return "ready"
+    day = as_of or latest_as_of(db, period)
+    if day is None:
+        return "no_industry"
+    ind = db.execute(
+        select(BoardIndustrySnapshot.bull_dur).where(
+            BoardIndustrySnapshot.as_of == day,
+            BoardIndustrySnapshot.period == period,
+            BoardIndustrySnapshot.industry_code == code)
+    ).first()
+    if ind is None:
+        return "no_industry"
+    if int(ind[0] or 0) != 1:
+        return "not_reversal"
+    exists = db.execute(
+        select(BoardStockSnapshot.id).where(
+            BoardStockSnapshot.as_of == day,
+            BoardStockSnapshot.period == period,
+            BoardStockSnapshot.industry_code == code).limit(1)
+    ).first()
+    if exists is not None:
+        return "ready"
+    compute_stocks(db, period, day, trigger="lazy", industry_codes=[code])
+    return "ready"
+
+
 # ---------------- 刷新任务 ----------------
 
 def create_run(db: Session, period: str, scope: str,

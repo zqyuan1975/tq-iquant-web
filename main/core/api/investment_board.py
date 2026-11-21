@@ -133,15 +133,37 @@ def get_industry(code: str, period: str = "1d", date: str = "",
 @router.get("/industries/{code}/stocks")
 def get_industry_stocks(code: str, period: str = "1d", date: str = "",
                         sort: str = "lead_days", order: str = "desc",
-                        limit: int = 50, db: Session = Depends(get_db)):
+                        limit: int = 50, compute: bool = False,
+                        db: Session = Depends(get_db)):
     try:
         p = _check_period(period)
     except ValueError as exc:
         return err(422, str(exc))
     day = _parse_date(date)
-    key = ("stocks", code.upper(), p, day, sort, order, limit)
-    return ok(_cached(key, lambda: svc.query_stocks(
-        db, code.upper(), p, day, sort=sort, order=order, limit=limit)))
+    key = ("stocks", code.upper(), p, day, sort, order, limit, compute)
+    return ok(_cached(key, lambda: _industry_stocks(
+        db, code.upper(), p, day, sort=sort, order=order,
+        limit=limit, compute=compute)))
+
+
+def _industry_stocks(db: Session, code: str, period: str,
+                     as_of: Optional[date], sort: str, order: str,
+                     limit: int, compute: bool) -> dict:
+    """30m 成分股按需补齐：仅对 30m「由空转多」（bull_dur=1）行业实时计算。"""
+    day = svc.resolve_as_of(db, period, as_of)
+    reason = None
+    if compute and period == "30m":
+        reason = svc.ensure_industry_stock_snapshot(db, code, period, day)
+        if reason != "ready":
+            return {
+                "as_of": day.isoformat() if day else None,
+                "rows": [],
+                "reason": reason,
+            }
+    data = svc.query_stocks(db, code, period, day, sort=sort,
+                            order=order, limit=limit)
+    data["reason"] = reason
+    return data
 
 
 @router.get("/leaders")
