@@ -302,6 +302,7 @@ onMounted(loadAll)
           <th class="sortable" @click="toggleSort('bias_z')">偏离 z{{ sortMark('bias_z') }}</th>
           <th>超买超卖</th>
           <th class="sortable" @click="toggleSort('lead_days')">领先大盘{{ sortMark('lead_days') }}</th>
+          <th>背离</th>
           <th>发生时间</th>
         </tr>
       </thead>
@@ -325,10 +326,16 @@ onMounted(loadAll)
             <span v-else class="muted">—</span>
           </td>
           <td class="num">{{ signed(r.lead_days) }}</td>
+          <td>
+            <span v-if="r.divergence_label" class="flag flag-divergence" :title="`${r.divergence_label}（仅提示，不参与决策）`">
+              {{ r.divergence_label }}
+            </span>
+            <span v-else class="muted">—</span>
+          </td>
           <td class="muted turn-cell" :title="turnTitle(r.turned_at, r.bull_dur)">{{ turnText(r.turned_at) }}</td>
         </tr>
         <tr v-if="!industries.length">
-          <td colspan="10" class="board-empty">
+          <td colspan="11" class="board-empty">
             暂无快照。请点击右上角「刷新」生成（首次建议选「行业 + 成分股」）。
           </td>
         </tr>
@@ -524,6 +531,8 @@ onMounted(loadAll)
 .flag-watch { font-size: 9.5px; padding: 0 5px; border: 1px solid var(--line); background: transparent; opacity: .72; }
 .flag-watch-ob { color: var(--red); }
 .flag-watch-os { color: var(--green); }
+/* G 大盘-行业背离：仅提示，不参与任何决策 */
+.flag-divergence { font-size: 9.5px; padding: 0 5px; border: 1px solid var(--line); background: transparent; color: var(--ink-soft); white-space: nowrap; }
 .watch-count { font-size: 11px; color: var(--ink-faint); }
 .muted { color: var(--ink-faint); }
 .board-loading { padding: 18px 16px; font-size: 12.5px; color: var(--ink-soft); }

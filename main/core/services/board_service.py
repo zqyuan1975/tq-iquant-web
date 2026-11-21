@@ -45,6 +45,7 @@ from core.services.market_gate_service import (
     DEFAULT_GATE_INDEX,
     expected_latest_trading_day,
 )
+from core.engine.market_gate import GATE_WARMUP_DAYS, compute_gate_states
 from core.tq.data import TQData
 from core.tq.utils import get_tdx_lock, get_tq
 
@@ -871,6 +872,58 @@ _STOCK_SORTS = {
 }
 
 
+# ---------------- G 大盘-行业背离（仅看板提示，不进决策） ----------------
+
+_MARKET_DIR_CACHE: Dict[date, tuple] = {}
+_MARKET_DIR_TTL = 300
+
+
+def market_direction_on(day: date) -> Optional[int]:
+    """大盘门控在 day 的方向（只读展示）。
+
+    只用于看板「背离」提示，绝不参与任何开仓/减仓/风控决策；取数失败返回 None
+    （前端不显示提示，不影响看板其余列）。
+    """
+    now = time.monotonic()
+    hit = _MARKET_DIR_CACHE.get(day)
+    if hit is not None and now - hit[0] <= _MARKET_DIR_TTL:
+        return hit[1]
+    direction = None
+    try:
+        from core.services.backtest_service import build_gate_ohlcv
+
+        start = day - timedelta(days=GATE_WARMUP_DAYS + 60)
+        ohlcv = build_gate_ohlcv(DEFAULT_GATE_INDEX, start, day)
+        if ohlcv is not None and not ohlcv.is_empty():
+            states, _ = compute_gate_states(ohlcv)
+            valid = [d for d in sorted(states) if d <= day]
+            if valid:
+                direction = int(states[valid[-1]])
+    except Exception:  # noqa: BLE001
+        logger.warning("看板：大盘门控方向取数失败，背离提示降级为无", exc_info=True)
+    _MARKET_DIR_CACHE[day] = (time.monotonic(), direction)
+    if len(_MARKET_DIR_CACHE) > 64:
+        oldest = min(_MARKET_DIR_CACHE, key=lambda k: _MARKET_DIR_CACHE[k][0])
+        _MARKET_DIR_CACHE.pop(oldest, None)
+    return direction
+
+
+def divergence_hint(industry_direction, market_direction) -> Tuple[Optional[str], Optional[str]]:
+    """大盘与行业方向背离（仅展示）：返回 (code, label)。"""
+    if market_direction == -1 and industry_direction in (1, 2):
+        return "market_bear_industry_bull", "大盘空头 · 行业多头"
+    if market_direction in (1, 2) and industry_direction == -1:
+        return "market_bull_industry_bear", "大盘多头 · 行业空头"
+    return None, None
+
+
+def _with_divergence(item: dict, market_dir: Optional[int]) -> dict:
+    code, label = divergence_hint(item.get("direction"), market_dir)
+    item["divergence"] = code
+    item["divergence_label"] = label
+    return item
+
+
 def query_industries(db: Session, period: str, as_of: Optional[date] = None,
                      sort: str = "bull_dur", order: str = "desc",
                      level: Optional[str] = None,
@@ -889,12 +942,16 @@ def query_industries(db: Session, period: str, as_of: Optional[date] = None,
     limit = max(1, min(int(limit or 200), 200))
     rows = list(db.execute(q.limit(limit)).scalars())
     bench = benchmark_bull_dur(db, period, benchmark, day)
+    market_dir = market_direction_on(day)
     return {
         "as_of": day.isoformat(),
         "benchmark_bull_dur": bench,
-        "rows": [serialize_industry(
-            r, bench, i + 1,
-            _turn_bar_time(r.as_of, period, r.bull_dur, r.bar_closed_at))
+        "market_direction": market_dir,
+        "rows": [_with_divergence(
+            serialize_industry(
+                r, bench, i + 1,
+                _turn_bar_time(r.as_of, period, r.bull_dur, r.bar_closed_at)),
+            market_dir)
             for i, r in enumerate(rows)],
     }
 
@@ -913,9 +970,11 @@ def query_industry(db: Session, code: str, period: str,
     ).scalars().first()
     if row is None:
         return None
-    return serialize_industry(
+    market_dir = market_direction_on(day)
+    return _with_divergence(serialize_industry(
         row, benchmark_bull_dur(db, period, benchmark, day), None,
-        _turn_bar_time(row.as_of, period, row.bull_dur, row.bar_closed_at))
+        _turn_bar_time(row.as_of, period, row.bull_dur, row.bar_closed_at)),
+        market_dir)
 
 
 def query_stocks(db: Session, industry_code: str, period: str,

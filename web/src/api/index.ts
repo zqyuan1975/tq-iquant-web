@@ -907,6 +907,8 @@ export interface BoardIndustryItem {
   bar_closed_at: string | null
   effective_from: string | null
   computed_at: string | null
+  divergence: string | null
+  divergence_label: string | null
 }
 
 export interface BoardStockItem {
