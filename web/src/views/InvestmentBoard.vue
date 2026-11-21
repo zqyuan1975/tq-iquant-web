@@ -298,20 +298,7 @@ onMounted(loadAll)
     </table>
   </div>
 
-  <!-- E 口径说明 -->
-  <details class="card board-caliber">
-    <summary>口径说明（本项目实现 vs 行业评级系统）</summary>
-    <ul>
-      <li><b>公式唯一来源</b>：本项目 <code>core/engine/rating_core.py</code>（{{ meta?.formula_version }}），方向取 ENH（<code>m_enh</code>）；不移植行业评级系统的 Python 版本。</li>
-      <li><b>三处已修正缺陷</b>：<code>WO</code> 补 ROUND；角度用 <code>180/3.1416</code>；补 <code>偏离分_空</code>（<code>IF(偏差率&lt;-3,10,IF(偏差率&lt;-1,…))</code>）。</li>
-      <li><b>超买超卖重定义</b>：乖离率 250 日滚动 z 分数、不含当日、多空对称、主档 k=2.5；2.0≤|z|&lt;2.5 仅作「轻度超买 / 轻度超卖」观察提示；JD 与 CH/CL 轨道只作二级过滤展示，不作必要条件。</li>
-      <li><b>名单</b>：严格 128 个 881 二级行业（剔除 881999 类）；不足 {{ meta?.min_bars ?? 300 }} 根不输出方向。</li>
-      <li><b>30m</b>：只用已闭合 bar，闭合后下一根 bar 生效；个股 30m 按需计算 30m「由空转多」行业的成分股。</li>
-      <li>{{ meta?.caliber_note }}</li>
-    </ul>
-  </details>
-
-  <!-- F 行业详情抽屉 -->
+  <!-- E 行业详情抽屉 -->
   <div v-if="active" class="board-drawer-overlay" @click.self="closeDrawer">
     <aside class="board-drawer">
       <div class="drawer-head">
@@ -466,12 +453,6 @@ onMounted(loadAll)
 .muted { color: var(--ink-faint); }
 .board-loading { padding: 18px 16px; font-size: 12.5px; color: var(--ink-soft); }
 .board-empty { padding: 20px 16px; text-align: center; color: var(--ink-faint); font-size: 12.5px; }
-
-/* E 口径说明 */
-.board-caliber { padding: 10px 16px; margin-bottom: 12px; font-size: 12px; color: var(--ink-soft); }
-.board-caliber summary { cursor: pointer; font-weight: 600; color: var(--ink); }
-.board-caliber ul { margin: 8px 0 2px; padding-left: 18px; line-height: 1.75; }
-.board-caliber code { font-size: 11.5px; }
 
 /* F 抽屉 */
 .board-drawer-overlay {
