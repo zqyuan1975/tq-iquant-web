@@ -10,7 +10,7 @@ const route = useRoute()
 const { theme, toggle: toggleTheme } = useTheme()
 
 const titles: Record<string, string> = {
-  'dashboard': '状态总览', 'stock-pools': '备选股池', 'formulas': '公式管理', 'portfolios': '组合策略',
+  'dashboard': '状态总览', 'investment-board': '投资看板', 'stock-pools': '备选股池', 'formulas': '公式管理', 'portfolios': '组合策略',
   'backtest': '回测管理', 'backtest-analysis': '回归验证', 'incremental': '增量回测', 'live': '实盘交易',
   'health': '健康总览', 'system': '系统配置', 'events': '关键事件检索', 'troubleshooting': '故障向导',
   'cash-outlets': '现金出口',
@@ -26,6 +26,7 @@ const NAV_GROUPS: NavGroup[] = [
   {
     label: '研究',
     items: [
+      { to: '/investment-board', label: '投资看板', icon: 'board' },
       { to: '/stock-pools', label: '备选股池', icon: 'pools' },
       { to: '/formulas', label: '公式管理', icon: 'formula' },
       { to: '/portfolios', label: '组合策略', icon: 'portfolio' },

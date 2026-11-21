@@ -5,7 +5,8 @@ export const ICONS: Record<string, string> = {
   dashboard: 'M4 4h7v7H4zM13 4h7v7h-7zM4 13h7v7H4zM13 13h7v7h-7z',
   // 股票池：列表（竖线 + 三条不等长横线）
   pools: 'M4 5h16M4 12h11M4 19h16M4 5v14',
-  // 公式管理：f(x) 曲线
+  // 投资看板：柱状图 + 基线
+  board: 'M4 20V4M4 20h16M8 17V11M12 17V7M16 17v-4',
   formula: 'M4 19c5 0 7-14 12-14M16 5h4M18 3v4M4 19h3',
   // 组合策略：两个错位矩形
   portfolio: 'M4 8h11v11H4zM9 4h11v11',

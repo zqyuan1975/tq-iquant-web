@@ -874,6 +874,184 @@ export async function getMarketGateOverview() {
   return res.data.data
 }
 
+// ---------------- 投资看板（只读） ----------------
+
+export interface BoardIndustryItem {
+  rank: number | null
+  code: string
+  name: string
+  as_of: string | null
+  period: string
+  direction: number
+  direction_label: string
+  strength: number | null
+  level: string
+  level_label: string
+  bull_dur: number | null
+  bear_dur: number | null
+  lead_days: number | null
+  bias: number | null
+  bias_z: number | null
+  overbought: boolean
+  oversold: boolean
+  jd: number | null
+  jd_filter: number
+  channel_filter: number
+  up_str: number | null
+  dn_str: number | null
+  bars: number | null
+  stale: boolean
+  bar_closed_at: string | null
+  effective_from: string | null
+  computed_at: string | null
+}
+
+export interface BoardStockItem {
+  rank: number | null
+  code: string
+  name: string
+  industry_code: string
+  as_of: string | null
+  period: string
+  direction: number
+  direction_label: string
+  strength: number | null
+  level: string
+  level_label: string
+  bull_dur: number | null
+  bear_dur: number | null
+  lead_days: number | null
+  bias: number | null
+  bias_z: number | null
+  overbought: boolean
+  oversold: boolean
+  bars: number | null
+  stale: boolean
+  bar_closed_at: string | null
+  effective_from: string | null
+  computed_at: string | null
+}
+
+export interface BoardRunInfo {
+  id: number
+  period: string
+  scope: string
+  as_of: string | null
+  trigger: string | null
+  status: string
+  started_at: string | null
+  finished_at: string | null
+  total: number
+  ok: number
+  skipped: number
+  error: string | null
+  stats: any
+}
+
+export interface BoardMeta {
+  formula_version: string
+  direction_basis: string
+  min_bars: number
+  bias_z: { window: number; k: number; include_today: boolean; symmetric: boolean }
+  periods: string[]
+  universe: { count: number; expected: number; ok: boolean; codes: string[] }
+  benchmark: string
+  level_labels: Record<string, string>
+  caliber_note: string
+}
+
+export async function getBoardMeta() {
+  const res = await api.get<ApiResponse<BoardMeta>>('/investment-board/meta')
+  return res.data.data
+}
+
+export async function getBoardSummary(params: {
+  period?: string
+  benchmark_index?: string
+  history?: number
+  force?: boolean
+} = {}) {
+  const res = await api.get<ApiResponse<{
+    gate: MarketGateStatusItem
+    period: string
+    as_of: string | null
+    level_counts: Record<string, number>
+    benchmark_bull_dur: number | null
+    formula_version: string
+    latest_run: BoardRunInfo | null
+  }>>('/investment-board/summary', { params })
+  return res.data.data
+}
+
+export async function getBoardIndustries(params: {
+  period?: string
+  date?: string
+  sort?: string
+  order?: string
+  level?: string
+  limit?: number
+} = {}) {
+  const res = await api.get<ApiResponse<{
+    as_of: string | null
+    benchmark_bull_dur: number | null
+    rows: BoardIndustryItem[]
+  }>>('/investment-board/industries', { params })
+  return res.data.data
+}
+
+export async function getBoardIndustry(code: string, params: {
+  period?: string
+  date?: string
+} = {}) {
+  const res = await api.get<ApiResponse<BoardIndustryItem>>(
+    `/investment-board/industries/${code}`, { params })
+  return res.data.data
+}
+
+export async function getBoardIndustryStocks(code: string, params: {
+  period?: string
+  date?: string
+  sort?: string
+  order?: string
+  limit?: number
+} = {}) {
+  const res = await api.get<ApiResponse<{
+    as_of: string | null
+    rows: BoardStockItem[]
+  }>>(`/investment-board/industries/${code}/stocks`, { params })
+  return res.data.data
+}
+
+export async function getBoardLeaders(params: {
+  period?: string
+  date?: string
+  limit?: number
+} = {}) {
+  const res = await api.get<ApiResponse<{
+    as_of: string | null
+    benchmark_bull_dur: number | null
+    sustained: BoardIndustryItem[]
+    reversal: BoardIndustryItem[]
+    excess: BoardIndustryItem[]
+  }>>('/investment-board/leaders', { params })
+  return res.data.data
+}
+
+export async function getBoardRun(id: number) {
+  const res = await api.get<ApiResponse<BoardRunInfo>>(`/investment-board/runs/${id}`)
+  return res.data.data
+}
+
+export async function refreshBoard(payload: { period: string; scope: string }) {
+  const res = await api.post<ApiResponse<{
+    run_id: number
+    period: string
+    scope: string
+    status: string
+  }>>('/investment-board/refresh', payload)
+  return res.data.data
+}
+
 export async function getStockPools() {
   const res = await api.get<ApiResponse<StockPoolItem[]>>('/stock-pools')
   return res.data.data
