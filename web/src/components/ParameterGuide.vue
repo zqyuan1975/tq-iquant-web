@@ -5,6 +5,9 @@
       字段定义、取值范围和继承细节请看「配置指南」，两边不重复。
       数字均来自同一区间 2021-01-04 → 2026-11-19 的消融与容量核查，记录 id 对应
       <code>backtest_records</code>。
+      其中 id <b>36–59</b> 已在 2026-11-22 回测清理中删除，数字照原样保留，可追溯至备份
+      <code>dev-before-bt-clean-20261122-153738.db</code>（删除前 56 条完整）；文中收益/回撤结论
+      以数字为准，不依赖记录实体。
     </p>
     <details v-for="grp in GROUPS" :key="grp.key" class="param-guide-group">
       <summary>
