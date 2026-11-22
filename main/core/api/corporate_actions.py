@@ -45,6 +45,14 @@ class BatchReq(BaseModel):
     items: List[CorporateActionReq]
 
 
+class SyncReq(BaseModel):
+    # 留空 = 自动范围：池 1 ∪ 回测记录涉及的池 ∪ 各会话最新快照持仓
+    codes: Optional[List[str]] = None
+    pool_ids: Optional[List[int]] = None
+    start: str = ""
+    end: str = ""
+
+
 @router.get("")
 def list_corporate_actions(code: Optional[str] = None,
                            event_type: Optional[str] = None,
@@ -75,6 +83,39 @@ def create_corporate_action(req: CorporateActionReq, db: Session = Depends(get_d
         return err(400, str(exc))
     except CorporateActionConflict as exc:
         return err(409, str(exc))
+
+
+@router.post("/sync")
+def sync_from_tdx(req: SyncReq, db: Session = Depends(get_db)):
+    """从通达信批量回填公司行为（逐票独立成败，不阻塞其它票）。"""
+    from core.services.corporate_action_sync import (
+        resolve_backfill_codes, sync_corporate_actions,
+    )
+    from core.tq import gate as tq_gate
+    from core.tq.gate import P2, tdx_priority
+
+    policy = tq_gate.evaluate_policy()
+    if not policy["p2_allowed"]:
+        nxt = policy.get("next_p2_open_at")
+        return err(409, "公司行为回填在交易时段暂停（实盘优先），%s 后可用"
+                   % (nxt.strftime("%m-%d %H:%M") if nxt else "收盘后"))
+
+    codes = req.codes or []
+    scope = None
+    if not codes:
+        scope = resolve_backfill_codes(db, pool_ids=req.pool_ids or [1])
+        codes = scope["codes"]
+    if not codes:
+        return err(400, "回填范围为空：请显式传 codes 或先导入股票池")
+    with tdx_priority(P2):
+        result = sync_corporate_actions(db, codes, start=req.start, end=req.end)
+    if scope is not None:
+        result["scope"] = {
+            "pool_ids": scope["pool_ids"],
+            "pool_counts": {str(k): len(v) for k, v in scope["by_pool"].items()},
+            "holdings": scope["holdings"],
+        }
+    return ok(result)
 
 
 @router.post("/batch")

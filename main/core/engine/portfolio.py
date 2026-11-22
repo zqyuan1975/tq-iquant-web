@@ -208,6 +208,14 @@ class Portfolio:
         # 当日停牌代码集合（apply_day 每日刷新）：只拦 OPEN/ADD（持仓不强平，
         # 卖出/风控照常）。默认空集合 → 闸门无任何副作用。
         self.suspended_codes: frozenset = frozenset()
+        # 当日除权除息代码集合（2026-11-22 口径切换）：只拦 OPEN/ADD——除权日价格
+        # 跳空会制造假突破，开仓/加仓一律次日按新价重评；CLOSE/REDUCE/止损止盈照常。
+        # 默认空集合 + data_ok=None（未接线）→ 闸门无副作用（fail-open）。
+        self.ex_dividend_codes: frozenset = frozenset()
+        # None=未接线/未知，True=事件表可读，False=取不到数据 → fail-open 放行，
+        # 但每组合每日至多记一条 ex_dividend_data_unavailable（不得静默）。
+        self.ex_dividend_data_ok = None
+        self._ex_div_noted_days: set = set()
         # 长期停牌处置的幂等键集合（(code, suspend_ex_date)），防每日重复发强平。
         self._ca_disposed: set = set()
         # 时点股票池（J7，2026-11-18）：None = 未启用（默认）。
@@ -1334,6 +1342,23 @@ class Portfolio:
             self._rec("corporate_suspend", "signal_gate", "block", ctx, sig, bar,
                       message="停牌期间禁止开仓/加仓（corporate_actions.suspend）")
             return []
+        # 除权除息日闸（2026-11-22）：当日除权的票跳过 OPEN/ADD（不排队、次日按
+        # 新价重评）；CLOSE/REDUCE/止损止盈不受影响。取不到事件数据时 fail-open
+        # 放行并记一条 ex_dividend_data_unavailable（每日至多一条，不误拦）。
+        if sig.signal_type in (SignalType.OPEN, SignalType.ADD):
+            bar_day = getattr(bar, "bar_time", None)
+            bar_day = bar_day.date() if bar_day is not None else None
+            if self.ex_dividend_data_ok is False and bar_day is not None:
+                if bar_day not in self._ex_div_noted_days:
+                    self._ex_div_noted_days.add(bar_day)
+                    self._rec("ex_dividend_data_unavailable", "signal_gate", "notice",
+                              ctx, sig, bar,
+                              message="除权事件数据不可用，已 fail-open 放行（请补跑公司行为同步）")
+            if self.ex_dividend_codes and sig.stock_code in self.ex_dividend_codes:
+                self._rec("corporate_ex_dividend", "signal_gate", "block", ctx, sig, bar,
+                          message="除权除息日跳过开仓/加仓，次日按新价重评"
+                                  "（corporate_actions.ex_date）")
+                return []
         # 时点股票池闸（J7，默认 pool_timeline=None → 整段跳过）：
         # 只拦 OPEN/ADD；该交易日无任何成员记录时 fail-open 放行（回落当前池），
         # 每组合每日只记一条 pool_pit_uncovered，避免历史未录段把回测变零交易。

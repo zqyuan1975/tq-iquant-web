@@ -4412,6 +4412,53 @@ def test_inject_startup_periods_fills_signal_cache():
     assert engine.signal_cache[(1, stock, daily_time)] == [{"name": "open_sig", "value": 1}]
 
 
+def test_inject_startup_periods_compute_takes_channel_at_p0():
+    """TQ 闸回归：1w/1mon 启动注入的 compute 必须按 P0 取通道，
+    14:55–15:10 保护窗内不得被 P1 规则拒绝（P1 在该窗口会抛 TdxTaskBlocked）。"""
+    from core.tq import gate as tq_gate
+
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single(period="1w", strategy_id=1)
+    stock = "600000.SH"
+    rec = _Recorder()
+    disp, _ = _make_dispatcher(rec)
+    engine = _make_engine_formula_portfolio(disp, factory, port, {1: "MA_CROSS"})
+    daily_time = datetime(2026, 8, 10, 0, 0)
+    seen = []
+
+    def fake_compute(*a, **kw):
+        level = tq_gate.current_priority()
+        seen.append(level)
+        # 真闸：若未按 P0 取通道，保护窗内这里会抛 TdxTaskBlocked
+        assert tq_gate.GATE.acquire(level, timeout=1)
+        tq_gate.GATE.release()
+        return {stock: {"open_sig": [{"Date": "20260810", "Value": 1}], "ErrorId": 0}}
+
+    engine._tq_formula.compute = fake_compute
+    tq_gate.reset_for_tests(
+        config=dict(tq_gate.DEFAULT_GATE_CONFIG),
+        clock=lambda: datetime(2026, 11, 23, 15, 0, tzinfo=timezone(timedelta(hours=8))),
+        trading_day_fn=lambda d: True,
+    )
+    tq_gate.GATE.reset_state()
+    try:
+        blocked = False
+        try:
+            tq_gate.GATE.acquire(tq_gate.P1, timeout=1)
+            tq_gate.GATE.release()
+        except tq_gate.TdxTaskBlocked:
+            blocked = True
+        assert blocked, "注入时钟应处于 14:55–15:10 保护窗"
+
+        engine._inject_startup_periods(daily_time)
+    finally:
+        tq_gate.reset_for_tests()
+        tq_gate.GATE.reset_state()
+
+    assert seen == [tq_gate.P0]
+    assert engine.signal_cache[(1, stock, daily_time)] == [{"name": "open_sig", "value": 1}]
+
+
 def test_maybe_daily_bars_drives_1w_from_prefilled_cache():
     """C6(C)：1w 策略在周期末（周五）收盘落定轮次命中启动预填信号，不拉桥注入。"""
     factory, _ = _db_factory()

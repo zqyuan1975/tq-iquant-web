@@ -1057,6 +1057,8 @@ class LiveEngine:
         self._corporate_action_specs: Dict[int, dict] = dict(corporate_action_specs or {})
         self._corporate_timeline_provider = corporate_timeline_provider
         self._ca_applied: Dict[int, date] = {}
+        # 当日除权除息清单加载幂等键（日期集合）：每日只读一次事件表，零 TDX 调用。
+        self._ex_div_loaded: set = set()
         # R3：每组合每日首根 bar 已调 enter_day（跨日补算上一日 daily_loss，
         # 与回测对齐——暂停/恢复在日首生效），防混合周期多 bar/日重复调用。
         self._enter_day_updated: Dict[int, date] = {}
@@ -2173,6 +2175,8 @@ class LiveEngine:
         某段取数时桥刚断（BridgeUnavailableError）只跳过该段，不影响其余段与下轮。
         """
         for name, fn in (
+            ("ex_dividend", lambda: self._maybe_load_ex_dividend_day(
+                now_shanghai())),
             ("corporate_actions", lambda: self._maybe_apply_corporate_actions(
                 now_shanghai())),
             ("daily_close", self._maybe_daily_close),
@@ -7486,7 +7490,7 @@ class LiveEngine:
                 "action": "%s->%s" % (previous, target),
                 "session_id": self.session_id,
                 "final_qty": None,
-                "message": "现金出口分级模式切换：%s → %s（仅台账放行级别）"
+                "message": "现金管理分级模式切换：%s → %s（仅台账放行级别）"
                            % (previous, target),
             })
         self._cash_outlet_checked_at = time.monotonic()
@@ -7963,6 +7967,37 @@ class LiveEngine:
                 logger.exception("组合 %s 公司行为应用失败", pid)
             finally:
                 db.close()
+
+    def _maybe_load_ex_dividend_day(self, now: datetime) -> None:
+        """加载当日除权除息清单（DB 读取，零 TDX 调用）：只拦 OPEN/ADD。
+
+        数据源是 F 组 ``corporate_action_sync`` 回填的 ``corporate_actions`` 表
+        （与回测 exact 档同一张表、同一套 ex_date）。读不到 / 表为空 →
+        ``ex_dividend_data_ok=False``，Portfolio 闸 **fail-open 放行**，并每日最多
+        记一条 ``ex_dividend_data_unavailable``，保证不误拦、也不静默。
+        """
+        factory = self._db_session_factory
+        if factory is None:
+            return
+        day = now.date() if isinstance(now, datetime) else now
+        if day in self._ex_div_loaded:
+            return
+        self._ex_div_loaded.add(day)
+        info = {"ok": False, "codes": {}}
+        db = factory()
+        try:
+            from core.services.corporate_action_sync import load_ex_date_codes
+            info = load_ex_date_codes(db, day)
+        except Exception:  # noqa: BLE001 — 除权闸数据失败不得阻断交易主链路
+            logger.warning("当日除权清单加载失败（fail-open）", exc_info=True)
+        finally:
+            db.close()
+        codes = frozenset(info.get("codes") or {})
+        for portfolio in self.portfolios:
+            portfolio.ex_dividend_codes = codes
+            portfolio.ex_dividend_data_ok = bool(info.get("ok"))
+        if codes:
+            logger.info("当日除权除息代码 %s：%s", day, sorted(codes))
 
     def _ca_live_price(self, portfolio: Portfolio, code: str) -> Optional[Decimal]:
         for ctx in portfolio.strategies:
@@ -12782,13 +12817,17 @@ class LiveEngine:
 
     @staticmethod
     def _tq_daily_closes(codes: List[str], today: date) -> Dict[str, float]:
-        """通达信 1d 当日收盘价（只取索引最后一行且日期必须是今天）。"""
+        """通达信 1d 当日收盘价（只取索引最后一行且日期必须是今天）。
+
+        口径：**不复权**——与桥 /quote（dividend_type=none）交叉校验同口径，
+        否则除权日两侧收盘天然不等，会把口径差误报成行情偏差。
+        """
         try:
             from core.tq.data import TQData
             raw = TQData().get_history_raw(
                 stocks=list(codes), periods=["1d"],
                 start=today.strftime("%Y%m%d"), end=today.strftime("%Y%m%d"),
-                dividend_type="front", count=-1,
+                dividend_type="none", count=-1,
             )
         except Exception:  # noqa: BLE001 — 取数失败只是本日不校验
             logger.warning("daily cross check: TQ 日线取数失败", exc_info=True)

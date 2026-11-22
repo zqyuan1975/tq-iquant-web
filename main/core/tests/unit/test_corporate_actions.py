@@ -292,3 +292,70 @@ def test_reinvest_buys_whole_lots_at_close():
 
 def test_delist_action_kind_constant_is_stable():
     assert KIND_DELIST_CLOSE == "delist_close"
+
+
+# ---------------- 除权除息闸（2026-11-22 口径切换） ----------------
+
+def test_ex_dividend_day_blocks_open_but_not_close():
+    port = _portfolio()
+    _ctx(port)
+    port.ex_dividend_codes = frozenset({STOCK})
+    port.ex_dividend_data_ok = True
+    result = BacktestEngine().run(port, klines=_klines(), signal_cache=_cache())
+    assert result["trades"] == []
+    assert any(ev.get("gate") == "corporate_ex_dividend" and ev.get("action") == "block"
+               for ev in result["decisions"])
+
+    # 卖出不受除权闸影响：持仓 + CLOSE 信号照常成交
+    sell_port = _portfolio()
+    sell_ctx = _ctx(sell_port)
+    sell_ctx.formula_signals = [
+        {"signal_name": "open_sig", "signal_type": SignalType.CLOSE, "trigger_value": 1},
+    ]
+    _hold(sell_port)
+    sell_port.ex_dividend_codes = frozenset({STOCK})
+    sell_port.ex_dividend_data_ok = True
+    sell_result = BacktestEngine().run(
+        sell_port, klines=_klines(), signal_cache=_cache())
+    assert [t for t in sell_result["trades"] if t.trade_type == TradeType.SELL]
+
+
+def test_ex_dividend_missing_data_fails_open_with_one_notice():
+    """取不到事件表：不误拦（照常开仓），但每日至多一条不可用标记。"""
+    port = _portfolio()
+    _ctx(port)
+    port.ex_dividend_codes = frozenset()
+    port.ex_dividend_data_ok = False
+    result = BacktestEngine().run(port, klines=_klines(), signal_cache=_cache())
+    assert len(result["trades"]) == 1
+    notices = [ev for ev in result["decisions"]
+               if ev.get("gate") == "ex_dividend_data_unavailable"]
+    assert len(notices) == 1
+    assert notices[0]["action"] == "notice"
+
+
+def test_ex_dividend_loader_sets_flags_once_per_day(db_session):
+    """LiveEngine 日首加载：读库失败/表空 → ok=False；同一交易日只加载一次。"""
+    from types import SimpleNamespace
+
+    from core.engine.live_engine import LiveEngine
+    from core.models import CorporateAction
+
+    db_session.add(CorporateAction(code=STOCK, event_type="dividend",
+                                   ex_date=date(2026, 6, 11),
+                                   cash_per_share=Decimal("0.25")))
+    db_session.commit()
+    portfolio = SimpleNamespace(ex_dividend_codes=None,
+                                ex_dividend_data_ok=None)
+    engine = SimpleNamespace(_db_session_factory=lambda: db_session,
+                             _ex_div_loaded=set(), portfolios=[portfolio])
+
+    LiveEngine._maybe_load_ex_dividend_day(engine, datetime(2026, 6, 11, 9, 20))
+    assert portfolio.ex_dividend_data_ok is True
+    assert portfolio.ex_dividend_codes == frozenset({STOCK})
+
+    # 同日再调：不会重读（置 None 后仍保持，证明走了幂等短路）
+    portfolio.ex_dividend_codes = None
+    LiveEngine._maybe_load_ex_dividend_day(engine, datetime(2026, 6, 11, 10, 0))
+    assert portfolio.ex_dividend_codes is None
+

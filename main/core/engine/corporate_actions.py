@@ -262,7 +262,7 @@ def apply_day(portfolio, timeline: Optional[CorporateActionTimeline], day: date,
             # 配股默认放弃：只记事件，不缴款、不改账、不下单（本批范围外）
             actions.append(AppliedAction(
                 KIND_NOTICE, code,
-                reason="rights waived ratio=%s price=%s" % (
+                reason="rights_unhandled: waived ratio=%s price=%s" % (
                     ev.share_ratio, ev.rights_price)))
 
         for ev in evs:
