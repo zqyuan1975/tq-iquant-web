@@ -9,6 +9,7 @@ import {
 } from '../api'
 import PageHeader from '../components/PageHeader.vue'
 import FieldLabel from '../components/FieldLabel.vue'
+import ParameterGuide from '../components/ParameterGuide.vue'
 import { BENCHMARKS, DEFAULT_BENCHMARK } from '../utils/benchmarks'
 import { MARKET_GATE_ENGINES, MARKET_GATE_MODES, MARKET_GATE_VOTE_MODES } from '../utils/marketGate'
 
@@ -30,6 +31,8 @@ const portfolioForm = ref<Record<string, any>>(emptyPortfolioForm())
 const industryRecommendationApplied = ref(false)
 const showGuide = ref(false)
 const showStrategyGuide = ref(false)
+// 参数设定使用指南（行业门控区上方入口，内联展开）
+const showParamGuide = ref(false)
 
 // ===== 子策略表单 =====
 const showStrategyForm = ref(false)
@@ -622,6 +625,7 @@ function openCreatePortfolio() {
   portfolioForm.value = emptyPortfolioForm()
   portfolioFieldErrors.value = {}
   industryRecommendationApplied.value = false
+  showParamGuide.value = false
   // 把比例默认值转成百分比显示
   for (const k of PORTFOLIO_RATIO_FIELDS) {
     portfolioForm.value[k] = toPercent(portfolioForm.value[k], true)
@@ -633,6 +637,7 @@ async function openEditPortfolio(p: PortfolioItem) {
   editingPortfolioId.value = p.id
   portfolioFieldErrors.value = {}
   industryRecommendationApplied.value = false
+  showParamGuide.value = false
   let detail: PortfolioItem
   try {
     detail = await getPortfolioDetail(p.id)
@@ -974,11 +979,17 @@ onMounted(loadPortfolios)
             <label class="group-label">{{ g.title }}<span v-if="g.hint" class="group-hint">{{ g.hint }}</span></label>
             <div v-if="g.title.startsWith('行业门控')" class="industry-preset-bar">
               <button type="button" class="btn btn-sm btn-primary" data-action="apply-industry-recommend" @click="applyIndustryRecommendation">应用推荐配置（A+B）</button>
+              <button type="button" class="btn btn-sm" data-action="toggle-param-guide" @click="showParamGuide = !showParamGuide">
+                {{ showParamGuide ? '收起参数指南' : '参数怎么设？' }}
+              </button>
               <span class="industry-preset-note" data-test="industry-recommend-note">
                 {{ industryRecommendationApplied
                   ? '已填入：行业放行=relief、跨策略排序=开、同行业上限=2；C/D/E/F 保持关闭。点「确认」保存后才写入组合设置并生效。'
                   : '推荐：行业放行=relief + 跨策略排序=开 + 同行业上限=2，其余关闭。点击只填入表单，仍需点「确认」保存后才生效。' }}
               </span>
+            </div>
+            <div v-if="g.title.startsWith('行业门控') && showParamGuide" class="industry-param-guide" data-test="industry-param-guide">
+              <ParameterGuide />
             </div>
             <div class="field-grid">
               <div
@@ -1118,6 +1129,50 @@ onMounted(loadPortfolios)
                 改后<b>需重启实盘会话</b>（回测按次生效）。</p>
               <p class="guide-note">· 资金池模式（capital_pool_mode=off、capital_pool_rebalance_enabled=0）
                 属于会话级开关，见实盘页「配置指南」；组合级不重复配置。</p>
+            </div>
+          </div>
+          <div class="form-group">
+            <label class="group-label">六、行业门控字段（2026-11-22 补充）</label>
+            <div class="guide-block">
+              <table>
+                <thead><tr><th>字段</th><th>含义</th><th>取值范围</th><th>默认值</th><th>回测/实盘继承</th></tr></thead>
+                <tbody>
+                  <tr><td><code>industry_gate_mode</code></td>
+                      <td>行业门控放行档：off 不读行业数据；relief 仅大盘空头时按行业放行；strict 常开拦非多头</td>
+                      <td>off / relief / strict</td><td>off</td>
+                      <td>双端继承（portfolio_settings.json，回测与实盘同读）</td></tr>
+                  <tr><td><code>industry_rank_enabled</code></td>
+                      <td>跨策略 OPEN 排序开关（同一 bar 内统一排序，行业强的优先）</td>
+                      <td>true / false</td><td>false</td>
+                      <td>双端继承</td></tr>
+                  <tr><td><code>industry_max_per_industry</code></td>
+                      <td>同行业持仓上限；只在跨策略排序开启时生效</td>
+                      <td>整数 ≥1</td><td>2</td>
+                      <td>双端继承</td></tr>
+                  <tr><td><code>industry_weight_enabled</code></td>
+                      <td>行业强度权重：按行业强度放大 OPEN 定量，不改选股与卖点</td>
+                      <td>true / false</td><td>false</td>
+                      <td>双端继承</td></tr>
+                  <tr><td><code>industry_overbought_block</code></td>
+                      <td>行业超买停开仓：行业强度 z≥2.5 时拦新仓</td>
+                      <td>true / false</td><td>false</td>
+                      <td>双端继承</td></tr>
+                  <tr><td><code>industry_trail_tighten_enabled</code> / <code>industry_trail_tighten_ratio</code></td>
+                      <td>行业转空收紧移动止损：与个股移动止损取更紧者</td>
+                      <td>true/false；比例 0~1</td><td>false / 0.015</td>
+                      <td>双端继承</td></tr>
+                  <tr><td><code>industry_bear_reduce_ratio</code></td>
+                      <td>行业空头减仓比例；与大盘空头档 <code>market_gate_bear_reduce_ratio</code> 取 max、不叠加</td>
+                      <td>0~1（0=关）</td><td>0</td>
+                      <td>双端继承</td></tr>
+                  <tr><td><code>industry_divergence_hint</code></td>
+                      <td>大盘-行业背离看板：只做展示</td>
+                      <td>true / false</td><td>false</td>
+                      <td>仅看板，不继承到决策</td></tr>
+                </tbody>
+              </table>
+              <p class="guide-note">· 行业分类数据缺失时门控 fail-open（不拦），不阻断交易；基准指数日线不足时门控状态右移一日，避免前视。</p>
+              <p class="guide-note">· 怎么选、为什么、反例与实测记录 id，见「行业门控」区上方的「参数怎么设？」。</p>
             </div>
           </div>
         </div>

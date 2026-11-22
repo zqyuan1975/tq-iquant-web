@@ -43,6 +43,7 @@ import { gateLabel, LAYER_LABEL, ACTION_LABEL } from '../utils/liveEvents'
 import { deriveBlockCode } from '../utils/blockCode'
 import { MARKET_GATE_OVERRIDES } from '../utils/marketGate'
 import PageHeader from '../components/PageHeader.vue'
+import ParameterGuide from '../components/ParameterGuide.vue'
 import { fmtMoney, fmtPrice, fmtQty, fmtPct, fmtSignedPct, fmtRatio } from '../utils/format'
 import { useTable } from '../composables/useTable'
 import TableToolbar from '../components/TableToolbar.vue'
@@ -130,6 +131,8 @@ const loading = ref(true)
 // ===== 发起弹窗 =====
 const showForm = ref(false)
 const showBacktestGuide = ref(false)
+// 参数设定使用指南：与组合编辑弹窗内联面板同一组件、同一内容
+const showParamGuide = ref(false)
 const submitting = ref(false)
 // 高级选项（评估口径 / IS-OOS 采纳门槛 / 费用预留 / 自适应滑点）默认折叠：发起回测默认走增强前的基础方式
 const showAdvanced = ref(false)
@@ -4543,12 +4546,17 @@ watch(theme, () => {
           </div>
 
           <!-- 高级选项（默认折叠）：增强前只填上面基础项即可发起 -->
-          <div
-            class="adv-toggle"
-            @click="showAdvanced = !showAdvanced"
-            data-field="advanced-toggle"
-          >
-            {{ showAdvanced ? '▼' : '▶' }} 高级选项（评估口径 / IS-OOS 门槛 / 费用预留 / 滑点 / 成交量·容量 / 日内亏损口径）
+          <div class="adv-toggle-row">
+            <div
+              class="adv-toggle"
+              @click="showAdvanced = !showAdvanced"
+              data-field="advanced-toggle"
+            >
+              {{ showAdvanced ? '▼' : '▶' }} 高级选项（评估口径 / IS-OOS 门槛 / 费用预留 / 滑点 / 成交量·容量 / 日内亏损口径）
+            </div>
+            <button type="button" class="btn btn-sm" data-field="param-guide-toggle" @click="showParamGuide = true">
+              参数怎么设？
+            </button>
           </div>
 
           <div v-show="showAdvanced" class="form-group" style="margin-top:6px">
@@ -5004,9 +5012,58 @@ watch(theme, () => {
               <p class="guide-note">· 收益衰减是正常的：加约束后收益下降但更真实；若收益暴跌，检查约束是否过严。</p>
             </div>
           </div>
+          <div class="form-group">
+            <label class="group-label">四、本轮补充字段（2026-11-22）</label>
+            <div class="guide-block">
+              <table>
+                <thead><tr><th>字段</th><th>含义</th><th>取值范围</th><th>默认值</th><th>回测/实盘继承</th></tr></thead>
+                <tbody>
+                  <tr><td><code>max_order_amount</code>（单笔上限）</td>
+                      <td>单次委托金额上限（元），0=本次不限额</td>
+                      <td>≥0；留空</td><td>跟随组合（默认 300,000，定稿建议 1,000,000）</td>
+                      <td>策略字段双端继承；run 级覆盖不落库，不改组合与实盘。增量回测指纹不含该字段，改后需全量重跑</td></tr>
+                  <tr><td><code>capacity_model</code>（容量模型）</td>
+                      <td>linear=4% 成交量闸门 + 线性冲击；sqrt=参与率切单 + sqrt 冲击 + 残量顺延</td>
+                      <td>默认 / linear / sqrt</td><td>跟随组合（linear）</td>
+                      <td>linear 为组合默认、双端口径一致；sqrt 仅 run 级、不落库</td></tr>
+                  <tr><td><code>slippage_impact_coef</code>（冲击系数）</td>
+                      <td>自适应滑点的冲击系数：有效滑点 = 基础滑点 + 系数×订单量/当日量，封顶 10%</td>
+                      <td>0~1（界面按 % 输入 1~100）</td><td>跟随组合（0.10）</td>
+                      <td>双端继承；run 级覆盖不落库；sqrt 下强制启用冲击，勾不勾都生效</td></tr>
+                  <tr><td><code>volume_limit_ratio</code>（参与率/成交量占比）</td>
+                      <td>单笔成交量 ≤ 成交量分母 × 该比例</td>
+                      <td>(0, 1]</td><td>跟随组合（模型默认 0.10，本组合 0.04）</td>
+                      <td>双端继承；run 级覆盖不落库</td></tr>
+                  <tr><td><code>liquidity_caliber</code>（流动性口径）</td>
+                      <td>成交量分母：same_day_bar=成交当根 bar 量；prev5d_avg=成交日前 5 个有效交易日日均量</td>
+                      <td>默认（same_day_bar）/ prev5d_avg</td><td>回测 same_day_bar；实盘固定前 5 日均量</td>
+                      <td>仅 run 级、不落库；口径写入快照，新旧结果不可混比</td></tr>
+                </tbody>
+              </table>
+              <p class="guide-note"><b>已知口径差异</b>：回测流动性默认「当日 bar 量」，实盘按「前 5 日均量」。
+                同一标的同一天可成交量因此不同：回测分母含当日成交、更宽松；实盘分母只含此前 5 日，缩量/放量日差异可达数倍。
+                需要贴近实盘时，本次回测显式选 prev5d_avg；新旧口径结果不要混比。</p>
+            </div>
+          </div>
         </div>
         <div class="modal-actions">
           <button @click="showBacktestGuide = false" class="btn btn-primary">知道了</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- ============ 参数设定使用指南 Modal（与组合编辑内联面板同一组件）============ -->
+    <div v-if="showParamGuide" class="modal-overlay modal-lg" @click.self="showParamGuide = false">
+      <div class="modal-content">
+        <div style="display:flex;align-items:center;justify-content:space-between;gap:8px">
+          <h3 style="margin:0">参数设定使用指南</h3>
+          <button class="btn btn-sm" @click="showParamGuide = false">关闭</button>
+        </div>
+        <div class="modal-body" style="margin-top:12px">
+          <ParameterGuide />
+        </div>
+        <div class="modal-actions">
+          <button @click="showParamGuide = false" class="btn btn-primary">知道了</button>
         </div>
       </div>
     </div>

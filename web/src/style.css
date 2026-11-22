@@ -282,6 +282,32 @@ tbody tr:last-child td{border-bottom:none}
 .guide-step code { font-family: var(--font-mono); font-size: 12px; background: var(--hover-bg); padding: 1px 5px; border-radius: 3px; color: var(--accent); }
 .guide-note { font-size: 12px; line-height: 1.7; margin: 0 0 6px; color: var(--ink-faint); }
 
+/* 参数设定使用指南（组合编辑内联 / 回测弹窗共用）：四组 <details> 默认收起 */
+.param-guide{display:flex;flex-direction:column;gap:8px}
+.param-guide-intro{font-size:12px;line-height:1.7;color:var(--ink-soft);margin:0 0 2px}
+.param-guide-intro code{font-family:var(--font-mono);font-size:11px;background:var(--hover-bg);padding:1px 5px;border-radius:3px;color:var(--accent)}
+.param-guide-group{border:1px solid var(--border);border-radius:var(--radius);background:var(--bg)}
+.param-guide-group>summary{display:flex;align-items:baseline;gap:8px;flex-wrap:wrap;cursor:pointer;padding:8px 10px;list-style:none;user-select:none}
+.param-guide-group>summary::-webkit-details-marker{display:none}
+.param-guide-group>summary::before{content:'▶';font-size:9px;color:var(--ink-faint);flex:0 0 auto}
+.param-guide-group[open]>summary::before{content:'▼'}
+.param-guide-group>summary:hover{color:var(--accent)}
+.param-guide-group[open]>summary{border-bottom:1px solid var(--border)}
+.param-guide-group-title{font-size:13px;font-weight:600;color:var(--ink)}
+.param-guide-group-hint{font-size:11px;color:var(--ink-faint)}
+.param-guide-items{padding:0 10px 6px}
+.param-guide-item{padding:8px 0;border-bottom:1px dashed var(--border)}
+.param-guide-item:last-child{border-bottom:none}
+.param-guide-name{font-size:13px;font-weight:600;color:var(--ink);margin:0 0 4px}
+.param-guide-name code{font-family:var(--font-mono);font-size:11px;font-weight:400;color:var(--ink-faint);background:var(--hover-bg);padding:1px 5px;border-radius:3px;margin-left:4px}
+.param-guide-line{display:flex;gap:8px;font-size:12px;line-height:1.65;color:var(--ink-soft);margin:0 0 2px}
+.param-guide-tag{flex:0 0 78px;font-size:11px;font-weight:600;color:var(--accent);white-space:nowrap}
+/* 组合弹窗内联展开区域 */
+.industry-param-guide{margin:0 0 10px;padding:8px 10px;border:1px solid var(--border);border-radius:var(--radius);background:var(--hover-bg)}
+/* 回测弹窗：高级选项折叠头与「参数怎么设？」同排 */
+.adv-toggle-row{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-top:12px;flex-wrap:wrap}
+.adv-toggle-row .adv-toggle{margin-top:0}
+
 /* 树状子策略子行 */
 .toggle-expand{margin-right:4px;padding:2px 6px;font-size:11px;line-height:1}
 .strategy-sub-row td{background:var(--hover-bg) !important;border-bottom:1px solid var(--line) !important;padding:6px 14px !important}
