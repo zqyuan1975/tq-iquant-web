@@ -59,8 +59,9 @@ class BacktestRequest(BaseModel):
     name: str
     start_date: date
     end_date: date
-    # 复权模式：front 前复权（默认，历史行为） / back 后复权 / dual 前复权信号+后复权记账
-    dividend_mode: str = "front"
+    # 复权模式：exact 不复权真实价 + 公司行为记账（默认，2026-11-22 起）/
+    # front 前复权 / back 后复权 / dual 信号不复权+后复权记账（历史兼容）
+    dividend_mode: str = "exact"
     # B6 考核口径：absolute 绝对收益（默认） / relative 相对收益；仅影响详情 acceptance 验收块
     evaluation_profile: str = "absolute"
     # C7 IS/OOS 采纳门槛（默认关）：启用后回测完成时评估 OOS CAGR ≥ min_ratio × IS CAGR
@@ -147,7 +148,7 @@ class MultiBacktestRequest(BaseModel):
     name: str = "多组合回测"
     start_date: date
     end_date: date
-    dividend_mode: str = "front"
+    dividend_mode: str = "exact"
     evaluation_profile: str = "absolute"
     daily_loss_basis: str | None = None
     market_gate_enabled: bool | None = None
@@ -172,7 +173,7 @@ class PoolCompareRequest(BaseModel):
     start_date: date
     end_date: date
     name_prefix: str = "换池对比"
-    dividend_mode: str = "dual"
+    dividend_mode: str = "exact"
 
 
 class CompareRecordsRequest(BaseModel):
@@ -185,7 +186,7 @@ class SignalReplayRequest(BaseModel):
     portfolio_strategy_id: int
     start_date: date
     end_date: date
-    dividend_mode: str = "front"
+    dividend_mode: str = "exact"
     session_id: int | None = None
 
 
@@ -199,7 +200,7 @@ class WalkForwardRequest(BaseModel):
     train_years: int = 3
     test_years: int = 1
     oos_gate_min_ratio: float = 0.5
-    dividend_mode: str = "front"
+    dividend_mode: str = "exact"
     evaluation_profile: str = "absolute"
     # 日内亏损熔断分母口径 run 级覆盖（None=跟随组合）
     daily_loss_basis: str | None = None
@@ -213,7 +214,7 @@ class ParamPerturbRequest(BaseModel):
     start_date: date
     end_date: date
     perturb_pct: float = 0.10
-    dividend_mode: str = "front"
+    dividend_mode: str = "exact"
     evaluation_profile: str = "absolute"
     # 日内亏损熔断分母口径 run 级覆盖（None=跟随组合）
     daily_loss_basis: str | None = None
@@ -269,6 +270,13 @@ from core.services.param_perturb_service import (  # noqa: E402
 )
 from core.tq.data import TQData  # noqa: E402  re-export（测试 monkeypatch bt_api.TQData）
 from core.tq.formula import TQFormula  # noqa: E402  re-export（同上）
+from core.tq.gate import P2, tdx_priority  # noqa: E402
+
+
+def _run_p2(fn, *args, **kwargs):
+    """后台重任务以 P2 优先级执行：交易时段被闸立即拒绝，非交易时段分片让出通道。"""
+    with tdx_priority(P2):
+        return fn(*args, **kwargs)
 
 
 # ---------------------------------------------------------------------------
@@ -298,7 +306,8 @@ def signal_replay(req: SignalReplayRequest, db: Session = Depends(get_db)):
 
     只读、不落库；组合不存在 → 404，日期区间非法 → 400。
     """
-    payload, msg = _svc_replay_signals(
+    payload, msg = _run_p2(
+        _svc_replay_signals,
         db, req.portfolio_strategy_id, req.start_date, req.end_date,
         dividend_mode=req.dividend_mode, session_id=req.session_id,
     )
@@ -352,7 +361,7 @@ def cancel_record(record_id: int, db: Session = Depends(get_db)):
 
 @router.post("/records/{record_id}/crisis-alpha/recompute")
 def recompute_record_crisis_alpha(record_id: int, db: Session = Depends(get_db)):
-    result = _svc_recompute_crisis_alpha(db, record_id)
+    result = _run_p2(_svc_recompute_crisis_alpha, db, record_id)
     if result is None:
         return err(404, "回测记录不存在")
     return ok(result)
@@ -361,7 +370,7 @@ def recompute_record_crisis_alpha(record_id: int, db: Session = Depends(get_db))
 @router.post("/records/{record_id}/market-regime/recompute")
 def recompute_record_market_regime(record_id: int, db: Session = Depends(get_db)):
     """离线重算市场状态×绩效分析（机遇/中性Alpha，不重跑回测）。"""
-    result = _svc_recompute_market_regime(db, record_id)
+    result = _run_p2(_svc_recompute_market_regime, db, record_id)
     if result is None:
         return err(404, "回测记录不存在")
     return ok(result)
@@ -370,7 +379,7 @@ def recompute_record_market_regime(record_id: int, db: Session = Depends(get_db)
 @router.post("/records/{record_id}/evaluations/recompute")
 def recompute_record_evaluation(record_id: int, db: Session = Depends(get_db)):
     """离线重算组合级评估（不重跑回测），供老记录补算基准相对等新增指标。"""
-    result = _svc_recompute_evaluation(db, record_id)
+    result = _run_p2(_svc_recompute_evaluation, db, record_id)
     if result is None:
         return err(404, "回测记录不存在")
     if result == "running":
@@ -381,7 +390,7 @@ def recompute_record_evaluation(record_id: int, db: Session = Depends(get_db)):
 @router.post("/records/{record_id}/robustness/recompute")
 def recompute_record_robustness(record_id: int, db: Session = Depends(get_db)):
     """离线重算稳健性检验（年度/3年滚动/集中度/样本内外，不触发回测）。"""
-    result = _svc_recompute_robustness(db, record_id)
+    result = _run_p2(_svc_recompute_robustness, db, record_id)
     if result is None:
         return err(404, "回测记录不存在")
     return ok(result)
@@ -390,7 +399,7 @@ def recompute_record_robustness(record_id: int, db: Session = Depends(get_db)):
 @router.post("/records/{record_id}/validation-crisis/recompute")
 def recompute_record_validation_crisis(record_id: int, db: Session = Depends(get_db)):
     """离线刷新验证结论的危机防御块（新窗口/新判定，仅用落库快照，不重跑回测）。"""
-    result = _svc_recompute_validation_crisis(db, record_id)
+    result = _run_p2(_svc_recompute_validation_crisis, db, record_id)
     if result is None:
         return err(404, "回测记录不存在")
     return ok(result)
@@ -403,7 +412,7 @@ def recompute_record_validation(record_id: int, db: Session = Depends(get_db)):
     capacity 从落库快照/评估/策略配置重建；ADV 容量预警需逐股日线（离线无
     klines）→ 跳过。新回测完成时由 build_validation_verdict 自动含全部维度。
     """
-    result = _svc_recompute_validation(db, record_id)
+    result = _run_p2(_svc_recompute_validation, db, record_id)
     if result is None:
         return err(404, "回测记录不存在")
     return ok(result)
@@ -418,7 +427,8 @@ def recompute_record_persistence(
     benchmark_code：可选判定基准覆盖（默认组合基准）。仅影响本模块，不改组合配置。
     """
     try:
-        result = _svc_recompute_persistence(db, record_id, benchmark_code=benchmark_code)
+        result = _run_p2(_svc_recompute_persistence, db, record_id,
+                         benchmark_code=benchmark_code)
     except ValueError as e:
         return err(400, str(e))
     if result is None:
@@ -454,7 +464,8 @@ def compare_pool_robustness(req: PoolCompareRequest, db: Session = Depends(get_d
             detail="回测正在进行中，请等待当前回测完成后再启动（已达并发上限）",
         )
     try:
-        results = _svc_run_pool_comparison(
+        results = _run_p2(
+            _svc_run_pool_comparison,
             db, req.portfolio_strategy_id, req.pool_ids,
             req.start_date, req.end_date,
             req.name_prefix, req.dividend_mode,
@@ -611,7 +622,7 @@ def run_backtest(req: BacktestRequest, db: Session = Depends(get_db)):
             detail="回测正在进行中，请等待当前回测完成后再启动（已达并发上限）",
         )
     try:
-        payload = _svc_run_backtest(db, ps, req)
+        payload = _run_p2(_svc_run_backtest, db, ps, req)
         if req.pairing_plan_id:
             try:
                 from core.services import pairing_service
@@ -696,7 +707,7 @@ def run_multi_backtest(req: MultiBacktestRequest, db: Session = Depends(get_db))
             detail="回测正在进行中，请等待当前回测完成后再启动（已达并发上限）",
         )
     try:
-        return ok(_svc_run_multi_backtest(db, portfolios, req))
+        return ok(_run_p2(_svc_run_multi_backtest, db, portfolios, req))
     except MarketGateUnavailableError as exc:
         return err(400, str(exc))
     except ValueError as exc:
@@ -791,7 +802,7 @@ def run_walk_forward(req: WalkForwardRequest, db: Session = Depends(get_db)):
             detail="回测正在进行中，请等待当前回测完成后再启动（已达并发上限）",
         )
     try:
-        return ok(_svc_run_walk_forward(db, ps, req))
+        return ok(_run_p2(_svc_run_walk_forward, db, ps, req))
     finally:
         _release_slot()
 
@@ -864,7 +875,7 @@ def run_param_perturb(req: ParamPerturbRequest, db: Session = Depends(get_db)):
             detail="回测正在进行中，请等待当前回测完成后再启动（已达并发上限）",
         )
     try:
-        return ok(_svc_run_param_perturb(db, ps, req))
+        return ok(_run_p2(_svc_run_param_perturb, db, ps, req))
     finally:
         _release_slot()
 

@@ -15,6 +15,7 @@ from sqlalchemy.orm import Session
 from core.api.response import err, ok
 from core.db import get_db
 from core.services import incremental_backtest as svc
+from core.tq.gate import P2, TdxTaskBlocked, tdx_priority
 
 router = APIRouter(prefix="/api/incremental", tags=["incremental"])
 
@@ -47,9 +48,12 @@ def get_summary(
 def post_rebuild(body: RebuildRequest, db: Session = Depends(get_db)):
     """K3：一键重建接缝（丢弃 checkpoint 后从接缝日全量重建）。"""
     try:
-        result = svc.run_incremental(
-            db, body.session_id, body.portfolio_strategy_id,
-            force_rebuild=True)
+        with tdx_priority(P2):
+            result = svc.run_incremental(
+                db, body.session_id, body.portfolio_strategy_id,
+                force_rebuild=True)
+    except TdxTaskBlocked:
+        raise  # 交给全局处理器：返回 409 + 下次可用时刻
     except Exception as exc:  # noqa: BLE001
         return err(500, "重建接缝失败：%s" % exc)
     if result.get("status") == "error":
@@ -60,9 +64,12 @@ def post_rebuild(body: RebuildRequest, db: Session = Depends(get_db)):
 @router.post("/validate")
 def post_validate(body: ValidateRequest, db: Session = Depends(get_db)):
     try:
-        result = svc.run_validation(
-            db, body.session_id, body.portfolio_strategy_id,
-            from_date=body.from_date, to_date=body.to_date)
+        with tdx_priority(P2):
+            result = svc.run_validation(
+                db, body.session_id, body.portfolio_strategy_id,
+                from_date=body.from_date, to_date=body.to_date)
+    except TdxTaskBlocked:
+        raise
     except Exception as exc:  # noqa: BLE001
         return err(500, "双跑校验失败：%s" % exc)
     if result.get("status") == "error":

@@ -499,7 +499,7 @@ def _slice_klines_from(klines: dict, start: date) -> dict:
 
 
 def build_klines(ps, start: date, end: date, db: Session = None,
-                 dividend_mode: str = "front",
+                 dividend_mode: str = "exact",
                  pool_codes: Optional[list] = None,
                  stats: Optional[dict] = None) -> dict:
     """从 TQ 取历史 K 线：{stock_code: {period: pl.DataFrame}}（含公式预热段）。
@@ -575,7 +575,7 @@ def build_klines(ps, start: date, end: date, db: Session = None,
 
 def build_index_close_series(
     codes: List[str], start: date, end: date, batch_size: int = 0,
-    dividend_mode: str = "front",
+    dividend_mode: str = "exact",
 ) -> Dict[str, Dict[date, Decimal]]:
     """取指数日线收盘价。batch_size>0 时分批取数（行业指数 128 个用）。"""
     wanted = [c for c in dict.fromkeys(codes) if c]
@@ -628,7 +628,7 @@ def build_index_close_series(
 
 
 def build_benchmark_data(
-    ps, start: date, end: date, db: Session = None, dividend_mode: str = "front"
+    ps, start: date, end: date, db: Session = None, dividend_mode: str = "exact"
 ) -> Dict[date, Decimal]:
     index_code = getattr(ps, "benchmark_index", None) or DEFAULT_BENCHMARK_CODE
     return build_index_close_series(
@@ -804,18 +804,24 @@ PARAMS_SNAPSHOT_FIELDS = (
     "market_gate_bear_reduce_ratio",
 )
 
-# 复权模式：K线/指数传 dividend_type 字符串（"front"/"back"，通达信 SDK 原样透传）；
-# 公式信号传整数（front=1/back=2）。缺省前复权，保持历史行为。
-# "dual" = 信号前复权 + 执行/记账后复权（模拟实盘口径：公式按前复权出信号、真实价成交）。
-# "exact" = 不复权取数 + 显式公司行为记账（对账基准档，默认关闭，需 J1 事件表）。
+# 复权模式（2026-11-22 口径切换后的语义）：
+#   - exact（**默认**）= 不复权取数 + 显式公司行为记账（分红入现金、送转改股数）。
+#     不复权历史价永不改变 → 跨日增量回测时间稳定、可复现，与实盘信号口径一致。
+#   - front = 不复权取数 + 前复权信号（保留为「展示/对照」档；因子随请求窗口变化，
+#     不得再作生产默认，也不用于跨日持久化的记账）。
+#   - back  = 后复权（仅供与历史记录对照；长区间价格失真，费用阈值口径已知偏差）。
+#   - dual  = 历史兼容档：信号已改为不复权（原「前复权信号」作废），记账仍后复权；
+#     保留枚举只为旧记录可读，新跑请用 exact。
 DIVIDEND_MODES = ("front", "back", "dual", "exact")
-_FORMULA_DIVIDEND_TYPE = {"front": 1, "back": 2, "exact": 0}
+_FORMULA_DIVIDEND_TYPE = {"front": 1, "back": 2, "exact": 0, "dual": 0, "none": 0}
 
 # J3（2026-11-18）口径显式标记：实盘 1d/1w/1mon 桥 /quote 固定 adjust=0（不复权），
 # 回测按 dividend_mode 复权 → 除权日附近同一日线公式可能给出不同信号。这是已知
 # 口径差异（非缺陷），把两侧口径冻结进 params_snapshot，对照面板据此提示。
 LIVE_BRIDGE_ADJUST_MODE = "none"
-PRICE_CALIBER_VERSION = "price_caliber_v1"
+#: v2（2026-11-22）：默认档由 front 改为 exact，公式信号统一不复权。
+#: 版本号进 params_snapshot → 旧记录与新记录天然不可混比（显式可见）。
+PRICE_CALIBER_VERSION = "price_caliber_v2"
 
 
 def _fetch_adjust_mode(dividend_mode: str) -> str:
@@ -935,7 +941,7 @@ def build_corporate_timeline(db: Session, start: Optional[date] = None,
     return build_timeline_from_rows(rows)
 
 
-def build_params_snapshot(ps, dividend_mode: str = "front",
+def build_params_snapshot(ps, dividend_mode: str = "exact",
                           fee_reserve_enabled: bool = False,
                           bond_t0_enabled: bool = False,
                           bond_lot_enabled: bool = False,
@@ -994,6 +1000,8 @@ def build_params_snapshot(ps, dividend_mode: str = "front",
         "version": PRICE_CALIBER_VERSION,
         "backtest_adjust": dividend_mode,
         "backtest_fetch_adjust": _fetch_adjust_mode(dividend_mode),
+        # 公式信号口径（2026-11-22 起统一 none，与实盘桥 /quote 一致）
+        "signal_adjust": "none",
         "live_bridge_adjust": LIVE_BRIDGE_ADJUST_MODE,
         "aligned_with_live": (
             _fetch_adjust_mode(dividend_mode) == LIVE_BRIDGE_ADJUST_MODE),
@@ -1959,7 +1967,7 @@ class _PoolCompareReq:
 def run_pool_comparison(
     db: Session, source_ps_id: int, pool_ids: List[int],
     start: date, end: date, name_prefix: str = "换池对比",
-    dividend_mode: str = "dual",
+    dividend_mode: str = "exact",
 ) -> list:
     """为每个备选池克隆组合并跑一遍回测（同参数仅换池），返回可并排比较的结果。
 
@@ -2634,7 +2642,7 @@ def build_signal_cache(
         raw = tq_formula.compute(
             formula_name=formula.name, formula_arg="",
             stocks=union, period=period,
-            count=-1, dividend_type=_FORMULA_DIVIDEND_TYPE.get(dividend_mode, 1),
+            count=-1, dividend_type=_FORMULA_DIVIDEND_TYPE.get(dividend_mode, 0),
             start_time=start_str, end_time=end_str,
         )
         # 分钟级传 bar_times 按索引对齐；日线不传走 Date 匹配
@@ -2825,6 +2833,25 @@ def pool_composition(ps, db: Session) -> Dict[str, List[str]]:
         if code not in bucket:
             bucket.append(code)
     return out
+
+
+def _corporate_missing_codes(ps, db: Session, ca_enabled: bool) -> List[str]:
+    """exact 档：池内「公司行为未回填」的代码（回测结果显式标记用）。
+
+    ``corporate_actions`` 表里没有行既可能代表「无除权事件」，也可能代表
+    「没同步过」——两者必须区分。区分依据是 F 组同步写的覆盖清单
+    （``corporate_actions_coverage.json``）：只有清单里 covered/no_events
+    或事件表有行才算已覆盖，其余一律标 ``corporate_actions_missing``。
+    """
+    if not ca_enabled:
+        return []
+    try:
+        from core.services.corporate_action_sync import missing_coverage_codes
+        pool = pool_composition(ps, db)
+        codes = sorted({code for bucket in pool.values() for code in bucket})
+        return missing_coverage_codes(db, codes)
+    except Exception:  # noqa: BLE001 — 覆盖核对失败只能留空（不阻断回测）
+        return []
 
 
 def _pool_stock_names(ps, db: Session) -> dict:
@@ -4610,13 +4637,14 @@ def run_backtest(db: Session, ps: PortfolioStrategy, req,
                     db.expunge(s)
                 s.max_order_amount = _moa_value
 
-    # 复权模式：读请求参数，非法值回退前复权（保持历史行为 + 防脏数据）
-    dividend_mode = getattr(req, "dividend_mode", "front") or "front"
+    # 复权模式：读请求参数，非法值回退 exact（2026-11-22 起的生产默认）
+    dividend_mode = getattr(req, "dividend_mode", "exact") or "exact"
     if dividend_mode not in DIVIDEND_MODES:
-        dividend_mode = "front"
-    # dual：公式信号走前复权（与通达信口径一致），引擎执行/记账走后复权（真实价、跨除权正确）
+        dividend_mode = "exact"
+    # dual：信号统一不复权（与实盘/桥 /quote 同口径），引擎执行/记账走后复权
+    # （历史兼容档，只为旧记录可读；新跑请用 exact）。
     if dividend_mode == "dual":
-        accounting_mode, signal_mode = "back", "front"
+        accounting_mode, signal_mode = "back", "none"
     else:
         accounting_mode = signal_mode = dividend_mode
 
@@ -4738,6 +4766,12 @@ def run_backtest(db: Session, ps: PortfolioStrategy, req,
         "events_digest": (
             ca_timeline.digest() if ca_timeline is not None and len(ca_timeline) else None),
     }
+    # 回填缺口显式标记（2026-11-22）：池内未同步过的票不得静默按「无除权」处理。
+    ca_missing = _corporate_missing_codes(ps, db, ca_enabled)
+    ca_snapshot["missing_count"] = len(ca_missing)
+    ca_snapshot["missing_codes"] = ca_missing[:50]
+    ca_snapshot["coverage_status"] = (
+        "corporate_actions_missing" if ca_missing else "complete")
 
     # 时点股票池（J7，默认关）：关闭时 timeline=None、选股范围仍是当前成分，
     # 引擎侧 portfolio.pool_timeline 不注入 → 闸门第一行返回，行为逐字不变。
@@ -4921,6 +4955,14 @@ def run_backtest(db: Session, ps: PortfolioStrategy, req,
                 f"{shown}{more}。请在通达信中补齐数据后重跑。"
             )
         warnings = data_warnings + signal_warnings
+        if ca_missing:
+            shown_missing = "、".join(ca_missing[:20])
+            more_missing = (f" 等 {len(ca_missing)} 只"
+                            if len(ca_missing) > 20 else "")
+            warnings.append(
+                f"公司行为未回填 {len(ca_missing)} 只（corporate_actions_missing）："
+                f"{shown_missing}{more_missing}。exact 档对这批票的除权日附近结果"
+                f"可能偏差，请补跑公司行为同步后重跑。")
         t3 = datetime.now()
         # 引擎视野切回主区间：预热段不进时间轴/成交/快照/熔断
         klines = _slice_klines_from(klines_full, req.start_date)
@@ -5255,11 +5297,12 @@ def run_multi_backtest(db: Session, portfolios: list, req) -> dict:
     from core.models import BacktestRunGroup
 
     start_date, end_date = req.start_date, req.end_date
-    dividend_mode = getattr(req, "dividend_mode", "front") or "front"
+    dividend_mode = getattr(req, "dividend_mode", "exact") or "exact"
     if dividend_mode not in DIVIDEND_MODES:
-        dividend_mode = "front"
+        dividend_mode = "exact"
+    # 信号口径统一不复权（2026-11-22）；dual 仅保留「后复权记账」差异以便对照旧记录。
     accounting_mode, signal_mode = (
-        ("back", "front") if dividend_mode == "dual" else (dividend_mode, dividend_mode))
+        ("back", "none") if dividend_mode == "dual" else (dividend_mode, dividend_mode))
     evaluation_profile = getattr(req, "evaluation_profile", "absolute") or "absolute"
     if evaluation_profile not in ACCEPTANCE_PROFILES:
         evaluation_profile = "absolute"
@@ -5316,6 +5359,7 @@ def run_multi_backtest(db: Session, portfolios: list, req) -> dict:
         exact_mode = dividend_mode == "exact"
         ca_enabled = (
             bool(getattr(ps, "corporate_actions_enabled", False)) or exact_mode)
+        ca_missing = _corporate_missing_codes(ps, db, ca_enabled)
         if ca_enabled and ca_timeline is None:
             # 事件表是全局的（按 code/ex_date 索引），一个组合启用即构建一次，
             # 各组合只作用于自己持仓的代码，共享同一 timeline 安全。
@@ -5367,6 +5411,7 @@ def run_multi_backtest(db: Session, portfolios: list, req) -> dict:
         entries.append({
             "ps": ps, "strategies": strategies, "portfolio": portfolio,
             "gate_enabled": gate_enabled, "gate_summary": gate_summary(tracker, ps),
+            "ca_missing": ca_missing,
             "pit_enabled": pit_enabled,
             "pit_snapshot": {
                 "version": POOL_TIMELINE_VERSION,
@@ -5485,6 +5530,11 @@ def run_multi_backtest(db: Session, portfolios: list, req) -> dict:
                         "events_digest": (
                             ca_timeline.digest()
                             if ca_timeline is not None and len(ca_timeline) else None),
+                        "missing_count": len(e.get("ca_missing") or []),
+                        "missing_codes": list(e.get("ca_missing") or [])[:50],
+                        "coverage_status": (
+                            "corporate_actions_missing"
+                            if e.get("ca_missing") else "complete"),
                     },
                     pool_timeline=e["pit_snapshot"],
                     execution=exec_snapshot,
@@ -5568,13 +5618,23 @@ def run_multi_backtest(db: Session, portfolios: list, req) -> dict:
                 # F1 数据质量冻结（只观测）：成员记录各自保存自己的取数质量。
                 rec.data_quality_json = json.dumps(
                     dq_by_ps.get(ps.id), ensure_ascii=False, default=str)
+                _rec_warnings: List[str] = []
                 if res.get("pending_order_count"):
-                    rec.warnings_json = json.dumps(
-                        [f"回测结束时仍有 {res['pending_order_count']} 笔信号未成交"],
-                        ensure_ascii=False)
+                    _rec_warnings.append(
+                        f"回测结束时仍有 {res['pending_order_count']} 笔信号未成交")
                 elif _cap_warning:
-                    rec.warnings_json = json.dumps(
-                        [_cap_warning], ensure_ascii=False)
+                    _rec_warnings.append(_cap_warning)
+                _missing = e.get("ca_missing") or []
+                if _missing:
+                    _rec_warnings.append(
+                        f"公司行为未回填 {len(_missing)} 只"
+                        f"（corporate_actions_missing）："
+                        f"{'、'.join(_missing[:20])}"
+                        f"{f' 等 {len(_missing)} 只' if len(_missing) > 20 else ''}。"
+                        f"exact 档对这批票的除权日附近结果可能偏差，请补跑同步后重跑。")
+                rec.warnings_json = (
+                    json.dumps(_rec_warnings, ensure_ascii=False)
+                    if _rec_warnings else None)
                 rec.completed_at = datetime.now(timezone.utc).replace(tzinfo=None)
             db.commit()
 

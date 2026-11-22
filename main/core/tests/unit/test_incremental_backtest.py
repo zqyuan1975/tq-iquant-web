@@ -392,7 +392,7 @@ def _seed_minute_link(db, period="5m"):
 def _seed_minute_checkpoint(db, sess, ps, as_of, as_of_bar=None,
                             day_complete=False):
     """落一个「已跑到 as_of 某根 bar」的 checkpoint（省略则整日已跑完）。"""
-    dm = ib._cfg().get("dividend_mode", "dual")
+    dm = ib._cfg().get("dividend_mode", "exact")
     fp = ib.params_fingerprint(ps, dm, db,
                                baseline=ib.baseline_fingerprint(sess))
     port = _make_portfolio(cash="100000", period="5m")
@@ -798,16 +798,16 @@ def test_invalidation_reasons_locate_changed_section(db_session):
 
 
 def test_engine_schema_bump_invalidates_with_readable_reason():
-    """引擎口径升 v3（基准对齐）；旧 checkpoint 作废时必须点名「引擎版本 v2 → v3」。"""
-    assert ib._ENGINE_SCHEMA == "backtest_engine_v3"
+    """引擎口径升 v4（口径切换）；旧 checkpoint 作废时必须点名「引擎版本 v3 → v4」。"""
+    assert ib._ENGINE_SCHEMA == "backtest_engine_v4"
     want_parts = ib.schema_parts("dual")
-    old_parts = dict(want_parts, engine="backtest_engine_v2")
+    old_parts = dict(want_parts, engine="backtest_engine_v3")
     reasons = ib._invalidation_reasons(
         {"schema_fp": "old-fp", "schema_parts": old_parts, "params_fp_parts": {}},
         "old-fp", ib.SCHEMA_VERSION, ib.schema_fingerprint("dual"), {},
         want_parts)
-    assert any("引擎版本" in r and "backtest_engine_v2" in r
-               and "backtest_engine_v3" in r for r in reasons)
+    assert any("引擎版本" in r and "backtest_engine_v3" in r
+               and "backtest_engine_v4" in r for r in reasons)
 
 
 def test_schema_parts_include_engine_version():
@@ -815,6 +815,9 @@ def test_schema_parts_include_engine_version():
     parts = ib.schema_parts("dual")
     assert parts["engine"] == ib._ENGINE_SCHEMA
     assert parts["dividend_mode"] == "dual"
+    # 2026-11-22 口径切换：信号不复权 + exact 价格口径进指纹
+    assert parts["signal_adjust"] == "signal_none_v1"
+    assert parts["price_caliber"] == "price_caliber_v2"
 
 
 # ---------------------------------------------------------------- 9. 快路径闸
@@ -839,7 +842,7 @@ def test_multi_day_gap_with_handoff_does_not_skip_middle_days(
     取数路径，把 1/6、1/7、1/8 三天都跑出来。
     """
     sess, ps, link = _seed_live_link(db_session)
-    dm = ib._cfg().get("dividend_mode", "dual")
+    dm = ib._cfg().get("dividend_mode", "exact")
     fp = ib.params_fingerprint(ps, dm, db_session)
     as_of = date(2026, 1, 5)
     link.seam_date = as_of
@@ -922,6 +925,37 @@ def test_capture_seam_records_trade_cursor_and_live_rows_no_double_count(
 
 
 # ---------------------------------------------------------------- 11. 方向判据语义
+def test_live_rows_accepts_lowercase_trade_type_from_order_machine(db_session):
+    """回归：live_trades 由 order_machine 落库为小写 buy/sell。
+
+    旧实现按 ``trade_type == "BUY"`` 判向，真实数据全部落入卖出分支——买入变成
+    减仓、成交额反加进现金；dirs 也带小写，与回测侧大写的方向对账恒不一致。
+    """
+    sess, ps, link = _seed_live_link(db_session)
+    link.seam_date = date(2026, 1, 8)
+    link.seam_cash = Decimal("100000")
+    link.seam_positions_json = "[]"
+    link.seam_trade_cursor = 0
+    db_session.commit()
+    strat = db_session.query(Strategy).filter_by(portfolio_id=ps.id).first()
+    _add_live_trade(db_session, sess, ps, strat, "000001.SZ", "buy",
+                    "10", 1000, datetime(2026, 1, 8, 9, 31))
+    _add_live_trade(db_session, sess, ps, strat, "000001.SZ", "sell",
+                    "11", 400, datetime(2026, 1, 8, 14, 0))
+
+    rows = ib._live_rows(
+        db_session, link, [date(2026, 1, 8)],
+        {"000001.SZ": {date(2026, 1, 8): Decimal("12")}})
+    row = rows[date(2026, 1, 8)]
+    # 买入扣现金、卖出回款：100000 - 10000 + 4400
+    assert Decimal(str(row["cash"])) == Decimal("94400")
+    # 600 股 × 收盘 12
+    assert Decimal(str(row["market_value"])) == Decimal("7200")
+    assert Decimal(str(row["total_value"])) == Decimal("101600")
+    # 方向与回测侧同为大写（消除伪 direction_mismatch）
+    assert row["dirs"] == ["000001.SZ:BUY", "000001.SZ:SELL"]
+
+
 def test_evaluate_alignment_direction_uses_own_dirs_and_none_when_missing():
     tol = {"max_net_dev_pct": 0.5, "mean_net_dev_pct": 0.2,
            "trade_count_match_ratio": 0.9, "direction_match_ratio": 0.9,
@@ -1103,9 +1137,9 @@ def test_state_roundtrip_preserves_risk_cooldown():
     assert fresh._risk_cooldown[(1, "000001.SZ")] == date(2026, 1, 6)
 
 
-def test_schema_version_bumped_to_3_for_formula_and_cooldown(db_session):
-    """SCHEMA_VERSION=3：旧 checkpoint 一律判废（不自动迁移/修补）。"""
-    assert ib.SCHEMA_VERSION == 3
+def test_schema_version_bumped_to_4_for_caliber_switch(db_session):
+    """SCHEMA_VERSION=4（2026-11-22 口径切换）：旧 checkpoint 一律判废。"""
+    assert ib.SCHEMA_VERSION == 4
     sess, ps, link = _seed_live_link(db_session)
     assert not ib.checkpoint_valid(
         "whatever", "", 2, "whatever", ib.schema_fingerprint("dual"))

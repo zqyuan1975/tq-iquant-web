@@ -1122,7 +1122,7 @@ def test_build_index_close_series_batches_codes_and_skips_missing(monkeypatch):
     assert call["periods"] == ["1d"]
     assert call["start"] == "20260101"
     assert call["end"] == "20260131"
-    assert call["dividend_type"] == "front"
+    assert call["dividend_type"] == "none"
     assert call["count"] == -1
 
 
@@ -2702,9 +2702,10 @@ def test_evaluation_reproducible_from_stored_snapshots(db_session, monkeypatch):
     assert got["closed_trades"] == stored.closed_trades
 
 
-def test_run_backtest_dual_mode_resolves_signal_front_accounting_back(db_session, monkeypatch):
-    """dual 模式：引擎 K线/基准走后复权（记账），公式信号走前复权（信号）；
-    且 params_snapshot 记录 dividend_mode=dual。"""
+def test_run_backtest_dual_mode_resolves_signal_none_accounting_back(db_session, monkeypatch):
+    """dual 模式（历史兼容）：引擎 K线/基准走后复权（记账），公式信号不复权
+    （2026-11-22 起与实盘桥 /quote 同口径）；且 params_snapshot 记录
+    dividend_mode=dual。"""
     ps, _ = _seed(db_session)
     seen = {}
 
@@ -2727,9 +2728,38 @@ def test_run_backtest_dual_mode_resolves_signal_front_accounting_back(db_session
     monkeypatch.setattr(svc.BacktestEngine, "run",
                         lambda self, portfolio, **kw: _NO_TRADES_RESULT)
     rid = svc.run_backtest(db_session, ps, _req(dividend_mode="dual"))["record_id"]
-    assert seen == {"klines": "back", "cache": "front", "bench": "back"}
+    assert seen == {"klines": "back", "cache": "none", "bench": "back"}
     snap = json.loads(db_session.get(BacktestRecord, rid).params_snapshot)
     assert snap["dividend_mode"] == "dual"
+
+
+def test_exact_mode_marks_corporate_actions_missing(db_session, monkeypatch, tmp_path):
+    """exact 档：池内未回填公司行为的票必须显式标记，不得静默当「无除权」。"""
+    from core.services import corporate_action_sync as cas
+
+    monkeypatch.setattr(cas, "coverage_path", lambda: tmp_path / "coverage.json")
+    ps, _ = _seed(db_session)
+    monkeypatch.setattr(svc, "build_klines", lambda *a, **kw: _mock_klines())
+    monkeypatch.setattr(svc, "build_signal_cache", lambda *a, **kw: {})
+    monkeypatch.setattr(svc, "build_benchmark_data", lambda *a, **kw: {})
+    monkeypatch.setattr(svc, "safe_compute_crisis_alpha", lambda *a, **kw: None)
+    monkeypatch.setattr(svc.BacktestEngine, "run",
+                        lambda self, portfolio, **kw: _NO_TRADES_RESULT)
+
+    rid = svc.run_backtest(db_session, ps, _Req(dividend_mode="exact"))["record_id"]
+    rec = db_session.get(BacktestRecord, rid)
+    ca = json.loads(rec.params_snapshot)["corporate_actions"]
+    assert ca["coverage_status"] == "corporate_actions_missing"
+    assert ca["missing_codes"] == ["000001.SZ"]
+    assert ca["missing_count"] == 1
+    assert "corporate_actions_missing" in (rec.warnings_json or "")
+
+    # 同步确认「取数成功但无事件」后，同一只票不再算缺失
+    cas._mark_coverage("000001.SZ", "no_events")
+    rid2 = svc.run_backtest(db_session, ps, _Req(dividend_mode="exact"))["record_id"]
+    ca2 = json.loads(db_session.get(BacktestRecord, rid2).params_snapshot)["corporate_actions"]
+    assert ca2["coverage_status"] == "complete"
+    assert ca2["missing_count"] == 0
 
 
 def test_recompute_prefers_snapshot_benchmark(db_session, monkeypatch):

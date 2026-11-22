@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { ref, reactive, computed, onMounted, onUnmounted, nextTick, watch } from 'vue'
 import * as echarts from 'echarts'
+import { useTdxGate } from '../composables/useTdxGate'
 import {
   getBacktestRecords, getBacktestDetail, runBacktest, getPortfolios,
   deleteBacktestRecord, recomputeCrisisAlpha, recomputeMarketRegime,
@@ -134,9 +135,11 @@ const showBacktestGuide = ref(false)
 // 参数设定使用指南：与组合编辑弹窗内联面板同一组件、同一内容
 const showParamGuide = ref(false)
 const submitting = ref(false)
+// TQ 通道闸：交易时段后台重任务（P2）被后端直接拒绝 → 提前置灰并说明原因
+const { p2Blocked: tqP2Blocked, p2Reason: tqP2Reason } = useTdxGate()
 // 高级选项（评估口径 / IS-OOS 采纳门槛 / 费用预留 / 自适应滑点）默认折叠：发起回测默认走增强前的基础方式
 const showAdvanced = ref(false)
-const form = ref({ portfolio_strategy_id: 0, name: '', start_date: '', end_date: '', dividend_mode: 'front', evaluation_profile: 'absolute', is_oos_gate_enabled: false, oos_gate_min_ratio: 0.5, fee_reserve_enabled: false, bond_t0_enabled: false, bond_lot_enabled: false, adaptive_slippage_enabled: undefined as boolean | undefined, slippage_impact_coef: undefined as string | undefined, volume_limit_enabled: undefined as boolean | undefined, volume_limit_ratio: undefined as string | undefined, equity_cap: undefined as string | undefined, capacity_model: '' as '' | 'linear' | 'sqrt', capacity_impact_k: '0.1' as string, liquidity_caliber: '' as '' | 'same_day_bar' | 'prev5d_avg', max_order_amount: undefined as string | undefined, daily_close_peak_enabled: false, daily_loss_basis: '' as '' | 'equity' | 'initial', market_gate_enabled: '' as '' | 'true' | 'false', industry_override: '' as '' | 'ab' | 'off' | 'all_relief' | 'all_strict', loan_model_plan: undefined as Record<string, unknown> | undefined, pairing_plan_id: undefined as number | undefined })
+const form = ref({ portfolio_strategy_id: 0, name: '', start_date: '', end_date: '', dividend_mode: 'exact', evaluation_profile: 'absolute', is_oos_gate_enabled: false, oos_gate_min_ratio: 0.5, fee_reserve_enabled: false, bond_t0_enabled: false, bond_lot_enabled: false, adaptive_slippage_enabled: undefined as boolean | undefined, slippage_impact_coef: undefined as string | undefined, volume_limit_enabled: undefined as boolean | undefined, volume_limit_ratio: undefined as string | undefined, equity_cap: undefined as string | undefined, capacity_model: '' as '' | 'linear' | 'sqrt', capacity_impact_k: '0.1' as string, liquidity_caliber: '' as '' | 'same_day_bar' | 'prev5d_avg', max_order_amount: undefined as string | undefined, daily_close_peak_enabled: false, daily_loss_basis: '' as '' | 'equity' | 'initial', market_gate_enabled: '' as '' | 'true' | 'false', industry_override: '' as '' | 'ab' | 'off' | 'all_relief' | 'all_strict', loan_model_plan: undefined as Record<string, unknown> | undefined, pairing_plan_id: undefined as number | undefined })
 
 // 行业门控 run 级覆盖预设（2026-11-22）：仅本次回测生效，不写组合配置。
 // 组合级长期开关在「组合策略 → 编辑 → 行业门控」里配置。
@@ -1275,7 +1278,7 @@ const replayForm = ref({
   portfolio_strategy_id: 0,
   start_date: '',
   end_date: '',
-  dividend_mode: 'front',
+  dividend_mode: 'exact',
   session_id: '' as number | string,
 })
 
@@ -1878,7 +1881,7 @@ function openForm() {
     name: '',
     start_date: '2021-01-01',
     end_date: fmt(today),
-    dividend_mode: 'front',
+    dividend_mode: 'exact',
     evaluation_profile: 'absolute',
     is_oos_gate_enabled: false,
     oos_gate_min_ratio: 0.5,
@@ -2722,7 +2725,7 @@ const compareForm = ref({
   pool_ids: [] as number[],
   start_date: '',
   end_date: '',
-  dividend_mode: 'dual',
+  dividend_mode: 'exact',
 })
 const comparing = ref(false)
 const compareResult = ref<{ comparisons: any[] } | null>(null)
@@ -2739,7 +2742,7 @@ async function openCompare() {
     pool_ids: [],
     start_date: currentRecord.value?.start_date || '',
     end_date: currentRecord.value?.end_date || '',
-    dividend_mode: 'dual',
+    dividend_mode: 'exact',
   }
   try {
     pools.value = await getStockPools()
@@ -4345,11 +4348,10 @@ watch(theme, () => {
             <div class="field-row">
               <span class="field-label">复权模式</span>
               <select v-model="replayForm.dividend_mode">
-                <option value="front">前复权（默认）</option>
+                <option value="exact">不复权+显式公司行为（默认，对账基准）</option>
+                <option value="front">前复权</option>
                 <option value="back">后复权</option>
-                <option value="exact">不复权+显式公司行为（对账基准）</option>
-                <option value="dual">前复权+后复权记账</option>
-                <option value="exact">不复权+显式公司行为（对账基准）</option>
+                <option value="dual">信号不复权+后复权记账（历史兼容）</option>
               </select>
             </div>
             <div class="field-row">
@@ -4528,16 +4530,17 @@ watch(theme, () => {
               <div class="field-row field-span-2">
                 <span class="field-label">复权模式</span>
                 <select v-model="form.dividend_mode">
-                  <option value="front">前复权（默认，通达信口径）</option>
+                  <option value="exact">不复权+显式公司行为（默认，对账基准）</option>
+                  <option value="front">前复权（通达信口径）</option>
                   <option value="back">后复权（长区间更真实、可复现）</option>
-                  <option value="dual">前复权+后复权记账（推荐，模拟实盘）</option>
-                <option value="exact">不复权+显式公司行为（对账基准）</option>
+                  <option value="dual">信号不复权+后复权记账（历史兼容）</option>
                 </select>
               </div>
               <div class="field-row field-span-2">
                 <span class="field-label"></span>
                 <span class="form-hint" style="margin:0">
-                  长周期回测建议用后复权/dual，避免前复权加性压缩导致的近零价假收益。
+                  默认 exact：不复权真实价 + 显式公司行为记账，与实盘信号同口径（公式不复权）；
+                  长周期对账建议 exact，前复权只作历史对照。
                   回测成本为模型口径（佣金含最低 5 元、卖出印花税、双边过户费）；实盘成本取柜台
                   真实值（含费、含送转摊薄，可能为负或未知），<b>两者不可逐日对比</b>。
                 </span>
@@ -4704,8 +4707,13 @@ watch(theme, () => {
           </div>
         </div>
 
+        <div v-if="tqP2Blocked" class="tq-gate-notice">
+          {{ tqP2Reason }}
+        </div>
         <div class="modal-actions">
-          <button @click="submit" class="btn btn-primary" :disabled="submitting">{{ submitting ? '运行中...' : '确定' }}</button>
+          <button @click="submit" class="btn btn-primary"
+                  :disabled="submitting || tqP2Blocked"
+                  :title="tqP2Blocked ? tqP2Reason : ''">{{ submitting ? '运行中...' : (tqP2Blocked ? '实盘优先，暂不可用' : '确定') }}</button>
           <button @click="showForm = false" class="btn" :disabled="submitting">取消</button>
         </div>
       </div>
@@ -4974,9 +4982,9 @@ watch(theme, () => {
           <div class="form-group">
             <label class="group-label">一、基本参数</label>
             <div class="guide-block">
-              <p class="guide-step"><b>复权模式</b>：front=前复权（默认，历史价被压缩）；back=后复权；
-                <b>dual=前复权信号+后复权记账（推荐）</b>，信号与真实价成交口径一致；
-                exact=不复权 + 显式公司行为（送转/分红/停牌/退市），仅作对账基准，成本与旧回测不可直接比较。</p>
+              <p class="guide-step"><b>复权模式</b>：exact=不复权真实价 + 显式公司行为（送转/分红/停牌/退市），
+                <b>默认且与实盘信号同口径</b>；front=前复权（历史价被压缩）；back=后复权；
+                dual=信号不复权+后复权记账（历史兼容）。</p>
               <p class="guide-step"><b>成本口径</b>：回测按模型计费（佣金含最低 5 元 / 卖出印花税 /
                 买卖双向过户费），实盘成本取柜台真实成交成本（含费、含送转摊薄，可能为负或未知），
                 <b>两者不可逐日对比</b>；2026-11-11 前发起的历史回测需在新过户费口径下重跑才严格可比。</p>
@@ -5266,16 +5274,16 @@ watch(theme, () => {
         <b>PENDING_DATA</b>，不做猜测。
       </p>
 
-      <div class="section-title" style="font-size:13px;margin-top:12px">现金出口候选</div>
+      <div class="section-title" style="font-size:13px;margin-top:12px">现金管理候选</div>
       <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:8px">
         <button class="btn btn-sm" :disabled="outletsLoading" @click="loadOutlets">
-          {{ outletsLoading ? '查询中…' : (outlets.length ? '刷新出口' : '查询出口') }}
+          {{ outletsLoading ? '查询中…' : (outlets.length ? '刷新标的' : '查询标的') }}
         </button>
         <span style="font-size:12px;color:var(--ink-soft)">未验证/过期一律不可借；执行按钮禁用</span>
       </div>
       <p v-if="outletsError" class="ca-msg ca-warn">{{ outletsError }}</p>
       <p v-if="outletsDisabled" style="font-size:12px;color:var(--ink-soft);margin:0">
-        现金出口开关未启用（capital_pool.cash_outlet_enabled=false）。
+        现金管理开关未启用（capital_pool.cash_outlet_enabled=false）。
       </p>
       <p v-else-if="outletEvalError" class="ca-msg ca-warn">{{ outletEvalError }}</p>
       <table v-if="!outletsDisabled && outlets.length" style="margin-top:6px">
@@ -5299,13 +5307,13 @@ watch(theme, () => {
             </td>
             <td>
               <button class="btn btn-sm" disabled
-                      title="阶段 G 才开放：现金出口执行需人工/半自动/自动三档与对账">执行（阶段 G）</button>
+                      title="阶段 G 才开放：现金管理执行需人工/半自动/自动三档与对账">执行（阶段 G）</button>
             </td>
           </tr>
         </tbody>
       </table>
       <p v-else-if="!outletsDisabled && !outletsLoading" style="font-size:12px;color:var(--ink-soft);margin:0">
-        暂无已登记的现金出口。
+        暂无已登记的现金管理标的。
       </p>
     </div>
 
@@ -7411,11 +7419,10 @@ watch(theme, () => {
             <div style="flex:1">
               <label>复权模式</label>
               <select class="field-select" v-model="compareForm.dividend_mode">
-                <option value="dual">前复权+后复权记账（推荐，模拟实盘）</option>
-                <option value="exact">不复权+显式公司行为（对账基准）</option>
-                <option value="front">前复权（默认）</option>
+                <option value="exact">不复权+显式公司行为（默认，对账基准）</option>
+                <option value="front">前复权</option>
                 <option value="back">后复权</option>
-                <option value="exact">不复权+显式公司行为（对账基准）</option>
+                <option value="dual">信号不复权+后复权记账（历史兼容）</option>
               </select>
             </div>
           </div>

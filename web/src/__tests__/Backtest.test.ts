@@ -91,10 +91,12 @@ const mockRecords = [
   {
     id: 1, name: '回测A', portfolio_strategy_id: 1, status: 'completed',
     start_date: '2026-07-01', end_date: '2026-07-31', created_at: '2026-08-01T10:00:00',
+    run_group_id: null,
   },
   {
     id: 2, name: '回测B', portfolio_strategy_id: 2, status: 'failed',
     start_date: '2026-06-01', end_date: '2026-06-30', created_at: '2026-08-02T10:00:00',
+    run_group_id: null,
   },
 ]
 const mockPortfolios = [
@@ -310,7 +312,7 @@ describe('Backtest.vue — 发起回测', () => {
     expect(arg.portfolio_strategy_id).toBe(1)  // 默认选第一个
     expect(arg.start_date).toBe('2026-07-01')
     expect(arg.end_date).toBe('2026-07-31')
-    expect(arg.dividend_mode).toBe('front')  // 默认前复权
+    expect(arg.dividend_mode).toBe('exact')  // 默认不复权+显式公司行为
     expect(arg.bond_t0_enabled).toBe(false)  // 可转债 T+0 默认关
     expect(arg.bond_lot_enabled).toBe(false)  // 可转债 10 张取整默认关
     vi.unstubAllGlobals()
@@ -1930,7 +1932,7 @@ describe('Backtest.vue — 稳健性检验 section', () => {
     expect(compareBacktestPools).toHaveBeenCalledTimes(1)
     const arg = (compareBacktestPools as any).mock.calls[0][0]
     expect(arg.pool_ids).toEqual([3, 7])
-    expect(arg.dividend_mode).toBe('dual')
+    expect(arg.dividend_mode).toBe('exact')
     expect(w.text()).toContain('成长精选')
   })
 })

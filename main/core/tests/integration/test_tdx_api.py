@@ -97,8 +97,9 @@ def test_test_run_default_params(client, monkeypatch):
     resp = client.post("/api/formulas/test-run", json={
         "content": "C;", "stock_codes": ["000001.SZ"]})
     assert resp.json()["code"] == 0
+    # 默认不复权（0），与实盘信号口径一致；前复权不再是缺省值
     assert calls["kwargs"] == {"period": "1d", "count": 20,
-                               "dividend_type": 1, "formula_type": 0}
+                               "dividend_type": 0, "formula_type": 0}
 
 
 def test_test_run_empty_content_400(client, monkeypatch):

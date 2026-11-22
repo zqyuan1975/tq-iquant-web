@@ -35,6 +35,7 @@ from sqlalchemy.orm import Session
 
 from core.config import load_config
 from core.db import SessionLocal, MAINTENANCE_GATE
+from core.tq.gate import P2, TdxTaskBlocked, tdx_priority
 from core.engine.backtest_engine import BacktestEngine, build_prev_close_by_day
 from core.engine.bar_poller import parse_bar_time, to_ohlcv
 from core.engine.event import OrderEvent
@@ -92,17 +93,23 @@ GATE_WAIT_SECONDS = 30.0
 
 _TZ = ZoneInfo("Asia/Shanghai")
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 # 口径版本（任一语义变化 → 提升 SCHEMA_VERSION 并在注释里写明原因）
 _COST_SCHEMA = "fee_inclusive_v2"    # 成本含佣金/印花税/过户费
 _EXEC_SCHEMA = "next_bar_open_v1"    # 成交价 = 下一根 bar 开盘价
 _T1_SCHEMA = "t1_forced_v1"          # 回测强制 T+1
+# 信号口径（2026-11-22）：公式信号统一不复权（与实盘桥 /quote、TDX 默认一致）。
+_SIGNAL_SCHEMA = "signal_none_v1"
+# 价格口径版本（与 backtest_service.PRICE_CALIBER_VERSION 保持一致）。
+# v2：默认档 front → exact（不复权取数 + 显式公司行为记账）。
+_PRICE_CALIBER_SCHEMA = "price_caliber_v2"
+# v4（2026-11-22）：口径切换——信号统一不复权、记账默认 exact。接缝两侧任一旧
+# checkpoint 的持仓成本/净值都在旧复权空间里，续跑会与新口径混算，故整体判废。
+_ENGINE_SCHEMA = "backtest_engine_v4"
+# 历史口径（仅为理解旧 checkpoint 判废原因，不再作为当前值）：
 # v3（2026-11-16）：资金基准对齐——实盘起账基准改为「真实账户总资产」口径，
 # params_fingerprint 新增 sections["baseline"]（baseline_version/baseline_value）；
-# 基准重置会重设 seam_date/seam_cash 并删除旧 checkpoint。旧 checkpoint 的
-# initial_capital/seam 属于旧基准，恢复会把新基准覆盖回去，故整体作废重建。
-_ENGINE_SCHEMA = "backtest_engine_v3"
-
+# 基准重置会重设 seam_date/seam_cash 并删除旧 checkpoint。
 # SCHEMA_VERSION 3（2026-11-16，P1 核查）：
 #   1) checkpoint state 新增 risk_cooldown（风控冷静期不再续跑后清零）；
 #   2) 参数指纹新增 sections["formula"]（公式正文哈希/engine/no_leak_cross/信号线）
@@ -423,14 +430,14 @@ def _cfg() -> dict:
 
 
 def _resolve_modes(dividend_mode: str) -> tuple:
-    """把三档复权模式拆成（记账取数档, 公式信号档）。
+    """把复权模式拆成（记账取数档, 公式信号档）。
 
-    ``dual`` = 信号前复权 + 记账后复权（与 ``backtest_service.run_backtest``
-    同口径）。**TQ 不认 "dual"**：直传 ``dividend_type="dual"`` 会返回空表，
-    续跑因此判定「无可用日线数据」——必须先拆成两档再分别取数/喂公式。
+    ``dual``（历史兼容）= 记账后复权 + 信号**不复权**（2026-11-22 起信号口径统一
+    none，与实盘桥 /quote 一致）。**TQ 不认 "dual"**：直传 ``dividend_type="dual"``
+    会返回空表，续跑因此判定「无可用日线数据」——必须先拆成两档再分别取数/喂公式。
     """
     if dividend_mode == "dual":
-        return "back", "front"
+        return "back", "none"
     return dividend_mode, dividend_mode
 
 
@@ -455,6 +462,9 @@ def schema_parts(dividend_mode: str) -> dict:
         "t1": _T1_SCHEMA,
         "engine": _ENGINE_SCHEMA,
         "dividend_mode": dividend_mode,
+        # 信号/价格口径（2026-11-22）：任一项变化都代表口径切换，接缝两侧不可混算。
+        "signal_adjust": _SIGNAL_SCHEMA,
+        "price_caliber": _PRICE_CALIBER_SCHEMA,
         # 市场多空门控公式口径（2026-11-18）：公式/参数任何调整都会改变拦单点，
         # 接缝前后必须同口径，否则续跑结果与全量/实盘不可比。
         "market_gate": GATE_FORMULA_VERSION,
@@ -527,6 +537,8 @@ _SCHEMA_PART_LABELS = {
     "t1": "T+1 口径 _T1_SCHEMA",
     "engine": "引擎版本 _ENGINE_SCHEMA",
     "dividend_mode": "复权模式",
+    "signal_adjust": "公式信号口径（不复权）",
+    "price_caliber": "价格口径版本（exact 档）",
     "corporate_actions": "公司行为内核口径",
     "pool_timeline": "时点股票池内核口径",
     "execution": "执行档位版本",
@@ -1003,6 +1015,10 @@ def capture_seam(db: Session, session_id: int, engine, today: Optional[date] = N
                     "strategy_id": ctx.strategy_id,
                     "stock_code": code,
                     "quantity": int(pos.quantity),
+                    # 平台买入且未平掉的部分：platform_only 下只有这部分可代卖，
+                    # 外部/手工导入仓为 0（与实盘 Position.platform_quantity 同义）。
+                    "platform_quantity": int(
+                        getattr(pos, "platform_quantity", 0) or 0),
                     "avg_cost": str(pos.avg_cost),
                     "buy_date": _dt(pos.buy_time.date() if pos.buy_time else None),
                     "highest_price": str(seed_hp),
@@ -1163,6 +1179,9 @@ def apply_seam_anchor(portfolio: Portfolio, seam_cash, seam_positions: List[dict
         cost = _dec(item.get("avg_cost"))
         pos = Position(code)
         pos.quantity = qty
+        # 缺省 0 = 外部接缝仓（旧 seam 无该字段），platform_only 下不可代卖；
+        # 新 seam 由 capture_seam 落库真实平台数量（如平台买入的 600211）。
+        pos.platform_quantity = max(0, int(item.get("platform_quantity") or 0))
         pos.avg_cost = cost
         pos.highest_price = _dec(item.get("highest_price"), str(cost)) or cost
         buy_date = _pdate(item.get("buy_date"))
@@ -1456,7 +1475,11 @@ def _live_rows(db: Session, link: LiveSessionPortfolio, dates: List[date],
             amount = Decimal(str(t.amount or 0))
             fees = Decimal(str(t.commission or 0)) + Decimal(str(t.stamp_duty or 0))
             price = Decimal(str(t.price or 0))
-            if t.trade_type == "BUY":
+            # live_trades 由 order_machine 落库为小写 buy/sell，必须先归一为大写再判向：
+            # 否则买入走卖出分支（数量做减、成交额反加进现金），dirs 也会与回测侧
+            # 大写的方向对账恒不一致（伪 direction_mismatch）。
+            trade_type = (t.trade_type or "").upper()
+            if trade_type == "BUY":
                 qty[t.stock_code] = qty.get(t.stock_code, Decimal("0")) + Decimal(t.quantity)
                 cash -= amount + fees
             else:
@@ -1465,7 +1488,7 @@ def _live_rows(db: Session, link: LiveSessionPortfolio, dates: List[date],
             last_price[t.stock_code] = price
             if t.trade_time.date() == d:
                 day_trades += 1
-                dirs.append("%s:%s" % (t.stock_code, t.trade_type))
+                dirs.append("%s:%s" % (t.stock_code, trade_type))
             ptr += 1
 
         market_value = Decimal("0")
@@ -1579,7 +1602,7 @@ def _run_incremental_locked(db: Session, session_id: int,
                 "reason": "尚未建立接缝日（该组合未在实盘启动过）"}
     seam_positions, seam_bar_time = _seam_payload(link.seam_positions_json)
 
-    dividend_mode = cfg.get("dividend_mode", "dual")
+    dividend_mode = cfg.get("dividend_mode", "exact")
     accounting_mode, signal_mode = _resolve_modes(dividend_mode)
     # 资金基准指纹（2026-11-16）：基准变更会让 checkpoint 作废重建，防旧基准覆盖。
     session_row = db.query(LiveSession).filter_by(id=session_id).first()
@@ -1720,7 +1743,11 @@ def _run_incremental_locked(db: Session, session_id: int,
     signal_cache = build_signal_cache(
         ps, klines_all, db, start=run_from, dividend_mode=signal_mode)
 
-    portfolio = assemble_portfolio(ps, strategies, db)
+    # 卖出范围与实盘同口径（会话级优先，NULL 回退全局 config）：接缝持仓的
+    # platform_quantity=0，platform_only 下续跑侧不再代卖实盘不会卖的外部存量仓。
+    from core.services.live_service import resolve_session_sell_scope
+    portfolio = assemble_portfolio(
+        ps, strategies, db, sell_scope=resolve_session_sell_scope(session_row))
     # 公司行为（J1/J2，默认关）：与全量回测同一内核与同一张表，接缝前后同口径
     # 由 schema_fp 的 corporate_actions 版本 + params 分项保证。
     if getattr(ps, "corporate_actions_enabled", False):
@@ -1943,7 +1970,7 @@ def run_validation(db: Session, session_id: int, ps_id: int,
             db.query(Strategy).filter_by(portfolio_id=ps.id)
             .order_by(Strategy.id).all()
         )
-        dividend_mode = cfg.get("dividend_mode", "dual")
+        dividend_mode = cfg.get("dividend_mode", "exact")
         accounting_mode, signal_mode = _resolve_modes(dividend_mode)
         try:
             seam_positions, seam_bar_time = _seam_payload(link.seam_positions_json)
@@ -1961,7 +1988,13 @@ def run_validation(db: Session, session_id: int, ps_id: int,
             signal_cache = build_signal_cache(
                 ps, klines_all, db, start=from_date,
                 dividend_mode=signal_mode)
-            portfolio = assemble_portfolio(ps, strategies, db)
+            # 与续跑侧同口径：外部接缝持仓在 platform_only 下不产生卖出单，
+            # 否则「全量 vs 续跑」会因代卖范围不同而恒不一致。
+            from core.services.live_service import resolve_session_sell_scope
+            session_row = db.query(LiveSession).filter_by(id=session_id).first()
+            portfolio = assemble_portfolio(
+                ps, strategies, db,
+                sell_scope=resolve_session_sell_scope(session_row))
             # 校验侧与续跑侧同口径（公司行为，J1/J2）：否则「全量 vs 续跑」对比恒不一致
             if getattr(ps, "corporate_actions_enabled", False):
                 _ca_timeline = build_corporate_timeline(db, from_date, to_date)
@@ -2307,9 +2340,17 @@ class IncrementalBacktestScheduler:
                 if _checkpoint_done(ckpt, today):
                     continue
                 try:
-                    run_incremental(
-                        db, link.session_id, link.portfolio_strategy_id,
-                        today=today, now=now)
+                    with tdx_priority(P2):
+                        run_incremental(
+                            db, link.session_id, link.portfolio_strategy_id,
+                            today=today, now=now)
+                except TdxTaskBlocked:
+                    # 交易时段被闸拦下：不当作失败（不落错误事件），15:15 后下轮自动重跑
+                    logger.info(
+                        "增量回测本轮被 TQ 通道闸拒绝（交易时段），待收盘后重试 "
+                        "(session %s, ps %s)",
+                        link.session_id, link.portfolio_strategy_id)
+                    continue
                 except Exception as exc:  # noqa: BLE001
                     logger.exception(
                         "增量回测失败 (session %s, ps %s)",

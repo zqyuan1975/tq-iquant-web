@@ -6,6 +6,7 @@ import {
   type IncrementalSummary, type LiveSessionItem, type PortfolioItem,
 } from '../api'
 import PageHeader from '../components/PageHeader.vue'
+import { useTdxGate } from '../composables/useTdxGate'
 
 const loading = ref(false)
 const validating = ref(false)
@@ -16,6 +17,8 @@ const portfolios = ref<PortfolioItem[]>([])
 const sessionId = ref<number | null>(null)
 const portfolioId = ref<number | null>(null)
 const summary = ref<IncrementalSummary | null>(null)
+// TQ 通道闸：双跑校验/重建接缝都会拉历史行情（P2），交易时段后端直接拒绝
+const { p2Blocked: tqP2Blocked, p2Reason: tqP2Reason } = useTdxGate()
 
 const portfolioName = computed(() => {
   const map = new Map(portfolios.value.map(p => [p.id, p.name]))
@@ -128,11 +131,14 @@ onMounted(async () => {
 <template>
   <div>
     <PageHeader title="增量回测">
-      <button class="btn" :disabled="validating || !summary?.supported" @click="onValidate">
-        {{ validating ? '校验中…' : '立即双跑校验' }}
+      <button class="btn" :disabled="validating || !summary?.supported || tqP2Blocked"
+              :title="tqP2Blocked ? tqP2Reason : ''" @click="onValidate">
+        {{ validating ? '校验中…' : (tqP2Blocked ? '实盘优先，暂不可校验' : '立即双跑校验') }}
       </button>
       <button class="btn" style="margin-left:6px" @click="loadSummary">刷新</button>
     </PageHeader>
+
+    <div v-if="tqP2Blocked" class="tq-gate-notice">{{ tqP2Reason }}</div>
 
     <div class="card" style="padding:12px; margin-bottom:12px; display:flex; gap:16px; flex-wrap:wrap; align-items:center">
       <label>
@@ -167,8 +173,9 @@ onMounted(async () => {
       <span v-if="summary.last_invalidation.at" class="muted" style="margin-left:8px">
         {{ summary.last_invalidation.at }}
       </span>
-      <button class="btn" style="margin-left:12px" :disabled="rebuilding" @click="onRebuild">
-        {{ rebuilding ? '重建中…' : '立即重建接缝' }}
+      <button class="btn" style="margin-left:12px" :disabled="rebuilding || tqP2Blocked"
+              :title="tqP2Blocked ? tqP2Reason : ''" @click="onRebuild">
+        {{ rebuilding ? '重建中…' : (tqP2Blocked ? '实盘优先，暂不可重建' : '立即重建接缝') }}
       </button>
     </div>
 
