@@ -1111,3 +1111,37 @@ def test_tdx_detail_prefers_explicit_configured_account(monkeypatch):
         svc, "load_config", lambda: _cfg(False, tq_trade={"account": "A1"}))
     data = svc.channel_status(engine_key="tdx", engines={})
     assert data["detail"] == "TQ 资金账号 A1"
+
+
+def test_session_detail_engine_running_follows_engine_registry():
+    """会话详情 engine_running 与会话级 channel-health 同源（运行时引擎注册表）：
+    引擎在册 → true；未运行 → false。修复前详情缺该字段（前端拿到 null）。"""
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
+
+    from core.models import Base, LiveSession
+
+    db = sessionmaker(bind=create_engine("sqlite:///:memory:"))()
+    Base.metadata.create_all(db.get_bind())
+    session = LiveSession(name="s1", mode="simulation", status="running",
+                          engine="tdx")
+    db.add(session)
+    db.commit()
+    engine = SimpleNamespace(
+        bridge_online=True, pending_orders_count=0, last_backfill_time=None,
+        reconcile_mismatches=[], _calendar=None,
+        dispatcher=SimpleNamespace(channel="tdx_tq"),
+        external_signal_status=lambda: {"enabled": False},
+    )
+
+    running = svc.get_session(db, session.id, engine)
+    running_health = svc.session_channel_health(
+        db, session.id, engines={session.id: engine})["primary"]
+    stopped = svc.get_session(db, session.id, None)
+    stopped_health = svc.channel_status(engines={})
+    db.close()
+
+    assert running["engine_running"] is True
+    assert running["engine_running"] is running_health["engine_running"]
+    assert stopped["engine_running"] is False
+    assert stopped["engine_running"] is stopped_health["engine_running"]

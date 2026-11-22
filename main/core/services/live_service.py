@@ -76,6 +76,7 @@ from core.engine.crisis_alpha import DEFAULT_BENCHMARK_CODE
 from core.engine.market_gate import gate_enabled_for
 from core.engine.event import TradeEvent
 from core.tq.formula import TQFormula
+from core.tq.gate import P0, tdx_priority
 from core.tq.alert import TQAlert
 from core.engine.live.alert_dispatcher import AlertDataDispatcher
 from core.engine.execution_engine import ShadowDispatcher
@@ -1346,10 +1347,13 @@ def _smoke_formula_outputs(db: Session, session_id: int):
         # 至少拉 200 根，避免周线 MACD 等长周期输出线因历史不足变 NaN
         count = max(f.formula_count or 200, 200)
         try:
-            raw = formula.compute(
-                f.name, "", [code], period=st.period,
-                count=count, end_time=now_shanghai().strftime("%Y%m%d"),
-            )
+            # 会话启动预检属主链：14:55–15:10 保护窗内启动会话也必须能取通道，
+            # 否则会被 P1 规则拒绝并让启动返回 503。
+            with tdx_priority(P0):
+                raw = formula.compute(
+                    f.name, "", [code], period=st.period,
+                    count=count, end_time=now_shanghai().strftime("%Y%m%d"),
+                )
             if (not isinstance(raw, dict)
                     or str(raw.get("ErrorId", "0")) not in ("0", "19")):
                 detail = raw.get("Error") if isinstance(raw, dict) else "无返回"
@@ -2997,6 +3001,9 @@ def get_session(db: Session, session_id: int, engine: Optional[LiveEngine] = Non
     # pending_orders 在途单计数，last_backfill_time 最近一次成交回报回填时点；未运行返回空值。
     # I-7（audit）：reconcile_mismatches = 引擎内存最近一次对账差异摘要（未运行 []）。
     if engine is not None:
+        # 引擎在册：与 /sessions 列表（s.id in engines）和 /sessions/{id}/channel-health
+        # 同源（均取运行时引擎注册表），会话在跑时该字段必为 true。
+        data["engine_running"] = True
         data["bridge_online"] = _live_bridge_online(engine)
         data["pending_orders"] = engine.pending_orders_count
         data["last_backfill_time"] = (
@@ -3018,6 +3025,7 @@ def get_session(db: Session, session_id: int, engine: Optional[LiveEngine] = Non
         # 滞后秒数 / 是否已回落快照合成；未启用或未运行 {"enabled": False}。
         data["minute_source"] = _native_minute_status(engine)
     else:
+        data["engine_running"] = False
         data["bridge_online"] = None
         data["pending_orders"] = 0
         data["last_backfill_time"] = None

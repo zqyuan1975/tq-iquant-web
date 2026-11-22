@@ -277,3 +277,58 @@ def test_execute_compute_uses_window_end_price_not_forming_bar():
     assert bar.stocks["000001.SZ"]["close"] == Decimal("12.34")
     assert md._tq_formula.calls
     assert md._tq_formula.calls[0][1]["end_time"] == "20261023"
+
+
+def test_execute_compute_takes_channel_at_p0_in_protected_window():
+    """TQ 闸回归：周/月线 signal compute 必须按 P0 取通道，
+    14:55–15:10 保护窗内不得被 P1 规则整体拒绝。"""
+    from datetime import timedelta, timezone
+
+    from core.tq import gate as tq_gate
+
+    strategy = _strategy()
+    md = ExecuteMarketData()
+    raw = md._tq_formula.raw
+    seen = []
+
+    def fake_compute(*a, **kw):
+        level = tq_gate.current_priority()
+        seen.append(level)
+        # 真闸：若未按 P0 取通道，保护窗内这里会抛 TdxTaskBlocked
+        assert tq_gate.GATE.acquire(level, timeout=1)
+        tq_gate.GATE.release()
+        return raw
+
+    md._tq_formula.compute = fake_compute
+    sched = SignalScheduler(
+        _exec_ctx(strategy, _BARS), md,
+        lambda: FakeCalendar([date(2026, 10, 23), date(2026, 10, 26)]),
+        {1: "momentum"}, {"momentum": 200}, {1: 10}, FakeMonitor(), FakeAlert(),
+    )
+    batch = DueBatch(
+        portfolio=_exec_ctx(strategy, _BARS).portfolios[0],
+        strategies=[strategy], frequency="1w", period="1d", mode="compute",
+        bar_time=datetime(2026, 10, 23, 15, 0),
+        data_end_date=date(2026, 10, 23),
+    )
+    tq_gate.reset_for_tests(
+        config=dict(tq_gate.DEFAULT_GATE_CONFIG),
+        clock=lambda: datetime(2026, 11, 23, 15, 0, tzinfo=timezone(timedelta(hours=8))),
+        trading_day_fn=lambda d: True,
+    )
+    tq_gate.GATE.reset_state()
+    try:
+        blocked = False
+        try:
+            tq_gate.GATE.acquire(tq_gate.P1, timeout=1)
+            tq_gate.GATE.release()
+        except tq_gate.TdxTaskBlocked:
+            blocked = True
+        assert blocked, "注入时钟应处于 14:55–15:10 保护窗"
+
+        sched.execute(batch)
+    finally:
+        tq_gate.reset_for_tests()
+        tq_gate.GATE.reset_state()
+
+    assert seen == [tq_gate.P0]
