@@ -50,6 +50,10 @@ main/stdin.empty
 web/stdin.empty
 # 源码版后端运行期写出的实例信息（server.json：端口/pid/版本），运行时产物不入库
 /data/runtime/
+# 源码版本地运行数据：开发库、健康巡检快照、自动备份目录
+data/dev.db
+data/health_overview_*.json
+data/backups/
 
 # Local machine paths (TDX/iQuant install paths)
 config.yaml
@@ -64,6 +68,11 @@ main/data/*.sqlite3
 
 # Draft docs (local working notes, not for commit)
 docs/draft/
+
+# 本地报告产物（生成物，未被文档引用，仅本机留存；按具体路径忽略，避免误伤文档引用图）
+docs/reports/backtest_report_01_A4_2026-11-19.pdf
+docs/reports/screenshots/backtest-advanced-capacity.png
+docs/reports/screenshots/backtest-advanced-capacity-full.png
 
 # Risk docs (local only, not for commit)
 docs/risk/
