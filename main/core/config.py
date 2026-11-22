@@ -129,6 +129,22 @@ def _defaults() -> dict:
         # 拿不到锁的调用方不再无限等待，超时抛 TDXLockTimeout 并跳过本轮 TQ 操作；
         # <=0 表示退回旧行为（无限阻塞）。改动需重启生效（进程内缓存）。
         "tq_lock_timeout_seconds": 30,
+        # TQ 通道闸（core/tq/gate.py）：实盘(P0)/实盘辅助(P1)/后台重任务(P2) 分级 +
+        # 交易时段策略。通达信单机只能一个实例，回测与实盘必须共用同一通道，故在
+        # TQ 调用层统一排队：P0 任何时刻可抢占；P1 交易时段受每分钟配额；P2 交易
+        # 时段直接拒绝、盘前/午休/收盘后/非交易日放开。改动需重启 Core。
+        "tq_gate": {
+            "enabled": True,
+            "pre_market_p2": ["08:00", "09:10"],
+            "lunch_p2": ["11:30", "13:00"],
+            "after_close_p2": ["15:15", "24:00"],
+            "trading": [["09:10", "11:30"], ["13:00", "15:10"]],
+            "p0_only": ["14:55", "15:10"],
+            "p1_max_per_minute": 600,
+            "p2_max_per_minute": 600,
+            "p2_chunk_size": 60,
+            "override_max_minutes": 120,
+        },
         "database": {
             "sqlite_path": "data/dev.db",
         },
@@ -359,7 +375,9 @@ def _defaults() -> dict:
             "enabled": True,
             # 每日续跑触发时刻（Asia/Shanghai）：晚于 DailyCloser 的 15:05 日线取数，
             # 直接复用那轮已取到的日线，不再额外卡通达信行情。
-            "daily_at": "15:10",
+            # 15:15 = TQ 通道闸对 P2 放开的最早时刻（15:05 收盘轮次实测 52–64s，
+            # 15:10–15:15 为缓冲）；被闸拒绝时调度每分钟重试，不当作失败。
+            "daily_at": "15:15",
             # 后端某天没开/续跑失败时，下次启动从最后 checkpoint 逐日补齐的上限
             # （交易日）。超过上限标「断档」并在对照表标红，同时从接缝日重建。
             "max_catchup_days": 5,
@@ -370,9 +388,10 @@ def _defaults() -> dict:
             # 每周双跑校验：0=周一 … 5=周六（默认）。到点后从接缝日全量重算对账。
             "validate_weekday": 5,
             "validate_at": "18:00",
-            # 续跑复权口径（front/back/dual），默认 dual（前复权信号 + 后复权记账）。
-            # 该值参与参数快照哈希，变更即作废 checkpoint 并从接缝日重跑。
-            "dividend_mode": "dual",
+            # 续跑复权口径（exact/front/back/dual），默认 exact（不复权真实价 +
+            # 公司行为记账，2026-11-22 起）。该值参与参数快照哈希，变更即作废
+            # checkpoint 并从接缝日重跑。
+            "dividend_mode": "exact",
             # 双跑校验的特征级容差（判据依据见 incremental_backtest 服务注释）。
             "tolerances": {
                 # 逐日净值相对偏差（%）上限：取整/费用/过户费/T+1 边界噪声远小于此

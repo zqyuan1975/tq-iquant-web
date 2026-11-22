@@ -484,7 +484,11 @@ class DailyCloser:
             return False
 
     def _fetch_1d_bars(self) -> Dict[str, list]:
-        """拉股票池 1d 快照（长度/去重同启动预热）。桥离线返回 {}（已标记离线）。"""
+        """拉股票池 1d 快照（长度/去重同启动预热）。桥离线返回 {}（已标记离线）。
+
+        口径：走 dispatcher.query_quote → 各通道均显式**不复权**（真实价），
+        与日终信号公式注入同口径；不得在此另取前复权。
+        """
         md = self._market_data
         bars_by_code: Dict[str, list] = {}
         codes = list(md._bar_poller.stock_codes)

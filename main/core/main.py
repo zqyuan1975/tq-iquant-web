@@ -20,6 +20,8 @@ from core.api.market_gate import router as market_gate_router
 from core.api.capital import router as capital_router
 from core.api.pairing import router as pairing_router
 from core.api.investment_board import router as investment_board_router
+from core.api.tdx_gate import router as tdx_gate_router
+from core.tq.gate import TdxTaskBlocked
 from core.logging_config import setup_logging
 from core.services.backtest_service import (
     recover_stale_running_backtests, recover_stale_running_batch_runs,
@@ -191,6 +193,19 @@ app.include_router(corporate_actions_router)
 app.include_router(capital_router)
 app.include_router(pairing_router)
 app.include_router(investment_board_router)
+app.include_router(tdx_gate_router)
+
+
+@app.exception_handler(TdxTaskBlocked)
+async def tdx_task_blocked_handler(request: Request, exc: TdxTaskBlocked):
+    """后台重任务被 TQ 通道闸拒绝 → 明确原因 + 下次可用时刻（HTTP 200 + code 409）。
+
+    不用长时间转圈或 30s 超时：闸在发起任何 TQ 调用前就拒绝，前端据此提示
+    「实盘运行中，回测类任务 15:15 后可用」。
+    """
+    from core.api.response import err as _err
+
+    return JSONResponse(status_code=200, content=_err(409, str(exc), exc.to_dict()))
 
 
 @app.exception_handler(Exception)

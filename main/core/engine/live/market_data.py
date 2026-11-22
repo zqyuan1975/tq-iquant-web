@@ -27,6 +27,7 @@ from typing import Callable, Dict, List, Optional
 from ..event import BarEvent
 from ..http_bridge_dispatcher import BridgeUnavailableError
 from ...tq.utils import TDXLockTimeout
+from ...tq.gate import P0, tdx_priority
 from ..bar_poller import parse_bar_time, to_ohlcv, latest_completed_bar
 from .native_minute import latest_closed_bar
 from ..portfolio import Portfolio
@@ -560,9 +561,14 @@ class MarketDataService:
                     time.sleep(0.4)
                 chunk = {c: df_by_code[c] for c in chunk_codes}
                 _tt = time.perf_counter()
-                raw = self._tq_formula.compute_injected_batch(
-                    formula_name=formula_name, ohlcv_by_code=chunk, period=period,
-                )
+                # P0：实盘信号计算属主链，任何时段可拿通道（后台 P2 分片让出）
+                with tdx_priority(P0):
+                    raw = self._tq_formula.compute_injected_batch(
+                        formula_name=formula_name, ohlcv_by_code=chunk, period=period,
+                        # 显式不复权（0）：喂入的 bars 已是 query_quote 的不复权真实价，
+                        # process 端若沿用默认前复权会二次调整 → 信号口径再次分裂。
+                        dividend_type=0,
+                    )
                 tq_elapsed += time.perf_counter() - _tt
                 n_inject += len(chunk)
                 for code in chunk:
@@ -601,6 +607,10 @@ class MarketDataService:
         count: int,
     ) -> list:
         """拉取去重：df_cache[(code, period)] 同 key 只实际拉取一次（单 bar 生命周期）。
+
+        口径：信号取数统一为**不复权**（dispatcher.query_quote 写死 none）——本进程
+        所有行情源（TQ/同花顺/桥）都只提供这一种口径，故 df_cache 键无需再带口径维度；
+        若将来引入第二种口径的取数，必须把它加进 key，否则会跨口径复用 bars。
 
         缓存值 (bars, used_count)。同 code+period 的公式 count 更大 → 升级重拉（过小会缺
         历史，公式长均线 NaN 静默失效）；bars_by_code 已按该周期最大 count 预拉 → 直接复用，
@@ -765,9 +775,14 @@ class MarketDataService:
                     # 节流：逐股 TDX 公式 compute（1w/1mon 全池）同步占 UI，逐笔小睡
                     time.sleep(0.2)
                     try:
-                        raw = self._tq_formula.compute(
-                            formula_name, "", [code], period=ctx.period, count=-1
-                        )
+                        # 1w/1mon 信号预填同属实盘信号生成：按 P0 取通道，
+                        # 避免在 14:55–15:10 保护窗内被 P1 规则拒绝而丢信号。
+                        with tdx_priority(P0):
+                            raw = self._tq_formula.compute(
+                                formula_name, "", [code], period=ctx.period, count=-1,
+                                # 不复权（0）：与 query_quote 信号口径一致
+                                dividend_type=0,
+                            )
                     except Exception:  # noqa: BLE001
                         logger.exception(
                             "startup period compute failed %s %s", ctx.period, code

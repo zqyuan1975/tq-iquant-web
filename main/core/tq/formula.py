@@ -20,16 +20,15 @@ class TQFormula:
     def compute(
         self, formula_name: str, formula_arg: str,
         stocks: List[str], period: str = "1d",
-        count: int = 10, dividend_type: int = 1,
+        count: int = 10, dividend_type: int = 0,
         start_time: str = "", end_time: str = "",
         return_count: int = -1, return_date: bool = True,
     ) -> Optional[dict]:
-        with get_tdx_lock():
-            return self._run_chunked(
-                formula_name, formula_arg, list(stocks), period,
-                count, dividend_type, start_time, end_time,
-                return_count, return_date,
-            )
+        return self._run_chunked(
+            formula_name, formula_arg, list(stocks), period,
+            count, dividend_type, start_time, end_time,
+            return_count, return_date,
+        )
 
     def _run_chunked(
         self, formula_name, formula_arg, stocks, period,
@@ -41,11 +40,15 @@ class TQFormula:
         merged: dict = {}
         errors: List[str] = []
         for chunk in _chunks(stocks, _FORMULA_STOCK_CHUNK):
-            data, err = self._run_split(
-                formula_name, formula_arg, chunk, period,
-                count, dividend_type, start_time, end_time,
-                return_count, return_date,
-            )
+            # 分片加锁：每 50 只一批独立获取 TQ 通道，批间让出。回测（P2）常以
+            # 数百只并集调 compute，若整段持锁会把通道一次性占住数十秒，实盘
+            # （P0）等待时也无法插队；按批取锁后单次占用被压到「一批」。
+            with get_tdx_lock():
+                data, err = self._run_split(
+                    formula_name, formula_arg, chunk, period,
+                    count, dividend_type, start_time, end_time,
+                    return_count, return_date,
+                )
             merged.update(data)
             if err:
                 errors.append(err)
@@ -95,7 +98,7 @@ class TQFormula:
 
     def compute_by_src(
         self, formula_src: str, stocks: List[str], period: str = "1d",
-        count: int = -1, dividend_type: int = 1,
+        count: int = -1, dividend_type: int = 0,
         formula_type: int = 0, return_count: int = -1, return_date: bool = True,
     ) -> dict:
         """临时公式源码试算（tqcenter 1.3.1 formula_by_src，不保存公式）。
@@ -146,7 +149,7 @@ class TQFormula:
     def compute_injected(
         self, formula_name: str, ohlcv_df: dict,
         stocks: List[str], period: str = "1m",
-        dividend_type: int = 1, formula_arg: str = "",
+        dividend_type: int = 0, formula_arg: str = "",
     ) -> Optional[dict]:
         """内存注入算公式（实盘逐 bar 链路，0010）。
 
@@ -226,7 +229,7 @@ class TQFormula:
 
     def compute_injected_batch(
         self, formula_name: str, ohlcv_by_code: Dict[str, dict],
-        period: str = "1m", dividend_type: int = 1, formula_arg: str = "",
+        period: str = "1m", dividend_type: int = 0, formula_arg: str = "",
     ) -> Optional[dict]:
         """批量内存注入算公式（实盘逐 bar 链路，1m 全池 N 只/分钟的性能路径）。
 

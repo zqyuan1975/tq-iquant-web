@@ -14,7 +14,7 @@ from pydantic import BaseModel
 
 from core.api.response import err, ok
 from core.tq.data import TQData
-from core.tq.utils import TDXConnectionError
+from core.tq.utils import TDXConnectionError, TdxTaskBlocked
 
 logger = logging.getLogger(__name__)
 
@@ -95,6 +95,8 @@ def create_user_block(req: UserBlockReq):
         msg = _sdk_err_msg(sent, "写入通达信自选股失败")
         if msg:
             return err(503, msg)
+    except TdxTaskBlocked:
+        raise  # 收盘保护窗口内 P1 被闸拒绝 → 全局处理器返回 409 + 下次可用时刻
     except TDXConnectionError as e:
         return err(503, str(e))
     return ok({"block_code": req.block_code, "count": len(req.stock_codes),
@@ -109,6 +111,8 @@ def get_divid_factors(stock_code: str = "", start: str = "", end: str = ""):
         return err(400, "stock_code 不能为空")
     try:
         df = TQData().get_divid_factors(stock_code, start=start, end=end)
+    except TdxTaskBlocked:
+        raise  # 收盘保护窗口内 P1 被闸拒绝 → 全局处理器返回 409 + 下次可用时刻
     except TDXConnectionError as e:
         return err(503, str(e))
     events = [
@@ -128,6 +132,8 @@ def get_trading_dates(start: str = "", end: str = ""):
         return err(400, "start 与 end 均必填（YYYYMMDD）")
     try:
         dates = TQData().get_trading_dates(start=start, end=end, strict=True)
+    except TdxTaskBlocked:
+        raise  # 收盘保护窗口内 P1 被闸拒绝 → 全局处理器返回 409 + 下次可用时刻
     except TDXConnectionError as e:
         return err(503, str(e))
     except Exception as e:

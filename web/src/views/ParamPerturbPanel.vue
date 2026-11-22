@@ -5,6 +5,7 @@ import {
   type PortfolioItem, type ParamPerturbRunItem, type ParamPerturbRequest, type PerturbRound,
 } from '../api'
 import { fmtPct, fmtSignedPct, fmtRatio, DASH } from '../utils/format'
+import { useTdxGate } from '../composables/useTdxGate'
 
 const props = withDefaults(defineProps<{ portfolios?: PortfolioItem[] }>(), { portfolios: () => [] })
 const emit = defineEmits<{ done: [] }>()
@@ -14,6 +15,8 @@ const loading = ref(false)
 const errMsg = ref('')
 const showForm = ref(false)
 const detail = ref<ParamPerturbRunItem | null>(null)
+// TQ 通道闸：参数扰动属 P2 后台重任务，交易时段后端直接拒绝 → 提前置灰
+const { p2Blocked: tqP2Blocked, p2Reason: tqP2Reason } = useTdxGate()
 
 function emptyForm(): ParamPerturbRequest {
   return {
@@ -22,7 +25,7 @@ function emptyForm(): ParamPerturbRequest {
     start_date: '',
     end_date: '',
     perturb_pct: 0.1,
-    dividend_mode: 'front',
+    dividend_mode: 'exact',
     evaluation_profile: 'absolute',
   }
 }
@@ -293,9 +296,11 @@ onMounted(load)
             </div>
           </div>
         </div>
+        <div v-if="tqP2Blocked" class="tq-gate-notice">{{ tqP2Reason }}</div>
         <div class="modal-actions">
-          <button @click="submit" class="btn btn-primary" :disabled="submitting">
-            {{ submitting ? '执行中…' : '确认' }}
+          <button @click="submit" class="btn btn-primary" :disabled="submitting || tqP2Blocked"
+                  :title="tqP2Blocked ? tqP2Reason : ''">
+            {{ submitting ? '执行中…' : (tqP2Blocked ? '实盘优先，暂不可执行' : '确认') }}
           </button>
           <button @click="showForm = false" class="btn" :disabled="submitting">取消</button>
         </div>

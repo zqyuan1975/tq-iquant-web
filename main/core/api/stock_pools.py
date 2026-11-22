@@ -16,7 +16,7 @@ from core.services.stock_pool_service import (
     update_membership as _svc_update_membership,
     delete_membership as _svc_delete_membership,
 )
-from core.tq.utils import TDXConnectionError
+from core.tq.utils import TDXConnectionError, TdxTaskBlocked
 
 router = APIRouter(prefix="/api/stock-pools", tags=["stock_pools"])
 
@@ -62,6 +62,8 @@ def list_tdx_pools(db: Session = Depends(get_db)):
     """
     try:
         data = _svc_list_tdx_pools(db)
+    except TdxTaskBlocked:
+        raise  # 保护窗口内 P1 被闸拒绝 → 全局处理器返回 409
     except TDXConnectionError:
         return err(500, "通达信未启动或连接失败")
     return ok(data)
@@ -75,6 +77,8 @@ def list_tdx_stocks(code: str):
     """实时成分股。板块在通达信不存在 → 404；通达信不可达 → 500。"""
     try:
         stocks = _svc_list_tdx_stocks(code)
+    except TdxTaskBlocked:
+        raise  # 保护窗口内 P1 被闸拒绝 → 全局处理器返回 409
     except TDXConnectionError:
         return err(500, "通达信未启动或连接失败")
     except LookupError:
@@ -90,6 +94,8 @@ def sync_pool(req: SyncReq, db: Session = Depends(get_db)):
     """按 code upsert：查通达信拿 name + 成分股，本地有则更新无则新建，全量替换成分股。"""
     try:
         data = _svc_sync_pool(db, req.code)
+    except TdxTaskBlocked:
+        raise  # 保护窗口 14:55–15:10 内 P1 被闸拒绝 → 全局处理器返回 409
     except TDXConnectionError:
         return err(500, "通达信未启动或连接失败")
     except LookupError:

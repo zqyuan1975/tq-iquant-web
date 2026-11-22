@@ -7,24 +7,28 @@ from typing import Optional
 
 from core.config import load_config
 
+from .gate import (  # noqa: F401 — 统一出口，既有 `from core.tq.utils import ...` 不变
+    GATE,
+    P0,
+    P1,
+    P2,
+    TDXConnectionError,
+    TDXLockTimeout,
+    TdxTaskBlocked,
+    current_priority,
+    gate_config,
+    gate_status,
+    parse_priority,
+    tdx_priority,
+)
+
 logger = logging.getLogger(__name__)
 
 
-class TDXConnectionError(Exception):
-    """通达信通道不可用（未启动/未登录/tqcenter 缺失/初始化失败）。"""
-
-
-class TDXLockTimeout(TDXConnectionError):
-    """等待 TQ 全局锁超时（P2-7）。
-
-    继承 TDXConnectionError：对上层语义仍是「本轮 TQ 通道不可用」——路由层
-    可直接给 503，引擎轮询按「取数失败」跳过本轮，不需要额外分支。
-    """
-
-
-_tdx_lock = threading.Lock()
-# 单例初始化专用锁：与 _tdx_lock 分开，避免「已持 _tdx_lock 的调用方再进
-# get_tq()」时自锁死。tqcenter 非线程安全，initialize 必须串行。
+# 向后兼容：旧代码/测试引用 `utils._tdx_lock`（.locked()）。闸本体提供同一接口。
+_tdx_lock = GATE
+# 单例初始化专用锁：与通道闸分开，避免「已持闸的调用方再进 get_tq()」时自锁死。
+# tqcenter 非线程安全，initialize 必须串行。
 _init_lock = threading.Lock()
 _tq = None
 _tq_initialized = False
@@ -50,37 +54,37 @@ def _lock_timeout_seconds() -> float:
 
 
 class _TDXLockGuard:
-    """``with get_tdx_lock():`` 的超时门闩（P2-7）。
+    """``with get_tdx_lock():`` 的优先级门闩（P2-7 超时语义 + tq_gate 分级）。
 
     语义：
-    - 拿到锁 → 与直接用 ``threading.Lock`` 完全一致；
+    - 拿到闸 → 与直接用 ``threading.Lock`` 完全一致；
     - 等待超过 ``timeout`` → 抛 :class:`TDXLockTimeout`，**不进入 with 体**。
-      因此不存在「锁已释放/没拿到但操作仍在跑」的并发漏洞——操作要么持锁执行，
-      要么一次都不执行；真正的持锁者（可能卡在 TQ DLL 里）不受影响。
-    - ``timeout <= 0`` → 退回旧行为（无限阻塞），用于需要长时间等锁的离线任务。
+      因此不存在「闸已释放/没拿到但操作仍在跑」的并发漏洞——操作要么持闸执行，
+      要么一次都不执行；真正的持有者（可能卡在 TQ DLL 里）不受影响。
+    - ``timeout <= 0`` → 无限阻塞（离线长任务用）。
+    - 命中 tq_gate 时段策略 → 立即抛 :class:`TdxTaskBlocked`（不等超时）。
 
-    兼容 Lock 接口（acquire/release/locked），既有调用点 ``with get_tdx_lock():``
-    与 ``get_tdx_lock().acquire()`` 均无需改动。
+    ``priority``：P0/P1/P2（或 ``"P0"/"P1"/"P2"``）。省略时取本线程默认优先级
+    （``tdx_priority`` 上下文），再回退 P1（实盘辅助级）。
     """
 
-    __slots__ = ("_timeout",)
+    __slots__ = ("_timeout", "_priority")
 
-    def __init__(self, timeout: float) -> None:
+    def __init__(self, timeout: float, priority=None) -> None:
         self._timeout = float(timeout)
+        self._priority = None if priority is None else parse_priority(priority)
 
     def acquire(self, blocking: bool = True, timeout: Optional[float] = None) -> bool:
-        if not blocking:
-            return _tdx_lock.acquire(False)
         t = self._timeout if timeout is None else float(timeout)
-        if t <= 0:
-            return _tdx_lock.acquire(True)
-        return _tdx_lock.acquire(True, t)
+        return GATE.acquire(
+            self._priority, blocking=blocking, timeout=t,
+            default_timeout=self._timeout)
 
     def release(self) -> None:
-        _tdx_lock.release()
+        GATE.release()
 
     def locked(self) -> bool:
-        return _tdx_lock.locked()
+        return GATE.locked()
 
     def __enter__(self):
         started = time.monotonic()
@@ -100,16 +104,19 @@ class _TDXLockGuard:
         return False
 
 
-def get_tdx_lock(timeout: Optional[float] = None) -> _TDXLockGuard:
-    """TQ 全局锁（可超时）。默认超时取 config.tq_lock_timeout_seconds（30s）。
+def get_tdx_lock(timeout: Optional[float] = None, priority=None) -> _TDXLockGuard:
+    """TQ 通道闸（可超时、可分级）。默认超时取 config.tq_lock_timeout_seconds。
 
-    所有 ``with get_tdx_lock():`` 的调用点在持锁超时后都会抛 TDXLockTimeout：
+    所有 ``with get_tdx_lock():`` 的调用点在持闸超时后都会抛 TDXLockTimeout：
     数据/公式/预警调用按「本轮无数据」跳过，下单通道在**未发出任何委托前**
     中断（不会产生半提交状态），由引擎的 180s 超时/失败回队兜底。
+
+    ``priority`` 见 :class:`_TDXLockGuard`；后台重任务入口用
+    ``with tdx_priority(P2):`` 包住整段，不必逐处传参。
     """
     if timeout is None:
         timeout = _lock_timeout_seconds()
-    return _TDXLockGuard(timeout)
+    return _TDXLockGuard(timeout, priority=priority)
 
 
 def _tdx_path() -> str:

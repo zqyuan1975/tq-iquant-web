@@ -25,6 +25,10 @@ os.environ.setdefault("TQ_DB_PATH", str(_TEST_DB_PATH))
 # 旧交接目录清理按「库里的 running/stopping 会话」决定保留哪些目录；库切到临时
 # 文件后读不到真实 running 会话，会误归档正在消费的会话目录 → 测试进程禁用。
 os.environ.setdefault("TQ_HANDOFF_ARCHIVE_DISABLED", "1")
+# TQ 通道闸（core/tq/gate.py）：测试进程默认关闭分级/时段策略，避免用例结果
+# 依赖墙上时钟（例如 14:55–15:10 保护窗口会把默认 P1 调用整体拒掉）。
+# 闸自身的用例走 reset_for_tests 注入配置，不受此开关影响。
+os.environ.setdefault("TQ_GATE_FORCE_ALLOW", "1")
 
 import pytest
 from sqlalchemy import create_engine

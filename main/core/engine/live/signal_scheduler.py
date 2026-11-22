@@ -6,6 +6,7 @@ from typing import Callable, Dict, List, Optional
 from ..bar_poller import latest_completed_bar, parse_bar_time, to_ohlcv
 from ..event import BarEvent
 from ..live.timing import now_shanghai
+from ...tq.gate import P0, tdx_priority
 from ...services.signal_schedule import (
     effective_signal_data_end, effective_signal_frequency, parse_signal_at,
 )
@@ -209,10 +210,13 @@ class SignalScheduler:
             count = self._formula_count_by_name.get(formula_name, 200)
             codes = self._codes()
             try:
-                raw = self.market_data._tq_formula.compute(
-                    formula_name, "", codes, period=batch.period,
-                    count=count, end_time=end_time,
-                )
+                # 信号生成属实盘主链：周/月线同样算信号，必须按 P0 取通道，
+                # 否则 14:55–15:10 保护窗内会被 P1 规则整体拒绝。
+                with tdx_priority(P0):
+                    raw = self.market_data._tq_formula.compute(
+                        formula_name, "", codes, period=batch.period,
+                        count=count, end_time=end_time,
+                    )
             except Exception as exc:  # noqa: BLE001
                 self._report_error(batch, st, formula_name, str(exc))
                 continue

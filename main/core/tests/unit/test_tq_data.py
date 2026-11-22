@@ -383,3 +383,15 @@ def test_no_trade_mask_ignores_zero_volume_price_move():
     mask = _no_trade_mask([10, 10.5], [10, 10.5], [10, 10.5], [10, 10.5], [1000, 0])
     assert mask == [False, False]
 
+
+def test_tq_data_defaults_to_unadjusted_caliber():
+    """口径决定（2026-11-22）：平台取数默认不复权，显式传参仍透传。"""
+    import inspect
+
+    from core.tq import data as data_mod
+
+    assert data_mod.DEFAULT_DIVIDEND_TYPE == "none"
+    for fn in (data_mod.TQData.get_history, data_mod.TQData.get_history_raw):
+        sig = inspect.signature(fn)
+        assert sig.parameters["dividend_type"].default == "none", fn.__name__
+

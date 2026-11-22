@@ -11,7 +11,7 @@ from core.engine.tdx_formula import syntax_check
 from core.engine.tdx_formula.normalizer import normalize_formula
 from core.services import formula_service
 from core.tq.formula import TQFormula
-from core.tq.utils import TDXConnectionError
+from core.tq.utils import TDXConnectionError, TdxTaskBlocked
 from core.services.formula_service import (
     list_formulas as _svc_list_formulas,
     get_formula as _svc_get_formula,
@@ -203,7 +203,7 @@ class TestRunRequest(BaseModel):
     stock_codes: list[str]  # 1~20 只
     period: str = "1d"
     count: int = 20  # 注入历史根数
-    dividend_type: int = 1  # 0=不复权 1=前复权 2=后复权
+    dividend_type: int = 0  # 0=不复权（默认，与实盘信号口径一致） 1=前复权 2=后复权
     formula_type: int = 0  # 0=指标 1=选股
 
 
@@ -259,6 +259,8 @@ def test_run_formula(req: TestRunRequest, db: Session = Depends(get_db)):
                 formula.name, "", req.stock_codes, period=req.period,
                 count=req.count, dividend_type=req.dividend_type,
             )
+    except TdxTaskBlocked:
+        raise
     except TDXConnectionError as e:
         return err(503, str(e))
     if str(res.get("ErrorId", "1")) != "0":

@@ -234,6 +234,8 @@ def test_query_quote_maps_to_http():
     assert rec.requests[-1].url.path == "/quote"
     assert "code=600000.SH" in str(rec.requests[-1].url)
     assert "period=1m" in str(rec.requests[-1].url)
+    # 口径决定（2026-11-22）：信号取数显式不复权（旧桥忽略该参数、默认也是不复权）
+    assert "dividend_type=none" in str(rec.requests[-1].url)
     assert rows == bars
 
 

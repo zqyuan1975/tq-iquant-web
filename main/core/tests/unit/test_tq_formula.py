@@ -312,6 +312,35 @@ def test_compute_chunks_stocks_at_50(monkeypatch):
     assert {k for k in raw if k != "ErrorId"} == set(codes)
 
 
+def test_compute_acquires_channel_per_chunk(monkeypatch):
+    """compute 按 50 只/批分别获取 TQ 通道：批间让出，P2 长任务不会整段独占。
+
+    回测（P2）常以数百只并集调 compute；若整段持锁，单次可占用通道数十秒，
+    实盘（P0）等待也无法插队。按批取锁后单次占用上界=一批。
+    """
+    acquired = []
+
+    class _Lock:
+        def __enter__(self):
+            acquired.append(1)
+
+        def __exit__(self, *exc):
+            return False
+
+    def fake_run(self, *args, **kwargs):
+        chunk = list(kwargs.get("stocks", args[2] if len(args) > 2 else []))
+        return {"ErrorId": "0", **{code: {"sig": []} for code in chunk}}
+
+    monkeypatch.setattr(TQFormula, "_run_formula", fake_run)
+    codes = [f"{i:06d}.SZ" for i in range(120)]
+    with patch("core.tq.formula.get_tdx_lock", lambda *a, **kw: _Lock()):
+        raw = TQFormula().compute("F", "", codes)
+
+    assert len(acquired) == 3          # 50/50/20 各一次，批间释放
+    assert raw["ErrorId"] == "0"
+    assert {k for k in raw if k != "ErrorId"} == set(codes)
+
+
 def test_compute_recursively_splits_error19(monkeypatch):
     """某块返回 19 时继续二分，直到小批量成功，最终合并为 ErrorId=0。"""
     calls = []
@@ -345,3 +374,16 @@ def test_compute_surfaces_error19_when_single_stock_still_partial(monkeypatch):
     assert raw["ErrorId"] == "19"
     assert "无法完全加载" in raw["Error"]
     assert "000001.SZ" in raw["Error"]
+
+
+def test_formula_chain_defaults_to_unadjusted():
+    """口径决定（2026-11-22）：公式链路默认不复权（0）。
+
+    漏传 dividend_type 时若默认前复权（1），信号口径会静默漂回旧行为；
+    这里锁住四个入口的默认值，任何回退都会被测出来。
+    """
+    import inspect
+    for fn in (TQFormula.compute, TQFormula.compute_by_src,
+               TQFormula.compute_injected, TQFormula.compute_injected_batch):
+        sig = inspect.signature(fn)
+        assert sig.parameters["dividend_type"].default == 0, fn.__name__

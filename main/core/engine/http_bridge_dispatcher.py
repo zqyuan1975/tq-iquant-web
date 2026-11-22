@@ -1152,14 +1152,14 @@ class HttpBridgeDispatcher(OrderDispatcher):
         这类「宁可放弃该只也不拖死调用方」的路径使用；None 沿用构造时的读超时
         （桥全局锁排队可能需要 15–30s，正常取数不能设太小）。
 
-        复权口径（P2-9）：桥侧一律返回**不复权**原始价——掘金桥
-        ``/quote`` 用 ``adjust=0``；QMT 桥 ``dividend_type="follow"`` 经
-        ContextInfo 解析为 ``this.dividend_type``（初始化空串）= 默认不复权。
-        当日分钟 bar 与实时价一致，下单/涨跌停/风控不受影响；但与 tdx/ths
-        的日线前复权口径不同，1d/1w/1mon 的公式回看段在除权日附近可能有差异
-        （只影响信号可比性，不影响下单）。桥支持按请求指定复权前，平台侧无法统一。
+        复权口径（2026-11-22 口径切换）：信号取数统一**不复权**，显式带
+        ``dividend_type=none``（两桥均支持；旧桥忽略未知参数、本就默认不复权 →
+        向后兼容）。当日分钟 bar 与实时价一致，下单/涨跌停/风控不受影响；
+        历史段与 tdx/ths 取数、与回测 ``exact`` 档逐值一致，不再口径分裂。
+        前复权只用于展示/对照，绝不再做信号默认。
         """
-        path = "/quote?code=%s&period=%s&count=%s" % (code, period, count)
+        path = "/quote?code=%s&period=%s&count=%s&dividend_type=none" % (
+            code, period, count)
         try:
             # 体检路径传 timeout 时按单次请求覆盖 httpx 读超时（见 docstring）。
             kwargs = {"timeout": timeout} if timeout else {}

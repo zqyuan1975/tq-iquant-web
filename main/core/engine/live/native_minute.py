@@ -89,8 +89,8 @@ def fetch_native_bars(
     if not pairs:
         return {}
     raw = TQData().get_history_raw(
-        [tq for _, tq in pairs], [period], dividend_type="front",
-        count=max(int(count or 10), 2))
+        [tq for _, tq in pairs], [period], dividend_type="none",
+        count=max(int(count or 10), 2), priority="P0")
     converted = raw_to_bars(raw, period)
     return {orig: converted.get(tq, []) for orig, tq in pairs}
 

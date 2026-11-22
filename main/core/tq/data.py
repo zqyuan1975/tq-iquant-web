@@ -4,11 +4,17 @@ import logging
 import pandas as pd
 import polars as pl
 from typing import Dict, List, Callable, Optional
-from .utils import get_tdx_lock, get_tq
+from .utils import get_tdx_lock, get_tq, P2, current_priority, gate_config, parse_priority
 
 logger = logging.getLogger(__name__)
 
 _FIELDS = ["Open", "High", "Low", "Close", "Volume", "Amount"]
+
+#: 平台取数默认复权口径 = **不复权（真实成交价）**。
+#: 2026-11-22 口径决定：信号与记账统一用不复权原始价（公司行为按除权日显式入账），
+#: 前复权/后复权降级为展示/对照。默认值在此集中定义，避免调用方漏传时静默漂回
+#: 前复权（前复权因子随请求窗口变化，跨日持久化会产生假盈亏）。
+DEFAULT_DIVIDEND_TYPE = "none"
 
 # --- 午休幽灵 bar（13:00）---
 # 批量 get_market_data(fill_data=True) 会把午休空档用「上一根 bar 收盘」填充：
@@ -252,7 +258,7 @@ class TQData:
     def get_history(
         self, stocks: List[str], periods: List[str],
         start: str = "", end: str = "",
-        dividend_type: str = "front", count: int = 100,
+        dividend_type: str = DEFAULT_DIVIDEND_TYPE, count: int = 100,
     ) -> Dict[str, Dict[str, pl.DataFrame]]:
         with get_tdx_lock():
             return self._load_history(stocks, periods, start, end, dividend_type, count)
@@ -260,15 +266,56 @@ class TQData:
     def get_history_raw(
         self, stocks: List[str], periods: List[str],
         start: str = "", end: str = "",
-        dividend_type: str = "front", count: int = 100,
+        dividend_type: str = DEFAULT_DIVIDEND_TYPE, count: int = 100,
+        priority=None,
     ) -> Dict[str, dict]:
         """取原始 TQ 行情（未经转换），按周期分组：{period: {field: pandas.DataFrame}}。
 
         field ∈ Open/High/Low/Close/Volume/Amount，DataFrame.index=时间戳，columns=股票代码。
         一次调用 = 单周期多股票。转换由调用方（_convert_market_data）负责，便于单测。
+
+        P2（后台重任务）且股票数超过 ``tq_gate.p2_chunk_size`` 时**按票分片**：
+        每片一次独立的加锁/放锁，片间 P0 实盘调用可插队——避免一次
+        ``count=-1`` 全量取数长时间独占通道（2026-11-19 实测 >2 分钟）。
         """
-        with get_tdx_lock():
+        level = current_priority() if priority is None else parse_priority(priority)
+        cfg = gate_config()
+        try:
+            chunk = int(cfg.get("p2_chunk_size") or 0)
+        except (TypeError, ValueError):
+            chunk = 0
+        if level == P2 and cfg.get("enabled", True) and chunk > 0 and len(stocks) > chunk:
+            return self._history_raw_chunked(
+                stocks, periods, start, end, dividend_type, count, chunk)
+        with get_tdx_lock(priority=level):
             return self._load_history_raw(stocks, periods, start, end, dividend_type, count)
+
+    def _history_raw_chunked(
+        self, stocks, periods, start, end, dividend_type, count, chunk,
+    ) -> Dict[str, dict]:
+        """P2 分片取数：逐片持闸，片间放闸；按字段 ``pd.concat(axis=1)`` 合并。
+
+        合并口径与批量一次取数一致（同构 {period: {field: DataFrame}}，列=股票），
+        列序保持入参 ``stocks`` 顺序；某片异常时沿用 ``_load_history_raw`` 的逐股兜底
+        与 ``skipped_stocks`` 语义，最终一次性回填。
+        """
+        merged: Dict[str, dict] = {}
+        skipped: List[str] = []
+        for i in range(0, len(stocks), chunk):
+            part = stocks[i:i + chunk]
+            with get_tdx_lock(priority=P2):
+                one = self._load_history_raw(
+                    part, periods, start, end, dividend_type, count)
+            skipped.extend(self.skipped_stocks)
+            for period, fields in (one or {}).items():
+                bucket = merged.setdefault(period, {})
+                for field, df in (fields or {}).items():
+                    if df is None:
+                        continue
+                    prev = bucket.get(field)
+                    bucket[field] = df if prev is None else pd.concat([prev, df], axis=1)
+        self.skipped_stocks = skipped
+        return merged
 
     def subscribe_bars(
         self, stocks: List[str], periods: List[str],
@@ -315,7 +362,7 @@ class TQData:
 
     def _load_history(
         self, stocks, periods, start="", end="",
-        dividend_type="front", count=100,
+        dividend_type=DEFAULT_DIVIDEND_TYPE, count=100,
     ) -> Dict[str, Dict[str, pl.DataFrame]]:
         tq = get_tq()
         result = {}
@@ -364,7 +411,7 @@ class TQData:
 
     def _load_history_raw(
         self, stocks, periods, start="", end="",
-        dividend_type="front", count=100,
+        dividend_type=DEFAULT_DIVIDEND_TYPE, count=100,
     ) -> Dict[str, dict]:
         """原始 TQ 行情按周期分组：{period: raw_dict}。raw_dict 即 tq.get_market_data 返回值。
 

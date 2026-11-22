@@ -32,7 +32,7 @@ from datetime import datetime, timedelta
 from decimal import Decimal, ROUND_HALF_UP
 from typing import Any, Dict, List, Optional
 
-from core.tq.utils import TDXConnectionError, get_tdx_lock, get_tq, inject_tqcenter_path, _tdx_path
+from core.tq.utils import TDXConnectionError, get_tdx_lock, get_tq, inject_tqcenter_path, _tdx_path, P0
 
 from .event import OrderEvent, TradeEvent
 from .execution_engine import OrderDispatcher
@@ -151,9 +151,12 @@ def _call(fn, *args, **kwargs):
 
     打包后是无控制台的 GUI 程序，``sys.stdout`` 可能为 None；TQ 内部 print 会抛
     AttributeError。统一重定向到 StringIO，同时保留最后一行用于错误信息。
+
+    优先级 P0（实盘主链）：行情/下单/撤单/账户/成交全部经此，任何时段可拿通道，
+    等待中的 P1/P2 在当前单次调用结束后让出（见 core.tq.gate）。
     """
     out = io.StringIO()
-    with get_tdx_lock():
+    with get_tdx_lock(priority=P0):
         with contextlib.redirect_stdout(out):
             return fn(*args, **kwargs)
 
@@ -311,7 +314,7 @@ class TdxTqDispatcher(OrderDispatcher):
         try:
             tq = self._tq()
             out = io.StringIO()
-            with get_tdx_lock():
+            with get_tdx_lock(priority=P0):
                 with contextlib.redirect_stdout(out):
                     aid = tq.stock_account(account=self._account,
                                            account_type=self._account_type)
@@ -754,10 +757,12 @@ class TdxTqDispatcher(OrderDispatcher):
     def query_quote(self, code: str, period: str = "1m", count: int = 10) -> list:
         """行情复用 Core 同进程内嵌的 TQ 模块（与回测取数口径一致）。
 
-        复权口径（P2-9）：显式取**前复权**（TQ 默认值，写死防止默认值变更后静默漂移）。
-        当日分钟 bar 的前复权值与不复权实时价相同（前复权锚定最新价），故下单价、
-        涨跌停夹取、风控阈值均不受影响；历史段连续无除权缺口，与回测
-        ``dividend_mode=front`` / ``dual`` 的信号口径一致。
+        复权口径（2026-11-22 口径切换）：显式取**不复权**（真实成交价），写死防止
+        SDK 默认值变更后静默漂移。信号链路与执行报价同口径：
+        - 当日/实时 bar 本就不复权，下单价、涨跌停夹取、风控阈值不受影响；
+        - 历史段与回测 ``dividend_mode=exact``（不复权 + 公司行为入账）逐值一致，
+          不再出现「实盘前复权、回测不复权」的口径分裂。
+        前复权仅用于展示/对照，绝不进入信号或记账链路。
         """
         tq_code = normalize_symbol(code)
         code6 = re.sub(r"\D", "", str(code or ""))[:6]
@@ -766,7 +771,7 @@ class TdxTqDispatcher(OrderDispatcher):
         try:
             from core.tq.data import TQData
             raw = TQData().get_history_raw(
-                [tq_code], [period], dividend_type="front",
+                [tq_code], [period], dividend_type="none",
                 count=max(int(count or 10), 2))
         except Exception as e:
             self._last_error = "quote unavailable: %s" % e
@@ -799,7 +804,7 @@ class TdxTqDispatcher(OrderDispatcher):
                 return {}
             from core.tq.data import TQData
             raw = TQData().get_history_raw(
-                [tq for _, tq in pairs], [period], dividend_type="front",
+                [tq for _, tq in pairs], [period], dividend_type="none",
                 count=max(int(count or 10), 2))
             converted = self._raw_to_bars(raw, period)
             return {orig: converted.get(tq, []) for orig, tq in pairs}
@@ -960,10 +965,11 @@ class TdxTqDispatcher(OrderDispatcher):
         多取几根是为了同时拿到「上市交易日序」（新股判定）与最早 bar 日期，
         供 ``core.engine.price_limit.resolve_limit_rule`` 判板块/ST/新股。
 
-        复权口径（P2-9）：显式取**前复权**日线。除权日的前复权收盘即交易所的
-        「除权后参考价」（涨跌停基准），若改用不复权原始前收，除权日会把
-        ±10%/±20% 带算偏 → 夹价错误。此序列只用于前收/板块/ST/上市日序判定，
-        不做持仓或净值口径用途。
+        复权口径：**保持前复权**，且不得改为不复权。此序列只服务涨跌停前收
+        基准（以及板块/ST/上市日序判定），不是信号口径也不是记账口径：
+        除权日的前复权收盘即交易所的「除权后参考价」（涨跌停基准），若改用不复权
+        原始前收，除权日会把 ±10%/±20% 带算偏 → 夹价错误。信号取数已在
+        ``query_quote`` 统一为不复权，与此处相互独立。
         """
         try:
             from core.tq.data import TQData

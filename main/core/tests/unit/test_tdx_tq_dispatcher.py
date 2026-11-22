@@ -1384,3 +1384,38 @@ def test_pending_row_state_disabled_when_auto_confirm_off():
     assert d.pending_row_state(_live_order()) is None
     assert stub.specs == []
 
+
+# ---------------- 信号口径 = 不复权（2026-11-22 口径切换） ----------------
+def test_query_quote_requests_unadjusted_bars(monkeypatch):
+    """query_quote 是信号/执行报价统一入口：必须显式取不复权（真实价）。"""
+    idx = [pd.Timestamp("2026-11-20 14:59:00")]
+    fq = FakeQuoteData({"1m": {"Close": pd.DataFrame(
+        {"603187.SH": [10.22]}, index=idx)}})
+    monkeypatch.setattr("core.tq.data.TQData", lambda: fq)
+    bars = TdxTqDispatcher().query_quote("603187", period="1m", count=5)
+    assert bars and bars[0]["close"] == 10.22
+    assert fq.history_calls[0][2]["dividend_type"] == "none"
+
+
+def test_query_quotes_batch_requests_unadjusted_bars(monkeypatch):
+    """批量行情与逐只同口径，不得一条路径前复权、另一条不复权。"""
+    idx = [pd.Timestamp("2026-11-20 14:59:00")]
+    fq = FakeQuoteData({"1m": {"Close": pd.DataFrame(
+        {"603187.SH": [10.22], "600211.SH": [45.0]}, index=idx)}})
+    monkeypatch.setattr("core.tq.data.TQData", lambda: fq)
+    out = TdxTqDispatcher().query_quotes_batch(
+        ["603187", "600211"], period="1m", count=5)
+    assert set(out) == {"603187", "600211"}
+    assert fq.history_calls[0][2]["dividend_type"] == "none"
+
+
+def test_daily_close_series_keeps_front_caliber_for_limit_base(monkeypatch):
+    """涨跌停前收基准必须前复权（除权日参考价），不得被信号口径改动波及。"""
+    idx = [pd.Timestamp("2026-11-19"), pd.Timestamp("2026-11-20")]
+    fq = FakeQuoteData({"1d": {"Close": pd.DataFrame(
+        {"603187.SH": [10.0, 10.2]}, index=idx)}})
+    monkeypatch.setattr("core.tq.data.TQData", lambda: fq)
+    series = TdxTqDispatcher()._daily_close_series("603187.SH", 10)
+    assert list(series) == [10.0, 10.2]
+    assert fq.history_calls[0][2]["dividend_type"] == "front"
+

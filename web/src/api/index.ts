@@ -1549,7 +1549,7 @@ export interface BacktestRequest {
   name: string
   start_date: string  // YYYY-MM-DD
   end_date: string    // YYYY-MM-DD
-  dividend_mode?: 'front' | 'back' | 'dual' | 'exact'  // 复权模式：前复权(默认)/后复权/前复权信号+后复权记账
+  dividend_mode?: 'front' | 'back' | 'dual' | 'exact'  // 复权模式：exact 不复权+公司行为(默认)/前复权/后复权/dual 历史兼容
   evaluation_profile?: 'absolute' | 'relative'  // B6 考核口径（默认 absolute）
   is_oos_gate_enabled?: boolean                 // C7 IS/OOS 采纳门槛（默认关）
   oos_gate_min_ratio?: number                   // (0,2]，默认 0.5
@@ -3488,7 +3488,7 @@ export interface IncrementalBacktestConfig {
   anchor_on_live_start: boolean // 接缝锚定：用实盘起账状态重锚回测
   validate_weekday: number      // 双跑校验星期（0=周一 … 5=周六）
   validate_at: string           // 双跑校验时点
-  dividend_mode: string         // front|back|dual
+  dividend_mode: string         // exact（默认）|front|back|dual
   tolerances: {
     max_net_dev_pct: number
     mean_net_dev_pct: number
@@ -3989,6 +3989,24 @@ export async function listCashOutlets(params?: { category?: string; status?: str
   return res.data.data
 }
 
+export async function registerCashOutlet(payload: {
+  code: string
+  name?: string
+  category?: string
+  channel?: string
+  channel_order_enabled?: boolean
+  liquidity?: string
+  term_days?: number
+  risk_level?: string
+  inflow_certainty?: string
+  notes?: string
+}) {
+  const res = await api.post<ApiResponse<{
+    enabled: boolean; item: CashOutletItem; warnings?: string[]
+  }>>('/capital/outlets/register', payload)
+  return res.data.data
+}
+
 export async function evaluateCashOutlet(
   outletId: number, payload: { need_date?: string; required_amount?: string } = {},
 ) {
@@ -4117,5 +4135,58 @@ export async function getCapitalUtilization(params: {
 }) {
   const res = await api.get<ApiResponse<CapitalUtilizationStats>>(
     '/capital/utilization', { params })
+  return res.data.data
+}
+
+// ---------------- TQ 通道闸（tq_gate，GET /system/tdx-gate） ----------------
+// 通达信单机只能一个实例：实盘(P0)/实盘辅助(P1)/后台重任务(P2) 在 TQ 调用层统一排队。
+// 前端据此把回测类按钮置灰，并显示「实盘优先，XX 后可用」。
+export interface TdxGatePolicy {
+  now: string
+  trading_day: boolean
+  window: string
+  override: boolean
+  protected: boolean
+  p1_allowed: boolean
+  p2_allowed: boolean
+  p2_quota_active: boolean
+  p1_quota_active: boolean
+  next_p2_open_at: string | null
+}
+
+export interface TdxGateStatus {
+  enabled: boolean
+  policy: TdxGatePolicy
+  override: {
+    minutes: number
+    reason: string
+    operator: string
+    started_at: string
+    expires_at: string
+    active: boolean
+  } | null
+  channel_held: boolean
+  stats: Record<string, unknown>
+}
+
+export async function getTdxGateStatus() {
+  const res = await api.get<ApiResponse<TdxGateStatus>>('/system/tdx-gate')
+  return res.data.data
+}
+
+export async function setTdxGateOverride(req: {
+  confirm: boolean
+  reason: string
+  minutes?: number
+  operator?: string
+}) {
+  const res = await api.post<ApiResponse<{ override: unknown; decision_event_id: number | null }>>(
+    '/system/tdx-gate/override', req)
+  return res.data.data
+}
+
+export async function clearTdxGateOverride(reason?: string) {
+  const res = await api.post<ApiResponse<{ cleared: boolean; decision_event_id: number | null }>>(
+    '/system/tdx-gate/override/clear', { reason })
   return res.data.data
 }
