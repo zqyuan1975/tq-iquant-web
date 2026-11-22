@@ -796,7 +796,7 @@ describe('LiveSessions.vue 新建实盘选组合', () => {
     w.unmount()
   })
 
-  it('错周期风控默认跟随全局（提交 null），三态选项齐全', async () => {
+  it('错周期风控默认未显式设置（提交 null），三态选项齐全', async () => {
     ;(getLiveSessions as any).mockResolvedValue([stoppedSession])
     ;(getPortfolios as any).mockResolvedValue(mockPortfolios)
     const w = mount(LiveSessions)
@@ -806,7 +806,8 @@ describe('LiveSessions.vue 新建实盘选组合', () => {
     await flushPromises()
     const sel = w.find('select[data-field="intraday_mismatched_risk_enabled"]')
     expect(sel.exists()).toBe(true)
-    expect(sel.text()).toContain('跟随全局')
+    // 语义已改为「未显式设置＝关闭」，不再沿用「跟随全局」的旧文案
+    expect(sel.text()).toContain('未显式设置')
     expect(sel.text()).toContain('强制开启')
     expect(sel.text()).toContain('强制关闭')
 
