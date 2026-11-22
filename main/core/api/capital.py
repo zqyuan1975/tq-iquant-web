@@ -242,19 +242,33 @@ class CashOutletVerifyRequest(BaseModel):
     valid_days: int = 365
 
 
+class CashOutletRegisterRequest(BaseModel):
+    """登记入口的请求体：只收登记必需字段，其余走默认值补全。"""
+    code: str
+    name: Optional[str] = None
+    category: Optional[str] = None
+    channel: str = "manual"
+    channel_order_enabled: bool = False
+    liquidity: str = "t1"
+    term_days: Optional[int] = None
+    risk_level: Optional[str] = None
+    inflow_certainty: Optional[str] = None
+    notes: Optional[str] = None
+
+
 def _outlet_switches() -> CapitalPoolSwitches:
     return CapitalPoolSwitches.from_config(load_config() or {})
 
 
 def _outlet_disabled():
     return ok(_disabled_payload(
-        ["现金出口开关未启用（capital_pool.cash_outlet_enabled=false）"]))
+        ["现金管理开关未启用（capital_pool.cash_outlet_enabled=false）"]))
 
 
 def _get_outlet(db: Session, outlet_id: int) -> CashOutlet:
     outlet = db.get(CashOutlet, outlet_id)
     if outlet is None:
-        raise LookupError(f"现金出口不存在：{outlet_id}")
+        raise LookupError(f"现金管理标的不存在：{outlet_id}")
     return outlet
 
 
@@ -302,6 +316,75 @@ def create_outlet(payload: CashOutletRequest, db: Session = Depends(get_db)):
         return err(422, str(exc))
     return ok({"enabled": True,
                "item": cash_outlet_service.serialize_outlet(outlet)})
+
+
+@router.post("/outlets/register")
+def register_outlet(payload: CashOutletRegisterRequest,
+                    db: Session = Depends(get_db)):
+    """登记现金管理标的（独立入口：代码/行情校验 + 防重复）。
+
+    只写配置，``verified`` 固定为 false（C8 仍需走 ``/outlets/{id}/verify``
+    记录小额实盘证据）；不改列表/评估/对账语义。
+    """
+    if not _outlet_switches().cash_outlet_enabled:
+        return _outlet_disabled()
+    try:
+        norm = cash_outlet_service.normalize_outlet_code(payload.code)
+    except ValueError as exc:
+        return err(422, str(exc))
+    if db.query(CashOutlet).filter(CashOutlet.code == norm["code"]).first():
+        return err(409, "该标的已登记：%s，请勿重复登记（可在列表中直接选用）"
+                   % norm["code"])
+    available, reason = cash_outlet_service.probe_outlet_quote(norm["symbol"])
+    if not available:
+        return err(422, reason)
+
+    category = (payload.category or norm["category"]).strip().lower()
+    if category not in cash_outlet_service.ALLOWED_CATEGORIES:
+        return err(422, "标的类型非法：%r（仅 repo/etf_money/other）"
+                   % payload.category)
+    channel = (payload.channel or "manual").strip().lower()
+    if channel not in ("tq", "qmt", "gj", "manual"):
+        return err(422, "通道非法：%r（仅 tq/qmt/gj/manual）" % payload.channel)
+    liquidity = (payload.liquidity or "t1").strip().lower()
+    if liquidity not in ("t0", "t1", "term"):
+        return err(422, "流动性非法：%r（仅 t0/t1/term）" % payload.liquidity)
+    if liquidity == "term" and not (1 <= int(payload.term_days or 0)
+                                    <= cash_outlet_service.MAX_TERM_DAYS):
+        return err(422, "期限类标的须给出 1–%d 天到期天数"
+                   % cash_outlet_service.MAX_TERM_DAYS)
+
+    warnings = []
+    order_enabled = bool(payload.channel_order_enabled)
+    if order_enabled and channel == "manual":
+        order_enabled = False
+        warnings.append("manual 通道不支持程序化下单，已按人工通道登记")
+    risk_level = (payload.risk_level or "").strip().upper() or None
+    if risk_level not in cash_outlet_service.ALLOWED_RISK_LEVELS:
+        warnings.append("风险等级未在 R1/R2，评估的 C6 会拦住，需补全后再使用")
+
+    try:
+        outlet = cash_outlet_service.create_outlet(db, {
+            "code": norm["code"],
+            "name": (payload.name or "").strip() or norm["code"],
+            "category": category,
+            "channel": channel,
+            "channel_order_enabled": order_enabled,
+            "liquidity": liquidity,
+            "term_days": int(payload.term_days) if liquidity == "term" else None,
+            "risk_level": risk_level,
+            "inflow_certainty": payload.inflow_certainty,
+            "notes": payload.notes,
+            "status": "active",
+        })
+    except ValueError as exc:
+        return err(409, str(exc))
+
+    item = cash_outlet_service.serialize_outlet(outlet)
+    item["verified_notice"] = (
+        "已登记为未验证标的：P1/P2 仍需人工确认，P3 不会自动放行；"
+        "完成小额实盘验证后才计入 C8")
+    return ok({"enabled": True, "item": item, "warnings": warnings})
 
 
 @router.put("/outlets/{outlet_id}")

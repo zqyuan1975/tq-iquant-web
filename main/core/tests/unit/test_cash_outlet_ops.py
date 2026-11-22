@@ -83,7 +83,13 @@ def test_p3_auto_executes_only_verified_short_term_outlet():
 def test_daily_limit_accumulates_across_ops():
     db = _db()
     outlet = _seed_outlet(db, max_daily_amount=Decimal("5000"))
-    svc.plan_outlet_op(db, outlet, amount="4000", mode="P1", now=NOW)
+    first = svc.plan_outlet_op(db, outlet, amount="4000", mode="P1", now=NOW)
+    # created_at 由模型默认取真实时钟（now 注入只影响业务时间字段，不覆盖它），
+    # 「单日累计」按 created_at 归日；这里显式对齐到 NOW，避免用例只在运行当天
+    # 恰好等于 NOW 时才生效的时间依赖。
+    row = db.get(svc.CashOutletOp, first["id"])
+    row.created_at = NOW
+    db.commit()
     with pytest.raises(svc.OutletOpsError, match="超过单日上限"):
         svc.plan_outlet_op(db, outlet, amount="2000", mode="P1", now=NOW)
 

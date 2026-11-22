@@ -8,6 +8,7 @@
 - 本模块只登记与评估配置，不产生委托、划转、收益，也不接实盘链路。
 """
 import logging
+import re
 from datetime import date, datetime, timedelta
 from decimal import Decimal
 from typing import Any, Dict, List, Optional
@@ -39,9 +40,60 @@ ALL_CODES = (
 
 ALLOWED_CHANNELS = ("tq", "qmt", "gj")   # manual 只能人工，不算可编程通道
 ALLOWED_RISK_LEVELS = ("R1", "R2")
+ALLOWED_CATEGORIES = ("repo", "etf_money", "other")
 MAX_TERM_DAYS = 7
 MIN_YIELD_HISTORY_DAYS = 60
 VERIFY_VALID_DAYS = 365
+
+#: 登记标的时接受的 6 位代码前缀 → (交易所后缀, 默认类别)。
+#: 只放行逆回购与场内货基 ETF，避免把股票/债券误登记成「现金管理」。
+_OUTLET_CODE_RE = re.compile(r"^\d{6}$")
+_OUTLET_CODE_PREFIXES = (
+    ("204", ".SH", "repo"),
+    ("131", ".SZ", "repo"),
+    ("51", ".SH", "etf_money"),
+    ("159", ".SZ", "etf_money"),
+)
+
+
+def normalize_outlet_code(raw: Any) -> Dict[str, str]:
+    """校验标的代码并归一化：返回 ``{code, symbol, category}``。
+
+    ``code`` 为落库用的裸 6 位；``symbol`` 为通达信行情用的带后缀代码。
+    只接受逆回购（204xxx/1318xx）与场内货基 ETF（51xxxx/159xxx）。
+    """
+    text = str(raw or "").strip().upper()
+    if text.endswith(".SH") or text.endswith(".SZ"):
+        text = text[:-3]
+    if not _OUTLET_CODE_RE.match(text):
+        raise ValueError("标的代码必须是 6 位数字（如 204001、511880），收到 %r"
+                         % (raw,))
+    for prefix, suffix, category in _OUTLET_CODE_PREFIXES:
+        if text.startswith(prefix):
+            return {"code": text, "symbol": text + suffix,
+                    "category": category}
+    raise ValueError(
+        "暂只支持逆回购（204xxx / 1318xx）与场内货基 ETF（51xxxx / 159xxx），"
+        "收到的代码 %s 不在支持范围" % text)
+
+
+def probe_outlet_quote(symbol: str) -> tuple[bool, str]:
+    """登记前探测通达信行情是否可取；返回 ``(是否可取, 失败原因)``。
+
+    取不到就明确拒绝登记，避免把不可交易代码落进白名单。
+    """
+    try:
+        from core.tq.data import TQData
+        snaps = TQData().get_market_snapshot_batch([symbol], []) or {}
+    except Exception as exc:  # noqa: BLE001 — 取数失败要转成可读原因
+        logger.warning("标的行情探测失败 %s: %s", symbol, exc)
+        return False, ("通达信行情不可用（客户端可能未启动或未登录），"
+                       "暂时无法登记，请稍后重试")
+    snap = snaps.get(symbol)
+    if not isinstance(snap, dict) or not snap:
+        return False, ("通达信未取到 %s 的行情，请确认代码是否正确、"
+                       "是否已上市或已退市" % symbol)
+    return True, ""
 
 
 def _dec(value: Any) -> Optional[Decimal]:
@@ -277,9 +329,9 @@ def serialize_outlet(outlet: CashOutlet) -> Dict[str, Any]:
 def create_outlet(db: Session, payload: Dict[str, Any]) -> CashOutlet:
     code = (payload.get("code") or "").strip()
     if not code:
-        raise ValueError("出口代码不能为空")
+        raise ValueError("标的代码不能为空")
     if db.query(CashOutlet).filter(CashOutlet.code == code).first():
-        raise ValueError("出口代码已存在：%s" % code)
+        raise ValueError("该标的已登记：%s，请勿重复登记" % code)
     outlet = CashOutlet(code=code, name=(payload.get("name") or code).strip())
     _apply(db, outlet, payload, creating=True)
     db.add(outlet)
