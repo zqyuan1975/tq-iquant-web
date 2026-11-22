@@ -4588,31 +4588,37 @@ watch(theme, () => {
                 <input type="number" step="10000" min="1000" v-model="form.equity_cap" placeholder="用组合默认" data-field="equity_cap" />
                 <span class="field-suffix">元（留空=用组合默认）</span>
               </div>
-              <div class="field-row">
+              <div class="field-row field-span-2">
                 <span class="field-label">容量模型</span>
-                <select v-model="form.capacity_model" data-field="capacity_model">
-                  <option value="">默认（linear 旧口径）</option>
-                  <option value="linear">linear（4% 成交量闸门）</option>
-                  <option value="sqrt">sqrt（参与率 + 冲击 + 残量顺延）</option>
-                </select>
-                <span class="field-suffix">改模型会改变结果数值，写入 capacity_model_version</span>
+                <div class="field-control">
+                  <select v-model="form.capacity_model" data-field="capacity_model">
+                    <option value="">默认（linear 旧口径）</option>
+                    <option value="linear">linear（4% 成交量闸门）</option>
+                    <option value="sqrt">sqrt（参与率 + 冲击 + 残量顺延）</option>
+                  </select>
+                  <span class="field-hint">改模型会改变结果数值，写入 capacity_model_version</span>
+                </div>
               </div>
-              <div class="field-row" v-if="form.capacity_model === 'sqrt'">
+              <div class="field-row field-span-2" v-if="form.capacity_model === 'sqrt'">
                 <span class="field-label">sqrt 冲击系数 k</span>
-                <select v-model="form.capacity_impact_k" data-field="capacity_impact_k">
-                  <option value="0.05">0.05（低敏感）</option>
-                  <option value="0.1">0.10（默认）</option>
-                  <option value="0.2">0.20（高敏感）</option>
-                </select>
-                <span class="field-suffix">冲击 = 20bps + k×√参与率（>5% 判不可成交）</span>
+                <div class="field-control">
+                  <select v-model="form.capacity_impact_k" data-field="capacity_impact_k">
+                    <option value="0.05">0.05（低敏感）</option>
+                    <option value="0.1">0.10（默认）</option>
+                    <option value="0.2">0.20（高敏感）</option>
+                  </select>
+                  <span class="field-hint">冲击 = 20bps + k×√参与率（>5% 判不可成交）</span>
+                </div>
               </div>
-              <div class="field-row">
+              <div class="field-row field-span-2">
                 <span class="field-label">流动性口径</span>
-                <select v-model="form.liquidity_caliber" data-field="liquidity_caliber">
-                  <option value="">默认（当日 bar 量，旧口径）</option>
-                  <option value="prev5d_avg">前 5 日均量（新口径，需显式选择）</option>
-                </select>
-                <span class="field-suffix">仅成交量闸门生效；口径写入快照，新旧结果不可混比</span>
+                <div class="field-control">
+                  <select v-model="form.liquidity_caliber" data-field="liquidity_caliber">
+                    <option value="">默认（当日 bar 量，旧口径）</option>
+                    <option value="prev5d_avg">前 5 日均量（新口径，需显式选择）</option>
+                  </select>
+                  <span class="field-hint">仅成交量闸门生效；口径写入快照，新旧结果不可混比</span>
+                </div>
               </div>
             </div>
           </div>

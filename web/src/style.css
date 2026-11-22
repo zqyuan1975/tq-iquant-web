@@ -228,6 +228,11 @@ tbody tr:last-child td{border-bottom:none}
 .field-row select:focus,.modal-content select:focus,.field select:focus,.field-select:focus{outline:none;border-color:var(--accent);box-shadow:0 0 0 2px var(--accent-light)}
 .field-row select:disabled,.modal-content select:disabled,.field select:disabled,.field-select:disabled{opacity:.55;cursor:not-allowed;background-color:var(--hover-bg)}
 .field-suffix{flex:0 0 auto;font-size:13px;color:var(--ink-soft)}
+/* 长说明改到控件下方（容量/成交量等高级选项）：说明不再与下拉抢同一行宽度，
+   下拉占满整行，选中项文字不会被挤成「模型▼」。 */
+.field-control{flex:1;min-width:0;display:flex;flex-direction:column;gap:2px}
+.field-row .field-control > select{flex:0 0 auto;width:100%}
+.field-row .field-control > .field-hint{margin:0}
 /* 开关行：勾选框 + 说明并排（双列网格下半格也紧凑） */
 .field-row .switch-row{display:inline-flex;align-items:center;gap:6px;flex:1;min-width:0;margin:0;font-size:12px}
 .field-row .switch-row input{flex:0 0 auto;width:auto;margin:0}
