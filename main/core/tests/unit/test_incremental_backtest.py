@@ -706,6 +706,70 @@ def test_params_hash_covers_strategy_formula_pool_and_add_delete(db_session):
     assert ib.params_hash(ps, "dual", db_session) == base
 
 
+def test_params_hash_covers_max_order_amount(db_session, monkeypatch, tmp_path):
+    """单笔上限参与回测定量：只改 max_order_amount 必须判废，且不改则稳定。"""
+    from core.services import portfolio_settings
+    monkeypatch.setattr(portfolio_settings, "_DEFAULT_PATH",
+                        tmp_path / "portfolio_settings.json")
+    sess, ps, link = _seed_live_link(db_session)
+    strat = db_session.query(Strategy).filter_by(portfolio_id=ps.id).first()
+    base = ib.params_fingerprint(ps, "dual", db_session)
+
+    # 都不改 → 指纹不变
+    assert ib.params_fingerprint(ps, "dual", db_session)["hash"] == base["hash"]
+
+    # 只改 max_order_amount → 指纹变化（归到 strategies 分项）
+    strat.max_order_amount = Decimal("1000000")
+    db_session.commit()
+    changed = ib.params_fingerprint(ps, "dual", db_session)
+    assert changed["hash"] != base["hash"]
+    assert changed["parts"]["strategies"] != base["parts"]["strategies"]
+
+    # 改回 → 指纹恢复
+    strat.max_order_amount = None
+    db_session.commit()
+    assert ib.params_fingerprint(ps, "dual", db_session)["hash"] == base["hash"]
+
+
+def test_params_hash_covers_industry_gate_settings(db_session, monkeypatch, tmp_path):
+    """行业门控决策项逐项进指纹；仅展示项（divergence_hint）不参与。"""
+    from core.services import portfolio_settings
+    monkeypatch.setattr(portfolio_settings, "_DEFAULT_PATH",
+                        tmp_path / "portfolio_settings.json")
+    sess, ps, link = _seed_live_link(db_session)
+    base = ib.params_fingerprint(ps, "dual", db_session)
+
+    # 都不改 → 指纹不变
+    assert ib.params_fingerprint(ps, "dual", db_session)["hash"] == base["hash"]
+
+    # 只改行业放行档 → 指纹变化（归到 industry 分项）
+    portfolio_settings.set_industry_settings(
+        ps.id, {"industry_gate_mode": "industry_relief"})
+    gate = ib.params_fingerprint(ps, "dual", db_session)
+    assert gate["hash"] != base["hash"]
+    assert gate["parts"]["industry"] != base["parts"]["industry"]
+
+    # 其余决策项逐项变化都要判废
+    for field, value in (
+        ("industry_rank_enabled", True),
+        ("industry_max_per_industry", 3),
+        ("industry_weight_enabled", True),
+        ("industry_overbought_block", True),
+        ("industry_trail_tighten_enabled", True),
+        ("industry_trail_tighten_ratio", 0.02),
+        ("industry_bear_reduce_ratio", 0.3),
+    ):
+        prev = ib.params_fingerprint(ps, "dual", db_session)["hash"]
+        portfolio_settings.set_industry_settings(ps.id, {field: value})
+        assert ib.params_fingerprint(ps, "dual", db_session)["hash"] != prev, field
+
+    # 仅展示项不进决策 → 指纹不变
+    stable = ib.params_fingerprint(ps, "dual", db_session)["hash"]
+    portfolio_settings.set_industry_settings(
+        ps.id, {"industry_divergence_hint": True})
+    assert ib.params_fingerprint(ps, "dual", db_session)["hash"] == stable
+
+
 def test_invalidation_reasons_locate_changed_section(db_session):
     """作废 checkpoint 时必须能说明是哪一类变化（不是只丢一句「参数变了」）。"""
     sess, ps, link = _seed_live_link(db_session)

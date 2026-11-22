@@ -58,6 +58,7 @@ from core.models import (
     StockPoolStock,
     Strategy,
 )
+from core.services import portfolio_settings
 from core.services.backtest_service import (
     STRATEGY_SNAPSHOT_FIELDS,
     _pool_stock_names,
@@ -480,13 +481,11 @@ def params_hash(ps, dividend_mode: str, db: Optional[Session] = None,
 # 2) 策略行——数值参数（止损/止盈/移动止损/加仓阈值/资金占比…）、公式、角色、
 #    周期、策略增删（按 id 升序，重命名不参与）；
 # 3) 股票池成分代码列表（组合级 ∪ 各策略独立池）。
-# 实盘执行配置（max_order_amount/requote/split_order 等）不影响回测，不参与。
-# 复用 params_snapshot 的同一字段口径（2026-11-16）：指纹与快照对「哪些策略
-# 字段影响结果」必须一致，避免一处改了、另一处漏判。
-# 不参与指纹的字段：name 只影响展示（重命名不该作废 checkpoint）；实盘执行配置
-# （max_order_amount/requote/split_order）不影响回测结果（旧口径）。
+# 实盘执行配置（requote/split_order 等）不参与回测，不进指纹；
+# `max_order_amount` 例外：它同时被回测引擎用于单笔金额封顶，改动必须判废（2026-11-22）。
+# 不参与指纹的字段：name 只影响展示（重命名不该作废 checkpoint）。
 _FP_EXCLUDED_FIELDS = frozenset({
-    "name", "max_order_amount", "requote_enabled", "requote_max_attempts",
+    "name", "requote_enabled", "requote_max_attempts",
     "requote_price_mode", "requote_max_slippage_ticks",
     "split_order_enabled", "split_order_threshold",
     "split_order_count", "split_order_min_qty", "split_order_interval_seconds",
@@ -494,6 +493,19 @@ _FP_EXCLUDED_FIELDS = frozenset({
 })
 _FP_STRATEGY_FIELDS = tuple(
     f for f in STRATEGY_SNAPSHOT_FIELDS if f not in _FP_EXCLUDED_FIELDS)
+
+# 行业门控参与决策的设置（2026-11-22）：任一变化都会改变开仓/出场集合 → 进指纹。
+# `industry_divergence_hint` 只影响看板展示、不进决策，故不纳入。
+_FP_INDUSTRY_FIELDS = (
+    "industry_gate_mode",
+    "industry_rank_enabled",
+    "industry_max_per_industry",
+    "industry_weight_enabled",
+    "industry_overbought_block",
+    "industry_trail_tighten_enabled",
+    "industry_trail_tighten_ratio",
+    "industry_bear_reduce_ratio",
+)
 
 _FP_PART_LABELS = {
     "params": "组合级参数（资金/费率/滑点/复权模式等）",
@@ -503,6 +515,7 @@ _FP_PART_LABELS = {
     "corporate_actions": "公司行为事件集合/处置档位",
     "pool_timeline": "时点股票池成分区间",
     "execution": "回测执行档位（成交假设）",
+    "industry": "行业门控设置",
     "baseline": "资金基准（baseline_version / baseline_value）",
 }
 
@@ -540,6 +553,17 @@ def _strategy_fp_rows(ps, db: Optional[Session]) -> list:
         {f: _fp_value(getattr(s, f, None)) for f in _FP_STRATEGY_FIELDS}
         for s in rows
     ]
+
+
+def _industry_fp(ps) -> str:
+    """行业门控设置指纹（portfolio_settings.json，2026-11-22）。
+
+    只纳入参与决策的设置；``industry_divergence_hint`` 仅影响看板展示，不纳入。
+    """
+    settings = portfolio_settings.get_industry_settings(ps.id)
+    return json.dumps(
+        {k: _fp_value(settings.get(k)) for k in _FP_INDUSTRY_FIELDS},
+        sort_keys=True, ensure_ascii=False)
 
 
 def _formula_fp(ps, db: Optional[Session]) -> dict:
@@ -698,6 +722,9 @@ def params_fingerprint(ps, dividend_mode: str,
         # 执行档位（2026-11-18，N1）：legacy 固定串；realistic 或显式覆盖时按
         # 展开后的逐开关入指纹（成交假设变化必须新旧不混比）。
         "execution": _execution_fp(ps),
+        # 行业门控（2026-11-22）：放行档/排序/同行业上限/权重/超买/收紧止损/
+        # 空头减仓任一变化 → 开仓与出场集合不同 → checkpoint 必须重建。
+        "industry": _industry_fp(ps),
         "baseline": json.dumps(baseline or {}, sort_keys=True, ensure_ascii=False),
     }
     payload = json.dumps(sections, sort_keys=True, ensure_ascii=False)
