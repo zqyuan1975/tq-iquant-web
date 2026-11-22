@@ -1568,6 +1568,7 @@ export interface BacktestRequest {
   daily_loss_basis?: 'equity' | 'initial' | null   // 日内亏损分母 run 级覆盖（null/undefined=跟随组合）
   market_gate_enabled?: boolean | null             // 市场多空门控 run 级三态覆盖（null/undefined=跟随组合）
   industry_settings?: Partial<IndustrySettings>     // 行业门控 run 级临时覆盖（undefined=跟随组合，不改配置）
+  max_order_amount?: number                        // 策略单笔上限 run 级覆盖（undefined=跟随组合；0=本次不限额）
   loan_model_plan?: Record<string, unknown>        // 资金池 B3：L2 拼盘借贷计划（默认不带）
   gate_release_plan?: Record<string, unknown>      // 资金池 D3/D4：门控释放/召回（默认不带）
   pairing_plan_id?: number                         // 资金池 B6：回测完成后绑定该拼盘

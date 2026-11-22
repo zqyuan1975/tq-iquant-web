@@ -133,7 +133,7 @@ const showBacktestGuide = ref(false)
 const submitting = ref(false)
 // 高级选项（评估口径 / IS-OOS 采纳门槛 / 费用预留 / 自适应滑点）默认折叠：发起回测默认走增强前的基础方式
 const showAdvanced = ref(false)
-const form = ref({ portfolio_strategy_id: 0, name: '', start_date: '', end_date: '', dividend_mode: 'front', evaluation_profile: 'absolute', is_oos_gate_enabled: false, oos_gate_min_ratio: 0.5, fee_reserve_enabled: false, bond_t0_enabled: false, bond_lot_enabled: false, adaptive_slippage_enabled: undefined as boolean | undefined, slippage_impact_coef: undefined as string | undefined, volume_limit_enabled: undefined as boolean | undefined, volume_limit_ratio: undefined as string | undefined, equity_cap: undefined as string | undefined, capacity_model: '' as '' | 'linear' | 'sqrt', capacity_impact_k: '0.1' as string, liquidity_caliber: '' as '' | 'same_day_bar' | 'prev5d_avg', daily_close_peak_enabled: false, daily_loss_basis: '' as '' | 'equity' | 'initial', market_gate_enabled: '' as '' | 'true' | 'false', industry_override: '' as '' | 'ab' | 'off' | 'all_relief' | 'all_strict', loan_model_plan: undefined as Record<string, unknown> | undefined, pairing_plan_id: undefined as number | undefined })
+const form = ref({ portfolio_strategy_id: 0, name: '', start_date: '', end_date: '', dividend_mode: 'front', evaluation_profile: 'absolute', is_oos_gate_enabled: false, oos_gate_min_ratio: 0.5, fee_reserve_enabled: false, bond_t0_enabled: false, bond_lot_enabled: false, adaptive_slippage_enabled: undefined as boolean | undefined, slippage_impact_coef: undefined as string | undefined, volume_limit_enabled: undefined as boolean | undefined, volume_limit_ratio: undefined as string | undefined, equity_cap: undefined as string | undefined, capacity_model: '' as '' | 'linear' | 'sqrt', capacity_impact_k: '0.1' as string, liquidity_caliber: '' as '' | 'same_day_bar' | 'prev5d_avg', max_order_amount: undefined as string | undefined, daily_close_peak_enabled: false, daily_loss_basis: '' as '' | 'equity' | 'initial', market_gate_enabled: '' as '' | 'true' | 'false', industry_override: '' as '' | 'ab' | 'off' | 'all_relief' | 'all_strict', loan_model_plan: undefined as Record<string, unknown> | undefined, pairing_plan_id: undefined as number | undefined })
 
 // 行业门控 run 级覆盖预设（2026-11-22）：仅本次回测生效，不写组合配置。
 // 组合级长期开关在「组合策略 → 编辑 → 行业门控」里配置。
@@ -1890,6 +1890,7 @@ function openForm() {
     capacity_impact_k: '0.1',
     liquidity_caliber: '',
     equity_cap: undefined,
+    max_order_amount: undefined,
     daily_close_peak_enabled: false,
     daily_loss_basis: '',
     market_gate_enabled: '',
@@ -1925,6 +1926,10 @@ async function submit() {
   if (form.value.equity_cap !== undefined && form.value.equity_cap !== '') {
     const e = Number(form.value.equity_cap)
     if (!(e > 0)) { alert('容量上限必须大于 0（留空=用组合默认）'); return }
+  }
+  if (form.value.max_order_amount !== undefined && form.value.max_order_amount !== '') {
+    const m = Number(form.value.max_order_amount)
+    if (!(m >= 0)) { alert('单笔上限必须 ≥ 0（留空=跟随组合；0=本次不限额）'); return }
   }
   if (form.value.capacity_model === 'sqrt') {
     const k = Number(form.value.capacity_impact_k)
@@ -1972,6 +1977,9 @@ async function submit() {
             : {}),
           ...(form.value.equity_cap !== undefined && form.value.equity_cap !== ''
             ? { equity_cap: Number(form.value.equity_cap) }
+            : {}),
+          ...(form.value.max_order_amount !== undefined && form.value.max_order_amount !== ''
+            ? { max_order_amount: Number(form.value.max_order_amount) }
             : {}),
           ...(form.value.capacity_model
             ? {
@@ -4646,6 +4654,11 @@ watch(theme, () => {
                 <span class="field-label">容量上限</span>
                 <input type="number" step="10000" min="1000" v-model="form.equity_cap" placeholder="用组合默认" data-field="equity_cap" />
                 <span class="field-suffix">元（留空=用组合默认）</span>
+              </div>
+              <div class="field-row field-span-2">
+                <span class="field-label">单笔上限</span>
+                <input type="number" step="10000" min="0" v-model="form.max_order_amount" placeholder="跟随组合" data-field="max_order_amount" />
+                <span class="field-suffix">元（仅本次回测生效，不改组合与实盘；留空=跟随组合，0=本次不限额）</span>
               </div>
               <div class="field-row field-span-2">
                 <span class="field-label">容量模型</span>

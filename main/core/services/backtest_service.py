@@ -4594,6 +4594,22 @@ def run_backtest(db: Session, ps: PortfolioStrategy, req,
                 else:
                     setattr(s, field, clamp_perturbed_value(field, base * factor))
 
+    # 策略级单笔最大买入金额 run 级覆盖（None=跟随各策略配置）：
+    # 仅在内存里改策略对象的 max_order_amount，先脱管再赋值（后续 db.commit()
+    # 不会把覆盖值 flush 回 strategies 表）。仅本次回测生效，不落任何持久配置。
+    # 0=本次不限额（引擎按 >0 才封顶，0 等价于 None 的旧行为）。
+    _moa_override = getattr(req, "max_order_amount", None)
+    if _moa_override is not None:
+        try:
+            _moa_value = float(_moa_override)
+        except (TypeError, ValueError):
+            _moa_value = None
+        if _moa_value is not None:
+            for s in strategies:
+                if s in db:
+                    db.expunge(s)
+                s.max_order_amount = _moa_value
+
     # 复权模式：读请求参数，非法值回退前复权（保持历史行为 + 防脏数据）
     dividend_mode = getattr(req, "dividend_mode", "front") or "front"
     if dividend_mode not in DIVIDEND_MODES:

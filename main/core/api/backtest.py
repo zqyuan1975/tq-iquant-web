@@ -109,6 +109,10 @@ class BacktestRequest(BaseModel):
     # 仅本次回测生效、不落盘。键同 portfolio_settings.INDUSTRY_DEFAULTS，
     # 未携带的键沿用组合设置；非法值按默认/夹取处理。
     industry_settings: dict | None = None
+    # 策略级单笔最大买入金额 run 级覆盖（2026-11-22，None=跟随各策略配置）：
+    # 仅本次回测内存生效，不改组合/策略表、不写 portfolio_settings.json。
+    # >0=按该金额封顶；0=本次不限额（临时解除上限做对照）。
+    max_order_amount: float | None = None
     # 执行档位（N1，2026-11-18）：None/legacy=旧成交口径（默认，行为逐字不变）；
     # realistic=一次性打开「涨跌停校验 + 成交量约束(10%) + 自适应滑点 + 日终抬峰」
     execution_profile: str | None = None

@@ -109,7 +109,8 @@ class _Req:
                  dividend_mode="front", fee_reserve_enabled=False,
                  adaptive_slippage_enabled=None, slippage_impact_coef=None,
                  bond_t0_enabled=False, bond_lot_enabled=False,
-                 daily_close_peak_enabled=False, liquidity_caliber=None):
+                 daily_close_peak_enabled=False, liquidity_caliber=None,
+                 max_order_amount=None):
         self.name = name
         self.start_date = start
         self.end_date = end
@@ -121,6 +122,7 @@ class _Req:
         self.bond_lot_enabled = bond_lot_enabled
         self.daily_close_peak_enabled = daily_close_peak_enabled
         self.liquidity_caliber = liquidity_caliber
+        self.max_order_amount = max_order_amount
 
 
 def _req(**kw):
@@ -185,6 +187,41 @@ def test_run_backtest_happy_path_marks_completed_and_persists(db_session, monkey
         backtest_record_id=rec.id, target_type="portfolio").count() == 2
     assert db_session.query(BacktestEvaluation).filter_by(
         backtest_record_id=rec.id, target_type="portfolio").count() == 1
+
+
+def test_run_backtest_max_order_amount_override_is_run_scoped(db_session, monkeypatch):
+    """run 级单笔上限覆盖：只改本轮内存装配值，不落 strategies 表。
+
+    覆盖值写入 params_snapshot（可复现），但组合/策略配置保持原值；
+    不传覆盖时 ctx 保持 None（旧行为）。
+    """
+    ps, strat_id = _seed(db_session)
+    monkeypatch.setattr(svc, "build_klines", lambda ps, start, end, db=None, dividend_mode="front", **kw: _mock_klines())
+    monkeypatch.setattr(svc, "build_signal_cache", lambda ps, klines, db=None, start=None, diagnostics=None, dividend_mode="front": {})
+    monkeypatch.setattr(svc, "build_benchmark_data", lambda ps, start, end, db=None, dividend_mode="front", **kw: {})
+    monkeypatch.setattr(svc, "safe_compute_crisis_alpha", lambda *a, **kw: None)
+    fake_result = {"trades": [], "snapshots": [], "evaluations": {},
+                   "strategy_snapshots": {}, "strategy_evaluations": {}}
+    captured = {}
+
+    def _fake_run(self, portfolio, **kw):
+        captured["portfolio"] = portfolio
+        return fake_result
+
+    monkeypatch.setattr(svc.BacktestEngine, "run", _fake_run)
+
+    # 默认路径：不传覆盖 → ctx 保持 None
+    svc.run_backtest(db_session, ps, _req(name="moa_default"))
+    assert captured["portfolio"].strategies[0].max_order_amount is None
+
+    # 传覆盖 → 本轮 ctx 生效，但策略表不变
+    result = svc.run_backtest(db_session, ps, _req(name="moa_override", max_order_amount=600000))
+    assert captured["portfolio"].strategies[0].max_order_amount == Decimal("600000")
+    db_session.expire_all()
+    assert db_session.get(Strategy, strat_id).max_order_amount is None
+    rec = db_session.get(BacktestRecord, result["record_id"])
+    snapshot = json.loads(rec.params_snapshot)
+    assert snapshot["strategies"][0]["max_order_amount"] == "600000.0"
 
 
 def test_run_backtest_persists_positions_json(db_session, monkeypatch):
