@@ -26,6 +26,8 @@ const strategyCache = ref<Record<number, StrategyDetail[]>>({})
 const showPortfolioForm = ref(false)
 const editingPortfolioId = ref<number | null>(null)
 const portfolioForm = ref<Record<string, any>>(emptyPortfolioForm())
+// 推荐配置按钮点击后的“待保存”提示；真实生效仍需点「确认」
+const industryRecommendationApplied = ref(false)
 const showGuide = ref(false)
 const showStrategyGuide = ref(false)
 
@@ -142,6 +144,10 @@ interface FieldMeta {
   options?: string
   hint?: string
   hintBelow?: boolean  // select/number 也把 hint 渲染成字段下方说明（默认只在 switch/percent 显示）
+  /** 消融实测结论标签（文字区分，不依赖颜色） */
+  tag?: { text: string; tone: 'good' | 'warn' | 'bad' | 'neutral' }
+  /** 标签对应的一句实测依据（消融数字） */
+  evidence?: string
   showIf?: string | { key: string; equals: unknown } | ((form: Record<string, any>) => boolean)
 }
 const PORTFOLIO_GROUPS: { title: string; hint?: string; fields: FieldMeta[] }[] = [
@@ -197,14 +203,14 @@ const PORTFOLIO_GROUPS: { title: string; hint?: string; fields: FieldMeta[] }[] 
     { key: 'market_gate_bear_reduce_ratio', label: '空头减仓比例', span: 1, type: 'percent', placeholder: '0=关闭', showIf: (f: Record<string, any>) => !!f.market_gate_enabled, hint: '空头连续段内每只持仓按该比例减仓一次（0=只拦开仓，不减仓）' },
   ]},
   { title: '行业门控（默认关闭）', hint: '基于通达信 881 二级行业日线，回测与实盘同一套内核。全部关闭时不读取行业数据，决策/委托/成交与旧版逐位一致。放行门控与上方「市场多空门控」配合：relief 只在大盘空头时生效；strict 常开。行业数据缺失（不足 300 根/取数失败）自动放行并记 WARNING 与决策事件。', fields: [
-    { key: 'industry_gate_mode', label: '行业放行模式', span: 2, type: 'select', options: 'industryGateModes', hint: '关闭=不读行业数据（默认）。relief=仅大盘空头时：个股行业多头→放行多头信号，行业非多头→继续封堵；大盘多头时不影响。strict=常开：行业非多头一律拦 OPEN/ADD（大盘空头仍拦）。' },
-    { key: 'industry_rank_enabled', label: '跨策略 OPEN 排序', span: 1, type: 'switch', hint: '同一 bar 全部 OPEN 按「行业领先天数→行业强度→个股信号天数→信号时间」统一排序后，再按组合最大持仓数截断。关闭时按原顺序处理。' },
-    { key: 'industry_max_per_industry', label: '同行业持仓上限', span: 1, type: 'number', placeholder: '2', showIf: (f: Record<string, any>) => !!f.industry_rank_enabled, hint: '含已有持仓与同 bar 在途单；0=不限制。默认 2。' },
-    { key: 'industry_weight_enabled', label: '行业强度作仓位权重', span: 1, type: 'switch', hint: '多头行业开仓量 ×(0.5+强度/100)，夹取 0.5~1.5；非多头/数据缺失=1（等值）。仅影响 OPEN 定量。' },
-    { key: 'industry_overbought_block', label: '行业超买停开仓', span: 1, type: 'switch', hint: '行业 bias_z≥2.5 时不接受该行业新 OPEN；已有持仓不强平，止损止盈照常。' },
-    { key: 'industry_trail_tighten_enabled', label: '转空收紧止损', span: 1, type: 'switch', hint: '行业处于空头时，该行业持仓的移动止损比例收紧为下方值（覆盖策略原值）；行业非空头时用原值。' },
-    { key: 'industry_trail_tighten_ratio', label: '收紧后移动止损', span: 1, type: 'percent', placeholder: '1.5', showIf: (f: Record<string, any>) => !!f.industry_trail_tighten_enabled, hint: '默认 1.5%（比常规 3% 更紧）；仅行业空头时生效。' },
-    { key: 'industry_bear_reduce_ratio', label: '行业空头减仓比例', span: 2, type: 'percent', placeholder: '0=关闭', hint: '行业转空后每只持仓按该比例减仓一次（独立开关，0=关闭）。与大盘空头减仓同时命中时取两者较大值，不叠加。' },
+    { key: 'industry_gate_mode', label: '行业放行模式', span: 2, type: 'select', options: 'industryGateModes', tag: { text: '推荐', tone: 'good' }, hint: '关闭=不读行业数据（默认）。relief=仅大盘空头时：个股行业多头→放行多头信号，行业非多头→继续封堵；大盘多头时不影响。strict=常开：行业非多头一律拦 OPEN/ADD（大盘空头仍拦）。', evidence: '消融：相对仅大盘门控，总收益 +799.8pp、最大回撤 −3.0pp（R1 vs R0）。' },
+    { key: 'industry_rank_enabled', label: '跨策略 OPEN 排序', span: 1, type: 'switch', tag: { text: '推荐', tone: 'good' }, hint: '同一 bar 全部 OPEN 按「行业领先天数→行业强度→个股信号天数→信号时间」统一排序后，再按组合最大持仓数截断。关闭时按原顺序处理。', evidence: '消融：在 A 之上再 +323.1pp、最大回撤 −4.2pp（R2 vs R1）。' },
+    { key: 'industry_max_per_industry', label: '同行业持仓上限', span: 1, type: 'number', placeholder: '2', showIf: (f: Record<string, any>) => !!f.industry_rank_enabled, tag: { text: '维持 2', tone: 'neutral' }, hint: '含已有持仓与同 bar 在途单；0=不限制。默认 2。', evidence: '消融：上限 1 → 收益 −61.7pp；上限 3 → −84.1pp；2 最优（R9 / R8 vs R2）。' },
+    { key: 'industry_weight_enabled', label: '行业强度作仓位权重', span: 1, type: 'switch', tag: { text: '中性偏负', tone: 'warn' }, hint: '多头行业开仓量 ×(0.5+强度/100)，夹取 0.5~1.5；非多头/数据缺失=1（等值）。仅影响 OPEN 定量。', evidence: '消融：−40.9pp；且开 C 前已有 40.5% 买单触 30 万单笔上限（开 C 后 43.4%），当前参数下难评估真实效果（R3 vs R2）。' },
+    { key: 'industry_overbought_block', label: '行业超买停开仓', span: 1, type: 'switch', tag: { text: '中性偏负', tone: 'warn' }, hint: '行业 bias_z≥2.5 时不接受该行业新 OPEN；已有持仓不强平，止损止盈照常。', evidence: '消融：−31.4pp，最大回撤仅 −0.1pp（R6 vs R3）。' },
+    { key: 'industry_trail_tighten_enabled', label: '转空收紧止损', span: 1, type: 'switch', tag: { text: '负向', tone: 'bad' }, hint: '行业处于空头时，该行业持仓的移动止损比例收紧为下方值（覆盖策略原值）；行业非空头时用原值。', evidence: '消融：−50.2pp、最大回撤 +2.0pp（R7 vs R3）。' },
+    { key: 'industry_trail_tighten_ratio', label: '收紧后移动止损', span: 1, type: 'percent', placeholder: '1.5', showIf: (f: Record<string, any>) => !!f.industry_trail_tighten_enabled, tag: { text: '负向', tone: 'bad' }, hint: '默认 1.5%（比常规 3% 更紧）；仅行业空头时生效。', evidence: '所属功能 E 整体负向；1.5% 为被测默认值，不建议开启。' },
+    { key: 'industry_bear_reduce_ratio', label: '行业空头减仓比例', span: 2, type: 'percent', placeholder: '0=关闭', tag: { text: '负向', tone: 'bad' }, hint: '行业转空后每只持仓按该比例减仓一次（独立开关，0=关闭）。与大盘空头减仓同时命中时取两者较大值，不叠加。', evidence: '消融：减仓 30% 使收益 −108.1pp，回撤无改善（R5 vs R4）。' },
   ]},
 ]
 
@@ -598,10 +604,24 @@ function validateStrategyPayload(p: Record<string, unknown>): string | null {
 }
 
 // ===== 组合 CRUD =====
+// 一键填入消融推荐组合 A+B（仅填表单，不保存、不落盘）
+function applyIndustryRecommendation() {
+  portfolioForm.value.industry_gate_mode = 'industry_relief'
+  portfolioForm.value.industry_rank_enabled = true
+  portfolioForm.value.industry_max_per_industry = 2
+  portfolioForm.value.industry_weight_enabled = false
+  portfolioForm.value.industry_overbought_block = false
+  portfolioForm.value.industry_trail_tighten_enabled = false
+  portfolioForm.value.industry_trail_tighten_ratio = 0.015
+  portfolioForm.value.industry_bear_reduce_ratio = 0
+  industryRecommendationApplied.value = true
+}
+
 function openCreatePortfolio() {
   editingPortfolioId.value = null
   portfolioForm.value = emptyPortfolioForm()
   portfolioFieldErrors.value = {}
+  industryRecommendationApplied.value = false
   // 把比例默认值转成百分比显示
   for (const k of PORTFOLIO_RATIO_FIELDS) {
     portfolioForm.value[k] = toPercent(portfolioForm.value[k], true)
@@ -612,6 +632,7 @@ function openCreatePortfolio() {
 async function openEditPortfolio(p: PortfolioItem) {
   editingPortfolioId.value = p.id
   portfolioFieldErrors.value = {}
+  industryRecommendationApplied.value = false
   let detail: PortfolioItem
   try {
     detail = await getPortfolioDetail(p.id)
@@ -951,14 +972,22 @@ onMounted(loadPortfolios)
         <div class="modal-body">
           <div v-for="g in PORTFOLIO_GROUPS" :key="g.title">
             <label class="group-label">{{ g.title }}<span v-if="g.hint" class="group-hint">{{ g.hint }}</span></label>
+            <div v-if="g.title.startsWith('行业门控')" class="industry-preset-bar">
+              <button type="button" class="btn btn-sm btn-primary" data-action="apply-industry-recommend" @click="applyIndustryRecommendation">应用推荐配置（A+B）</button>
+              <span class="industry-preset-note" data-test="industry-recommend-note">
+                {{ industryRecommendationApplied
+                  ? '已填入：行业放行=relief、跨策略排序=开、同行业上限=2；C/D/E/F 保持关闭。点「确认」保存后才写入组合设置并生效。'
+                  : '推荐：行业放行=relief + 跨策略排序=开 + 同行业上限=2，其余关闭。点击只填入表单，仍需点「确认」保存后才生效。' }}
+              </span>
+            </div>
             <div class="field-grid">
               <div
                 v-for="fld in g.fields" :key="fld.key"
                 v-show="fieldVisible(fld, portfolioForm)"
                 class="field-row"
-                :class="[fld.span === 2 ? 'field-span-2' : '', ((fld.type === 'percent' && fld.hint) || fld.hintBelow || portfolioFieldErrors[fld.key]) ? 'field-row--hinted' : '']"
+                :class="[fld.span === 2 ? 'field-span-2' : '', ((fld.type === 'percent' && fld.hint) || fld.hintBelow || fld.evidence || portfolioFieldErrors[fld.key]) ? 'field-row--hinted' : '']"
               >
-                <FieldLabel :text="fld.label" />
+                <FieldLabel :text="fld.label" :tag="fld.tag?.text" :tone="fld.tag?.tone" />
                 <label v-if="fld.type === 'switch'" class="switch-row">
                   <input type="checkbox" :data-field="fld.key" v-model="portfolioForm[fld.key]" />
                   <span v-if="fld.hint" class="field-hint">{{ fld.hint }}</span>
@@ -976,6 +1005,7 @@ onMounted(loadPortfolios)
                 </select>
                 <span v-if="fld.type === 'percent'" class="field-suffix">%</span>
                 <span v-if="(fld.type === 'percent' || fld.hintBelow) && fld.hint" class="field-hint field-hint--below">{{ fld.hint }}</span>
+                <span v-if="fld.evidence" class="field-evidence" :data-evidence="fld.key">{{ fld.evidence }}</span>
                 <span v-if="portfolioFieldErrors[fld.key]" class="field-error" data-test="portfolio-field-error">{{ portfolioFieldErrors[fld.key] }}</span>
               </div>
             </div>

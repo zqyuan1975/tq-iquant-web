@@ -200,6 +200,15 @@ tbody tr:last-child td{border-bottom:none}
 /* 标签括号注释统一换到第二行：主标题保持常规色，注释弱化一档，避免在窄标签列里被硬折行 */
 .field-label-main{display:block}
 .label-note{display:block;font-size:11px;font-weight:400;line-height:1.25;color:var(--ink-faint)}
+/* 消融实测结论标签：文字本身区分推荐/维持/中性偏负/负向，颜色仅辅助 */
+.field-tag{display:inline-block;margin-left:4px;padding:0 4px;border-radius:4px;border:1px solid;font-size:10px;line-height:14px;font-weight:600;vertical-align:1px;white-space:nowrap}
+.field-tag--good{color:#0b7a3b;background:#e8f7ee;border-color:#a9dcbd}
+.field-tag--warn{color:#8a6100;background:#fff7e0;border-color:#f0d08a}
+.field-tag--bad{color:#a32020;background:#fdecec;border-color:#efb2b2}
+.field-tag--neutral{color:#4a5568;background:#f0f2f5;border-color:#cbd2dc}
+.field-evidence{flex:1 0 100%;font-size:11px;line-height:1.35;color:var(--ink-faint)}
+.industry-preset-bar{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin:2px 0 8px}
+.industry-preset-note{font-size:11px;line-height:1.4;color:var(--ink-faint)}
 .field-row input,.field-row select{flex:1;margin-bottom:0;padding:7px 10px;border:1px solid var(--border);border-radius:var(--radius)}
 /* 下拉框统一规格：字段行 / 弹窗 / `.field` 内下拉与显式 `.field-select` 共用一套外观。
    原生箭头统一替换为内联 SVG（9×6，距右 9px），右侧留出箭头区；颜色沿用主题变量。

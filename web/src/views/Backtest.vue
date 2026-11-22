@@ -133,17 +133,24 @@ const showBacktestGuide = ref(false)
 const submitting = ref(false)
 // 高级选项（评估口径 / IS-OOS 采纳门槛 / 费用预留 / 自适应滑点）默认折叠：发起回测默认走增强前的基础方式
 const showAdvanced = ref(false)
-const form = ref({ portfolio_strategy_id: 0, name: '', start_date: '', end_date: '', dividend_mode: 'front', evaluation_profile: 'absolute', is_oos_gate_enabled: false, oos_gate_min_ratio: 0.5, fee_reserve_enabled: false, bond_t0_enabled: false, bond_lot_enabled: false, adaptive_slippage_enabled: undefined as boolean | undefined, slippage_impact_coef: undefined as string | undefined, volume_limit_enabled: undefined as boolean | undefined, volume_limit_ratio: undefined as string | undefined, equity_cap: undefined as string | undefined, capacity_model: '' as '' | 'linear' | 'sqrt', capacity_impact_k: '0.1' as string, liquidity_caliber: '' as '' | 'same_day_bar' | 'prev5d_avg', daily_close_peak_enabled: false, daily_loss_basis: '' as '' | 'equity' | 'initial', market_gate_enabled: '' as '' | 'true' | 'false', industry_override: '' as '' | 'off' | 'all_relief' | 'all_strict', loan_model_plan: undefined as Record<string, unknown> | undefined, pairing_plan_id: undefined as number | undefined })
+const form = ref({ portfolio_strategy_id: 0, name: '', start_date: '', end_date: '', dividend_mode: 'front', evaluation_profile: 'absolute', is_oos_gate_enabled: false, oos_gate_min_ratio: 0.5, fee_reserve_enabled: false, bond_t0_enabled: false, bond_lot_enabled: false, adaptive_slippage_enabled: undefined as boolean | undefined, slippage_impact_coef: undefined as string | undefined, volume_limit_enabled: undefined as boolean | undefined, volume_limit_ratio: undefined as string | undefined, equity_cap: undefined as string | undefined, capacity_model: '' as '' | 'linear' | 'sqrt', capacity_impact_k: '0.1' as string, liquidity_caliber: '' as '' | 'same_day_bar' | 'prev5d_avg', daily_close_peak_enabled: false, daily_loss_basis: '' as '' | 'equity' | 'initial', market_gate_enabled: '' as '' | 'true' | 'false', industry_override: '' as '' | 'ab' | 'off' | 'all_relief' | 'all_strict', loan_model_plan: undefined as Record<string, unknown> | undefined, pairing_plan_id: undefined as number | undefined })
 
 // 行业门控 run 级覆盖预设（2026-11-22）：仅本次回测生效，不写组合配置。
 // 组合级长期开关在「组合策略 → 编辑 → 行业门控」里配置。
 const INDUSTRY_OVERRIDES = [
   { value: '', label: '跟随组合设置（默认）' },
+  { value: 'ab', label: '本次 A+B（推荐）' },
   { value: 'off', label: '本次全部关闭' },
   { value: 'all_relief', label: '本次全开：relief' },
   { value: 'all_strict', label: '本次全开：strict' },
 ]
 const INDUSTRY_PRESETS: Record<string, Record<string, unknown>> = {
+  ab: {
+    industry_gate_mode: 'industry_relief', industry_rank_enabled: true,
+    industry_max_per_industry: 2, industry_weight_enabled: false,
+    industry_overbought_block: false, industry_trail_tighten_enabled: false,
+    industry_trail_tighten_ratio: 0.015, industry_bear_reduce_ratio: 0,
+  },
   off: {
     industry_gate_mode: 'off', industry_rank_enabled: false,
     industry_max_per_industry: 2, industry_weight_enabled: false,
@@ -165,6 +172,7 @@ const INDUSTRY_PRESETS: Record<string, Record<string, unknown>> = {
 }
 
 function industryOverrideHint(v: string): string {
+  if (v === 'ab') return '本次 A+B：relief 放行 + 跨策略排序（同行业上限 2）；权重/超买/收紧止损/空头减仓保持关闭。仅本次回测生效。'
   if (v === 'off') return '本次全部关闭：不读取行业数据，行为与旧版一致；组合级设置保持不变。'
   if (v === 'all_relief') return '本次全开：relief 放行 + 跨策略排序（同行业上限 2）+ 强度权重 + 超买停开仓 + 转空收紧止损 1.5% + 行业空头减仓 30%。'
   if (v === 'all_strict') return '本次全开（strict）：行业非多头一律拦，其余同上。'
