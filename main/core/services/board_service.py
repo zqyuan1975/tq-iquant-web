@@ -496,6 +496,26 @@ def _industry_bull_map(db: Session, period: str, as_of: date) -> Dict[str, int]:
     return {code: int(bull or 0) for code, bull in rows}
 
 
+def _stock_target_industries(db: Session, period: str,
+                             as_of: date) -> List[str]:
+    """本次成分股快照的目标行业。
+
+    日线：全量 128 行业（空头行业也要有成分股快照，否则抽屉领先榜永远为空）；
+    30m：只算「由空转多」的行业并限 20 个，避免全市场 30m 取数。
+    """
+    base = select(BoardIndustrySnapshot.industry_code).where(
+        BoardIndustrySnapshot.as_of == as_of,
+        BoardIndustrySnapshot.period == period)
+    if period == "30m":
+        base = base.where(
+            BoardIndustrySnapshot.direction.in_((1, 2)),
+            BoardIndustrySnapshot.bull_dur == 1)
+    codes = [c for (c,) in db.execute(base).all()]
+    if period == "30m":
+        codes = codes[:_STOCK_30M_MAX_INDUSTRIES]
+    return list(dict.fromkeys(codes))
+
+
 def compute_stocks(db: Session, period: str, as_of: date,
                    trigger: str = "manual", run_id: Optional[int] = None,
                    industry_codes: Optional[List[str]] = None) -> dict:
@@ -503,15 +523,7 @@ def compute_stocks(db: Session, period: str, as_of: date,
     now = datetime.now()
     ind_bull = _industry_bull_map(db, period, as_of)
     if industry_codes is None:
-        base = select(BoardIndustrySnapshot.industry_code).where(
-            BoardIndustrySnapshot.as_of == as_of,
-            BoardIndustrySnapshot.period == period,
-            BoardIndustrySnapshot.direction.in_((1, 2)))
-        if period == "30m":
-            base = base.where(BoardIndustrySnapshot.bull_dur == 1)
-        industry_codes = [c for (c,) in db.execute(base).all()]
-        if period == "30m":
-            industry_codes = industry_codes[:_STOCK_30M_MAX_INDUSTRIES]
+        industry_codes = _stock_target_industries(db, period, as_of)
     target = list(dict.fromkeys(industry_codes or []))
     t0 = time.monotonic()
     rows: List[dict] = []

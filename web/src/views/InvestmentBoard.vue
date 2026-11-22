@@ -12,6 +12,7 @@ import {
 } from '../api'
 import { gateDirectionTone } from '../utils/marketGate'
 import { DEFAULT_BENCHMARK } from '../utils/benchmarks'
+import { useTdxGate } from '../composables/useTdxGate'
 
 type Period = '1d' | '30m'
 
@@ -27,6 +28,8 @@ const leaders = ref<{ sustained: BoardIndustryItem[]; reversal: BoardIndustryIte
 const asOf = ref<string | null>(null)
 const loading = ref(false)
 const errorMsg = ref('')
+// TQ 通道闸：看板全量刷新属 P2 后台重任务，交易时段后端直接拒绝 → 前端提前置灰
+const { p2Blocked: tqP2Blocked, p2Reason: tqP2Reason } = useTdxGate()
 
 const sortKey = ref('bull_dur')
 const sortOrder = ref<'desc' | 'asc'>('desc')
@@ -210,10 +213,13 @@ onMounted(loadAll)
       <option value="industries">刷新行业榜</option>
       <option value="all">行业 + 成分股</option>
     </select>
-    <button class="btn btn-primary" :disabled="refreshing" @click="doRefresh">
-      {{ refreshing ? '刷新中…' : '刷新' }}
+    <button class="btn btn-primary" :disabled="refreshing || tqP2Blocked"
+            :title="tqP2Blocked ? tqP2Reason : ''" @click="doRefresh">
+      {{ refreshing ? '刷新中…' : (tqP2Blocked ? '实盘优先，暂不可刷新' : '刷新') }}
     </button>
   </PageHeader>
+
+  <div v-if="tqP2Blocked" class="tq-gate-notice">{{ tqP2Reason }}</div>
 
   <div v-if="errorMsg" class="card board-error">{{ errorMsg }}</div>
 
@@ -448,7 +454,11 @@ onMounted(loadAll)
                       : (stocksReason === 'no_industry'
                           ? '暂无 30m 行业快照，请先刷新行业榜'
                           : '暂无 30m 成分股数据'))
-                  : '暂无成分股快照，请用「行业 + 成分股」刷新' }}
+                  : (stocksReason === 'no_industry'
+                      ? '暂无行业快照，请先刷新行业榜'
+                      : (stocksReason === 'no_rows'
+                          ? '最近一次「行业 + 成分股」刷新未返回该行业成分股（可稍后重试）'
+                          : '暂无成分股快照，请用「行业 + 成分股」刷新')) }}
               </td>
             </tr>
           </tbody>

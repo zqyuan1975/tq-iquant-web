@@ -22,6 +22,8 @@ from core.engine.market_gate import MarketGateUnavailableError
 from core.engine.rating_core import RATING_FORMULA_VERSION
 from core.services import board_service as svc
 from core.services.market_gate_service import fetch_gate_status
+from core.tq import gate as tq_gate
+from core.tq.gate import P2, tdx_priority
 
 logger = logging.getLogger(__name__)
 
@@ -168,6 +170,18 @@ def get_industry_stocks(code: str, period: str = "1d", date: str = "",
         limit=limit, compute=compute)))
 
 
+def _empty_stock_reason(db: Session, period: str, day: Optional[date]) -> str:
+    """空结果的成因：日线用于区分「已刷新但无成分股」与「还没刷新过」。"""
+    if day is None:
+        return "no_industry"
+    run = svc.latest_run(db, period)
+    if (run is not None and run.as_of == day
+            and run.scope in (svc.SCOPE_STOCKS, "all")
+            and run.status in ("ok", "partial")):
+        return "no_rows"
+    return "no_snapshot"
+
+
 def _industry_stocks(db: Session, code: str, period: str,
                      as_of: Optional[date], sort: str, order: str,
                      limit: int, compute: bool) -> dict:
@@ -184,6 +198,8 @@ def _industry_stocks(db: Session, code: str, period: str,
             }
     data = svc.query_stocks(db, code, period, day, sort=sort,
                             order=order, limit=limit)
+    if not data["rows"] and reason is None:
+        reason = _empty_stock_reason(db, period, day)
     data["reason"] = reason
     return data
 
@@ -225,6 +241,14 @@ def post_refresh(req: RefreshReq, db: Session = Depends(get_db)):
         return err(422, "scope 仅支持 industries / stocks / all")
     if not _refresh_lock.acquire(blocking=False):
         return err(409, "已有刷新任务在运行，请稍后再试")
+    # 看板全量刷新要拉行业/成分股行情：属 P2 后台重任务，交易时段直接拒绝
+    policy = tq_gate.evaluate_policy()
+    if not policy["p2_allowed"]:
+        _refresh_lock.release()
+        nxt = policy.get("next_p2_open_at")
+        return err(409, "看板全量刷新在交易时段暂停（实盘优先），%s 后可用"
+                   % (nxt.strftime("%m-%d %H:%M") if nxt else "收盘后"),
+                   {"next_available_at": nxt.isoformat(timespec="seconds") if nxt else None})
     try:
         run = svc.create_run(db, p, scope, trigger="manual")
     except Exception:
@@ -235,7 +259,8 @@ def post_refresh(req: RefreshReq, db: Session = Depends(get_db)):
 
     def _worker(run_id: int):
         try:
-            svc.execute_run(run_id, p, scope)
+            with tdx_priority(P2):
+                svc.execute_run(run_id, p, scope)
         finally:
             _refresh_lock.release()
 
