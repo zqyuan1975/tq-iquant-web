@@ -18,6 +18,7 @@ import re
 
 from core.api.response import err, ok
 from core.db import get_db
+from core.engine.industry_gate import INDUSTRY_MODES
 from core.models import PortfolioStrategy, Strategy, StockPool, StockPoolStock, Formula
 from core.services.strategy_service import (
     list_portfolios as _svc_list_portfolios,
@@ -125,6 +126,17 @@ class PortfolioCreate(BaseModel):
     market_gate_vote_mode: str | None = None
     market_gate_strength_threshold: int | None = None
     market_gate_bear_reduce_ratio: float | None = None
+    # 行业门控（2026-11-22，组合 JSON 侧配置，全部默认关闭）：
+    # None=请求未携带（编辑不动已有值）；"off" / relief / strict 三态模式。
+    industry_gate_mode: str | None = None
+    industry_rank_enabled: bool | None = None
+    industry_max_per_industry: int | None = None
+    industry_weight_enabled: bool | None = None
+    industry_overbought_block: bool | None = None
+    industry_trail_tighten_enabled: bool | None = None
+    industry_trail_tighten_ratio: float | None = None
+    industry_bear_reduce_ratio: float | None = None
+    industry_divergence_hint: bool | None = None
     # 公司行为（2026-11-18，J1/J2）：手工事件表总开关与处置档位，全部默认关。
     # None=请求未携带（编辑不动已有值 / 新建落默认 False/0）。
     corporate_actions_enabled: bool | None = None
@@ -394,6 +406,18 @@ def _validate_portfolio(req: PortfolioCreate, db: Session) -> str | None:
     if req.equity_cap_mode not in (None, "cap", "distribute"):
         return (f"equity_cap_mode 仅支持 cap/distribute（None=不改），"
                 f"收到 {req.equity_cap_mode!r}")
+    # 行业门控（组合 JSON 侧）：模式三态；比例 0~1；同行业上限 0~100
+    if req.industry_gate_mode not in (None, "off", *INDUSTRY_MODES):
+        return (f"industry_gate_mode 仅支持 off/{'/'.join(INDUSTRY_MODES)}"
+                f"（None=不改），收到 {req.industry_gate_mode!r}")
+    if (req.industry_max_per_industry is not None
+            and not (0 <= req.industry_max_per_industry <= 100)):
+        return (f"industry_max_per_industry 须在 [0,100]（0=不限制），"
+                f"收到 {req.industry_max_per_industry}")
+    for _k in ("industry_trail_tighten_ratio", "industry_bear_reduce_ratio"):
+        _v = getattr(req, _k, None)
+        if _v is not None and not (0 <= _v <= 1):
+            return f"{_k} 必须在 [0,1]（0=关闭/默认），收到 {_v}"
     # 实盘单票上限 / 现金下限：None/0=不限制；显式值须在 [0,1]
     for _k in ("max_single_position_pct", "min_cash_reserve_pct"):
         _v = getattr(req, _k, None)

@@ -45,3 +45,40 @@ def test_delete_portfolio_settings(tmp_path):
     assert ps.get_equity_cap_mode(3, p) == "cap"
     # 最后一个组合删除后文件也移除，避免残留空 {} 文件
     assert not p.exists()
+
+
+def test_industry_defaults_all_off(tmp_path):
+    s = ps.get_industry_settings(1, tmp_path / "s.json")
+    assert s["industry_gate_mode"] == "off"
+    assert s["industry_rank_enabled"] is False
+    assert s["industry_weight_enabled"] is False
+    assert s["industry_overbought_block"] is False
+    assert s["industry_trail_tighten_enabled"] is False
+    assert s["industry_bear_reduce_ratio"] == 0.0
+    assert ps.industry_data_needed(s) is False
+
+
+def test_apply_industry_overrides_run_level(tmp_path):
+    p = tmp_path / "s.json"
+    ps.set_industry_settings(5, {"industry_rank_enabled": True}, p)
+    base = ps.get_industry_settings(5, p)
+    # 未携带的键沿用组合设置；非法模式回落 off；未知键忽略；None=不覆盖
+    merged = ps.apply_industry_overrides(base, {
+        "industry_gate_mode": "bogus",
+        "industry_weight_enabled": True,
+        "industry_max_per_industry": None,
+        "unknown_key": 1,
+    })
+    assert merged["industry_rank_enabled"] is True
+    assert merged["industry_gate_mode"] == "off"
+    assert merged["industry_weight_enabled"] is True
+    assert merged["industry_max_per_industry"] == 2
+    assert ps.industry_data_needed(merged) is True
+    # 不写盘：组合设置保持原样
+    assert ps.get_industry_settings(5, p)["industry_weight_enabled"] is False
+
+
+def test_industry_bool_string_coerced(tmp_path):
+    p = tmp_path / "s.json"
+    ps.set_industry_settings(9, {"industry_rank_enabled": "false"}, p)
+    assert ps.get_industry_settings(9, p)["industry_rank_enabled"] is False

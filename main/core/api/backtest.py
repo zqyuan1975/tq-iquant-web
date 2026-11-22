@@ -105,6 +105,10 @@ class BacktestRequest(BaseModel):
     # 市场多空门控 run 级三态覆盖（None=跟随组合市场门控配置）：
     # True=强制开启，False=强制关闭；空头状态只禁开仓/加仓，持仓不强平
     market_gate_enabled: bool | None = None
+    # 行业门控 run 级临时覆盖（2026-11-22，默认 None=跟随组合 JSON 配置）：
+    # 仅本次回测生效、不落盘。键同 portfolio_settings.INDUSTRY_DEFAULTS，
+    # 未携带的键沿用组合设置；非法值按默认/夹取处理。
+    industry_settings: dict | None = None
     # 执行档位（N1，2026-11-18）：None/legacy=旧成交口径（默认，行为逐字不变）；
     # realistic=一次性打开「涨跌停校验 + 成交量约束(10%) + 自适应滑点 + 日终抬峰」
     execution_profile: str | None = None

@@ -72,6 +72,19 @@ export interface FormulaItem {
   signals: FormulaSignalItem[]
 }
 
+// 行业门控（组合 JSON 侧配置，2026-11-22）：全部默认关闭
+export interface IndustrySettings {
+  industry_gate_mode: 'off' | 'industry_relief' | 'industry_strict'
+  industry_rank_enabled: boolean
+  industry_max_per_industry: number
+  industry_weight_enabled: boolean
+  industry_overbought_block: boolean
+  industry_trail_tighten_enabled: boolean
+  industry_trail_tighten_ratio: number
+  industry_bear_reduce_ratio: number
+  industry_divergence_hint: boolean
+}
+
 // 组合策略（GET/POST/PUT /portfolios）— 对齐 strategies._serialize_portfolio
 export interface PortfolioItem {
   id: number
@@ -116,6 +129,7 @@ export interface PortfolioItem {
   market_gate_vote_mode: string        // any（默认）| majority | all
   market_gate_strength_threshold: number  // 空头强度门槛 0-100；0=不设门槛
   market_gate_bear_reduce_ratio: number   // 空头减仓比例 0-1；0=关闭
+  industry_settings: IndustrySettings     // 行业门控（默认全关）
   status: string  // active|archived
   created_at: string | null
   updated_at: string | null
@@ -1375,6 +1389,16 @@ export interface PortfolioRequest {
   market_gate_vote_mode?: string | null        // any（默认）| majority | all
   market_gate_strength_threshold?: number | null // 空头强度门槛 0-100；0=不设门槛
   market_gate_bear_reduce_ratio?: number | null  // 空头减仓比例 0-1；0=关闭
+  // 行业门控（组合 JSON 侧，null/undefined=请求未携带，编辑不动）
+  industry_gate_mode?: IndustrySettings['industry_gate_mode'] | null
+  industry_rank_enabled?: boolean | null
+  industry_max_per_industry?: number | null
+  industry_weight_enabled?: boolean | null
+  industry_overbought_block?: boolean | null
+  industry_trail_tighten_enabled?: boolean | null
+  industry_trail_tighten_ratio?: number | null
+  industry_bear_reduce_ratio?: number | null
+  industry_divergence_hint?: boolean | null
   status: string  // active|archived
   strategies?: StrategyItem[]  // 创建时携带；更新组合时后端忽略（策略单独 CRUD）
 }
@@ -1543,6 +1567,7 @@ export interface BacktestRequest {
   daily_close_peak_enabled?: boolean            // 日末 peak 保护（默认关）：仅当日最后一根 bar 更新峰值/回撤
   daily_loss_basis?: 'equity' | 'initial' | null   // 日内亏损分母 run 级覆盖（null/undefined=跟随组合）
   market_gate_enabled?: boolean | null             // 市场多空门控 run 级三态覆盖（null/undefined=跟随组合）
+  industry_settings?: Partial<IndustrySettings>     // 行业门控 run 级临时覆盖（undefined=跟随组合，不改配置）
   loan_model_plan?: Record<string, unknown>        // 资金池 B3：L2 拼盘借贷计划（默认不带）
   gate_release_plan?: Record<string, unknown>      // 资金池 D3/D4：门控释放/召回（默认不带）
   pairing_plan_id?: number                         // 资金池 B6：回测完成后绑定该拼盘

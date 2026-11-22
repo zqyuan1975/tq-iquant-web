@@ -72,6 +72,12 @@ const EQUITY_CAP_MODES = [
   { value: 'cap', label: '封顶（只限制新开仓定量，默认）' },
   { value: 'distribute', label: '日终出金（仅回测，超上限部分扣现）' },
 ]
+// 行业门控放行模式（默认 off=完全不读取行业数据，行为与旧版逐位一致）
+const INDUSTRY_GATE_MODES = [
+  { value: 'off', label: '关闭（默认，不读取行业数据）' },
+  { value: 'industry_relief', label: 'relief：仅大盘空头时按行业放行多头' },
+  { value: 'industry_strict', label: 'strict：常开，行业非多头一律拦' },
+]
 
 // 实盘预警调度（alert 半自动）：NULL=跟随默认；rank 与后端 validate_signal_config 同口径
 const SIGNAL_FREQUENCIES = ['1m', '5m', '15m', '30m', '1h', '1d', '1w', '1mon']
@@ -95,6 +101,7 @@ const PORTFOLIO_RATIO_FIELDS = new Set([
   'max_single_position_pct', 'min_cash_reserve_pct',
   'target_utilization',
   'market_gate_bear_reduce_ratio',
+  'industry_trail_tighten_ratio', 'industry_bear_reduce_ratio',
 ])
 const STRATEGY_RATIO_FIELDS = new Set([
   'capital_ratio', 'single_open_ratio',
@@ -115,6 +122,9 @@ const NULLABLE_NUMERIC_FIELDS = new Set([
   'split_order_count', 'split_order_min_qty',
   'split_order_interval_seconds', 'split_order_volume_pct',
   'cash_enhance_equity_threshold', 'cash_enhance_position_ratio_threshold',
+  // 行业门控：留空=不修改（null），避免 Pydantic 422
+  'industry_max_per_industry', 'industry_trail_tighten_ratio',
+  'industry_bear_reduce_ratio',
   'trend_trailing_stop_ratio', 'trend_max_positions',
   'signal_weekday', 'risk_cooldown_days', 'priority',
   'market_gate_strength_threshold',
@@ -185,6 +195,16 @@ const PORTFOLIO_GROUPS: { title: string; hint?: string; fields: FieldMeta[] }[] 
     { key: 'market_gate_vote_mode', label: '投票模式', span: 2, type: 'select', options: 'gateVoteModes', showIf: (f: Record<string, any>) => !!f.market_gate_enabled, hint: '任一空头即拦（默认，与单指数旧语义一致）/ 过半 / 全部空头才拦' },
     { key: 'market_gate_strength_threshold', label: '空头强度门槛', span: 1, type: 'number', placeholder: '0=不设门槛', showIf: (f: Record<string, any>) => !!f.market_gate_enabled, hint: '只有空头强度 ≥ 该值（0-100）才计入空头票；0=不设门槛' },
     { key: 'market_gate_bear_reduce_ratio', label: '空头减仓比例', span: 1, type: 'percent', placeholder: '0=关闭', showIf: (f: Record<string, any>) => !!f.market_gate_enabled, hint: '空头连续段内每只持仓按该比例减仓一次（0=只拦开仓，不减仓）' },
+  ]},
+  { title: '行业门控（默认关闭）', hint: '基于通达信 881 二级行业日线，回测与实盘同一套内核。全部关闭时不读取行业数据，决策/委托/成交与旧版逐位一致。放行门控与上方「市场多空门控」配合：relief 只在大盘空头时生效；strict 常开。行业数据缺失（不足 300 根/取数失败）自动放行并记 WARNING 与决策事件。', fields: [
+    { key: 'industry_gate_mode', label: '行业放行模式', span: 2, type: 'select', options: 'industryGateModes', hint: '关闭=不读行业数据（默认）。relief=仅大盘空头时：个股行业多头→放行多头信号，行业非多头→继续封堵；大盘多头时不影响。strict=常开：行业非多头一律拦 OPEN/ADD（大盘空头仍拦）。' },
+    { key: 'industry_rank_enabled', label: '跨策略 OPEN 排序', span: 1, type: 'switch', hint: '同一 bar 全部 OPEN 按「行业领先天数→行业强度→个股信号天数→信号时间」统一排序后，再按组合最大持仓数截断。关闭时按原顺序处理。' },
+    { key: 'industry_max_per_industry', label: '同行业持仓上限', span: 1, type: 'number', placeholder: '2', showIf: (f: Record<string, any>) => !!f.industry_rank_enabled, hint: '含已有持仓与同 bar 在途单；0=不限制。默认 2。' },
+    { key: 'industry_weight_enabled', label: '行业强度作仓位权重', span: 1, type: 'switch', hint: '多头行业开仓量 ×(0.5+强度/100)，夹取 0.5~1.5；非多头/数据缺失=1（等值）。仅影响 OPEN 定量。' },
+    { key: 'industry_overbought_block', label: '行业超买停开仓', span: 1, type: 'switch', hint: '行业 bias_z≥2.5 时不接受该行业新 OPEN；已有持仓不强平，止损止盈照常。' },
+    { key: 'industry_trail_tighten_enabled', label: '转空收紧止损', span: 1, type: 'switch', hint: '行业处于空头时，该行业持仓的移动止损比例收紧为下方值（覆盖策略原值）；行业非空头时用原值。' },
+    { key: 'industry_trail_tighten_ratio', label: '收紧后移动止损', span: 1, type: 'percent', placeholder: '1.5', showIf: (f: Record<string, any>) => !!f.industry_trail_tighten_enabled, hint: '默认 1.5%（比常规 3% 更紧）；仅行业空头时生效。' },
+    { key: 'industry_bear_reduce_ratio', label: '行业空头减仓比例', span: 2, type: 'percent', placeholder: '0=关闭', hint: '行业转空后每只持仓按该比例减仓一次（独立开关，0=关闭）。与大盘空头减仓同时命中时取两者较大值，不叠加。' },
   ]},
 ]
 
@@ -299,6 +319,12 @@ function emptyPortfolioForm(): Record<string, any> {
     // E3 门控维度扩展：默认值 = 单指数 / any / 不设门槛 / 不减仓（旧语义）
     market_gate_indices: '', market_gate_vote_mode: 'any',
     market_gate_strength_threshold: null, market_gate_bear_reduce_ratio: 0,
+    // 行业门控（默认全关；关闭时不读行业数据，行为与旧版逐位一致）
+    industry_gate_mode: 'off',
+    industry_rank_enabled: false, industry_max_per_industry: 2,
+    industry_weight_enabled: false, industry_overbought_block: false,
+    industry_trail_tighten_enabled: false, industry_trail_tighten_ratio: 0.015,
+    industry_bear_reduce_ratio: 0,
     strategies: [],
   }
 }
@@ -503,6 +529,13 @@ function validatePortfolioPayload(p: Record<string, unknown>): string | null {
   if (sic !== null && !(sic > 0 && sic <= 1)) return '滑点冲击系数须在 (0,1]'
   const ec = num(p.equity_cap)
   if (ec !== null && ec <= 0) return '容量上限必须大于 0'
+  const imax = num(p.industry_max_per_industry)
+  if (imax !== null && !(imax >= 0 && imax <= 100)) return '同行业持仓上限须在 [0,100]（0=不限制）'
+  for (const [k, label] of [['industry_trail_tighten_ratio', '收紧后移动止损'],
+                            ['industry_bear_reduce_ratio', '行业空头减仓比例']] as const) {
+    const n = num(p[k])
+    if (n !== null && !(n >= 0 && n <= 1)) return `${label} 须在 [0%, 100%]`
+  }
   const b = String(p.benchmark_index || '').trim()
   if (b && !/^\d{6}\.[A-Za-z]{2,4}$/.test(b)) return '基准指数格式须为 6位代码.市场（如 000300.SH）'
   return null
@@ -624,6 +657,15 @@ async function openEditPortfolio(p: PortfolioItem) {
     market_gate_vote_mode: detail.market_gate_vote_mode || 'any',
     market_gate_strength_threshold: detail.market_gate_strength_threshold ?? null,
     market_gate_bear_reduce_ratio: detail.market_gate_bear_reduce_ratio ?? 0,
+    // 行业门控：响应里是独立对象，平铺进表单；缺失（老后端）按全关处理
+    industry_gate_mode: detail.industry_settings?.industry_gate_mode || 'off',
+    industry_rank_enabled: detail.industry_settings?.industry_rank_enabled ?? false,
+    industry_max_per_industry: detail.industry_settings?.industry_max_per_industry ?? 2,
+    industry_weight_enabled: detail.industry_settings?.industry_weight_enabled ?? false,
+    industry_overbought_block: detail.industry_settings?.industry_overbought_block ?? false,
+    industry_trail_tighten_enabled: detail.industry_settings?.industry_trail_tighten_enabled ?? false,
+    industry_trail_tighten_ratio: detail.industry_settings?.industry_trail_tighten_ratio ?? 0.015,
+    industry_bear_reduce_ratio: detail.industry_settings?.industry_bear_reduce_ratio ?? 0,
     strategies: [],
   }
   // 比例字段转百分比显示
@@ -800,6 +842,7 @@ function optionsOf(src: string | undefined, pid?: number) {
   if (src === 'positionSizings') return POSITION_SIZINGS.map(s => ({ value: s.value, label: s.label }))
   if (src === 'dailyLossBases') return DAILY_LOSS_BASES.map(s => ({ value: s.value, label: s.label }))
   if (src === 'equityCapModes') return EQUITY_CAP_MODES.map(s => ({ value: s.value, label: s.label }))
+  if (src === 'industryGateModes') return INDUSTRY_GATE_MODES.map(s => ({ value: s.value, label: s.label }))
   if (src === 'riskTimings') return RISK_TIMINGS.map(t => ({ value: t.value, label: t.label }))
   if (src === 'requotePriceModes') return [
     { value: 'tick', label: '固定 1 档（原行为）' },

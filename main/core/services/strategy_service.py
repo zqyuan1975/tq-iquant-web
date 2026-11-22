@@ -131,6 +131,8 @@ def serialize_portfolio(db: Session, p: PortfolioStrategy) -> dict:
         "equity_cap": (float(p.equity_cap) if p.equity_cap is not None else None),
         # 上限处理模式（组合 JSON 侧配置，缺省 cap=旧行为）
         "equity_cap_mode": portfolio_settings.get_equity_cap_mode(p.id),
+        # 行业门控（组合 JSON 侧配置，缺省全关=旧行为）
+        "industry_settings": portfolio_settings.get_industry_settings(p.id),
         # 实盘单票上限 / 现金下限：NULL=不限制，原样回给前端（百分比由前端换算）
         "max_single_position_pct": (
             float(p.max_single_position_pct)
@@ -395,6 +397,23 @@ def _apply_equity_cap_mode(pid: int, req) -> None:
     portfolio_settings.set_equity_cap_mode(pid, getattr(req, "equity_cap_mode", None))
 
 
+def _apply_industry_settings(pid: int, req) -> None:
+    """组合 JSON 侧行业开关：仅写入请求显式携带且非 None 的键。
+
+    值与默认值相同的键由 ``set_industry_settings`` 自动删除（默认不落盘）。
+    """
+    values = {}
+    for name in portfolio_settings.INDUSTRY_DEFAULTS:
+        if not _field_sent(req, name):
+            continue
+        value = getattr(req, name, None)
+        if value is None:
+            continue
+        values[name] = value
+    if values:
+        portfolio_settings.set_industry_settings(pid, values)
+
+
 def create_portfolio(db: Session, req) -> dict:
     """建组合 + 子策略（两步 commit）。req 已校验合法。"""
     p = PortfolioStrategy()
@@ -412,6 +431,7 @@ def create_portfolio(db: Session, req) -> dict:
     db.refresh(p)
     pid = p.id
     _apply_equity_cap_mode(pid, req)
+    _apply_industry_settings(pid, req)
     return serialize_portfolio(db, p)
 
 
@@ -430,6 +450,7 @@ def update_portfolio(db: Session, pid: int, req) -> dict | None:
     db.commit()
     db.refresh(p)
     _apply_equity_cap_mode(pid, req)
+    _apply_industry_settings(pid, req)
     return serialize_portfolio(db, p)
 
 

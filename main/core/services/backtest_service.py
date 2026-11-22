@@ -4690,6 +4690,9 @@ def run_backtest(db: Session, ps: PortfolioStrategy, req,
     # 取数失败/行业不足 300 根由 build_industry_tracker 内部 fail-open（error tracker），
     # 门控查询返回 None → 放行并留 WARNING + 决策事件。
     _industry_settings = portfolio_settings.get_industry_settings(ps.id)
+    # run 级临时覆盖（仅本次回测生效，不落盘；None=跟随组合配置）
+    _industry_settings = portfolio_settings.apply_industry_overrides(
+        _industry_settings, getattr(req, "industry_settings", None))
     industry_tracker = (
         build_industry_tracker(req.start_date, req.end_date)
         if portfolio_settings.industry_data_needed(_industry_settings) else None
@@ -5330,6 +5333,8 @@ def run_multi_backtest(db: Session, portfolios: list, req) -> dict:
         portfolio.equity_cap_mode = portfolio_settings.get_equity_cap_mode(ps.id)
         # 行业层组合开关（默认全关）：任一组合开启即整批构建一份共享行业轴
         _industry_settings = portfolio_settings.get_industry_settings(ps.id)
+        _industry_settings = portfolio_settings.apply_industry_overrides(
+            _industry_settings, getattr(req, "industry_settings", None))
         portfolio.configure_industry(_industry_settings)
         if portfolio_settings.industry_data_needed(_industry_settings):
             _industry_enabled = True

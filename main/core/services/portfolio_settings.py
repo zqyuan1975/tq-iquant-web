@@ -126,6 +126,8 @@ def _coerce_industry_value(key: str, value) -> object:
         mode = str(value or "off").strip().lower()
         return mode if mode in INDUSTRY_MODES else "off"
     if isinstance(default, bool):
+        if isinstance(value, str):
+            return value.strip().lower() in ("1", "true", "yes", "on")
         return bool(value)
     if key == "industry_max_per_industry":
         try:
@@ -152,6 +154,22 @@ def industry_data_needed(settings: Dict[str, object]) -> bool:
         return float(cfg.get("industry_bear_reduce_ratio", 0) or 0) > 0
     except (TypeError, ValueError):
         return False
+
+
+def apply_industry_overrides(settings: Dict[str, object],
+                             overrides: Optional[Dict[str, object]]) -> Dict[str, object]:
+    """回测 run 级临时覆盖（不落盘）：在组合设置上合并，未知键忽略。
+
+    ``None`` 值视为「不覆盖」，便于前端只提交改动的键。
+    """
+    merged = {
+        key: _coerce_industry_value(key, (settings or {}).get(key, default))
+        for key, default in INDUSTRY_DEFAULTS.items()
+    }
+    for name, value in (overrides or {}).items():
+        if name in INDUSTRY_DEFAULTS and value is not None:
+            merged[name] = _coerce_industry_value(name, value)
+    return merged
 
 
 def get_industry_settings(portfolio_id: int,
