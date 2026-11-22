@@ -211,11 +211,17 @@ onUnmounted(() => {
       <div class="frame-body">
         <div class="table-wrap">
           <table class="health-table">
+            <colgroup>
+              <col class="c-name" /><col class="c-status" /><col class="c-engine" />
+              <col class="c-channel" /><col class="c-bridge" /><col class="c-data" />
+              <col class="c-today" /><col class="c-alerts" /><col class="c-deferred" />
+              <col class="c-approval" />
+            </colgroup>
             <thead>
               <tr>
                 <th>名称</th><th>状态</th><th>引擎</th><th>通道</th><th>桥</th>
-                <th>数据新鲜度</th><th>今日委托/成交</th>
-                <th>未处理告警</th><th>顺延</th><th>待审批</th>
+                <th>数据新鲜度</th><th class="t-right">今日委托/成交</th>
+                <th class="t-right">未处理告警</th><th class="t-right">顺延</th><th class="t-right">待审批</th>
               </tr>
             </thead>
             <tbody>
@@ -314,13 +320,26 @@ onUnmounted(() => {
 .hs-label { font-size: 11.5px; color: var(--ink-soft); white-space: nowrap; flex: 0 0 auto }
 .health-stat > b { min-width: 0; font-family: var(--font-serif); font-size: 16px; font-weight: 800; color: var(--ink); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-variant-numeric: tabular-nums }
 .health-stat > i { font-style: normal; font-size: 11px; color: var(--ink-faint); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; font-variant-numeric: tabular-nums }
-.health-table { font-size: 13px }
+/* 10 列与 10 个 td 一一对应：固定 table-layout 后列宽只由 colgroup 决定，
+   窄屏改为表格内部横向滚动，不会因自动布局挤压而让单元格内容跑位。
+   数据新鲜度列容纳「徽标 + 逐周期明细」，仍全部落在同一个 td 内。 */
+.health-table { font-size: 13px; table-layout: fixed; min-width: 920px }
+.health-table .c-name { width: 8% }
+.health-table .c-status { width: 10% }
+.health-table .c-engine { width: 12% }
+.health-table .c-channel { width: 8% }
+.health-table .c-bridge { width: 5% }
+.health-table .c-data { width: 18% }
+.health-table .c-today { width: 15% }
+.health-table .c-alerts { width: 9% }
+.health-table .c-deferred { width: 7% }
+.health-table .c-approval { width: 8% }
 .health-table th, .health-table td { padding: 4px 10px }
 .health-table td { vertical-align: top }
+.health-table td.num { white-space: nowrap }
 .problem-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 4px }
 .problem-list li { display: flex; align-items: flex-start; gap: 8px; font-size: 13px; line-height: 1.4 }
 .num { font-variant-numeric: tabular-nums; text-align: right }
-.data-cell { min-width: 150px }
 .period-line { font-size: 11px; color: var(--ink-soft); line-height: 1.5; margin-top: 3px; font-variant-numeric: tabular-nums }
 .guard-block { padding: 6px 0; border-top: 1px dashed var(--line) }
 .guard-block:first-child { padding-top: 0; border-top: none }
