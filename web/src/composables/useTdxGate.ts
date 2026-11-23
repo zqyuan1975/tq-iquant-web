@@ -47,8 +47,12 @@ function _fmtNext(iso: string | null): string {
 export function useTdxGate() {
   ensurePolling()
   const enabled = computed(() => status.value?.enabled !== false)
+  // 只有「有实盘在跑」才谈得上让路：没有实盘引擎时时段限制不生效，
+  // 不能只读 p2_allowed（旧后端版本无 live_running 字段时保持原行为）。
+  const liveRunning = computed(() => status.value?.policy.live_running !== false)
   const p2Blocked = computed(() =>
-    enabled.value && !!status.value && !status.value.policy.p2_allowed)
+    enabled.value && liveRunning.value && !!status.value &&
+    !status.value.policy.p2_allowed)
   const p2Reason = computed(() => {
     const p = status.value?.policy
     if (!p2Blocked.value || !p) return ''
@@ -57,5 +61,5 @@ export function useTdxGate() {
     }
     return `实盘运行中，回测类任务（P2）暂不可用；${_fmtNext(p.next_p2_open_at)} 后自动恢复`
   })
-  return { status, loading, enabled, p2Blocked, p2Reason, refresh }
+  return { status, loading, enabled, liveRunning, p2Blocked, p2Reason, refresh }
 }

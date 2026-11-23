@@ -4144,6 +4144,8 @@ export async function getCapitalUtilization(params: {
 export interface TdxGatePolicy {
   now: string
   trading_day: boolean
+  /** 是否有运行中的实盘引擎；false 时后端不做时段限制（window=no_live_engine） */
+  live_running?: boolean
   window: string
   override: boolean
   protected: boolean
