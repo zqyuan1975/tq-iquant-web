@@ -554,6 +554,113 @@ def test_sound_sender_propagates_player_failure_as_notify_error():
 _FAKE_WECOM = "https://example.invalid/wecom/abcdef123456"
 
 
+# ================================================================ P2-10 限频
+_RATE_LIMIT_EXC = ns.NotifyError("飞书返回 code=11232 msg=frequency limited")
+
+
+def _pending_rows(path):
+    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()
+            if line.strip()]
+
+
+def test_rate_limited_event_is_parked_then_retried(tmp_path):
+    """11232 不再丢弃：落待发队列，退避到点后重投成功并清理文件。"""
+    pending = tmp_path / "notify_pending.jsonl"
+    clock = [1000.0]
+
+    class _Flaky(_Recorder):
+        def __init__(self):
+            super().__init__()
+            self.fail_times = 1
+
+        def send_text(self, text):
+            if self.fail_times > 0:
+                self.fail_times -= 1
+                raise _RATE_LIMIT_EXC
+            return super().send_text(text)
+
+    sender = _Flaky()
+    notifier = ns.Notifier(cfg=_cfg(), sender_factory=sender,
+                           mono_fn=lambda: clock[0], pending_path=pending)
+    try:
+        assert notifier.notify("warn", "行情停滞", "x",
+                               gate="market_data_stalled", code="1") is True
+        assert _wait(lambda: pending.exists() and _pending_rows(pending))
+        notifier.close()  # 停掉后台线程，改由本用例手动驱动重投（避免并发重投）
+        rows = _pending_rows(pending)
+        assert rows[0]["gate"] == "market_data_stalled"
+        assert notifier._pending and notifier._pending[0]["_next_at"] >= clock[0]
+        # 退避未到点：不重投
+        clock[0] += 1.0
+        notifier._retry_due_pending()
+        assert notifier._pending
+        # 退避到点：重投成功并清空
+        clock[0] += ns.RETRY_BASE_SECONDS
+        notifier._retry_due_pending()
+        assert notifier._pending == []
+        assert not pending.exists()
+        assert len(sender.sent) == 1
+    finally:
+        notifier.close()
+
+
+def test_rate_limited_key_events_merge_and_downshift(tmp_path):
+    """关键事件（卖出/风控/熔断）限频：按去重键合并计数、按关键间隔降频重投。"""
+    pending = tmp_path / "notify_pending.jsonl"
+    clock = [2000.0]
+    sender = _Recorder(exc=_RATE_LIMIT_EXC)
+    notifier = ns.Notifier(cfg=_cfg(), sender_factory=sender,
+                           mono_fn=lambda: clock[0], pending_path=pending)
+    try:
+        ev = ns.NotifyEvent("critical", "风控熔断", "触发熔断",
+                            gate="breaker", code="000001")
+        notifier._send_one(ev)
+        clock[0] += 10.0
+        notifier._send_one(ev)
+        rows = _pending_rows(pending)
+        assert len(rows) == 1
+        assert rows[0]["count"] == 2
+        assert notifier._pending[0]["_next_at"] == clock[0] + ns.RETRY_KEY_SECONDS
+    finally:
+        notifier.close()
+
+
+def test_pending_queue_resumes_after_restart(tmp_path):
+    """进程重启后由 start() 恢复落盘队列并继续投递。"""
+    pending = tmp_path / "notify_pending.jsonl"
+    pending.write_text(json.dumps({
+        "level": "error", "title": "卖出未成交", "message": "重投我",
+        "fields": {"代码": "600000"}, "gate": "sell", "code": "600000",
+        "trade_date": "2026-11-23", "count": 3, "attempts": 1,
+        "created_at": 1.0}, ensure_ascii=False) + "\n", encoding="utf-8")
+    sender = _Recorder()
+    notifier = ns.Notifier(cfg=_cfg(), sender_factory=sender,
+                           pending_path=pending)
+    try:
+        notifier.start()
+        assert _wait(lambda: len(sender.sent) == 1)
+        assert _wait(lambda: not pending.exists())
+        assert notifier._pending == []
+    finally:
+        notifier.close()
+
+
+def test_transient_failure_without_rate_limit_stays_log_only(tmp_path, caplog):
+    """非 11232 失败保持旧口径：不落待发队列、只节流写日志。"""
+    pending = tmp_path / "notify_pending.jsonl"
+    sender = _Recorder(exc=RuntimeError("connection refused"))
+    notifier = ns.Notifier(cfg=_cfg(), sender_factory=sender,
+                           pending_path=pending)
+    try:
+        with caplog.at_level(logging.WARNING):
+            assert notifier.notify("warn", "t", "m", gate="net") is True
+            assert _wait(lambda: notifier._last_fail_log > 0)
+        assert notifier._pending == []
+        assert not pending.exists()
+    finally:
+        notifier.close()
+
+
 def test_failure_log_masks_wecom_url_and_email_password(caplog):
     leaker = _CountRecorder(exc=RuntimeError(
         "wecom %s email pw %s" % (_FAKE_WECOM, "EmAilPw9876")))

@@ -12,6 +12,10 @@
   并只写日志——所有调用点都在既有事件已经发射/落库之后。
 - **不改既有语义**：本模块不改任何落库、不改闸门、不改订单状态机；调用点只允许
   「在既有事件产生的同一处顺带发一条」。
+- **限频不丢**：飞书返回 ``code=11232 frequency limited`` 时不再只写日志丢弃，
+  改为落本地待发队列（``app_root()/data/notify_pending.jsonl``，原子替换）并按
+  指数退避重试；关键事件（卖出/风控/熔断）按去重键合并、降频重投；进程重启后
+  由 ``Notifier.start()`` 恢复队列继续投递。其它失败仍按原口径只节流写日志。
 
 分级：``info < warn < error < critical``，低于 ``min_level`` 的事件直接丢弃。
 
@@ -24,6 +28,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import hmac
+import json
 import logging
 import os
 import queue
@@ -38,7 +43,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import httpx
 
-from ..config import load_config
+from ..config import app_root, load_config
 
 logger = logging.getLogger(__name__)
 
@@ -59,10 +64,62 @@ FAIL_LOG_INTERVAL_SECONDS = 600.0
 #: 静默期表上限（超出清空，防长期运行内存增长）
 _DEDUPE_MAX = 2000
 
+# ---- 飞书限频（code=11232 frequency limited）落盘重试 ----
+#: 飞书自定义机器人限频错误码：命中后不丢，转本地待发队列按退避重试
+RATE_LIMIT_CODE = "11232"
+#: 退避基数/上限（秒）：30 → 60 → 120 → 240 → 300
+RETRY_BASE_SECONDS = 30.0
+RETRY_MAX_SECONDS = 300.0
+#: 关键事件（卖出/风控/熔断）限频后的合并重投间隔（秒）：降频，不丢弃
+RETRY_KEY_SECONDS = 300.0
+#: 待发队列上限（超出丢最旧的非关键项并留日志）
+PENDING_MAX = 500
+#: 关键事件标记：级别=critical，或 gate/title 命中下列词（中英）
+_KEY_EVENT_MARKERS = (
+    "卖出", "风控", "熔断", "止损", "止盈", "子单丢失",
+    "sell", "risk", "circuit", "breaker",
+)
+#: 待发队列默认落盘位置（相对 app_root，可用 TQ_NOTIFY_PENDING_DISABLED=1 关闭）
+PENDING_FILE_REL = ("data", "notify_pending.jsonl")
+
 
 def level_value(level: str) -> int:
     """级别字符串 → 权重；未知级别按 ``warn`` 处理（宁可发出也不静默丢弃）。"""
     return LEVELS.get(str(level or "").strip().lower(), LEVELS["warn"])
+
+
+def is_rate_limited(exc: BaseException) -> bool:
+    """异常是否为飞书限频（code=11232 frequency limited）。"""
+    text = str(exc or "").lower()
+    return RATE_LIMIT_CODE in text or "frequency limited" in text
+
+
+def is_key_event(level: str, gate: str = "", title: str = "") -> bool:
+    """是否关键事件（卖出/风控/熔断）：限频时合并降频重投，绝不丢弃。
+
+    判据：级别 ≥ critical，或 gate/title 命中 :data:`_KEY_EVENT_MARKERS`
+    （现有调用点里熔断/止盈止损 gate 与标题都带这些词）。
+    """
+    if level_value(level) >= LEVELS["critical"]:
+        return True
+    text = ("%s %s" % (gate or "", title or "")).lower()
+    return any(mark in text for mark in _KEY_EVENT_MARKERS)
+
+
+def _pending_file_disabled() -> bool:
+    return str(os.environ.get("TQ_NOTIFY_PENDING_DISABLED") or "").strip().lower() in (
+        "1", "true", "yes", "on")
+
+
+def default_pending_path() -> Optional[Path]:
+    """待发队列默认落盘路径（app_root/data/notify_pending.jsonl）；禁用/异常→None。"""
+    if _pending_file_disabled():
+        return None
+    try:
+        root = app_root()
+        return root.joinpath(*PENDING_FILE_REL)
+    except Exception:  # noqa: BLE001 — 路径不可得不落盘（内存重试仍然生效）
+        return None
 
 
 @dataclass
@@ -444,6 +501,9 @@ class NotifyEvent:
     title: str
     message: str
     fields: Dict[str, str] = field(default_factory=dict)
+    gate: str = ""
+    code: str = ""
+    trade_date: str = ""
 
 
 class Notifier:
@@ -456,7 +516,8 @@ class Notifier:
 
     def __init__(self, cfg: Optional[NotifyConfig] = None,
                  sender_factory=None, mono_fn=time.monotonic,
-                 wecom_factory=None, email_factory=None, sound_factory=None):
+                 wecom_factory=None, email_factory=None, sound_factory=None,
+                 pending_path=None):
         self._cfg = cfg
         self._sender_factory = sender_factory or (
             lambda c: FeishuSender(c.webhook_url, c.secret, c.timeout_seconds))
@@ -477,6 +538,13 @@ class Notifier:
         self._last_sent: Dict[tuple, float] = {}
         self._last_fail_log = 0.0
         self._dropped = 0
+        # 飞书限频待发队列（内存 + 落盘，进程重启后继续投递）：
+        #   记录 = {level,title,message,fields,gate,code,trade_date,count,attempts,
+        #           created_at,_key,_next_at}；下划线键不落盘。
+        self._pending_path = Path(pending_path) if pending_path else None
+        self._pending: List[dict] = []
+        self._pending_loaded = False
+        self._pending_lock = threading.Lock()
 
     # ------------------------------------------------------------ 配置
     def config(self) -> NotifyConfig:
@@ -515,6 +583,9 @@ class Notifier:
                 title=str(title or "实盘告警"),
                 message=str(message or ""),
                 fields=text_fields,
+                gate=str(gate or ""),
+                code=str(code or ""),
+                trade_date=_today_text(trade_date),
             )
             try:
                 self._queue.put_nowait(event)
@@ -530,6 +601,18 @@ class Notifier:
             logger.warning("notify: 入队失败 level=%s title=%s",
                            level, title, exc_info=True)
             return False
+
+    def start(self) -> None:
+        """启动发送线程并恢复待发队列（进程重启后继续投递限频遗留告警）。
+
+        配置未启用/无可用渠道时零副作用（不建线程、不读写待发文件）。
+        """
+        try:
+            if not self.config().usable:
+                return
+            self._ensure_thread()
+        except Exception:  # noqa: BLE001 — 启动失败不得影响调用方
+            logger.warning("notify: 启动发送线程失败（忽略）", exc_info=True)
 
     def close(self, timeout: float = 1.0) -> None:
         """停止发送线程（正常不调用；进程退出随 daemon 线程消失）。"""
@@ -550,12 +633,19 @@ class Notifier:
             self._thread.start()
 
     def _run(self) -> None:
+        # 进程重启后先把上次限频遗留的待发告警捞回来（文件不存在/已禁用时为空）
+        self._load_pending()
         while not self._stop.is_set():
             try:
-                event = self._queue.get(timeout=0.5)
-            except queue.Empty:
-                continue
-            self._send_one(event)
+                try:
+                    event = self._queue.get(timeout=0.5)
+                except queue.Empty:
+                    event = None
+                if event is not None:
+                    self._send_one(event)
+                self._retry_due_pending()
+            except Exception:  # noqa: BLE001 — 发送线程绝不因单条异常退出
+                logger.warning("notify: 发送线程本轮异常（继续运行）", exc_info=True)
 
     def _build_senders(self, cfg: NotifyConfig) -> List[Any]:
         """按配置返回本次要投递的渠道（顺序固定：飞书 → 企微 → 邮件 → 提示音）。"""
@@ -570,21 +660,16 @@ class Notifier:
             senders.append(self._sound_factory(cfg))
         return senders
 
-    def _send_one(self, event: NotifyEvent) -> None:
-        """一条告警发往所有可用渠道；全部失败才按 600s 节流写日志，绝不抛出。
-
-        任一渠道成功即视为外发成功——单个渠道故障不影响其它渠道送达。
-        """
-        cfg = self.config()
+    def _deliver(self, cfg: NotifyConfig, event: NotifyEvent):
+        """把一条告警投递到所有可用渠道；返回 ``(成功渠道数, 异常列表)``。"""
         if not cfg.usable:
-            return
+            return 0, []
         try:
             senders = self._build_senders(cfg)
         except Exception as exc:  # noqa: BLE001 — 构造失败按全失败处理
-            self._log_fail(cfg, exc)
-            return
+            return 0, [exc]
         if not senders:
-            return
+            return 0, []
         title = "[%s] %s" % (event.level.upper(), event.title)
         errors: List[BaseException] = []
         delivered = 0
@@ -600,8 +685,200 @@ class Notifier:
                 delivered += 1
             except Exception as exc:  # noqa: BLE001 — 单渠道失败不影响其它渠道
                 errors.append(exc)
-        if not delivered and errors:
+        return delivered, errors
+
+    def _send_one(self, event: NotifyEvent) -> None:
+        """一条告警发往所有可用渠道；绝不抛出。
+
+        - 任一渠道成功即视为外发成功（单渠道故障不影响其它渠道送达）；
+        - **全部失败且为飞书限频（11232）→ 转本地待发队列**，按退避重试，
+          关键事件合并降频，进程重启后继续投递；
+        - 其它全部失败 → 保持旧行为：只按 600s 节流写日志。
+        """
+        cfg = self.config()
+        if not cfg.usable:
+            return
+        delivered, errors = self._deliver(cfg, event)
+        if delivered or not errors:
+            return
+        if is_rate_limited(errors[0]):
+            self._park_pending(event)
+            return
+        self._log_fail(cfg, errors[0])
+
+    # ------------------------------------------------------ 限频待发队列
+    def _pending_file(self) -> Optional[Path]:
+        if self._pending_path is not None:
+            return self._pending_path
+        return default_pending_path()
+
+    @staticmethod
+    def _event_to_record(event: NotifyEvent, count: int = 1,
+                         attempts: int = 0) -> dict:
+        return {
+            "level": event.level,
+            "title": event.title,
+            "message": event.message,
+            "fields": dict(event.fields),
+            "gate": event.gate,
+            "code": event.code,
+            "trade_date": event.trade_date,
+            "count": int(count),
+            "attempts": int(attempts),
+            "created_at": datetime.now().timestamp(),
+            "_key": (event.gate[:60], event.code[:20], event.trade_date),
+            "_next_at": 0.0,
+        }
+
+    @staticmethod
+    def _record_to_event(rec: dict) -> NotifyEvent:
+        raw_fields = rec.get("fields")
+        fields = {str(k): str(v) for k, v in raw_fields.items()} \
+            if isinstance(raw_fields, dict) else {}
+        return NotifyEvent(
+            level=str(rec.get("level") or "warn"),
+            title=str(rec.get("title") or "实盘告警"),
+            message=str(rec.get("message") or ""),
+            fields=fields,
+            gate=str(rec.get("gate") or ""),
+            code=str(rec.get("code") or ""),
+            trade_date=str(rec.get("trade_date") or ""),
+        )
+
+    def _backoff_seconds(self, attempts: int) -> float:
+        return min(RETRY_MAX_SECONDS, RETRY_BASE_SECONDS * (2 ** max(0, attempts)))
+
+    def _park_pending(self, event: NotifyEvent) -> None:
+        """限频告警转入待发队列（落盘 + 退避）；关键事件按 key 合并降频。"""
+        now = self._mono()
+        key = (event.gate[:60], event.code[:20], event.trade_date)
+        key_event = is_key_event(event.level, event.gate, event.title)
+        with self._pending_lock:
+            existing = next(
+                (r for r in self._pending if r.get("_key") == key), None)
+            if existing is not None:
+                existing["count"] = int(existing.get("count") or 1) + 1
+                existing["message"] = event.message
+                existing["fields"] = dict(event.fields)
+                existing["attempts"] = int(existing.get("attempts") or 0) + 1
+                existing["_next_at"] = now + (
+                    RETRY_KEY_SECONDS if key_event
+                    else self._backoff_seconds(existing["attempts"]))
+                record = existing
+            else:
+                record = self._event_to_record(event)
+                record["_next_at"] = now + (
+                    RETRY_KEY_SECONDS if key_event
+                    else self._backoff_seconds(0))
+                self._pending.append(record)
+                while len(self._pending) > PENDING_MAX:
+                    self._pending.pop(0)
+                    logger.warning(
+                        "notify: 待发队列超过上限 %d，丢弃最旧一条", PENDING_MAX)
+            self._persist_pending()
+            size = len(self._pending)
+        logger.warning(
+            "notify: 飞书限频（%s），告警已转入本地待发队列并退避重试"
+            "（gate=%s，关键=%s，待发 %d 条）",
+            RATE_LIMIT_CODE, event.gate or event.title, key_event, size)
+
+    def _retry_due_pending(self) -> None:
+        """重投所有到期的待发告警（发送线程内串行调用）。"""
+        now = self._mono()
+        with self._pending_lock:
+            due = [r for r in self._pending if float(r.get("_next_at") or 0) <= now]
+        for record in due:
+            self._retry_one(record)
+
+    def _retry_one(self, record: dict) -> None:
+        event = self._record_to_event(record)
+        cfg = self.config()
+        if not cfg.usable:
+            return
+        delivered, errors = self._deliver(cfg, event)
+        now = self._mono()
+        key_event = is_key_event(event.level, event.gate, event.title)
+        with self._pending_lock:
+            if delivered or not errors:
+                self._pending = [r for r in self._pending if r is not record]
+                self._persist_pending()
+                if delivered and int(record.get("count") or 1) > 1:
+                    logger.info(
+                        "notify: 限频积压已补发（合并 %d 条）gate=%s",
+                        record.get("count"), event.gate or event.title)
+                return
+            record["attempts"] = int(record.get("attempts") or 0) + 1
+            if is_rate_limited(errors[0]):
+                record["_next_at"] = now + (
+                    RETRY_KEY_SECONDS if key_event
+                    else self._backoff_seconds(record["attempts"]))
+            else:
+                # 限频已解除但其它原因仍失败：继续退避，并按既有节流写日志
+                record["_next_at"] = now + self._backoff_seconds(record["attempts"])
+            self._persist_pending()
+        if not is_rate_limited(errors[0]):
             self._log_fail(cfg, errors[0])
+
+    def _load_pending(self) -> None:
+        """进程启动时从磁盘恢复待发队列（只读；文件不存在/损坏则忽略）。"""
+        with self._pending_lock:
+            if self._pending_loaded:
+                return
+            self._pending_loaded = True
+            path = self._pending_file()
+            if path is None or not path.exists():
+                return
+            loaded: List[dict] = []
+            try:
+                text = path.read_text(encoding="utf-8")
+            except OSError:
+                logger.warning("notify: 待发队列读取失败（忽略）", exc_info=True)
+                return
+            for line in text.splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    raw = json.loads(line)
+                except ValueError:
+                    continue
+                if not isinstance(raw, dict) or not raw.get("title"):
+                    continue
+                try:
+                    rec = self._event_to_record(
+                        self._record_to_event(raw),
+                        count=int(raw.get("count") or 1),
+                        attempts=int(raw.get("attempts") or 0),
+                    )
+                except (TypeError, ValueError):
+                    continue
+                # 启动即尝试重投（上次进程留下的退避时间点不跨进程沿用）
+                rec["_next_at"] = 0.0
+                loaded.append(rec)
+            self._pending = loaded[:PENDING_MAX]
+            if self._pending:
+                logger.info("notify: 已恢复 %d 条限频遗留告警，开始重投",
+                            len(self._pending))
+
+    def _persist_pending(self) -> None:
+        """待发队列整体落盘（原子替换）；失败只告警，内存重试继续。"""
+        path = self._pending_file()
+        if path is None:
+            return
+        rows = [{k: v for k, v in r.items() if not k.startswith("_")}
+                for r in self._pending]
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            if not rows:
+                if path.exists():
+                    path.unlink()
+                return
+            tmp = path.with_name(path.name + ".tmp")
+            text = "\n".join(json.dumps(r, ensure_ascii=False) for r in rows) + "\n"
+            tmp.write_text(text, encoding="utf-8")
+            os.replace(tmp, path)
+        except OSError:
+            logger.warning("notify: 待发队列落盘失败（内存重试继续）", exc_info=True)
 
     def _log_fail(self, cfg: NotifyConfig, exc: BaseException) -> None:
         now = self._mono()

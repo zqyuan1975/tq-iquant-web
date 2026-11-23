@@ -18,6 +18,9 @@ os.environ.setdefault("TQ_INCREMENTAL_SCHEDULER_DISABLED", "1")
 # 告警外发（飞书 Webhook）：测试期间强制关闭，绝不给真实机器人发消息
 # （本机 config.yaml 可能已配真实 webhook_url 且 enabled=true）。
 os.environ.setdefault("TQ_NOTIFY_DISABLED", "1")
+# 告警限频待发队列落盘：测试进程不写仓库 data/（需要持久化的用例显式传
+# pending_path=tmp_path/...，显式路径不受本开关影响）。
+os.environ.setdefault("TQ_NOTIFY_PENDING_DISABLED", "1")
 # 僵尸实盘会话清理：lifespan 用的是真实 SessionLocal（dependency_overrides 管不到），
 # 集成用例 `with TestClient(app)` 会把正在运行的实盘会话写成 stopped
 # （2026-11-19 09:45:27 实证：测试进程借 lifespan 改真实 dev.db）。

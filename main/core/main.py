@@ -63,6 +63,13 @@ async def lifespan(app: FastAPI):
         except Exception:  # noqa: BLE001 — 迁移失败不得阻断启动
             logger.warning("runtime 数据目录迁移失败（忽略，不影响启动）",
                            exc_info=True)
+    # P2-10：告警待发队列恢复（未启用 notify 时零副作用）。上次进程遇到飞书限频
+    # 落盘的告警在这里继续投递，不依赖下一条新告警触发发送线程。
+    try:
+        from core.services.notify_service import get_notifier
+        get_notifier().start()
+    except Exception:  # noqa: BLE001 — 告警恢复失败不得阻断启动
+        logger.warning("notify 待发队列恢复异常（已忽略）", exc_info=True)
     # L5：启动版本校验（默认关闭）。只读比对 alembic_version 与代码 head，
     # 不执行任何迁移；开关关闭时无日志、零副作用。
     try:
