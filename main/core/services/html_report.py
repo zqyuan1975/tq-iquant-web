@@ -1677,12 +1677,17 @@ def _gate_label(g: str) -> str:
 
 
 def _gate_val(v) -> str:
+    """闸门参数值固定单位展示（P1-6）：不再按量级猜百分数。
+
+    param_value 语义随闸门不同（阈值/价格/手数），无法统一推断单位，
+    因此统一按原始数值展示 4 位小数；百分比语义在字段名/说明里标注。
+    """
     if v is None:
         return "—"
-    f = float(v)
-    if f != 0 and abs(f) < 1:
-        return f"{f * 100:.2f}%"
-    return f"{f:.4f}"
+    try:
+        return f"{float(v):.4f}"
+    except (TypeError, ValueError):
+        return str(v)
 
 
 def _decision_section(detail: dict) -> str:

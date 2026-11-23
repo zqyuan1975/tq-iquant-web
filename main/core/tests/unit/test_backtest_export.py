@@ -72,7 +72,9 @@ def test_build_csv_snapshots_and_metrics():
     metrics = be.build_csv(_detail(), "metrics").lstrip("\ufeff").splitlines()
     assert metrics[0] == "指标,数值"
     joined = "\n".join(metrics)
-    assert "总收益" in joined and "0.01" in joined
+    # P1-6：导出统一百分数并带 (%) 后缀（内部口径仍是小数）。
+    assert "总收益(%)" in joined and "1.0" in joined
+    assert "成本拖累占比(%)" in joined and "2.0" in joined
     assert "交易成本合计" in joined and "10.6" in joined
 
 
