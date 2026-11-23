@@ -63,6 +63,16 @@ async def lifespan(app: FastAPI):
         except Exception:  # noqa: BLE001 — 迁移失败不得阻断启动
             logger.warning("runtime 数据目录迁移失败（忽略，不影响启动）",
                            exc_info=True)
+    # P1-3：桥地址启动校验（不阻断）。live 腿端口与配置声明的现网端口（simulation
+    # 腿，缺省 8790）不一致时记一条显式告警——历史默认给的是 8791 信用账户腿，
+    # 实盘会持续连不上 QMT 桥。
+    try:
+        from core.config import iquant_live_port_mismatch
+        _endpoint_warn = iquant_live_port_mismatch()
+        if _endpoint_warn:
+            logger.warning("%s", _endpoint_warn)
+    except Exception:  # noqa: BLE001 — 校验失败不得阻断启动
+        logger.warning("iquant_bridge live 端点校验异常（已忽略）", exc_info=True)
     # P2-10：告警待发队列恢复（未启用 notify 时零副作用）。上次进程遇到飞书限频
     # 落盘的告警在这里继续投递，不依赖下一条新告警触发发送线程。
     try:

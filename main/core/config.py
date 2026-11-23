@@ -3,8 +3,13 @@ import sys
 import threading
 from pathlib import Path
 from typing import Optional
+from urllib.parse import urlparse
 
 import yaml
+
+#: QMT 桥现网端口（股票账户）：config.yaml 与 packaging/config.template.yaml
+#: 的 simulation / live 两条腿均指向 8790；8791 为信用账户腿（不使用）。
+IQUANT_BRIDGE_EXPECTED_PORT = 8790
 
 
 def is_frozen_app() -> bool:
@@ -198,8 +203,11 @@ def _defaults() -> dict:
             "sound": {"enabled": False, "path": ""},
         },
         "iquant_bridge": {
+            # QMT 桥（股票账户）现网端口 8790：simulation / live 两条腿共用同一
+            # 本地桥服务。历史默认 live 指向 8791（信用账户腿），与 config.yaml /
+            # packaging/config.template.yaml 不一致，实盘会连到不存在的服务。
             "simulation": {"base_url": "http://127.0.0.1:8790"},
-            "live": {"base_url": "http://127.0.0.1:8791"},
+            "live": {"base_url": "http://127.0.0.1:8790"},
             # 桥请求超时（秒，= 读/写/池超时）：桥内全局锁/GIL 排队下 /ping 也要
             # 5~8s，15s 留足余量；超时按在途处理，不判拒单。缺省/非法回退该值
             # （live_service.iquant_config）。建连超时见 live.bridge_connect_timeout_seconds。
@@ -237,10 +245,13 @@ def _defaults() -> dict:
             "window_title": "网上股票交易系统5.0",
             "client_exe_path": "D:/同花顺远航版/transaction/xiadan.exe",
             "driver": "clipboard",
-            "captcha_ocr": False,
+            # 验证码 OCR：默认开启，与 packaging/config.template.yaml 及现网
+            # config.yaml 一致（历史代码默认 false 属默认值分叉）。
+            "captcha_ocr": True,
             # 委托价模式：approval=键入审批价（信号价）限价，委托价≠审批价自动撤单；
             # latest=不键价格，让 THS 代码键入后自动跟出最新价（日线信号跨日跳空补救）。
-            "price_mode": "approval",
+            # 默认 latest，与模板/现网一致（历史代码默认 approval 属默认值分叉）。
+            "price_mode": "latest",
             # 文件交接层：file_builtin=信号/风控/指令落 JSONL + 内置后台执行器按
             # 频率执行（place_order 秒回）；direct=同步 UI 自动化直呼（原行为）。
             "execute_mode": "file_builtin",
@@ -462,6 +473,45 @@ def load_config(config_path: Optional[str] = None) -> dict:
     with open(path, "r", encoding="utf-8") as f:
         cfg = yaml.safe_load(f) or {}
     return _deep_merge(_defaults(), cfg)
+
+
+def _url_port(raw) -> Optional[int]:
+    """``http://host:port`` → 端口号；空值/非法 URL 返回 None。"""
+    try:
+        return urlparse(str(raw or "").strip()).port
+    except (TypeError, ValueError):
+        return None
+
+
+def iquant_live_port_mismatch(cfg: Optional[dict] = None) -> Optional[str]:
+    """启动校验：live 腿端口与配置声明的现网端口不一致时返回告警文案。
+
+    现网端口以 ``iquant_bridge.simulation.base_url`` 的端口为准（simulation 与
+    live 共用同一本地 QMT 桥），解析不到时回退 :data:`IQUANT_BRIDGE_EXPECTED_PORT`。
+    只返回文案、不抛异常、**不阻断启动**；由 ``main.lifespan`` 记一条 WARNING。
+    """
+    try:
+        cfg = load_config() if cfg is None else cfg
+        section = (cfg or {}).get("iquant_bridge") or {}
+        if not isinstance(section, dict):
+            return None
+        sim = section.get("simulation") if isinstance(section.get("simulation"), dict) else {}
+        live = section.get("live") if isinstance(section.get("live"), dict) else {}
+        expected = _url_port(sim.get("base_url")) or IQUANT_BRIDGE_EXPECTED_PORT
+        live_url = str(live.get("base_url") or "").strip()
+        actual = _url_port(live_url)
+        if actual == expected:
+            return None
+        return (
+            "iquant_bridge.live.base_url=%r 的端口为 %s，与配置声明的现网端口 %s 不一致："
+            "实盘将通过该地址访问 QMT 桥，端口不符会持续连不上。请核对 config.yaml / "
+            "packaging/config.template.yaml（simulation 与 live 均应为 "
+            "http://127.0.0.1:%s）。"
+            % (live_url or "—", "无法解析" if actual is None else actual,
+               expected, expected)
+        )
+    except Exception:  # noqa: BLE001 — 校验自身异常不得影响启动
+        return None
 
 
 _CONFIG_WRITE_LOCK = threading.Lock()
