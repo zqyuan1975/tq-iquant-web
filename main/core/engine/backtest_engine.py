@@ -39,6 +39,7 @@ from .market_rules import (  # noqa: F401
     session_allows_bar,
     trading_days_between,
 )
+from .price_limit import check_bar_consistent_with_prev_close
 from .capital_contracts import (
     CAPITAL_POOL_VERSION,
     PortfolioQuotaInput,
@@ -631,6 +632,13 @@ class BacktestEngine:
                     sorted({t[0].date() for t in times}), recorder)
         report_every = max(1, total_bars // 100)
         price_index = self._build_price_index(klines)
+        # P1-3：沪/北送转新增股落 ex_date+1 交易日桶所需的「下一交易日」查询。
+        _trade_days = sorted({_t[0].date() for _t in times})
+
+        def _next_trade_day(_d, _days=_trade_days):
+            import bisect
+            _i = bisect.bisect_right(_days, _d)
+            return _days[_i] if _i < len(_days) else None
         # #2 成交量闸门分母（可选新口径）：成交日之前 5 个交易日日均量
         # （与实盘同口径，无前视）。默认口径不预计算，保持旧行为与耗时。
         volume_ref_by_day = (
@@ -779,6 +787,7 @@ class BacktestEngine:
                     dispose_days=portfolio.suspension_dispose_days,
                     delist_force_close=portfolio.delist_force_close_enabled,
                     last_action_date=last_action_date,
+                    next_trade_day=_next_trade_day,
                 )
                 last_action_date = t.date()
                 ca_reinvest.extend(
@@ -814,6 +823,12 @@ class BacktestEngine:
                         # 新股窗口档位为 None：无涨跌幅限制，不夹取（交由闸门 fail-open）
                         if _rule.ratio is None:
                             continue
+                        # P1-2（2026-11-23）：夹价前自洽守卫——只诊断，不改夹价。
+                        _ohlcv = (price_index.get((t, period), {}) or {}).get(_code) or {}
+                        check_bar_consistent_with_prev_close(
+                            code=_code, high=_ohlcv.get("high"),
+                            low=_ohlcv.get("low"), prev_close=_pc,
+                            ratio=_rule.ratio)
                         bar_price_limits[_code] = (
                             (_pc * (1 - _rule.ratio)).quantize(
                                 Decimal("0.01"), rounding=ROUND_HALF_UP),
@@ -1536,6 +1551,13 @@ class BacktestEngine:
         times = self._build_timeline(klines)
         price_index = self._build_price_index(klines)
         prev_close_by_day = build_prev_close_by_day(klines)
+        # P1-3：沪/北送转新增股落 ex_date+1 交易日桶所需的「下一交易日」查询。
+        _trade_days = sorted({_t[0].date() for _t in times})
+
+        def _next_trade_day(_d, _days=_trade_days):
+            import bisect
+            _i = bisect.bisect_right(_days, _d)
+            return _days[_i] if _i < len(_days) else None
         # #2 成交量闸门分母（可选新口径）：成交日之前 5 个交易日日均量
         # （与实盘同口径，无前视）。默认口径不预计算，保持旧行为与耗时。
         volume_ref_by_day = (
@@ -1818,6 +1840,7 @@ class BacktestEngine:
                         dispose_days=portfolio.suspension_dispose_days,
                         delist_force_close=portfolio.delist_force_close_enabled,
                         last_action_date=s["last_action_date"],
+                        next_trade_day=_next_trade_day,
                     )
                     s["last_action_date"] = t.date()
                     s["ca_reinvest"].extend(
@@ -1864,6 +1887,12 @@ class BacktestEngine:
                             _rule_cache[(_code, t.date())] = _rule
                         if _rule.ratio is None:
                             continue
+                        # P1-2（2026-11-23）：夹价前自洽守卫——只诊断，不改夹价。
+                        _ohlcv = (price_index.get((t, period), {}) or {}).get(_code) or {}
+                        check_bar_consistent_with_prev_close(
+                            code=_code, high=_ohlcv.get("high"),
+                            low=_ohlcv.get("low"), prev_close=_pc,
+                            ratio=_rule.ratio)
                         bar_price_limits[_code] = (
                             (_pc * (1 - _rule.ratio)).quantize(
                                 Decimal("0.01"), rounding=ROUND_HALF_UP),

@@ -359,3 +359,86 @@ def test_ex_dividend_loader_sets_flags_once_per_day(db_session):
     LiveEngine._maybe_load_ex_dividend_day(engine, datetime(2026, 6, 11, 10, 0))
     assert portfolio.ex_dividend_codes is None
 
+
+# ---------------- P1-3：沪/北送转新增股 T+1 落桶 ----------------
+
+SH = "600000.SH"
+BJ = "830799.BJ"
+
+
+def _hold_code(port, code, qty=1000, price=Decimal("10")):
+    ctx = port.strategies[0]
+    pos = Position(code)
+    ctx.positions[code] = pos
+    pos.buy(qty, price, datetime(2026, 7, 1))
+    pos.highest_price = price
+    return pos
+
+
+def _split_timeline(code, ex_date=date(2026, 7, 20), ratio=Decimal("0.3")):
+    return CorporateActionTimeline([
+        CorporateActionEvent(code=code, event_type="split",
+                             ex_date=ex_date, share_ratio=ratio),
+    ])
+
+
+def test_sh_split_new_shares_not_sellable_on_ex_date():
+    """沪市送转：原 1000 股除权日可卖，新增 300 股次一交易日才可卖。
+
+    本系统 ``_lots`` 键为取得日、可卖判据为 ``d < query_date``，因此新增股记
+    ``ex_date`` 桶；对用户口径即「ex_date+1 起可卖」。
+    """
+    port = _portfolio()
+    pos = _hold_code(port, SH)
+    next_day = date(2026, 7, 21)
+    apply_day(port, _split_timeline(SH), date(2026, 7, 20),
+              mode="backtest", last_action_date=date(2026, 7, 17),
+              next_trade_day=lambda d: next_day if d == date(2026, 7, 20) else None)
+
+    assert pos.quantity == 1300
+    assert pos._lots == {date(2026, 7, 1): 1000, date(2026, 7, 20): 300}
+    assert pos.available_shares_on(date(2026, 7, 20)) == 1000
+    assert pos.available_shares_on(next_day) == 1300
+    assert pos.avg_cost == Decimal("10") * 1000 / 1300
+    assert pos.highest_price == Decimal("10") * 1000 / 1300
+
+
+def test_bj_split_same_t_plus_one_rule():
+    port = _portfolio()
+    pos = _hold_code(port, BJ)
+    next_day = date(2026, 7, 21)
+    apply_day(port, _split_timeline(BJ), date(2026, 7, 20),
+              mode="backtest", last_action_date=date(2026, 7, 17),
+              next_trade_day=lambda d: next_day)
+
+    assert pos._lots == {date(2026, 7, 1): 1000, date(2026, 7, 20): 300}
+    assert pos.available_shares_on(date(2026, 7, 20)) == 1000
+    assert pos.available_shares_on(next_day) == 1300
+
+
+def test_sz_split_keeps_scaling_all_lots_same_day():
+    """深市维持原口径：各桶等比放大、日期不变，除权日全部可卖。"""
+    port = _portfolio()
+    pos = _hold_code(port, STOCK)
+    apply_day(port, _split_timeline(STOCK), date(2026, 7, 20),
+              mode="backtest", last_action_date=date(2026, 7, 17),
+              next_trade_day=lambda d: date(2026, 7, 21))
+
+    assert pos.quantity == 1300
+    assert pos._lots == {date(2026, 7, 1): 1300}
+    assert pos.available_shares_on(date(2026, 7, 20)) == 1300
+
+
+def test_sh_split_falls_back_when_next_trade_day_unknown():
+    """取不到下一交易日 → 回落到原「等比放大」口径（不静默丢股）。"""
+    port = _portfolio()
+    pos = _hold_code(port, SH)
+    apply_day(port, _split_timeline(SH), date(2026, 7, 20),
+              mode="backtest", last_action_date=date(2026, 7, 17),
+              next_trade_day=lambda d: None)
+
+    assert pos.quantity == 1300
+    assert sum(pos._lots.values()) == 1300
+    assert pos.available_shares_on(date(2026, 7, 20)) == 1300
+
+

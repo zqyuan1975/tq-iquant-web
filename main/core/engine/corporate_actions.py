@@ -123,10 +123,24 @@ def _iter_holding(portfolio, code: str):
             yield ctx, pos
 
 
-def _apply_split(pos, share_ratio) -> int:
-    """送转：股数增加、总成本不变（均价按比例摊薄）、最高价按比例下调、T+1 桶等比放大。
+def _apply_split(pos, share_ratio, *, code: str = "",
+                 ex_date: Optional[date] = None,
+                 next_trade_day: Optional[Callable[[date], Optional[date]]] = None) -> int:
+    """送转：股数增加、总成本不变（均价按比例摊薄）、最高价按比例下调。
 
-    返回新增股数（0 = 无变动）。整数取整误差全部记在最后一个桶上，保证
+    T+1 桶口径（P1-3，2026-11-23，按交易所规则）：
+
+    - **沪市 / 北交所**（``.SH`` / ``.BJ``）：送转/转增所得**新增股份**在除权日
+      不可卖、次一交易日可卖——即除权日不可卖出的增量，记为 ``ex_date`` 桶
+      （本系统桶键为取得日、可卖判据 ``d < query_date``，故等价于次日起可卖）；
+      原持仓各桶数量与日期保持不变（原股除权日照旧可卖）。取不到下一交易日时
+      回落到原「等比放大」口径。
+    - **深市**（``.SZ`` 及其它）：维持原口径——各桶等比放大、日期不变。
+
+    配股（``rights``）当前仍整体放弃（``apply_day`` 只记事件、不缴款不改账），
+    因此本函数只处理送转/转增；若未来启用配股，应复用同一落桶规则。
+
+    返回新增股数（0 = 无变动）。整数取整误差记在最后一桶，保证
     ``sum(_lots) == quantity``。
     """
     if share_ratio is None or share_ratio <= 0 or pos.quantity <= 0:
@@ -144,13 +158,40 @@ def _apply_split(pos, share_ratio) -> int:
     pos.strategy_quantity = int(Decimal(pos.strategy_quantity) * ratio)
     pos.platform_quantity = min(
         new_qty, int(Decimal(pos.platform_quantity) * ratio))
-    # T+1 桶等比放大，取整误差补到最后一桶
-    if pos._lots:
-        scaled = {d: int(Decimal(q) * ratio) for d, q in pos._lots.items()}
-        diff = new_qty - sum(scaled.values())
-        last = max(scaled)
-        scaled[last] += diff
-        pos._lots = {d: q for d, q in scaled.items() if q > 0}
+    if not pos._lots:
+        return new_qty - old_qty
+
+    is_sh_or_bj = str(code).upper().endswith((".SH", ".BJ"))
+    next_day = None
+    if is_sh_or_bj and ex_date is not None and next_trade_day is not None:
+        try:
+            next_day = next_trade_day(ex_date)
+        except Exception:  # noqa: BLE001 — 日历异常回落原口径
+            next_day = None
+    if next_day is not None:
+        # 原桶总量校准为 old_qty（异常数据时差额扣/补最后一桶），新增股单独落桶。
+        # 注意：本系统 _lots 的键是「取得日」，可卖判据是 d < query_date，因此
+        # 新增股要「除权日不可卖、次一交易日可卖」必须记为 ex_date 桶（等价于
+        # 用户口径的「ex_date+1 起可卖」；若记成 next_day 会再晚一天）。
+        lots = {d: q for d, q in pos._lots.items() if q > 0}
+        diff = old_qty - sum(lots.values())
+        if lots:
+            last = max(lots)
+            lots[last] += diff
+            if lots[last] <= 0:
+                lots.pop(last, None)
+        delta = new_qty - old_qty
+        if delta > 0:
+            lots[ex_date] = lots.get(ex_date, 0) + delta
+        pos._lots = lots
+        return new_qty - old_qty
+
+    # 深市 / 无下一交易日：原「等比放大」口径，取整误差补到最后一桶。
+    scaled = {d: int(Decimal(q) * ratio) for d, q in pos._lots.items()}
+    diff = new_qty - sum(scaled.values())
+    last = max(scaled)
+    scaled[last] += diff
+    pos._lots = {d: q for d, q in scaled.items() if q > 0}
     return new_qty - old_qty
 
 
@@ -187,7 +228,8 @@ def apply_day(portfolio, timeline: Optional[CorporateActionTimeline], day: date,
               dispose_days: int = 0,
               delist_force_close: bool = False,
               apply_split: bool = True,
-              last_action_date: Optional[date] = None) -> List[AppliedAction]:
+              last_action_date: Optional[date] = None,
+              next_trade_day: Optional[Callable[[date], Optional[date]]] = None) -> List[AppliedAction]:
     """把当日公司行为落到 ``portfolio``，返回意图列表。
 
     参数：
@@ -197,6 +239,8 @@ def apply_day(portfolio, timeline: Optional[CorporateActionTimeline], day: date,
     - ``dispose_days``：连续停牌超过 N 个交易日 → 发一次 delist_close 意图；0 = 不处置。
     - ``delist_force_close``：退市事件是否强平（False = 只发 notice）。
     - ``last_action_date``：上次生效日（调用方维护），保证事件只生效一次 + 顺延。
+    - ``next_trade_day``：给定日期返回下一交易日（P1-3）。仅沪市/北交所送转所得
+      新增股用它落 ``ex_date + 1`` 桶；缺省时回落实盘原有「等比放大」口径。
     """
     if timeline is None or timeline.is_empty():
         return []
@@ -217,7 +261,9 @@ def apply_day(portfolio, timeline: Optional[CorporateActionTimeline], day: date,
                 continue
             for ctx, pos in holdings:
                 if apply_split:
-                    delta = _apply_split(pos, ev.share_ratio)
+                    delta = _apply_split(
+                        pos, ev.share_ratio, code=code, ex_date=ev.ex_date,
+                        next_trade_day=next_trade_day)
                     if delta:
                         actions.append(AppliedAction(
                             KIND_SPLIT, code, qty=delta,

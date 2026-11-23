@@ -36,10 +36,16 @@
 所有分支都在 ``LimitRule.source`` / ``confidence`` 里留痕，通道侧写日志
 （拦截文案同时带上 ``source``/``confidence``，随拒单进工作台决策事件）。
 """
+import logging
 from dataclasses import dataclass
 from datetime import date
 from decimal import Decimal
 from typing import Optional
+
+logger = logging.getLogger(__name__)
+
+#: 「bar 与昨收不自洽」一次性诊断去重键（进程级，按 (code, 原因) 只报一次）。
+_BAR_INCONSISTENT_WARNED: set = set()
 
 BOARD_MAIN = "main"
 BOARD_CHINEXT = "chinext"
@@ -237,3 +243,54 @@ def resolve_limit_rule(
     return LimitRule(
         ratio=BOARD_LIMIT_RATIOS[board], unlimited=False, board=board,
         source="board_default", confidence="high")
+
+
+#: bar 自身价格相对「昨收 × 幅度」的越界容差：一手最小价差 0.01 元 + 千分之一。
+BAR_CONSISTENCY_ABS_TOLERANCE = Decimal("0.011")
+BAR_CONSISTENCY_REL_TOLERANCE = Decimal("0.001")
+
+
+def check_bar_consistent_with_prev_close(
+    *, code: str, high, low, prev_close, ratio,
+) -> Optional[str]:
+    """校验「当根 bar 的高/低」是否落在按昨收推的涨跌停区间内（P1-2）。
+
+    用途：若昨收因公司行为未入账/复权口径错配而失真，则 ``prev_close × 幅度``
+    推出来的涨跌停价本身是错的，夹价就会凭空多付/少收。这里**只做诊断**：
+
+    - 返回 ``"high_above_limit"`` / ``"low_below_limit"`` / ``None``；
+    - 绝不改调用方的夹价结果（fail-open，照旧按原规则夹）；
+    - 同一 ``(code, 原因)`` 进程内只告警一次，避免逐日刷屏。
+    """
+    if ratio is None or prev_close is None:
+        return None
+    try:
+        pc = Decimal(str(prev_close))
+        if pc < Decimal("1"):
+            return None
+        hi = Decimal(str(high)) if high is not None else None
+        lo = Decimal(str(low)) if low is not None else None
+        up = pc * (1 + Decimal(str(ratio)))
+        down = pc * (1 - Decimal(str(ratio)))
+        up_tol = max(BAR_CONSISTENCY_ABS_TOLERANCE,
+                     up * BAR_CONSISTENCY_REL_TOLERANCE)
+        down_tol = max(BAR_CONSISTENCY_ABS_TOLERANCE,
+                       down * BAR_CONSISTENCY_REL_TOLERANCE)
+        reason = None
+        if hi is not None and hi > up + up_tol:
+            reason = "high_above_limit"
+        elif lo is not None and lo < down - down_tol:
+            reason = "low_below_limit"
+        if reason is None:
+            return None
+        key = (str(code), reason)
+        if key not in _BAR_INCONSISTENT_WARNED:
+            _BAR_INCONSISTENT_WARNED.add(key)
+            logger.warning(
+                "bar 与昨收不自洽（%s，%s）：high=%s low=%s prev_close=%s "
+                "ratio=%s → 涨跌停推断可能失真；仅诊断，不改夹价",
+                code, reason, high, low, prev_close, ratio)
+        return reason
+    except Exception:  # noqa: BLE001 — 诊断绝不影响回测/实盘
+        return None
+

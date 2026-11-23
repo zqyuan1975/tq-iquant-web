@@ -19,6 +19,7 @@ from core.engine.price_limit import (
     BOARD_STAR,
     BOARD_UNKNOWN,
     board_for,
+    check_bar_consistent_with_prev_close,
     extract_name,
     is_st_name,
     resolve_limit_rule,
@@ -219,3 +220,38 @@ def test_extract_name_does_not_mistake_error_code_for_name():
     assert extract_name({"ErrorId": "0"}) is None
     assert extract_name(None) is None
     assert extract_name({}) is None
+
+
+def test_bar_consistency_flags_high_above_limit():
+    """bar 高点越过「昨收 × 幅度 + 容差」→ 报 high_above_limit（只诊断）。"""
+    reason = check_bar_consistent_with_prev_close(
+        code="600000.SH", high=Decimal("11.50"), low=Decimal("10.00"),
+        prev_close=Decimal("10.00"), ratio=Decimal("0.10"))
+    assert reason == "high_above_limit"
+
+
+def test_bar_consistency_flags_low_below_limit():
+    reason = check_bar_consistent_with_prev_close(
+        code="600001.SH", high=Decimal("10.00"), low=Decimal("8.50"),
+        prev_close=Decimal("10.00"), ratio=Decimal("0.10"))
+    assert reason == "low_below_limit"
+
+
+def test_bar_consistency_ok_within_limit_and_tolerance():
+    # 涨停 11.00；11.01 属于一手最小价差 ±0.01 的容差内，不报。
+    assert check_bar_consistent_with_prev_close(
+        code="600002.SH", high=Decimal("11.01"), low=Decimal("9.00"),
+        prev_close=Decimal("10.00"), ratio=Decimal("0.10")) is None
+
+
+def test_bar_consistency_fail_open_on_missing_inputs():
+    assert check_bar_consistent_with_prev_close(
+        code="600003.SH", high=None, low=None,
+        prev_close=Decimal("10.00"), ratio=Decimal("0.10")) is None
+    assert check_bar_consistent_with_prev_close(
+        code="600003.SH", high=Decimal("11.50"), low=Decimal("8.00"),
+        prev_close=None, ratio=Decimal("0.10")) is None
+    assert check_bar_consistent_with_prev_close(
+        code="600003.SH", high=Decimal("11.50"), low=Decimal("8.00"),
+        prev_close=Decimal("10.00"), ratio=None) is None
+
