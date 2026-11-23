@@ -3583,6 +3583,93 @@ def test_cost_capacity_explicit_cost_drag_and_capacity():
     assert cap["pressure_level"] == "高"
 
 
+# ---------------------------------------------------------------------------
+# 口径已过期（派生字段，不写库）
+# ---------------------------------------------------------------------------
+def _rec_with_snapshot(snapshot):
+    return BacktestRecord(
+        portfolio_strategy_id=1, name="caliber_demo",
+        start_date=date(2026, 7, 29), end_date=date(2026, 7, 31),
+        status="completed",
+        params_snapshot=(json.dumps(snapshot) if snapshot is not None else None),
+    )
+
+
+def test_caliber_stale_fresh_exact_snapshot_is_not_stale():
+    rec = _rec_with_snapshot({
+        "dividend_mode": "exact",
+        "price_caliber": {"version": "v2", "backtest_adjust": "exact"},
+    })
+    assert svc._caliber_stale(rec) == (False, None)
+    out = svc._serialize_record(rec)
+    assert out["caliber_stale"] is False
+    assert out["caliber_stale_reason"] is None
+
+
+def test_caliber_stale_flags_non_exact_and_missing_version():
+    rec = _rec_with_snapshot({
+        "dividend_mode": "front",
+        "price_caliber": {"backtest_adjust": "front"},
+    })
+    stale, reason = svc._caliber_stale(rec)
+    assert stale is True
+    assert "front" in reason and "price_caliber_version" in reason
+
+    out = svc._serialize_record(rec)
+    assert out["caliber_stale"] is True
+    assert out["caliber_stale_reason"] == reason
+
+
+def test_caliber_stale_flags_missing_or_broken_snapshot():
+    assert svc._caliber_stale(_rec_with_snapshot(None))[0] is True
+    broken = _rec_with_snapshot({"x": 1})
+    broken.params_snapshot = "{not-json"
+    stale, reason = svc._caliber_stale(broken)
+    assert stale is True and "无法解析" in reason
+
+
+def test_compare_records_warns_stale_caliber_not_comparable(db_session):
+    ps, _ = _seed(db_session)
+    fresh = _seed_compare_record(
+        db_session, ps, "fresh", [100, 110], [],
+        {"dividend_mode": "exact", "price_caliber": {"version": "v2"}}, 0.1)
+    old = _seed_compare_record(
+        db_session, ps, "old", [100, 105], [],
+        {"dividend_mode": "front"}, 0.05)
+    db_session.commit()
+
+    payload, err = svc.compare_records(db_session, [fresh.id, old.id])
+    assert err is None
+    assert any("口径已过期" in w and "不可与其他记录直接比较" in w
+               for w in payload["warnings"])
+
+
+# ---------------------------------------------------------------------------
+# B1：1w/1mon 末根周期完整性复核
+# ---------------------------------------------------------------------------
+def _week_df(days):
+    return pl.DataFrame({
+        "datetime": [datetime.combine(d, datetime.min.time()) for d in days],
+        "Close": [1.0] * len(days),
+    })
+
+
+def test_partial_period_tail_marks_incomplete_week():
+    klines = {"600000.SH": {"1w": _week_df(
+        [date(2026, 7, 27), date(2026, 7, 28), date(2026, 7, 29)])}}
+    warnings = svc._mark_partial_period_tails(klines)
+    assert warnings and "区间末端周期未完成" in warnings[0]
+    assert klines["600000.SH"]["1w"]["partial_period"].to_list() == [
+        False, False, True]
+
+
+def test_partial_period_tail_week_complete_not_marked():
+    klines = {"600000.SH": {"1w": _week_df(
+        [date(2026, 7, 27), date(2026, 7, 31)])}}
+    assert svc._mark_partial_period_tails(klines) == []
+    assert "partial_period" not in klines["600000.SH"]["1w"].columns
+
+
 def test_cost_capacity_without_slippage_param_and_empty():
     """K5：params 缺滑点时不臆造超额；无 trades/snapshots 返回 None。"""
     snaps = [

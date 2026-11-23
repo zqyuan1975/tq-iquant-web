@@ -159,6 +159,9 @@ export interface BacktestRecordItem {
   data_quality: DataQuality | null
   // 0021 E5：所属多组合回测批（拼盘成员），单组合为 null
   run_group_id: number | null
+  // 口径已过期（派生，不改历史数据）：非 exact 或参数快照缺 price_caliber_version
+  caliber_stale?: boolean
+  caliber_stale_reason?: string
 }
 
 // K2 多记录横向对比（对齐 backtest_service.compare_records）

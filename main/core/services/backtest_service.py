@@ -25,6 +25,7 @@ import polars as pl
 from sqlalchemy.orm import Session
 
 from core.config import load_config
+from core.engine import period_semantics as period_sem
 from core.models import (
     StockPool, StockPoolStock, StockPoolMembership, Strategy, Formula, FormulaSignal, PortfolioStrategy,
     BacktestRecord, BacktestTrade, BacktestDailySnapshot, BacktestEvaluation,
@@ -89,6 +90,7 @@ from core.engine.portfolio_builder import (
 from core.tq.data import TQData, no_trade_bar_mask
 from core.tq.kline_cache import KlineCache
 from core.tq.formula import TQFormula
+from core.tq.utils import TDXConnectionError
 from core.engine.tdx_formula import (
     FormulaEvalError,
     cross_periods_of,
@@ -309,6 +311,49 @@ def _convert_market_data_multi(raw_by_period: dict, stocks: list,
 # F1 数据质量口径版本：缺根按「池内并集 ∩ 个股首末 bar 区间」统计。口径变化必须改
 # 版本号，避免新旧结果混比。
 DATA_QUALITY_VERSION = "data_quality_v1"
+
+
+def _mark_partial_period_tails(klines: dict) -> List[str]:
+    """B1：复核 1w/1mon 末根是否为周期末交易日，非周期末则打 partial_period。
+
+    只标记与告警，**不改 bar 选择/成交/信号判定**。周期末判定复用
+    ``period_semantics.is_period_end_day``；日历用 ``TradingCalendar`` 的内置
+    官方休市表（provider 置空 → 已收录年份按真实交易日，未收录年份 fail-open），
+    不依赖本次取数末根，避免「数据截断到周三→误判周三为周期末」。
+    返回 warnings 文案（无异常返回空列表）。
+    """
+    periods = [p for p in ("1w", "1mon")
+               if any(p in (per or {}) for per in (klines or {}).values())]
+    if not periods:
+        return []
+    from core.engine.live.calendar import TradingCalendar
+    cal = TradingCalendar(lambda: [])
+    touched = set()
+    for per_period in (klines or {}).values():
+        for p in periods:
+            df = (per_period or {}).get(p)
+            if df is None or "datetime" not in df.columns or df.height == 0:
+                continue
+            last = _normalize_ts(df["datetime"].to_list()[-1])
+            last_day = last.date() if hasattr(last, "date") else last
+            if not isinstance(last_day, date):
+                continue
+            if period_sem.is_period_end_day(cal, p, last_day):
+                continue
+            (per_period)[p] = df.with_columns(
+                pl.when(pl.int_range(0, pl.len(), dtype=pl.Int64)
+                        == pl.len() - 1)
+                .then(pl.lit(True))
+                .otherwise(pl.lit(False))
+                .alias("partial_period")
+            )
+            touched.add(p)
+    if not touched:
+        return []
+    return [
+        "区间末端周期未完成，当期周期信号不计入统计（%s）"
+        % "、".join(sorted(touched))
+    ]
 
 
 def summarize_data_quality(per_stock: dict, klines: dict, stocks: list,
@@ -569,8 +614,90 @@ def build_klines(ps, start: date, end: date, db: Session = None,
             for period, raw in raw_by_period.items():
                 cache.store_period(
                     raw, stocks, period, start_str, end_str, fetch_mode)
-    return _convert_market_data_multi(
+    result = _convert_market_data_multi(
         raw_by_period, stocks, stats=stats, window=(start, end))
+    # P1-4：取数成功后的旁路台账登记。默认关闭（backtest.kline_ledger.enabled），
+    # 关闭时此处直接 return，取数行为/返回结构与改动前逐字一致；失败只告警。
+    _record_kline_ledger(raw_by_period, stocks, periods, fetch_start, end)
+    return result
+
+
+_KLINE_LEDGER_FIELDS = ("Open", "High", "Low", "Close", "Volume", "Amount")
+
+
+def _record_kline_ledger(raw_by_period: dict, stocks: list, periods: list,
+                         fetch_start: date, end: date) -> None:
+    """把本次取数结果登记进 K 线覆盖台账（只读接入，默认关闭）。
+
+    台账是旁路能力：只记录实际取到的日期、内部缺日与来源文件指纹，不跳过
+    取数、不裁剪区间、不改 ``build_klines`` 的返回值。任何异常都吞掉并告警，
+    绝不影响回测主链路。
+    """
+    try:
+        from core.services import kline_coverage_ledger as ledger
+
+        if not ledger.is_enabled():
+            return
+        try:
+            tdx_root = (load_config().get("tdx_path") or "").strip() or None
+        except Exception:  # pragma: no cover - 配置异常时退化为不登记指纹
+            tdx_root = None
+        items = []
+        path_cache = {}
+        for period in periods:
+            raw = (raw_by_period or {}).get(period) or {}
+            close_df = raw.get("Close")
+            for field in _KLINE_LEDGER_FIELDS:
+                df = raw.get(field)
+                if df is None:
+                    continue
+                columns = set(getattr(df, "columns", []))
+                for code in stocks:
+                    if code not in columns:
+                        continue
+                    series = df[code]
+                    dates = [ts for ts, value in series.items() if pd.notna(value)]
+                    if not dates:
+                        continue
+                    key = (code, period)
+                    if key not in path_cache:
+                        path_cache[key] = ledger.tdx_source_path(
+                            code, period, tdx_root=tdx_root)
+                    items.append({
+                        "code": code,
+                        "period": period,
+                        "field": field,
+                        "dates": dates,
+                        "source": ledger.SOURCE_TDX,
+                        "source_path": path_cache[key],
+                    })
+            # 额外登记整根 bar 的覆盖（以 Close 为准），供默认查询/信任判定使用
+            if close_df is not None:
+                columns = set(getattr(close_df, "columns", []))
+                for code in stocks:
+                    if code not in columns:
+                        continue
+                    dates = [ts for ts, value in close_df[code].items()
+                             if pd.notna(value)]
+                    if not dates:
+                        continue
+                    key = (code, period)
+                    if key not in path_cache:
+                        path_cache[key] = ledger.tdx_source_path(
+                            code, period, tdx_root=tdx_root)
+                    items.append({
+                        "code": code,
+                        "period": period,
+                        "field": ledger.FIELD_ALL,
+                        "dates": dates,
+                        "source": ledger.SOURCE_TDX,
+                        "source_path": path_cache[key],
+                    })
+        if items:
+            ledger.record_observations(
+                items, requested_start=fetch_start, requested_end=end)
+    except Exception:  # noqa: BLE001 台账是旁路，失败不得影响回测
+        logger.warning("K 线覆盖台账登记失败（忽略，不影响回测）", exc_info=True)
 
 
 def build_index_close_series(
@@ -637,12 +764,17 @@ def build_benchmark_data(
 
 
 def build_gate_ohlcv(code: str, start: date, end: date,
-                     period: str = "1d") -> pl.DataFrame:
+                     period: str = "1d", *,
+                     raise_gate_errors: bool = False) -> pl.DataFrame:
     """取门控基准指数的 OHLCV（默认前复权日线）供内置公式计算。
 
     与 build_index_close_series 分开：门控公式需要 High/Low/Open/Volume
     （角度线/形态/量能分都用得上），单收 close 不足以复现状态机。
     取数失败或列缺失 → 返回空 DataFrame（由调用方统一报错）。
+
+    ``raise_gate_errors=True``：TQ 通道类异常（闸拒绝 / 等待超时 / 通道不可用）
+    原样上抛，供实盘与看板区分「闸拒绝 / 超时 / 真无数据」三种原因；默认 False
+    保持回测既有「空表 + 统一报错」语义不变。
     """
     try:
         raw = TQData().get_history_raw(
@@ -653,6 +785,11 @@ def build_gate_ohlcv(code: str, start: date, end: date,
             dividend_type="front",
             count=-1,
         )
+    except TDXConnectionError:
+        if raise_gate_errors:
+            raise
+        logger.exception("门控基准 %s 取数异常", code)
+        return pl.DataFrame()
     except Exception:
         logger.exception("门控基准 %s 取数异常", code)
         return pl.DataFrame()
@@ -671,11 +808,13 @@ def build_gate_ohlcv(code: str, start: date, end: date,
 
 
 def build_single_gate_tracker(code: str, engine: str, formula_name: str | None,
-                              start: date, end: date):
+                              start: date, end: date, *,
+                              raise_gate_errors: bool = False):
     """单指数门控 tracker（python=内置 M 状态机 / tdx=客户端公式库）。
 
     取数/公式无结果一律抛 ValueError——门控开启却静默放行等于没开，
     宁可让本轮失败并给出可操作提示（路由层转 HTTP 400）。
+    ``raise_gate_errors=True`` 透传给取数层：闸拒绝/超时原样上抛（实盘用）。
     """
     fetch_start = start - timedelta(days=GATE_WARMUP_DAYS)
     if (engine or "python").lower() == "tdx":
@@ -687,7 +826,8 @@ def build_single_gate_tracker(code: str, engine: str, formula_name: str | None,
         )
         states, strengths = parse_tdx_gate_outputs(raw or {}, code)
     else:
-        ohlcv = build_gate_ohlcv(code, fetch_start, end)
+        ohlcv = build_gate_ohlcv(
+            code, fetch_start, end, raise_gate_errors=raise_gate_errors)
         if ohlcv.is_empty():
             raise MarketGateUnavailableError(
                 f"门控基准 {code} 无法取数（无 K 线）。请确认该指数在通达信中已下载，"
@@ -704,12 +844,14 @@ def build_single_gate_tracker(code: str, engine: str, formula_name: str | None,
     return tracker
 
 
-def build_gate_tracker(ps, start: date, end: date, enabled: bool | None = None):
+def build_gate_tracker(ps, start: date, end: date, enabled: bool | None = None,
+                       *, raise_gate_errors: bool = False):
     """构建市场多空门控跟踪器（None=未启用）。
 
     enabled=None 跟随组合 market_gate_enabled；显式 bool 为 run 级覆盖。
     E3：market_gate_indices 非空时按列表逐指数构建并投票；单指数 + any +
     threshold=0 时返回原 MarketGateTracker（旧语义逐字一致）。
+    ``raise_gate_errors=True`` 透传给取数层（实盘门控用：闸拒绝/超时要可见）。
     """
     if enabled is None:
         enabled = bool(getattr(ps, "market_gate_enabled", False))
@@ -723,9 +865,13 @@ def build_gate_tracker(ps, start: date, end: date, enabled: bool | None = None):
     vote_mode = (getattr(ps, "market_gate_vote_mode", None) or "any").lower()
     threshold = int(getattr(ps, "market_gate_strength_threshold", 0) or 0)
     if len(codes) == 1 and vote_mode == "any" and threshold <= 0:
-        return build_single_gate_tracker(codes[0], engine, fname, start, end)
+        return build_single_gate_tracker(
+            codes[0], engine, fname, start, end,
+            raise_gate_errors=raise_gate_errors)
     trackers = [
-        build_single_gate_tracker(code, engine, fname, start, end)
+        build_single_gate_tracker(
+            code, engine, fname, start, end,
+            raise_gate_errors=raise_gate_errors)
         for code in codes
     ]
     return CompositeGateTracker(
@@ -807,7 +953,7 @@ PARAMS_SNAPSHOT_FIELDS = (
 # 复权模式（2026-11-22 口径切换后的语义）：
 #   - exact（**默认**）= 不复权取数 + 显式公司行为记账（分红入现金、送转改股数）。
 #     不复权历史价永不改变 → 跨日增量回测时间稳定、可复现，与实盘信号口径一致。
-#   - front = 不复权取数 + 前复权信号（保留为「展示/对照」档；因子随请求窗口变化，
+#   - front = 前复权取数 + 前复权信号（保留为「展示/对照」档；因子随请求窗口变化，
 #     不得再作生产默认，也不用于跨日持久化的记账）。
 #   - back  = 后复权（仅供与历史记录对照；长区间价格失真，费用阈值口径已知偏差）。
 #   - dual  = 历史兼容档：信号已改为不复权（原「前复权信号」作废），记账仍后复权；
@@ -1000,8 +1146,9 @@ def build_params_snapshot(ps, dividend_mode: str = "exact",
         "version": PRICE_CALIBER_VERSION,
         "backtest_adjust": dividend_mode,
         "backtest_fetch_adjust": _fetch_adjust_mode(dividend_mode),
-        # 公式信号口径（2026-11-22 起统一 none，与实盘桥 /quote 一致）
-        "signal_adjust": "none",
+        # 公式信号口径：exact/dual 为 none（与实盘桥 /quote 一致），front/back 随档位
+        "signal_adjust": (
+            "none" if dividend_mode in ("exact", "dual") else dividend_mode),
         "live_bridge_adjust": LIVE_BRIDGE_ADJUST_MODE,
         "aligned_with_live": (
             _fetch_adjust_mode(dividend_mode) == LIVE_BRIDGE_ADJUST_MODE),
@@ -3080,8 +3227,41 @@ def _persist_result(
 # ---------------------------------------------------------------------------
 # 序列化
 # ---------------------------------------------------------------------------
+def _caliber_stale(record) -> Tuple[bool, Optional[str]]:
+    """派生「口径已过期」（不改历史行、不写库）。
+
+    口径过期判据（用户拍板 2026-11-23）：
+    - ``dividend_mode != 'exact'``（含快照写入口径字段缺失）；
+    - ``params_snapshot`` 缺 ``price_caliber_version``（新快照实际落在
+      ``price_caliber.version``，两处都认）。
+    """
+    raw = getattr(record, "params_snapshot", None)
+    if not raw:
+        return True, "params_snapshot 缺失"
+    snap = raw
+    if isinstance(raw, str):
+        try:
+            snap = json.loads(raw)
+        except (TypeError, ValueError):
+            return True, "params_snapshot 无法解析"
+    if not isinstance(snap, dict):
+        return True, "params_snapshot 结构非法"
+    caliber = snap.get("price_caliber")
+    caliber = caliber if isinstance(caliber, dict) else {}
+    reasons: List[str] = []
+    dividend_mode = snap.get("dividend_mode") or caliber.get("backtest_adjust")
+    if dividend_mode != "exact":
+        reasons.append("复权口径=%s，非 exact" % (dividend_mode or "缺省"))
+    version = snap.get("price_caliber_version") or caliber.get("version")
+    if not version:
+        reasons.append("缺少 price_caliber_version")
+    if not reasons:
+        return False, None
+    return True, "；".join(reasons)
+
+
 def _serialize_record(r: BacktestRecord) -> dict:
-    return {
+    out = {
         "id": r.id,
         "portfolio_strategy_id": r.portfolio_strategy_id,
         "name": r.name,
@@ -3112,6 +3292,10 @@ def _serialize_record(r: BacktestRecord) -> dict:
         # 0021 E5：拼盘/多组合批成员标记，供前端折叠与对比默认排除
         "run_group_id": getattr(r, "run_group_id", None),
     }
+    stale, stale_reason = _caliber_stale(r)
+    out["caliber_stale"] = stale
+    out["caliber_stale_reason"] = stale_reason
+    return out
 
 
 def _f(v) -> float | None:
@@ -3505,6 +3689,10 @@ def compare_records(
         rec = recs[rid]
         if rec.status != "completed":
             warnings.append(f"记录 #{rid} 状态为 {rec.status}，曲线与指标可能为空")
+        stale, stale_reason = _caliber_stale(rec)
+        if stale:
+            warnings.append(
+                f"记录 #{rid} 口径已过期（{stale_reason}），不可与其他记录直接比较")
         snaps = (
             db.query(BacktestDailySnapshot)
             .filter_by(backtest_record_id=rid, target_type="portfolio")
@@ -4930,6 +5118,8 @@ def run_backtest(db: Session, ps: PortfolioStrategy, req,
             **_kl_kwargs,
         )
         t2 = datetime.now()
+        # B1：1w/1mon 末根周期完整性复核（只打标 + 告警，不改 bar 选择/成交）
+        period_warnings = _mark_partial_period_tails(klines_full)
         # 数据量摘要：各周期多少根 bar、多少只股票，帮助判断瓶颈
         _log_kline_summary(record_id, klines_full)
         # 信号计算喂全量（含预热段，分钟级索引对齐与喂入数据同源），start 起的条目才进 cache
@@ -4954,7 +5144,7 @@ def run_backtest(db: Session, ps: PortfolioStrategy, req,
                 f"股票池中 {len(skipped_stocks)} 只股票行情数据异常或缺失，已跳过："
                 f"{shown}{more}。请在通达信中补齐数据后重跑。"
             )
-        warnings = data_warnings + signal_warnings
+        warnings = data_warnings + signal_warnings + period_warnings
         if ca_missing:
             shown_missing = "、".join(ca_missing[:20])
             more_missing = (f" 等 {len(ca_missing)} 只"
@@ -5429,6 +5619,7 @@ def run_multi_backtest(db: Session, portfolios: list, req) -> dict:
     klines_by_ps: Dict[int, dict] = {}
     signal_by_ps: Dict[int, dict] = {}
     dq_by_ps: Dict[int, dict] = {}
+    period_warnings_by_ps: Dict[int, List[str]] = {}
     names: Dict[str, str] = {}
     for e in entries:
         ps = e["ps"]
@@ -5442,6 +5633,8 @@ def run_multi_backtest(db: Session, portfolios: list, req) -> dict:
         dq_by_ps[ps.id] = summarize_data_quality(
             dq_stats, full, pool_for_kl, start_date, end_date)
         klines_by_ps[ps.id] = full
+        # B1：逐成员复核 1w/1mon 末根周期完整性（只打标 + 告警）
+        period_warnings_by_ps[ps.id] = _mark_partial_period_tails(full)
         signal_by_ps[ps.id] = build_signal_cache(
             ps, full, db, start=start_date, dividend_mode=signal_mode)
         names.update(_pool_stock_names(ps, db))
@@ -5619,6 +5812,7 @@ def run_multi_backtest(db: Session, portfolios: list, req) -> dict:
                 rec.data_quality_json = json.dumps(
                     dq_by_ps.get(ps.id), ensure_ascii=False, default=str)
                 _rec_warnings: List[str] = []
+                _rec_warnings.extend(period_warnings_by_ps.get(ps.id) or [])
                 if res.get("pending_order_count"):
                     _rec_warnings.append(
                         f"回测结束时仍有 {res['pending_order_count']} 笔信号未成交")

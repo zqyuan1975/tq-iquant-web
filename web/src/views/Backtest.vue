@@ -4165,6 +4165,8 @@ watch(theme, () => {
               {{ r.name }}
               <span v-if="r.run_group_id !== null" class="badge badge-blue" style="margin-left:6px"
                     :title="`所属运行组 #${r.run_group_id}`">拼盘成员</span>
+              <span v-if="r.caliber_stale" class="badge badge-red" style="margin-left:6px"
+                    :title="r.caliber_stale_reason || '口径已过期'">口径已过期</span>
             </td>
             <td>{{ poolName(r.portfolio_strategy_id) }}</td>
             <td style="color:var(--ink-soft);font-size:12px">{{ r.start_date }} ~ {{ r.end_date }}</td>
@@ -4225,6 +4227,8 @@ watch(theme, () => {
                     <th>指标</th>
                     <th v-for="it in recordCompareData.records" :key="it.record.id">
                       #{{ it.record.id }} {{ it.record.name }}
+                      <span v-if="it.record.caliber_stale" class="badge badge-red" style="margin-left:4px"
+                            :title="it.record.caliber_stale_reason || '口径已过期'">口径已过期</span>
                       <div class="note" style="font-weight:400;white-space:nowrap">
                         {{ it.record.start_date }} ~ {{ it.record.end_date }} · {{ recordCompareBenchmark(it) }}
                       </div>
@@ -4532,7 +4536,7 @@ watch(theme, () => {
                 <select v-model="form.dividend_mode">
                   <option value="exact">不复权+显式公司行为（默认，对账基准）</option>
                   <option value="front">前复权（通达信口径）</option>
-                  <option value="back">后复权（长区间更真实、可复现）</option>
+                  <option value="back">后复权（含因子窗口漂移，仅作对比）</option>
                   <option value="dual">信号不复权+后复权记账（历史兼容）</option>
                 </select>
               </div>
@@ -5083,7 +5087,13 @@ watch(theme, () => {
     <!-- 报告头 -->
     <div class="report-header">
       <button @click="backToList" class="back-link btn btn-sm">← 返回</button>
-      <h1>{{ currentRecord.name }}</h1>
+      <h1>{{ currentRecord.name }}
+        <span v-if="currentRecord.caliber_stale" class="badge badge-red" style="margin-left:8px;vertical-align:middle"
+              :title="currentRecord.caliber_stale_reason || '口径已过期'">口径已过期</span>
+      </h1>
+      <p class="subtitle" v-if="currentRecord.caliber_stale">
+        该记录 {{ currentRecord.caliber_stale_reason }}，不可与新口径结果直接比较。
+      </p>
       <p class="subtitle">{{ currentRecord.start_date }} ~ {{ currentRecord.end_date }} · {{ subtitle }}</p>
       <p class="subtitle" v-if="detail">
         容量模型版本 <code>{{ detail.capacity_model_version || 'v1' }}</code>
