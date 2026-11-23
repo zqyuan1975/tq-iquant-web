@@ -48,6 +48,8 @@ logs/
 *.log
 main/stdin.empty
 web/stdin.empty
+# 仓库根 data/ 整体按本地残留忽略（锚定根目录，不影响 main/data；后者另有独立规则）
+/data/
 # 源码版后端运行期写出的实例信息（server.json：端口/pid/版本），运行时产物不入库
 /data/runtime/
 # 源码版本地运行数据：开发库、健康巡检快照、自动备份目录
