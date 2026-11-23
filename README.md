@@ -42,7 +42,7 @@ npm run build     # 构建到 dist/（生产期由 FastAPI 托管）
 ## 关键约定
 
 - 统一响应格式 `{ "code": 0, "message": "ok", "data": {...} }`
-- 股票代码统一带后缀（`000001.SZ`，通达信规范）；复权统一前复权；时间按 Asia/Shanghai
+- 股票代码统一带后缀（`000001.SZ`，通达信规范）；回测复权默认 `exact`（不复权取数 + 不复权真实执行价 + 公司行为入账，与实盘同口径），`front/back/dual` 仅历史兼容；时间按 Asia/Shanghai
 - 回测强制 T+1；实盘实时查可用股数
 - 数据库：纯单用户本地 SQLite，零配置
 - 通信拓扑：Core↔QMT 为 HTTP 桥（原 NATS 网关方案已废弃），Core↔通达信同进程调用，Web↔Core 走 HTTP + SSE

@@ -91,8 +91,8 @@ Web 前端 (Vue 3 + Vite + Pinia) ←HTTP/SSE→ Core (FastAPI)
 ## 业务规则（容易遗漏）
 
 - **股票代码格式**：统一带后缀（如 `000001.SZ`），通达信规范
-- **复权方式**：回测支持三档复权模式（`dividend_mode`：`front` 前复权默认 / `back` 后复权 / `dual` 前复权信号+后复权记账，推荐）。TDX 前复权为「加性」且锚定查询 end 日期，长区间下高分红股（如 601225.SH）2020 年前 Close 被整体减到 ≤0/近零（最低 −5.44）——取数层已过滤 `Open/Close≤0` 与近零价（<0.01）伪影行，长区间回测建议用 `back`/`dual` 而非 `front`
-- **实盘桥行情不复权（已知口径差异，显式标记，不按缺陷处理）**：`/quote` 返回柜台原始价（`kline_t` 直出，`http_bridge_dispatcher.py` 注释自述），而回测（含 `dual` 的信号腿）用前复权。影响仅限 **1d/1w/1mon** 这类跨除权日的周期公式（除权日前后同一公式可能给出不同信号）；1m/5m 等日内周期与风控（止损/止盈/移动止损只用当日价格序列）不受影响。桥侧不做复权（QMT/掘金均无稳定前复权序列），故不回改信号口径；已知差异只做标记：`backtest_records.params_snapshot.dividend_mode` 记录回测口径，实盘会话按原始价执行，不可用「回测信号条数」直接与实盘对齐核对。
+- **复权方式（2026-11-23 起默认 `exact`）**：`DIVIDEND_MODES = front / back / dual / exact`，回测默认 **`exact`**＝不复权取数 + 不复权真实执行价 + 公司行为（分红/送转/配股）强制入账，与实盘同口径。`front` 前复权 / `back` 后复权 / `dual`（**信号不复权 + 后复权记账**）**仅历史兼容**，不再作为推荐档。TDX 前复权为「加性」且锚定查询 end 日期，长区间下高分红股（如 601225.SH）2020 年前 Close 被整体减到 ≤0/近零（最低 −5.44）——取数层仍过滤 `Open/Close≤0` 与近零价（<0.01）伪影行。**后复权因子随查询窗口漂移**，跨时点比对必须同源同 vintage（同一 `price_caliber_version` + 同一数据窗口），否则不可直接比较。
+- **实盘桥行情不复权与回测口径（默认已对齐）**：`/quote` 返回柜台原始价（`kline_t` 直出，`http_bridge_dispatcher.py` 注释自述）；回测默认 `exact` 同样按不复权取数、不复权执行价并把公司行为强制入账，两端同口径。`front/back/dual` 仅历史兼容——非 `exact` 或快照缺 `price_caliber_version` 的记录带 `caliber_stale` 标记，不可与实盘/新记录直接比较。桥侧不做复权（QMT/掘金均无稳定前复权序列）；`backtest_records.params_snapshot.dividend_mode` 记录回测口径，回看旧记录时须先确认口径。
 - **TQ 数据传递**：polars DataFrame 进程内传递，通过 tqcenter SDK 直连运行中通达信
 - **Core↔交易通道通信**：QMT 通道走 HTTP 桥（`127.0.0.1:8790`，账号 410038214257 / `STOCK`；QMT 是四条生产通道之一、平台按生产标准维护，但**该账户是 QMT 仿真账户、账户内为仿真资金**，不是真实资金；切真实资金须改桥文件 `ACCOUNT` / `ACCOUNT_TYPE`（必要时 `TICK_TAG` / `DRY_RUN`）并重跑实盘验证。`iquant_bridge_live.py` 的 `8791` + 信用账户 `CREDIT` 保留但**非生产、未启用**），掘金走 HTTP 桥（`127.0.0.1:7801`）；桥策略受理下单/查单/持仓/资金，QMT 桥另提供行情拉取（掘金行情由平台走通达信快照合成）。端点见 [live/bridge/README.md](live/bridge/README.md)
 - **信号优先级**：风控信号（止损/止盈/移动止损）> 公式信号（OPEN/ADD/REDUCE/CLOSE）
@@ -164,7 +164,7 @@ Web 前端 (Vue 3 + Vite + Pinia) ←HTTP/SSE→ Core (FastAPI)
 - **组合开关**（`portfolio_strategies` 四列，全默认关）：`corporate_actions_enabled` / `dividend_reinvest_enabled` / `suspension_dispose_days`（0=不处置）/ `delist_force_close_enabled`（与总开关 AND）。
 - **回测接入点**：`BacktestEngine.run` 主循环内、`risk_manager.enter_day` 之后、pending 成交之前（送转必须先改股数，否则顺延单按旧股数入账）；每交易日一次（`last_action_date` 水位）。再投资在 `is_day_end` 分支按当日收盘价买整手，不足一手留现金记 `skip_lot`。
 - **实盘接入点**：`LiveEngine._maybe_apply_corporate_actions`（`_run_daily_schedule` + 每根 `_handle_bar` 开头，每组合每日一次）。**送转不手工改虚拟持仓**（柜台镜面已吸收，`_is_share_count_change` 不扣现金），只记事件；**现金分红 `account.add_cash` + 落 `live_corporate_actions` 台账**（`recover` 按 `applied_date > seam_date` 重放；**绝不走 `live_cash_flows`**，否则被当外部入金从净值抹掉）；再投资只记 `action=notice`（审批队列上线前不下单）；退市/长期停牌强平走 `_submit_one_order` 同一闸门链。
-- **分红口径**：回测只认 `cash_pct`（前复权加性压缩，每股金额不可还原），实盘只认 `cash_per_share`；字段缺失记 `skip_cash`，不猜。事件日为非交易日 → 顺延到下一交易日，只生效一次。
+- **分红口径**：默认 `exact` 走 **`backtest_raw` 模式**——不复权原始价空间优先按每股税后金额 `cash_per_share` 入账，缺失时才回落 `cash_pct`（金额 = `cash_pct × 参照前收 × 持股数`）；旧 `front`/`back` 记录仍在复权价空间只认 `cash_pct`（前复权加性压缩，每股金额不可还原）；实盘只认 `cash_per_share`。字段缺失记 `skip_cash`，不猜。事件日为非交易日 → 顺延到下一交易日，只生效一次。
 - **停牌闸**：`Portfolio.suspended_codes` 只拦 `OPEN`/`ADD`（`gate=corporate_suspend`），`CLOSE`/`REDUCE`/止损/止盈一律放行；估值仍走「最后已知价」三级兜底。
 - **口径冻结**：`params_snapshot.corporate_actions`（version/enabled/档位/event_count/events_digest）+ 增量指纹 `corporate_actions` 分项；开关/档位/事件集合任一变化 → 旧接缝判废（不自动重建）。**旧记录缺键 ≠ 关闭**，不混比。
 - **运行中改开关需停止再启动会话**（`build_engine` 只读一次）；事件表内容每日现读，改事件不必重启，当日已应用的不重算。
@@ -180,8 +180,30 @@ Web 前端 (Vue 3 + Vite + Pinia) ←HTTP/SSE→ Core (FastAPI)
 - **回测**：`BacktestEngine.run(gate_tracker=)` 注入 `portfolio.current_market_gate`，日快照追加 `gate_state`/`gate_strength`（`None` 不写键）；`POST /api/backtest/run` 的 `market_gate_enabled` 为 run 级三态覆盖（`null` 跟随组合 / `true` / `false`）。`params_snapshot` 写 `market_gate_enabled` / `gate_index` / `gate_formula_version` / `gate_summary`。
 - **增量续跑**：`run_incremental` 与校验侧（`run_validation`）**都必须**带 `build_gate_tracker`（同一口径），`schema_fingerprint` 含 `market_gate = GATE_FORMULA_VERSION` → 开关或公式版本变化判废旧接缝，防接缝前后半段口径不一致。
 - **实盘**：`live_service` 组装组合时收集**标量**配置 `gate_specs`（只收启用门控的组合，**不持有 ORM 实例**——避免 `build_engine` 之后 commit/expire 触发 DetachedInstanceError），传 `gate_provider` + `gate_portfolio_ids`；`LiveEngine._maybe_update_gate` 在**每组合每交易日首根非 baseline bar** 重建 tracker，调用点必须在 `_release_signal_bar_deferred` **之前**；provider 异常保留旧 tracker（fail-open，绝不因取数失败变成永不开仓）。**运行中改门控配置需停止再启动会话**（配置只在 `build_engine` 读一次）。
-- **状态卡**：`GET /api/market-gate/status`（`core/services/market_gate_service.py`）实时算、不落库；进程内 **5 分钟缓存**（`(code, period)` 键，`refresh=true` 绕过）以避免每次进备选股池页都冻结通达信客户端。返回 `direction(-1/0/1/2)`、`strength`、`as_of`、`since`、`duration_bars`、`transitions`（最近 N 次转折）。前端入口（2026-11-18）：「备选股池」页顶部状态卡（基准下拉默认 `000001.SH`、刷新、方向/强度分/截至/持续与起始日/最近转折，**独立取数失败只影响卡片**）；组合编辑弹窗末组「市场多空门控」；「发起回测」弹窗三态下拉（`''`=跟随组合 / `'true'` / `'false'`，提交时非空才展开为布尔）。
+- **状态卡**：`GET /api/market-gate/status`（`core/services/market_gate_service.py`）**默认读 `live_gate_snapshots` 落库快照**（最近一次成功取数结果），不触发 TQ 取数；显式 `refresh=true` 才实时取数并回写快照（绕过进程内 5 分钟缓存，`(code, period)` 键）——避免每次进备选股池页都冻结通达信客户端。返回 `direction(-1/0/1/2)`、`strength`、`as_of`、`since`、`duration_bars`、`transitions`（最近 N 次转折）。取数失败带原因码 `reason_code ∈ gate_blocked / timeout / channel_unavailable / no_data`（`gate_blocked`=实盘优先时段暂停取数，`timeout`=取数超时，`channel_unavailable`=通道不可用，`no_data`=公式无输出）；有快照时回退展示快照并标注非实时。前端入口（2026-11-18）：「备选股池」页顶部状态卡（基准下拉默认 `000001.SH`、刷新、方向/强度分/截至/持续与起始日/最近转折，**独立取数失败只影响卡片**）；组合编辑弹窗末组「市场多空门控」；「发起回测」弹窗三态下拉（`''`=跟随组合 / `'true'` / `'false'`，提交时非空才展开为布尔）。
 - **已知边界**：①门控只拦新信号，已排队的次日 deferred 单与盘前集合竞价单**不重判**（沿用信号日已决策，与参考版对齐）；②默认基准仅**新建组合**取 `000001.SH`（上证指数），既有组合保留库值；③本地指数日线若有缺口（实证 `000985.CSI` 在 `2026-10-28~11-17` 缺失），状态靠 carry-forward 维持，卡片「数据截至」仍显示最新一根，**不报错也不拦截**。
+
+## 周期-执行语义与 14:50 提前收盘价（2026-11-23）
+
+**三条不变式**（回测与实盘同一套定义，判定内核 `core/engine/period_semantics.py`）：①信号在**策略自身周期**的 bar 上判定（1d 用日 bar、5m 用 5m bar、1w/1mon 用周期末 bar）；②执行在**下一根同级别 bar 的开盘**（1d → 次一交易日开盘，5m → 下一根 5m bar 开盘）；③回测与实盘共用同一套定义，禁止任一端另写周期/执行规则。
+
+- **`live.period_signal_mode`**（全局，默认 `period_close`）：`period_close` 周期末根确认后判定（默认，1d/1w/1mon 通用）/ `dynamic` 周期内逐日滚动、**仅 1w/1mon**、**只进预警不下单** / `pre_close_1450` **仅 1d**，且**全局配置写该值会被回退为 `period_close`**——14:50 只能由会话级 `live_sessions.advance_close_enabled` 显式开启。
+- **1w/1mon 注入门控**：只在**周期末交易日 15:05** 注入与判定（`is_period_end_day` 判定周期末）；启动补注入必须同时满足「今天就是周期末交易日」+「已过 15:05」双重条件，任一不满足不注入（绝不用未完成周期 bar 出信号）。
+- **非法组合直接 400**：`dynamic` 配非 1w/1mon、`pre_close_1450` 出现在全局配置、`dynamic` 与会话 14:50 开关并用等，在**策略保存**与**会话启动**两处均返回 HTTP 400，不落库、不启动（不做静默回退）。
+
+**14:50 提前收盘价（会话级开关，默认关闭，仅 `1d`）**：`live_sessions.advance_close_enabled`（默认 0）+ `advance_close_time`（默认 `14:51`，限定 14:51–14:59）；实际轮次不早于 14:52（需 14:52 起始 1m bar 的开盘价）。四时点：14:50 分钟 bar 闭合 → 14:51 判定价 → 14:52 执行 → 收盘后复核。
+
+- **判定价（fail-closed）**：优先原生 1m bar（该 code 标签**严格等于 14:51**）；逐 code 回落到快照合成；两条都取不到则**不下单**（记 `gate=advance_close / action=skip`），绝不猜价。
+- **执行价**：主取 14:52 起始的 1m bar `open`；该 bar 缺失且已 ≥14:53 → 回退 14:51 判定价。委托语义为**当日尾盘可成交**，不受 `risk_timing=next_day` 顺延；`1w/1mon` 不受该开关影响（仍走 15:05 收盘落定 + 次日执行）。
+- **判定留档与复核**：落库判定价 + 最终收盘价 + 是否反转 + 价格来源（native/snapshot）+ 滞后秒数；收盘后用最终收盘价复核。
+- **反转处置**：`strategies.reversal_disposition` ∈ `close_next_open`（**默认**，反转标的次日首根 bar 按开盘价减出）/ `hold`（只标记/告警，交给正常风控）。只撤**本轮新开仓**（历史仓不动）；同标同日已有卖出则本轮卖出**让位**；一字板/无成交记 `untradable` 顺延，上限 **10 个自然日**，超限告警后放弃。
+
+## 数据体检、K 线覆盖与公司行为审计（2026-11-23）
+
+- **实盘数据体检**（`core/services/live_data_health.py`）：启动体检与总览体检抽样上限 **30 只**（`_DATA_HEALTH_MAX_CODES=30`，时间预算 2s）。返回 `status_counts`（ok/stale/empty/error/timeout 分项计数）、`data_missing_count`（**只含 stale + empty**，不含 error/timeout、不含未抽查）、`truncated_reason`（`sample` 抽样截断 / `budget` 时间预算截断）、`warm_retry`（盘中不重读时 `skipped_reason="intraday"`）、逐只 `checks`（code/status/last_bar/reason_code）。**截断时只标记不判缺失**：`truncated_reason` 非空时不可把 `data_missing_count` 当全池缺数结论。历史字段 `missing_count` 保留兼容，新调用方用 `data_missing_count`。
+- **回测口径过期标记**：非 `exact` 复权口径或快照缺 `price_caliber_version` 的记录带派生标记 `caliber_stale` + 「不可直接比较」告警；区间末端未完成的周期 bar 带 `partial_period` 告警（按未完成 bar 算收益/回撤会失真）。两者都只是标记，不改数据、不改成交。
+- **K 线覆盖台账（P1-4，默认关闭）**：`backtest.kline_ledger.enabled`（默认 **false**）/ `path`（默认 `data/kline_ledger.sqlite3`）。开启后只在 `build_klines` 取数成功后**旁路**登记覆盖段/停牌空日/来源文件指纹，不跳过取数、不改返回结构；关闭时既有补数行为逐字不变。API：`GET /api/kline-coverage`、`GET /api/kline-coverage/status`、`GET /api/kline-coverage/plan`（只读，不写台账）。
+- **公司行为审计（默认开启，只读诊断）**：`POST /api/corporate-actions/audit` 用「不复权收盘价 vs 前复权收盘价」的断点检出疑似漏录事件（`dry_run=true` 只算不落库），`GET /api/corporate-actions/diagnostics` 回看诊断行。**只写诊断，绝不入账或改 `corporate_actions` 事件表**，仍需人工确认后录入。配置 `corporate_action_audit`：`enabled`（默认 **true**）、`lookback_days`（250）、`min_drop_pct`（1.0）、`match_tolerance_days`（5）、`max_codes`（0=不限）。交易时段按实盘优先原则返回 409。
 
 ## 时点股票池与多组合回测（2026-11-18）
 

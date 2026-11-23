@@ -82,7 +82,7 @@ shared/ — tq_iquant_shared 包，被 main 和 live 共同引用
 
 - **统一响应格式**：`{ "code": 0, "message": "ok", "data": {...} }`，code=0 成功，非 0 错误。前端 `ApiResponse<T>` 已定义于 [web/src/api/index.ts](web/src/api/index.ts)。
 - **股票代码**：统一带后缀（如 `000001.SZ`），通达信规范；校验见 [shared/tq_iquant_shared/stock_utils.py](shared/tq_iquant_shared/stock_utils.py)
-- **复权**：统一前复权
+- **复权**：回测默认 `exact`（不复权取数 + 不复权真实执行价 + 公司行为强制入账，与实盘同口径）；`front/back/dual` 仅历史兼容，`dual`＝信号不复权 + 后复权记账
 - **时区**：所有时间按 Asia/Shanghai 处理
 - **T+1**：回测强制 T+1，实盘实时查可用股数
 - **信号优先级**：风控信号（止损/止盈/移动止损）> 公式信号（OPEN/ADD/REDUCE/CLOSE）
