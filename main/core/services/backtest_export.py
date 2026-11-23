@@ -57,7 +57,7 @@ def build_csv(detail: dict, kind: str) -> str:
 
     if kind == "trades":
         writer.writerow(["时间", "策略", "信号", "代码", "方向", "价格", "数量",
-                         "金额", "佣金", "印花税", "过户费"])
+                         "金额(元)", "佣金(元)", "印花税(元)", "过户费(元)"])
         for t in detail.get("trades") or []:
             writer.writerow([
                 t.get("bar_time") or "",
@@ -70,8 +70,8 @@ def build_csv(detail: dict, kind: str) -> str:
             ])
     elif kind == "snapshots":
         # P1-6（2026-11-23）：内部口径统一小数；导出统一百分数，字段名带 (%)。
-        writer.writerow(["日期", "总资产", "现金", "持仓市值", "日收益(%)",
-                         "累计收益(%)", "基准值", "门控状态", "门控强度"])
+        writer.writerow(["日期", "总资产(元)", "现金(元)", "持仓市值(元)", "日收益(%)",
+                         "累计收益(%)", "基准值(元)", "门控状态", "门控强度"])
         for s in detail.get("snapshots") or []:
             writer.writerow([
                 s.get("snap_date") or "",
@@ -103,7 +103,7 @@ def build_csv(detail: dict, kind: str) -> str:
             ("年化超额(%)", _as_pct(ev.get("excess_annual_return"))),
             ("年化换手（双边，%）", _as_pct(ev.get("annual_turnover"))),
             ("交易成本/日均净值(%)", _as_pct(ev.get("total_cost_ratio"))),
-            ("交易成本合计", ex.get("total_cost")),
+            ("交易成本合计(元)", ex.get("total_cost")),
             ("成本拖累占比(%)", _as_pct(ex.get("cost_drag_ratio"))),
         ]
         writer.writerow(["指标", "数值"])

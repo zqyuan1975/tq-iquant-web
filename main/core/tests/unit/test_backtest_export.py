@@ -56,6 +56,8 @@ def test_build_csv_trades():
     assert text.startswith("\ufeff")           # Excel 友好 BOM
     lines = text.lstrip("\ufeff").splitlines()
     assert lines[0].split(",")[:5] == ["时间", "策略", "信号", "代码", "方向"]
+    # 金额类列统一带单位（价格/数量不是金额，不加）
+    assert lines[0].split(",")[7:11] == ["金额(元)", "佣金(元)", "印花税(元)", "过户费(元)"]
     assert "000001.SZ" in lines[1]
     assert "买入" in lines[1]
     assert "卖出" in lines[2]
@@ -66,7 +68,8 @@ def test_build_csv_trades():
 
 def test_build_csv_snapshots_and_metrics():
     snap = be.build_csv(_detail(), "snapshots").lstrip("\ufeff").splitlines()
-    assert snap[0].split(",")[0] == "日期"
+    assert snap[0].split(",")[:4] == ["日期", "总资产(元)", "现金(元)", "持仓市值(元)"]
+    assert "基准值(元)" in snap[0]
     assert snap[1].startswith("2026-07-30")
 
     metrics = be.build_csv(_detail(), "metrics").lstrip("\ufeff").splitlines()

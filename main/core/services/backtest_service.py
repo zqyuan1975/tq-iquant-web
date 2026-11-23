@@ -351,8 +351,10 @@ def _mark_partial_period_tails(klines: dict) -> List[str]:
             touched.add(p)
     if not touched:
         return []
+    # 文案与引擎行为对齐：这里只给末根打 partial_period 标记，**不剔除**该根
+    # （周期信号照算照显示）；区间末端没有后续 bar 可以成交，因此实际不产生成交。
     return [
-        "区间末端周期未完成，当期周期信号不计入统计（%s）"
+        "区间末端周期未完成：已标记，未剔除（末端无后续 bar 不成交）（%s）"
         % "、".join(sorted(touched))
     ]
 

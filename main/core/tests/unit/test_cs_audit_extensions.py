@@ -172,7 +172,10 @@ def test_csv_snapshots_headers_and_values_percent():
     }]}
     lines = build_csv(detail, "snapshots").strip().splitlines()
 
-    assert lines[0].endswith("日收益(%),累计收益(%),基准值,门控状态,门控强度")
+    # 金额类列统一带 (元)；收益率列带 (%)；门控列不带单位
+    assert lines[0].lstrip("\ufeff") == (
+        "日期,总资产(元),现金(元),持仓市值(元),日收益(%),"
+        "累计收益(%),基准值(元),门控状态,门控强度")
     assert lines[1].split(",")[4] == "1.0"
     assert lines[1].split(",")[5] == "5.0"
 
