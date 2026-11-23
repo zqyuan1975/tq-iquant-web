@@ -41,8 +41,10 @@ def _cursor_path() -> Path:
     override = str(os.environ.get("TQ_HEALTH_CURSOR_PATH") or "").strip()
     if override:
         return Path(override)
-    from core.config import app_root
-    return app_root() / "data" / "health_sample_cursor.json"
+    # 统一走 core.runtime.data_path：源码=main/data，打包/app_root=data 同锚，
+    # 不再单独按 app_root()/data 推算（否则源码态落仓库根 data/）。
+    from core.runtime import data_path
+    return data_path("health_sample_cursor.json")
 
 
 def _read_cursors() -> dict:
@@ -80,7 +82,7 @@ def rotate_sample(codes: List[str], limit: int, *, key: str = "default") -> dict
     limit = max(0, int(limit or 0))
     if total == 0 or limit <= 0:
         return {"sample": [], "total": total, "start": 0, "next": 0,
-                "wrapped": False}
+                "wrapped": False, "key": key}
     with _CURSOR_LOCK:
         cursors = _read_cursors()
         start = int(cursors.get(key) or 0) % total
@@ -91,7 +93,25 @@ def rotate_sample(codes: List[str], limit: int, *, key: str = "default") -> dict
         cursors[key] = nxt
         _write_cursors(cursors)
     return {"sample": sample, "total": total, "start": start,
-            "next": nxt, "wrapped": wrapped}
+            "next": nxt, "wrapped": wrapped, "key": key}
+
+
+def _advance_cursor(key: str, total: int, start: int, attempted: int) -> int:
+    """按**实际尝试数**推进轮换游标（预算提前 break 时不跳过错过的票）。
+
+    ``rotate_sample`` 先按 ``start+take`` 乐观前进；体检因预算/超时提前收尾时，
+    本轮真正尝试到的只有 ``attempted`` 只，若仍按 ``+30`` 前进，剩余 28 只会被
+    永久跳过。这里用实际尝试数覆盖游标，保证「多轮覆盖全池」对慢会话成立。
+    """
+    total = int(total or 0)
+    if total <= 0:
+        return 0
+    nxt = (int(start) + max(0, int(attempted))) % total
+    with _CURSOR_LOCK:
+        cursors = _read_cursors()
+        cursors[key] = nxt
+        _write_cursors(cursors)
+    return nxt
 
 
 # 「盘中」窗口（含盘前集合竞价）：此窗口内不做自动补齐，避免与实盘取数抢通道。
@@ -466,11 +486,22 @@ def check_data_health(dispatcher, codes, periods, *, now: datetime = None,
         truncated = True
         # 预算耗尽比抽样截断更「硬」：两者同时命中时报预算，提示可稍后重试。
         truncated_reason = "budget"
-    healthy = (not truncated) and all(
-        stats["stale"] == 0 and stats["empty"] == 0 and stats["error"] == 0
-        and stats["timeout"] == 0
+    # N3 修正：rotate_sample 乐观按 start+take 前进；本轮若因预算/超时提前收尾，
+    # 只按**实际尝试到的抽样数**推进，避免把没轮到的票永久跳过（慢会话尤其明显）。
+    if sample_rotation is not None:
+        attempted_in_sample = sum(1 for c in codes if c in attempted_codes)
+        sample_rotation["next"] = _advance_cursor(
+            sample_rotation.get("key") or f"data_health:{session_id or 'all'}",
+            sample_rotation.get("total") or 0,
+            sample_rotation.get("start") or 0, attempted_in_sample)
+        sample_rotation["attempted"] = attempted_in_sample
+    abnormal = any(
+        stats["stale"] or stats["empty"] or stats["error"] or stats["timeout"]
         for stats in per_period.values()
     )
+    # 「通过」= 全量校验且无异常；截断（抽样/预算）不算通过，但也不等于「异常」。
+    # 启动告警据 ``abnormal`` 判断是否为真异常，避免池 > 抽样上限时每次启动误报。
+    healthy = (not truncated) and not abnormal
     status_counts = {
         key: sum(int(stats.get(key, 0) or 0) for stats in per_period.values())
         for key in ("ok", "stale", "empty", "error", "timeout")
@@ -481,6 +512,7 @@ def check_data_health(dispatcher, codes, periods, *, now: datetime = None,
         "intraday": intraday,
         "expected_dates": {p: d.isoformat() for p, d in expected.items()},
         "healthy": healthy,
+        "abnormal": abnormal,
         "unavailable": bool(total_checks) and total_errors == total_checks,
         "truncated": truncated,
         "truncated_reason": truncated_reason,
@@ -638,17 +670,11 @@ def health_summary_text(health: dict) -> str:
     """体检结论 → 一句话（启动告警/通知复用）。
 
     口径：truncated / timeout / error / stale / empty **分别陈述**；只有 stale 或
-    empty（真有缺失嫌疑，且已做过预热重读）才提示去通达信补下载。
+    empty（真有缺失嫌疑，且已做过预热重读）才提示去通达信补下载。截断时以
+    「未完成/抽样」为主语，即使已验部分有异常也一并列出，不会被截断掩盖。
     """
     if health.get("unavailable"):
         return "数据体检失败：行情通道不可用，无法读取本地数据"
-    if health.get("truncated"):
-        reason = ("预算耗尽" if health.get("truncated_reason") == "budget"
-                  else "抽样截断")
-        return ("数据体检未完成：已验 %s/%s 只（%s，未验部分未校验、不计缺失，"
-                "可稍后重试）" % (
-                    health.get("checked_codes", 0),
-                    health.get("requested_codes", 0), reason))
     counts = health.get("status_counts") or {}
 
     def _count(key: str) -> int:
@@ -668,6 +694,23 @@ def health_summary_text(health: dict) -> str:
         parts.append("查询异常 %d 只（未计入缺失）" % error)
     if timeout_count:
         parts.append("取价超时 %d 只（未校验，不算缺失）" % timeout_count)
+    if health.get("truncated"):
+        reason = ("预算耗尽" if health.get("truncated_reason") == "budget"
+                  else "抽样截断")
+        text = ("数据体检未完成：已验 %s/%s 只（%s，未验部分未校验、不计缺失，"
+                "可稍后重试）" % (
+                    health.get("checked_codes", 0),
+                    health.get("requested_codes", 0), reason))
+        if parts:
+            text += "；已验部分：" + "，".join(parts)
+        if stale or empty:
+            shown = "、".join((health.get("data_missing_codes")
+                               or health.get("missing_codes") or [])[:10])
+            if shown:
+                text += "（%s%s）" % (
+                    shown, " 等" if (stale + empty) > 10 else "")
+            text += "；确有缺失的请在通达信客户端补下载对应周期数据"
+        return text
     if not parts:
         return "数据体检通过"
     text = "数据体检异常：" + "，".join(parts)

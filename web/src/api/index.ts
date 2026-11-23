@@ -3347,8 +3347,16 @@ export interface HealthSessionItem {
     unavailable?: boolean
     reason?: string | null
     codes_total?: number | null
+    codes_checked?: number | null
     periods?: Record<string, { stale: number; empty: number; total: number }>
     bad_total?: number
+    // stale+empty 才是真缺失；error/timeout/未抽查单列，未运行会话不适用
+    data_missing_count?: number
+    status_counts?: Record<string, number>
+    truncated?: boolean
+    in_progress?: boolean
+    incomplete?: boolean
+    not_running?: boolean
   }
   today: { orders: number; trades: number }
   alerts: { open_decisions: number; deferred_orders: number; pending_approvals: number }
@@ -3357,6 +3365,15 @@ export interface HealthSessionItem {
 export interface HealthProblem {
   level: 'warn' | 'error'
   text: string
+  // 三类视角同源：问题也带定位与处置元数据，供向导/总览/事件互相跳转。
+  kind?: string | null
+  session_id?: number | null
+  // 影响说明（原因看 text，影响看 impact）
+  impact?: string | null
+  // 本平台内可执行、执行后该条会消失的动作；为空则看 observe
+  fix?: { label: string; to: string } | null
+  // 平台无法代执行的外部处理方式（观察项）
+  observe?: string | null
 }
 
 export interface HealthOverview {

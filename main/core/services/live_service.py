@@ -3411,8 +3411,8 @@ def session_data_health(db: Session, session_id: int,
     """F2：会话数据体检 + 非盘中自动补齐（只读，不改交易语义）。
 
     - 运行中：用引擎 dispatcher/日历（与实盘同一通道口径）；
-    - 未运行：按会话引擎临时构造 dispatcher（tdx/ths 走本机 TQ；桥走 HTTP），
-      构造失败返回 available=False 与原因；
+    - 未运行/已停止：与健康总览同一判据，直接返回 ``not_running``，不构造
+      dispatcher、不连离线桥取数（避免直连 stopped 会话反复取价超时）；
     - 周期取会话内策略实际使用的 period（至少 1d），代码取组合股票池并集。
 
     **必须有预算**：默认 ``max_codes=30`` / ``time_budget_seconds=2s``，超预算置
@@ -3485,6 +3485,47 @@ def _collect_session_data_health(db: Session, session_id: int,
         for _pid, st in _session_strategies(db, session_id)
         if getattr(st, "period", None)
     }) or ["1d"]
+    # 与健康总览同一判据：非 running/stopping 直接返回 not_running，不构造
+    # dispatcher、不连离线桥取数（2026-11-23：UI 直连 stopped 会话导致
+    # 20:02–20:09 反复「单只取价超时：会话 2/会话 3」）。
+    if session.status not in ("running", "stopping"):
+        return {
+            "session_id": session_id,
+            "available": False,
+            "not_running": True,
+            "engine": session_engine(session),
+            "engine_running": (engines or {}).get(session_id) is not None,
+            "reason": "会话未运行，跳过数据体检（不需要）",
+            "periods_checked": periods,
+            "codes_total": None,
+            "codes_checked": 0,
+            "codes_unchecked": 0,
+            "timeout_count": 0,
+            "timeout_codes": [],
+            "status_counts": {},
+            "data_missing_count": 0,
+            "data_missing_codes": [],
+            "truncated": False,
+            "truncated_reason": None,
+            "warm_retry": {"enabled": False, "attempted": 0, "resolved": 0,
+                           "failed": 0, "skipped_reason": "not_running"},
+            "budget": {"max_codes": max_codes,
+                       "time_budget_seconds": time_budget_seconds},
+            "auto_fill": {"triggered": False, "reason": "not_running"},
+            "health": {
+                "version": "live_data_health_v1",
+                "checked_at": None,
+                "healthy": False,
+                "abnormal": False,
+                "unavailable": False,
+                "not_running": True,
+                "truncated": False,
+                "truncated_reason": None,
+                "periods": {},
+                "status_counts": {},
+                "checks": [],
+            },
+        }
     links = (
         db.query(LiveSessionPortfolio)
         .filter(LiveSessionPortfolio.session_id == session_id)
@@ -3653,26 +3694,36 @@ def session_channel_guard(db: Session, session_id: int,
     )
     checks = [
         {"key": "primary_configured", "ok": bool(primary.get("configured")),
+         "applicable": True,
          "label": "主通道已配置",
          "detail": primary.get("detail") or engine_key},
-        {"key": "client_online", "ok": bool(primary.get("online")),
+        # 未运行会话不判客户端/桥在线：没有引擎在跑就没有「在线」需求，硬判离线
+        # 只会制造假告警（2026-11-23：停止会话 02/03 仍报「客户端/桥在线」未通过）。
+        {"key": "client_online",
+         "ok": (not running_status) or bool(primary.get("online")),
+         "applicable": running_status,
          "label": "客户端/桥在线",
-         "detail": (("在线" if primary.get("online") else
-                     (primary.get("detail") or "离线"))
-                    + ("（%s）" % probe_note if probe_note else ""))},
+         "detail": ("未运行（不需要）" if not running_status else
+                    (("在线" if primary.get("online") else
+                      (primary.get("detail") or "离线"))
+                     + ("（%s）" % probe_note if probe_note else "")))},
         {"key": "engine_registered", "ok": (not running_status) or registered,
+         "applicable": running_status,
          "label": "运行态引擎已注册",
          "detail": ("未运行（不需要）" if not running_status else
                     ("已注册" if registered else "会话运行中但后端无引擎实例，需停止后重新启动"))},
-        # 停止态不判备用通道：未运行会话没有「切换」需求，硬判未配置会制造
-        # 假告警（2026-11-19：停止会话仍报「备用通道可用」失败）。
+        # 备用通道未配置是「配置选择」不是故障：运行中但没装备用通道只算「不适用」，
+        # 只有配置了却离线才算未通过（2026-11-19 停止态误报的延续修复）。
         {"key": "backup_ready",
-         "ok": (not running_status) or bool(backup and backup.get("online")),
+         "ok": (not running_status) or backup is None
+               or bool(backup.get("online")),
+         "applicable": running_status and backup is not None,
          "label": "备用通道可用",
          "detail": ("未运行（不需要）" if not running_status else
-                    ("未配置" if backup is None else
+                    ("未配置（可选，未启用备用通道）" if backup is None else
                      ("在线" if backup.get("online") else "离线")))},
         {"key": "pending_changes", "ok": pending_count == 0,
+         "applicable": True,
          "label": "无待生效配置",
          "detail": ("无" if pending_count == 0 else
                     "%d 项待下次启动生效" % pending_count)},
@@ -5526,7 +5577,10 @@ def start_session(
             time_budget_seconds=_START_HEALTH_TIME_BUDGET_SECONDS,
             session_id=session_id,
         )["health"]
-        if not health.get("healthy"):
+        # 只有「已检查项里确有异常」才告警/外发；抽样/预算截断（池 > 抽样上限时
+        # 必然发生）按「未完成/抽样」提示即可，不判异常——否则 251 只的池每次启动
+        # 都误报「实盘数据体检异常」（2026-11-23 实测 30 只全 ok 仍告警）。
+        if health.get("abnormal"):
             msg = health_summary_text(health)
             start_warnings.append(msg)
             _record_decision_event(
@@ -5539,6 +5593,9 @@ def start_session(
                         gate="data_health", trade_date=now_shanghai().date())
             except Exception:  # noqa: BLE001 — 通知失败不影响启动
                 logger.debug("data health notify failed", exc_info=True)
+        elif health.get("truncated"):
+            # 已检查项全 ok、只是没覆盖全池：仅作启动提示，不落告警、不外发。
+            start_warnings.append(health_summary_text(health))
     except Exception:  # noqa: BLE001 — 体检失败只告警，绝不阻断启动
         logger.warning("启动前数据体检失败 (session %s)", session_id, exc_info=True)
     setattr(engine, "start_warnings", start_warnings)

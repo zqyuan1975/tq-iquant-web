@@ -58,7 +58,27 @@ _OVERVIEW_PROBE_BUDGET_SECONDS = 6.0
 _OVERVIEW_PROBE_FLOOR_SECONDS = 0.5
 # 降级原因（前端/日志可直接展示）。
 REASON_OVERVIEW_BUDGET = "健康总览整体时间预算已耗尽，未做数据体检"
-REASON_DATA_TRUNCATED = "体检超出预算，仅校验部分标的"
+REASON_DATA_TRUNCATED = "体检为抽样校验（受抽样上限与时间预算限制，未覆盖的标的不计缺失）"
+# 问题 → 影响（向导/总览统一展示：原因看 text，影响看这里，动作看 fix/observe）。
+_PROBLEM_IMPACTS = {
+    "engine_unregistered": "会话显示运行中但后端没有引擎实例，不会产生新信号或下单",
+    "bridge_offline": "下单与回执通道中断，策略信号无法执行",
+    "channel_unavailable": "行情/交易通道不可用，实盘无法正常取数与下单",
+    "channel_guard": "通道就绪度不足，启动或主备切换可能失败",
+    "probe_degraded": "通道状态可能滞后，本项为观测提示、非故障",
+    "data_unavailable": "无法判断数据新鲜度，选股可能使用旧数据",
+    "data_incomplete": "本次抽样未覆盖全部标的，属未验完、非数据缺失",
+    "data_missing": "缺失标的不会进入选股/信号，回测与实盘结果会偏差",
+    "data_unverified": "本批标的未验成（查询异常/超时），不代表本地缺数据",
+    "open_decisions": "告警堆积会掩盖新问题，盘后难以核对",
+    "deferred_orders": "顺延委托未放行，可能错过交易时点",
+    "pending_approvals": "待审批单积压，超时后会过期被拒",
+    "disk_low": "磁盘不足会自动跳过备份，故障时缺少恢复点",
+    "backup_pending": "今日无备份，故障时缺少恢复点",
+    "backup_failed": "最近备份不可用，故障时缺少恢复点",
+    "watchdog_alarms": "引擎异常未被处置，可能持续停滞",
+    "watchdog_down": "引擎卡死不会被自动检测与告警",
+}
 
 
 def _safe(label: str, fn, default=None):
@@ -92,6 +112,8 @@ def _session_item(db, session: LiveSession, now: datetime,
     """
     sid = int(session.id)
     engine = live_service.ENGINES.get(sid)
+    # 未运行会话没有引擎在跑：不探数据体检（省预算），也不产生「未完成/缺失」条目。
+    running = session.status in ("running", "stopping")
 
     bridge = _safe("bridge_status(%s)" % sid,
                    lambda: live_service.bridge_status(sid, session.status, engine),
@@ -109,7 +131,17 @@ def _session_item(db, session: LiveSession, now: datetime,
     checks = (guard or {}).get("checks") or []
     failed = [c.get("label") for c in checks if not c.get("ok")]
 
-    if data_budget is not None and data_budget <= 0:
+    if not running:
+        # 停止态：没有引擎在跑，数据新鲜度不适用（不是「有缺失/陈旧」）。
+        data = {"available": False, "healthy": False, "unavailable": False,
+                "reason": "", "codes_total": None, "codes_checked": None,
+                "periods": {}, "bad_total": 0, "data_missing_count": 0,
+                "status_counts": {k: 0 for k in
+                                  ("ok", "stale", "empty", "error", "timeout")},
+                "truncated": False, "in_progress": False,
+                "incomplete": False, "not_running": True}
+        data_health = None
+    elif data_budget is not None and data_budget <= 0:
         data_health = {"available": False, "incomplete": True,
                        "skipped": True, "reason": REASON_OVERVIEW_BUDGET}
     else:
@@ -121,7 +153,6 @@ def _session_item(db, session: LiveSession, now: datetime,
                                 db, sid, live_service.ENGINES, auto_fill=False,
                                 max_codes=_OVERVIEW_DATA_HEALTH_MAX_CODES,
                                 time_budget_seconds=budget))
-    data = {"available": False, "incomplete": False}
     if data_health:
         raw = data_health.get("health") or {}
         periods = {}
@@ -136,10 +167,12 @@ def _session_item(db, session: LiveSession, now: datetime,
         truncated = bool(data_health.get("truncated") or raw.get("truncated"))
         reason = data_health.get("reason")
         if truncated and not skipped and not in_progress:
-            reason = "%s（已校验 %s/%s 只，其余未校验）" % (
+            # 明确这是「抽样没覆盖到」，不是「数据缺失」；未校验部分不补下载。
+            reason = "%s（已校验 %s/%s 只，其余未校验、不计缺失，可稍后重试）" % (
                 REASON_DATA_TRUNCATED,
                 data_health.get("codes_checked", raw.get("checked_codes")),
                 data_health.get("codes_total"))
+        status_counts = raw.get("status_counts") or {}
         data = {
             "available": bool(data_health.get("available", True)),
             "healthy": bool(raw.get("healthy")),
@@ -150,9 +183,16 @@ def _session_item(db, session: LiveSession, now: datetime,
                                              raw.get("checked_codes")),
             "periods": periods,
             "bad_total": sum(p["stale"] + p["empty"] for p in periods.values()),
+            # 与数据体检同一口径：stale/empty 才是真缺失，error/timeout/未抽查不算。
+            "data_missing_count": int(raw.get("data_missing_count")
+                                      or sum(p["stale"] + p["empty"]
+                                             for p in periods.values())),
+            "status_counts": {k: int(status_counts.get(k) or 0) for k in
+                              ("ok", "stale", "empty", "error", "timeout")},
             "truncated": truncated,
             "in_progress": in_progress,
             "incomplete": bool(in_progress or skipped or truncated),
+            "not_running": False,
         }
 
     start = datetime(now.year, now.month, now.day)
@@ -326,66 +366,142 @@ def overview(session_factory=None, now: Optional[datetime] = None) -> dict:
         for key in totals:
             totals[key] += int(item["alerts"][key])
 
-    problems: List[Dict[str, str]] = []
+    problems: List[Dict[str, Any]] = []
 
-    def _add(level: str, text: str) -> None:
-        problems.append({"level": level, "text": text})
+    def _add(level: str, text: str, *, kind: str = None,
+             session_id: int = None, fix: dict = None,
+             observe: str = None) -> None:
+        """登记一条总览问题。
+
+        ``fix`` 必须是本平台内**真能执行并让该条消失**的动作
+        （{"label","to"}，to 为站内路由）；做不到的（需在通达信/客户端等外部
+        软件操作、或进程级不可控）一律给 ``observe`` 写清外部处理方式，
+        前端会把它们与「可修复故障」分开呈现，避免向导里放摆设按钮。
+        """
+        problems.append({
+            "level": level, "text": text, "kind": kind,
+            "session_id": session_id,
+            "impact": _PROBLEM_IMPACTS.get(kind),
+            "fix": fix, "observe": observe,
+        })
 
     for item in items:
         running = item["status"] in ("running", "stopping")
+        sid = item["id"]
         if running and not item["registered"]:
             _add(LEVEL_ERROR, "会话「%s」状态为 %s 但引擎未注册"
-                 % (item["name"], item["status"]))
+                 % (item["name"], item["status"]),
+                 kind="engine_unregistered", session_id=sid,
+                 fix={"label": "停止后重新启动该会话", "to": "/live"})
         bridge_online = (item["bridge"] or {}).get("online")
         if running and bridge_online is False:
-            _add(LEVEL_ERROR, "会话「%s」交易通道离线" % item["name"])
+            _add(LEVEL_ERROR, "会话「%s」交易通道离线" % item["name"],
+                 kind="bridge_offline", session_id=sid,
+                 observe="在对应交易客户端/桥进程确认已登录并监听端口；"
+                         "外部进程平台不代启，恢复后该条自动消失")
         if running and not item["channel_ok"]:
-            _add(LEVEL_ERROR, "会话「%s」主通道不可用" % item["name"])
-        if item["channel_guard"]["failed"]:
-            _add(LEVEL_WARN, "会话「%s」通道检查未通过：%s" % (
-                item["name"], "、".join(str(x) for x in
-                                       item["channel_guard"]["failed"][:4])))
+            _add(LEVEL_ERROR, "会话「%s」主通道不可用" % item["name"],
+                 kind="channel_unavailable", session_id=sid,
+                 observe="核对系统配置中的通道地址，并在客户端完成登录；"
+                         "改配置后需停止并重新启动会话（配置待生效项会提示）")
+        data = item["data"]
+        # 未运行会话没有引擎/取数需求：通道检查与数据体检不产生「需关注」条目
+        # （2026-11-23：02/03 已 stopped 仍报「客户端/桥在线」「体检未完成 0/150」）。
+        guard = item["channel_guard"]
+        if running and guard["failed"]:
+            failed = [str(x) for x in guard["failed"][:4]]
+            only_restart = all(
+                c.get("key") in ("pending_changes", "engine_registered")
+                for c in (guard.get("checks") or [])
+                if c.get("ok") is False)
+            _add(LEVEL_WARN, "会话「%s」通道检查未通过：%s"
+                 % (item["name"], "、".join(failed)),
+                 kind="channel_guard", session_id=sid,
+                 fix=({"label": "停止后重新启动会话（应用待生效配置）",
+                       "to": "/live"} if only_restart else None),
+                 observe=(None if only_restart else
+                          "按通道检查明细逐项核对；客户端在线/备通道属外部或配置项，"
+                          "修好后重跑通道检查即可消失"))
         chan = item.get("channel") or {}
-        if chan.get("probe_degraded") and chan.get("probe_note"):
+        if running and chan.get("probe_degraded") and chan.get("probe_note"):
             # 探活没探成 ≠ 通道离线：如实标注，避免被误读为故障。
             _add(LEVEL_WARN, "会话「%s」通道探活降级：%s"
-                 % (item["name"], chan.get("probe_note")))
-        data = item["data"]
-        if data.get("unavailable"):
+                 % (item["name"], chan.get("probe_note")),
+                 kind="probe_degraded", session_id=sid,
+                 observe="探活超时后沿用上次已知状态，稍后自动重试；无需操作")
+        if running and data.get("unavailable"):
             _add(LEVEL_WARN, "会话「%s」数据体检不可用：%s"
-                 % (item["name"], data.get("reason") or "行情通道不可用"))
-        elif data.get("incomplete"):
+                 % (item["name"], data.get("reason") or "行情通道不可用"),
+                 kind="data_unavailable", session_id=sid,
+                 observe="先修复行情通道（客户端/桥在线）后在实盘工作台重跑数据体检")
+        elif running and data.get("incomplete"):
             _add(LEVEL_WARN, "会话「%s」数据体检未完成：%s"
-                 % (item["name"], data.get("reason") or "未校验完整"))
-        elif data.get("available") and not data.get("healthy"):
-            _add(LEVEL_WARN, "会话「%s」数据缺失/陈旧 %d 项"
-                 % (item["name"], int(data.get("bad_total") or 0)))
-        if item["alerts"]["open_decisions"]:
+                 % (item["name"], data.get("reason") or "未校验完整"),
+                 kind="data_incomplete", session_id=sid,
+                 observe="抽样校验未覆盖全部标的（受抽样上限与时间预算限制），"
+                         "未校验部分不计缺失、无需补下载；如需全量核对请在通达信客户端人工核验")
+        elif running and data.get("available") and not data.get("healthy"):
+            bad = int(data.get("bad_total") or 0)
+            counts = data.get("status_counts") or {}
+            err = int(counts.get("error") or 0)
+            timeout_count = int(counts.get("timeout") or 0)
+            if bad:
+                _add(LEVEL_WARN, "会话「%s」数据缺失/陈旧 %d 项"
+                     % (item["name"], bad),
+                     kind="data_missing", session_id=sid,
+                     observe="在通达信客户端补下载对应周期数据（外部操作），"
+                             "完成后重跑数据体检该条消失")
+            elif err or timeout_count:
+                # 零缺失时不写「缺失」：查不到/超时只是没验成，不是数据缺失。
+                _add(LEVEL_WARN, "会话「%s」数据体检查询异常 %d 只、"
+                     "取价超时 %d 只（未计入缺失）"
+                     % (item["name"], err, timeout_count),
+                     kind="data_unverified", session_id=sid,
+                     fix={"label": "重跑数据体检", "to": "/live"})
+        # 未运行会话不进入「需关注」：告警/顺延/待审批计数仍在会话表与关键事件里
+        # 如实可见（同一份事实），但停止态没有可执行的部署修复动作，不作为故障项。
+        if running and item["alerts"]["open_decisions"]:
             _add(LEVEL_WARN, "会话「%s」有 %d 条未处理告警"
-                 % (item["name"], item["alerts"]["open_decisions"]))
-        if item["alerts"]["deferred_orders"]:
+                 % (item["name"], item["alerts"]["open_decisions"]),
+                 kind="open_decisions", session_id=sid,
+                 fix={"label": "去决策页签批量确认", "to": "/live?tab=decisions"})
+        if running and item["alerts"]["deferred_orders"]:
             _add(LEVEL_WARN, "会话「%s」有 %d 笔待放行顺延委托"
-                 % (item["name"], item["alerts"]["deferred_orders"]))
-        if item["alerts"]["pending_approvals"]:
+                 % (item["name"], item["alerts"]["deferred_orders"]),
+                 kind="deferred_orders", session_id=sid,
+                 fix={"label": "去委托页签处理顺延", "to": "/live?tab=orders"})
+        if running and item["alerts"]["pending_approvals"]:
             _add(LEVEL_WARN, "会话「%s」有 %d 笔待审批委托"
-                 % (item["name"], item["alerts"]["pending_approvals"]))
+                 % (item["name"], item["alerts"]["pending_approvals"]),
+                 kind="pending_approvals", session_id=sid,
+                 fix={"label": "前往审批", "to": "/live?tab=approvals"})
 
     if not disk["ok"]:
         _add(LEVEL_WARN, "磁盘剩余 %s MB 低于保护阈值 %s MB"
-             % (disk["free_mb"], disk["min_free_mb"]))
+             % (disk["free_mb"], disk["min_free_mb"]),
+             kind="disk_low",
+             observe="清理磁盘后可自动恢复；磁盘不足时自动备份会跳过（外部操作）")
     if backup_status.get("enabled") and not backup_status.get("auto_done_today"):
         _add(LEVEL_WARN, "今日自动备份尚未完成（计划 %s）"
-             % (backup_status.get("daily_at") or "—"))
+             % (backup_status.get("daily_at") or "—"),
+             kind="backup_pending",
+             fix={"label": "去系统页手动备份", "to": "/system"})
     last_auto = backup_status.get("last_auto") or {}
     if last_auto.get("status") == backup_service.STATUS_FAILED:
         _add(LEVEL_WARN, "最近一次自动备份失败：%s"
-             % (last_auto.get("message") or "未知原因"))
+             % (last_auto.get("message") or "未知原因"),
+             kind="backup_failed",
+             fix={"label": "去系统页手动备份", "to": "/system"})
     if watchdog.get("active_alarms"):
         _add(LEVEL_WARN, "引擎 watchdog 有 %d 条活跃告警"
-             % len(watchdog["active_alarms"]))
+             % len(watchdog["active_alarms"]),
+             kind="watchdog_alarms",
+             observe="在实盘工作台查看会话告警；持续告警通常需停止并重新启动会话")
     running_count = sum(1 for s in items if s["status"] in ("running", "stopping"))
     if running_count and not watchdog.get("running"):
-        _add(LEVEL_WARN, "存在运行中会话但 watchdog 未运行")
+        _add(LEVEL_WARN, "存在运行中会话但 watchdog 未运行",
+             kind="watchdog_down",
+             observe="watchdog 随 Core 进程启动；需在服务器侧重启 Core（平台不代启进程）")
 
     level = LEVEL_OK
     if any(p["level"] == LEVEL_ERROR for p in problems):

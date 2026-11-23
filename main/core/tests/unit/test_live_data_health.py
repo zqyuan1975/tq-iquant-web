@@ -425,3 +425,66 @@ def test_check_data_health_rotates_sample_across_pool(tmp_path, monkeypatch):
     assert first["checked_codes"] == second["checked_codes"] == 3
 
 
+def test_sample_truncation_all_checked_ok_is_not_abnormal(tmp_path, monkeypatch):
+    """启动体检：池 > 抽样上限必然 truncated，但已验全 ok 不算异常（不外发告警）。"""
+    monkeypatch.setattr(h, "_cursor_path", lambda: tmp_path / "cursor.json")
+    codes = [f"60000{i}.SH" for i in range(251)]
+    disp = _Disp({c: _bars(date(2026, 11, 18)) for c in codes[:30]})
+    health = h.check_data_health(disp, codes, ["1d"], now=_NOW_OFF, calendar=_CAL,
+                                 max_codes=30, time_budget_seconds=30.0,
+                                 session_id=1)
+    assert health["truncated"] is True
+    assert health["truncated_reason"] == "sample"
+    assert health["status_counts"]["ok"] == 30
+    assert health["abnormal"] is False
+    assert health["healthy"] is False  # 未全量校验，仍不报「通过」
+    text = h.health_summary_text(health)
+    assert "未完成" in text and "已验 30/251" in text
+    assert "补下载" not in text
+
+
+def test_truncated_with_real_fault_still_abnormal(tmp_path, monkeypatch):
+    """截断但已验部分有 stale：仍判异常，文案两者都写（不被截断掩盖）。"""
+    monkeypatch.setattr(h, "_cursor_path", lambda: tmp_path / "cursor.json")
+    codes = ["600000.SH", "000001.SZ", "600519.SH"]
+    disp = _Disp({
+        "600000.SH": _bars(date(2026, 11, 18)),
+        "000001.SZ": _bars(date(2026, 11, 17)),  # stale，预热重读仍 stale
+    })
+    health = h.check_data_health(disp, codes, ["1d"], now=_NOW_OFF, calendar=_CAL,
+                                 max_codes=2, time_budget_seconds=30.0)
+    assert health["truncated"] is True
+    assert health["abnormal"] is True
+    assert health["healthy"] is False
+    text = h.health_summary_text(health)
+    assert "未完成" in text and "陈旧 1 只" in text and "补下载" in text
+
+
+def test_cursor_advances_by_actual_attempts_on_budget_break(tmp_path, monkeypatch):
+    """预算提前 break：游标按实际尝试数推进，没轮到的票后续仍会被轮到。"""
+    monkeypatch.setattr(h, "_cursor_path", lambda: tmp_path / "cursor.json")
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(h._time, "monotonic", lambda: clock["t"])
+
+    class _Slow(_Disp):
+        def query_quote(self, code, period="1d", count=1):
+            self.calls.append((code, period, count))
+            clock["t"] += 1.0
+            return _bars(date(2026, 11, 18))
+
+    codes = [f"60000{i}.SH" for i in range(4)]
+    health = h.check_data_health(_Slow(), codes, ["1d"], now=_NOW_OFF,
+                                 calendar=_CAL, max_codes=3,
+                                 time_budget_seconds=1.5, session_id=9)
+    assert health["truncated_reason"] == "budget"
+    assert health["checked_codes"] == 2
+    assert health["sample_rotation"]["attempted"] == 2
+    # 游标按实际尝试数（2）前进，而不是抽样步长（4）
+    import json
+    cur = json.loads((tmp_path / "cursor.json").read_text())
+    assert cur["data_health:9"] == 2
+    # 下一轮从下标 2 开始，被跳过的两只不会漏检
+    assert h.rotate_sample(codes, 4, key="data_health:9")["sample"][0] == codes[2]
+
+
+

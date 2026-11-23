@@ -46,15 +46,32 @@ function onlineText(v: boolean | null | undefined): string {
   return '—'
 }
 
+// 数据新鲜度口径：未运行=不适用；缺失只看 stale+empty；截断/未完成单独表述，
+// 绝不把「未校验」写成「有缺失/陈旧」。
 function dataText(s: HealthSessionItem): string {
+  if (s.data.not_running) return '未运行（不需要）'
   if (s.data.unavailable) return '不可用'
   if (!s.data.available) return '—'
-  return s.data.healthy ? '正常' : '有缺失/陈旧'
+  if (Number(s.data.bad_total || 0) > 0) return '有缺失/陈旧'
+  if (s.data.incomplete) return '未校验（抽样）'
+  return '正常'
 }
 
 function dataBadge(s: HealthSessionItem): string {
+  if (s.data.not_running) return 'badge-gray'
   if (s.data.unavailable || !s.data.available) return 'badge-gray'
-  return s.data.healthy ? 'badge-green' : 'badge-red'
+  if (Number(s.data.bad_total || 0) > 0) return 'badge-red'
+  if (s.data.incomplete) return 'badge-blue'
+  return 'badge-green'
+}
+
+/** 抽样未覆盖时补一行「已校验 X/Y 只」，说明是没验完而不是缺数据。 */
+function dataNote(s: HealthSessionItem): string {
+  if (s.data.not_running) return ''  // 徽标已写「未运行（不需要）」
+  if (s.data.incomplete && s.data.codes_total) {
+    return `已校验 ${s.data.codes_checked ?? 0}/${s.data.codes_total} 只，其余未校验、不计缺失`
+  }
+  return ''
 }
 
 interface GuardCheck {
@@ -62,6 +79,7 @@ interface GuardCheck {
   label?: string
   ok?: boolean
   detail?: string
+  applicable?: boolean
 }
 
 /** 后端在 channel_guard 内返回逐项 checks（5 项）；旧数据无该字段时返回空数组。 */
@@ -191,7 +209,8 @@ onUnmounted(() => {
               <b :style="{ color: alertTotal ? 'var(--red)' : 'var(--ink)' }">{{ alertTotal }}</b>
             </div>
             <i class="hs-sub" :title="`未处理告警 ${data.alert_totals.open_decisions} · 顺延 ${data.alert_totals.deferred_orders} · 待审批 ${data.alert_totals.pending_approvals}`">
-              未处理告警 {{ data.alert_totals.open_decisions }} · 顺延 {{ data.alert_totals.deferred_orders }} ·
+              <RouterLink to="/events?ack_status=open" class="alert-link">未处理告警 {{ data.alert_totals.open_decisions }}</RouterLink>
+              · 顺延 {{ data.alert_totals.deferred_orders }} ·
               <RouterLink to="/live?tab=approvals" class="alert-link">待审批 {{ data.alert_totals.pending_approvals }}</RouterLink>
             </i>
           </div>
@@ -220,7 +239,13 @@ onUnmounted(() => {
             <span class="badge" :class="p.level === 'error' ? 'badge-red' : 'badge-blue'">
               {{ p.level === 'error' ? '异常' : '注意' }}
             </span>
-            <span>{{ p.text }}</span>
+            <span>
+              {{ p.text }}
+              <RouterLink v-if="p.fix" :to="p.fix.to" class="alert-link">
+                {{ p.fix.label }} →
+              </RouterLink>
+              <i v-else-if="p.observe" class="hs-sub">（需外部处理：{{ p.observe }}）</i>
+            </span>
           </li>
         </ul>
       </div>
@@ -261,13 +286,30 @@ onUnmounted(() => {
                   <div v-if="s.data.unavailable" class="period-line">
                     {{ s.data.reason || '行情通道不可用' }}
                   </div>
+                  <div v-if="dataNote(s)" class="period-line">{{ dataNote(s) }}</div>
                   <div v-for="[p, v] in periodEntries(s)" :key="p" class="period-line">
                     {{ p }}：陈旧 {{ v.stale }} / 空 {{ v.empty }} / 共 {{ v.total }}
                   </div>
                 </td>
                 <td class="num">{{ s.today.orders }} / {{ s.today.trades }}</td>
-                <td class="num">{{ s.alerts.open_decisions }}</td>
-                <td class="num">{{ s.alerts.deferred_orders }}</td>
+                <td class="num">
+                  <RouterLink
+                    v-if="s.alerts.open_decisions"
+                    :to="`/events?ack_status=open&session_id=${s.id}`"
+                    class="alert-link"
+                    title="在关键事件检索中定位该会话的未处理事件"
+                  >{{ s.alerts.open_decisions }}</RouterLink>
+                  <span v-else>0</span>
+                </td>
+                <td class="num">
+                  <RouterLink
+                    v-if="s.alerts.deferred_orders"
+                    to="/live?tab=orders"
+                    class="alert-link"
+                    title="前往实盘工作台处理顺延委托"
+                  >{{ s.alerts.deferred_orders }}</RouterLink>
+                  <span v-else>0</span>
+                </td>
                 <td class="num">
                   <RouterLink
                     v-if="s.alerts.pending_approvals"
@@ -302,9 +344,11 @@ onUnmounted(() => {
             </span>
           </div>
           <ul v-if="guardChecks(s).length" class="guard-list">
-            <li v-for="c in guardChecks(s)" :key="c.key || c.label" :class="{ bad: c.ok === false }">
-              <span class="badge" :class="c.ok ? 'badge-green' : 'badge-red'">
-                {{ c.ok ? '通过' : '未通过' }}
+            <li v-for="c in guardChecks(s)" :key="c.key || c.label"
+                :class="{ bad: c.ok === false && c.applicable !== false }">
+              <span class="badge"
+                    :class="c.applicable === false ? 'badge-gray' : (c.ok ? 'badge-green' : 'badge-red')">
+                {{ c.applicable === false ? '不适用' : (c.ok ? '通过' : '未通过') }}
               </span>
               <span class="guard-label">{{ c.label || c.key || '—' }}</span>
               <span class="guard-detail">{{ c.detail || '—' }}</span>

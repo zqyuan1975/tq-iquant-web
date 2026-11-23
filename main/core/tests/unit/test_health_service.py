@@ -117,11 +117,48 @@ def test_overview_empty_is_ok(session_factory, patched):
     assert res["disk"]["ok"] is True
 
 
+def test_problem_metadata_marks_fixable_vs_observation(
+        session_factory, patched):
+    """向导只列「站内能修好」的项；外部处理项带 observe、不给按钮。"""
+    db = session_factory()
+    sess = _session(db, status="running")
+    sid = sess.id
+    db.close()
+    patched.setattr(hs.live_service, "ENGINES", {sid: object()})
+    patched.setattr(hs.live_service, "session_data_health",
+                    lambda db, sid, engines, auto_fill=True, **kw: {
+                        "available": True, "truncated": True,
+                        "codes_total": 251, "codes_checked": 22,
+                        "health": {"healthy": False,
+                                   "status_counts": {"ok": 22},
+                                   "periods": {"1d": {"stale": 0, "empty": 0,
+                                                      "total": 22}}}})
+    patched.setattr(hs.live_service, "session_decisions",
+                    lambda db, sid, ack_status=None: {
+                        "ack_summary": {"open": 5, "acked": 0}})
+
+    res = hs.overview(session_factory=session_factory, now=NOW)
+    by_kind = {p["kind"]: p for p in res["problems"]}
+    alerts = by_kind["open_decisions"]
+    assert alerts["fix"] == {"label": "去决策页签批量确认",
+                             "to": "/live?tab=decisions"}
+    assert alerts["session_id"] == sid
+    assert alerts["impact"] and alerts["observe"] is None
+    incomplete = by_kind["data_incomplete"]
+    assert incomplete["fix"] is None       # 抽样未覆盖不是故障，不给按钮
+    assert incomplete["observe"] and incomplete["impact"]
+
+    assert "缺失/陈旧" not in " ".join(p["text"] for p in res["problems"])
+
+
 def test_overview_counts_today_alerts_and_warns(session_factory, patched):
     db = session_factory()
-    sess = _session(db)
+    sess = _session(db, status="running")
+    sid = sess.id
     _add_activity(db, sess.id)
     db.close()
+    # 运行中有引擎实例：告警/顺延/待审批才会作为可执行的「需关注」项输出。
+    patched.setattr(hs.live_service, "ENGINES", {sid: object()})
     patched.setattr(hs.live_service, "session_decisions",
                     lambda db, sid, ack_status=None: {
                         "ack_summary": {"open": 3, "acked": 1}})
@@ -226,7 +263,7 @@ def test_health_overview_api(monkeypatch):
 def test_truncated_data_health_marks_session_incomplete(session_factory, patched):
     """体检超预算截断：会话标记未完成、原因带已校验只数，顶层 partial 标明。"""
     db = session_factory()
-    _session(db)
+    _session(db, status="running")
     db.close()
     patched.setattr(hs.live_service, "session_data_health",
                     lambda db, sid, engines, auto_fill=True, **kw: {
@@ -251,8 +288,8 @@ def test_overview_total_budget_degrades_remaining_sessions(
         session_factory, patched, monkeypatch):
     """整体预算耗尽后，后续会话不再发起体检，只降级标注原因。"""
     db = session_factory()
-    _session(db, name="会话A")
-    _session(db, name="会话B")
+    _session(db, name="会话A", status="running")
+    _session(db, name="会话B", status="running")
     db.close()
     clock = {"t": 1000.0}
     monkeypatch.setattr(hs, "_monotonic", lambda: clock["t"])
@@ -284,8 +321,8 @@ def test_overview_hard_deadline_stops_probe_and_data_of_later_sessions(
         session_factory, patched, monkeypatch):
     """硬截止：整体预算被前一个会话吃满后，后续会话零探活预算且跳过体检。"""
     db = session_factory()
-    _session(db, name="会话A")
-    _session(db, name="会话B")
+    _session(db, name="会话A", status="running")
+    _session(db, name="会话B", status="running")
     db.close()
     clock = {"t": 1000.0}
     monkeypatch.setattr(hs, "_monotonic", lambda: clock["t"])
@@ -345,7 +382,7 @@ def test_overview_global_channel_probe_bounded_by_tail_budget(
 def test_in_progress_data_health_marks_incomplete(session_factory, patched):
     """同一会话体检已在跑：总览降级为未完成，不重复取数。"""
     db = session_factory()
-    _session(db)
+    _session(db, status="running")
     db.close()
     called = []
 
@@ -401,7 +438,7 @@ def test_overview_probes_channel_once_and_guard_reuses_result(
 def test_overview_surfaces_probe_degradation(session_factory, patched):
     """探活超时沿用上次结果时，总览如实标注（不能静默当成离线/正常）。"""
     db = session_factory()
-    _session(db, engine="goldminer")
+    _session(db, engine="goldminer", status="running")
     db.close()
 
     def _health(db, sid, engines, probe_deadline=None):
@@ -419,3 +456,110 @@ def test_overview_surfaces_probe_degradation(session_factory, patched):
     assert item["channel"]["probe_degraded"] is True
     assert item["channel"]["probe_note"] == "探活超时，沿用上次结果"
     assert any("探活超时，沿用上次结果" in p["text"] for p in res["problems"])
+
+
+def test_stopped_session_has_no_channel_or_data_problems(
+        session_factory, patched):
+    """停止态会话不产出通道检查/数据体检的「需关注」条目，也不发起体检。"""
+    db = session_factory()
+    _session(db, name="会话B", status="stopped")
+    db.close()
+    called = []
+    patched.setattr(hs.live_service, "session_data_health",
+                    lambda *a, **kw: called.append(1) or {"available": True,
+                                                          "health": {}})
+    # 即使底层检查仍报 ok=False（旧口径），停止态也不该进 problems
+    patched.setattr(hs.live_service, "session_channel_guard",
+                    lambda db, sid, engines, probe_deadline=None, health=None: {
+                        "checks": [{"key": "client_online", "ok": False,
+                                    "label": "客户端/桥在线",
+                                    "detail": "未运行（不需要）"}]})
+    # 停止态仍有历史未处理告警（02=47/03=19 的真实情形）：计数如实进会话表，
+    # 但不作为「需关注」故障项。
+    patched.setattr(hs.live_service, "session_decisions",
+                    lambda db, sid, ack_status=None: {
+                        "ack_summary": {"open": 5, "acked": 0}})
+
+    res = hs.overview(session_factory=session_factory, now=NOW)
+    item = res["sessions"][0]
+    assert item["data"]["not_running"] is True
+    assert item["data"]["periods"] == {}
+    assert item["alerts"]["open_decisions"] == 5
+    assert called == []
+    texts = " ".join(p["text"] for p in res["problems"])
+    assert "通道检查未通过" not in texts
+    assert "数据体检未完成" not in texts
+    assert "缺失/陈旧" not in texts
+    assert "未处理告警" not in texts
+
+
+def test_collect_data_health_returns_not_running_without_fetch(
+        session_factory, monkeypatch):
+    """直连 data-health 端点：非 running 直接返回 not_running，不构造 dispatcher/不取数。"""
+    db = session_factory()
+    sess = _session(db, status="stopped")
+    sid = sess.id
+    called = []
+
+    def _boom(*a, **kw):
+        called.append(1)
+        raise AssertionError("停止态不应构造 dispatcher 取数")
+
+    monkeypatch.setattr(hs.live_service, "make_dispatcher", _boom)
+    payload = hs.live_service._collect_session_data_health(
+        db, sid, {}, True, None, 30, 2.0)
+    db.close()
+    assert payload["not_running"] is True
+    assert payload["available"] is False
+    assert payload["health"]["not_running"] is True
+    assert payload["codes_checked"] == 0
+    assert called == []
+
+
+def test_truncated_zero_missing_is_not_reported_as_missing(
+        session_factory, patched):
+    """抽样截断但零缺失：只写「未完成/抽样」，不得写「有缺失/陈旧」。"""
+    db = session_factory()
+    _session(db, status="running")
+    db.close()
+    patched.setattr(hs.live_service, "session_data_health",
+                    lambda db, sid, engines, auto_fill=True, **kw: {
+                        "available": True, "truncated": True,
+                        "codes_total": 251, "codes_checked": 22,
+                        "health": {"healthy": False,
+                                   "status_counts": {"ok": 22, "stale": 0,
+                                                     "empty": 0, "error": 0,
+                                                     "timeout": 0},
+                                   "periods": {"1d": {"stale": 0, "empty": 0,
+                                                      "total": 22}}}})
+
+    res = hs.overview(session_factory=session_factory, now=NOW)
+    item = res["sessions"][0]
+    assert item["data"]["bad_total"] == 0
+    assert item["data"]["data_missing_count"] == 0
+    texts = " ".join(p["text"] for p in res["problems"])
+    assert "缺失/陈旧" not in texts
+    assert "数据体检未完成" in texts
+    assert "22/251" in texts and "不计缺失" in texts
+
+
+def test_query_error_without_missing_is_not_labelled_missing(
+        session_factory, patched):
+    """有查询异常但零缺失：文案写「查询异常」，不写「缺失/陈旧」。"""
+    db = session_factory()
+    _session(db, status="running")
+    db.close()
+    patched.setattr(hs.live_service, "session_data_health",
+                    lambda db, sid, engines, auto_fill=True, **kw: {
+                        "available": True,
+                        "health": {"healthy": False,
+                                   "status_counts": {"ok": 29, "stale": 0,
+                                                     "empty": 0, "error": 1,
+                                                     "timeout": 0},
+                                   "periods": {"1d": {"stale": 0, "empty": 0,
+                                                      "total": 30}}}})
+
+    res = hs.overview(session_factory=session_factory, now=NOW)
+    texts = " ".join(p["text"] for p in res["problems"])
+    assert "查询异常 1 只" in texts and "未计入缺失" in texts
+    assert "缺失/陈旧" not in texts

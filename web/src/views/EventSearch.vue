@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from 'vue'
+import { RouterLink } from 'vue-router'
 import PageHeader from '../components/PageHeader.vue'
 import TablePager from '../components/TablePager.vue'
 import {
@@ -90,6 +91,23 @@ function onPageSize(size: number) {
 }
 
 onMounted(async () => {
+  // 支持从健康总览/故障向导深链过来（如 ?ack_status=open&session_id=1&gate=...），
+  // 保证「故障项 ↔ 关键事件」能直接落到同一批事实，而不是让用户重新筛一遍。
+  const q = new URLSearchParams(window.location.search)
+  const qs = {
+    session_id: q.get('session_id'),
+    gate: q.get('gate'),
+    layer: q.get('layer'),
+    action: q.get('action'),
+    ack_status: q.get('ack_status'),
+    keyword: q.get('keyword'),
+  }
+  if (qs.session_id) sessionId.value = qs.session_id
+  if (qs.gate) gate.value = qs.gate
+  if (qs.layer) layer.value = qs.layer
+  if (qs.action) action.value = qs.action
+  if (qs.ack_status) ackStatus.value = qs.ack_status as typeof ackStatus.value
+  if (qs.keyword) keyword.value = qs.keyword
   try {
     sessions.value = await getLiveSessions()
   } catch {
@@ -162,7 +180,7 @@ onMounted(async () => {
       <thead>
         <tr>
           <th>时间</th><th>会话</th><th>门类</th><th>层级</th><th>动作</th>
-          <th>股票</th><th>参数</th><th>消息</th><th>状态</th>
+          <th>股票</th><th>参数</th><th>消息</th><th>状态</th><th>定位</th>
         </tr>
       </thead>
       <tbody>
@@ -181,6 +199,10 @@ onMounted(async () => {
               {{ (e.ack_status || 'open') === 'open' ? '未处理'
                 : (e.ack_status === 'archived' ? '已归档' : '已确认') }}
             </span>
+          </td>
+          <td class="locate">
+            <RouterLink to="/live?tab=decisions">实盘处置</RouterLink>
+            <RouterLink to="/health">健康总览</RouterLink>
           </td>
         </tr>
       </tbody>
@@ -211,4 +233,7 @@ onMounted(async () => {
 .filter-actions { display: flex; align-items: center; gap: 8px; margin-top: 10px; }
 .filter-total { margin-left: auto; font-size: 12px; color: var(--ink-soft); }
 .msg { max-width: 420px; overflow-wrap: anywhere; }
+.locate { display: flex; gap: 8px; white-space: nowrap; font-size: 12px; }
+.locate a { color: var(--link); text-decoration: none; }
+.locate a:hover { color: var(--link-hover); text-decoration: underline; }
 </style>

@@ -2293,7 +2293,8 @@ onUnmounted(() => {
         {{ dataHealthLoading ? '体检中…' : '数据体检' }}
       </button>
       <template v-if="dataHealth">
-        <span v-if="dataHealth.available === false" class="badge badge-red">不可用：{{ dataHealth.reason }}</span>
+        <span v-if="dataHealth.not_running" class="badge badge-gray">未运行（不需要体检）</span>
+        <span v-else-if="dataHealth.available === false" class="badge badge-red">不可用：{{ dataHealth.reason }}</span>
         <template v-else>
           <span class="badge" :class="dataHealth.health?.healthy ? 'badge-green' : 'badge-orange'">
             <template v-if="dataHealth.health?.healthy">本地数据齐全</template>

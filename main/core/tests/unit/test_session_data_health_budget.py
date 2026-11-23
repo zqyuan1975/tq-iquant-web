@@ -35,7 +35,7 @@ def _clear_health_state():
 def _session(factory):
     db = factory()
     row = LiveSession(name="会话A", mode="simulation", engine="tdx",
-                      status="stopped")
+                      status="running")
     db.add(row)
     db.commit()
     sid = row.id

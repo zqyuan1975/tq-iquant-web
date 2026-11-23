@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { onMounted, onUnmounted, ref } from 'vue'
+import { computed, onMounted, onUnmounted, ref } from 'vue'
 import { RouterLink } from 'vue-router'
 import PageHeader from '../components/PageHeader.vue'
 import { getHealthOverview, type HealthOverview } from '../api'
@@ -23,6 +23,13 @@ const loading = ref(false)
 const errorMsg = ref('')
 let timer: ReturnType<typeof setInterval> | null = null
 
+// 故障向导/健康总览/关键事件同源：都用 getHealthOverview() 的这一份事实。
+// 只有带 fix（站内可执行、执行后该条会消失）的才进「故障」；其余是观察项。
+const fixableProblems = computed(
+  () => (overview.value?.problems || []).filter((p) => !!p.fix))
+const observeProblems = computed(
+  () => (overview.value?.problems || []).filter((p) => !p.fix))
+
 const PLAYBOOK: PlaybookItem[] = [
   {
     key: 'channel',
@@ -31,7 +38,7 @@ const PLAYBOOK: PlaybookItem[] = [
     checks: [
       { label: '主通道状态', detail: '健康总览「通道」区确认 primary.online 与 configured；主通道不可用会亮 error。', to: '/health', linkText: '查看健康总览' },
       { label: '客户端进程', detail: '通达信/同花顺客户端是否仍在运行；ths 通道还需确认窗口标题与交接目录未被改动。', to: '/system', linkText: '核对通道配置' },
-      { label: '通道守卫检查', detail: '健康总览「通道检查明细」逐项列出 5 项检查（主通道配置 / 客户端在线 / 运行态引擎注册 / 备用通道 / 无待生效配置）；未通过项也会出现在「需要关注」。停止态会话不判备用通道。', to: '/health', linkText: '查看逐项明细' },
+      { label: '通道守卫检查', detail: '健康总览「通道检查明细」逐项列出 5 项检查（主通道配置 / 客户端在线 / 运行态引擎注册 / 备用通道 / 无待生效配置）。停止态会话整体不判在线与备用通道，显示「不适用」；运行中未装备用通道属配置选择，也显示「不适用」而不是未通过。', to: '/health', linkText: '查看逐项明细' },
       { label: '近期通道事件', detail: '关键事件检索里 gate=channel_offline / channel_recovered，确认断线持续时间与恢复时间。', to: '/events', linkText: '检索通道事件' },
     ],
   },
@@ -40,7 +47,7 @@ const PLAYBOOK: PlaybookItem[] = [
     title: '行情停滞 / 数据陈旧',
     symptom: '引擎仍在运行，但最近 bar 很久没有推进，策略不产生新信号。',
     checks: [
-      { label: '最近 bar 时间', detail: '健康总览「数据新鲜度」按周期列出 stale/empty 数量；业务心跳开启时 /health 也带最近 bar。', to: '/health', linkText: '查看数据体检' },
+      { label: '最近 bar 时间', detail: '健康总览「数据新鲜度」按周期列出 stale（落后）/empty（无 bar）数量；「未校验（抽样）」表示本次体检没覆盖到，不等于数据缺失。业务心跳开启时 /health 也带最近 bar。', to: '/health', linkText: '查看数据体检' },
       { label: '行情链路', detail: '确认行情源（TQ / 桥）在线；bridge_online=false 或客户端退出都会先表现为行情停摆。', to: '/health', linkText: '查看通道状态' },
       { label: '盘外误报', detail: '午休 11:30–13:00、盘后与非交易日不判停滞；先确认当前是否在连续竞价时段。', to: '/health', linkText: '查看当日任务' },
       { label: '关键事件', detail: '检索 gate=channel_offline，关键字填 market_data_stalled（事件 message 含「判据=market_data_stalled」；行情停滞类事件统一落在 channel_offline）。', to: '/events', linkText: '检索行情事件' },
@@ -72,9 +79,9 @@ const PLAYBOOK: PlaybookItem[] = [
     title: '数据缺失 / 补齐失败',
     symptom: '数据体检出现 stale/empty，策略回测或实盘选股少了股票。',
     checks: [
-      { label: '按周期排查', detail: '健康总览 data.periods 逐周期给出 stale/empty/total，定位是分钟线还是日线缺口。', to: '/health', linkText: '查看数据体检' },
+      { label: '按周期排查', detail: '健康总览 data.periods 逐周期给出 stale/empty/total，定位是分钟线还是日线缺口；只有 stale/empty 才算缺失，查询异常/超时/未抽查单列且不计缺失。', to: '/health', linkText: '查看数据体检' },
       { label: '行情通道', detail: '数据体检 unavailable 时先修通道（行情源不可用无法补齐）。', to: '/health', linkText: '查看通道' },
-      { label: '股票池 / 数据体检', detail: '备选股池可核对股票池同步；数据缺口到实盘工作台点「数据体检」查看。非盘中会自动重读本地落盘，但平台无法程序化触发通达信下载，需在通达信客户端人工补下载。', to: '/live', linkText: '进入实盘工作台' },
+      { label: '股票池 / 数据体检', detail: '总览的体检是抽样校验（受抽样上限与时间预算限制），显示「未校验（抽样）X/Y」只代表没验完，不是缺数据；盘后可在实盘工作台重跑体检。平台无法程序化触发通达信下载，确需补下载的标的只能在通达信客户端人工补下载（属观察项，不在故障向导里放按钮）。', to: '/live', linkText: '进入实盘工作台' },
     ],
   },
   {
@@ -156,15 +163,47 @@ onUnmounted(() => {
       </button>
     </div>
     <div v-if="errorMsg" style="color:var(--red);font-size:13px;margin-top:8px">{{ errorMsg }}</div>
-    <ul v-else-if="overview?.problems.length" class="ts-problems">
-      <li v-for="(p, i) in overview.problems" :key="i" :class="p.level">
-        <span class="badge" :class="p.level === 'error' ? 'badge-red' : 'badge-orange'">
-          {{ p.level === 'error' ? '故障' : '告警' }}
-        </span>
-        {{ p.text }}
-      </li>
-    </ul>
-    <p v-else-if="overview" class="ts-ok">当前没有检测到异常，按下方手册进行预防性巡检。</p>
+    <template v-else-if="overview">
+      <p class="ts-src">
+        本页与健康总览、关键事件同源（同一份健康总览快照），不各自计算；
+        「故障」仅列本平台内可执行修复的项，执行后该条会自动消失。
+      </p>
+      <div v-if="fixableProblems.length" class="ts-section">
+        <div class="ts-section-title">可修复故障（{{ fixableProblems.length }}）</div>
+        <ul class="ts-problems">
+          <li v-for="(p, i) in fixableProblems" :key="'fix' + i" :class="p.level">
+            <span class="badge" :class="p.level === 'error' ? 'badge-red' : 'badge-orange'">
+              {{ p.level === 'error' ? '故障' : '告警' }}
+            </span>
+            <span>
+              {{ p.text }}
+              <i v-if="p.impact" class="ts-impact">影响：{{ p.impact }}</i>
+              <RouterLink v-if="p.fix" :to="p.fix.to" class="ts-link">
+                {{ p.fix.label }} →
+              </RouterLink>
+            </span>
+          </li>
+        </ul>
+      </div>
+      <div v-if="observeProblems.length" class="ts-section">
+        <div class="ts-section-title">
+          观察项（{{ observeProblems.length }}，需外部处理或无需操作，不列入故障）
+        </div>
+        <ul class="ts-problems">
+          <li v-for="(p, i) in observeProblems" :key="'obs' + i" class="warn">
+            <span class="badge badge-gray">观察</span>
+            <span>
+              {{ p.text }}
+              <i v-if="p.impact" class="ts-impact">影响：{{ p.impact }}</i>
+              <i v-if="p.observe" class="ts-impact">外部处理：{{ p.observe }}</i>
+            </span>
+          </li>
+        </ul>
+      </div>
+      <p v-if="!overview.problems.length" class="ts-ok">
+        当前没有检测到异常，按下方手册进行预防性巡检。
+      </p>
+    </template>
   </div>
 
   <div class="ts-grid">
@@ -192,6 +231,10 @@ onUnmounted(() => {
 .ts-problems li.error { color: var(--red); }
 .ts-problems li.warn { color: var(--ink); }
 .ts-ok { margin: 8px 0 0; font-size: 13px; color: var(--ink-soft); }
+.ts-src { margin: 8px 0 0; font-size: 12px; color: var(--ink-soft); line-height: 1.6; }
+.ts-section { margin-top: 12px; }
+.ts-section-title { font-size: 13px; font-weight: 600; margin-bottom: 6px; }
+.ts-impact { display: block; margin-top: 2px; font-size: 12px; color: var(--ink-soft); font-style: normal; }
 .ts-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(340px, 1fr)); gap: 12px; }
 .ts-item { padding: 12px 14px; }
 .ts-item summary { cursor: pointer; list-style: none; }

@@ -44,7 +44,7 @@ def _fake_status(online_map):
 
 def test_guard_lists_checks_and_actions(monkeypatch):
     db = _db()
-    sid = _session(db, engine="tdx", backup="iquant")
+    sid = _session(db, engine="tdx", backup="iquant", status="running")
     monkeypatch.setattr(live_service, "channel_status",
                         _fake_status({"tdx": False, "iquant": True}))
     data = live_service.session_channel_guard(db, sid, {})
@@ -57,6 +57,34 @@ def test_guard_lists_checks_and_actions(monkeypatch):
     assert any("通达信" in a for a in data["actions"])
 
     assert live_service.session_channel_guard(db, 99999, {}) is None
+
+
+def test_guard_marks_stopped_checks_not_applicable(monkeypatch):
+    """停止态：客户端在线检查不适用，不产生「未通过」（2026-11-23 总览误报）。"""
+    db = _db()
+    sid = _session(db, engine="tdx", status="stopped")
+    monkeypatch.setattr(live_service, "channel_status",
+                        _fake_status({"tdx": False}))
+    data = live_service.session_channel_guard(db, sid, {})
+    checks = {c["key"]: c for c in data["checks"]}
+    assert checks["client_online"]["ok"] is True
+    assert checks["client_online"]["applicable"] is False
+    assert "未运行" in checks["client_online"]["detail"]
+    assert checks["backup_ready"]["applicable"] is False
+
+
+def test_guard_backup_not_configured_is_not_applicable_not_failure(monkeypatch):
+    """运行中但没装备用通道是配置选择：标「不适用」，不是「未通过」。"""
+    db = _db()
+    sid = _session(db, engine="tdx", backup=None, status="running")
+    monkeypatch.setattr(live_service, "channel_status",
+                        _fake_status({"tdx": True}))
+    data = live_service.session_channel_guard(db, sid, {})
+    checks = {c["key"]: c for c in data["checks"]}
+    assert checks["backup_ready"]["ok"] is True
+    assert checks["backup_ready"]["applicable"] is False
+    assert "未配置" in checks["backup_ready"]["detail"]
+    assert all(c["ok"] for c in data["checks"] if c["key"] != "engine_registered")
 
 
 def test_guard_skips_backup_check_for_stopped_session(monkeypatch):
