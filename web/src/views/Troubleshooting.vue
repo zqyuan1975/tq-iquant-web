@@ -2,7 +2,11 @@
 import { computed, onMounted, onUnmounted, ref } from 'vue'
 import { RouterLink } from 'vue-router'
 import PageHeader from '../components/PageHeader.vue'
-import { getHealthOverview, type HealthOverview } from '../api'
+import {
+  getHealthOverview, getTdxGateStatus, setTdxGateOverride,
+  clearTdxGateOverride, liquidateAllSessions,
+  type HealthOverview, type TdxGateStatus,
+} from '../api'
 
 interface PlaybookCheck {
   label: string
@@ -22,6 +26,127 @@ const overview = ref<HealthOverview | null>(null)
 const loading = ref(false)
 const errorMsg = ref('')
 let timer: ReturnType<typeof setInterval> | null = null
+
+// ---- 高危与通道运维：TQ 闸覆盖 / 紧急全平（二次确认 + 后端审计）----
+const opsFeedback = ref<{ ok: boolean; text: string } | null>(null)
+
+const gate = ref<TdxGateStatus | null>(null)
+const gateLoading = ref(false)
+const gateError = ref('')
+const gateClearing = ref(false)
+const gateModal = ref(false)
+const gateMinutes = ref<number | string>(30)
+const gateReason = ref('')
+const gateBusy = ref(false)
+const gateModalError = ref('')
+
+async function loadGate() {
+  gateLoading.value = true
+  gateError.value = ''
+  try {
+    gate.value = await getTdxGateStatus()
+  } catch (e) {
+    gateError.value = '读取 TQ 闸状态失败：' + (e instanceof Error ? e.message : String(e))
+  } finally {
+    gateLoading.value = false
+  }
+}
+
+function openGateModal() {
+  gateMinutes.value = 30
+  gateReason.value = ''
+  gateModalError.value = ''
+  gateModal.value = true
+}
+
+async function submitGateOverride() {
+  if (gateBusy.value) return
+  const minutes = Number(gateMinutes.value)
+  if (!Number.isInteger(minutes) || minutes < 1 || minutes > 240) {
+    gateModalError.value = '覆盖时长须为 1–240 分钟的整数'; return
+  }
+  if (!gateReason.value.trim()) {
+    gateModalError.value = '必须填写覆盖原因（写审计事件）'; return
+  }
+  gateBusy.value = true
+  gateModalError.value = ''
+  try {
+    await setTdxGateOverride({
+      confirm: true, reason: gateReason.value.trim(), minutes,
+    })
+    gateModal.value = false
+    opsFeedback.value = {
+      ok: true,
+      text: `TQ 闸已临时覆盖 ${minutes} 分钟：P2 后台任务可抢占通道，到期自动恢复`,
+    }
+    await loadGate()
+  } catch (e: any) {
+    gateModalError.value = e?.response?.data?.message || e?.message || '覆盖失败'
+  } finally {
+    gateBusy.value = false
+  }
+}
+
+async function clearGate() {
+  if (gateClearing.value) return
+  gateClearing.value = true
+  try {
+    await clearTdxGateOverride('故障向导手动解除')
+    opsFeedback.value = { ok: true, text: 'TQ 闸覆盖已解除' }
+    await loadGate()
+  } catch (e: any) {
+    opsFeedback.value = {
+      ok: false,
+      text: '解除覆盖失败：' + (e?.response?.data?.message || e?.message || String(e)),
+    }
+  } finally {
+    gateClearing.value = false
+  }
+}
+
+// 紧急全平（全部运行中会话；后端要求 confirm=LIQUIDATE）
+const liquidateModal = ref(false)
+const liquidateConfirmText = ref('')
+const liquidateReason = ref('')
+const liquidating = ref(false)
+const liquidateError = ref('')
+
+function openLiquidateModal() {
+  liquidateConfirmText.value = ''
+  liquidateReason.value = ''
+  liquidateError.value = ''
+  liquidateModal.value = true
+}
+
+async function submitLiquidate() {
+  if (liquidating.value) return
+  if (liquidateConfirmText.value.trim() !== 'LIQUIDATE') {
+    liquidateError.value = '请输入 LIQUIDATE 以确认全平'; return
+  }
+  liquidating.value = true
+  liquidateError.value = ''
+  try {
+    const res = await liquidateAllSessions(
+      'LIQUIDATE', liquidateReason.value.trim() || undefined)
+    liquidateModal.value = false
+    const lines = (res.results || []).map((r) => {
+      const sid = r.session_id
+      const err = (r as Record<string, unknown>).error
+      if (err) return `#${sid} 失败：${String(err)}`
+      const n = Number((r as Record<string, unknown>).submitted ?? 0)
+      const skipped = Number((r as Record<string, unknown>).skipped ?? 0)
+      return `#${sid} 提交 ${n} 笔卖单${skipped ? `（跳过 ${skipped} 笔，原因见日志）` : ''}`
+    })
+    opsFeedback.value = {
+      ok: true,
+      text: lines.length ? `紧急全平：${lines.join('；')}` : '紧急全平：无运行中会话',
+    }
+  } catch (e: any) {
+    liquidateError.value = e?.response?.data?.message || e?.message || '紧急全平失败'
+  } finally {
+    liquidating.value = false
+  }
+}
 
 // 故障向导/健康总览/关键事件同源：都用 getHealthOverview() 的这一份事实。
 // 只有带 fix（站内可执行、执行后该条会消失）的才进「故障」；其余是观察项。
@@ -131,7 +256,11 @@ async function load() {
 
 onMounted(() => {
   load()
-  timer = setInterval(load, 30000)
+  void loadGate()
+  timer = setInterval(() => {
+    load()
+    void loadGate()
+  }, 30000)
 })
 
 onUnmounted(() => {
@@ -206,6 +335,125 @@ onUnmounted(() => {
     </template>
   </div>
 
+  <!-- 高危与通道运维：TQ 闸覆盖（临时放开 P2）/ 紧急全平 -->
+  <div class="card" style="padding:14px;margin-bottom:12px" data-test="ops-card">
+    <div class="ts-head">
+      <b>高危与通道运维</b>
+      <button class="btn btn-sm" :disabled="gateLoading" @click="loadGate">
+        {{ gateLoading ? '刷新中…' : '刷新 TQ 闸状态' }}
+      </button>
+    </div>
+    <p class="ts-src">
+      TQ 通道单实例：实盘（P0）优先，回测类后台任务（P2）在交易时段被拦。
+      临时覆盖会让 P2 抢占通道，仅在确需盘后补算时使用；所有变更写审计事件。
+    </p>
+
+    <div class="ts-section">
+      <div class="ts-section-title">TQ 通道闸覆盖</div>
+      <template v-if="gate">
+        <div class="gate-line">
+          <span class="badge" :class="gate.enabled ? 'badge-green' : 'badge-gray'">
+            {{ gate.enabled ? '闸门启用' : '闸门关闭' }}
+          </span>
+          <span>时段：{{ gate.policy.window }}</span>
+          <span>P1：{{ gate.policy.p1_allowed ? '可执行' : '被拦' }}</span>
+          <span>P2：{{ gate.policy.p2_allowed ? '可执行' : '被拦' }}</span>
+          <span v-if="gate.channel_held">通道占用中</span>
+        </div>
+        <p v-if="gate.override && gate.override.active" class="ts-impact" data-test="gate-override-active">
+          覆盖生效至 {{ gate.override.expires_at }}（{{ gate.override.minutes }} 分钟 ·
+          操作者：{{ gate.override.operator || '—' }} · 原因：{{ gate.override.reason }}）
+        </p>
+        <p v-else class="ts-impact">当前无覆盖。</p>
+        <div class="gate-actions">
+          <button class="btn btn-sm" data-test="gate-override-open" @click="openGateModal">临时覆盖…</button>
+          <button
+            v-if="gate.override && gate.override.active"
+            class="btn btn-sm" data-test="gate-clear" :disabled="gateClearing"
+            @click="clearGate"
+          >{{ gateClearing ? '解除中…' : '立即解除覆盖' }}</button>
+        </div>
+      </template>
+      <p v-else-if="gateError" class="ts-impact" style="color:var(--red)" data-test="gate-error">{{ gateError }}</p>
+      <p v-else class="ts-impact">读取中…</p>
+    </div>
+
+    <div class="ts-section">
+      <div class="ts-section-title" style="color:var(--red)">紧急全平</div>
+      <p class="ts-src">
+        对<b>全部运行中会话</b>的持仓按整仓提交卖单（不受 sell_scope / 代卖授权限制），
+        仍走既有提交闸门（T+1 / 时点 / 审批）；需输入 LIQUIDATE 确认，动作写审计事件。
+      </p>
+      <button
+        class="btn btn-sm" style="color:var(--red);border-color:var(--red)"
+        data-test="liquidate-open" @click="openLiquidateModal"
+      >紧急全平…</button>
+    </div>
+
+    <p v-if="opsFeedback" style="margin:10px 0 0;font-size:12px"
+       :style="{ color: opsFeedback.ok ? 'var(--ink-soft)' : 'var(--red)' }"
+       data-test="ops-feedback">{{ opsFeedback.text }}</p>
+  </div>
+
+  <!-- TQ 闸覆盖：二次确认（展示时长与后果） -->
+  <div v-if="gateModal" class="modal-overlay" data-test="gate-modal" @click.self="gateModal = false">
+    <div class="modal-content">
+      <h3>临时覆盖 TQ 通道闸</h3>
+      <div class="modal-body">
+        <p class="ts-src">
+          覆盖期间回测类后台任务（P2）可抢占通达信通道，可能与实盘（P0）争用。
+          到期自动恢复；变更写审计事件。
+        </p>
+        <div class="form-group">
+          <label>覆盖时长（分钟，1–240）</label>
+          <input v-model="gateMinutes" type="number" min="1" max="240" data-test="gate-minutes" />
+        </div>
+        <div class="form-group">
+          <label>原因（必填，写审计）</label>
+          <input v-model="gateReason" type="text" placeholder="如：盘后补算需放开 P2" data-test="gate-reason" />
+        </div>
+        <p v-if="gateModalError" class="form-error" data-test="gate-modal-error">{{ gateModalError }}</p>
+      </div>
+      <div class="modal-actions">
+        <button class="btn btn-primary" :disabled="gateBusy" data-test="gate-confirm" @click="submitGateOverride">
+          {{ gateBusy ? '提交中…' : '确认覆盖' }}
+        </button>
+        <button class="btn" :disabled="gateBusy" @click="gateModal = false">取消</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 紧急全平：必须键入 LIQUIDATE -->
+  <div v-if="liquidateModal" class="modal-overlay" data-test="liquidate-modal" @click.self="liquidateModal = false">
+    <div class="modal-content">
+      <h3 style="color:var(--red)">紧急全平</h3>
+      <div class="modal-body">
+        <p class="ts-src" style="color:var(--red)">
+          将对<b>全部运行中会话</b>的持仓按整仓提交卖单（不受 sell_scope / 代卖授权限制）。
+          该动作立即生效、不可撤销，仅用于紧急处置；后端写审计事件。
+        </p>
+        <div class="form-group">
+          <label>确认口令</label>
+          <input v-model="liquidateConfirmText" type="text" placeholder="键入 LIQUIDATE 以确认"
+                 data-test="liquidate-confirm-text" />
+        </div>
+        <div class="form-group">
+          <label>原因（可选）</label>
+          <input v-model="liquidateReason" type="text" placeholder="如：通道异常 / 风控紧急降险"
+                 data-test="liquidate-reason" />
+        </div>
+        <p v-if="liquidateError" class="form-error" data-test="liquidate-error">{{ liquidateError }}</p>
+      </div>
+      <div class="modal-actions">
+        <button class="btn btn-primary" style="background:var(--red);border-color:var(--red)"
+                :disabled="liquidating" data-test="liquidate-confirm" @click="submitLiquidate">
+          {{ liquidating ? '提交中…' : '确认全平' }}
+        </button>
+        <button class="btn" :disabled="liquidating" @click="liquidateModal = false">取消</button>
+      </div>
+    </div>
+  </div>
+
   <div class="ts-grid">
     <details v-for="item in PLAYBOOK" :key="item.key" class="card ts-item">
       <summary>
@@ -249,4 +497,6 @@ onUnmounted(() => {
 .ts-check-detail { color: var(--ink-soft); }
 .ts-link { font-size: 12px; color: var(--link); text-decoration: none; }
 .ts-link:hover { color: var(--link-hover); text-decoration: underline; }
+.gate-line { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; font-size: 12px; color: var(--ink-soft); }
+.gate-actions { display: flex; gap: 8px; margin-top: 8px; }
 </style>

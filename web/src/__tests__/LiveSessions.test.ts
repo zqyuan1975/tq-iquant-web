@@ -19,6 +19,9 @@ const { mockGetLiveSessions, mockCreateLiveSession, mockStartLiveSession, mockSt
   mockGetLiveDataHealth: vi.fn(),
   mockGetLivePositionScopes: vi.fn(),
   mockSetLivePositionScope: vi.fn(),
+  mockAdjustLivePosition: vi.fn(),
+  mockGetLiveReconciliationDiffs: vi.fn(),
+  mockResolveLiveReconciliationDiff: vi.fn(),
 }))
 vi.mock('../api', () => ({
   getLiveSessions: mockGetLiveSessions,
@@ -32,10 +35,13 @@ vi.mock('../api', () => ({
   resetLiveBaseline: mockResetLiveBaseline,
   getLiveParamsDrift: mockGetLiveParamsDrift,
   getLiveCashFlows: mockGetLiveCashFlows,
-  getLivePositionScopes: mockGetLivePositionScopes,
-  setLivePositionScope: mockSetLivePositionScope,
   createLiveCashFlow: mockCreateLiveCashFlow,
   getLiveDataHealth: mockGetLiveDataHealth,
+  getLivePositionScopes: mockGetLivePositionScopes,
+  setLivePositionScope: mockSetLivePositionScope,
+  adjustLivePosition: mockAdjustLivePosition,
+  getLiveReconciliationDiffs: mockGetLiveReconciliationDiffs,
+  resolveLiveReconciliationDiff: mockResolveLiveReconciliationDiff,
   getLivePositions: vi.fn(),
   getLiveOrders: vi.fn(),
   getLiveTrades: vi.fn(),
@@ -116,11 +122,12 @@ beforeEach(() => {
       { key: 'tdx', channel: 'tdx_tq', label: '通达信 TQ 交易', configured: true, detail: '' },
       { key: 'ths', channel: 'ths_ui', label: '同花顺独立交易（UI 自动化）', configured: true, detail: '' },
     ],
-  ;(mockGetLivePositionScopes as any).mockResolvedValue({ session_id: 0, enabled_codes: [], items: [] })
     ths_ui: { enabled: false, available: false, window_title: '网上股票交易系统5.0', client_exe_path: '', driver: 'clipboard' },
     bridge: { simulation: 'http://127.0.0.1:8790', live: 'http://127.0.0.1:8791' },
   })
   ;(testLiveChannel as any).mockResolvedValue({ ok: true, channel: 'iquant_bridge', base_url: 'http://127.0.0.1:8790' })
+  ;(mockGetLivePositionScopes as any).mockResolvedValue({ session_id: 0, enabled_codes: [], items: [] })
+  ;(mockGetLiveReconciliationDiffs as any).mockResolvedValue({ session_id: 0, diffs: [], status_counts: {} })
 })
 
 afterEach(() => {
@@ -426,13 +433,6 @@ describe('LiveSessions.vue 工作台(B4b)', () => {
     w.unmount()
   })
 
-  it('SSE position 事件未带 attribution → 保留已有兜底徽标', async () => {
-    ;(getLiveSessions as any).mockResolvedValue([runningSession])
-    ;(getLivePositions as any).mockResolvedValue([
-      { stock_code: '002745.SZ', quantity: 5300, avg_cost: 10.221, market_value: 54171,
-        portfolio_id: 1, strategy_id: 1, source: 'strategy', attribution: 'fallback' },
-    ])
-    const w = mount(LiveSessions)
   it('持仓「代卖授权」：未授权→确认框展示整仓/价格/金额→确认后按代码调接口', async () => {
     ;(getLiveSessions as any).mockResolvedValue([runningSession])
     ;(getLivePositions as any).mockResolvedValue([
@@ -488,6 +488,13 @@ describe('LiveSessions.vue 工作台(B4b)', () => {
     w.unmount()
   })
 
+  it('SSE position 事件未带 attribution → 保留已有兜底徽标', async () => {
+    ;(getLiveSessions as any).mockResolvedValue([runningSession])
+    ;(getLivePositions as any).mockResolvedValue([
+      { stock_code: '002745.SZ', quantity: 5300, avg_cost: 10.221, market_value: 54171,
+        portfolio_id: 1, strategy_id: 1, source: 'strategy', attribution: 'fallback' },
+    ])
+    const w = mount(LiveSessions)
     await flushPromises()
     const es = FakeEventSource.instances[0]
 
@@ -2446,6 +2453,123 @@ describe('LiveSessions — warnings 与恢复事件（P2/P3）', () => {
     expect(text).toContain('陈旧 1 只')
     expect(text).toContain('600000.SH')
     expect(text).toContain('请在通达信客户端补下载')
+    w.unmount()
+  })
+})
+
+// ---- 任务三：运维端点入口（手工改账 / 差异核销）----
+describe('LiveSessions — 运维入口（二次确认 + 结果反馈）', () => {
+  const stoppedWithPortfolio = {
+    id: 8, name: '模拟盘B', mode: 'simulation', status: 'stopped',
+    started_at: null, stopped_at: null, portfolio_ids: [1],
+  }
+
+  it('持仓改账：两步确认展示方向/数量/金额，确认后按数量差调接口', async () => {
+    ;(getLiveSessions as any).mockResolvedValue([runningSession, stoppedWithPortfolio])
+    ;(getPortfolios as any).mockResolvedValue([
+      { id: 1, name: '组合A', strategies: [{ id: 11 }, { id: 12 }] },
+    ])
+    ;(mockAdjustLivePosition as any).mockResolvedValue({
+      trade_id: 5, stock_code: '600211', trade_type: 'SELL', quantity: 1300,
+      price: '10.50', amount: '13650.00', cash_delta: '13650.00',
+      effective: '重启会话后生效',
+    })
+    const w = mount(LiveSessions)
+    await flushPromises()
+
+    await w.find('[data-test="adjust-open"]').trigger('click')
+    expect(w.find('[data-test="adjust-modal"]').exists()).toBe(true)
+    // 会话下拉只列已停止会话
+    const sessionOpts = w.find('[data-test="adjust-session"]').findAll('option')
+    expect(sessionOpts).toHaveLength(1)
+    expect(sessionOpts[0].text()).toContain('模拟盘B')
+
+    await w.find('[data-test="adjust-portfolio"]').setValue('1')
+    await w.find('[data-test="adjust-strategy"]').setValue('11')
+    await w.find('[data-test="adjust-code"]').setValue('600211')
+    await w.find('[data-test="adjust-delta"]').setValue('-1300')
+    await w.find('[data-test="adjust-price"]').setValue('10.5')
+    await w.find('[data-test="adjust-next"]').trigger('click')
+    await flushPromises()
+
+    // 确认页展示具体动作/数量/金额；此时仍未调接口
+    const confirmText = w.find('[data-test="adjust-modal"]').text()
+    expect(confirmText).toContain('卖出（扣除）')
+    expect(confirmText).toContain('1300 股')
+    expect(confirmText).toContain('13650.00')
+    expect(mockAdjustLivePosition).not.toHaveBeenCalled()
+
+    await w.find('[data-test="adjust-confirm"]').trigger('click')
+    await flushPromises()
+    expect(mockAdjustLivePosition).toHaveBeenCalledWith(8, {
+      portfolio_strategy_id: 1, strategy_id: 11, stock_code: '600211',
+      quantity_delta: -1300, price: 10.5,
+    })
+    expect(w.find('[data-test="adjust-modal"]').exists()).toBe(false)
+    expect(w.text()).toContain('改账已写入合成成交：600211 SELL 1300 股')
+    w.unmount()
+  })
+
+  it('差异核销：接受差异弹确认框（可填入账价），确认后调接口并刷新', async () => {
+    ;(getLiveSessions as any).mockResolvedValue([runningSession])
+    ;(mockGetLiveReconciliationDiffs as any).mockResolvedValue({
+      session_id: 7,
+      diffs: [{
+        id: 3, diff_type: 'position', portfolio_id: 1, stock_code: '002922.SZ',
+        expected: '2500', actual: '2400', delta: '-100',
+        status: 'open', resolution: null, created_at: '2026-11-23T15:05:00+08:00',
+      }],
+      status_counts: { open: 1 },
+    })
+    ;(mockResolveLiveReconciliationDiff as any).mockResolvedValue({})
+    const w = mount(LiveSessions)
+    await flushPromises()
+
+    await w.findAll('button').find((b) => b.text() === '差异核销')!.trigger('click')
+    await flushPromises()
+    expect(w.find('[data-test="diffs-panel"]').text()).toContain('002922.SZ')
+
+    await w.find('[data-test="diff-accept"]').trigger('click')
+    const modal = w.find('[data-test="diff-modal"]')
+    expect(modal.exists()).toBe(true)
+    expect(modal.text()).toContain('接受：以柜台为准按实际入账')
+
+    await w.find('[data-test="diff-price"]').setValue('9.9')
+    await w.find('[data-test="diff-resolution"]').setValue('柜台对账')
+    await w.find('[data-test="diff-confirm"]').trigger('click')
+    await flushPromises()
+
+    expect(mockResolveLiveReconciliationDiff).toHaveBeenCalledWith(7, 3, {
+      action: 'accept', resolution: '柜台对账', price: 9.9,
+    })
+    expect(w.find('[data-test="diff-modal"]').exists()).toBe(false)
+    expect(w.text()).toContain('差异 #3 已处理（按实际入账）')
+    w.unmount()
+  })
+
+  it('差异核销失败：错误原因显示在确认框内', async () => {
+    ;(getLiveSessions as any).mockResolvedValue([runningSession])
+    ;(mockGetLiveReconciliationDiffs as any).mockResolvedValue({
+      session_id: 7,
+      diffs: [{
+        id: 4, diff_type: 'cash', portfolio_id: 1, stock_code: null,
+        expected: '1000', actual: '900', delta: '-100',
+        status: 'open', resolution: null, created_at: null,
+      }],
+      status_counts: { open: 1 },
+    })
+    ;(mockResolveLiveReconciliationDiff as any).mockRejectedValue(
+      new Error('差异不存在或已处理'))
+    const w = mount(LiveSessions)
+    await flushPromises()
+    await w.findAll('button').find((b) => b.text() === '差异核销')!.trigger('click')
+    await flushPromises()
+
+    await w.find('[data-test="diff-accept"]').trigger('click')
+    await w.find('[data-test="diff-confirm"]').trigger('click')
+    await flushPromises()
+    expect(w.find('[data-test="diff-modal"]').exists()).toBe(true)
+    expect(w.find('[data-test="diff-error"]').text()).toContain('差异不存在或已处理')
     w.unmount()
   })
 })

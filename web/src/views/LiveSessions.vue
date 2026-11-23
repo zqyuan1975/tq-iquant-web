@@ -18,6 +18,8 @@ import {
 import {
   getLiveOrders, getLiveTrades, getLivePositions, getLiveDecisions, getLiveSignals, getPortfolios,
   getLivePositionScopes, setLivePositionScope,
+  adjustLivePosition, getLiveReconciliationDiffs, resolveLiveReconciliationDiff,
+  type ReconciliationDiffItem,
   ackLiveDecision, previewLiveDecisionBatch, batchAckLiveDecisions,
   type DecisionBatchFilters, type DecisionBatchPreview,
   getLiveSessions, getLiveSession, createLiveSession, updateLiveSession, startLiveSession, stopLiveSession, deleteLiveSession,
@@ -480,12 +482,12 @@ function snapshotHint(engine: string | null | undefined): string {
   }
   return '后台每 60s 采集一次，无需打开下单窗口'
 }
-type WbTab = 'positions' | 'orders' | 'approvals' | 'trades' | 'decisions' | 'signals' | 'gate'
+type WbTab = 'positions' | 'orders' | 'approvals' | 'trades' | 'decisions' | 'signals' | 'gate' | 'diffs'
 const wbTab = ref<WbTab>('positions')
 let initialTabFromQuery = false
 const TAB_LABEL: Record<WbTab, string> = {
   positions: '持仓', orders: '委托', approvals: '待审批', trades: '成交', decisions: '决策/拦截',
-  signals: '预警信号', gate: '门控快照',
+  signals: '预警信号', gate: '门控快照', diffs: '差异核销',
 }
 
 // ---- 决策/拦截页签：自带刷新 + 切页签重拉 ----
@@ -654,6 +656,7 @@ function setWbTab(tab: WbTab) {
   decOnlyDeferred.value = false
   if (tab === 'decisions') void reloadDecisions()
   if (tab === 'gate') void reloadGateSnapshots()
+  if (tab === 'diffs') void loadDiffs()
 }
 
 // ---- E2：每日市场门控快照（每组合每日一条，工作台回看门控判定依据）----
@@ -881,11 +884,11 @@ async function loadHistory(id: number) {
     loadDeferredOrders(id)
     // G4：盘前效果统计（与委托同屏，失败静默）
     loadPreOpenStats(id)
+    // 按标的授权代卖清单（旧后端/未迁移 → 静默为空 = 全部按未授权展示）
+    loadPositionScopes(id)
     // 账户全貌快照 + 交易日历来源/退化状态（同一详情请求，采集于 deals 节拍）——失败静默（辅助卡）
     try {
       getLiveSession(id).then(d => {
-    // 按标的授权代卖清单（旧后端/未迁移 → 静默为空 = 全部按未授权展示）
-    loadPositionScopes(id)
         if (activeSessionId !== id) return
         accountSnapshots.value = { ...accountSnapshots.value, [id]: d?.account_snapshot ?? null }
         calendarStatus.value = { ...calendarStatus.value, [id]: d?.trading_calendar ?? null }
@@ -1273,10 +1276,10 @@ function watchSession(id: number) {
   decisions.value = []
   signals.value = []
   signalsTotal.value = 0
+  positionScopes.value = new Set()
   decOnlyDeferred.value = false
   loadHistory(id)
 }
-  positionScopes.value = new Set()
 
 async function load() {
   try {
@@ -1294,12 +1297,18 @@ async function load() {
   const running = sessions.value.filter((s) => s.status === 'running')
   const target = running.find((s) => s.id === watchedSessionId.value) || running[0] || null
   watchedSessionId.value = target ? target.id : null
-  // 健康总览「待审批」计数深链到本工作台审批页签（仅首次进入时生效，
-  // 之后用户手动切换页签不会被定时刷新抢回）。
+  // 健康总览/故障向导的深链（tab=decisions|orders|approvals…）落到对应页签，
+  // 仅首次进入生效，之后手动切换页签不会被定时刷新抢回。
   if (!initialTabFromQuery) {
     initialTabFromQuery = true
-    if (new URLSearchParams(window.location.search).get('tab') === 'approvals') {
-      wbTab.value = 'approvals'
+    const q = new URLSearchParams(window.location.search).get('tab')
+    const validTabs: WbTab[] = ['positions', 'decisions', 'orders',
+                               'approvals', 'trades', 'gate', 'signals', 'diffs']
+    if (q && (validTabs as string[]).includes(q)) {
+      wbTab.value = q as WbTab
+      if (q === 'decisions') void reloadDecisions()
+      if (q === 'gate') void reloadGateSnapshots()
+      if (q === 'diffs') void loadDiffs()
     }
   }
   runningEngine.value = (target?.engine as LiveEngineKey) || null
@@ -1643,6 +1652,10 @@ async function toggleSellScope(s: LiveSessionItem) {
   } catch (e: any) {
     alert(e?.response?.data?.message || e?.message || '切换失败')
   } finally {
+    sellScopeBusy.value = null
+  }
+}
+
 // ---- 按标的授权代卖（platform_only 下逐票放行；默认无记录 = 不代卖）----
 // 与会话级 sell_scope 开关相互独立：这里不改 full/platform_only，只对单个代码
 // 放开「下单前不夹到平台仓」。变更由后端写审计事件，下一轮 tick 生效。
@@ -1715,9 +1728,185 @@ function scopeCellTitle(code: string): string {
     : '未授权代卖：风控照常计算并落触发事件、每日首条 warn 告警，但下单前数量夹到平台仓（为 0 则不下单并记 sell_scope/skip）'
 }
 
-    sellScopeBusy.value = null
+// ---- 运维操作：手工改账 / 差异核销（二次确认 + 后端审计）----
+const opsFeedback = ref<{ ok: boolean; text: string } | null>(null)
+
+// 手工持仓改账（I1，仅停止的会话）：停止态会话不在运行工作台焦点里，
+// 因此弹窗内单独选会话（默认当前会话若已停止，否则第一个停止会话）。
+const adjustModal = ref(false)
+const adjustStep = ref<'form' | 'confirm'>('form')
+const adjustBusy = ref(false)
+const adjustError = ref('')
+const adjustSessionId = ref<number | null>(null)
+const adjustForm = ref({
+  portfolio_id: '' as number | string,
+  strategy_id: '' as number | string,
+  stock_code: '',
+  quantity_delta: '' as number | string,
+  price: '' as number | string,
+  note: '',
+})
+
+const stoppedSessions = computed(() => sessions.value.filter((s) => !isSessionActive(s)))
+const adjustTargetSession = computed(
+  () => sessions.value.find((x) => x.id === adjustSessionId.value) || null)
+const activeSessionPortfolios = computed(() => {
+  const s = adjustTargetSession.value
+  const ids = s?.portfolio_ids || []
+  return portfolios.value.filter((p) => ids.includes(p.id))
+})
+const adjustStrategies = computed(() => {
+  const p = activeSessionPortfolios.value.find(
+    (x) => x.id === Number(adjustForm.value.portfolio_id))
+  return ((p as any)?.strategies || []) as { id: number; formula_id?: number }[]
+})
+
+function openAdjustModal() {
+  if (!stoppedSessions.value.length) {
+    opsFeedback.value = { ok: false, text: '没有已停止的会话：持仓改账需先停止会话' }
+    return
+  }
+  const preferred = stoppedSessions.value.find((s) => s.id === activeSessionId)
+  adjustSessionId.value = (preferred || stoppedSessions.value[0]).id
+  adjustForm.value = {
+    portfolio_id: '', strategy_id: '', stock_code: '', quantity_delta: '', price: '', note: '',
+  }
+  adjustForm.value.portfolio_id = activeSessionPortfolios.value[0]?.id ?? ''
+  adjustError.value = ''
+  adjustStep.value = 'form'
+  adjustModal.value = true
+}
+
+function onAdjustSessionChange() {
+  adjustForm.value.portfolio_id = activeSessionPortfolios.value[0]?.id ?? ''
+  adjustForm.value.strategy_id = ''
+}
+
+/** 表单 → 确认页：校验并展示动作/数量/金额，避免误写。 */
+function adjustPreview() {
+  const f = adjustForm.value
+  const delta = Number(f.quantity_delta)
+  const price = Number(f.price)
+  if (adjustSessionId.value === null || !adjustTargetSession.value) {
+    adjustError.value = '请选择要改账的会话'; return
+  }
+  if (!f.portfolio_id || !f.strategy_id) {
+    adjustError.value = '请选择组合策略与子策略'; return
+  }
+  if (!String(f.stock_code || '').trim()) {
+    adjustError.value = '股票代码不能为空'; return
+  }
+  if (!Number.isInteger(delta) || delta === 0) {
+    adjustError.value = '数量差须为非零整数（正=买入，负=卖出）'; return
+  }
+  if (!(price > 0)) {
+    adjustError.value = '价格须为正数'; return
+  }
+  adjustError.value = ''
+  adjustStep.value = 'confirm'
+}
+
+const adjustSummary = computed(() => {
+  const f = adjustForm.value
+  const delta = Number(f.quantity_delta)
+  const price = Number(f.price)
+  return {
+    direction: delta > 0 ? '买入（补入）' : '卖出（扣除）',
+    quantity: Math.abs(delta),
+    amount: Math.abs(delta) * price,
+  }
+})
+
+async function submitAdjust() {
+  if (adjustBusy.value) return
+  const id = adjustSessionId.value
+  if (id === null) return
+  adjustBusy.value = true
+  opsFeedback.value = null
+  try {
+    const f = adjustForm.value
+    const res = await adjustLivePosition(id, {
+      portfolio_strategy_id: Number(f.portfolio_id),
+      strategy_id: Number(f.strategy_id),
+      stock_code: String(f.stock_code).trim().toUpperCase(),
+      quantity_delta: Number(f.quantity_delta),
+      price: f.price,
+      ...(f.note ? { note: f.note } : {}),
+    })
+    adjustModal.value = false
+    opsFeedback.value = {
+      ok: true,
+      text: `改账已写入合成成交：${res.stock_code} ${res.trade_type} ${res.quantity} 股 @ ${res.price}`
+        + `（${res.effective}）`,
+    }
+  } catch (e: any) {
+    adjustError.value = e?.response?.data?.message || e?.message || '持仓改账失败'
+  } finally {
+    adjustBusy.value = false
   }
 }
+
+// 差异核销（C1）
+const diffs = ref<ReconciliationDiffItem[]>([])
+const diffsLoading = ref(false)
+const diffStatusFilter = ref<'open' | 'all'>('open')
+const diffModal = ref<{ row: ReconciliationDiffItem; action: 'accept' | 'ignore' | 'resolve' } | null>(null)
+const diffResolution = ref('')
+const diffPrice = ref('' as number | string)
+const diffBusy = ref(false)
+const diffError = ref('')
+
+async function loadDiffs() {
+  const id = activeSessionId
+  if (id === null) return
+  diffsLoading.value = true
+  try {
+    const data = await getLiveReconciliationDiffs(
+      id, diffStatusFilter.value === 'open' ? 'open' : undefined)
+    diffs.value = data.diffs || []
+  } catch (e) {
+    opsFeedback.value = { ok: false, text: '差异台账加载失败：' + (e instanceof Error ? e.message : String(e)) }
+  } finally {
+    diffsLoading.value = false
+  }
+}
+
+function openDiffAction(row: ReconciliationDiffItem, action: 'accept' | 'ignore' | 'resolve') {
+  diffModal.value = { row, action }
+  diffResolution.value = ''
+  diffPrice.value = ''
+  diffError.value = ''
+}
+
+async function confirmDiffAction() {
+  const m = diffModal.value
+  const id = activeSessionId
+  if (!m || id === null || diffBusy.value) return
+  diffBusy.value = true
+  diffError.value = ''
+  try {
+    await resolveLiveReconciliationDiff(id, m.row.id, {
+      action: m.action,
+      ...(diffResolution.value ? { resolution: diffResolution.value } : {}),
+      ...(m.action === 'accept' && diffPrice.value !== ''
+        ? { price: diffPrice.value } : {}),
+    })
+    diffModal.value = null
+    opsFeedback.value = {
+      ok: true,
+      text: `差异 #${m.row.id} 已处理（${m.action === 'accept' ? '按实际入账'
+        : m.action === 'ignore' ? '忽略' : '标记已处理'}）`,
+    }
+    await loadDiffs()
+  } catch (e: any) {
+    diffError.value = e?.response?.data?.message || e?.message || '差异处理失败'
+  } finally {
+    diffBusy.value = false
+  }
+}
+
+// 紧急全平（M2）入口已移至「故障处置向导」：该动作作用于全部运行中会话，
+// 放在单会话工作台里语义不成立。
 
 // ---- B3 通道守护（只读检查清单 + 一键重新探活）----
 const guardModal = ref<LiveSessionItem | null>(null)
@@ -2344,6 +2533,15 @@ onUnmounted(() => {
           title="重新拉取全量持仓（原有持仓服务端缓存 60s）"
         >↻ 刷新持仓</button>
         <button
+          v-if="wbTab === 'positions'"
+          class="btn btn-sm" style="margin-left:8px"
+          data-test="adjust-open"
+          :disabled="loading || !stoppedSessions.length"
+          @click="openAdjustModal"
+          title="仅停止的会话：写一笔合成成交（正=买入 / 负=卖出），重启会话后由 live_trades 重放生效"
+        >持仓改账</button>
+
+        <button
           v-if="wbTab === 'decisions'"
           class="btn btn-sm" style="margin-left:8px"
           data-test="decisions-refresh"
@@ -2359,6 +2557,12 @@ onUnmounted(() => {
         >理论 vs 实盘</button>
       </div>
     </div>
+
+    <!-- 运维操作结果反馈（改账 / 差异核销） -->
+    <p v-if="opsFeedback" style="margin:0 0 12px;font-size:12px"
+       :style="{ color: opsFeedback.ok ? 'var(--ink-soft)' : 'var(--red)' }">
+      {{ opsFeedback.text }}
+    </p>
 
     <!-- F2 数据体检：本地数据缺失/陈旧自查；非盘中自动重读一次已落盘数据 -->
     <div
@@ -2490,9 +2694,24 @@ onUnmounted(() => {
                 池外·不参与风控
               </span>
             </td>
+            <td>
+              <span v-if="p.out_of_pool === true || p.attribution === 'fallback'"
+                    style="color:var(--ink-soft)"
+                    title="池外仓不进虚拟账本，与代卖授权无关">—</span>
+              <button v-else class="btn btn-sm" :class="isScopeAuthorized(p.stock_code) ? 'btn-primary' : ''"
+                      data-test="position-scope-toggle"
+                      :title="scopeCellTitle(p.stock_code)"
+                      @click="openScopeConfirm(p)">
+                {{ isScopeAuthorized(p.stock_code) ? '已授权代卖' : '未授权·仅平台仓' }}
+              </button>
+            </td>
           </tr>
         </tbody>
       </table>
+      <p v-if="scopeFeedback" style="margin:8px 0 0;font-size:12px"
+         :style="{ color: scopeFeedback.ok ? 'var(--ink-soft)' : 'var(--danger, #c0392b)' }">
+        {{ scopeFeedback.text }}
+      </p>
       <div v-if="poolPositions.length === 0" class="empty-state">
         <p>暂无持仓</p>
         <p>账户原有持仓（非策略买入）以灰色标注为原有持仓：属于本会话股票池的已导入虚拟账本并按真实成本<b>纳入风控计算</b>；池外仓不进虚拟账本、与卖出范围/代卖授权无关（仅展示/对账、不占槽位、不代卖）；成本 ≤0 显示「成本未知」且不参与风控。<br>
@@ -2695,24 +2914,9 @@ onUnmounted(() => {
         <select class="field-select field-select--compact" v-model="decRange" aria-label="决策时间范围">
           <option v-for="opt in TIME_RANGE_OPTIONS" :key="opt.value" :value="opt.value">{{ opt.label }}</option>
         </select>
-            <td>
-              <span v-if="p.out_of_pool === true || p.attribution === 'fallback'"
-                    style="color:var(--ink-soft)"
-                    title="池外仓不进虚拟账本，与代卖授权无关">—</span>
-              <button v-else class="btn btn-sm" :class="isScopeAuthorized(p.stock_code) ? 'btn-primary' : ''"
-                      data-test="position-scope-toggle"
-                      :title="scopeCellTitle(p.stock_code)"
-                      @click="openScopeConfirm(p)">
-                {{ isScopeAuthorized(p.stock_code) ? '已授权代卖' : '未授权·仅平台仓' }}
-              </button>
-            </td>
         <span style="font-size:12px;color:var(--ink-faint)">按北京时间自然日 · 聚合与统计随筛选重算 · 共 {{ filteredDecisions.length }} 条事件</span>
         <span style="margin-left:auto;font-size:12px;color:var(--ink-soft)">
           未处理 {{ decisionAckSummary.open }} 条 · 已确认 {{ decisionAckSummary.acked }} 条 · 已归档 {{ decisionAckSummary.archived }} 条
-      <p v-if="scopeFeedback" style="margin:8px 0 0;font-size:12px"
-         :style="{ color: scopeFeedback.ok ? 'var(--ink-soft)' : 'var(--danger, #c0392b)' }">
-        {{ scopeFeedback.text }}
-      </p>
         </span>
       </div>
       <!-- 批量确认：必须带筛选条件（不提供「全选所有」）；高危门类永远排除，只能逐条确认。
@@ -2865,6 +3069,60 @@ onUnmounted(() => {
       <div v-else class="empty-state">
         <p>暂无门控快照：仅启用市场门控的组合会在每个交易日首根 bar 落一条记录（最近 30 天）。</p>
       </div>
+    </div>
+
+    <!-- C1 差异核销：虚拟持仓 vs 柜台实际对账差异；accept/忽略/标记均二次确认 -->
+    <div v-if="wbTab === 'diffs'" class="table-wrap" data-test="diffs-panel">
+      <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:8px">
+        <select v-model="diffStatusFilter" class="field-select" style="width:auto"
+                @change="loadDiffs">
+          <option value="open">未处理</option>
+          <option value="all">全部</option>
+        </select>
+        <button class="btn btn-sm" :disabled="diffsLoading" @click="loadDiffs">
+          {{ diffsLoading ? '加载中…' : '↻ 刷新差异' }}
+        </button>
+        <span style="font-size:12px;color:var(--ink-soft)">
+          接受＝以柜台为准按实际入账（持仓差改账）；忽略/标记只留痕。全部动作写审计事件。
+        </span>
+      </div>
+      <table>
+        <thead><tr>
+          <th>#</th><th>类型</th><th>组合</th><th>代码</th><th>期望</th>
+          <th>实际</th><th>差额</th><th>状态</th><th>时间</th><th>操作</th>
+        </tr></thead>
+        <tbody>
+          <tr v-for="d in diffs" :key="d.id">
+            <td>{{ d.id }}</td>
+            <td>{{ d.diff_type }}</td>
+            <td>{{ d.portfolio_id ?? '—' }}</td>
+            <td>{{ d.stock_code || '—' }}</td>
+            <td>{{ d.expected ?? '—' }}</td>
+            <td>{{ d.actual ?? '—' }}</td>
+            <td>{{ d.delta ?? '—' }}</td>
+            <td>
+              <span class="badge" :class="d.status === 'open' ? 'badge-orange' : 'badge-gray'">
+                {{ d.status }}
+              </span>
+            </td>
+            <td>{{ d.created_at || '—' }}</td>
+            <td>
+              <template v-if="d.status === 'open'">
+                <button class="btn btn-sm" data-test="diff-accept"
+                        @click="openDiffAction(d, 'accept')">接受</button>
+                <button class="btn btn-sm" @click="openDiffAction(d, 'resolve')">标记</button>
+                <button class="btn btn-sm" @click="openDiffAction(d, 'ignore')">忽略</button>
+              </template>
+              <span v-else style="font-size:12px;color:var(--ink-soft)">
+                {{ d.resolution || d.status }}
+              </span>
+            </td>
+          </tr>
+          <tr v-if="!diffs.length">
+            <td colspan="10" style="color:var(--ink-soft)">暂无差异记录</td>
+          </tr>
+        </tbody>
+      </table>
     </div>
 
     <!-- 预警信号：alert 模式主产物（半自动）；auto 模式信号同样落库并默认经 send_warn 推送（审计旁路） -->
@@ -3254,35 +3512,6 @@ onUnmounted(() => {
         ⑤ <strong>去重</strong>：同代码 + 同日 + 同方向各认第一条（买卖互不吞并；同方向重复推送不重复下单）。去重键 = 代码 + 交易日 + 方向（会话内生效，跨会话不共享）。未知/不可解析的动作一律忽略并节流告警，绝不猜测方向或默认成买入。
       </p>
       <div class="opt-block">
-  <!-- 按标的授权代卖：二次确认（展示整仓数量/当前价/预估金额，确认后才调接口） -->
-  <div v-if="scopeModal" class="modal-overlay" data-test="position-scope-modal" @click.self="scopeModal = null">
-    <div class="modal-content">
-      <h3>{{ scopeModal.enabled ? '放开代卖授权' : '收回代卖授权' }}「{{ scopeModal.code }}」</h3>
-      <div class="modal-body">
-        <p class="muted">会话 #{{ scopeModal.sessionId }} · 授权按标的（代码）生效，同代码多子策略共享</p>
-        <ul class="guard-check-list">
-          <li class="ok"><b>整仓数量</b><span>{{ scopeModal.row.quantity }} 股</span></li>
-          <li class="ok"><b>当前价（估算）</b><span>{{ fmtCost(scopePrice(scopeModal.row)) }}</span></li>
-          <li class="ok"><b>预估金额</b><span>{{ fmtMoney(scopeAmount(scopeModal.row)) }}</span></li>
-        </ul>
-        <p v-if="scopeModal.enabled" class="baseline-preview warn">
-          放开后：该代码触发止损/移动止损/止盈时按<b>整仓可卖量</b>下单（不再只卖平台仓），
-          仍受 T+1、涨跌停、审批、时点等既有闸门约束；下一轮 tick 生效，变更写审计事件。
-        </p>
-        <p v-else class="baseline-preview">
-          收回后：立即恢复「仅卖平台仓」，存量/外部部分不下单（但仍纳入风控计算，
-          触发时记 sell_scope/skip 并每日首条 warn 告警）。
-        </p>
-      </div>
-      <div class="modal-actions">
-        <button class="btn btn-primary" :disabled="scopeBusy" data-test="position-scope-confirm" @click="confirmScopeToggle">
-          {{ scopeBusy ? '提交中…' : (scopeModal.enabled ? '确认放开代卖' : '确认收回授权') }}
-        </button>
-        <button class="btn" :disabled="scopeBusy" @click="scopeModal = null">取消</button>
-      </div>
-    </div>
-  </div>
-
         <div class="opt-grid">
           <input v-model="form.advance_close_enabled" type="checkbox" class="opt-check" />
           <span class="opt-title">14:50 提前收盘价（pre_close_1450，仅日线 1d，当日尾盘报单）</span>
@@ -3371,6 +3600,153 @@ onUnmounted(() => {
       <div class="modal-actions">
         <button @click="create" class="btn btn-primary">确认</button>
         <button @click="showCreate = false" class="btn">取消</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 按标的授权代卖：二次确认（展示整仓数量/当前价/预估金额，确认后才调接口） -->
+  <div v-if="scopeModal" class="modal-overlay" data-test="position-scope-modal" @click.self="scopeModal = null">
+    <div class="modal-content">
+      <h3>{{ scopeModal.enabled ? '放开代卖授权' : '收回代卖授权' }}「{{ scopeModal.code }}」</h3>
+      <div class="modal-body">
+        <p class="muted">会话 #{{ scopeModal.sessionId }} · 授权按标的（代码）生效，同代码多子策略共享</p>
+        <ul class="guard-check-list">
+          <li class="ok"><b>整仓数量</b><span>{{ scopeModal.row.quantity }} 股</span></li>
+          <li class="ok"><b>当前价（估算）</b><span>{{ fmtCost(scopePrice(scopeModal.row)) }}</span></li>
+          <li class="ok"><b>预估金额</b><span>{{ fmtMoney(scopeAmount(scopeModal.row)) }}</span></li>
+        </ul>
+        <p v-if="scopeModal.enabled" class="baseline-preview warn">
+          放开后：该代码触发止损/移动止损/止盈时按<b>整仓可卖量</b>下单（不再只卖平台仓），
+          仍受 T+1、涨跌停、审批、时点等既有闸门约束；下一轮 tick 生效，变更写审计事件。
+        </p>
+        <p v-else class="baseline-preview">
+          收回后：立即恢复「仅卖平台仓」，存量/外部部分不下单（但仍纳入风控计算，
+          触发时记 sell_scope/skip 并每日首条 warn 告警）。
+        </p>
+      </div>
+      <div class="modal-actions">
+        <button class="btn btn-primary" :disabled="scopeBusy" data-test="position-scope-confirm" @click="confirmScopeToggle">
+          {{ scopeBusy ? '提交中…' : (scopeModal.enabled ? '确认放开代卖' : '确认收回授权') }}
+        </button>
+        <button class="btn" :disabled="scopeBusy" @click="scopeModal = null">取消</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 手工持仓改账（I1）：两步式，先展示方向/数量/金额，确认后才写合成成交 -->
+  <div v-if="adjustModal" class="modal-overlay modal-lg" data-test="adjust-modal" @click.self="adjustModal = false">
+    <div class="modal-content">
+      <h3>持仓改账<span v-if="adjustSessionId !== null">（会话 #{{ adjustSessionId }}）</span></h3>
+      <div class="modal-body">
+        <template v-if="adjustStep === 'form'">
+          <p class="muted" style="font-size:12px">
+            仅停止的会话可用：写一笔合成成交（正=买入 / 负=卖出），重启会话后由成交重放生效。
+          </p>
+          <div class="form-group">
+            <label>会话（仅已停止）</label>
+            <select v-model="adjustSessionId" data-test="adjust-session"
+                    @change="onAdjustSessionChange">
+              <option v-for="s in stoppedSessions" :key="s.id" :value="s.id">#{{ s.id }} {{ s.name }}</option>
+            </select>
+          </div>
+          <div class="form-group">
+            <label>组合策略</label>
+            <select v-model="adjustForm.portfolio_id" data-test="adjust-portfolio"
+                    @change="adjustForm.strategy_id = ''">
+              <option v-for="p in activeSessionPortfolios" :key="p.id" :value="p.id">#{{ p.id }} {{ p.name }}</option>
+            </select>
+          </div>
+          <div class="form-group">
+            <label>子策略</label>
+            <select v-model="adjustForm.strategy_id" data-test="adjust-strategy">
+              <option value="">请选择</option>
+              <option v-for="s in adjustStrategies" :key="s.id" :value="s.id">策略 #{{ s.id }}</option>
+            </select>
+          </div>
+          <div class="form-group">
+            <label>股票代码</label>
+            <input v-model="adjustForm.stock_code" type="text" placeholder="如 600211" data-test="adjust-code" />
+          </div>
+          <div class="form-group">
+            <label>数量差（股）</label>
+            <input v-model="adjustForm.quantity_delta" type="number" step="100"
+                   placeholder="正=买入 / 负=卖出" data-test="adjust-delta" />
+          </div>
+          <div class="form-group">
+            <label>成交价（元）</label>
+            <input v-model="adjustForm.price" type="number" step="0.01"
+                   placeholder="改账价格" data-test="adjust-price" />
+          </div>
+          <div class="form-group">
+            <label>备注（可选）</label>
+            <input v-model="adjustForm.note" type="text" placeholder="改账原因" data-test="adjust-note" />
+          </div>
+          <p v-if="adjustError" class="form-error" data-test="adjust-error">{{ adjustError }}</p>
+        </template>
+        <template v-else>
+          <p class="muted" style="font-size:12px">请确认将要写入的合成成交：</p>
+          <ul class="guard-check-list">
+            <li class="ok"><b>标的</b><span>{{ String(adjustForm.stock_code).toUpperCase() }}</span></li>
+            <li class="ok"><b>方向</b><span>{{ adjustSummary.direction }}</span></li>
+            <li class="ok"><b>数量</b><span>{{ adjustSummary.quantity }} 股</span></li>
+            <li class="ok"><b>价格</b><span>{{ adjustForm.price }} 元</span></li>
+            <li class="ok"><b>金额</b><span>{{ fmtMoney(adjustSummary.amount) }} 元</span></li>
+          </ul>
+          <p class="baseline-preview warn">
+            写入后持仓不会立即变化：需重启会话，由 live_trades 重放生效；本次动作写审计事件。
+          </p>
+          <p v-if="adjustError" class="form-error" data-test="adjust-error">{{ adjustError }}</p>
+        </template>
+      </div>
+      <div class="modal-actions">
+        <template v-if="adjustStep === 'form'">
+          <button class="btn btn-primary" data-test="adjust-next" @click="adjustPreview">下一步：确认</button>
+          <button class="btn" @click="adjustModal = false">取消</button>
+        </template>
+        <template v-else>
+          <button class="btn btn-primary" :disabled="adjustBusy" data-test="adjust-confirm" @click="submitAdjust">
+            {{ adjustBusy ? '写入中…' : '确认写入' }}
+          </button>
+          <button class="btn" :disabled="adjustBusy" @click="adjustStep = 'form'">返回修改</button>
+        </template>
+      </div>
+    </div>
+  </div>
+
+  <!-- 差异核销（C1）：接受=按柜台实际入账（改虚拟持仓），忽略/标记只留痕；均写审计 -->
+  <div v-if="diffModal" class="modal-overlay" data-test="diff-modal" @click.self="diffModal = null">
+    <div class="modal-content">
+      <h3>核销差异 #{{ diffModal.row.id }}</h3>
+      <div class="modal-body">
+        <ul class="guard-check-list">
+          <li class="ok"><b>类型</b><span>{{ diffModal.row.diff_type }}</span></li>
+          <li class="ok"><b>代码</b><span>{{ diffModal.row.stock_code || '—' }}</span></li>
+          <li class="ok"><b>期望 / 实际</b><span>{{ diffModal.row.expected ?? '—' }} / {{ diffModal.row.actual ?? '—' }}</span></li>
+          <li class="ok"><b>差额</b><span>{{ diffModal.row.delta ?? '—' }}</span></li>
+        </ul>
+        <p class="muted" style="font-size:12px">
+          {{ diffModal.action === 'accept'
+            ? '接受：以柜台为准按实际入账，将按差额调整虚拟持仓；'
+            : diffModal.action === 'ignore'
+              ? '忽略：不改持仓，仅把该差异标记为忽略；'
+              : '标记：不改持仓，仅把该差异标记为已处理；' }}
+          本次动作写审计事件。
+        </p>
+        <div v-if="diffModal.action === 'accept'" class="form-group">
+          <label>入账价格（可选，留空用最近价）</label>
+          <input v-model="diffPrice" type="number" step="0.01" data-test="diff-price" />
+        </div>
+        <div class="form-group">
+          <label>处理说明（可选）</label>
+          <input v-model="diffResolution" type="text" placeholder="核销依据" data-test="diff-resolution" />
+        </div>
+        <p v-if="diffError" class="form-error" data-test="diff-error">{{ diffError }}</p>
+      </div>
+      <div class="modal-actions">
+        <button class="btn btn-primary" :disabled="diffBusy" data-test="diff-confirm" @click="confirmDiffAction">
+          {{ diffBusy ? '处理中…' : '确认处理' }}
+        </button>
+        <button class="btn" :disabled="diffBusy" @click="diffModal = null">取消</button>
       </div>
     </div>
   </div>

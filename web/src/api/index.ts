@@ -2286,6 +2286,86 @@ export async function abandonLiveDeferredOrder(
   return res.data.data
 }
 
+// ---------------------------------------------------------------------------
+// 运维操作：手工持仓改账 / 差异核销 / 紧急全平（均需二次确认，后端写审计）
+// ---------------------------------------------------------------------------
+export interface PositionAdjustResult {
+  trade_id: number
+  stock_code: string
+  trade_type: string
+  quantity: number
+  price: string
+  amount: string
+  cash_delta: string
+  effective: string
+  manual_action?: unknown
+}
+
+/** I1 持仓改账（仅停止的会话）：写合成成交，重启 recover 后生效。 */
+export async function adjustLivePosition(sessionId: number, body: {
+  portfolio_strategy_id: number
+  strategy_id: number
+  stock_code: string
+  quantity_delta: number
+  price: number | string
+  note?: string
+}) {
+  const res = await api.post<ApiResponse<PositionAdjustResult>>(
+    `/live/sessions/${sessionId}/manual/position-adjust`, body)
+  return res.data.data
+}
+
+export interface ReconciliationDiffItem {
+  id: number
+  diff_type: string
+  portfolio_id: number | null
+  stock_code: string | null
+  expected: string | null
+  actual: string | null
+  delta: string | null
+  status: string
+  resolution: string | null
+  detail?: string | null
+  created_at: string | null
+  updated_at: string | null
+}
+
+export interface ReconciliationDiffList {
+  session_id: number
+  diffs: ReconciliationDiffItem[]
+  status_counts: Record<string, number>
+}
+
+/** C1 差异台账（只读）。 */
+export async function getLiveReconciliationDiffs(sessionId: number, status?: string) {
+  const res = await api.get<ApiResponse<ReconciliationDiffList>>(
+    `/live/sessions/${sessionId}/diffs`, { params: status ? { status } : {} })
+  return res.data.data
+}
+
+/** 差异核销（accept=按实际入账 / ignore=忽略 / resolve=标记已处理）。 */
+export async function resolveLiveReconciliationDiff(
+  sessionId: number, diffId: number,
+  body: { action: 'accept' | 'ignore' | 'resolve'; resolution?: string; price?: number | string },
+) {
+  const res = await api.post<ApiResponse<ReconciliationDiffItem>>(
+    `/live/sessions/${sessionId}/diffs/${diffId}/resolve`, body)
+  return res.data.data
+}
+
+export interface EmergencyLiquidateResult {
+  results: Array<Record<string, unknown> & { session_id: number }>
+  reason?: string | null
+}
+
+/** M2 一键全平（全部运行中会话；需 confirm=LIQUIDATE）。 */
+export async function liquidateAllSessions(confirm: string, reason?: string) {
+  const res = await api.post<ApiResponse<EmergencyLiquidateResult>>(
+    '/live/emergency/liquidate-all',
+    { confirm, ...(reason ? { reason } : {}) })
+  return res.data.data
+}
+
 /** G4：盘前效果统计（只读，按日/周）。 */
 export interface LivePreOpenBucket {
   bucket: string
