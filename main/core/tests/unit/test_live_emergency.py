@@ -31,9 +31,12 @@ def test_pause_and_resume_syncs_running_engines(db_session):
 
 
 def test_liquidate_requires_explicit_confirm(db_session):
-    engine = _FakeEngine()
+    class _Probe:
+        def emergency_liquidate_all(self, **kwargs):
+            raise AssertionError("confirm 未过不应触达引擎")
+
     ok, error = live_service.liquidate_all(
-        db_session, "yes", "test", {1: engine})
+        db_session, "yes", "test", {1: _Probe()}, dry_run=True)
     assert ok is False
     assert error[0] == 400
 
@@ -42,15 +45,44 @@ def test_liquidate_calls_engine(db_session):
     class _LiquidEngine:
         def __init__(self):
             self.reason = None
+            self.operator = None
+            self.dry_run = None
 
-        def emergency_liquidate_all(self, reason=None):
+        def emergency_liquidate_all(self, reason=None, operator=None,
+                                    dry_run=False):
             self.reason = reason
-            return {"submitted": 2, "skipped": 0}
+            self.operator = operator
+            self.dry_run = dry_run
+            return {"submitted": 2, "blocked": 1, "deferred": 0,
+                    "errors": 0, "details": []}
 
     engine = _LiquidEngine()
     ok, data = live_service.liquidate_all(
-        db_session, "LIQUIDATE", "风控事件", {7: engine})
+        db_session, "LIQUIDATE", "风控事件", {7: engine}, "tester")
     assert ok is True
     assert engine.reason == "风控事件"
+    assert engine.operator == "tester"
+    assert engine.dry_run is False
     assert data["results"][0]["session_id"] == 7
     assert data["results"][0]["submitted"] == 2
+    assert data["results"][0]["blocked"] == 1
+
+
+def test_liquidate_passes_dry_run_flag(db_session):
+    class _LiquidEngine:
+        def __init__(self):
+            self.dry_run = None
+
+        def emergency_liquidate_all(self, reason=None, operator=None,
+                                    dry_run=False):
+            self.dry_run = dry_run
+            return {"submitted": 1, "blocked": 0, "deferred": 0,
+                    "errors": 0, "details": []}
+
+    engine = _LiquidEngine()
+    ok, data = live_service.liquidate_all(
+        db_session, "LIQUIDATE", None, {3: engine}, dry_run=True)
+    assert ok is True
+    assert engine.dry_run is True
+    assert data["dry_run"] is True
+    assert data["results"][0]["submitted"] == 1

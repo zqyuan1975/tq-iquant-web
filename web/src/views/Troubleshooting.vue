@@ -108,12 +108,14 @@ async function clearGate() {
 const liquidateModal = ref(false)
 const liquidateConfirmText = ref('')
 const liquidateReason = ref('')
+const liquidateOperator = ref('')
 const liquidating = ref(false)
 const liquidateError = ref('')
 
 function openLiquidateModal() {
   liquidateConfirmText.value = ''
   liquidateReason.value = ''
+  liquidateOperator.value = ''
   liquidateError.value = ''
   liquidateModal.value = true
 }
@@ -126,16 +128,25 @@ async function submitLiquidate() {
   liquidating.value = true
   liquidateError.value = ''
   try {
-    const res = await liquidateAllSessions(
-      'LIQUIDATE', liquidateReason.value.trim() || undefined)
+    const op = liquidateOperator.value.trim() || undefined
+    const res = op
+      ? await liquidateAllSessions('LIQUIDATE', liquidateReason.value.trim() || undefined, op)
+      : await liquidateAllSessions('LIQUIDATE', liquidateReason.value.trim() || undefined)
     liquidateModal.value = false
     const lines = (res.results || []).map((r) => {
       const sid = r.session_id
       const err = (r as Record<string, unknown>).error
       if (err) return `#${sid} 失败：${String(err)}`
-      const n = Number((r as Record<string, unknown>).submitted ?? 0)
-      const skipped = Number((r as Record<string, unknown>).skipped ?? 0)
-      return `#${sid} 提交 ${n} 笔卖单${skipped ? `（跳过 ${skipped} 笔，原因见日志）` : ''}`
+      const sub = Number((r as Record<string, unknown>).submitted ?? 0)
+      const blocked = Number((r as Record<string, unknown>).blocked ?? 0)
+      const deferred = Number((r as Record<string, unknown>).deferred ?? 0)
+      const details = ((r as Record<string, unknown>).details || []) as Array<Record<string, unknown>>
+      const skippedReasons = details
+        .filter((d) => d.status !== 'submitted')
+        .map((d) => `${String(d.code)} ${String(d.reason || d.status)}`)
+        .slice(0, 3)
+      return `#${sid} 受理 ${sub} 笔 / 被拦 ${blocked} 笔 / 顺延 ${deferred} 笔`
+        + (skippedReasons.length ? `（${skippedReasons.join('；')}${details.filter((d) => d.status !== 'submitted').length > 3 ? '…' : ''}）` : '')
     })
     opsFeedback.value = {
       ok: true,
@@ -382,7 +393,8 @@ onUnmounted(() => {
       <div class="ts-section-title" style="color:var(--red)">紧急全平</div>
       <p class="ts-src">
         对<b>全部运行中会话</b>的持仓按整仓提交卖单（不受 sell_scope / 代卖授权限制），
-        仍走既有提交闸门（T+1 / 时点 / 审批）；需输入 LIQUIDATE 确认，动作写审计事件。
+        仍走既有提交闸门（T+1 / 时点）；<b>非交易时段将顺延至次日 09:15 集合竞价</b>。
+        需输入 LIQUIDATE 确认，动作写审计事件。
       </p>
       <button
         class="btn btn-sm" style="color:var(--red);border-color:var(--red)"
@@ -430,7 +442,8 @@ onUnmounted(() => {
       <div class="modal-body">
         <p class="ts-src" style="color:var(--red)">
           将对<b>全部运行中会话</b>的持仓按整仓提交卖单（不受 sell_scope / 代卖授权限制）。
-          该动作立即生效、不可撤销，仅用于紧急处置；后端写审计事件。
+          <b>非交易时段提交将顺延至次日 09:15 集合竞价，不会立即成交</b>，仅用于紧急处置；
+          后端写审计事件。
         </p>
         <div class="form-group">
           <label>确认口令</label>
@@ -441,6 +454,11 @@ onUnmounted(() => {
           <label>原因（可选）</label>
           <input v-model="liquidateReason" type="text" placeholder="如：通道异常 / 风控紧急降险"
                  data-test="liquidate-reason" />
+        </div>
+        <div class="form-group">
+          <label>操作者（可选，写审计）</label>
+          <input v-model="liquidateOperator" type="text" placeholder="缺省记「无鉴权，无法识别操作者」"
+                 data-test="liquidate-operator" />
         </div>
         <p v-if="liquidateError" class="form-error" data-test="liquidate-error">{{ liquidateError }}</p>
       </div>

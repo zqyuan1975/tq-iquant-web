@@ -227,6 +227,16 @@ _GAP_BACKFILL_MAX_BARS = 240
 # 峰值更新允许；盘中的分钟 bar 对「全为日线策略」的组合只是噪声（P1-2）。
 _DAILY_PERIODS = ("1d", "1w", "1mon")
 
+# 提交链三态返回（M2 一键全平上报口径）：受理 / 被拦 / 顺延。
+# 旧调用点不读取返回值，改为返回字符串不影响既有行为；_submit_reason 由
+# 具体闸门点覆盖（默认「闸门拦截」），供接口按票回显原因。
+_SUBMIT_SUBMITTED = "submitted"
+_SUBMIT_BLOCKED = "blocked"
+_SUBMIT_DEFERRED = "deferred"
+_SUBMIT_REASON_DEFAULT = "闸门拦截（详见决策事件）"
+# 系统无鉴权：高危操作审计的操作者固定留痕，不伪造身份。
+_SUBMIT_OPERATOR_UNKNOWN = "无鉴权，无法识别操作者"
+
 
 def _allow_peak_update(portfolio: Portfolio, bar: BarEvent) -> bool:
     """P1-2：本 bar 是否允许抬净值峰值（回撤分母）。
@@ -7809,16 +7819,118 @@ class LiveEngine:
                 "message": "资金对账通过，恢复新增买入",
             })
 
-    def emergency_liquidate_all(self, reason: Optional[str] = None) -> dict:
+    def _dry_run_submit_outcome(
+        self, db, portfolio: Portfolio, order: OrderEvent, period: str,
+    ) -> Tuple[str, str]:
+        """dry-run 闸门判定：复用真实提交链同一批只读闸门，不写任何行。
+
+        顺序与 `_submit_one_order` 对齐（收盘顺延 → 交易日历 → B-1 deferred →
+        D6 去重 → bar 幂等 → 在途/人工核对 → 资金/T+1 审批）。新增闸门时必须
+        两处同步，避免 dry-run 与真实结果分叉。
+        """
+        ctx = portfolio.find_strategy(order.strategy_id)
+        if ctx is None:
+            return _SUBMIT_BLOCKED, "策略上下文缺失"
+        bt = order.bar_time
+        deferred_by_close = bool(
+            bt is not None and (bt.hour, bt.minute) >= _MARKET_CLOSE_TIME)
+        if deferred_by_close:
+            order.signal_bar_date = bt.date()
+            order._after_close_defer = True
+        elif period not in self._DAILY_PERIODS and bt is not None:
+            wall = self.ctx.clock()
+            if (wall.date() == bt.date()
+                    and (wall.hour, wall.minute) >= _MARKET_CLOSE_TIME):
+                deferred_by_close = True
+                order._after_close_defer = True
+        if (bt is not None and not deferred_by_close
+                and not self._trading_allowed_for(bt, period)):
+            return _SUBMIT_BLOCKED, "非交易日/非交易时段"
+        if deferred_by_close or self._should_defer_order(portfolio, order):
+            return _SUBMIT_DEFERRED, "顺延至次一交易日"
+        op = "buy" if order.trade_type == TradeType.BUY else "sell"
+        if bt is not None:
+            dup = db.query(LiveOrder).filter(
+                LiveOrder.live_session_id == self.session_id,
+                LiveOrder.portfolio_strategy_id == order.portfolio_id,
+                LiveOrder.strategy_id == order.strategy_id,
+                LiveOrder.stock_code == order.stock_code,
+                LiveOrder.bar_time == bt,
+                LiveOrder.trade_type == op,
+                LiveOrder.status.in_(["submitted", "partial", "filled"]),
+            ).first()
+            if dup is not None:
+                return _SUBMIT_BLOCKED, "同 bar 同向单已存在（order=%s）" % dup.id
+        if not getattr(order, "_requote", False):
+            prev_mark = self._bar_already_processed(db, order)
+            if prev_mark is not None:
+                return _SUBMIT_BLOCKED, "该 bar 已处理（幂等跳过）"
+        inflight = db.query(LiveOrder).filter(
+            LiveOrder.live_session_id == self.session_id,
+            LiveOrder.portfolio_strategy_id == order.portfolio_id,
+            LiveOrder.strategy_id == order.strategy_id,
+            LiveOrder.stock_code == order.stock_code,
+            LiveOrder.trade_type == op,
+            LiveOrder.status.in_(["submitted", "partial"]),
+            or_(
+                LiveOrder.error_message.is_(None),
+                ~LiveOrder.error_message.like(_UNTRACEABLE_MARKER + "%"),
+            ),
+        ).first()
+        if inflight is not None:
+            return _SUBMIT_BLOCKED, "同向在途单未确认（order=%s）" % inflight.id
+        review = db.query(LiveOrder).filter(
+            LiveOrder.live_session_id == self.session_id,
+            LiveOrder.portfolio_strategy_id == order.portfolio_id,
+            LiveOrder.strategy_id == order.strategy_id,
+            LiveOrder.stock_code == order.stock_code,
+            LiveOrder.trade_type == op,
+            LiveOrder.status.in_(["submitted", "partial"]),
+            LiveOrder.error_message.startswith(_MANUAL_REVIEW_MARKER,
+                                              autoescape=True),
+        ).first()
+        if review is not None:
+            return _SUBMIT_BLOCKED, "同向委托 %s 待人工核对" % review.id
+        pos = ctx.positions.get(order.stock_code)
+        if pos is None:
+            return _SUBMIT_BLOCKED, "无持仓（无可卖数量）"
+        # 资金/T+1 审批只算不下单；SELL 走 T+1 可卖量。
+        cash_cap = (self._buy_available_cash(portfolio)
+                    if order.trade_type == TradeType.BUY else None)
+        capped = self._engine.cap_quantity(
+            order, portfolio.account, pos,
+            available_cash_cap=cash_cap,
+            **self._exposure_kwargs(portfolio, ctx),
+        )
+        if capped is None:
+            return _SUBMIT_BLOCKED, "资金/T+1/仓位审批未通过"
+        order.quantity = capped
+        return _SUBMIT_SUBMITTED, ""
+
+    def emergency_liquidate_all(
+        self, reason: Optional[str] = None,
+        operator: Optional[str] = None, dry_run: bool = False,
+    ) -> dict:
         """M2 一键全平：逐组合逐持仓生成 SELL CLOSE，走既有提交闸门链。
 
         不绕过熔断/时点/T+1/在途门；任一单失败只记日志不中断其它组合。
+        返回三态计数（受理 / 被拦 / 顺延）+ 逐票明细，计数取自提交链真实返回值，
+        不再把「闸门静默拦截」算成提交成功。
+
+        ``dry_run=True``：走同一套遍历、整仓取量与闸门判定，但**不提交、不写
+        live_orders、不改持仓与资金**；三态语义为「真跑会发生什么」。审计照写，
+        但 gate 标 `global_emergency_dry_run` 且 archived_at 已置（不计待处理告警）。
         """
         db = self._db_session_factory()
         if db is None:
-            return {"submitted": 0, "skipped": 0, "error": "db unavailable"}
+            return {"submitted": 0, "blocked": 0, "deferred": 0,
+                    "errors": 0, "details": [], "error": "db unavailable"}
+        operator = (operator or "").strip() or _SUBMIT_OPERATOR_UNKNOWN
         submitted = 0
-        skipped = 0
+        blocked = 0
+        deferred = 0
+        errors = 0
+        details: List[dict] = []
         try:
             now = self.ctx.clock()
             for portfolio in list(self.ctx.portfolios or []):
@@ -7833,41 +7945,95 @@ class LiveEngine:
                         price = price_snapshot.get(code)
                         if price is None:
                             price = getattr(pos, "avg_cost", None)
+                        order = None
+                        final_qty = 0
                         if price is None:
-                            skipped += 1
-                            continue
-                        order = OrderEvent(
-                            strategy_id=strategy_id,
-                            portfolio_id=portfolio.portfolio_id,
-                            stock_code=code, trade_type=TradeType.SELL,
-                            signal_type=SignalType.CLOSE, quantity=qty,
-                            price=Decimal(str(price)), bar_time=now,
-                            signal_name="emergency_liquidate", period="1d",
-                        )
-                        try:
-                            self._submit_one_order(
-                                db, portfolio, order, "1d", emit_signal=False)
-                            submitted += 1
-                        except Exception:  # noqa: BLE001 — 单票失败不中断全平
-                            db.rollback()
-                            skipped += 1
-                            logger.exception(
-                                "组合 %s 应急全平提交失败（%s）",
-                                portfolio.portfolio_id, code)
+                            outcome = _SUBMIT_BLOCKED
+                            reason_txt = "无可用价格（行情快照与成本价均缺失）"
+                            blocked += 1
+                        else:
+                            order = OrderEvent(
+                                strategy_id=strategy_id,
+                                portfolio_id=portfolio.portfolio_id,
+                                stock_code=code, trade_type=TradeType.SELL,
+                                signal_type=SignalType.CLOSE, quantity=qty,
+                                price=Decimal(str(price)), bar_time=now,
+                                signal_name="emergency_liquidate", period="1d",
+                            )
+                            try:
+                                if dry_run:
+                                    outcome, reason_txt = \
+                                        self._dry_run_submit_outcome(
+                                            db, portfolio, order, "1d")
+                                else:
+                                    # 三态以提交链写入 order 的 outcome 为准（提前
+                                    # return 的路径无法靠返回值区分顺延/拦截）。
+                                    self._submit_one_order(
+                                        db, portfolio, order, "1d",
+                                        emit_signal=False)
+                                    outcome = getattr(
+                                        order, "_submit_outcome", None) \
+                                        or _SUBMIT_BLOCKED
+                                    reason_txt = getattr(
+                                        order, "_submit_reason", "") or ""
+                            except Exception as exc:  # noqa: BLE001 — 单票失败不中断全平
+                                db.rollback()
+                                outcome = getattr(
+                                    order, "_submit_outcome", _SUBMIT_BLOCKED)
+                                outcome = outcome or _SUBMIT_BLOCKED
+                                if outcome != _SUBMIT_SUBMITTED:
+                                    errors += 1
+                                reason_txt = "提交异常：%s" % exc
+                                logger.exception(
+                                    "组合 %s 应急全平提交失败（%s）",
+                                    portfolio.portfolio_id, code)
+                            if outcome == _SUBMIT_SUBMITTED:
+                                submitted += 1
+                                final_qty = int(
+                                    getattr(order, "quantity", qty) or 0)
+                            elif outcome == _SUBMIT_DEFERRED:
+                                deferred += 1
+                            else:
+                                blocked += 1
+                        details.append({
+                            "code": code, "quantity": qty,
+                            "status": outcome, "reason": reason_txt or "",
+                        })
+                        # 审计：成功/被拦/顺延/异常都落行，含操作者与结构化数量。
+                        # dry-run 行用独立 gate 且 archived_at 已置（不进待处理告警）。
                         try:
                             db.add(LiveDecisionEvent(
                                 live_session_id=self.session_id,
-                                gate="global_emergency", layer="global",
-                                action="liquidate", bar_time=now,
+                                gate=("global_emergency_dry_run" if dry_run
+                                      else "global_emergency"),
+                                layer="global",
+                                action=("liquidate_dry_run" if dry_run
+                                        else "liquidate"),
+                                bar_time=now,
+                                portfolio_id=portfolio.portfolio_id,
+                                strategy_id=strategy_id,
+                                stock_code=code,
                                 param_name="liquidate_all",
-                                message=("应急全平 %s %s x%s：%s" % (
-                                    portfolio.portfolio_id, code, qty,
-                                    reason or ""))[:200],
+                                requested_qty=qty,
+                                final_qty=final_qty,
+                                operator=operator,
+                                result=outcome,
+                                archived_at=(now if dry_run else None),
+                                archive_reason=("dry-run" if dry_run else None),
+                                message=(("[dry-run] " if dry_run else "")
+                                         + "应急全平 %s %s x%s [%s]：%s" % (
+                                             portfolio.portfolio_id, code, qty,
+                                             outcome, reason or reason_txt
+                                             or ""))[:200],
                             ))
                             db.commit()
                         except Exception:  # noqa: BLE001
                             db.rollback()
-            return {"submitted": submitted, "skipped": skipped}
+            return {
+                "submitted": submitted, "blocked": blocked,
+                "deferred": deferred, "errors": errors,
+                "details": details,
+            }
         finally:
             db.close()
 
@@ -11105,6 +11271,10 @@ class LiveEngine:
         prType=11、审批价原样下发）；None = 通道按配置默认（盘中 opponent），
         其它调用点一律不传，行为不变。
         """
+        # 三态默认「被拦」：任何未显式改写 outcome 的提前 return 都按拦截上报，
+        # 顺延/受理点各自覆盖 reason（一键全平按此统计，不再靠事后数订单表）。
+        order._submit_outcome = _SUBMIT_BLOCKED
+        order._submit_reason = _SUBMIT_REASON_DEFAULT
         ctx = portfolio.find_strategy(order.strategy_id)
         if ctx is None:
             return
@@ -11203,6 +11373,7 @@ class LiveEngine:
                 "non_trading_block", "block", portfolio, order,
                 message="非交易日/非交易时段 period=%s bar=%s" % (period, bt),
             )
+            order._submit_reason = "非交易日/非交易时段"
             return
         # B-1 未来函数闸门（与回测同式判定 t.date() <= signal_bar_date）：
         # 日线级信号（signal_bar_date 非 None，signal bar 为当日 00:00，close
@@ -11236,6 +11407,8 @@ class LiveEngine:
                            for o in self._signal_bar_deferred):
                     order._deferred_row_id = dup.id
                     self._signal_bar_deferred.append(order)
+                order._submit_outcome = _SUBMIT_DEFERRED
+                order._submit_reason = "同键已顺延（去重）"
                 return
             self._signal_bar_deferred.append(order)
             # P2 持久化：deferred 落库（status=deferred），重启 recover 重建
@@ -11262,6 +11435,8 @@ class LiveEngine:
                     message="日线级信号次日执行：signal_bar_date=%s，本 bar %s 不下单，"
                             "延至次一交易日首 bar 提交" % (order.signal_bar_date, order.bar_time),
                 )
+            order._submit_outcome = _SUBMIT_DEFERRED
+            order._submit_reason = "顺延至次一交易日"
             return
         # 审批（cap_quantity）+ 拆单 + submitted 落库注册整体下移到
         # _approve_split_and_register，与 pending 注册同处 _book_lock 临界区
@@ -11297,6 +11472,7 @@ class LiveEngine:
                     "dup_skip", "block", portfolio, order,
                     message="同 bar 同向单已存在 order=%s" % dup.id,
                 )
+                order._submit_reason = "同 bar 同向单已存在（order=%s）" % dup.id
                 return
         # 持久幂等门（2026-11-11）：同 (session/组合/策略/股票/bar_time/方向, 子单
         # 序号) 历史上提交过一次即视为该 bar 已处理——**不看订单当前终态**。上面的
@@ -11317,6 +11493,7 @@ class LiveEngine:
                     message="跳过：该 bar 已处理（mark=%s，同 bar 同向历史已下过单，"
                             "不看原单终态）" % prev_mark,
                 )
+                order._submit_reason = "该 bar 已处理（幂等跳过）"
                 return
         # 在途单门（F7）：同 (组合,策略,股票) 已有同向未确认单（submitted/partial）
         # → 压掉新同向单。根因：下单→/deals 成交回填之间存在在途窗口，期间虚拟
@@ -11358,6 +11535,7 @@ class LiveEngine:
                 "inflight_skip", "block", portfolio, order,
                 message="同向在途单未确认 order=%s status=%s" % (inflight.id, inflight.status),
             )
+            order._submit_reason = "同向在途单未确认（order=%s）" % inflight.id
             return
         # 人工核对闸（2026-11-11）：桥通道超过 grace 仍无法追溯的单不再判 rejected，
         # 而是打 bridge_order_manual_review 标记留在途（柜台可能仍挂着旧单）。这里挡住
@@ -11385,6 +11563,7 @@ class LiveEngine:
                 message="同向委托 %s 超过 grace 仍无法追溯，已保留在途等待人工核对，"
                         "禁止自动重报" % review.id,
             )
+            order._submit_reason = "同向委托 %s 待人工核对" % review.id
             return
         # 批次1 外部信号改造：BUY 槽位/排重闸（SELL 不受限——风控卖出必须放行）。
         # ① 槽位闸：已持仓数 + 本策略在途 BUY 单数 >= max_positions → 拦截
@@ -11424,6 +11603,7 @@ class LiveEngine:
                         message="槽位已满：平台买入持仓 %d + 在途 BUY %d >= max_positions %d，"
                                 "跳过 BUY" % (held, inflight_buys, pos_limit),
                     )
+                    order._submit_reason = "槽位已满（max_positions=%d）" % pos_limit
                     return
             # T+1 排重按订单 bar_time 的自然日（bar 驱动口径，与收盘/日历闸一致；
             # bar_time 缺省回退当前上海时间）。
@@ -11477,6 +11657,7 @@ class LiveEngine:
                         message="同股当日已有 BUY 成交（trade %s，T+1 排重），跳过重复信号"
                                 % bought_today.id,
                     )
+                    order._submit_reason = "同股当日已有成交（T+1 排重）"
                     return
         # ①' M1 半自动审批队列（2026-11-18）：manual 模式下的**开仓类**新单不直接
         # 下发，先入队等人工批准。入队点选在「全部非资金闸门已过、尚未拆单/落库」
@@ -11491,6 +11672,7 @@ class LiveEngine:
                 and not getattr(order, "_requote", False)
                 and not self._approval_exempt(order)):
             self._enqueue_approval(db, portfolio, order, period)
+            order._submit_reason = "已转入人工审批队列"
             return
         # ① 审批 + 拆单 + submitted 落库注册：整段在 _book_lock 内完成
         # （P1#5，2026-11-16）。旧实现 BUY 资金上限（读 _pending_orders 预留）在锁外
@@ -11510,6 +11692,8 @@ class LiveEngine:
         registered = self._approve_split_and_register(
             db, portfolio, order, ctx, period)
         if registered is None:
+            # 审批/成交量/幂等/拆单队列拦截：reason 已在 _approve_split_and_register
+            # 或默认值里给出，这里只保证 outcome 为 blocked。
             return
         live_order, bar_mark_key, had_deferred_row = registered
         # I1：把落库行 id 挂回订单，人工补单 / 人工平仓据此判断「已受理 vs 闸门拦截」
@@ -11573,6 +11757,7 @@ class LiveEngine:
                 "bridge_unavailable", "reject", portfolio, order,
                 message="桥离线（dispatcher 不可达）",
             )
+            order._submit_reason = "桥离线（dispatcher 不可达）"
             with self._book_lock:
                 self._pending_orders.pop(live_order.id, None)
                 self._emit("order", {
@@ -11595,9 +11780,12 @@ class LiveEngine:
             # 回显桥侧真实原因（此前被吞成笼统 "approval failed"，真机查不了原因）。
             if _is_retryable_reject(e) and self._requeue_rejected_order(
                     db, portfolio, order, live_order, str(e)):
+                order._submit_outcome = _SUBMIT_DEFERRED
+                order._submit_reason = "桥拒单可重排：%s" % str(e)
                 return
             live_order.status = "rejected"
             live_order.error_message = str(e)
+            order._submit_reason = "桥拒单：%s" % str(e)
             # 终态拒单不得留在 deferred 队列里（否则同一逻辑单会被反复重试）
             if any(id(o) == id(order) for o in self._signal_bar_deferred):
                 with self._book_lock:
@@ -11643,6 +11831,9 @@ class LiveEngine:
                 with self._book_lock:
                     db.commit()
                 detach_loaded(db, live_order)
+                # 请求已发出、柜台可能已受理：按「已受理」上报（不谎报被拦）。
+                order._submit_outcome = _SUBMIT_SUBMITTED
+                order._submit_reason = "发单后异常，请求已发出待核对"
                 raise
             # 明确未发出：同事务回滚幻影（订单行 / 在途集合 / bar 幂等标记）
             self._rec_live(
@@ -11656,6 +11847,8 @@ class LiveEngine:
                 # 放行单：回 deferred 可重排（受既有次数上限约束），并清掉本次写入的
                 # bar 标记，避免重试被 `_mark_bar_processed` 唯一索引静默拦下。
                 self._clear_bar_mark(db, bar_mark_key)
+                order._submit_outcome = _SUBMIT_DEFERRED
+                order._submit_reason = "发单异常已回顺延队列（可重排）"
                 return
             live_order.status = "rejected"
             live_order.error_message = ("submit_error: %s" % detail)[:500]
@@ -11675,6 +11868,7 @@ class LiveEngine:
                 db.commit()
             detach_loaded(db, live_order)
             self._clear_bar_mark(db, bar_mark_key)
+            order._submit_reason = "发单异常且请求未发出（已回滚）"
             raise
         if trade is None:
             # TDX：柜台已受理（ErrorId=0）但委托表暂未见该单——**保持 submitted**，
@@ -11706,6 +11900,8 @@ class LiveEngine:
                     "order_unconfirmed", "warn", portfolio, order,
                     message="柜台已受理但暂未认领委托号，保持 submitted 等待回填",
                 )
+                order._submit_outcome = _SUBMIT_SUBMITTED
+                order._submit_reason = "柜台已受理未认领（等待回填）"
                 if order.trade_type == TradeType.SELL:
                     self._t1_checker.consume_available(
                         order.stock_code, order.quantity)
@@ -11739,6 +11935,7 @@ class LiveEngine:
                     "approval_failed", "reject", portfolio, order,
                     message="发单兜底失败（审批不过/桥返回 ok:false 无原因）",
                 )
+                order._submit_reason = "发单兜底失败（审批不过/桥无原因）"
                 with self._book_lock:
                     self._pending_orders.pop(live_order.id, None)
                     self._emit("order", {
@@ -11795,6 +11992,9 @@ class LiveEngine:
             order.signal_name, live_order.quantity, live_order.price,
             order.bar_time, self.session_id,
         )
+        order._submit_outcome = _SUBMIT_SUBMITTED
+        order._submit_reason = ""
+        return _SUBMIT_SUBMITTED
 
     def _approve_split_and_register(
         self, db: Session, portfolio: Portfolio, order: OrderEvent, ctx,
@@ -11856,6 +12056,7 @@ class LiveEngine:
                                 ("，可用现金上限 %s" % cash_cap)
                                 if cash_cap is not None else "")),
                 )
+                order._submit_reason = "资金/T+1/仓位审批未通过"
                 return None
             order.quantity = capped
             # 成交量约束（实盘化，对齐回测 #2）：快照合成 bar 量 × volume_limit_ratio。
@@ -11910,6 +12111,7 @@ class LiveEngine:
                         message="跳过：该 bar 已处理（并发重复提交，已回滚本单 order=%s）"
                                 % lo_id,
                     )
+                    order._submit_reason = "该 bar 已处理（并发幂等冲突）"
                     return None
             live_order._submit_at = now_shanghai()
             self._pending_orders[live_order.id] = live_order

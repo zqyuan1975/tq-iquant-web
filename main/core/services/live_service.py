@@ -6632,8 +6632,16 @@ def set_global_halt(db: Session, halted: bool, reason: Optional[str],
 
 
 def liquidate_all(db: Session, confirm: Optional[str], reason: Optional[str],
-                  engines: Dict[int, LiveEngine]):
-    """M2 一键全平：需显式 confirm=LIQUIDATE；仅运行中会话。"""
+                  engines: Dict[int, LiveEngine],
+                  operator: Optional[str] = None,
+                  dry_run: bool = False):
+    """M2 一键全平：需显式 confirm=LIQUIDATE；仅运行中会话。
+
+    `dry_run=True` 只算不报单（不写 live_orders、不改持仓资金），返回结构不变；
+    口令校验对 dry-run 同样生效，避免被当无害探针滥用。
+    返回的每个会话明细含 submitted / blocked / deferred / errors / details，
+    计数来自提交链三态真实返回值（闸门拦截与顺延不再算作提交成功）。
+    """
     if str(confirm or "") != "LIQUIDATE":
         return False, (400, "高危操作：需 confirm=LIQUIDATE 显式确认")
     results = []
@@ -6642,13 +6650,13 @@ def liquidate_all(db: Session, confirm: Optional[str], reason: Optional[str],
         if fn is None:
             continue
         try:
-            detail = fn(reason=reason)
+            detail = fn(reason=reason, operator=operator, dry_run=dry_run)
         except Exception as exc:  # noqa: BLE001 — 单会话失败不影响其它会话
             logger.exception("emergency liquidate failed (session %s)",
                              session_id)
             detail = {"error": str(exc)}
         results.append(dict(detail, session_id=session_id))
-    return True, {"results": results, "reason": reason}
+    return True, {"results": results, "reason": reason, "dry_run": dry_run}
 
 
 def bridge_status(session_id: int, status: str, engine: Optional[LiveEngine]) -> dict:

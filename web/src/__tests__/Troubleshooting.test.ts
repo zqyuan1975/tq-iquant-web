@@ -112,9 +112,13 @@ describe('故障向导：高危运维入口（二次确认 + 结果反馈）', (
     w.unmount()
   })
 
-  it('紧急全平：未输入 LIQUIDATE 不调接口；确认后展示每会话提交/跳过数', async () => {
+  it('紧急全平：未输入 LIQUIDATE 不调接口；确认后展示每会话受理/被拦/顺延数', async () => {
     mockLiquidateAllSessions.mockResolvedValue({
-      results: [{ session_id: 1, submitted: 3, skipped: 1 }],
+      results: [{
+        session_id: 1, submitted: 3, blocked: 1, deferred: 0, errors: 0,
+        details: [{ code: '600000', quantity: 100, status: 'blocked',
+                    reason: 'T+1 可卖不足或审批未通过' }],
+      }],
     })
     const w = mount(Troubleshooting, {
       global: { stubs: { RouterLink: RouterLinkStub } },
@@ -133,8 +137,27 @@ describe('故障向导：高危运维入口（二次确认 + 结果反馈）', (
     await flushPromises()
     expect(mockLiquidateAllSessions).toHaveBeenCalledWith('LIQUIDATE', undefined)
     const fb = w.find('[data-test="ops-feedback"]').text()
-    expect(fb).toContain('#1 提交 3 笔卖单')
-    expect(fb).toContain('跳过 1 笔')
+    expect(fb).toContain('#1 受理 3 笔 / 被拦 1 笔 / 顺延 0 笔')
+    expect(fb).toContain('600000')
+    expect(fb).toContain('T+1 可卖不足')
+    w.unmount()
+  })
+
+  it('紧急全平：填写操作者时随请求提交（写审计）', async () => {
+    mockLiquidateAllSessions.mockResolvedValue({
+      results: [{ session_id: 2, submitted: 0, blocked: 0, deferred: 2, details: [] }],
+    })
+    const w = mount(Troubleshooting, {
+      global: { stubs: { RouterLink: RouterLinkStub } },
+    })
+    await flushPromises()
+    await w.find('[data-test="liquidate-open"]').trigger('click')
+    await w.find('[data-test="liquidate-confirm-text"]').setValue('LIQUIDATE')
+    await w.find('[data-test="liquidate-operator"]').setValue('张三')
+    await w.find('[data-test="liquidate-confirm"]').trigger('click')
+    await flushPromises()
+    expect(mockLiquidateAllSessions).toHaveBeenCalledWith('LIQUIDATE', undefined, '张三')
+    expect(w.find('[data-test="ops-feedback"]').text()).toContain('顺延 2 笔')
     w.unmount()
   })
 

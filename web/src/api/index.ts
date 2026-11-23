@@ -2358,11 +2358,13 @@ export interface EmergencyLiquidateResult {
   reason?: string | null
 }
 
-/** M2 一键全平（全部运行中会话；需 confirm=LIQUIDATE）。 */
-export async function liquidateAllSessions(confirm: string, reason?: string) {
+/** M2 一键全平（全部运行中会话；需 confirm=LIQUIDATE；operator 写审计）。 */
+export async function liquidateAllSessions(
+  confirm: string, reason?: string, operator?: string,
+) {
   const res = await api.post<ApiResponse<EmergencyLiquidateResult>>(
     '/live/emergency/liquidate-all',
-    { confirm, ...(reason ? { reason } : {}) })
+    { confirm, ...(reason ? { reason } : {}), ...(operator ? { operator } : {}) })
   return res.data.data
 }
 

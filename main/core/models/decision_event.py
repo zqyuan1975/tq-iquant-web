@@ -71,6 +71,11 @@ class LiveDecisionEvent(_DecisionEventColumns, Base):
     ack_by = Column(String(64), nullable=True)
     archived_at = Column(DateTime, nullable=True)
     archive_reason = Column(String(200), nullable=True)
+    # 高危全局操作审计（M2 一键全平起）：发起者与提交结果。
+    # result 三态：submitted（已受理）/ blocked（被闸门拦下）/ deferred（顺延）。
+    # 失败同样落行（result=blocked），保证「按了按钮」这件事可追溯。
+    operator = Column(String(64), nullable=True)
+    result = Column(String(16), nullable=True)
 
     __table_args__ = (
         Index("ix_live_decisions_sess_gate", "live_session_id", "gate"),

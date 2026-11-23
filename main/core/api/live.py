@@ -786,10 +786,15 @@ def resume_all(data: Optional[dict] = None, db: Session = Depends(get_db)):
 
 @router.post("/emergency/liquidate-all")
 def liquidate_all(data: Optional[dict] = None, db: Session = Depends(get_db)):
-    """M2 高危：一键全平，需 body `confirm="LIQUIDATE"`；走既有提交闸门链。"""
+    """M2 高危：一键全平，需 body `confirm="LIQUIDATE"`；走既有提交闸门链。
+
+    `operator` 可选，写入 live_decision_events 审计；缺省记「无鉴权，无法识别操作者」。
+    `dry_run=true` 只算不报单（返回三态结构，零副作用），口令校验同样必填。
+    """
     payload = data or {}
     ok_flag, result = svc.liquidate_all(
-        db, payload.get("confirm"), payload.get("reason"), _ENGINES)
+        db, payload.get("confirm"), payload.get("reason"), _ENGINES,
+        payload.get("operator"), bool(payload.get("dry_run")))
     if not ok_flag:
         return err(result[0], result[1])
     return ok(result)
