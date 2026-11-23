@@ -53,6 +53,17 @@ class SyncReq(BaseModel):
     end: str = ""
 
 
+class AuditReq(BaseModel):
+    # 留空 = 自动范围（同 sync）；支持按池 / 最近 N 日限定，避免全量扫描
+    codes: Optional[List[str]] = None
+    pool_ids: Optional[List[int]] = None
+    start: str = ""
+    end: str = ""
+    lookback_days: Optional[int] = None
+    # 只算不落库（试跑），默认 False = 写诊断
+    dry_run: bool = False
+
+
 @router.get("")
 def list_corporate_actions(code: Optional[str] = None,
                            event_type: Optional[str] = None,
@@ -109,6 +120,65 @@ def sync_from_tdx(req: SyncReq, db: Session = Depends(get_db)):
         return err(400, "回填范围为空：请显式传 codes 或先导入股票池")
     with tdx_priority(P2):
         result = sync_corporate_actions(db, codes, start=req.start, end=req.end)
+    if scope is not None:
+        result["scope"] = {
+            "pool_ids": scope["pool_ids"],
+            "pool_counts": {str(k): len(v) for k, v in scope["by_pool"].items()},
+            "holdings": scope["holdings"],
+        }
+    return ok(result)
+
+
+@router.get("/diagnostics")
+def list_corporate_action_diagnostics(code: Optional[str] = None,
+                                      start: Optional[str] = None,
+                                      end: Optional[str] = None,
+                                      page: int = 1, page_size: int = 50,
+                                      db: Session = Depends(get_db)):
+    """查询公司行为漏记诊断（只读观测，不影响任何账务）。"""
+    from core.services.corporate_action_audit import list_diagnostics
+
+    try:
+        start_d = date.fromisoformat(start) if start else None
+        end_d = date.fromisoformat(end) if end else None
+    except ValueError:
+        return err(400, "start/end 日期格式应为 YYYY-MM-DD")
+    return ok(list_diagnostics(db, code=code, start=start_d, end=end_d,
+                               page=page, page_size=page_size))
+
+
+@router.post("/audit")
+def audit_corporate_actions(req: AuditReq, db: Session = Depends(get_db)):
+    """检测「有显著除权断点但未登记事件」，只写诊断、绝不入账或改事件。"""
+    from core.services.corporate_action_audit import (
+        audit_config, audit_corporate_actions as run_audit,
+    )
+    from core.services.corporate_action_sync import resolve_backfill_codes
+    from core.tq import gate as tq_gate
+    from core.tq.gate import P2, tdx_priority
+
+    if not audit_config()["enabled"]:
+        return ok({"enabled": False, "skipped": True,
+                   "reason": "corporate_action_audit.enabled=false"})
+
+    codes = req.codes or []
+    scope = None
+    if not codes:
+        scope = resolve_backfill_codes(db, pool_ids=req.pool_ids or [1])
+        codes = scope["codes"]
+    if not codes:
+        return err(400, "检测范围为空：请显式传 codes 或先导入股票池")
+
+    policy = tq_gate.evaluate_policy()
+    if not policy["p2_allowed"]:
+        nxt = policy.get("next_p2_open_at")
+        return err(409, "公司行为检测在交易时段暂停（实盘优先），%s 后可用"
+                   % (nxt.strftime("%m-%d %H:%M") if nxt else "收盘后"))
+
+    with tdx_priority(P2):
+        result = run_audit(db, codes, start=req.start, end=req.end,
+                           lookback_days=req.lookback_days,
+                           write=not req.dry_run)
     if scope is not None:
         result["scope"] = {
             "pool_ids": scope["pool_ids"],

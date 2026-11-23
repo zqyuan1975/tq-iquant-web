@@ -21,6 +21,7 @@ from core.api.capital import router as capital_router
 from core.api.pairing import router as pairing_router
 from core.api.investment_board import router as investment_board_router
 from core.api.tdx_gate import router as tdx_gate_router
+from core.api.kline_coverage import router as kline_coverage_router
 from core.tq.gate import TdxTaskBlocked
 from core.logging_config import setup_logging
 from core.services.backtest_service import (
@@ -194,6 +195,7 @@ app.include_router(capital_router)
 app.include_router(pairing_router)
 app.include_router(investment_board_router)
 app.include_router(tdx_gate_router)
+app.include_router(kline_coverage_router)
 
 
 @app.exception_handler(TdxTaskBlocked)

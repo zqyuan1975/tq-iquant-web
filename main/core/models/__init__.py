@@ -38,7 +38,12 @@ from .decision_event import (
     LiveDecisionEvent,
 )
 from .data_backup import DataBackupRecord
-from .corporate_action import CorporateAction, LiveCorporateAction
+from .corporate_action import (
+    DIAG_UNVERIFIED_EVENT,
+    CorporateAction,
+    CorporateActionDiagnostic,
+    LiveCorporateAction,
+)
 from .live_approval_queue import LiveApprovalQueue
 from .live_manual_action import LiveManualAction
 from .live_reconciliation_diff import LiveReconciliationDiff
@@ -100,6 +105,8 @@ __all__ = [
     "LiveDecisionEvent",
     "DataBackupRecord",
     "CorporateAction",
+    "CorporateActionDiagnostic",
+    "DIAG_UNVERIFIED_EVENT",
     "LiveCorporateAction",
     "LiveApprovalQueue",
     "LiveManualAction",
