@@ -135,6 +135,45 @@ def test_api_accepts_valid_execution_config():
 
 
 # ---------------------------------------------------------------------------
+# B5：period_signal_mode 严格校验（非法取值不再静默回退）
+# ---------------------------------------------------------------------------
+def test_api_rejects_unknown_period_signal_mode(monkeypatch):
+    db = _db()
+    pool_id, formula_id = _seed(db)
+    monkeypatch.setattr(
+        "core.engine.period_semantics.raw_configured_mode",
+        lambda *a, **k: "dynamik")
+    msg = _validate_strategy(
+        StrategyCreate(**_strategy_base(formula_id)), db, pool_id)
+    assert msg and "period_signal_mode" in msg
+    db.close()
+
+
+def test_api_rejects_global_pre_close_1450(monkeypatch):
+    db = _db()
+    pool_id, formula_id = _seed(db)
+    monkeypatch.setattr(
+        "core.engine.period_semantics.raw_configured_mode",
+        lambda *a, **k: "pre_close_1450")
+    msg = _validate_strategy(
+        StrategyCreate(**_strategy_base(formula_id)), db, pool_id)
+    assert msg and "pre_close_1450" in msg
+    db.close()
+
+
+def test_api_accepts_dynamic_mode_for_weekly(monkeypatch):
+    db = _db()
+    pool_id, formula_id = _seed(db)
+    monkeypatch.setattr(
+        "core.engine.period_semantics.raw_configured_mode",
+        lambda *a, **k: "dynamic")
+    ok = StrategyCreate(
+        name="S", formula_id=formula_id, period="1w", role="independent")
+    assert _validate_strategy(ok, db, pool_id) is None
+    db.close()
+
+
+# ---------------------------------------------------------------------------
 # service 序列化 / 创建 / 更新透传
 # ---------------------------------------------------------------------------
 def test_serialize_strategy_includes_execution_config_with_fallbacks():

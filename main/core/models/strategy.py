@@ -77,5 +77,10 @@ class Strategy(Base):
     split_order_volume_pct = Column(Float, nullable=True)       # 单笔 ≤ 最近完成 bar 成交量 × 比例
     # 风控/信号执行时点：next_day=当日信号次日执行（回测对齐，默认）/ immediate=当日确认立即执行
     risk_timing = Column(String(15), default="next_day", server_default="next_day", nullable=False)
+    # 14:50 提前收盘价反转处置档（规范 3.6，默认 hold）：
+    #   hold = 只标记/告警，持仓按正常风控与策略管理（需显式选择）
+    #   close_next_open = 反转标的次日首根 bar 按开盘价减出（默认）
+    reversal_disposition = Column(String(20), default="close_next_open",
+                                  server_default="close_next_open", nullable=False)
     created_at = Column(DateTime, server_default=func.now())
     updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())

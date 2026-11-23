@@ -753,29 +753,42 @@ class MarketDataService:
             outputs.append({"name": var_name, "value": _to_int(v)})
         return outputs
 
-    def inject_startup_periods(self, daily_time: datetime) -> None:
-        """C6(C)：1w/1mon 策略通达信注入——TQFormula.compute 自取历史 → 最新信号填 signal_cache。
+    def inject_startup_periods(
+        self, daily_time: datetime, *, periods=None, force: bool = False,
+        codes=None,
+    ) -> int:
+        """周期信号注入——TQFormula.compute 自取历史 → 最新信号填 signal_cache。
 
         key=(strategy_id, stock_code, daily_time)，与日终 _maybe_daily_bars 驱动用的
         bar_time 一致，驱动时命中预填信号。桥端 xtdata 拉不到 1w/1mon，通达信是唯一通路。
-        start() 启动调一次；_maybe_daily_bars 检测日切 cache miss 时补调。
-        单策略/单股 compute 失败 → 跳过（不阻断其余）。
+
+        - ``periods``：限定周期集合（None=兼容旧行为，仅 1w/1mon）；
+        - ``force``：True 时覆盖同 key 已有值（周期末 15:05 必须用**完成周期 bar**
+          刷新掉启动时写入的滚动值）；
+        - ``codes``：限定代码（None=全池；14:50 收盘复核只重算有信号的代码）。
+
+        返回实际写入的 key 数。单策略/单股 compute 失败 → 跳过（不阻断其余）。
         """
         if self._tq_formula is None or not self._formula_by_strategy:
-            return
-        codes = list(self._bar_poller.stock_codes)
+            return 0
+        allowed = set(periods) if periods is not None else set(_STARTUP_ONLY_PERIODS)
+        targets = list(codes) if codes is not None else list(self._bar_poller.stock_codes)
+        written = 0
         for portfolio in self.ctx.portfolios:
             for ctx in portfolio.strategies:
-                if ctx.period not in _STARTUP_ONLY_PERIODS:
+                if ctx.period not in allowed:
                     continue
                 formula_name = self._formula_by_strategy.get(ctx.strategy_id)
                 if not formula_name:
                     continue
-                for code in codes:
-                    # 节流：逐股 TDX 公式 compute（1w/1mon 全池）同步占 UI，逐笔小睡
+                for code in targets:
+                    key = (ctx.strategy_id, code, daily_time)
+                    if not force and key in self.signal_cache:
+                        continue
+                    # 节流：逐股 TDX 公式 compute 同步占 UI，逐笔小睡
                     time.sleep(0.2)
                     try:
-                        # 1w/1mon 信号预填同属实盘信号生成：按 P0 取通道，
+                        # 周期信号注入同属实盘信号生成：按 P0 取通道，
                         # 避免在 14:55–15:10 保护窗内被 P1 规则拒绝而丢信号。
                         with tdx_priority(P0):
                             raw = self._tq_formula.compute(
@@ -790,7 +803,9 @@ class MarketDataService:
                         continue
                     outputs = self._extract_latest_signal(raw, code)
                     if outputs:
-                        self.signal_cache[(ctx.strategy_id, code, daily_time)] = outputs
+                        self.signal_cache[key] = outputs
+                        written += 1
+        return written
 
     def startup_periods_missing(self, daily_time: datetime) -> bool:
         """1w/1mon 策略在 daily_time 的信号是否全部已预填（cache miss → 需补注入）。

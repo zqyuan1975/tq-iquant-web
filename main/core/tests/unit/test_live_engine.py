@@ -586,6 +586,98 @@ def _deferred_buy_order(stock, day, qty=300):
     )
 
 
+def test_reversal_forced_close_only_sells_todays_new_open():
+    """护栏①：close_next_open 只撤当日新开仓，既有仓（前一日）不动。"""
+    port, ctx = _portfolio_single(period="1d")
+    stock = "600000.SH"
+    pos = Position(stock)
+    ctx.positions[stock] = pos
+    pos.buy(200, Decimal("9.0"), datetime(2026, 8, 21, 9, 30))   # 既有仓
+    pos.buy(300, Decimal("9.0"), datetime(2026, 8, 24, 9, 30))   # 当日新开
+    bar = _bar(stock, "9.1", datetime(2026, 8, 24, 15, 5))
+
+    orders = port.forced_close_orders(bar, {1: {stock}})
+    assert len(orders) == 1
+    assert orders[0].quantity == 300
+    assert pos.quantity == 500                                   # 只生成订单，不动持仓
+
+    capped = port.forced_close_orders(
+        bar, {1: {stock}}, new_open_qty={1: {stock: 100}})
+    assert [o.quantity for o in capped] == [100]
+
+    # 归因为 0（当日无新开仓）→ 不生成卖单，既有仓保留
+    assert port.forced_close_orders(
+        bar, {1: {stock}}, new_open_qty={1: {stock: 0}}) == []
+
+
+def test_reversal_deferred_untradable_waits_for_tradable_bar():
+    """护栏③：次日零成交 → 留队并记 untradable；可成交 bar 再放行。"""
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single(period="1d")
+    stock = "600000.SH"
+    d1, d2 = date(2026, 8, 24), date(2026, 8, 25)
+    rec = _Recorder()
+    disp, _ = _make_dispatcher(rec)
+    engine = _calendar_engine(factory, port, disp, [d1, d2], stock)
+    engine.signal_cache = {}
+
+    db = factory()
+    engine._submit_one_order(
+        db, port, _reversal_deferred_order(stock, d1), "1d")
+    db.close()
+    assert len(engine._signal_bar_deferred) == 1
+
+    no_trade = BarEvent(
+        stocks={stock: {"open": Decimal("9.0"), "high": Decimal("9.0"),
+                        "low": Decimal("9.0"), "close": Decimal("9.0"),
+                        "volume": 0}},
+        bar_time=datetime(2026, 8, 25, 9, 31),
+    )
+    assert engine._release_signal_bar_deferred(port, no_trade) == []
+    assert len(engine._signal_bar_deferred) == 1
+    db = factory()
+    evs = db.query(LiveDecisionEvent).filter_by(gate="reversal_close").all()
+    db.close()
+    assert any(e.action == "untradable" for e in evs)
+
+    tradable = BarEvent(
+        stocks={stock: {"open": Decimal("9.0"), "high": Decimal("9.2"),
+                        "low": Decimal("8.9"), "close": Decimal("9.1"),
+                        "volume": 10000}},
+        bar_time=datetime(2026, 8, 25, 9, 32),
+    )
+    released = engine._release_signal_bar_deferred(port, tradable)
+    assert len(released) == 1
+    assert engine._signal_bar_deferred == []
+
+
+def test_reversal_deferred_yields_to_same_day_risk_sell():
+    """护栏②：释放的反转单遇同标同日风控/策略 SELL → 让位并留档 superseded。"""
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single(period="1d")
+    stock = "600000.SH"
+    rec = _Recorder()
+    disp, _ = _make_dispatcher(rec)
+    engine = _calendar_engine(
+        factory, port, disp, [date(2026, 8, 24), date(2026, 8, 25)], stock)
+
+    day = date(2026, 8, 25)
+    reversal = _reversal_deferred_order(stock, day)
+    reversal.bar_time = datetime(2026, 8, 25, 9, 31)
+    risk = OrderEvent(
+        strategy_id=1, portfolio_id=1, stock_code=stock,
+        trade_type=TradeType.SELL, signal_type=SignalType.CLOSE,
+        quantity=300, price=Decimal("9.0"),
+        bar_time=datetime(2026, 8, 25, 9, 31), signal_name="stop_loss",
+    )
+    kept = engine._yield_reversal_sells(port, [reversal, risk])
+    assert kept == [risk]
+    db = factory()
+    evs = db.query(LiveDecisionEvent).filter_by(gate="reversal_close").all()
+    db.close()
+    assert any(e.action == "superseded" for e in evs)
+
+
 def test_release_expires_deferred_after_one_trading_day():
     """R2：只允许在 signal_bar_date 的下一交易日放行；再晚 → canceled + 决策事件。"""
     factory, _ = _db_factory()
@@ -9669,6 +9761,17 @@ def _deferred_order(stock, day, qty=300):
         quantity=qty, price=Decimal("9.0"),
         bar_time=datetime.combine(day, datetime.min.time()),
         signal_name="stop_loss", signal_bar_date=day,
+    )
+
+
+def _reversal_deferred_order(stock, day, qty=300):
+    """反转 close_next_open 的 deferred SELL（signal_name=reversal_close）。"""
+    return OrderEvent(
+        strategy_id=1, portfolio_id=1, stock_code=stock,
+        trade_type=TradeType.SELL, signal_type=SignalType.CLOSE,
+        quantity=qty, price=Decimal("9.0"),
+        bar_time=datetime.combine(day, datetime.min.time()),
+        signal_name="reversal_close", signal_bar_date=day,
     )
 
 

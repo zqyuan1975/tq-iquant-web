@@ -35,7 +35,7 @@ def test_cached_then_force_refresh(monkeypatch):
     calls = {"n": 0}
     df = _ohlcv()
 
-    def fake(code, start, end, period="1d"):
+    def fake(code, start, end, period="1d", **kwargs):
         calls["n"] += 1
         return df
 

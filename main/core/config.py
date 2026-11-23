@@ -259,6 +259,11 @@ def _defaults() -> dict:
             "execution_stall_seconds": 180,
             "bridge_timeout_seconds": 90,
             "market_data_stall_seconds": 180,
+            # 信号判定维度（规范 2026-11-23）：period_close（默认，周期末根确认）/
+            # dynamic（周期内逐日滚动，仅 1w/1mon，仅预警不下单）。pre_close_1450
+            # （14:50 提前收盘价，仅 1d）只由会话级 advance_close_enabled 显式开启，
+            # 不能作为全局默认；此处填该值会被回退为 period_close。
+            "period_signal_mode": "period_close",
             # 决策事件过期归档：open 事件超过该天数由后台每小时扫描自动归档
             # （ack_status=archived，移出「未处理」计数，记录仍可查询回看）。
             # 高危门类（cash_diff/equity_deviation/engine_owner_mismatch/
@@ -412,6 +417,13 @@ def _defaults() -> dict:
                 "enabled": False,
                 "dir": "data/kline_cache",
                 "today_ttl_seconds": 300,
+            },
+            # P1-4（2026-11-23）：K 线数据覆盖台账。默认关闭；开启后只在
+            # build_klines 取数成功后旁路登记覆盖段/停牌空日/来源文件指纹，
+            # 不跳过取数、不改返回结构。关闭时既有补数行为逐字不变。
+            "kline_ledger": {
+                "enabled": False,
+                "path": "data/kline_ledger.sqlite3",
             },
         },
         # 资金池（docs/plans/0019 / 0020 / 0021）：四个开关默认全关。

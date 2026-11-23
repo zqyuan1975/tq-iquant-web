@@ -53,8 +53,8 @@ class _MD:
     def startup_periods_missing(self, daily_time):
         return False
 
-    def inject_startup_periods(self, daily_time):
-        return None
+    def inject_startup_periods(self, daily_time, **kwargs):
+        return 0
 
 
 def _mk_closer(on_bar):
@@ -198,3 +198,138 @@ def test_fetch_1d_bars_aborts_on_stop_request():
 
     assert calls == ["600000.SH"]  # 第一只后立即收尾，不再遍历全池
     assert list(out) == ["600000.SH"]
+
+
+# ---------------------------------------------------------------------------
+# B3：1w/1mon 因陈旧/停牌剔除 → 逐票 alert_only 决策事件，不产生委托
+# ---------------------------------------------------------------------------
+class _CalWeekEnd:
+    """把今天当成本周末交易日（触发 1w 轮次）。"""
+
+    def is_trading_day(self, d):
+        return True
+
+    def is_last_trading_day_of_week(self, d):
+        return True
+
+    def is_last_trading_day_of_month(self, d):
+        return False
+
+
+class _DispStale:
+    """600001.SH 最后一根为昨日（陈旧），600000.SH 为今日（新鲜）。"""
+
+    def query_quote(self, code, period="1d", count=250):
+        stime = "20260804" if code == "600001.SH" else "20260805"
+        return [{
+            "stime": stime, "open": "9.0", "high": "9.3",
+            "low": "8.9", "close": "9.1", "volume": "100000",
+        }]
+
+
+def _mk_week_end_closer(events):
+    factory, _ = _db_factory()
+    md = _MD()
+    md._bar_poller = SimpleNamespace(stock_codes=["600000.SH", "600001.SH"])
+    ctx = SimpleNamespace(
+        session_id=1,
+        portfolios=[SimpleNamespace(portfolio_id=1)],
+        db_session_factory=factory,
+        dispatcher=_DispStale(),
+        code_period_count={},
+        clock=lambda: _NOW,
+    )
+    closer = DailyCloser(
+        ctx=ctx,
+        market_data=md,
+        breaker=None,
+        orders=None,
+        on_bar=lambda *a, **k: None,
+        calendar_provider=lambda: _CalWeekEnd(),
+        emit=lambda kind, payload: events.append((kind, payload)),
+        set_bridge_offline=lambda: None,
+    )
+    return closer, factory
+
+
+def test_period_stale_writes_alert_only_event_per_code():
+    """1w 轮次下陈旧票逐票写 alert_only 决策事件，且不产生订单。"""
+    from core.models import LiveDecisionEvent, LiveOrder
+
+    events = []
+    closer, factory = _mk_week_end_closer(events)
+
+    closer.maybe_daily_bars(_NOW)
+
+    # SSE 事件：只有陈旧票 600001.SH 该 1w 轮次一条 alert_only
+    stale_alerts = [
+        p for kind, p in events
+        if kind == "risk" and p.get("action") == "alert_only"
+        and p.get("stock_code") == "600001.SH" and p.get("period") == "1w"
+    ]
+    assert len(stale_alerts) == 1
+    assert "600001.SH" in stale_alerts[0]["message"]
+
+    db = factory()
+    try:
+        rows = db.query(LiveDecisionEvent).filter(
+            LiveDecisionEvent.action == "alert_only",
+            LiveDecisionEvent.gate == "daily_bar_freshness",
+        ).all()
+        assert len(rows) == 1
+        assert rows[0].stock_code == "600001.SH"
+        assert rows[0].param_name == "daily_bar_not_today"
+        # 只告警，不下单
+        assert db.query(LiveOrder).count() == 0
+    finally:
+        db.close()
+
+
+def test_period_stale_no_alert_when_not_week_or_month_end():
+    """非 1w/1mon 轮次（只跑 1d）不产生 alert_only 噪音。"""
+    from core.models import LiveDecisionEvent
+
+    events = []
+    factory, _ = _db_factory()
+    md = _MD()
+    md._bar_poller = SimpleNamespace(stock_codes=["600000.SH", "600001.SH"])
+    ctx = SimpleNamespace(
+        session_id=1,
+        portfolios=[SimpleNamespace(portfolio_id=1)],
+        db_session_factory=factory,
+        dispatcher=_DispStale(),
+        code_period_count={},
+        clock=lambda: _NOW,
+    )
+    closer = DailyCloser(
+        ctx=ctx, market_data=md, breaker=None, orders=None,
+        on_bar=lambda *a, **k: None,
+        calendar_provider=lambda: _Cal(),  # 周三：只跑 1d
+        emit=lambda kind, payload: events.append((kind, payload)),
+        set_bridge_offline=lambda: None,
+    )
+    closer.maybe_daily_bars(_NOW)
+
+    assert [p for _, p in events if p.get("action") == "alert_only"] == []
+    db = factory()
+    try:
+        assert db.query(LiveDecisionEvent).filter(
+            LiveDecisionEvent.action == "alert_only").count() == 0
+    finally:
+        db.close()
+
+
+# ---------------------------------------------------------------------------
+# B4：daily_bar_freshness 文案不再说「本轮未执行」
+# ---------------------------------------------------------------------------
+def test_daily_freshness_message_says_remaining_continue():
+    events = []
+    closer, _ = _mk_closer(lambda *a, **k: None)
+    closer._emit = lambda kind, payload: events.append((kind, payload))
+
+    closer._note_daily_freshness_skip(_TODAY, stale=3, total=10)
+
+    msgs = [p["message"] for kind, p in events if kind == "risk"]
+    assert len(msgs) == 1
+    assert "3/10 只按陈旧剔除，其余继续执行" in msgs[0]
+    assert "本轮未执行" not in msgs[0]

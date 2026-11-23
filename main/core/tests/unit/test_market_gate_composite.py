@@ -110,7 +110,7 @@ def test_build_gate_tracker_dispatches_composite(monkeypatch):
 
     calls: list = []
 
-    def fake_single(code, engine, formula_name, start, end):
+    def fake_single(code, engine, formula_name, start, end, **kwargs):
         calls.append(code)
         t = MarketGateTracker()
         t.feed_history({D0: -1 if code.endswith("SH") else 1}, {D0: 60})

@@ -23,6 +23,8 @@ from core.engine.market_gate import (
 )
 from core.engine.market_rules import trading_days_between
 from core.services.backtest_service import build_gate_ohlcv
+from core.tq.gate import TDXLockTimeout, TdxTaskBlocked
+from core.tq.utils import TDXConnectionError
 
 logger = logging.getLogger(__name__)
 
@@ -81,24 +83,49 @@ def expected_latest_trading_day(now: Optional[datetime] = None) -> date:
     return _last_trading_day_on_or_before(anchor)
 
 
+def _unavailable(message: str, reason: str) -> MarketGateUnavailableError:
+    """构造带原因码的不可用异常（reason: gate_blocked/timeout/channel_unavailable/no_data）。"""
+    exc = MarketGateUnavailableError(message)
+    exc.reason = reason  # noqa: B010 — 附加属性，路由层据此区分文案
+    return exc
+
+
 def _compute(code: str, period: str, count: int, history: int) -> dict:
-    """实算一次状态卡（不走缓存）。取数失败抛 MarketGateUnavailableError。"""
+    """实算一次状态卡（不走缓存）。取数失败抛 MarketGateUnavailableError。
+
+    取数层区分三种失败原因（闸拒绝 / 超时 / 真无数据），对外文案随原因变化，
+    不再把「通道闸挡住了」误报成「请在通达信下载指数日线」。
+    """
     # 日历天数按「根数 × 1.6 + 预热」估算，保证 MA288 有足够前置样本
     span_days = max(GATE_WARMUP_DAYS + 60, int(count * 1.6) + 30)
     end = date.today()
     start = end - timedelta(days=span_days)
-    ohlcv = build_gate_ohlcv(code, start, end, period=period)
+    try:
+        ohlcv = build_gate_ohlcv(
+            code, start, end, period=period, raise_gate_errors=True)
+    except TdxTaskBlocked as exc:
+        raise _unavailable(
+            f"门控基准 {code} 取数被 TQ 通道闸拒绝（{exc.reason}"
+            f"{'，' + exc.window if exc.window else ''}）：{exc}",
+            "gate_blocked") from exc
+    except TDXLockTimeout as exc:
+        raise _unavailable(
+            f"门控基准 {code} 取数等待 TQ 通道超时：{exc}", "timeout") from exc
+    except TDXConnectionError as exc:
+        raise _unavailable(
+            f"门控基准 {code} 取数失败：TQ 通道不可用（{exc}）",
+            "channel_unavailable") from exc
     if ohlcv.is_empty():
-        raise MarketGateUnavailableError(
+        raise _unavailable(
             f"门控基准 {code} 无法取数（无 {period} K 线）。"
-            f"请确认该指数已在通达信中下载。"
-        )
+            f"请确认该指数已在通达信中下载。",
+            "no_data")
     states, strengths = compute_gate_states(ohlcv)
     if not states:
-        raise MarketGateUnavailableError(
+        raise _unavailable(
             f"门控基准 {code} 历史不足，无法判定多空状态（区间 {start}~{end}）。"
-            f"请先在通达信中补齐该指数日线数据。"
-        )
+            f"请先在通达信中补齐该指数日线数据。",
+            "no_data")
     days = sorted(states)
     as_of = days[-1]
     direction = int(states[as_of])
@@ -129,6 +156,9 @@ def _compute(code: str, period: str, count: int, history: int) -> dict:
         "latest_trading_day": latest.isoformat(),
         "stale_days": int(stale_days),
         "stale": bool(stale_days >= GATE_STALE_TRADING_DAYS),
+        # 新增字段（只增不改）：来源与数据时间，供前端区分实时取数/实盘快照
+        "source": "live_fetch",
+        "data_time": as_of.isoformat(),
     }
 
 
@@ -163,6 +193,67 @@ def fetch_gate_status(benchmark_index: Optional[str] = None,
 def clear_cache() -> None:
     """清空缓存（测试/基准切换用）。"""
     _cache.clear()
+
+
+def fetch_gate_status_from_snapshot(db, benchmark_index: Optional[str] = None,
+                                    period: str = "1d",
+                                    history: int = 5) -> Optional[dict]:
+    """最近一次成功落库的实盘门控快照 → 状态卡结构（无可用快照返回 None）。
+
+    看板优先走此路径：读 ``live_gate_snapshots``（实盘每日门控落库），**不触发
+    TQ 取数**，因此不会被 14:55–15:10 保护窗或回测重任务挡住。返回结构与
+    ``fetch_gate_status`` 兼容（只新增字段，不删/不改名），未知的明细字段
+    （since/duration_bars/bars/transitions）置空。
+    """
+    from core.models import LiveGateSnapshot
+
+    row = (
+        db.query(LiveGateSnapshot)
+        .filter(LiveGateSnapshot.direction.isnot(None),
+                LiveGateSnapshot.as_of.isnot(None))
+        .order_by(LiveGateSnapshot.snap_date.desc(),
+                  LiveGateSnapshot.updated_at.desc(),
+                  LiveGateSnapshot.id.desc())
+        .first()
+    )
+    if row is None:
+        return None
+    codes = [c.strip() for c in str(row.benchmark_index or "").split(",")
+             if c.strip()]
+    code = codes[0] if codes else (benchmark_index or DEFAULT_GATE_INDEX)
+    latest = expected_latest_trading_day()
+    stale_days = trading_days_between(row.as_of, latest)
+    if latest <= row.as_of:
+        stale_days = 0
+    direction = int(row.direction)
+    return {
+        "code": code,
+        "benchmark_name": _BENCHMARK_NAMES.get(code, code),
+        "period": period,
+        "as_of": row.as_of.isoformat(),
+        "direction": direction,
+        "direction_label": _DIRECTION_LABELS.get(direction, "未定"),
+        "strength": int(row.strength or 0),
+        # 快照只存当日生效方向/强度/基准与数据截至日，明细字段置空（不伪造）
+        "since": None,
+        "duration_bars": None,
+        "transitions": [],
+        "bars": None,
+        "latest_trading_day": latest.isoformat(),
+        "stale_days": int(stale_days),
+        "stale": bool(stale_days >= GATE_STALE_TRADING_DAYS),
+        "cached": True,
+        # 新增字段（只增不改）：来源、数据时间与快照元信息
+        "source": "live_snapshot",
+        "data_time": row.as_of.isoformat(),
+        "snapshot_at": (row.updated_at.isoformat(timespec="seconds")
+                        if row.updated_at else None),
+        "snapshot_date": (row.snap_date.isoformat() if row.snap_date else None),
+        "snapshot_session_id": row.live_session_id,
+        "snapshot_portfolio_id": row.portfolio_strategy_id,
+        "requested_code": benchmark_index or DEFAULT_GATE_INDEX,
+        "code_matched": bool((benchmark_index or DEFAULT_GATE_INDEX) in codes),
+    }
 
 
 # E5：两套市场状态机制的作用域与优先级（只读说明，前端原样渲染）

@@ -108,17 +108,19 @@ def test_auto_fill_skipped_intraday():
 
 
 def test_auto_fill_off_hours_warms_and_rechecks():
-    # 第一次读空 → 补齐读（count=240）有数据 → after 健康
+    # 首次读空 → 体检内预热重读（count=240）仍空 → 补齐再读（count=240）有数据 → after 健康
     class _WarmDisp(_Disp):
         def __init__(self):
             super().__init__()
-            self.warmed = False
+            self.warm_reads = 0
 
         def query_quote(self, code, period="1d", count=1):
             self.calls.append((code, period, count))
             if count >= h._WARM_COUNT:
-                self.warmed = True
-            return _bars(date(2026, 11, 18)) if self.warmed else []
+                self.warm_reads += 1
+                # 第 1 次是体检内的预热重读（仍空），第 2 次是 auto_fill 的补齐
+                return _bars(date(2026, 11, 18)) if self.warm_reads >= 2 else []
+            return []
 
     disp = _WarmDisp()
     health = h.check_data_health(disp, ["600000.SH"], ["1d"],
@@ -174,13 +176,17 @@ def test_check_data_health_time_budget_stops_early(monkeypatch):
 
 
 def test_run_health_check_truncated_skips_fill():
-    # 超预算后不再补齐（否则同等规模的串行读取会继续拖住启动链）
+    # 超预算/抽样截断后不再做第二遍补齐（否则同等规模的串行读取会继续拖住启动）；
+    # 但缺失嫌疑标的的预热重读已在体检内完成，不算「跳过重读」。
     disp = _Disp({})
     out = h.run_health_check(disp, ["A", "B"], ["1d"], auto_fill=True,
                              now=_NOW_OFF, calendar=_CAL, max_codes=1)
     assert out["health"]["truncated"] is True
-    assert out["auto_fill"]["reason"] == "budget_exhausted"
-    assert len(disp.calls) == 1
+    assert out["health"]["truncated_reason"] == "sample"
+    assert out["health"]["warm_retry"]["attempted"] == 1  # 有嫌疑就重读，与截断无关
+    assert out["auto_fill"]["reason"] == "truncated"
+    # 1 次 3 根判定 + 1 次 240 根预热重读
+    assert [c[2] for c in disp.calls] == [h._CHECK_COUNT, h._WARM_COUNT]
 
 
 def test_check_data_health_logs_slow_quote(monkeypatch, caplog):
@@ -232,6 +238,7 @@ def test_check_data_health_hard_timeout_marks_unverified_not_missing():
     assert health["periods"]["1d"]["timeout"] == 1
     assert health["periods"]["1d"]["error"] == 0        # 也不当成通道错误
     assert health["healthy"] is False
+    assert health["data_missing_count"] == 0            # 超时不计入「真缺失」
     assert "未校验" in h.health_summary_text(health)
     # 单只硬超时必须严格低于整体预算（2s 预算 → ≤ 1.2s）
     assert all(t is not None and t < 2.0 for _c, _p, t in disp.calls)
@@ -263,3 +270,102 @@ def test_is_timeout_error_detects_wrapped_bridge_error():
     err.__cause__ = TimeoutError()
     assert h._is_timeout_error(err) is True
     assert h._is_timeout_error(RuntimeError("bridge offline")) is False
+
+
+class _ShallowBarDisp:
+    """3 根读空、240 根才有数据：复现 2026-11-20 09:07 的误报场景。"""
+
+    def __init__(self, warm_codes=(), fail_codes=()):
+        self.warm_codes = set(warm_codes)
+        self.fail_codes = set(fail_codes)
+        self.calls = []
+
+    def query_quote(self, code, period="1d", count=1):
+        self.calls.append((code, period, count))
+        if code in self.fail_codes:
+            raise RuntimeError("query failed")
+        if count >= h._WARM_COUNT and code in self.warm_codes:
+            return _bars(date(2026, 11, 18))
+        return []
+
+
+def test_sample_truncation_does_not_false_report_missing():
+    """抽样截断/未验 ≠ 缺失：3 根读空但 240 根能读到的，不得计缺失或提示补下载。"""
+    codes = ["600000.SH", "000001.SZ", "600519.SH"]
+    disp = _ShallowBarDisp(warm_codes=codes)
+    health = h.check_data_health(disp, codes, ["1d"], now=_NOW_OFF,
+                                 calendar=_CAL, max_codes=2,
+                                 time_budget_seconds=30.0)
+    assert health["truncated"] is True
+    assert health["truncated_reason"] == "sample"
+    assert health["checked_codes"] == 2
+    assert health["unchecked_count"] == 1          # 共 3 只、已验 2 只
+    assert health["data_missing_count"] == 0
+    assert health["status_counts"]["ok"] == 2
+    assert health["warm_retry"]["resolved"] == 2
+    assert health["checks"][0]["last_bar"].startswith("2026-11-18")
+    assert health["checks"][0]["reason_code"] == "ok"
+    text = h.health_summary_text(health)
+    assert "未完成" in text and "已验 2/3" in text
+    assert "补下载" not in text
+
+
+def test_intraday_skips_warm_retry_and_marks_reason():
+    """盘中不做预热重读（避免抢实盘通道），结果明确标注跳过原因。"""
+    disp = _ShallowBarDisp(warm_codes=["600000.SH"])
+    health = h.check_data_health(disp, ["600000.SH"], ["1d"], now=_NOW_IN,
+                                 calendar=_CAL)
+    assert health["intraday"] is True
+    assert health["warm_retry"]["enabled"] is False
+    assert health["warm_retry"]["skipped_reason"] == "intraday"
+    assert health["warm_retry"]["attempted"] == 0
+    assert health["periods"]["1d"]["empty"] == 1
+    assert all(c[2] == h._CHECK_COUNT for c in disp.calls)  # 只做过 3 根那次
+
+
+def test_query_error_is_not_counted_as_real_missing():
+    """查询异常与真缺失分开：error 只进 missing 历史字段，不进 data_missing。"""
+    disp = _ShallowBarDisp(fail_codes=["600000.SH"])  # 600519.SH 真无 bar
+    health = h.check_data_health(disp, ["600000.SH", "600519.SH"], ["1d"],
+                                 now=_NOW_OFF, calendar=_CAL,
+                                 time_budget_seconds=30.0)
+    assert health["status_counts"]["error"] == 1
+    assert health["status_counts"]["empty"] == 1
+    assert health["data_missing_count"] == 1
+    assert health["data_missing_codes"] == ["600519.SH"]
+    assert "600000.SH" not in health["data_missing_codes"]
+    # 历史字段口径不变（stale+empty+error），仅新增字段区分
+    assert health["missing_count"] == 2
+    by_code = {(c["code"], c["period"]): c for c in health["checks"]}
+    assert by_code[("600000.SH", "1d")]["reason_code"] == "query_error"
+    assert by_code[("600519.SH", "1d")]["reason_code"] == "no_bars"
+    text = h.health_summary_text(health)
+    assert "查询异常 1 只" in text and "无 bar 1 只" in text
+
+
+def test_health_summary_text_branches():
+    """文案分支：未完成/超时/异常/无 bar 各自触发，补下载只在有真缺失时出现。"""
+    base = {"version": h.DATA_HEALTH_VERSION, "periods": {}}
+    truncated = dict(base, truncated=True, truncated_reason="budget",
+                     checked_codes=30, requested_codes=251, status_counts={})
+    assert "预算耗尽" in h.health_summary_text(truncated)
+    assert "已验 30/251" in h.health_summary_text(truncated)
+    assert "补下载" not in h.health_summary_text(truncated)
+
+    timeout_only = dict(base, status_counts={"ok": 2, "timeout": 1},
+                        timeout_count=1)
+    text = h.health_summary_text(timeout_only)
+    assert "取价超时 1 只" in text and "不算缺失" in text
+    assert "补下载" not in text
+
+    error_only = dict(base, status_counts={"ok": 2, "error": 1})
+    text = h.health_summary_text(error_only)
+    assert "查询异常 1 只" in text
+    assert "补下载" not in text
+
+    empty_only = dict(base, status_counts={"ok": 2, "empty": 1},
+                      data_missing_codes=["600519.SH"], data_missing_count=1)
+    text = h.health_summary_text(empty_only)
+    assert "无 bar 1 只" in text and "600519.SH" in text
+    assert "补下载" in text
+

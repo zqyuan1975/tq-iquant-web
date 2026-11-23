@@ -125,6 +125,7 @@ from .live.order_machine import (
 from .live.breaker import BreakerService
 from .live.account_risk import AccountRiskService
 from .live.daily_closer import DailyCloser
+from . import period_semantics as ps
 from .market_rules import session_allows_bar, tick_size
 from .decision import DecisionRecorder
 from .capital_shadow import build_shadow_payload
@@ -447,6 +448,10 @@ DEFERRED_RECOVER_ALERT_THRESHOLD = 10
 # fail-open 年份（未收录休市表且桥不可用）会把节后首个交易日误算成节中工作日，
 # 导致 due 偏早、节前 deferred 单在节后首日被判过期取消。给 7 天宽限兜住长假。
 _DEFERRED_RELEASE_GRACE_DAYS = 7
+# 反转 close_next_open 顺延上限（自然日）：次日一字跌停/无成交时顺延到可成交的
+# 首根 bar；从首次不可成交日起超过该天数仍不可成交 → 终态取消并记 untradable，
+# 防停牌/长期锁定无限挂单。
+_REVERSAL_UNTRADABLE_MAX_DAYS = 10
 # 可重排拒单的重试上限（P1-3/P1-4，2026-11-11）：涨跌停拦截、桥明确拒单、盘前越价
 # 撤单都不再一次性作废，而是回 deferred 等**次一交易日 due 窗口 / 同一交易日 09:31
 # 首根 1m bar** 再试；首报 + 2 次重排 = 最多 3 次尝试，仍失败才落终态 rejected。
@@ -805,6 +810,9 @@ class LiveEngine:
         # 14:50 提前收盘价（仅 1d）：原始配置，构造 DailyCloser 时再按 auto 模式收敛
         self._advance_close_enabled_cfg = bool(advance_close_enabled)
         self._advance_close_time_cfg = advance_close_time or "14:51"
+        # 信号判定维度（规范 2026-11-23）：period_close（默认）/ dynamic（1w/1mon，
+        # 仅预警）。pre_close_1450 只由会话级 advance_close_enabled 显式开启。
+        self._period_signal_mode_cfg = ps.period_signal_mode()
         # 账户全貌对齐（快照采集 + 外部持仓导入 + BUY 资金对齐）
         self._engine_key = engine_key
         self._acct_snap_interval = account_snapshot_interval
@@ -1045,6 +1053,9 @@ class LiveEngine:
         self._gate_portfolio_ids: set = set(gate_portfolio_ids or ())
         self._gate_specs: Dict[int, dict] = dict(gate_specs or {})
         self._gate_updated: Dict[int, date] = {}
+        # 门控更新失败的去重水位：每组合每交易日只落一条 risk/决策事件，
+        # 避免日内每分钟重试刷屏（fail-open 语义不变）。
+        self._gate_failure_noted: Dict[int, date] = {}
         # 行业层决策（默认关闭）：每组合每交易日首根 bar 重建/命中缓存后注入
         # portfolio.current_industry_gate；provider=None 时整个分支零开销。
         self._industry_gate_provider = industry_gate_provider
@@ -1201,6 +1212,11 @@ class LiveEngine:
                 and self.execution_mode in ("auto", "shadow")),
             advance_close_time=self._advance_close_time_cfg,
             snapshot_synth=self._snapshot_synth,
+            # 规范 2026-11-23：周期末/动态模式的统一判定与预警回调
+            period_signal_mode=self._period_signal_mode_cfg,
+            on_period_alert=self._handle_period_alert,
+            # 规范 3.6：14:50 反转 close_next_open → 次日 deferred 卖单
+            on_reversal_close=self._handle_reversal_closes,
             # A3（2026-11-18）：14:30 日终写组合资金日序列
             on_daily_snapshot=self._write_daily_portfolio_snapshots,
             # F3（2026-11-18）：15:05 收盘清扫后输出当日缺失分钟段清单（只观测）
@@ -1736,9 +1752,19 @@ class LiveEngine:
         # 外部信号文件模式：1w/1mon 的 TQ 启动注入同样停用（信号只来自预警文件，
         # 避免启动即有 TQ 预填信号与文件路径并存）。预热保留（行情/风控仍需历史）。
         if self.execution_mode != "alert" and self._signal_source is None:
-            self._inject_startup_periods(
-                datetime.combine(now_shanghai().date(), datetime.min.time())
+            now = now_shanghai()
+            today = now.date()
+            # 规范 2026-11-23：仅「周期末交易日 + 15:05 后」注入完成周期信号；
+            # 盘中启动只预热行情，不写滚动 1w/1mon 信号（避免周内/月内翻转值入库）。
+            after_close = (now.hour, now.minute) >= (15, 5)
+            periods = tuple(
+                p for p in ps.DYNAMIC_PERIODS
+                if after_close and ps.is_period_end_day(self._calendar, p, today)
             )
+            if periods:
+                self._inject_startup_periods(
+                    datetime.combine(today, datetime.min.time()), periods=periods
+                )
         self._preheat()
 
     def _dispatcher_close_safe(self) -> None:
@@ -4033,6 +4059,44 @@ class LiveEngine:
                         ctx.strategy_id, symbol, self.session_id)
             if not buy_allowed and not sell_allowed:
                 continue
+            # 规范 2026-11-23：1w/1mon 的外部预警信号不得进入下单链。
+            # - 默认 period_close：周/月内信号未到周期末 → 忽略（留痕）；
+            # - dynamic：只进 SignalMonitor 预警，绝不下单。
+            if ctx.period in ps.DYNAMIC_PERIODS:
+                outs = []
+                for cfg, is_sell in (
+                    [(cfg, False) for cfg in buy_allowed]
+                    + [(cfg, True) for cfg in sell_allowed]
+                ):
+                    if is_sell and cfg.get("signal_type") == SignalType.REDUCE:
+                        outs.append({
+                            "name": cfg["signal_name"], "value": 1,
+                            "signal_type": SignalType.CLOSE.value,
+                        })
+                    else:
+                        outs.append({"name": cfg["signal_name"], "value": 1})
+                period_bar = BarEvent(
+                    stocks={symbol: {
+                        "open": price, "high": price, "low": price,
+                        "close": price, "volume": 0,
+                    }},
+                    bar_time=bar_time,
+                    period=ctx.period,
+                )
+                self.signal_cache[(ctx.strategy_id, symbol, bar_time)] = outs
+                if (ps.is_dynamic(ctx.period, self._period_signal_mode_cfg)
+                        and self._signal_monitor is not None):
+                    self._handle_period_alert(port, period_bar)
+                    logger.info(
+                        "external period signal alert-only (dynamic): %s %s "
+                        "period=%s (session %s)",
+                        symbol, bar_time, ctx.period, self.session_id)
+                else:
+                    logger.info(
+                        "external period signal ignored (period_close requires "
+                        "period-end bar): %s %s period=%s (session %s)",
+                        symbol, bar_time, ctx.period, self.session_id)
+                continue
             # 「实际注入」才占本日方向名额：避免重复买入行把卖出名额一并吞掉
             if buy_allowed:
                 injected_buy = True
@@ -4356,6 +4420,8 @@ class LiveEngine:
             with self._book_lock:
                 self._consume_execution_receipts()
                 converged_ids = self._poll_deals() or []
+                # 反转单成交后补 disposition=filled 留档（每单一次）。
+                self._note_reversal_fills()
                 # 成交价偏离监控（P0-3）：本轮回填已落库，核对成交价 vs 审批价。
                 # 必须在 _poll_deals 之后（否则读不到本轮新成交）。
                 self._check_fill_price_deviation()
@@ -8241,11 +8307,77 @@ class LiveEngine:
             self._gate_updated[pid] = bar_date
             self._persist_gate_snapshot(
                 pid, bar_date, tracker or portfolio.current_market_gate)
-        except Exception:
+        except Exception as exc:
             logger.warning(
                 "portfolio %s 市场门控更新失败，沿用旧状态（fail-open）",
                 pid, exc_info=True,
             )
+            self._note_gate_update_failure(pid, bar_date, exc)
+
+    @staticmethod
+    def _classify_gate_failure(exc: Exception) -> Tuple[str, str]:
+        """门控失败原因分类：闸拒绝 / 通道超时 / 无数据 / 其他。
+
+        区分原因是为了「对外文案随之区分」：闸拒绝要说明是保护窗，不是数据缺失。
+        """
+        from core.engine.market_gate import MarketGateUnavailableError
+        from core.tq.gate import TDXLockTimeout, TdxTaskBlocked
+
+        if isinstance(exc, TdxTaskBlocked):
+            window = f"（保护窗 {exc.window}）" if exc.window else ""
+            return "gate_blocked", f"TQ 通道闸拒绝{window}"
+        if isinstance(exc, TDXLockTimeout):
+            return "timeout", "TQ 通道等待超时"
+        if isinstance(exc, MarketGateUnavailableError):
+            return "no_data", f"门控取数无数据：{exc}"
+        return "error", f"{type(exc).__name__}: {exc}"
+
+    def _note_gate_update_failure(self, pid: int, bar_date: date,
+                                  exc: Exception) -> None:
+        """门控更新失败显式化：risk 事件 + 决策事件落库（每日每组合一条）。
+
+        fail-open 不变：旧门控状态继续生效、不拦开仓，只是让失败可见，
+        不再被 `except Exception` 静默吞掉。
+        """
+        if self._gate_failure_noted.get(pid) == bar_date:
+            return
+        self._gate_failure_noted[pid] = bar_date
+        reason, detail = self._classify_gate_failure(exc)
+        msg = (f"市场门控更新失败（{reason}）：{detail}；"
+               f"沿用旧门控状态（fail-open，不拦开仓）")
+        self._emit("risk", {
+            "gate": "market_gate_update",
+            "action": "fail",
+            "reason": reason,
+            "portfolio_id": pid,
+            "bar_date": bar_date.isoformat(),
+            "message": msg,
+        })
+        try:
+            db = self._db_session_factory()
+            if db is None:
+                return
+            try:
+                db.add(LiveDecisionEvent(
+                    live_session_id=self.session_id,
+                    portfolio_id=pid,
+                    layer="risk",
+                    gate="market_gate_update",
+                    action="fail",
+                    bar_time=datetime(bar_date.year, bar_date.month,
+                                      bar_date.day, 15, 0),
+                    param_name=reason,
+                    message=msg[:200],
+                ))
+                db.commit()
+            except Exception:
+                db.rollback()
+                raise
+            finally:
+                db.close()
+        except Exception:
+            logger.warning("门控失败事件落库失败（portfolio %s）", pid,
+                           exc_info=True)
 
     def _maybe_update_industry_gate(self, portfolio: Portfolio,
                                     bar_date: date) -> None:
@@ -8558,6 +8690,295 @@ class LiveEngine:
         decorated.sort(key=lambda x: (x[0], x[1]))
         return [item[2] for item in decorated]
 
+    def _handle_period_alert(self, portfolio: Portfolio, bar: BarEvent) -> None:
+        """dynamic 模式（1w/1mon）预警回调：只进 SignalMonitor，绝不进下单链。
+
+        由 DailyCloser 每日 15:05 用滚动周期值触发；SignalMonitor 只落 LiveSignal
+        并 send_warn，不产生委托。
+        """
+        if self._signal_monitor is None:
+            return
+        self._signal_monitor.evaluate(
+            portfolio, bar, self.signal_cache,
+            strategies=portfolio.strategies, frequency=bar.period,
+        )
+
+    def _handle_reversal_closes(
+        self, portfolio: Portfolio, bar: BarEvent, mapping: Dict[int, Set[str]],
+    ) -> None:
+        """14:50 反转 close_next_open：生成次日 deferred 卖单（规范 3.6）。
+
+        只走既有提交链（``_submit_one_order(post_close=True)`` → deferred →
+        下一交易日首根 bar 放行），不新建下单路径；本方法不评估公式信号/风控。
+        三源去重已在 DailyCloser 侧按「同日同标的一条 SELL」完成。
+        """
+        if self._db_session_factory is None:
+            return
+        # 护栏①：只撤「本轮由该信号新开的仓」。按当日 BUY 成交汇总
+        # (策略 → 代码 → 股数) 作为可卖上限，当日之前的既有仓不动。
+        new_open_qty: Optional[Dict[int, Dict[str, int]]] = None
+        day = (bar.bar_time.date()
+               if getattr(bar, "bar_time", None) is not None else None)
+        if day is not None:
+            start = datetime.combine(day, datetime.min.time())
+            end = start + timedelta(days=1)
+            qdb = self._db_session_factory()
+            try:
+                rows = (
+                    qdb.query(
+                        LiveTrade.strategy_id,
+                        LiveTrade.stock_code,
+                        func.sum(LiveTrade.quantity),
+                    )
+                    .filter(
+                        LiveTrade.live_session_id == self.session_id,
+                        func.lower(LiveTrade.trade_type) == "buy",
+                        LiveTrade.trade_time >= start,
+                        LiveTrade.trade_time < end,
+                    )
+                    .group_by(LiveTrade.strategy_id, LiveTrade.stock_code)
+                    .all()
+                )
+                new_open_qty = {}
+                for sid, code, qty in rows:
+                    new_open_qty.setdefault(int(sid), {})[code] = int(qty or 0)
+            except Exception:  # noqa: BLE001 — 归因失败退回持仓分桶
+                logger.exception(
+                    "reversal new-open attribution failed (portfolio %s)",
+                    portfolio.portfolio_id)
+                new_open_qty = None
+            finally:
+                qdb.close()
+        try:
+            orders = portfolio.forced_close_orders(
+                bar, mapping, new_open_qty=new_open_qty)
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                "reversal close order build failed (portfolio %s)",
+                portfolio.portfolio_id)
+            return
+        if not orders:
+            logger.warning(
+                "reversal close: no sellable position (portfolio %s, %s) — "
+                "可能 14:50 成交尚未回填持仓或当日无新开仓，本档不生成委托",
+                portfolio.portfolio_id, mapping)
+            return
+        orders = self._dedupe_inflight_sells(portfolio, orders)
+        if not orders:
+            return
+        db = self._db_session_factory()
+        try:
+            for order in orders:
+                try:
+                    # 明确 signal_bar_date：deferred 生命周期/过期/顺延均以它为准。
+                    if order.bar_time is not None:
+                        order.signal_bar_date = order.bar_time.date()
+                    self._submit_one_order(
+                        db, portfolio, order, bar.period, post_close=True)
+                    self._record_reversal_disposition(
+                        db, order, "pending", bar.bar_time,
+                        "close_next_open 次日 deferred，等待首根可成交 bar")
+                except Exception:  # noqa: BLE001
+                    db.rollback()
+                    logger.exception(
+                        "reversal close submit failed: %s %s qty=%s",
+                        order.stock_code, order.signal_name, order.quantity)
+        finally:
+            db.close()
+
+    def _record_reversal_disposition(
+        self, db, order, action: str, bar_time, message: str = "",
+    ) -> None:
+        """反转处置档留档：pending / filled / superseded / untradable。"""
+        try:
+            db.add(LiveDecisionEvent(
+                live_session_id=self.session_id,
+                portfolio_id=(getattr(order, "portfolio_id", None)
+                              or getattr(order, "portfolio_strategy_id", None)),
+                strategy_id=getattr(order, "strategy_id", None),
+                stock_code=getattr(order, "stock_code", None),
+                bar_time=bar_time,
+                gate="reversal_close",
+                layer="signal",
+                action=action,
+                param_name="close_next_open",
+                message=("reversal_disposition=%s %s" % (action, message))[:200],
+            ))
+            db.commit()
+        except Exception:  # noqa: BLE001 — 留档失败不得影响交易
+            db.rollback()
+            logger.exception(
+                "record reversal disposition failed: %s %s",
+                getattr(order, "stock_code", None), action)
+
+    def _note_reversal_action(
+        self, order, action: str, bar_time, message: str = "",
+    ) -> None:
+        """独立会话写一条反转 disposition（untradable/superseded/filled 用）。"""
+        if self._db_session_factory is None:
+            return
+        db = self._db_session_factory()
+        try:
+            self._record_reversal_disposition(db, order, action, bar_time, message)
+        finally:
+            db.close()
+
+    @staticmethod
+    def _is_reversal_sell(order) -> bool:
+        return (order.trade_type == TradeType.SELL
+                and getattr(order, "signal_name", "") == "reversal_close")
+
+    def _reversal_sell_tradable(self, bar: BarEvent, order):
+        """反转 SELL 在当前 bar 是否可成交 → (bool, 原因)。
+
+        护栏③：一字跌停（high==low 且收在跌停价）或无成交（volume<=0/缺该标的
+        bar）判不可成交，顺延到下一根 bar；缺数据/通道不提供涨跌停时 fail-open。
+        """
+        quote = (getattr(bar, "stocks", None) or {}).get(order.stock_code)
+        if not isinstance(quote, dict):
+            return False, "无成交（缺该标的 bar，停牌/无数据）"
+        volume = quote.get("volume")
+        if volume is not None:
+            try:
+                if float(volume) <= 0:
+                    return False, "无成交（volume=0）"
+            except (TypeError, ValueError):
+                pass
+        try:
+            high = float(quote.get("high"))
+            low = float(quote.get("low"))
+            close = float(quote.get("close"))
+        except (TypeError, ValueError):
+            return True, ""
+        bounds = self._price_limit_bounds(order.stock_code)
+        if bounds and len(bounds) >= 3 and bounds[2] is not None:
+            try:
+                down = float(bounds[2])
+            except (TypeError, ValueError):
+                down = None
+            if down is not None and high == low and close <= down:
+                return False, "一字跌停（high==low<=%.3f）" % down
+        return True, ""
+
+    def _supersede_reversal_order(
+        self, portfolio: Portfolio, order, message: str,
+    ) -> None:
+        """护栏②：同标同日已有风控/策略 SELL → 反转单让位（不叠加数量）。"""
+        logger.warning(
+            "reversal sell superseded: %s %s qty=%s (portfolio %s, %s)",
+            order.stock_code, order.signal_name, order.quantity,
+            portfolio.portfolio_id, message)
+        row_id = getattr(order, "_deferred_row_id", None)
+        if self._db_session_factory is None:
+            return
+        db = self._db_session_factory()
+        try:
+            if row_id:
+                row = db.query(LiveOrder).filter(LiveOrder.id == row_id).first()
+                if row is not None:
+                    row.status = "canceled"
+                    tail = "reversal_superseded: %s" % message
+                    row.error_message = (
+                        ((row.error_message + "; ") if row.error_message else "")
+                        + tail
+                    )[:500]
+            self._record_reversal_disposition(
+                db, order, "superseded", order.bar_time, message)
+        except Exception:  # noqa: BLE001
+            db.rollback()
+            logger.exception(
+                "supersede reversal order failed: %s", order.stock_code)
+        finally:
+            db.close()
+
+    def _yield_reversal_sells(self, portfolio: Portfolio, orders) -> list:
+        """护栏②：释放的反转单若与同标同日风控/策略 SELL 冲突则让位。
+
+        同批冲突优先（本 bar 的风控/策略 SELL 已生成）；再查当日已提交的有效
+        SELL（排除本 deferred 行自身与已失败/已撤终态），避免叠加数量。
+        """
+        if not orders:
+            return orders
+        reversals = [o for o in orders if self._is_reversal_sell(o)]
+        if not reversals:
+            return orders
+        batch_keys = {
+            (o.strategy_id, o.stock_code)
+            for o in orders
+            if o.trade_type == TradeType.SELL and not self._is_reversal_sell(o)
+        }
+        day = next(
+            (o.bar_time.date() for o in reversals if o.bar_time is not None),
+            None)
+        db = self._db_session_factory() if self._db_session_factory else None
+        dead = ("canceled", "rejected", "failed", "error", "submit_error", "junk")
+        kept = []
+        try:
+            for order in orders:
+                if not self._is_reversal_sell(order):
+                    kept.append(order)
+                    continue
+                conflict = (order.strategy_id, order.stock_code) in batch_keys
+                if not conflict and db is not None and day is not None:
+                    start = datetime.combine(day, datetime.min.time())
+                    end = start + timedelta(days=1)
+                    q = db.query(LiveOrder.id).filter(
+                        LiveOrder.live_session_id == self.session_id,
+                        LiveOrder.portfolio_strategy_id == portfolio.portfolio_id,
+                        LiveOrder.stock_code == order.stock_code,
+                        func.lower(LiveOrder.trade_type) == "sell",
+                        LiveOrder.bar_time >= start,
+                        LiveOrder.bar_time < end,
+                        ~LiveOrder.status.in_(dead),
+                    )
+                    row_id = getattr(order, "_deferred_row_id", None)
+                    if row_id:
+                        q = q.filter(LiveOrder.id != row_id)
+                    conflict = q.first() is not None
+                if conflict:
+                    self._supersede_reversal_order(
+                        portfolio, order,
+                        "同标同日已有风控/策略 SELL，让位不叠加数量")
+                else:
+                    kept.append(order)
+        finally:
+            if db is not None:
+                db.close()
+        return kept
+
+    def _note_reversal_fills(self) -> None:
+        """反转单成交后补一条 disposition=filled（每单一次）。"""
+        if self._db_session_factory is None:
+            return
+        noted = getattr(self, "_reversal_fill_noted", None)
+        if noted is None:
+            noted = set()
+            self._reversal_fill_noted = noted
+        db = self._db_session_factory()
+        try:
+            rows = (
+                db.query(LiveOrder)
+                .filter(
+                    LiveOrder.live_session_id == self.session_id,
+                    LiveOrder.signal_name == "reversal_close",
+                    LiveOrder.status == "filled",
+                )
+                .all()
+            )
+            for row in rows:
+                if row.id in noted:
+                    continue
+                noted.add(row.id)
+                self._record_reversal_disposition(
+                    db, row, "filled", row.bar_time,
+                    "成交 %s 股 @ %s" % (row.filled_quantity, row.filled_price))
+        except Exception:  # noqa: BLE001 — 留档失败不影响交易
+            db.rollback()
+            logger.exception("note reversal fills failed (session %s)",
+                             self.session_id)
+        finally:
+            db.close()
+
     def _handle_bar(
         self,
         portfolio: Portfolio,
@@ -8808,6 +9229,8 @@ class LiveEngine:
             # 会重复生成止损/止盈卖单）。按「目标数量 − 在途未成交数量」收窄或跳过，
             # 仅实盘路径；回测不经过本方法。
             orders = self._dedupe_inflight_sells(portfolio, orders)
+            # 护栏②：反转 deferred 单若与同标同日风控/策略 SELL 冲突 → 让位。
+            orders = self._yield_reversal_sells(portfolio, orders)
         if orders:
             orders.sort(key=lambda o: 0 if o.trade_type.value == "SELL" else 1)
             # D1：账户级熔断/日亏暂停 → 剥 BUY（SELL 保留），在资金分配之前，
@@ -11863,7 +12286,36 @@ class LiveEngine:
             if due is not None and extended:
                 # 已顺延过一次：到期日 = 原 due 的下一交易日，再超即取消（不再顺延）
                 due = self._next_trading_day(due)
-            if (due is not None
+            # 护栏③（反转 close_next_open）：只允许在到期后「可成交的首根 bar」放行。
+            # 一字跌停/无成交 → 留在队列逐 bar 重试并记 untradable；超过
+            # _REVERSAL_UNTRADABLE_MAX_DAYS 仍不可成交才终态取消。该分支绕过下方
+            # 通用过期判定（通用判定只允许 due 当日放行，无法表达「顺延」）。
+            is_reversal = self._is_reversal_sell(order)
+            if is_reversal and due is not None:
+                if bar_date < due:
+                    remaining.append(order)
+                    continue
+                tradable, why = self._reversal_sell_tradable(bar, order)
+                if not tradable:
+                    first = getattr(order, "_reversal_untradable_since", None)
+                    if first is None:
+                        order._reversal_untradable_since = bar_date
+                        first = bar_date
+                    noted = getattr(order, "_reversal_untradable_noted", None)
+                    if noted is None:
+                        noted = set()
+                        order._reversal_untradable_noted = noted
+                    if bar_date not in noted:
+                        noted.add(bar_date)
+                        self._note_reversal_action(
+                            order, "untradable", bar.bar_time, why)
+                    if (bar_date - first).days > _REVERSAL_UNTRADABLE_MAX_DAYS:
+                        self._cancel_reversal_untradable(
+                            order, portfolio, bar.bar_time, why)
+                        continue
+                    remaining.append(order)
+                    continue
+            if (not is_reversal and due is not None
                     and bar_date > due + timedelta(days=grace_days)):
                 # P1：due 当日一根分钟 bar 都没收到（行情失效）→ 顺延一个交易日。
                 # 「bar 日期恰好是 due 的下一交易日」给顺延幅度封顶，停摆多日不会
@@ -11893,6 +12345,37 @@ class LiveEngine:
             released.append(order)
         self._signal_bar_deferred = remaining
         return released
+
+    def _cancel_reversal_untradable(
+        self, order, portfolio: Portfolio, bar_time, why: str,
+    ) -> None:
+        """反转单长期不可成交 → 终态取消（disposition=untradable 留档）。"""
+        msg = ("反转单顺延超过 %d 个自然日仍不可成交（%s），终态取消"
+               % (_REVERSAL_UNTRADABLE_MAX_DAYS, why))
+        logger.warning(
+            "reversal sell canceled untradable: %s qty=%s (portfolio %s, %s)",
+            order.stock_code, order.quantity, portfolio.portfolio_id, msg)
+        if self._db_session_factory is None:
+            return
+        db = self._db_session_factory()
+        try:
+            row_id = getattr(order, "_deferred_row_id", None)
+            if row_id:
+                row = db.query(LiveOrder).filter(LiveOrder.id == row_id).first()
+                if row is not None:
+                    row.status = "canceled"
+                    row.error_message = (
+                        ((row.error_message + "; ") if row.error_message else "")
+                        + "reversal_untradable: %s" % why
+                    )[:500]
+            self._record_reversal_disposition(
+                db, order, "untradable", bar_time, msg)
+        except Exception:  # noqa: BLE001
+            db.rollback()
+            logger.exception(
+                "cancel reversal untradable failed: %s", order.stock_code)
+        finally:
+            db.close()
 
     def _extend_deferred_order(
         self, order: OrderEvent, portfolio: Portfolio, due: date
@@ -12985,9 +13468,13 @@ class LiveEngine:
         """取公式返回最后一条 bar 的信号（薄委托 → MarketDataService）。"""
         return MarketDataService._extract_latest_signal(raw, code)
 
-    def _inject_startup_periods(self, daily_time: datetime) -> None:
-        """C6(C)：1w/1mon 通达信启动注入（薄委托 → MarketDataService）。"""
-        self.market_data.inject_startup_periods(daily_time)
+    def _inject_startup_periods(self, daily_time: datetime, *, periods=None) -> None:
+        """C6(C)：1w/1mon 通达信启动注入（薄委托 → MarketDataService）。
+
+        规范 2026-11-23：只有「周期末交易日 + 已收盘」才允许在启动时写入完成
+        周期信号；盘中启动不得把滚动周期值写进 signal_cache。
+        """
+        self.market_data.inject_startup_periods(daily_time, periods=periods)
 
     def _startup_periods_missing(self, daily_time: datetime) -> bool:
         """1w/1mon 信号是否全部已预填（薄委托 → MarketDataService）。"""

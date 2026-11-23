@@ -86,6 +86,7 @@ from core.engine.live.timing import now_shanghai
 from core.services import portfolio_settings
 from core.services import capital_inheritance
 from core.engine import capital_enforce
+from core.engine import period_semantics as period_sem
 from core.services.pairing_service import binding_snapshot, build_loan_model_plan
 from core.services.live_data_health import (
     health_summary_text,
@@ -1432,6 +1433,22 @@ def split_channel_warnings(
     ]
 
 
+def build_live_gate_tracker(spec, start, end):
+    """实盘市场门控 tracker 构建（**显式 P0**）。
+
+    实盘自己的门控刷新属主链：14:55–15:10 收盘保护窗内也必须能取到通道，
+    否则会被自家 P1 时段规则拒绝（2026-11-23 15:05 日线轮次/门控静默失败）。
+    ``raise_gate_errors=True`` 让闸拒绝/超时原样上抛，由引擎落 risk 事件区分原因；
+    失败仍是 fail-open（沿用旧门控状态，不拦开仓）。
+    """
+    from types import SimpleNamespace
+    from core.services.backtest_service import build_gate_tracker
+
+    with tdx_priority(P0):
+        return build_gate_tracker(
+            SimpleNamespace(**spec), start, end, raise_gate_errors=True)
+
+
 def build_engine(
     session_id: int,
     db: Session,
@@ -1721,12 +1738,10 @@ def build_engine(
         spec = gate_specs.get(portfolio_id)
         if not spec:
             return None
-        from types import SimpleNamespace
-        from core.services.backtest_service import build_gate_tracker
         # build_gate_tracker 内部再前推 GATE_WARMUP_DAYS(500) 自然日，
         # 这里传 end_date-365 天 → 实际回看约 865 天（≈600 根日线），MA288 余量充足。
-        return build_gate_tracker(
-            SimpleNamespace(**spec), end_date - timedelta(days=365), end_date)
+        return build_live_gate_tracker(
+            spec, end_date - timedelta(days=365), end_date)
 
     def _industry_gate_provider(portfolio_id: int, end_date):
         """行业层决策数据：按需构建/命中进程内缓存（每组合每交易日一次）。
@@ -3511,9 +3526,17 @@ def _collect_session_data_health(db: Session, session_id: int,
         "periods_checked": periods,
         "codes_total": len(pool_codes),
         "codes_checked": health.get("checked_codes"),
+        "codes_unchecked": health.get("unchecked_count"),
         "timeout_count": health.get("timeout_count"),
         "timeout_codes": health.get("timeout_codes") or [],
+        # 新增口径（只增不改）：把 stale/empty 与 error/timeout/未抽查分开，
+        # 前端据此按原因分别提示，避免把「没验完/查询异常」误报成「需补下载」。
+        "status_counts": health.get("status_counts") or {},
+        "data_missing_count": health.get("data_missing_count"),
+        "data_missing_codes": health.get("data_missing_codes") or [],
         "truncated": bool(health.get("truncated")),
+        "truncated_reason": health.get("truncated_reason"),
+        "warm_retry": health.get("warm_retry") or {},
         "budget": {"max_codes": max_codes,
                    "time_budget_seconds": time_budget_seconds},
         "health": health,
@@ -5379,6 +5402,15 @@ def start_session(
         )
 
     try:
+        # B5：周期-执行语义组合校验——dynamic 与 14:50 提前收盘价互斥；配置非法值
+        # 不再静默回退，直接在启动前拒绝并给出可见原因（不建引擎、不置 running）。
+        period_mode_msg = period_sem.validate_session_mode(
+            period_sem.raw_configured_mode(),
+            bool(getattr(session, "advance_close_enabled", False)),
+        )
+        if period_mode_msg:
+            return None, session, (
+                400, period_mode_msg, {"rule": "period_signal_mode"})
         engine = build_engine(
             session_id, db, mode,
             db_session_factory=db_session_factory, dispatcher_cls=dispatcher_cls,

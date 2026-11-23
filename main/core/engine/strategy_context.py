@@ -63,6 +63,8 @@ class StrategyContext:
         split_order_interval_jitter: bool = False,
         split_order_volume_pct: Optional[float] = None,
         risk_timing: str = "next_day",
+        # 14:50 反转处置档（规范 3.6，默认 close_next_open）。hold = 只标记不撤单。
+        reversal_disposition: str = "close_next_open",
         signal_frequency: Optional[str] = None,
         signal_at: Optional[str] = None,
         signal_weekday: Optional[int] = None,
@@ -121,6 +123,7 @@ class StrategyContext:
         self.split_order_interval_jitter = split_order_interval_jitter
         self.split_order_volume_pct = split_order_volume_pct
         self.risk_timing = risk_timing
+        self.reversal_disposition = reversal_disposition or "close_next_open"
         self.positions: Dict[str, Position] = {}
         # 策略风控（assemble_portfolio 注入；未注入 → _check_risks 跳过并告警，不静默）
         self.strategy_risk: Optional[StrategyRiskManager] = None

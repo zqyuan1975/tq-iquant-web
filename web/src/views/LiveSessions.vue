@@ -1052,13 +1052,42 @@ function closeEventStreams() {
 // ---- F2：数据体检（只读；非盘中自动重读本地已落盘数据，不触发下载）----
 const dataHealth = ref<Record<string, any> | null>(null)
 const dataHealthLoading = ref(false)
-// 逐周期「缺失/陈旧」摘要（stale + empty）
-const dataHealthProblems = computed(() => {
-  const periods = dataHealth.value?.health?.periods as Record<string, any> | undefined
-  if (!periods) return []
-  return Object.entries(periods)
-    .filter(([, s]) => (Number(s?.stale) || 0) + (Number(s?.empty) || 0) > 0)
-    .map(([p, s]) => `${p} 缺/陈旧 ${(Number(s?.stale) || 0) + (Number(s?.empty) || 0)} 只`)
+// 逐原因提示（truncated / timeout / error / stale / empty 分开；不合并成一个「缺失」数字）
+const dataHealthVerdicts = computed<{ tone: string; text: string }[]>(() => {
+  const payload = dataHealth.value
+  if (!payload || payload.available === false) return []
+  const h = (payload.health || {}) as Record<string, any>
+  const periods = (h.periods || {}) as Record<string, Record<string, any>>
+  const counts = (h.status_counts || {}) as Record<string, number>
+  const sum = (key: string) => {
+    if (counts[key] !== undefined) return Number(counts[key]) || 0
+    return Object.values(periods).reduce((n, s) => n + (Number(s?.[key]) || 0), 0)
+  }
+  const stale = sum('stale')
+  const empty = sum('empty')
+  const error = sum('error')
+  const timeout = sum('timeout')
+  const items: { tone: string; text: string }[] = []
+  if (h.truncated) {
+    const reason = h.truncated_reason === 'budget' ? '预算耗尽' : '抽样截断'
+    items.push({
+      tone: 'warn',
+      text: `体检未完成：已验 ${h.checked_codes ?? 0}/${h.requested_codes ?? payload.codes_total ?? 0} 只（${reason}，未验部分不计缺失，可稍后重试）`,
+    })
+  } else if (h.intraday && (stale + empty) > 0) {
+    items.push({ tone: 'info', text: '盘中只报告、未做预热重读；如仍有陈旧/无 bar，请盘后复检' })
+  }
+  if (timeout) items.push({ tone: 'warn', text: `查询超时 ${timeout} 只（未校验，不算缺失）` })
+  if (error) items.push({ tone: 'warn', text: `查询异常 ${error} 只（查询失败，不算缺失）` })
+  if (stale) items.push({ tone: 'warn', text: `陈旧 ${stale} 只（最新 bar 落后，确需补下载该周期数据）` })
+  if (empty) items.push({ tone: 'warn', text: `无 bar ${empty} 只（数据源确认无行情，如停牌/退市；如本应有行情才需补下载）` })
+  return items
+})
+// 真缺失嫌疑（stale + empty）的代码；error/timeout/未抽查不在其中
+const dataHealthMissing = computed(() => {
+  const h = (dataHealth.value?.health || {}) as Record<string, any>
+  const codes: string[] = h.data_missing_codes || []
+  return { codes: codes.slice(0, 10), count: Number(h.data_missing_count ?? codes.length) || 0 }
 })
 
 async function checkDataHealth() {
@@ -2267,18 +2296,33 @@ onUnmounted(() => {
         <span v-if="dataHealth.available === false" class="badge badge-red">不可用：{{ dataHealth.reason }}</span>
         <template v-else>
           <span class="badge" :class="dataHealth.health?.healthy ? 'badge-green' : 'badge-orange'">
-            {{ dataHealth.health?.healthy ? '本地数据齐全' : `缺失/陈旧 ${dataHealth.health?.missing_count ?? 0} 只` }}
+            <template v-if="dataHealth.health?.healthy">本地数据齐全</template>
+            <template v-else-if="dataHealthMissing.count > 0">缺失/陈旧 {{ dataHealthMissing.count }} 只</template>
+            <template v-else-if="dataHealth.health?.truncated">
+              体检未完成 {{ dataHealth.health?.checked_codes ?? 0 }}/{{ dataHealth.health?.requested_codes ?? dataHealth.codes_total ?? 0 }}
+            </template>
+            <template v-else>部分未校验（不影响启动）</template>
           </span>
           <span style="color:var(--ink-soft)">
-            {{ (dataHealth.periods_checked || []).join('/') }} · {{ dataHealth.codes_total }} 只
+            {{ (dataHealth.periods_checked || []).join('/') }} ·
+            已验 {{ dataHealth.health?.checked_codes ?? dataHealth.codes_checked ?? 0 }}/{{ dataHealth.health?.requested_codes ?? dataHealth.codes_total }} 只
             <template v-if="dataHealth.health?.intraday">（盘中只报告，不自动补齐）</template>
           </span>
-          <span v-if="dataHealthProblems.length" style="color:var(--orange, #b45309)">{{ dataHealthProblems.join('；') }}</span>
+          <span
+            v-for="v in dataHealthVerdicts"
+            :key="v.text"
+            :style="v.tone === 'warn' ? 'color:var(--orange, #b45309)' : 'color:var(--ink-soft)'"
+          >{{ v.text }}</span>
+          <span v-if="dataHealth.health?.warm_retry?.attempted" style="color:var(--ink-soft)">
+            预热重读 {{ dataHealth.health.warm_retry.attempted }} 只（纠正 {{ dataHealth.health.warm_retry.resolved }} 只）
+          </span>
           <span v-if="dataHealth.auto_fill?.triggered" style="color:var(--ink-soft)">
             非盘中已重读 {{ dataHealth.auto_fill.warmed }}/{{ dataHealth.auto_fill.requested }} 项
           </span>
-          <span v-if="!dataHealth.health?.healthy" style="color:var(--ink-soft)">
-            缺失：{{ (dataHealth.health?.missing_codes || []).slice(0, 10).join('、') }}{{ (dataHealth.health?.missing_count || 0) > 10 ? ' 等' : '' }}；请在通达信客户端补下载对应周期数据
+          <!-- 只在「确有缺失嫌疑」时才提示补下载；missing_count=0 绝不出现 -->
+          <span v-if="dataHealthMissing.count > 0" style="color:var(--ink-soft)">
+            缺失/陈旧：{{ dataHealthMissing.codes.join('、') }}{{ dataHealthMissing.count > 10 ? ' 等' : '' }}
+            <template v-if="(dataHealth.health?.status_counts?.stale || 0) > 0">；陈旧项请在通达信客户端补下载对应周期数据</template>
           </span>
         </template>
       </template>
@@ -3116,43 +3160,56 @@ onUnmounted(() => {
         ④ <strong>减仓比例</strong>：预警文件没有数量/比例列，<strong>REDUCE 未给出比例时按清仓执行</strong>（日志与风控事件明确标注「未给出比例，按清仓执行」，不静默猜测百分比）；CLOSE 恒清仓。<br />
         ⑤ <strong>去重</strong>：同代码 + 同日 + 同方向各认第一条（买卖互不吞并；同方向重复推送不重复下单）。去重键 = 代码 + 交易日 + 方向（会话内生效，跨会话不共享）。未知/不可解析的动作一律忽略并节流告警，绝不猜测方向或默认成买入。
       </p>
-      <label style="display:flex;align-items:center;gap:8px;margin-top:4px">
-        <input v-model="form.advance_close_enabled" type="checkbox" style="width:auto" />
-        14:50 提前收盘价（B 可选增强，仅日线 1d，当日尾盘报单）
-      </label>
-      <template v-if="form.advance_close_enabled">
-        <label>提前收盘价执行时点</label>
-        <select v-model="form.advance_close_time">
-          <option value="14:51">14:51（默认）</option>
-          <option value="14:52">14:52</option>
-          <option value="14:55">14:55</option>
-          <option value="14:57">14:57</option>
+      <div class="opt-block">
+        <div class="opt-grid">
+          <input v-model="form.advance_close_enabled" type="checkbox" class="opt-check" />
+          <span class="opt-title">14:50 提前收盘价（pre_close_1450，仅日线 1d，当日尾盘报单）</span>
+          <div class="opt-desc">
+            <b>勾选后是真实下单、当日尾盘即可成交，不是提醒或演练。</b>
+            仅 <code>1d</code> 生效；「只进预警、不生成委托」只约束 <code>dynamic</code>（1w/1mon 滚动模式），
+            与本档无关。周线/月线策略不受本开关影响。
+            <template v-if="form.advance_close_enabled">
+              <label class="opt-sub-label">提前收盘价执行时点</label>
+              <select v-model="form.advance_close_time">
+                <option value="14:51">14:51（默认）</option>
+                <option value="14:52">14:52</option>
+                <option value="14:55">14:55</option>
+                <option value="14:57">14:57</option>
+              </select>
+              <p class="opt-desc-text">
+                <strong>信号判定维度（三选一，互斥）</strong>：<code>period_close</code>（默认，周期末根收盘后判定：日线 15:05 / 周线本周最后交易日 / 月线本月最后交易日）＜<code>dynamic</code>（1w/1mon 可选，周期内逐日滚动，<b>只进预警、不生成委托</b>）＜本开关 <code>pre_close_1450</code>（仅 1d，14:50 实时价代理收盘价，可当日尾盘报单）。同一策略只能选一个；周线/月线与日线策略各自独立，不互相触发出单。<br />
+                <strong>默认（不勾选 = 关闭，显式 true/false 永远优先）</strong>：1d/1w/1mon 都等周期收盘价落定后（15:05）用完整 bar 算信号，次一交易日开盘执行；14:30 只做日终估值/日亏/熔断恢复，不再产生日线级信号。周线/月线仅在周期最后一个交易日的 15:05 轮次计算。<br />
+                <strong>勾选后（仅 1d 提前）</strong>：14:50 用快照合成 1m bar 的收盘价定信号，<strong>委托价取 14:52 起始 1m bar 的开盘价</strong>（考虑报价时延，取不到回退 14:51 起始 bar 的开盘价并推送 fallback 风控事件；两者都取不到则该股本日不下单），该轮 1d 信号<strong>当日尾盘提交成交</strong>（不受 risk_timing=next_day 的次日顺延）。<strong>周线/月线不受影响</strong>（仍收盘落定 + 次日执行）。<br />
+                <strong>双留档与收盘复核</strong>：14:50 判定时记录判定价与信号方向；15:05 用最终收盘价复核并记录 <code>final_close</code> 与 <code>reversed</code>（信号反转只标记告警，不自动反向/撤单）。14:50 轮次与 15:05 同为 <code>tdx_priority(P0)</code>，避免被收盘保护窗挤掉。数量/资金/仓位仍按 14:50 收盘价计算；成本价以柜台成交回填为准。外部信号文件模式下 1d 信号仍来自文件，本时点只补跑日线风控。仅自动模式、仅实盘；当日只执行一次（重启不重复）；会话须在 14:50 前启动。
+              </p>
+            </template>
+          </div>
+        </div>
+      </div>
+      <div class="opt-block opt-block--field">
+        <label class="opt-label">错周期风控</label>
+        <select v-model="form.intraday_mismatched_risk_enabled" data-field="intraday_mismatched_risk_enabled">
+          <option :value="null">未显式设置（默认关闭；有分钟策略时界面会提示可开启）</option>
+          <option :value="true">强制开启（任意 bar 都跑风控）</option>
+          <option :value="false">强制关闭</option>
         </select>
-        <p style="font-size:12px;color:var(--ink-faint);margin:2px 0 12px">
-          <strong>默认（不勾选）</strong>：1d/1w/1mon 都等周期收盘价落定后（15:05）用完整 bar 算信号，次一交易日开盘执行；14:30 只做日终估值/日亏/熔断恢复，不再产生日线级信号。周线/月线仅在周期最后一个交易日的 15:05 轮次计算。<br />
-          <strong>勾选后（仅 1d 提前）</strong>：14:50 用快照合成 1m bar 的收盘价定信号，<strong>委托价取 14:52 起始 1m bar 的开盘价</strong>（考虑报价时延，取不到回退 14:51 起始 bar 的开盘价并推送 fallback 风控事件；两者都取不到则该股本日不下单），该轮 1d 信号<strong>当日尾盘提交成交</strong>（不受 risk_timing=next_day 的次日顺延）。<strong>周线/月线不受影响</strong>（仍收盘落定 + 次日执行）。数量/资金/仓位仍按 14:50 收盘价计算；成本价以柜台成交回填为准。外部信号文件模式下 1d 信号仍来自文件，本时点只补跑日线风控。仅自动模式、仅实盘；当日只执行一次（重启不重复）；会话须在 14:50 前启动。
+        <p class="opt-desc-text">
+          「未显式设置」＝<b>关闭</b>：不因会话内存在分钟策略自动开启，默认继承回测的次日执行
+          （日线策略止损在 15:05 收盘落定、次日首根 bar 提交）。显式 true/false 直接生效，永远优先。
+          自动推导仅用于界面建议（有分钟策略时提示「可考虑开启」），不写库、不影响生效值。
+          自身周期的 bar 恒评估；开启后错周期 bar（如 1m bar 驱动 5m/日线策略）也逐根按收盘价评估
+          止损/止盈/移动止损。运行中会话改动<b>下次启动生效</b>。
         </p>
-      </template>
-      <label>错周期风控</label>
-      <select v-model="form.intraday_mismatched_risk_enabled" data-field="intraday_mismatched_risk_enabled">
-        <option :value="null">未显式设置（默认关闭；有分钟策略时界面会提示可开启）</option>
-        <option :value="true">强制开启（任意 bar 都跑风控）</option>
-        <option :value="false">强制关闭</option>
-      </select>
-      <p style="font-size:12px;color:var(--ink-faint);margin:2px 0 12px">
-        「未显式设置」＝<b>关闭</b>：不因会话内存在分钟策略自动开启，默认继承回测的次日执行
-        （日线策略止损在 15:05 收盘落定、次日首根 bar 提交）。显式 true/false 直接生效，永远优先。
-        自动推导仅用于界面建议（有分钟策略时提示「可考虑开启」），不写库、不影响生效值。
-        自身周期的 bar 恒评估；开启后错周期 bar（如 1m bar 驱动 5m/日线策略）也逐根按收盘价评估
-        止损/止盈/移动止损。运行中会话改动<b>下次启动生效</b>。
-      </p>
-      <label style="display:flex;align-items:center;gap:8px">
-        <input v-model="form.gate_recheck_on_execute" type="checkbox" style="width:auto" data-field="gate_recheck_on_execute" />
-        执行前重判门控（顺延次日单 / 盘前竞价单提交前再判一次）
-      </label>
-      <p style="font-size:12px;color:var(--ink-faint);margin:2px 0 12px">
-        默认关闭：信号日门控通过即按原决策执行。开启后，顺延次日单与盘前集合竞价单在真正提交前用「执行日前一收盘」的门控状态再判一次；若为空头则直接取消并落决策事件（gate=market_gate_recheck），不拿旧决策硬执行。仅对启用市场门控的组合生效。
-      </p>
+      </div>
+      <div class="opt-block">
+        <div class="opt-grid">
+          <input v-model="form.gate_recheck_on_execute" type="checkbox" class="opt-check" data-field="gate_recheck_on_execute" />
+          <span class="opt-title">执行前重判门控（顺延次日单 / 盘前竞价单提交前再判一次）</span>
+          <div class="opt-desc">
+            默认关闭：信号日门控通过即按原决策执行。开启后，顺延次日单与盘前集合竞价单在真正提交前用「执行日前一收盘」的门控状态再判一次；若为空头则直接取消并落决策事件（gate=market_gate_recheck），不拿旧决策硬执行。仅对启用市场门控的组合生效。
+          </div>
+        </div>
+      </div>
       <label>盘前集合竞价参数<span class="label-note">（会话级覆盖）</span></label>
       <select v-model="form.pre_open_auction_enabled" data-field="pre_open_auction_enabled">
         <option :value="null">跟随全局（默认开启，09:15–09:20 / 让价 2%）</option>
@@ -3604,12 +3661,20 @@ onUnmounted(() => {
               在 15:05 轮次用完整 bar 算信号，<b>次一交易日开盘执行</b>；14:30 只做日终估值 /
               日亏 / 熔断恢复，不再驱动日线级信号。1w 只在每周最后一个交易日、1mon 只在每月
               最后一个交易日的 15:05 轮次计算（周五 / 月末休市自动前移到前一交易日），其余日子跳过。</p>
-            <p class="guide-step"><b>14:50 提前收盘价（B，可选增强，仅 1d，advance_close_enabled）</b>：
-              会话级开关，默认关。开启后仅 1d 提前——14:50 用快照合成 1m bar 收盘价定信号，
+            <p class="guide-step"><b>14:50 提前收盘价（pre_close_1450，可选增强，仅 1d，advance_close_enabled）</b>：
+              信号判定维度三选一：<code>period_close</code>（默认）/ <code>dynamic</code>（仅 1w/1mon，
+              逐日滚动、只预警不下单）/ 本项 <code>pre_close_1450</code>（仅 1d）。会话级开关，默认关；
+              未显式设置=关闭，显式 true/false 永远优先，自动推导仅界面建议、不写库、不影响生效值。
+              <b>本档是真实下单、当日尾盘即可成交，不是提醒或演练；「只进预警、不生成委托」只约束
+              dynamic（1w/1mon 滚动模式），与本档无关。</b>
+              开启后仅 1d 提前——14:50 用快照合成 1m bar 收盘价定信号，
               <b>委托价取 14:52 起始 1m bar 的开盘价</b>（考虑报价时延；取不到回退 14:51 起始
               bar 的开盘价并推送 fallback 风控事件；两者都取不到则该股本日不下单），<b>该轮信号
               当日尾盘提交成交</b>（不受 risk_timing 的次日顺延）。<b>周线/月线不受影响</b>
-              （仍走 15:05 收盘落定 + 次日执行）。时点限定 14:51–14:59，实际轮次不早于 14:52。
+              （仍走 15:05 收盘落定 + 次日执行）。时点限定 14:51–14:59，实际轮次不早于 14:52；
+              整轮与 15:05 同级走 <code>tdx_priority(P0)</code>。
+              双留档：14:50 记录判定价与信号方向；15:05 用最终收盘价复核并记录
+              <code>final_close</code> 与 <code>reversed</code>（反转只标记告警，不自动反向/撤单）。
               四引擎通用、仅实盘 auto 生效、回测忽略；当日只执行一次（跨重启幂等，DB
               advance_close_done_date）。外部信号文件模式下 1d 信号仍来自文件，该时点只补跑日线风控。
               14:52/14:51 开盘价都取不到则不下单（不伪造价格，ERROR 日志 + risk 事件可见）；
@@ -3714,7 +3779,7 @@ onUnmounted(() => {
               任一空头即拦、无强度门槛、不减仓）；breaker_action=halt（只停开仓）；requote_price_mode=tick
               （adaptive 才按盘口追价）；split_order_count/min_qty/interval_seconds/volume_pct=NULL、
               interval_jitter=false（NULL/false＝按阈值推导或旧口径）。</p>
-            <p class="guide-step"><b>回测档位</b>：dividend_mode 默认 front，exact＝不复权 + 显式公司行为（仅作
+            <p class="guide-step"><b>回测档位</b>：dividend_mode 默认 exact，exact＝不复权 + 显式公司行为（仅作
               对账基准）；execution_profile 默认 legacy，realistic 才启用涨跌停/成交量/自适应滑点/日终抬峰。
               二者按每次回测显式选择，无需重启。</p>
             <p class="guide-note">· <b>通道能力矩阵</b>：GET /api/live/channel 的 engines[].capabilities /
@@ -3845,6 +3910,46 @@ onUnmounted(() => {
 .capability-chip.off { color: var(--ink-faint); opacity: .65; text-decoration: line-through; }
 .capability-hint { font-size: 12px; color: var(--ink-faint); margin: 2px 0 10px; }
 .form-error { font-size: 12px; color: var(--red); margin: -6px 0 12px; }
+/* 新建弹窗勾选项统一网格：勾选框 / 标题 / 说明三列对齐。
+   说明文字与标题同列左对齐，避免相邻勾选项的说明被误读成下一项的注解。 */
+.opt-block { margin: 4px 0 12px; }
+/* 「错周期风控」这类普通字段：标题+控件+说明整体成块，左侧竖线明确从属关系 */
+.opt-block--field {
+  padding: 2px 0 2px 12px;
+  border-left: 2px solid var(--line, #ddd);
+}
+.opt-grid {
+  display: grid;
+  grid-template-columns: 16px minmax(0, 1fr);
+  column-gap: 8px;
+  align-items: start;
+}
+.opt-check { width: auto; margin: 3px 0 0; justify-self: start; }
+.opt-title {
+  font-size: 13px;
+  line-height: 1.5;
+  font-weight: 500;
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+.opt-desc {
+  grid-column: 2;
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--ink-faint);
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+.opt-desc-text {
+  margin: 2px 0 8px;
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--ink-faint);
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+.opt-label { display: block; margin-bottom: 4px; font-size: 13px; font-weight: 500; }
+.opt-sub-label { display: block; margin: 6px 0 4px; font-size: 12px; color: var(--ink-soft); }
 /* start 409 行内红字：指名占用者，不笼统报「启动失败」 */
 .start-error {
   margin-top: 6px;

@@ -64,6 +64,39 @@ def test_stopped_session_edit_applies_immediately_and_syncs_portfolios():
     assert result["session"]["portfolio_ids"] == [p2.id]
 
 
+def test_start_session_rejects_dynamic_plus_advance_close(monkeypatch):
+    """B5：dynamic 与 14:50 提前收盘价互斥 → 启动前 400 可见失败，不建引擎。"""
+    db = _db()
+    p1 = _portfolio(db, "p1")
+    sid = _session(db, [p1.id])["id"]
+    session = db.query(LiveSession).filter_by(id=sid).first()
+    session.advance_close_enabled = True
+    db.commit()
+
+    monkeypatch.setattr(
+        "core.engine.period_semantics.raw_configured_mode",
+        lambda *a, **k: "dynamic")
+    monkeypatch.setattr(live_service, "apply_pending_changes", lambda *a, **k: None)
+    monkeypatch.setattr(
+        live_service, "compute_params_drift", lambda *a, **k: {"drifted": False})
+    monkeypatch.setattr(live_service, "_check_channel_conflict", lambda *a, **k: None)
+    monkeypatch.setattr(
+        live_service, "resolve_stock_codes", lambda *a, **k: ["600000.SH"])
+    called = {}
+    monkeypatch.setattr(
+        live_service, "build_engine", lambda *a, **k: called.setdefault("hit", 1))
+
+    engine, sess, err = live_service.start_session(
+        db, sid, {}, "alert", db_session_factory=lambda: db)
+
+    assert engine is None
+    assert err is not None
+    assert err[0] == 400
+    assert "period_signal_mode" in err[1]
+    assert err[2] == {"rule": "period_signal_mode"}
+    assert "hit" not in called  # 未进入 build_engine
+
+
 def test_running_session_edit_queues_except_name():
     db = _db()
     p1, p2 = _portfolio(db, "p1"), _portfolio(db, "p2")

@@ -1,4 +1,4 @@
-from typing import Callable, List, Dict, Optional
+from typing import Callable, List, Dict, Optional, Set
 from decimal import Decimal
 from datetime import date, datetime, time
 from contextlib import nullcontext
@@ -999,6 +999,60 @@ class Portfolio:
                 counts[industry] = counts.get(industry, 0) + 1
         return orders
 
+    def forced_close_orders(
+        self, bar: BarEvent, mapping: Dict[int, Set[str]],
+        new_open_qty: Optional[Dict[int, Dict[str, int]]] = None,
+    ) -> List[OrderEvent]:
+        """反转平仓（规范 3.6 ``close_next_open``）：按策略生成 SELL 订单。
+
+        只生成 SELL，不评估公式信号与风控——调用方在 14:50 收盘复核后单独驱动，
+        并以 ``post_close=True`` 提交，由既有 deferred 机制在下一交易日首根 bar
+        放行（A 股 T+1，次日开盘为最早可卖时点）。三源去重（风控 > 策略 > 反转）
+        由调用方在提交前完成；本方法只按持仓生成卖单，不叠加数量。
+
+        护栏①（2026-11-23）：只撤「本轮新开仓」。``new_open_qty`` 为调用方按
+        当日 BUY 成交汇总的 (策略 → 代码 → 股数)；缺省时退化为当日持仓分桶
+        ``pos._lots[today]``。当日之前就有的既有仓一律不动，可卖量为 0 则跳过。
+        """
+        orders: List[OrderEvent] = []
+        if not mapping:
+            return orders
+        self._bar_equity = self.total_value(bar)
+        bar_day = (bar.bar_time.date()
+                   if getattr(bar, "bar_time", None) is not None else None)
+        for strategy_id, codes in mapping.items():
+            ctx = self.find_strategy(strategy_id)
+            if ctx is None or not codes:
+                continue
+            for code in sorted(codes):
+                if code not in bar.stocks:
+                    continue
+                pos = ctx.positions.get(code)
+                if pos is None or pos.quantity <= 0:
+                    continue
+                if new_open_qty is not None:
+                    new_qty = int(
+                        (new_open_qty.get(strategy_id) or {}).get(code, 0) or 0)
+                else:
+                    new_qty = int(
+                        (getattr(pos, "_lots", {}) or {}).get(bar_day, 0) or 0)
+                if new_qty <= 0:
+                    logger.debug(
+                        "反转平仓跳过 %s/%s：当日无新开仓（既有仓不动）",
+                        strategy_id, code,
+                    )
+                    continue
+                sig = SignalEvent(
+                    strategy_id=strategy_id,
+                    stock_code=code,
+                    signal_name="reversal_close",
+                    signal_type=SignalType.CLOSE,
+                    bar_time=bar.bar_time,
+                )
+                orders.extend(self._signal_to_order(
+                    ctx, sig, bar, {}, set(), quantity_cap=new_qty))
+        return orders
+
     def _process_strategy(
         self, ctx: StrategyContext, bar: BarEvent, signal_cache,
         inflight: Dict[int, set], include_signals: bool = True,
@@ -1317,6 +1371,7 @@ class Portfolio:
         self, ctx: StrategyContext, sig: SignalEvent, bar: BarEvent,
         inflight: Optional[Dict[int, set]] = None,
         cleared: Optional[set] = None,
+        quantity_cap: Optional[int] = None,
     ) -> List[OrderEvent]:
         """信号转 OrderEvent 列表（B4 轮动一单进两单出）。下单量按策略表参数计算（非硬编码）。
         - 全平类（CLOSE/止损/止盈/移动止损）：量 = 持仓全量
@@ -1400,7 +1455,11 @@ class Portfolio:
             if pos is None or pos.quantity == 0:
                 return []
             # 卖出范围口径：platform_only 只卖平台仓（全平允许剩余零股，故不取整）
-            quantity = self._scope_sell_quantity(ctx, sig, bar, pos, pos.quantity)
+            # quantity_cap：反转平仓只撤当日新开仓（护栏①），在口径收窄前先夹总量。
+            intent_qty = pos.quantity
+            if quantity_cap is not None:
+                intent_qty = min(intent_qty, max(0, int(quantity_cap)))
+            quantity = self._scope_sell_quantity(ctx, sig, bar, pos, intent_qty)
             if quantity <= 0:
                 return []
             trade_type = TradeType.SELL

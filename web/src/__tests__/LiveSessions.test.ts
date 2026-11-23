@@ -2,7 +2,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { mount, flushPromises } from '@vue/test-utils'
 
 // 会话 CRUD/启停 + 工作台历史查询 + 组合选单全走 ../api 客户端（import 的即 mock 的 vi.fn）
-const { mockGetLiveSessions, mockCreateLiveSession, mockStartLiveSession, mockStopLiveSession, mockGetLiveChannel, mockTestLiveChannel, mockGetLiveSession, mockGetWatchdogStatus, mockGetLiveAccountPreview, mockResetLiveBaseline, mockGetLiveParamsDrift, mockGetLiveCashFlows, mockCreateLiveCashFlow } = vi.hoisted(() => ({
+const { mockGetLiveSessions, mockCreateLiveSession, mockStartLiveSession, mockStopLiveSession, mockGetLiveChannel, mockTestLiveChannel, mockGetLiveSession, mockGetWatchdogStatus, mockGetLiveAccountPreview, mockResetLiveBaseline, mockGetLiveParamsDrift, mockGetLiveCashFlows, mockCreateLiveCashFlow, mockGetLiveDataHealth } = vi.hoisted(() => ({
   mockGetLiveSessions: vi.fn(),
   mockCreateLiveSession: vi.fn(),
   mockStartLiveSession: vi.fn(),
@@ -16,6 +16,7 @@ const { mockGetLiveSessions, mockCreateLiveSession, mockStartLiveSession, mockSt
   mockGetLiveParamsDrift: vi.fn(),
   mockGetLiveCashFlows: vi.fn(),
   mockCreateLiveCashFlow: vi.fn(),
+  mockGetLiveDataHealth: vi.fn(),
 }))
 vi.mock('../api', () => ({
   getLiveSessions: mockGetLiveSessions,
@@ -30,6 +31,7 @@ vi.mock('../api', () => ({
   getLiveParamsDrift: mockGetLiveParamsDrift,
   getLiveCashFlows: mockGetLiveCashFlows,
   createLiveCashFlow: mockCreateLiveCashFlow,
+  getLiveDataHealth: mockGetLiveDataHealth,
   getLivePositions: vi.fn(),
   getLiveOrders: vi.fn(),
   getLiveTrades: vi.fn(),
@@ -66,7 +68,7 @@ class FakeEventSource {
 }
 
 import LiveSessions from '../views/LiveSessions.vue'
-import { getLiveSessions, createLiveSession, startLiveSession, stopLiveSession, getLivePositions, getLiveOrders, getLiveTrades, getLiveDecisions, getLiveSignals, getPortfolios, getLiveChannel, testLiveChannel, sendUserBlock, getFormulas, getLiveSession, getWatchdogStatus, getLiveAccountPreview, resetLiveBaseline, getLiveParamsDrift, getLiveCashFlows, createLiveCashFlow } from '../api'
+import { getLiveSessions, createLiveSession, startLiveSession, stopLiveSession, getLivePositions, getLiveOrders, getLiveTrades, getLiveDecisions, getLiveSignals, getPortfolios, getLiveChannel, testLiveChannel, sendUserBlock, getFormulas, getLiveSession, getWatchdogStatus, getLiveAccountPreview, resetLiveBaseline, getLiveParamsDrift, getLiveCashFlows, createLiveCashFlow, getLiveDataHealth } from '../api'
 import { deriveBlockCode } from '../utils/blockCode'
 
 const runningSession = { id: 7, name: '模拟盘A', mode: 'simulation', status: 'running', started_at: null, stopped_at: null, portfolio_ids: [] }
@@ -2323,6 +2325,65 @@ describe('LiveSessions — warnings 与恢复事件（P2/P3）', () => {
     const logText = w.find('.event-log').text()
     expect(logText).toContain('恢复')
     expect(logText).toContain('交易桥恢复: 交易桥已恢复')
+    w.unmount()
+  })
+
+  // ---- F2 数据体检：口径分开呈现，未验/超时/异常不得提示补下载 ----
+  async function _runDataHealth(payload: Record<string, any>) {
+    ;(getLiveSessions as any).mockResolvedValue([runningSession])
+    ;(getLiveDataHealth as any).mockResolvedValue(payload)
+    const w = mount(LiveSessions)
+    await flushPromises()
+    // 唯一 running 会话会被自动聚焦到工作台，数据体检按钮直接可用
+    await w.findAll('button').find((b) => b.text() === '数据体检')!.trigger('click')
+    await flushPromises()
+    return w
+  }
+
+  function _payload(overrides: Record<string, any> = {}) {
+    const { health: healthOverrides, ...rest } = overrides
+    return {
+      session_id: 7, available: true, periods_checked: ['1d'], codes_total: 251,
+      truncated: true, truncated_reason: 'sample',
+      health: {
+        healthy: false, truncated: true, truncated_reason: 'sample',
+        intraday: false, checked_codes: 30, requested_codes: 251,
+        periods: { '1d': { total: 30, ok: 28, stale: 0, empty: 0, error: 1, timeout: 1 } },
+        status_counts: { ok: 28, stale: 0, empty: 0, error: 1, timeout: 1 },
+        data_missing_count: 0, data_missing_codes: [],
+        warm_retry: { enabled: true, attempted: 2, resolved: 2, failed: 0 },
+        ...(healthOverrides || {}),
+      },
+      auto_fill: { triggered: false, reason: 'truncated', requested: 0, warmed: 0, failed: 0 },
+      ...rest,
+    }
+  }
+
+  it('数据体检：抽样截断/超时/异常分列提示，且不出现「补下载」', async () => {
+    const w = await _runDataHealth(_payload())
+    const text = w.text()
+    expect(text).toContain('体检未完成：已验 30/251 只')
+    expect(text).toContain('查询超时 1 只')
+    expect(text).toContain('查询异常 1 只')
+    expect(text).not.toContain('补下载')
+    w.unmount()
+  })
+
+  it('数据体检：真缺失（stale）才提示补下载，并列出代码', async () => {
+    const w = await _runDataHealth(_payload({
+      health: {
+        healthy: false, truncated: false, truncated_reason: null,
+        status_counts: { ok: 29, stale: 1, empty: 0, error: 0, timeout: 0 },
+        data_missing_count: 1, data_missing_codes: ['600000.SH'],
+        periods: { '1d': { total: 30, ok: 29, stale: 1, empty: 0, error: 0, timeout: 0 } },
+        warm_retry: { enabled: true, attempted: 1, resolved: 0, failed: 0 },
+      },
+      truncated: false, truncated_reason: null,
+    }))
+    const text = w.text()
+    expect(text).toContain('陈旧 1 只')
+    expect(text).toContain('600000.SH')
+    expect(text).toContain('请在通达信客户端补下载')
     w.unmount()
   })
 })

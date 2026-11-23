@@ -201,6 +201,8 @@ def assemble_portfolio(
                 getattr(strat, "split_order_interval_jitter", False)),
             split_order_volume_pct=getattr(strat, "split_order_volume_pct", None),
             risk_timing=getattr(strat, "risk_timing", None) or "next_day",
+            reversal_disposition=(
+                getattr(strat, "reversal_disposition", None) or "close_next_open"),
             signal_frequency=strat.signal_frequency,
             signal_at=strat.signal_at,
             signal_weekday=strat.signal_weekday,

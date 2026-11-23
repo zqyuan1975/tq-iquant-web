@@ -77,6 +77,7 @@ def serialize_strategy(s: Strategy) -> dict:
             s.requote_max_slippage_ticks
             if s.requote_max_slippage_ticks is not None else 5),
         "risk_timing": s.risk_timing or "next_day",
+        "reversal_disposition": getattr(s, "reversal_disposition", None) or "close_next_open",
         "signal_frequency": s.signal_frequency,
         "signal_at": s.signal_at,
         "signal_weekday": s.signal_weekday,
@@ -353,6 +354,8 @@ def _create_strategies_two_step(db: Session, pid: int, strategies: list) -> None
             split_order_interval_jitter=getattr(s, "split_order_interval_jitter", False),
             split_order_volume_pct=getattr(s, "split_order_volume_pct", None),
             risk_timing=getattr(s, "risk_timing", None) or "next_day",
+            reversal_disposition=(
+                getattr(s, "reversal_disposition", None) or "close_next_open"),
             signal_frequency=getattr(s, "signal_frequency", None),
             signal_at=getattr(s, "signal_at", None),
             signal_weekday=getattr(s, "signal_weekday", None),
@@ -538,6 +541,8 @@ def _apply_strategy_fields(s: Strategy, req, is_update: bool = False) -> None:
     s.requote_price_mode = getattr(req, "requote_price_mode", None) or "tick"
     s.requote_max_slippage_ticks = getattr(req, "requote_max_slippage_ticks", 5) or 5
     s.risk_timing = getattr(req, "risk_timing", None) or "next_day"
+    s.reversal_disposition = (
+        getattr(req, "reversal_disposition", None) or "close_next_open")
     s.signal_frequency = getattr(req, "signal_frequency", None)
     s.signal_at = getattr(req, "signal_at", None)
     s.signal_weekday = getattr(req, "signal_weekday", None)

@@ -18,6 +18,7 @@ import re
 
 from core.api.response import err, ok
 from core.db import get_db
+from core.engine import period_semantics as period_sem
 from core.engine.industry_gate import INDUSTRY_MODES
 from core.models import PortfolioStrategy, Strategy, StockPool, StockPoolStock, Formula
 from core.services.strategy_service import (
@@ -52,6 +53,8 @@ VALID_STATUSES = {"active", "archived"}  # draft:500
 VALID_POSITION_SIZING = {"dynamic", "fixed"}  # W2 仓位模型：动态净资产/固定名义
 VALID_DAILY_LOSS_BASIS = {"equity", "initial"}  # 日内亏损分母：昨收净值（默认）/ 初始资金
 VALID_RISK_TIMINGS = {"next_day", "immediate"}  # 实盘风控/信号执行时点（批次1）
+# 14:50 反转处置档（规范 3.6）：hold=只标记/告警；close_next_open=次日首根 bar 减出
+VALID_REVERSAL_DISPOSITIONS = {"hold", "close_next_open"}
 VALID_MARKET_GATE_ENGINES = {"python", "tdx"}  # 市场门控：内置公式 / 客户端公式库
 
 
@@ -103,6 +106,7 @@ class StrategyItem(BaseModel):
     split_order_interval_jitter: bool = False
     split_order_volume_pct: float | None = None
     risk_timing: str = "next_day"
+    reversal_disposition: str = "close_next_open"
     signal_frequency: str | None = None
     signal_at: str | None = None
     signal_weekday: int | None = None
@@ -280,6 +284,12 @@ def _validate_strategy_numerics(req, label: str = "") -> str | None:
     _moa = getattr(req, "max_order_amount", None)
     if _moa is not None and _moa <= 0:
         return f"{label}单笔最大金额须大于 0，收到 {_moa}"
+    _rd = getattr(req, "reversal_disposition", None)
+    if _rd is not None and _rd not in VALID_REVERSAL_DISPOSITIONS:
+        return (
+            f"{label}reversal_disposition 必须为 "
+            f"{sorted(VALID_REVERSAL_DISPOSITIONS)}，收到 {_rd}"
+        )
     return None
 
 
@@ -623,6 +633,7 @@ class StrategyCreate(BaseModel):
     split_order_interval_jitter: bool = False
     split_order_volume_pct: float | None = None
     risk_timing: str = "next_day"
+    reversal_disposition: str = "close_next_open"
     signal_frequency: str | None = None
     signal_at: str | None = None
     signal_weekday: int | None = None
@@ -642,6 +653,15 @@ def _validate_strategy(
         return f"role 必须为 {sorted(VALID_ROLES)}，收到 {req.role}"
     if req.period not in VALID_PERIODS:
         return f"period 必须为 {sorted(VALID_PERIODS)}，收到 {req.period}"
+    # B5：全局周期-执行语义取值必须显式合法，不再静默回退；再复核该周期是否适配。
+    raw_mode = period_sem.raw_configured_mode()
+    mode_msg = period_sem.validate_configured_mode(raw_mode)
+    if mode_msg:
+        return mode_msg
+    resolved_mode = period_sem.resolve_strategy_mode(req.period, raw_mode, False)
+    mode_msg = period_sem.validate_mode(req.period, resolved_mode)
+    if mode_msg:
+        return mode_msg
     sig_msg = validate_signal_config(
         req.period, req.signal_frequency, req.signal_at,
         req.signal_weekday, req.signal_data_end,
