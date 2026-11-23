@@ -3,6 +3,7 @@ import vue from '@vitejs/plugin-vue'
 
 export default defineConfig({
   plugins: [vue()],
+  server: { fs: { allow: ['..'] } },
   test: {
     environment: 'happy-dom',
     include: ['src/**/__tests__/**/*.ts', 'src/**/*.test.ts'],

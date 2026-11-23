@@ -190,6 +190,7 @@ onUnmounted(() => {
       </div>
     </div>
     <div class="dash-hero-actions">
+      <router-link class="btn" to="/guide">使用说明</router-link>
       <button @click="load" class="btn">刷新</button>
     </div>
   </div>
@@ -351,7 +352,7 @@ onUnmounted(() => {
 .dash-hero-stats { display: flex; flex-wrap: wrap; gap: 8px 22px; font-size: 12px; color: var(--ink-soft) }
 .dash-hero-stats b { font-family: var(--font-serif); font-size: 18px; font-weight: 800; color: var(--ink); margin-right: 5px; font-variant-numeric: tabular-nums }
 .dash-hero-stats .db-accent { color: var(--red) }
-.dash-hero-actions { flex-shrink: 0 }
+.dash-hero-actions { flex-shrink: 0; display: flex; align-items: center; gap: 8px }
 
 /* 本页密度：全局 .metric-grid/.metric-card 已被回测详情占用（12 列 + span 6），
    这里不再复用，改用本页自有紧凑类，避免被全局规则撑成大卡。 */

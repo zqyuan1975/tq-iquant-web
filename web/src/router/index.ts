@@ -18,6 +18,7 @@ const router = createRouter({
     { path: '/events', name: 'events', component: () => import('../views/EventSearch.vue') },
     { path: '/troubleshooting', name: 'troubleshooting', component: () => import('../views/Troubleshooting.vue') },
     { path: '/system', name: 'system', component: () => import('../views/SystemConfig.vue') },
+    { path: '/guide', name: 'guide', component: () => import('../views/Guide.vue') },
   ],
 })
 
