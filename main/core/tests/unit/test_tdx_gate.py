@@ -37,18 +37,22 @@ def _gated(monkeypatch):
     monkeypatch.delenv("TQ_GATE_FORCE_ALLOW", raising=False)
     g.reset_for_tests(config=dict(_BASE_CFG),
                       clock=lambda: _at(10, 0),
-                      trading_day_fn=lambda d: d.weekday() < 5)
+                      trading_day_fn=lambda d: d.weekday() < 5,
+                      live_running_fn=lambda: True)
     g.clear_override()
     g.GATE.reset_state()
     yield
     g.clear_override()
-    g.reset_for_tests(config=None, clock=None, trading_day_fn=None)
+    g.reset_for_tests(config=None, clock=None, trading_day_fn=None,
+                      live_running_fn=None)
     g.GATE.reset_state()
 
 
-def _use_clock(dt: datetime):
+def _use_clock(dt: datetime, live_running: bool = True):
+    """注入时钟；默认假定有实盘在跑（时段限制生效）。"""
     g.reset_for_tests(config=dict(_BASE_CFG), clock=lambda: dt,
-                      trading_day_fn=lambda d: d.weekday() < 5)
+                      trading_day_fn=lambda d: d.weekday() < 5,
+                      live_running_fn=lambda: live_running)
 
 
 # ------------------------------------------------------------------ 时间窗
@@ -425,3 +429,59 @@ def test_signal_replay_endpoint_is_p2(monkeypatch):
     assert resp.get("code") == 0
     assert levels == [g.P2, g.P2]
     assert runs == [1]
+
+
+# ------------------------------------------- 无实盘引擎时不按时段限制（新增）
+def test_no_live_engine_opens_p2_during_trading():
+    """刚安装/纯回测：没有实盘引擎时，交易时段也不拒 P2。"""
+    _use_clock(_at(10, 0), live_running=False)
+    p = g.evaluate_policy()
+    assert p["live_running"] is False
+    assert p["window"] == "no_live_engine"
+    assert p["p1_allowed"] is True and p["p2_allowed"] is True
+    assert p["next_p2_open_at"] is None
+    t0 = time.monotonic()
+    assert g.GATE.acquire(g.P2, timeout=1)
+    g.GATE.release()
+    assert time.monotonic() - t0 < 0.2
+
+
+def test_no_live_engine_opens_p1_in_protected_window():
+    _use_clock(_at(15, 0), live_running=False)
+    assert g.evaluate_policy()["protected"] is False
+    assert g.GATE.acquire(g.P1, timeout=1)
+    g.GATE.release()
+
+
+def test_live_engine_restores_time_windows():
+    """有实盘时回到原时段限制（10:00 拒 P2 / 15:00 拒 P1），文案指向实盘。"""
+    _use_clock(_at(10, 0), live_running=True)
+    assert g.evaluate_policy()["live_running"] is True
+    with pytest.raises(g.TdxTaskBlocked) as ei:
+        g.GATE.acquire(g.P2, timeout=1)
+    assert "实盘运行中" in str(ei.value)
+    _use_clock(_at(15, 0), live_running=True)
+    with pytest.raises(g.TdxTaskBlocked):
+        g.GATE.acquire(g.P1, timeout=1)
+
+
+def test_status_exposes_live_running():
+    _use_clock(_at(10, 0), live_running=False)
+    st = g.status()
+    assert st["policy"]["live_running"] is False
+    assert st["policy"]["p2_allowed"] is True
+
+
+def test_default_live_running_reads_engine_registry(monkeypatch):
+    """生产默认判据：进程级引擎注册表非空即视为有实盘。"""
+    from core.services import live_service
+
+    monkeypatch.setattr(live_service, "ENGINES", {})
+    g.reset_for_tests(config=dict(_BASE_CFG), clock=lambda: _at(10, 0),
+                      trading_day_fn=lambda d: d.weekday() < 5)
+    assert g.evaluate_policy()["live_running"] is False
+
+    monkeypatch.setattr(live_service, "ENGINES", {1: object()})
+    g.reset_for_tests(config=dict(_BASE_CFG), clock=lambda: _at(10, 0),
+                      trading_day_fn=lambda d: d.weekday() < 5)
+    assert g.evaluate_policy()["live_running"] is True

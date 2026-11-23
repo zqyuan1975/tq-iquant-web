@@ -4439,6 +4439,7 @@ def test_inject_startup_periods_compute_takes_channel_at_p0():
         config=dict(tq_gate.DEFAULT_GATE_CONFIG),
         clock=lambda: datetime(2026, 11, 23, 15, 0, tzinfo=timezone(timedelta(hours=8))),
         trading_day_fn=lambda d: True,
+        live_running_fn=lambda: True,
     )
     tq_gate.GATE.reset_state()
     try:

@@ -26,11 +26,13 @@ def _gated(monkeypatch):
     tz = timezone(timedelta(hours=8))
     g.reset_for_tests(config=dict(_BASE_CFG),
                       clock=lambda: datetime(2026, 11, 23, 10, 0, tzinfo=tz),
-                      trading_day_fn=lambda d: d.weekday() < 5)
+                      trading_day_fn=lambda d: d.weekday() < 5,
+                      live_running_fn=lambda: True)
     g.clear_override()
     yield
     g.clear_override()
-    g.reset_for_tests(config=None, clock=None, trading_day_fn=None)
+    g.reset_for_tests(config=None, clock=None, trading_day_fn=None,
+                      live_running_fn=None)
 
 
 def test_status_reports_trading_block(test_client):
@@ -51,3 +53,19 @@ def test_override_requires_confirm_and_reason(test_client):
                            json={"confirm": True}).json()
     assert res["code"] == 400
     assert g.override_info() is None
+
+
+def test_status_no_live_engine_does_not_block_p2(test_client):
+    """刚安装无实盘：状态接口不得报交易时段拦截（window=no_live_engine）。"""
+    from datetime import datetime, timedelta, timezone
+    tz = timezone(timedelta(hours=8))
+    g.reset_for_tests(config=dict(_BASE_CFG),
+                      clock=lambda: datetime(2026, 11, 23, 10, 0, tzinfo=tz),
+                      trading_day_fn=lambda d: d.weekday() < 5,
+                      live_running_fn=lambda: False)
+    res = test_client.get("/api/system/tdx-gate").json()
+    data = res["data"]
+    assert data["policy"]["live_running"] is False
+    assert data["policy"]["window"] == "no_live_engine"
+    assert data["policy"]["p2_allowed"] is True
+    assert data["policy"]["p1_allowed"] is True

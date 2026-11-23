@@ -19,6 +19,10 @@
   不再空转 30s）；盘前 08:00–09:10、午休 11:30–13:00、15:15 后至次日 08:00
   放开；非交易日全天放开。
 
+前提：以上时段限制**只在有实盘引擎运行时生效**（判据为进程级
+``live_service.ENGINES`` 非空）。刚安装/纯回测场景没有实盘在跑，P1/P2 不因
+时段被拒（``window=no_live_engine``），只保留配额与分片。
+
 时间窗全部来自 ``config.yaml`` 的 ``tq_gate`` 段（见 ``DEFAULT_GATE_CONFIG``），
 不在代码里硬编码。闸在进程内，改代码或放开/收紧默认值需重启 Core。
 """
@@ -121,7 +125,25 @@ _cfg_cache: Optional[Dict] = None
 _cfg_injected = False
 _clock: Optional[Callable[[], datetime]] = None
 _trading_day_fn: Optional[Callable[[date], bool]] = None
+_live_running_fn: Optional[Callable[[], bool]] = None
 _policy_cache: Optional[Tuple[str, Dict]] = None
+
+
+def _live_running() -> bool:
+    """当前进程是否存在运行中的实盘引擎。
+
+    时段限制只为「给实盘让路」而存在：没有实盘在跑时（如刚安装、纯回测使用），
+    P1/P2 不应因交易时段被拒。注册表是进程级 dict（``live_service.ENGINES``），
+    启动/停止会话会即时反映到下一次 ``evaluate_policy``（缓存键含该标记）。
+    无法判定时按「有实盘」处理（保守：维持时段限制，不放开重任务）。
+    """
+    if _live_running_fn is not None:
+        return _live_running_fn()
+    try:
+        from core.services import live_service
+        return bool(live_service.ENGINES)
+    except Exception:  # noqa: BLE001 — 导入/判定异常不放开闸
+        return True
 
 
 def gate_config(force_reload: bool = False) -> Dict:
@@ -156,13 +178,16 @@ def reset_for_tests(
     config: Optional[Dict] = None,
     clock: Optional[Callable[[], datetime]] = None,
     trading_day_fn: Optional[Callable[[date], bool]] = None,
+    live_running_fn: Optional[Callable[[], bool]] = None,
 ) -> None:
-    """测试注入：重置配置缓存/时钟/交易日判定（生产代码不调用）。"""
-    global _cfg_cache, _cfg_injected, _clock, _trading_day_fn, _policy_cache
+    """测试注入：重置配置缓存/时钟/交易日/实盘运行判定（生产代码不调用）。"""
+    global _cfg_cache, _cfg_injected, _clock, _trading_day_fn, _live_running_fn
+    global _policy_cache
     _cfg_cache = dict(config) if config is not None else None
     _cfg_injected = config is not None
     _clock = clock
     _trading_day_fn = trading_day_fn
+    _live_running_fn = live_running_fn
     _policy_cache = None
 
 
@@ -223,12 +248,14 @@ def evaluate_policy(now: Optional[datetime] = None) -> Dict:
     生产路径按分钟缓存（时段判定只到分钟）；注入时钟（测试）时不缓存。
     """
     global _policy_cache
-    if now is None and _clock is None:
-        key = now_shanghai().strftime("%Y%m%d%H%M")
+    if now is None:
+        now = now_shanghai()
+    live_running = _live_running()
+    if _clock is None:
+        key = now.strftime("%Y%m%d%H%M") + (":1" if live_running else ":0")
         if _policy_cache is not None and _policy_cache[0] == key:
             return _policy_cache[1]
     cfg = gate_config()
-    now = now or now_shanghai()
     trading_day = _trading_day(now.date())
     override = _override_active(now)
 
@@ -247,7 +274,16 @@ def evaluate_policy(now: Optional[datetime] = None) -> Dict:
         p2_open = False
     p1_open = not protected
 
-    if not trading_day:
+    if not live_running:
+        # 无实盘引擎：时段限制整体不生效（限制只为给实盘让路而存在），
+        # 仅保留配额与分片。避免「没实盘却禁回测/刷新」。
+        protected = False
+        p2_open = True
+        p1_open = True
+
+    if not live_running:
+        window = "no_live_engine"
+    elif not trading_day:
         window = "non_trading_day"
     elif protected:
         window = "p0_only"
@@ -268,17 +304,21 @@ def evaluate_policy(now: Optional[datetime] = None) -> Dict:
     policy = {
         "now": now.isoformat(timespec="seconds"),
         "trading_day": trading_day,
+        # 是否有运行中的实盘引擎：false 时 window=no_live_engine，P1/P2 全放行
+        "live_running": live_running,
         "window": window,
         "override": override,
         "protected": protected,
         "p1_allowed": p1_open,
         "p2_allowed": p2_open,
-        "p2_quota_active": p2_open and trading_day,
-        "p1_quota_active": trading_day and not p2_open,
+        # 配额与分片始终保留（即使无实盘/放开窗口）：保护 TQ 通道本身
+        "p2_quota_active": trading_day,
+        "p1_quota_active": trading_day,
         "next_p2_open_at": None if p2_open else _next_p2_open(now, cfg),
     }
     if _clock is None:
-        _policy_cache = (now.strftime("%Y%m%d%H%M"), policy)
+        _policy_cache = (now.strftime("%Y%m%d%H%M")
+                         + (":1" if live_running else ":0"), policy)
     return policy
 
 
@@ -487,7 +527,7 @@ class TdxChannelGate:
         if priority == P2 and not policy["p2_allowed"]:
             nxt = policy["next_p2_open_at"]
             raise TdxTaskBlocked(
-                "回测类后台任务在交易时段被 TQ 通道闸拒绝（实盘优先）；%s 后自动可用"
+                "实盘运行中，回测类后台任务被 TQ 通道闸拒绝；%s 后自动可用"
                 % (nxt.strftime("%m-%d %H:%M") if nxt else "收盘后"),
                 priority=priority, reason="trading_window",
                 window=policy["window"], next_available_at=nxt)
