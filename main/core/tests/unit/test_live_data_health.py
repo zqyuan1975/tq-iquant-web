@@ -369,3 +369,59 @@ def test_health_summary_text_branches():
     assert "无 bar 1 只" in text and "600519.SH" in text
     assert "补下载" in text
 
+
+# ---------------- N3：轮换抽样游标 ----------------
+
+def test_rotate_sample_covers_pool_over_rounds(tmp_path, monkeypatch):
+    monkeypatch.setattr(h, "_cursor_path", lambda: tmp_path / "cursor.json")
+    codes = [f"60000{i}.SH" for i in range(7)]
+
+    r1 = h.rotate_sample(codes, 3, key="s1")
+    r2 = h.rotate_sample(codes, 3, key="s1")
+    r3 = h.rotate_sample(codes, 3, key="s1")
+
+    assert r1["sample"] == codes[:3]
+    assert r2["sample"] == codes[3:6]
+    # 第三轮回绕：从 6 开始取 3 只，第 2 只回到 0
+    assert r3["sample"] == [codes[6], codes[0], codes[1]]
+    assert r3["wrapped"] is True
+
+
+def test_rotate_sample_limit_and_scope_unchanged(tmp_path, monkeypatch):
+    """单次上限不变；不同 key（会话）各自独立游标。"""
+    monkeypatch.setattr(h, "_cursor_path", lambda: tmp_path / "cursor.json")
+    codes = [f"S{i}" for i in range(5)]
+
+    a = h.rotate_sample(codes, 5, key="a")
+    b = h.rotate_sample(codes, 2, key="b")
+
+    assert a["sample"] == codes  # 全池一次取完
+    assert b["sample"] == codes[:2]
+    assert a["total"] == b["total"] == 5
+
+
+def test_rotate_sample_empty_and_zero_limit(tmp_path, monkeypatch):
+    monkeypatch.setattr(h, "_cursor_path", lambda: tmp_path / "cursor.json")
+
+    assert h.rotate_sample([], 10)["sample"] == []
+    assert h.rotate_sample(["A"], 0)["sample"] == []
+
+
+def test_check_data_health_rotates_sample_across_pool(tmp_path, monkeypatch):
+    """两轮体检拼接后可覆盖全池（不再永远只查前 30 只）。"""
+    monkeypatch.setattr(h, "_cursor_path", lambda: tmp_path / "cursor.json")
+    codes = [f"60000{i}.SH" for i in range(6)]
+    disp = _Disp({c: _bars(date(2026, 11, 18)) for c in codes})
+
+    first = h.check_data_health(disp, codes, ["1d"], now=_NOW_OFF, calendar=_CAL,
+                                max_codes=3, session_id=9)
+    second = h.check_data_health(disp, codes, ["1d"], now=_NOW_OFF, calendar=_CAL,
+                                 max_codes=3, session_id=9)
+
+    checked = {c for c, _p, _n in disp.calls}
+    assert checked == set(codes)
+    assert first["sample_rotation"]["start"] == 0
+    assert second["sample_rotation"]["start"] == 3
+    assert first["checked_codes"] == second["checked_codes"] == 3
+
+

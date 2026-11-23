@@ -17,9 +17,13 @@
 from __future__ import annotations
 
 import inspect
+import json
 import logging
+import os
+import threading
 import time as _time
 from datetime import date, datetime, time, timedelta
+from pathlib import Path
 from typing import Dict, List, Optional
 
 from core.engine.bar_poller import parse_bar_time
@@ -28,6 +32,67 @@ from core.engine.live.timing import now_shanghai
 logger = logging.getLogger(__name__)
 
 DATA_HEALTH_VERSION = "live_data_health_v1"
+
+#: 轮换抽样游标（N3，2026-11-23）：持久化到可写根目录 data/ 下，多轮覆盖全池。
+_CURSOR_LOCK = threading.Lock()
+
+
+def _cursor_path() -> Path:
+    override = str(os.environ.get("TQ_HEALTH_CURSOR_PATH") or "").strip()
+    if override:
+        return Path(override)
+    from core.config import app_root
+    return app_root() / "data" / "health_sample_cursor.json"
+
+
+def _read_cursors() -> dict:
+    try:
+        raw = _cursor_path().read_text(encoding="utf-8")
+        data = json.loads(raw or "{}")
+        return data if isinstance(data, dict) else {}
+    except Exception:  # noqa: BLE001 — 游标坏了按从头开始，不影响体检
+        return {}
+
+
+def _write_cursors(cursors: dict) -> None:
+    try:
+        path = _cursor_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(cursors, ensure_ascii=False), encoding="utf-8")
+        tmp.replace(path)
+    except Exception:  # noqa: BLE001 — 写游标失败只影响下一轮起点
+        logger.warning("写入体检抽样游标失败（忽略）", exc_info=True)
+
+
+def rotate_sample(codes: List[str], limit: int, *, key: str = "default") -> dict:
+    """按持久化游标轮换抽样（N3）。
+
+    - **单次上限不变**（``limit`` 只，取数与预算压力不增加）；
+    - 每轮从上次结束位置继续，多轮自然覆盖全池；
+    - 游标只存内存外的 JSON 文件，读失败从头开始。
+
+    返回 ``{sample, total, start, next, wrapped}``；``sample`` 保持传入顺序的
+    轮转切片（同池多轮拼接后即全池覆盖）。
+    """
+    ordered = list(dict.fromkeys(str(c) for c in (codes or []) if str(c)))
+    total = len(ordered)
+    limit = max(0, int(limit or 0))
+    if total == 0 or limit <= 0:
+        return {"sample": [], "total": total, "start": 0, "next": 0,
+                "wrapped": False}
+    with _CURSOR_LOCK:
+        cursors = _read_cursors()
+        start = int(cursors.get(key) or 0) % total
+        take = min(limit, total)
+        sample = [ordered[(start + i) % total] for i in range(take)]
+        nxt = (start + take) % total
+        wrapped = (start + take) > total
+        cursors[key] = nxt
+        _write_cursors(cursors)
+    return {"sample": sample, "total": total, "start": start,
+            "next": nxt, "wrapped": wrapped}
+
 
 # 「盘中」窗口（含盘前集合竞价）：此窗口内不做自动补齐，避免与实盘取数抢通道。
 _INTRADAY_START = time(9, 15)
@@ -239,10 +304,15 @@ def check_data_health(dispatcher, codes, periods, *, now: datetime = None,
     truncated = False
     truncated_reason: Optional[str] = None
     sample_limit = None
+    sample_rotation = None
     if max_codes is not None and max_codes > 0:
         sample_limit = int(max_codes)
         if len(codes) > sample_limit:
-            codes = codes[:sample_limit]
+            # N3：轮换抽样（游标持久化），单次上限/预算不变，多轮覆盖全池。
+            sample_rotation = rotate_sample(
+                codes, sample_limit,
+                key=f"data_health:{session_id or 'all'}")
+            codes = sample_rotation["sample"]
             truncated = True
             truncated_reason = "sample"
     deadline = None
@@ -415,6 +485,8 @@ def check_data_health(dispatcher, codes, periods, *, now: datetime = None,
         "truncated": truncated,
         "truncated_reason": truncated_reason,
         "sample_limit": sample_limit,
+        # N3：本轮抽样起点/下一轮起点（只增字段，多轮拼接可覆盖全池）
+        "sample_rotation": sample_rotation,
         "requested_codes": len(requested_codes),
         "checked_codes": len(checked_codes),
         "attempted_count": len(attempted_codes),
