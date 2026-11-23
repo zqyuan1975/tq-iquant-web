@@ -37,6 +37,9 @@ os.environ.setdefault("TQ_HANDOFF_ARCHIVE_DISABLED", "1")
 # 依赖墙上时钟（例如 14:55–15:10 保护窗口会把默认 P1 调用整体拒掉）。
 # 闸自身的用例走 reset_for_tests 注入配置，不受此开关影响。
 os.environ.setdefault("TQ_GATE_FORCE_ALLOW", "1")
+# N4（2026-11-23）：lifespan 会把仓库根 data/ 的 runtime 文件迁到 main/data。
+# 测试进程绝不动真实文件（需要验证迁移的用例显式传 old_dir/new_dir）。
+os.environ.setdefault("TQ_DATA_DIR_MIGRATION_DISABLED", "1")
 
 import pytest
 from sqlalchemy import create_engine

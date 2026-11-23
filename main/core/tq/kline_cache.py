@@ -77,6 +77,10 @@ class KlineCache:
         if not isinstance(section, dict) or not bool(section.get("enabled", False)):
             return None
         base_dir = str(section.get("dir") or "data/kline_cache")
+        # 相对目录统一锚到运行期数据目录（源码=main/data，打包=app_root/data），
+        # 不再依赖进程 cwd（否则从不同目录启动会分裂出多份缓存）。
+        from core.runtime import data_path
+        base_dir = str(data_path(base_dir))
         try:
             ttl = float(section.get("today_ttl_seconds", 300))
         except (TypeError, ValueError):

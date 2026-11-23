@@ -105,25 +105,32 @@ _LOCK = threading.Lock()
 # 路径与开关
 # ---------------------------------------------------------------------------
 
-def _repo_data_dir() -> Path:
-    """返回主库所在目录（``main/data``），与 ``core.db._db_path`` 保持一致。"""
-    try:
-        from core.db import _db_path
+def _app_base_dir() -> Path:
+    """相对路径的锚定目录，与 ``core.db._db_path`` 的 ``sqlite_path`` 规则一致。
 
-        return Path(_db_path()).parent
+    非打包态锚到 ``main/``（``core/db.py`` 所在工程根）；打包态锚到
+    ``app_root()``，避免安装目录只读时落错位置。台账路径**不能**锚到
+    ``_db_path().parent``，否则配置里的 ``data/...`` 会被再拼一层 ``data``。
+    """
+    try:
+        from core.db import _MAIN_DIR, app_root, use_app_root
+
+        return app_root() if use_app_root() else Path(_MAIN_DIR)
     except Exception:  # pragma: no cover - 仅在异常环境降级
-        return Path(__file__).resolve().parent.parent.parent / "data"
+        return Path(__file__).resolve().parent.parent.parent
 
 
 def ledger_path() -> Path:
-    """台账库路径。
+    """台账库路径（唯一解析入口）。
 
     优先级：``TQ_KLINE_LEDGER_PATH`` 环境变量 > 配置
-    ``backtest.kline_ledger.path`` > 主库目录下 ``kline_ledger.sqlite3``。
-    相对路径统一相对主库目录解析，避免打包后落到错误工作目录。
+    ``backtest.kline_ledger.path`` > ``<app_base>/data/kline_ledger.sqlite3``。
+    相对路径统一相对应用根目录（``main/`` 或打包 ``app_root()``）解析，与
+    ``core.db._db_path`` 对 ``sqlite_path`` 的规则完全一致，避免出现
+    ``data/data/kline_ledger.sqlite3``。
     """
     env = os.environ.get("TQ_KLINE_LEDGER_PATH")
-    base = _repo_data_dir()
+    base = _app_base_dir()
     if env:
         p = Path(env)
         return p if p.is_absolute() else base / p
@@ -139,7 +146,7 @@ def ledger_path() -> Path:
     if configured:
         p = Path(configured)
         return p if p.is_absolute() else base / p
-    return base / LEDGER_FILE_NAME
+    return base / "data" / LEDGER_FILE_NAME
 
 
 def is_enabled(cfg: Optional[dict] = None) -> bool:

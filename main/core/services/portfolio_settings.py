@@ -18,8 +18,7 @@ from typing import Dict, Optional
 
 from core.engine.industry_gate import INDUSTRY_MODES
 
-# main/data/portfolio_settings.json（main/core/services → parents[2] == main）
-_DEFAULT_PATH = Path(__file__).resolve().parents[2] / "data" / "portfolio_settings.json"
+# 统一运行期数据目录（源码=main/data，打包=app_root/data），见 core.runtime.data_dir
 _LOCK = threading.Lock()
 VALID_MODES = ("cap", "distribute")
 
@@ -44,8 +43,13 @@ INDUSTRY_DEFAULTS: Dict[str, object] = {
 }
 
 
+def _default_path() -> Path:
+    from core.runtime import data_path
+    return data_path("portfolio_settings.json")
+
+
 def _path(path: Optional[os.PathLike | str] = None) -> Path:
-    return Path(path) if path is not None else _DEFAULT_PATH
+    return Path(path) if path is not None else _default_path()
 
 
 def _read(path: Optional[os.PathLike | str] = None) -> Dict[str, dict]:

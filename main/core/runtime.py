@@ -28,7 +28,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional, Tuple
 
-from core.config import app_root
+from core.config import app_root, use_app_root
 from core.version import APP_VERSION
 
 logger = logging.getLogger(__name__)
@@ -45,11 +45,104 @@ _STARTED_MONOTONIC = time.monotonic()
 _BOUND_PORT: Optional[int] = None
 _SERVING = False
 
+#: 源码模式下运行期数据锚点（本文件位于 main/core/runtime.py → main/）。
+#: 与 core.db 的 ``_MAIN_DIR`` 同义：DB 在 ``main/data/dev.db``，runtime 文件
+#: 也统一落 ``main/data``，不再按仓库根 ``data/`` 各自推算。
+_MAIN_DIR = Path(__file__).resolve().parent.parent
 
-# ---------------------------------------------------------------- 路径
+# ---------------------------------------------------------------- 数据目录
+def data_dir() -> Path:
+    """统一运行期数据目录（自动创建）。
+
+    - 打包版 / 显式 ``TQ_APP_ROOT``：``app_root()/data``（锚安装目录）；
+    - 纯源码运行：``main/data``（与 DB 默认位置同目录）。
+
+    所有 runtime 文件（体检游标、server.json、组合设置、K 线缓存等）都必须
+    经此函数或 :func:`data_path` 解析，禁止再各自 ``app_root()/data`` 或按
+    cwd 拼相对路径。
+    """
+    base = app_root() if use_app_root() else _MAIN_DIR
+    path = base / "data"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def legacy_data_dir() -> Path:
+    """旧版 runtime 文件所在目录（``app_root()/data``）。
+
+    源码模式下 ``app_root()`` 是仓库根，与 :func:`data_dir`（``main/data``）
+    不同；打包/TQ_APP_ROOT 模式下两者相同。
+    """
+    return app_root() / "data"
+
+
+def data_path(rel: str | os.PathLike) -> Path:
+    """把相对 ``data/...`` 路径锚定到统一数据目录。
+
+    绝对路径原样返回；相对路径若以 ``data/`` 开头则去掉前缀后拼到
+    :func:`data_dir`，否则直接下挂到 :func:`data_dir`。这是 runtime 文件的
+    **唯一**路径解析入口。
+    """
+    p = Path(rel)
+    if p.is_absolute():
+        return p
+    parts = p.parts
+    if parts and parts[0] == "data":
+        tail = parts[1:]
+        return data_dir().joinpath(*tail) if tail else data_dir()
+    return data_dir() / p
+
+
+#: 需要从旧目录一次性迁移到 :func:`data_dir` 的持久 runtime 文件。
+#: 锁文件（*.lock）、server.json、K 线缓存、THS 交接目录属易失/外部状态，
+#: 不迁移（重启后自然在新位置重建；THS 交接目录由外部客户端持有，强迁会断供）。
+MIGRATABLE_RUNTIME_FILES = ("health_sample_cursor.json",)
+
+
+def migrate_legacy_data_files(old_dir=None, new_dir=None) -> list[dict]:
+    """源码模式一次性迁移：旧 ``data/`` → 统一 ``data_dir``。
+
+    - 打包/``TQ_APP_ROOT`` 模式两目录相同，直接返回空；
+    - 新位置不存在则复制；已存在则不覆盖（可能是当前进程刚写的）；
+    - 旧文件统一改名为 ``<name>.pre-migrate-<时间戳>.bak`` 留档，避免重复迁移；
+    - 失败只告警，不阻断启动。``TQ_DATA_DIR_MIGRATION_DISABLED=1`` 可关闭。
+    """
+    if os.environ.get("TQ_DATA_DIR_MIGRATION_DISABLED") == "1":
+        return []
+    old = Path(old_dir) if old_dir is not None else legacy_data_dir()
+    new = Path(new_dir) if new_dir is not None else data_dir()
+    results: list[dict] = []
+    if old.resolve() == new.resolve():
+        return results
+    stamp = datetime.now().strftime("%Y%m%d%H%M%S")
+    for name in MIGRATABLE_RUNTIME_FILES:
+        src = old / name
+        if not src.is_file():
+            continue
+        dst = new / name
+        if dst.exists():
+            action = "kept_new"
+        else:
+            new.mkdir(parents=True, exist_ok=True)
+            dst.write_bytes(src.read_bytes())
+            action = "copied"
+        bak = src.with_name(f"{name}.pre-migrate-{stamp}.bak")
+        try:
+            src.replace(bak)
+        except OSError:
+            action += "+backup_failed"
+        results.append({"name": name, "action": action,
+                        "src": str(src), "dst": str(dst),
+                        "backup": str(bak)})
+        logger.warning("runtime 数据目录迁移：%s %s → %s（备份 %s）",
+                       action, src, dst, bak)
+    return results
+
+
+# ---------------------------------------------------------------- 运行期路径
 def runtime_dir() -> Path:
-    """``<app_root>/data/runtime``（自动创建）。"""
-    path = app_root() / "data" / "runtime"
+    """``<data_dir>/runtime``（自动创建）。"""
+    path = data_dir() / "runtime"
     path.mkdir(parents=True, exist_ok=True)
     return path
 

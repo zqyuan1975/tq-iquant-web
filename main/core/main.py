@@ -50,6 +50,19 @@ async def lifespan(app: FastAPI):
     # 打包版端口动态（8888~8898），自愈父进程与第二次双击都靠它找到本实例。
     runtime.mark_serving(runtime.resolve_bound_port())
     init_db()
+    # 源码模式运行期数据目录统一（一次性）：旧仓库根 data/ 下的体检游标等
+    # 持久 runtime 文件迁到 main/data（与 DB 同目录），原文件留 .bak。打包/
+    # TQ_APP_ROOT 模式新旧同目录，自动 no-op。失败只告警，不阻断启动。
+    if os.environ.get("TQ_DATA_DIR_MIGRATION_DISABLED") == "1":
+        logger.info("runtime 数据目录迁移已禁用（TQ_DATA_DIR_MIGRATION_DISABLED=1）")
+    else:
+        try:
+            moved = runtime.migrate_legacy_data_files()
+            if moved:
+                logger.warning("runtime 数据目录迁移完成：%s", moved)
+        except Exception:  # noqa: BLE001 — 迁移失败不得阻断启动
+            logger.warning("runtime 数据目录迁移失败（忽略，不影响启动）",
+                           exc_info=True)
     # L5：启动版本校验（默认关闭）。只读比对 alembic_version 与代码 head，
     # 不执行任何迁移；开关关闭时无日志、零副作用。
     try:

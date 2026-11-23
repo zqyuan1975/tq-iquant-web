@@ -8,7 +8,9 @@
 - 通达信源的头尾缺口不得判为 source_empty（只有内部缺口才算停牌）；
 - 台账查询/状态入口可用。
 """
+import os
 from datetime import date
+from pathlib import Path
 
 import pandas as pd
 
@@ -30,6 +32,28 @@ def _record(db, src, ranges):
         "600000.SH", "1d", ledger.FIELD_ALL, ranges,
         db_path=db, source_path=src,
     )
+
+
+def test_ledger_path_resolves_single_data_dir(monkeypatch):
+    """锁死路径解析：配置 ``data/kline_ledger.sqlite3`` 只能出现一层 data。
+
+    回归背景：此前相对路径锚到主库所在目录（main/data），再拼配置里的
+    ``data/...``，得到 ``main/data/data/kline_ledger.sqlite3``。
+    """
+    from core.db import _MAIN_DIR
+
+    monkeypatch.delenv("TQ_KLINE_LEDGER_PATH", raising=False)
+    monkeypatch.setattr("core.db.use_app_root", lambda: False)
+    monkeypatch.setattr(
+        "core.config.load_config",
+        lambda *args, **kwargs: {
+            "backtest": {"kline_ledger": {"path": "data/kline_ledger.sqlite3"}}
+        },
+    )
+
+    resolved = ledger.ledger_path()
+    assert resolved == Path(_MAIN_DIR) / "data" / "kline_ledger.sqlite3"
+    assert f"data{os.sep}data" not in str(resolved)
 
 
 def test_stamp_mismatch_invalidates_whole_record(tmp_path):
