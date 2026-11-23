@@ -6,4 +6,4 @@
 （tests 无强校验，升级版本时两处同步改）。
 """
 
-APP_VERSION = "1.0.6"
+APP_VERSION = "1.0.7"

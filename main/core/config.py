@@ -1,3 +1,6 @@
+import copy
+import datetime
+import logging
 import os
 import sys
 import threading
@@ -6,6 +9,8 @@ from typing import Optional
 from urllib.parse import urlparse
 
 import yaml
+
+logger = logging.getLogger(__name__)
 
 #: QMT 桥现网端口（股票账户）：config.yaml 与 packaging/config.template.yaml
 #: 的 simulation / live 两条腿均指向 8790；8791 为信用账户腿（不使用）。
@@ -92,12 +97,8 @@ def _default_config_path() -> Path:
     return Path(__file__).resolve().parent.parent.parent / "config.yaml"
 
 
-def ensure_config() -> Path:
-    """首次启动生成 config.yaml（从打包附带的模板复制，模板只读不覆盖用户配置）。"""
-    path = _default_config_path()
-    if path.exists():
-        return path
-    template = None
+def _template_candidates():
+    """配置模板候选路径：打包版优先 exe 同级，其次是仓库根/打包目录。"""
     candidates = []
     if is_frozen_app():
         candidates.append(_install_dir() / "config.template.yaml")
@@ -105,10 +106,82 @@ def ensure_config() -> Path:
     candidates.append(
         Path(__file__).resolve().parent.parent.parent / "packaging" / "config.template.yaml"
     )
-    for c in candidates:
+    return candidates
+
+
+def _first_template() -> Optional[Path]:
+    for c in _template_candidates():
         if c.exists():
-            template = c
-            break
+            return c
+    return None
+
+
+def _fill_missing(target: dict, source: dict, prefix: str = "") -> list:
+    """把 source 中存在、target 中缺失的键补进 target（只增不改，递归处理嵌套 dict）。"""
+    added = []
+    for key, value in source.items():
+        path = f"{prefix}{key}"
+        if key not in target:
+            target[key] = copy.deepcopy(value)
+            added.append(path)
+        elif isinstance(value, dict) and isinstance(target.get(key), dict):
+            added.extend(_fill_missing(target[key], value, f"{path}."))
+    return added
+
+
+def migrate_config_file(path: Path) -> list:
+    """打包版启动时补齐既有 config.yaml 中模板新增的键。
+
+    背景：封装版模板按「能力/入口全开」渲染，而旧版 config.yaml 缺这些键时，
+    ``load_config`` 的 deep-merge 会回落到代码默认值（多为关闭）。这里在启动时
+    只把「模板有、用户配置没有」的键补进去，用户已显式写入的值一律不动。
+    写前把原文件备份到 ``data/backups/config.yaml.bak-<时间戳>``，便于回退。
+    返回补齐的键路径列表；无变更返回空列表。
+    """
+    template_path = _first_template()
+    if template_path is None or not path.exists():
+        return []
+    with open(template_path, "r", encoding="utf-8") as f:
+        template = yaml.safe_load(f) or {}
+    with open(path, "r", encoding="utf-8") as f:
+        current = yaml.safe_load(f) or {}
+    if not isinstance(template, dict) or not isinstance(current, dict):
+        return []
+
+    added = _fill_missing(current, template)
+    if not added:
+        return []
+
+    backup_dir = app_root() / "data" / "backups"
+    try:
+        backup_dir.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
+        backup = backup_dir / f"config.yaml.bak-{stamp}"
+        backup.write_text(path.read_text(encoding="utf-8"), encoding="utf-8")
+        logger.info("配置迁移：原文件已备份到 %s", backup)
+    except OSError:
+        logger.warning("配置迁移：备份原 config.yaml 失败，仍继续补齐缺失键", exc_info=True)
+
+    save_config(current, str(path))
+    logger.info("配置迁移：已补齐 %d 个新增配置键（%s）", len(added), ", ".join(added[:20]))
+    return added
+
+
+def ensure_config() -> Path:
+    """首次启动生成 config.yaml（从打包附带的模板复制，模板只读不覆盖用户配置）。
+
+    打包版每次启动还会执行一次「只增不改」的配置迁移：把新版模板中新增的键
+    补进既有 config.yaml（用户已写值不动），保证升级后新功能开关可用。
+    """
+    path = _default_config_path()
+    if path.exists():
+        if is_frozen_app():
+            try:
+                migrate_config_file(path)
+            except Exception:  # noqa: BLE001 — 迁移失败不得阻断启动，仅记录
+                logger.warning("配置迁移失败，按原配置继续启动", exc_info=True)
+        return path
+    template = _first_template()
     path.parent.mkdir(parents=True, exist_ok=True)
     with _CONFIG_WRITE_LOCK:
         if template is not None:
@@ -119,6 +192,7 @@ def ensure_config() -> Path:
                 encoding="utf-8",
             )
     return path
+
 
 
 def get_config_path() -> Path:

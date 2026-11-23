@@ -17,6 +17,7 @@
 """
 import argparse
 import datetime
+import hashlib
 import json
 import os
 import re
@@ -45,11 +46,119 @@ def read_version() -> str:
     text = VERSION_FILE.read_text(encoding="utf-8-sig")
     match = re.search(r'#define\s+AppVersion\s+"([^"]+)"', text)
     if not match:
-        sys.exit(f"无法从 {VERSION_FILE} 解析 AppVersion（期望格式：#define AppVersion \"1.0.6\"）")
+        sys.exit(f"无法从 {VERSION_FILE} 解析 AppVersion（期望格式：#define AppVersion \"1.0.7\"）")
     return match.group(1)
 
 
 VERSION = read_version()
+
+#: 封装版功能开关：能力/观测/入口类默认开启；执行类（真实委托、资金动作、
+#: 破坏性恢复）与依赖凭据的通道保持源码安全默认，避免封装改变实盘语义。
+#: 键为 config.yaml 的路径（嵌套 dict 用元组表示）。
+PACKAGED_FEATURE_OVERRIDES = {
+    ("capital_pool", "enabled"): True,
+    ("capital_pool", "pairing_enabled"): True,
+    ("capital_pool", "loan_model_enabled"): True,
+    ("capital_pool", "cash_outlet_enabled"): True,
+    ("backtest", "kline_cache", "enabled"): True,
+    ("backtest", "kline_ledger", "enabled"): True,
+    ("live", "cross_check", "enabled"): True,
+    ("tq_trade", "reconciliation_ledger_enabled"): True,
+    ("health", "business_probe_enabled"): True,
+    ("logging", "daily_rotate"): True,
+}
+
+
+def _get_path(data, path):
+    cur = data
+    for key in path:
+        if not isinstance(cur, dict) or key not in cur:
+            return None
+        cur = cur[key]
+    return cur
+
+
+def render_packaged_template(text: str) -> str:
+    """把源码安全默认的模板渲染成封装版模板：只改 PACKAGED_FEATURE_OVERRIDES
+    命中的布尔行，保留全部注释与其它键值。"""
+    stack = []
+    out = []
+    for line in text.splitlines():
+        m = re.match(r"^(\s*)([A-Za-z0-9_\-]+):\s*(.*?)\s*$", line)
+        if m and not line.lstrip().startswith("#"):
+            indent = len(m.group(1))
+            key = m.group(2)
+            while stack and stack[-1][0] >= indent:
+                stack.pop()
+            stack.append((indent, key))
+            path = tuple(k for _, k in stack)
+            value = m.group(3)
+            if path in PACKAGED_FEATURE_OVERRIDES and value in ("true", "false"):
+                line = "%s%s: %s" % (
+                    m.group(1), key,
+                    "true" if PACKAGED_FEATURE_OVERRIDES[path] else "false",
+                )
+        out.append(line)
+    return "\n".join(out) + ("\n" if text.endswith("\n") else "")
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def assert_distribution(dist_dir: Path):
+    """出包断言：前端入口一致、无用户数据、版本档案一致、封装开关已开启。"""
+    print("\n=== 出包断言 ===")
+
+    index = dist_dir / "_internal" / "web" / "dist" / "index.html"
+    if not index.exists():
+        sys.exit("出包断言失败：包内缺少前端入口 _internal/web/dist/index.html")
+    src_hash = sha256_file(WEB_DIST / "index.html")
+    dist_hash = sha256_file(index)
+    if src_hash != dist_hash:
+        sys.exit(
+            "出包断言失败：包内 index.html 与 web/dist 不一致（dist=%s，web=%s）"
+            % (dist_hash, src_hash)
+        )
+    print(f"  前端入口 index.html sha256={dist_hash}（与 web/dist 一致）")
+
+    for rel in ("data/dev.db", "config.yaml"):
+        if (dist_dir / rel).exists():
+            sys.exit(f"出包断言失败：分发目录包含用户数据 {rel}，不得打进安装包")
+    print("  用户数据检查通过（无 dev.db / config.yaml）")
+
+    info_path = dist_dir / "build-info.json"
+    if not info_path.exists():
+        sys.exit("出包断言失败：缺少 build-info.json")
+    info = json.loads(info_path.read_text(encoding="utf-8"))
+    if info.get("app_version") != VERSION:
+        sys.exit(
+            "出包断言失败：build-info app_version=%s，期望 %s"
+            % (info.get("app_version"), VERSION)
+        )
+    if info.get("git_dirty") is not False:
+        sys.exit("出包断言失败：build-info 记录 git_dirty=%s，产物来自脏工作区"
+                 % info.get("git_dirty"))
+    print(f"  build-info：{info.get('app_version')} / {info.get('git_commit')} / dirty=False")
+
+    template_path = dist_dir / "config.template.yaml"
+    if not template_path.exists():
+        sys.exit("出包断言失败：缺少 config.template.yaml")
+    import yaml
+    template = yaml.safe_load(template_path.read_text(encoding="utf-8")) or {}
+    wrong = []
+    for path, expected in PACKAGED_FEATURE_OVERRIDES.items():
+        actual = _get_path(template, path)
+        if actual is not expected:
+            wrong.append("%s=%r(期望 %r)" % (".".join(path), actual, expected))
+    if wrong:
+        sys.exit("出包断言失败：封装版模板开关未按约定开启：\n  " + "\n  ".join(wrong))
+    print(f"  封装版功能开关：{len(PACKAGED_FEATURE_OVERRIDES)} 项已开启")
+
 
 
 def run(cmd, cwd=None, env=None):
@@ -182,8 +291,10 @@ def copy_assets(dist_dir: Path):
         print("  WARNING: 未找到 echarts.min.js，离线报告导出将失败")
 
     if CONFIG_TEMPLATE.exists():
-        shutil.copy2(CONFIG_TEMPLATE, dist_dir / "config.template.yaml")
-        print("  config.template.yaml（首次启动生成用户 config.yaml）")
+        # 源码模板保持安全默认；封装版按「能力/入口全开」渲染后随包分发。
+        rendered = render_packaged_template(CONFIG_TEMPLATE.read_text(encoding="utf-8"))
+        (dist_dir / "config.template.yaml").write_text(rendered, encoding="utf-8")
+        print(f"  config.template.yaml（封装版功能开关已开启：{len(PACKAGED_FEATURE_OVERRIDES)} 项）")
 
     alembic_src = ROOT / "alembic"
     if not alembic_src.exists():
@@ -333,6 +444,11 @@ def write_build_info(dist_dir: Path, mode: str):
             if prev.get(key) is not None:
                 info[key] = prev[key]
         info["frontend_patch_time"] = now
+    else:
+        # 记录本次封装开启的功能开关，装到目标机后可直接核对
+        info["packaged_features"] = {
+            ".".join(path): bool(value) for path, value in PACKAGED_FEATURE_OVERRIDES.items()
+        }
     (dist_dir / "build-info.json").write_text(
         json.dumps(info, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
     )
@@ -405,6 +521,7 @@ def main():
 
     copy_assets(DIST_OUT)
     write_build_info(DIST_OUT, mode)
+    assert_distribution(DIST_OUT)
 
     size_mb = sum(f.stat().st_size for f in DIST_OUT.rglob("*") if f.is_file()) / 1024 / 1024
     print(f"\n=== 完成：{DIST_OUT}（{size_mb:.1f} MB） ===")

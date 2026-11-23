@@ -1,70 +1,65 @@
-﻿# 创懿基金量化投资平台 —— 首次启动配置模板
+# 创懿基金量化投资平台 —— 首次启动配置模板
 # 安装后首次运行会复制为 <数据根目录>\config.yaml，之后所有修改以该文件为准，
 # 本模板不会被覆盖。界面「系统设置」里也能改这些项。
-database:
-  sqlite_path: data/dev.db
-iquant_bridge:
-  # QMT 通道（股票账户，端口 8790）：simulation 与 live 两个模式位都指向 8790，
-  # 不使用信用账户腿（8791）
-  simulation:
-    base_url: http://127.0.0.1:8790
-  live:
-    base_url: http://127.0.0.1:8790
-goldminer:
-  base_url: http://127.0.0.1:7801
-  # 掘金终端「策略」里生成的 token 与账户 ID（留空则在界面里填写）
-  token: ''
-  account_id: ''
-  # 桥请求超时（秒）：须 ≥30s 且 < 主循环 60s；默认 45s（30s 贴着实测上界，易误超时）。
-  request_timeout_seconds: 45
-  slow_response_seconds: 15
-  slow_warn_interval_seconds: 300
+#
+# 本文件与 main/core/config.py 的 _defaults() 对齐：缺键时运行时取代码默认值，
+# 但模板显式列全所有键，便于用户查看/修改，也避免升级后新旧配置口径不一致。
+# 注意：封装版出包时会按「能力/入口全开、执行类安全默认」再渲染一份模板
+# （见 main/build_package.py 的 PACKAGED_FEATURE_OVERRIDES），本文件保持源码安全默认。
+
+tdx_path: ''
 # QMT/iQuant 客户端安装路径（留空则在界面里选择）
 iquant_path: ''
 max_concurrent_backtest: 1
 # 通达信 TQ 全局锁获取超时（秒），默认 30；<=0 退回旧行为（无限等待）。
 # 通达信卡住时拿不到锁的调用方会超时跳过本轮，避免整条实盘主循环被拖死。
 tq_lock_timeout_seconds: 30
-# 通达信安装路径（含 PYPlugins 目录，TQ 模块从这里加载 tqcenter.py）
-tdx_path: ''
-ths_ui:
-  captcha_ocr: true
-  # 同花顺下单程序 xiadan.exe 的完整路径（留空则在界面里选择）
-  client_exe_path: ''
-  driver: clipboard
+
+# TQ 通道闸：实盘(P0)/实盘辅助(P1)/后台重任务(P2) 分级 + 交易时段策略。
+tq_gate:
+  enabled: true
+  pre_market_p2: ["08:00", "09:10"]
+  lunch_p2: ["11:30", "13:00"]
+  after_close_p2: ["15:15", "24:00"]
+  trading: [["09:10", "11:30"], ["13:00", "15:10"]]
+  p0_only: ["14:55", "15:10"]
+  p1_max_per_minute: 600
+  p2_max_per_minute: 600
+  p2_chunk_size: 60
+  override_max_minutes: 120
+
+database:
+  sqlite_path: data/dev.db
+
+# 日志：daily_rotate=true 按日切割，backup_count 为保留份数（需重启进程生效）。
+logging:
+  daily_rotate: false
+  backup_count: 14
+
+# 内嵌数据备份：每日 daily_at（Asia/Shanghai）自动备份当前库，只保留最近 keep 份。
+# restore_enabled（默认 false）为破坏性恢复入口，需前端显式确认。
+backup:
+  enabled: true
+  daily_at: "15:10"
+  keep: 10
+  min_free_mb: 500
+  dir: data/backup
+  restore_enabled: false
+
+# 升级校验（默认关闭）：enabled=true 时启动校验版本并支持升级前备份。
+upgrade:
   enabled: false
-  execute_interval_seconds: 5
-  execute_mode: file_builtin
-  price_mode: latest
-  window_title: 网上股票交易系统5.0
-  work_dir: data/ths
-live:
-  heartbeat_timeout_seconds: 90
-  execution_stall_seconds: 180
-  bridge_timeout_seconds: 90
-  market_data_stall_seconds: 180
-  # 行情轮询窗口（Asia/Shanghai，左闭右开）：窗口外停 BarPoller 行情拉取。
-  quote_polling:
-    enabled: true
-    resume_time: "09:15"
-    pause_time: "15:05"
-tq_trade:
-  account: ''
-  account_type: stock
-  auto_confirm_dialog: true
-  cancel_unfilled_minutes: 3
-  client_path: ''
-  price_mode: my
-  # 外部信号文件（通达信条件预警输出）轮询间隔，秒。仅会话 signal_file_path
-  # 非空时生效；默认 5s，实际夹在 1~60s。信号最坏延迟 ≈ 本间隔 + 单次注入。
-  external_signal_poll_interval_seconds: 5
-  # 同代码 + 同日 + 同方向是否只认第一条预警：true（默认，保持既有语义）。
-  # 改 false 会让同方向每次预警都注入（重复加仓/重复卖出），仅特殊场景打开。
-  external_signal_daily_dedup: true
-# 告警外发（飞书自定义机器人 Webhook）：默认关闭，不填 webhook_url 等于关闭。
-# 只做「熔断/通道离线/账不平/子单丢失/订单未确认/增量回测失败」等既有事件旁路
-# 再发一条，不参与任何交易闸门、不改落库；发送在后台线程、超时 5 秒，失败只写
-# 日志。webhook_url 属敏感信息：只写在本机 config.yaml（该文件不入 git）。
+  require_backup: true
+  max_backup_age_hours: 24
+
+# 业务心跳探针（默认关闭）：开启后 /health 附加 business，supervisor 按业务心跳判活。
+health:
+  business_probe_enabled: false
+  business_stall_seconds: 180
+  business_grace_seconds: 120
+
+# 告警外发（飞书自定义机器人 Webhook）：不填 webhook_url 等于关闭。
+# 只做既有事件旁路再发一条，不参与交易闸门、不改落库。
 notify:
   enabled: false
   channel: feishu
@@ -75,5 +70,166 @@ notify:
   min_level: warn
   # 同类事件静默期（秒），去重键 =（闸门, 代码, 交易日）
   silence_seconds: 300
-  # HTTP 超时（秒），实际强制夹在 1~5 秒
   timeout_seconds: 5
+  wecom:
+    webhook_url: ''
+  email:
+    smtp_host: ''
+    smtp_port: 465
+    username: ''
+    password: ''
+    from: ''
+    to: []
+    use_ssl: true
+  sound:
+    enabled: false
+    path: ''
+
+# QMT 桥（股票账户，端口 8790）：simulation 与 live 两个模式位都指向 8790，
+# 不使用信用账户腿（8791）。
+iquant_bridge:
+  simulation:
+    base_url: http://127.0.0.1:8790
+  live:
+    base_url: http://127.0.0.1:8790
+  request_timeout_seconds: 15
+  slow_response_seconds: 5
+  slow_warn_interval_seconds: 300
+  # opponent（默认对手价）/ limit / market_best5
+  price_type: opponent
+
+goldminer:
+  base_url: http://127.0.0.1:7801
+  # 掘金终端「策略」里生成的 token 与账户 ID（留空则在界面里填写）
+  token: ''
+  account_id: ''
+  # 桥请求超时（秒）：须 ≥30s 且 < 主循环 60s；默认 45s（30s 贴着实测上界，易误超时）。
+  request_timeout_seconds: 45
+  slow_response_seconds: 15
+  slow_warn_interval_seconds: 300
+
+ths_ui:
+  enabled: false
+  captcha_ocr: true
+  # 同花顺下单程序 xiadan.exe 的完整路径（留空则在界面里选择）
+  client_exe_path: ''
+  driver: clipboard
+  execute_interval_seconds: 5
+  execute_mode: file_builtin
+  price_mode: latest
+  window_title: 网上股票交易系统5.0
+  work_dir: data/ths
+
+live:
+  heartbeat_timeout_seconds: 90
+  execution_stall_seconds: 180
+  bridge_timeout_seconds: 90
+  market_data_stall_seconds: 180
+  # 信号判定维度：period_close（默认，周期末根确认）/ dynamic（仅 1w/1mon，只预警不下单）
+  period_signal_mode: period_close
+  # 决策事件自动归档天数（高危门类不自动归档）；<=0 关闭。
+  decision_archive_days: 7
+  bridge_read_timeout_seconds: 15
+  bridge_connect_timeout_seconds: 3
+  # 成交价相对审批价的偏离告警阈值（%）；<=0 关闭监控。
+  fill_price_deviation_pct: 1.0
+  # 行情轮询窗口（Asia/Shanghai，左闭右开）：窗口外停 BarPoller 行情拉取。
+  quote_polling:
+    enabled: true
+    resume_time: "09:15"
+    pause_time: "15:05"
+  # 行情取数降级链（默认关闭）。
+  quote_fallback:
+    enabled: false
+    chain: ["tq", "iquant", "goldminer"]
+  # 原生分钟数据源（默认关闭；关闭时走快照合成，行为与接入前一致）。
+  native_minute:
+    enabled: false
+    stall_timeout_seconds: 180
+  # 收盘后抽样交叉校验（默认关闭，只观测不影响交易判定）。
+  cross_check:
+    enabled: false
+    sample_size: 5
+    max_dev_pct: 1.0
+
+tq_trade:
+  account: ''
+  account_type: stock
+  auto_confirm_dialog: true
+  cancel_unfilled_minutes: 3
+  client_path: ''
+  price_mode: my
+  # 新建实盘会话未显式选引擎时的默认交易引擎
+  default_engine: tdx
+  # 次日盘前（集合竞价）执行日线级信号单
+  pre_open_auction_enabled: true
+  pre_open_auction_end_time: "09:20"
+  pre_open_auction_price_bias_pct: 2.0
+  # 顺延单积压告警（0=关闭）
+  deferred_backlog_warn_count: 0
+  deferred_backlog_warn_days: 0
+  # 卖出范围口径：platform_only（默认）只卖平台自建仓；full 卖整仓
+  live_sell_scope: platform_only
+  intraday_mismatched_risk_enabled: false
+  deferred_release_ensure_fill: false
+  keyboard_conflict_hard_block: false
+  params_drift_block: false
+  # 对账差异台账（默认关闭；关闭时只发既有告警/事件）
+  reconciliation_ledger_enabled: false
+  # 审批队列：卖单默认豁免审批（仅 execution_mode=manual 有意义）
+  approval_exempt_sells: true
+  # 人工单单笔金额上限（<=0 不限）与同名操作防连点间隔（毫秒）
+  manual_order_max_amount: 0
+  manual_action_min_interval_ms: 1000
+  # 账户级熔断回退阈值（仅会话未显式设置时生效）
+  account_max_drawdown: 0.15
+  daily_loss_limit: 0.05
+  # 外部信号文件轮询间隔（秒），仅会话 signal_file_path 非空时生效
+  external_signal_poll_interval_seconds: 5
+  # 同代码 + 同日 + 同方向是否只认第一条预警
+  external_signal_daily_dedup: true
+
+# 接缝续跑式增量回测
+incremental_backtest:
+  enabled: true
+  daily_at: "15:15"
+  max_catchup_days: 5
+  anchor_on_live_start: true
+  validate_weekday: 5
+  validate_at: "18:00"
+  dividend_mode: exact
+  tolerances:
+    max_net_dev_pct: 0.5
+    mean_net_dev_pct: 0.2
+    trade_count_match_ratio: 0.9
+    direction_match_ratio: 0.9
+    max_drawdown_dev_pct: 1.0
+
+backtest:
+  # 回测 K 线本地 parquet 缓存（默认关闭；开启后结果与不开缓存一致）
+  kline_cache:
+    enabled: false
+    dir: data/kline_cache
+    today_ttl_seconds: 300
+  # K 线覆盖台账（默认关闭，只旁路登记，不跳过取数）
+  kline_ledger:
+    enabled: false
+    path: data/kline_ledger.sqlite3
+  # 分钟级公式输出与 K 线逐根日期对齐守卫：off / diagnose（默认）/ block
+  formula_align:
+    mode: diagnose
+
+# 公司行为检测（只写诊断/日志，不参与交易或记账判定）
+corporate_action_audit:
+  enabled: true
+  lookback_days: 250
+  min_drop_pct: 1.0
+  match_tolerance_days: 5
+  max_codes: 0
+
+# 资金池：四个开关默认全关；关闭时额度推导器不计算、不落库、不影响既有结果。
+capital_pool:
+  enabled: false
+  pairing_enabled: false
+  loan_model_enabled: false
+  cash_outlet_enabled: false
