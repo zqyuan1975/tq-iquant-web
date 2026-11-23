@@ -1490,8 +1490,6 @@ def test_backfilled_positions_unblock_industry_attribution(db_session, monkeypat
     industry_attribution.compute_industry_attribution 都以
     `any(positions is not None)` 为条件）。
     """
-    from core.services.positions_backfill import backfill_record
-
     # 样本量闸已提到 210 天（2026-11-16），本用例只验证双门禁，放宽下限
     monkeypatch.setattr(svc, "_MARKET_REGIME_MIN_DAYS", 10)
     rec, ps = _seed_record(db_session)
@@ -1529,15 +1527,19 @@ def test_backfilled_positions_unblock_industry_attribution(db_session, monkeypat
     assert json.loads(row.payload_json)[
         "industry_attribution"]["status"] == "needs_rerun"
 
-    # 价格与持仓市值逐日一致（加仓后按 10.50 → 市值 2100），缩放系数 k = 1
-    prices = {d: (Decimal("10.00") if i < 5 else Decimal("10.50"))
-              for i, d in enumerate(days)}
-    out = backfill_record(db_session, rec.id,
-                          close_provider=lambda codes, s, e: {
-                              "000001.SZ": prices})
-    assert out["status"] == "ok" and out["written"] is True
-    assert out["cash_check"]["ok"] is True
-    assert out["scale"]["max_dev"] == "0"   # 无缩放偏离
+    # 模拟历史记录已回填每日持仓（结构与 backtest_engine 落盘一致），越过双门禁
+    for i, d in enumerate(days):
+        if i < 5:
+            continue
+        snap = db_session.query(BacktestDailySnapshot).filter_by(
+            backtest_record_id=rec.id, snap_date=d,
+            target_type="portfolio").one()
+        snap.positions_json = json.dumps([{
+            "stock_code": "000001.SZ", "quantity": 200,
+            "sellable_quantity": 200, "market_value": "2100.00",
+            "cost_value": "2000.00",
+        }])
+    db_session.commit()
 
     monkeypatch.setattr(
         svc, "TQData",

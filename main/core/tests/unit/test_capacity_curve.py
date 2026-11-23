@@ -111,7 +111,7 @@ def test_negative_base_return_has_no_decay_ratio():
     assert curve.slope == Decimal("-0.15")
 
 
-def test_participation_matches_pairing_eval_keys():
+def test_participation_keys_for_consumers():
     part = compute_participation(
         adv_by_code={"600000.SH": Decimal("1000"),
                      "000001.SZ": Decimal("500"),
@@ -126,7 +126,7 @@ def test_participation_matches_pairing_eval_keys():
     assert part.same_code_participation == Decimal("0.015")
     assert part.overlap == Decimal("0.005")
     assert part.bid_probability == Decimal("0.75")  # 0.015 / 0.02
-    # pairing_eval 读取的键必须齐全
+    # 消费方读取的参与度键必须齐全
     data = part.to_dict()
     for key in ("lender_participation", "borrower_participation",
                 "same_code_participation", "overlap", "bid_probability"):
