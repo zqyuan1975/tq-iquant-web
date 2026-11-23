@@ -1961,6 +1961,35 @@ def test_detail_oos_refreshed_from_later_walk_forward(db_session):
     assert oos["overall_pass"] is True
 
 
+def test_get_record_detail_exposes_data_fingerprint(db_session):
+    """P1-5：params_snapshot['data'] 序列化为详情 data_fingerprint（只增字段）。"""
+    rec, _ps = _seed_record(db_session)
+    rec.params_snapshot = json.dumps({
+        "data": {
+            "version": "data_fingerprint_v1",
+            "window": {"start": "2024-01-01", "end": "2024-03-31"},
+            "codes": 2, "hash": "abc123",
+            "per_code": {"000001.SZ": {"1d": {
+                "bars": 10, "first": "2024-01-02", "last": "2024-01-16"}}},
+        },
+    }, ensure_ascii=False)
+    db_session.commit()
+    detail = svc.get_record_detail(db_session, rec.id)
+    fp = detail["data_fingerprint"]
+    assert fp["hash"] == "abc123"
+    assert fp["codes"] == 2
+    assert fp["per_code"]["000001.SZ"]["1d"]["bars"] == 10
+
+
+def test_get_record_detail_data_fingerprint_none_for_old_record(db_session):
+    """老记录缺 data 键 → None（前端隐藏对比视图，不报错）。"""
+    rec, _ps = _seed_record(db_session)
+    rec.params_snapshot = json.dumps({"dividend_mode": "exact"},
+                                     ensure_ascii=False)
+    db_session.commit()
+    assert svc.get_record_detail(db_session, rec.id)["data_fingerprint"] is None
+
+
 def test_detail_oos_ignores_running_walk_forward(db_session):
     """仅有 running 的 WF 时不得当作已完成样本外结果注入。"""
     from core.models import WalkForwardRun

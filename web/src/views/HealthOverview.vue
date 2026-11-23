@@ -2,7 +2,11 @@
 import { computed, onMounted, onUnmounted, ref } from 'vue'
 import {
   getDataObservabilitySummary, getHealthOverview,
+  getKlineCoverageStatus, listKlineCoverage, getKlineCoveragePlan,
+  getBacktestRecords, getBacktestDetail,
   type DataObservabilitySummary, type HealthOverview, type HealthSessionItem,
+  type KlineCoverageStatus, type KlineCoverageRecord, type KlineCoveragePlan,
+  type BacktestRecordItem, type DataFingerprint,
 } from '../api'
 
 const data = ref<HealthOverview | null>(null)
@@ -126,6 +130,252 @@ function caliberReasonText(): string {
   const reasons = obs.value?.caliber.reasons || {}
   const parts = Object.entries(reasons).map(([k, n]) => `${k} × ${n}`)
   return parts.length ? parts.join('；') : '—'
+}
+
+// ---- 台账详情 / 回测指纹对比（只读；查看不会开启台账）----
+const showLedger = ref(false)
+const ledgerTab = ref<'coverage' | 'fingerprint'>('coverage')
+const ledgerLoading = ref(false)
+const ledgerError = ref('')
+const ledgerStatus = ref<KlineCoverageStatus | null>(null)
+const ledgerRecords = ref<KlineCoverageRecord[]>([])
+const ledgerPage = ref(1)
+const LEDGER_PAGE_SIZE = 20
+const expandedKey = ref('')
+const planCache = ref<Record<string, KlineCoveragePlan | 'loading' | 'error'>>({})
+
+function recordKey(r: KlineCoverageRecord): string {
+  return `${r.code}|${r.period}|${r.field}`
+}
+
+function ledgerRange(r: KlineCoverageRecord): [string, string] | null {
+  if (!r.ranges.length) return null
+  return [r.ranges[0][0], r.ranges[r.ranges.length - 1][1]]
+}
+
+const ledgerTotalPages = computed(() =>
+  Math.max(1, Math.ceil(ledgerRecords.value.length / LEDGER_PAGE_SIZE)))
+const pagedRecords = computed(() => {
+  const start = (ledgerPage.value - 1) * LEDGER_PAGE_SIZE
+  return ledgerRecords.value.slice(start, start + LEDGER_PAGE_SIZE)
+})
+
+/** 当前页已加载计划的汇总：停牌（数据源确认无行情）/ 未发布（需补数）。 */
+const pageGapTotals = computed(() => {
+  let stop = 0, missing = 0, expected = 0, covered = 0, loaded = 0
+  for (const r of pagedRecords.value) {
+    const p = planCache.value[recordKey(r)]
+    if (!p || p === 'loading' || p === 'error') continue
+    loaded += 1
+    expected += p.expected_days
+    covered += p.covered_days
+    missing += p.missing_days.length
+    stop += p.empty_days.length
+  }
+  return { stop, missing, expected, covered, loaded }
+})
+
+async function loadLedger() {
+  ledgerLoading.value = true
+  ledgerError.value = ''
+  try {
+    const [status, list] = await Promise.all([
+      getKlineCoverageStatus(), listKlineCoverage({ limit: 500 }),
+    ])
+    ledgerStatus.value = status
+    ledgerRecords.value = list.records || []
+    ledgerPage.value = 1
+    expandedKey.value = ''
+    planCache.value = {}
+    await loadPagePlans()
+  } catch (e) {
+    ledgerError.value = '台账加载失败: ' + (e instanceof Error ? e.message : String(e))
+  } finally {
+    ledgerLoading.value = false
+  }
+}
+
+/** 逐票计划只按台账窗口查询（不传 local_days：缺口三分类由窗口内缺日推导）。 */
+async function loadPagePlans() {
+  const tasks = pagedRecords.value
+    .filter((r) => ledgerRange(r) !== null)
+    .map(async (r) => {
+      const key = recordKey(r)
+      if (planCache.value[key]) return
+      const [start, end] = ledgerRange(r) as [string, string]
+      planCache.value = { ...planCache.value, [key]: 'loading' }
+      try {
+        const plan = await getKlineCoveragePlan({
+          code: r.code, period: r.period, start, end,
+          source: r.source, field: r.field,
+        })
+        planCache.value = { ...planCache.value, [key]: plan }
+      } catch {
+        planCache.value = { ...planCache.value, [key]: 'error' }
+      }
+    })
+  await Promise.all(tasks)
+}
+
+function planOf(r: KlineCoverageRecord): KlineCoveragePlan | null {
+  const p = planCache.value[recordKey(r)]
+  return p && p !== 'loading' && p !== 'error' ? p : null
+}
+
+function gapCell(r: KlineCoverageRecord, kind: 'stop' | 'missing'): string {
+  const p = planOf(r)
+  if (!p) return '—'
+  if (!p.stamp_valid) return '台账不可信'
+  if (kind === 'stop') return String(p.empty_days.length)
+  return String(p.missing_days.length)
+}
+
+function coverageCell(r: KlineCoverageRecord): string {
+  const p = planOf(r)
+  if (!p) return '—'
+  if (!p.stamp_valid) return '逐日核对'
+  return `${p.covered_days}/${p.expected_days}`
+}
+
+function toggleRecord(r: KlineCoverageRecord) {
+  const key = recordKey(r)
+  expandedKey.value = expandedKey.value === key ? '' : key
+}
+
+/** 缺口日期列表：默认只显示前 60 天（防止单票数百天撑爆弹窗）。 */
+function daysText(days?: string[], limit = 60): string {
+  if (!days || !days.length) return '无'
+  const head = days.slice(0, limit).join('，')
+  return days.length > limit ? `${head} …共 ${days.length} 天` : head
+}
+
+function rangesText(r: KlineCoverageRecord): string {
+  if (!r.ranges.length) return '—'
+  return r.ranges.map((x) => `${x[0]} ~ ${x[1]}`).join('，')
+}
+
+function trustText(r: KlineCoverageRecord): string {
+  const p = planOf(r)
+  if (!p) return '计划加载中…'
+  return p.trusted ? '可信任台账' : `需逐日核对（${p.reason}）`
+}
+
+function changeLedgerPage(delta: number) {
+  const next = ledgerPage.value + delta
+  if (next < 1 || next > ledgerTotalPages.value) return
+  ledgerPage.value = next
+  expandedKey.value = ''
+  loadPagePlans()
+}
+
+function switchLedgerTab(tab: 'coverage' | 'fingerprint') {
+  ledgerTab.value = tab
+  if (tab === 'coverage' && !ledgerRecords.value.length && !ledgerLoading.value) {
+    loadLedger()
+  }
+  if (tab === 'fingerprint' && !fpRecords.value.length) {
+    loadFingerprintRecords()
+  }
+}
+
+function openLedger() {
+  showLedger.value = true
+  switchLedgerTab(ledgerTab.value)
+}
+
+// ---- 回测记录指纹对比 ----
+const fpRecords = ref<BacktestRecordItem[]>([])
+const fpLoading = ref(false)
+const fpError = ref('')
+const fpComparing = ref(false)
+const fpLeftId = ref<number | null>(null)
+const fpRightId = ref<number | null>(null)
+const fpLeft = ref<DataFingerprint | null>(null)
+const fpRight = ref<DataFingerprint | null>(null)
+const fpLeftLabel = ref('')
+const fpRightLabel = ref('')
+
+interface FpRow {
+  key: string
+  left: string
+  right: string
+  status: 'same' | 'diff' | 'left_only' | 'right_only'
+}
+
+function fpText(v?: { bars?: number; first?: string; last?: string }): string {
+  if (!v) return '—'
+  return `${v.bars ?? '—'} 根 · ${v.first || '—'} → ${v.last || '—'}`
+}
+
+const fpRows = computed<FpRow[]>(() => {
+  const l = fpLeft.value?.per_code || {}
+  const r = fpRight.value?.per_code || {}
+  const keys = new Set<string>([...Object.keys(l), ...Object.keys(r)])
+  const rows: FpRow[] = []
+  for (const code of [...keys].sort()) {
+    const periods = new Set<string>([
+      ...Object.keys(l[code] || {}), ...Object.keys(r[code] || {}),
+    ])
+    for (const period of [...periods].sort()) {
+      const lv = (l[code] || {})[period]
+      const rv = (r[code] || {})[period]
+      let status: FpRow['status'] = 'diff'
+      if (!lv) status = 'right_only'
+      else if (!rv) status = 'left_only'
+      else if (lv.bars === rv.bars && lv.first === rv.first && lv.last === rv.last) {
+        status = 'same'
+      }
+      rows.push({
+        key: `${code} ${period}`,
+        left: fpText(lv), right: fpText(rv), status,
+      })
+    }
+  }
+  return rows
+})
+
+async function loadFingerprintRecords() {
+  fpLoading.value = true
+  fpError.value = ''
+  try {
+    const list = await getBacktestRecords()
+    fpRecords.value = (list || []).filter((r) => r.status !== 'running')
+    if (!fpLeftId.value && fpRecords.value.length) {
+      fpLeftId.value = fpRecords.value[0].id
+    }
+    if (!fpRightId.value && fpRecords.value.length > 1) {
+      fpRightId.value = fpRecords.value[1].id
+    }
+  } catch (e) {
+    fpError.value = '回测记录加载失败: ' + (e instanceof Error ? e.message : String(e))
+  } finally {
+    fpLoading.value = false
+  }
+}
+
+async function compareFingerprints() {
+  if (!fpLeftId.value || !fpRightId.value) {
+    fpError.value = '请选择两条回测记录'
+    return
+  }
+  fpComparing.value = true
+  fpError.value = ''
+  try {
+    const [a, b] = await Promise.all([
+      getBacktestDetail(fpLeftId.value), getBacktestDetail(fpRightId.value),
+    ])
+    fpLeft.value = a.data_fingerprint || null
+    fpRight.value = b.data_fingerprint || null
+    fpLeftLabel.value = `#${a.record.id} ${a.record.name}`
+    fpRightLabel.value = `#${b.record.id} ${b.record.name}`
+    if (!fpLeft.value && !fpRight.value) {
+      fpError.value = '两条记录都没有数据指纹（老记录或不含台账快照）'
+    }
+  } catch (e) {
+    fpError.value = '指纹对比失败: ' + (e instanceof Error ? e.message : String(e))
+  } finally {
+    fpComparing.value = false
+  }
 }
 
 let timer: ReturnType<typeof setInterval> | null = null
@@ -406,9 +656,206 @@ onUnmounted(() => {
             <i class="hs-sub" :title="`生成于 ${fmtTime(obs.generated_at)}`">只读汇总 · 不改计算</i>
           </div>
         </div>
+        <div style="margin-top:10px;display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+          <button class="btn btn-sm" data-test="ledger-open" @click="openLedger">
+            台账详情 / 指纹对比
+          </button>
+          <span style="font-size:12px;color:var(--ink-soft)">
+            只读查看：展示覆盖率、缺口三分类与逐票明细，不会开启台账
+          </span>
+        </div>
       </div>
     </div>
   </template>
+
+  <!-- 台账详情 + 回测指纹对比（只读；查看不写入、不启用台账） -->
+  <div v-if="showLedger" class="modal-overlay modal-lg" data-test="ledger-modal"
+       @click.self="showLedger = false">
+    <div class="modal-content">
+      <h3>数据台账与指纹对比</h3>
+      <div class="modal-body">
+        <div style="display:flex;gap:8px;margin-bottom:12px;flex-wrap:wrap">
+          <button class="btn btn-sm" :class="ledgerTab === 'coverage' ? 'btn-primary' : ''"
+                  data-test="ledger-tab-coverage" @click="switchLedgerTab('coverage')">
+            K 线覆盖台账
+          </button>
+          <button class="btn btn-sm" :class="ledgerTab === 'fingerprint' ? 'btn-primary' : ''"
+                  data-test="ledger-tab-fingerprint" @click="switchLedgerTab('fingerprint')">
+            回测记录指纹对比
+          </button>
+        </div>
+
+        <p v-if="ledgerError" style="color:var(--red);font-size:13px">{{ ledgerError }}</p>
+        <p v-if="fpError" style="color:var(--red);font-size:13px">{{ fpError }}</p>
+
+        <!-- 台账 -->
+        <template v-if="ledgerTab === 'coverage'">
+          <p v-if="ledgerLoading">加载中…</p>
+          <template v-else>
+            <div class="health-stats" style="margin-bottom:10px">
+              <div class="health-stat">
+                <div class="hs-head">
+                  <span class="hs-label">台账开关</span>
+                  <b>{{ ledgerStatus?.enabled ? '已开启' : '未开启' }}</b>
+                </div>
+                <i class="hs-sub" :title="ledgerStatus?.ledger_path">
+                  {{ ledgerStatus?.exists ? '库已生成' : '库未生成（只读查看不创建）' }}
+                </i>
+              </div>
+              <div class="health-stat">
+                <div class="hs-head">
+                  <span class="hs-label">覆盖记录</span>
+                  <b>{{ ledgerStatus?.coverage ?? 0 }}</b>
+                </div>
+                <i class="hs-sub">空日 {{ ledgerStatus?.empty_days ?? 0 }} · 指纹 {{ ledgerStatus?.stamps ?? 0 }}</i>
+              </div>
+              <div class="health-stat">
+                <div class="hs-head">
+                  <span class="hs-label">当前页缺口</span>
+                  <b>{{ pageGapTotals.stop + pageGapTotals.missing }}</b>
+                </div>
+                <i class="hs-sub">
+                  停牌 {{ pageGapTotals.stop }} · 未发布 {{ pageGapTotals.missing }}
+                  （已算 {{ pageGapTotals.loaded }} 条）
+                </i>
+              </div>
+              <div class="health-stat">
+                <div class="hs-head">
+                  <span class="hs-label">当前页覆盖</span>
+                  <b>{{ pageGapTotals.covered }}/{{ pageGapTotals.expected }}</b>
+                </div>
+                <i class="hs-sub">非交易日按交易日历剔除，不计缺口</i>
+              </div>
+            </div>
+
+            <p v-if="!ledgerRecords.length" style="color:var(--ink-soft);font-size:13px">
+              暂无台账记录。台账写入口默认关闭，开启与否由配置
+              <code>backtest.kline_ledger.enabled</code> 控制；此处查看不会启用台账。
+            </p>
+            <template v-else>
+              <table class="table">
+                <thead>
+                  <tr>
+                    <th>代码</th><th>周期</th><th>字段</th><th>覆盖段</th>
+                    <th>已覆盖/应有</th><th>停牌</th><th>未发布</th>
+                    <th>指纹</th><th>最近更新</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <template v-for="r in pagedRecords" :key="recordKey(r)">
+                    <tr style="cursor:pointer" @click="toggleRecord(r)">
+                      <td>{{ r.code }}</td>
+                      <td>{{ r.period }}</td>
+                      <td>{{ r.field }}</td>
+                      <td>{{ r.ranges.length }} 段</td>
+                      <td>{{ coverageCell(r) }}</td>
+                      <td>{{ gapCell(r, 'stop') }}</td>
+                      <td>{{ gapCell(r, 'missing') }}</td>
+                      <td>
+                        <span class="badge" :class="r.stamp_valid ? 'badge-green' : 'badge-red'">
+                          {{ r.stamp_valid ? '有效' : (r.stamp ? '失效' : '无') }}
+                        </span>
+                      </td>
+                      <td>{{ fmtTime(r.updated_at) }}</td>
+                    </tr>
+                    <tr v-if="expandedKey === recordKey(r)">
+                      <td colspan="9" style="background:var(--bg-soft, #fafafa)">
+                        <div style="font-size:12px;line-height:1.7">
+                          <div><b>覆盖区间：</b>{{ rangesText(r) }}</div>
+                          <div><b>停牌（数据源确认无行情）：</b>
+                            {{ daysText(planOf(r)?.empty_days) }}
+                          </div>
+                          <div><b>未发布/未下载：</b>
+                            {{ daysText(planOf(r)?.missing_days) }}
+                          </div>
+                          <div><b>可信判定：</b>{{ trustText(r) }}</div>
+                        </div>
+                      </td>
+                    </tr>
+                  </template>
+                </tbody>
+              </table>
+              <div style="display:flex;align-items:center;gap:8px;margin-top:10px;font-size:12px">
+                <button class="btn btn-sm" :disabled="ledgerPage <= 1"
+                        @click="changeLedgerPage(-1)">上一页</button>
+                <span>第 {{ ledgerPage }} / {{ ledgerTotalPages }} 页 · 共 {{ ledgerRecords.length }} 条</span>
+                <button class="btn btn-sm" :disabled="ledgerPage >= ledgerTotalPages"
+                        @click="changeLedgerPage(1)">下一页</button>
+              </div>
+            </template>
+          </template>
+        </template>
+
+        <!-- 指纹对比 -->
+        <template v-else>
+          <p v-if="fpLoading">回测记录加载中…</p>
+          <template v-else>
+            <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:flex-end">
+              <label style="font-size:13px">记录 A
+                <select v-model.number="fpLeftId" class="input" style="min-width:260px">
+                  <option v-for="r in fpRecords" :key="r.id" :value="r.id">
+                    #{{ r.id }} {{ r.name }}（{{ r.start_date }} ~ {{ r.end_date }}）
+                  </option>
+                </select>
+              </label>
+              <label style="font-size:13px">记录 B
+                <select v-model.number="fpRightId" class="input" style="min-width:260px">
+                  <option v-for="r in fpRecords" :key="r.id" :value="r.id">
+                    #{{ r.id }} {{ r.name }}（{{ r.start_date }} ~ {{ r.end_date }}）
+                  </option>
+                </select>
+              </label>
+              <button class="btn btn-sm" :disabled="fpComparing" @click="compareFingerprints">
+                {{ fpComparing ? '比对中…' : '比对指纹' }}
+              </button>
+            </div>
+
+            <template v-if="fpLeft || fpRight">
+              <p style="font-size:12px;margin:10px 0 6px">
+                A: {{ fpLeftLabel }} · window
+                {{ fpLeft?.window ? `${fpLeft.window.start} ~ ${fpLeft.window.end}` : '—' }}
+                · hash {{ fpLeft?.hash || '—' }}<br>
+                B: {{ fpRightLabel }} · window
+                {{ fpRight?.window ? `${fpRight.window.start} ~ ${fpRight.window.end}` : '—' }}
+                · hash {{ fpRight?.hash || '—' }}
+              </p>
+              <p v-if="!fpRows.length" style="font-size:13px;color:var(--ink-soft)">
+                无可比对的逐票指纹（记录可能为老版本或无台账快照）。
+              </p>
+              <table v-else class="table">
+                <thead>
+                  <tr><th>代码 / 周期</th><th>记录 A</th><th>记录 B</th><th>结论</th></tr>
+                </thead>
+                <tbody>
+                  <tr v-for="row in fpRows" :key="row.key">
+                    <td>{{ row.key }}</td>
+                    <td>{{ row.left }}</td>
+                    <td>{{ row.right }}</td>
+                    <td>
+                      <span class="badge"
+                            :class="row.status === 'same' ? 'badge-green'
+                              : row.status === 'diff' ? 'badge-red' : 'badge-gray'">
+                        {{ row.status === 'same' ? '一致'
+                          : row.status === 'diff' ? '不一致'
+                          : row.status === 'left_only' ? '仅 A 有' : '仅 B 有' }}
+                      </span>
+                    </td>
+                  </tr>
+                </tbody>
+              </table>
+            </template>
+            <p v-else style="font-size:13px;color:var(--ink-soft)">
+              选择两条回测记录后点「比对指纹」：按代码+周期对比首根/最后一根/行数。
+              老记录无指纹时显示为空。
+            </p>
+          </template>
+        </template>
+      </div>
+      <div class="modal-actions">
+        <button class="btn" @click="showLedger = false">关闭</button>
+      </div>
+    </div>
+  </div>
 </template>
 
 <style scoped>

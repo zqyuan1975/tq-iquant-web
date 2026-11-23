@@ -4438,6 +4438,9 @@ def get_record_detail(
         # 新记录 prev5d_avg（前 5 日均量，无前视）。详情页据此打口径标记。
         "liquidity_caliber": (
             (_snapshot_data or {}).get("liquidity_caliber") or "same_day_bar"),
+        # P1-5 数据指纹（每票首根/最后一根/行数 + 区间 hash）：只读快照元数据，
+        # 不参与计算；老记录缺该键 → None（前端隐藏对比视图），不改历史行。
+        "data_fingerprint": (_snapshot_data or {}).get("data") or None,
         "snapshots": [_serialize_snapshot(s) for s in snaps],
         "trades": [_serialize_trade_with_name(t, strat_name_map) for t in trades],
         "evaluations": evals_dict,

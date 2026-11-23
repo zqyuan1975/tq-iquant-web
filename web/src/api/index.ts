@@ -631,6 +631,22 @@ export interface BacktestDetailItem {
   acceptance: AcceptanceResult              // B6 考核口径验收（absolute/relative）
   cost_capacity: BacktestCostCapacity | null  // K5 成本与容量（详情现算，不落库）
   gate_release?: GateReleaseResult | null     // 0021 D4：门控释放/召回时间轴（只读）
+  // P1-5 数据指纹（params_snapshot["data"] 序列化）：老记录为 null
+  data_fingerprint: DataFingerprint | null
+}
+
+/** 数据指纹：区间窗口 + 每票每周期首根/最后一根/行数 + 区间 hash。 */
+export interface DataFingerprint {
+  version?: string
+  window?: { start: string; end: string }
+  codes?: number
+  hash?: string
+  per_code?: Record<string, Record<string, {
+    bars?: number
+    first?: string
+    last?: string
+    hash?: string
+  }>>
 }
 
 // K5 成本与容量（对齐 backtest_service.build_cost_capacity）
@@ -3442,6 +3458,76 @@ export interface DataObservabilitySummary {
 
 export async function getDataObservabilitySummary() {
   const res = await api.get<ApiResponse<DataObservabilitySummary>>('/data-observability/summary')
+  return res.data.data
+}
+
+// ---------------------------------------------------------------------------
+// K 线覆盖台账详情（只读，GET /kline-coverage*）
+// 查看不会开启台账：写入口只受 backtest.kline_ledger.enabled 控制。
+// ---------------------------------------------------------------------------
+export interface KlineCoverageStatus {
+  enabled: boolean
+  ledger_path: string
+  exists: boolean
+  coverage: number
+  empty_days: number
+  stamps: number
+  latest_updated_at: string | null
+}
+
+export interface KlineCoverageRecord {
+  code: string
+  period: string
+  field: string
+  source: string
+  ranges: [string, string][]
+  empty_days: string[]
+  stamp: { path?: string | null; mtime_ns?: number | null; size?: number | null } | null
+  stamp_valid: boolean
+  updated_at: string | null
+}
+
+export interface KlineCoverageList {
+  ledger_path: string
+  enabled: boolean
+  records: KlineCoverageRecord[]
+  count: number
+}
+
+export interface KlineCoveragePlan {
+  code: string
+  period: string
+  field: string
+  source: string
+  requested?: [string, string]
+  ranges: [string, string][]
+  empty_days: string[]
+  stamp_valid: boolean
+  trusted: boolean
+  reason: string
+  missing_days: string[]
+  tail_gap: boolean
+  expected_days: number
+  covered_days: number
+}
+
+export async function getKlineCoverageStatus() {
+  const res = await api.get<ApiResponse<KlineCoverageStatus>>('/kline-coverage/status')
+  return res.data.data
+}
+
+export async function listKlineCoverage(params?: {
+  code?: string; period?: string; source?: string; field?: string; limit?: number
+}) {
+  const res = await api.get<ApiResponse<KlineCoverageList>>('/kline-coverage', { params })
+  return res.data.data
+}
+
+export async function getKlineCoveragePlan(params: {
+  code: string; period: string; start: string; end: string;
+  source?: string; field?: string;
+}) {
+  const res = await api.get<ApiResponse<KlineCoveragePlan>>('/kline-coverage/plan', { params })
   return res.data.data
 }
 
