@@ -143,12 +143,49 @@ def record_channel_decision(session_id: int, channel: str, gate: str,
             session_id, gate)
 
 
+def _minute_dt(day, minutes: int) -> datetime:
+    """当日 00:00 + ``minutes`` 分钟（支持 1440=次日 00:00）。"""
+    return datetime.combine(day, _dtime(0, 0)) + timedelta(minutes=int(minutes))
+
+
+def _hm_minutes(raw) -> int:
+    """``'HH:MM'`` → 当日分钟数；兼容 YAML 把未加引号的 ``08:00`` 解析成整数。"""
+    if isinstance(raw, int):
+        return raw
+    hh, _, mm = str(raw).strip().partition(":")
+    return int(hh) * 60 + int(mm or 0)
+
+
+def _protected_windows() -> list:
+    """TQ 通道闸的 ``p0_only`` 窗口（分钟区间列表）；闸关闭/配置非法返回空。
+
+    收盘保护窗（默认 14:55–15:10）内闸对 P1/P2 全禁、P0 只做收盘收口，快照采样
+    被拒，行情基准停在同一根属预期行为。窗口一律从 ``core.tq.gate.gate_config()``
+    读取（不硬编码），跟随 config.yaml 的 ``tq_gate.p0_only``。
+    """
+    try:
+        from core.tq.gate import gate_config
+        cfg = gate_config()
+        if not isinstance(cfg, dict) or not cfg.get("enabled", True):
+            return []
+        raw = cfg.get("p0_only")
+        if isinstance(raw, (list, tuple)) and len(raw) == 2:
+            return [(_hm_minutes(raw[0]), _hm_minutes(raw[1]))]
+    except Exception:  # noqa: BLE001 — 闸配置不可用不臆造扣减
+        pass
+    return []
+
+
 def _tradable_seconds(start: datetime, end: datetime) -> float:
-    """start→end 的有效交易时长：扣除午休 11:30–13:00；隔夜从当日开盘起算。
+    """start→end 的有效交易时长：扣除午休 11:30–13:00 与收盘保护窗；隔夜从开盘起算。
 
     午休/隔夜不是行情停滞（13:00 开盘首根 pm 1m bar 要到 13:01 才闭合，
     09:30 开盘首根同样如此），直接用墙钟相减会在每天开盘后必报假警
     （2026-11-05 13:00:02 实证：last bar=11:41:18，静默 4724 秒）。
+
+    收盘保护窗（``tq_gate.p0_only``，默认 14:55–15:10）同样不是停滞：闸对
+    P1/P2 全禁、快照采样被拒，last completed bar 停在同一根是预期行为
+    （2026-11-23 14:58 实证：误报「行情停滞 180s」）。
     """
     if start >= end:
         return 0.0
@@ -157,10 +194,16 @@ def _tradable_seconds(start: datetime, end: datetime) -> float:
         if start >= end:
             return 0.0
     total = (end - start).total_seconds()
-    lunch_s = datetime.combine(end.date(), _LUNCH_START)
-    lunch_e = datetime.combine(end.date(), _LUNCH_END)
-    overlap = max(0.0, (min(end, lunch_e) - max(start, lunch_s)).total_seconds())
-    return total - overlap
+    day = end.date()
+    quiet = 0.0
+    lunch_s = datetime.combine(day, _LUNCH_START)
+    lunch_e = datetime.combine(day, _LUNCH_END)
+    quiet += max(0.0, (min(end, lunch_e) - max(start, lunch_s)).total_seconds())
+    for start_min, end_min in _protected_windows():
+        win_s = _minute_dt(day, start_min)
+        win_e = _minute_dt(day, end_min)
+        quiet += max(0.0, (min(end, win_e) - max(start, win_s)).total_seconds())
+    return total - quiet
 
 
 def config_seconds(key: str, default: float, cfg: Optional[dict] = None) -> float:
