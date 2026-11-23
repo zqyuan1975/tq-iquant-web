@@ -676,3 +676,17 @@ def test_failure_log_masks_wecom_url_and_email_password(caplog):
         assert _FAKE_WECOM not in text and "EmAilPw9876" not in text
     finally:
         notifier.close()
+
+
+def test_default_pending_path_follows_runtime_data_dir(monkeypatch, tmp_path):
+    """待发队列与体检游标/台账同口径：落 runtime.data_dir()，不再各自推算。"""
+    from core import runtime
+
+    monkeypatch.delenv("TQ_NOTIFY_PENDING_DISABLED", raising=False)
+    assert ns.default_pending_path() == runtime.data_dir() / "notify_pending.jsonl"
+
+    monkeypatch.setattr(ns, "data_dir", lambda: tmp_path)
+    assert ns.default_pending_path() == tmp_path / "notify_pending.jsonl"
+
+    monkeypatch.setenv("TQ_NOTIFY_PENDING_DISABLED", "1")
+    assert ns.default_pending_path() is None

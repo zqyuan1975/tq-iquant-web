@@ -13,7 +13,7 @@
 - **不改既有语义**：本模块不改任何落库、不改闸门、不改订单状态机；调用点只允许
   「在既有事件产生的同一处顺带发一条」。
 - **限频不丢**：飞书返回 ``code=11232 frequency limited`` 时不再只写日志丢弃，
-  改为落本地待发队列（``app_root()/data/notify_pending.jsonl``，原子替换）并按
+  改为落本地待发队列（``runtime.data_dir()/notify_pending.jsonl``，原子替换）并按
   指数退避重试；关键事件（卖出/风控/熔断）按去重键合并、降频重投；进程重启后
   由 ``Notifier.start()`` 恢复队列继续投递。其它失败仍按原口径只节流写日志。
 
@@ -43,7 +43,8 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import httpx
 
-from ..config import app_root, load_config
+from ..config import load_config
+from ..runtime import data_dir
 
 logger = logging.getLogger(__name__)
 
@@ -79,8 +80,8 @@ _KEY_EVENT_MARKERS = (
     "卖出", "风控", "熔断", "止损", "止盈", "子单丢失",
     "sell", "risk", "circuit", "breaker",
 )
-#: 待发队列默认落盘位置（相对 app_root，可用 TQ_NOTIFY_PENDING_DISABLED=1 关闭）
-PENDING_FILE_REL = ("data", "notify_pending.jsonl")
+#: 待发队列默认落盘位置（相对 runtime.data_dir()，可用 TQ_NOTIFY_PENDING_DISABLED=1 关闭）
+PENDING_FILE_REL = "notify_pending.jsonl"
 
 
 def level_value(level: str) -> int:
@@ -112,12 +113,15 @@ def _pending_file_disabled() -> bool:
 
 
 def default_pending_path() -> Optional[Path]:
-    """待发队列默认落盘路径（app_root/data/notify_pending.jsonl）；禁用/异常→None。"""
+    """待发队列默认落盘路径（runtime.data_dir()/notify_pending.jsonl）；禁用/异常→None。
+
+    与体检游标、台账同口径：源码模式落 ``main/data``，打包/TQ_APP_ROOT 模式落
+    ``app_root()/data``，不再按仓库根 ``data/`` 各自推算。
+    """
     if _pending_file_disabled():
         return None
     try:
-        root = app_root()
-        return root.joinpath(*PENDING_FILE_REL)
+        return data_dir() / PENDING_FILE_REL
     except Exception:  # noqa: BLE001 — 路径不可得不落盘（内存重试仍然生效）
         return None
 
