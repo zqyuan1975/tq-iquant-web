@@ -3389,6 +3389,45 @@ export async function getHealthOverview() {
   return res.data.data
 }
 
+// ---------------------------------------------------------------------------
+// 数据与口径观测汇总（P0-1，GET /data-observability/summary）
+// 公司行为未验证数 + 口径过期标记数 + K 线覆盖摘要，只读。
+// ---------------------------------------------------------------------------
+export interface DataObservabilityAudit {
+  at?: string
+  reason?: string
+  window?: { start: string; end: string }
+  requested?: number | null
+  unverified?: number | null
+  written?: number | null
+  resolved?: number | null
+}
+
+export interface DataObservabilitySummary {
+  generated_at: string
+  corporate_actions: {
+    enabled: boolean
+    unverified: number
+    codes: string[]
+    last_audit: DataObservabilityAudit | null
+  }
+  caliber: { records: number; stale: number; reasons: Record<string, number> }
+  kline_coverage: {
+    enabled: boolean
+    ledger_path: string
+    exists: boolean
+    coverage: number
+    empty_days: number
+    stamps: number
+    latest_updated_at: string | null
+  }
+}
+
+export async function getDataObservabilitySummary() {
+  const res = await api.get<ApiResponse<DataObservabilitySummary>>('/data-observability/summary')
+  return res.data.data
+}
+
 export async function getSystemConfigs() {
   const res = await api.get<ApiResponse<SystemConfig>>('/system/configs')
   return res.data.data

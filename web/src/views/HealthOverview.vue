@@ -1,8 +1,13 @@
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, ref } from 'vue'
-import { getHealthOverview, type HealthOverview, type HealthSessionItem } from '../api'
+import {
+  getDataObservabilitySummary, getHealthOverview,
+  type DataObservabilitySummary, type HealthOverview, type HealthSessionItem,
+} from '../api'
 
 const data = ref<HealthOverview | null>(null)
+const obs = ref<DataObservabilitySummary | null>(null)
+const obsError = ref('')
 const loading = ref(true)
 const errorMsg = ref('')
 const busy = ref(false)
@@ -77,14 +82,32 @@ function fmtTime(iso: string | null): string {
 async function load() {
   busy.value = true
   errorMsg.value = ''
-  try {
-    data.value = await getHealthOverview()
-  } catch (e) {
+  obsError.value = ''
+  // 主总览失败才阻断页面；观测汇总失败只在卡片内提示（两者互相独立）。
+  const [healthRes, obsRes] = await Promise.allSettled([
+    getHealthOverview(), getDataObservabilitySummary(),
+  ])
+  if (healthRes.status === 'fulfilled') {
+    data.value = healthRes.value
+  } else {
+    const e = healthRes.reason
     errorMsg.value = '加载失败: ' + (e instanceof Error ? e.message : String(e))
-  } finally {
-    loading.value = false
-    busy.value = false
   }
+  if (obsRes.status === 'fulfilled') {
+    obs.value = obsRes.value
+  } else {
+    const e = obsRes.reason
+    obsError.value = '观测汇总加载失败: ' + (e instanceof Error ? e.message : String(e))
+  }
+  loading.value = false
+  busy.value = false
+}
+
+/** 口径过期原因 → 「原因 × N」文本（后端已给中文原因，原样展示）。 */
+function caliberReasonText(): string {
+  const reasons = obs.value?.caliber.reasons || {}
+  const parts = Object.entries(reasons).map(([k, n]) => `${k} × ${n}`)
+  return parts.length ? parts.join('；') : '—'
 }
 
 let timer: ReturnType<typeof setInterval> | null = null
@@ -291,6 +314,56 @@ onUnmounted(() => {
         </div>
       </div>
     </div>
+    <div class="frame">
+      <div class="frame-head">
+        <span class="frame-num">05</span>
+        <span class="frame-title">数据与口径观测</span>
+      </div>
+      <div class="frame-body">
+        <div v-if="obsError" class="obs-error">{{ obsError }}</div>
+        <div v-else-if="obs" class="health-stats obs-stats">
+          <div class="health-stat">
+            <div class="hs-head">
+              <span class="hs-label">公司行为未验证</span>
+              <b :style="{ color: obs.corporate_actions.unverified ? 'var(--red)' : 'var(--ink)' }">{{ obs.corporate_actions.unverified }}</b>
+            </div>
+            <i class="hs-sub" :title="obs.corporate_actions.codes.join(' ')">
+              自动审计{{ obs.corporate_actions.enabled ? '已开启' : '已关闭' }} · 涉及 {{ obs.corporate_actions.codes.length }} 只
+            </i>
+          </div>
+          <div class="health-stat">
+            <div class="hs-head">
+              <span class="hs-label">最近一轮审计</span>
+              <b>{{ obs.corporate_actions.last_audit ? (obs.corporate_actions.last_audit.reason || '—') : '未运行' }}</b>
+            </div>
+            <i class="hs-sub">{{ obs.corporate_actions.last_audit ? fmtTime(obs.corporate_actions.last_audit.at || null) : '暂无本轮结果' }}</i>
+          </div>
+          <div class="health-stat">
+            <div class="hs-head">
+              <span class="hs-label">口径过期标记</span>
+              <b :style="{ color: obs.caliber.stale ? 'var(--red)' : 'var(--ink)' }">{{ obs.caliber.stale }}</b>
+            </div>
+            <i class="hs-sub" :title="caliberReasonText()">共 {{ obs.caliber.records }} 条记录</i>
+          </div>
+          <div class="health-stat">
+            <div class="hs-head">
+              <span class="hs-label">K 线覆盖台账</span>
+              <b>{{ obs.kline_coverage.enabled ? (obs.kline_coverage.exists ? '已有台账' : '未生成') : '未开启' }}</b>
+            </div>
+            <i class="hs-sub" :title="obs.kline_coverage.ledger_path">
+              覆盖 {{ obs.kline_coverage.coverage }} · 空日 {{ obs.kline_coverage.empty_days }} · 指纹 {{ obs.kline_coverage.stamps }}
+            </i>
+          </div>
+          <div class="health-stat">
+            <div class="hs-head">
+              <span class="hs-label">台账最近更新</span>
+              <b>{{ fmtTime(obs.kline_coverage.latest_updated_at) }}</b>
+            </div>
+            <i class="hs-sub" :title="`生成于 ${fmtTime(obs.generated_at)}`">只读汇总 · 不改计算</i>
+          </div>
+        </div>
+      </div>
+    </div>
   </template>
 </template>
 
@@ -314,6 +387,9 @@ onUnmounted(() => {
 .frame-body { padding: 8px 12px }
 /* 01 区单行数字条：主值一行 + 副信息小字（对齐首页状态总览 01 的形态） */
 .health-stats { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 10px 0 }
+/* 05 数据与口径观测：5 项单行（比 01 少一格，单独收列宽） */
+.obs-stats { grid-template-columns: repeat(5, minmax(0, 1fr)) }
+.obs-error { font-size: 12px; color: var(--red) }
 .health-stat { display: flex; flex-direction: column; gap: 1px; min-width: 0; padding: 0 12px; border-left: 1px solid var(--line) }
 .health-stat:first-child { padding-left: 0; border-left: none }
 .hs-head { display: flex; align-items: baseline; gap: 6px; min-width: 0 }
