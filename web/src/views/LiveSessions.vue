@@ -17,6 +17,7 @@ import {
 } from '../utils/liveWorkbench'
 import {
   getLiveOrders, getLiveTrades, getLivePositions, getLiveDecisions, getLiveSignals, getPortfolios,
+  getLivePositionScopes, setLivePositionScope,
   ackLiveDecision, previewLiveDecisionBatch, batchAckLiveDecisions,
   type DecisionBatchFilters, type DecisionBatchPreview,
   getLiveSessions, getLiveSession, createLiveSession, updateLiveSession, startLiveSession, stopLiveSession, deleteLiveSession,
@@ -883,6 +884,8 @@ async function loadHistory(id: number) {
     // 账户全貌快照 + 交易日历来源/退化状态（同一详情请求，采集于 deals 节拍）——失败静默（辅助卡）
     try {
       getLiveSession(id).then(d => {
+    // 按标的授权代卖清单（旧后端/未迁移 → 静默为空 = 全部按未授权展示）
+    loadPositionScopes(id)
         if (activeSessionId !== id) return
         accountSnapshots.value = { ...accountSnapshots.value, [id]: d?.account_snapshot ?? null }
         calendarStatus.value = { ...calendarStatus.value, [id]: d?.trading_calendar ?? null }
@@ -1273,6 +1276,7 @@ function watchSession(id: number) {
   decOnlyDeferred.value = false
   loadHistory(id)
 }
+  positionScopes.value = new Set()
 
 async function load() {
   try {
@@ -1612,8 +1616,8 @@ function sellScopeTitle(s: LiveSessionItem): string {
   const src = s.sell_scope_source === 'session'
     ? '本会话已显式设置' : `本会话未设置，跟随全局默认（${s.sell_scope_global || 'platform_only'}）`
   return cur === 'full'
-    ? `存量/外部持仓已纳入风控代卖：风控卖出按整仓口径（${src}）`
-    : `仅代卖平台自建仓，存量/外部持仓不纳入风控（${src}）`
+    ? `存量/外部持仓已纳入风控并按整仓代卖；池外仓不在虚拟账本内、与本开关无关（${src}）`
+    : `存量/外部仓仍纳入风控计算、触发会落 stop_loss/trailing_stop 事件并每日首条 warn 告警，但未授权代卖时不下单（下单前数量夹到平台仓，为 0 则跳过并记 sell_scope/skip）；可在持仓表逐只开启「代卖授权」；池外仓不在虚拟账本内、与本开关无关（${src}）`
 }
 async function toggleSellScope(s: LiveSessionItem) {
   if (sellScopeBusy.value === s.id) return
@@ -1639,6 +1643,78 @@ async function toggleSellScope(s: LiveSessionItem) {
   } catch (e: any) {
     alert(e?.response?.data?.message || e?.message || '切换失败')
   } finally {
+// ---- 按标的授权代卖（platform_only 下逐票放行；默认无记录 = 不代卖）----
+// 与会话级 sell_scope 开关相互独立：这里不改 full/platform_only，只对单个代码
+// 放开「下单前不夹到平台仓」。变更由后端写审计事件，下一轮 tick 生效。
+const positionScopes = ref<Set<string>>(new Set())
+const scopeModal = ref<{ row: PositionRow; sessionId: number; code: string; enabled: boolean } | null>(null)
+const scopeBusy = ref(false)
+const scopeFeedback = ref<{ ok: boolean; text: string } | null>(null)
+
+function isScopeAuthorized(code: string): boolean {
+  return positionScopes.value.has(code)
+}
+
+async function loadPositionScopes(id: number) {
+  try {
+    const data = await getLivePositionScopes(id)
+    if (activeSessionId !== id) return
+    positionScopes.value = new Set(data.enabled_codes || [])
+  } catch { /* 旧后端/迁移未应用 → 空集合（等价全部未授权） */ }
+}
+
+/** 打开二次确认：展示整仓数量、当前价、预估金额后再放开/收回。 */
+function openScopeConfirm(p: PositionRow) {
+  const sid = activeSessionId
+  if (sid === null) {
+    scopeFeedback.value = { ok: false, text: '请先在工作台选择会话' }
+    return
+  }
+  scopeModal.value = {
+    row: p, sessionId: sid, code: p.stock_code,
+    enabled: !isScopeAuthorized(p.stock_code),
+  }
+}
+
+/** 当前价估算：市值/数量，缺失回退成本价；仅用于确认框展示。 */
+function scopePrice(p: PositionRow): number {
+  if (p.quantity > 0 && p.market_value > 0) return p.market_value / p.quantity
+  return p.avg_cost || 0
+}
+function scopeAmount(p: PositionRow): number {
+  if (p.market_value > 0) return p.market_value
+  return scopePrice(p) * (p.quantity || 0)
+}
+
+async function confirmScopeToggle() {
+  const m = scopeModal.value
+  if (!m || scopeBusy.value) return
+  scopeBusy.value = true
+  scopeFeedback.value = null
+  try {
+    const res = await setLivePositionScope(m.sessionId, m.code, m.enabled)
+    const next = new Set(positionScopes.value)
+    if (m.enabled) next.add(m.code)
+    else next.delete(m.code)
+    positionScopes.value = next
+    scopeModal.value = null
+    scopeFeedback.value = { ok: true, text: res.message }
+  } catch (e: any) {
+    scopeFeedback.value = {
+      ok: false,
+      text: e?.response?.data?.message || e?.message || '代卖授权变更失败',
+    }
+  } finally {
+    scopeBusy.value = false
+  }
+}
+
+function scopeCellTitle(code: string): string {
+  return isScopeAuthorized(code)
+    ? '已授权代卖：该代码触发止损/移动止损时按整仓可卖量下单（T+1/涨跌停/审批/时点等闸门照旧）'
+    : '未授权代卖：风控照常计算并落触发事件、每日首条 warn 告警，但下单前数量夹到平台仓（为 0 则不下单并记 sell_scope/skip）'
+}
+
     sellScopeBusy.value = null
   }
 }
@@ -2098,7 +2174,7 @@ onUnmounted(() => {
           <th class="col-strategy">组合策略<span class="th-sub">执行模式 · 引擎 · 模式</span></th>
           <th class="col-baseline">资金基准</th>
           <th class="col-status">状态</th>
-          <th class="col-scope">存量仓风控</th>
+          <th class="col-scope">存量仓代卖</th>
           <th class="col-actions">操作</th>
         </tr>
       </thead>
@@ -2167,15 +2243,15 @@ onUnmounted(() => {
               </div>
             </div>
           </td>
-          <td class="col-scope" data-label="存量仓风控">
+          <td class="col-scope" data-label="存量仓代卖">
             <div class="scope-cell">
-              <!-- 存量/外部持仓是否纳入风控（代卖）：会话级开关，默认关闭 -->
+              <!-- 存量/外部持仓是否代卖（风控计算常开，此开关只决定下单量是否收窄）：会话级开关，默认关闭 -->
               <span
                 class="badge"
                 :class="sellScopeOf(s) === 'full' ? 'badge-orange' : 'badge-gray'"
                 :title="sellScopeTitle(s)"
                 data-test="sell-scope-badge"
-              >{{ sellScopeOf(s) === 'full' ? '存量仓已纳入' : '仅平台自建仓' }}</span>
+              >{{ sellScopeOf(s) === 'full' ? '代卖存量仓' : '仅卖平台仓' }}</span>
               <button
                 class="btn btn-sm" data-test="sell-scope-toggle"
                 :disabled="s.status === 'stopping' || sellScopeBusy === s.id"
@@ -2390,7 +2466,7 @@ onUnmounted(() => {
     <!-- 持仓（序号 + 组合/子策略归属，同票多子策略分多行；来源分级：策略/原有持仓） -->
     <div v-if="wbTab === 'positions'" class="table-wrap">
       <table>
-        <thead><tr><th>序号</th><th>组合策略</th><th>子策略</th><th>代码</th><th>数量</th><th>成本价</th><th>市值</th><th>峰值</th><th>峰值日期</th><th>峰值来源</th><th>来源</th></tr></thead>
+        <thead><tr><th>序号</th><th>组合策略</th><th>子策略</th><th>代码</th><th>数量</th><th>成本价</th><th>市值</th><th>峰值</th><th>峰值日期</th><th>峰值来源</th><th>来源</th><th>代卖授权</th></tr></thead>
         <tbody>
           <tr v-for="(p, i) in poolPositions" :key="positionRowKey(p)">
             <td style="color:var(--ink-soft)">{{ i + 1 }}</td>
@@ -2419,7 +2495,8 @@ onUnmounted(() => {
       </table>
       <div v-if="poolPositions.length === 0" class="empty-state">
         <p>暂无持仓</p>
-        <p>账户原有持仓（非策略买入）以灰色标注为原有持仓；属于本会话股票池的已导入虚拟账本并按真实成本纳入风控，池外外部仓仅展示/对账、不进风控、不占槽位、不代卖；成本 ≤0 显示「成本未知」且不参与风控。</p>
+        <p>账户原有持仓（非策略买入）以灰色标注为原有持仓：属于本会话股票池的已导入虚拟账本并按真实成本<b>纳入风控计算</b>；池外仓不进虚拟账本、与卖出范围/代卖授权无关（仅展示/对账、不占槽位、不代卖）；成本 ≤0 显示「成本未知」且不参与风控。<br>
+        卖出范围 = platform_only（默认）时，池内存量/外部仓的止损/止盈/移动止损<b>照常判定并落触发事件</b>，只在最后一步把卖出数量夹到平台仓；为 0 即<b>未授权代卖</b>→不下单，并记 `sell_scope/skip` + 每日首条 warn 告警。可在「代卖授权」列逐只放开（等价按整仓代卖，仍受 T+1/涨跌停/审批/时点约束）；切 full 才是整会话按整仓下卖单。</p>
       </div>
     </div>
 
@@ -2618,9 +2695,24 @@ onUnmounted(() => {
         <select class="field-select field-select--compact" v-model="decRange" aria-label="决策时间范围">
           <option v-for="opt in TIME_RANGE_OPTIONS" :key="opt.value" :value="opt.value">{{ opt.label }}</option>
         </select>
+            <td>
+              <span v-if="p.out_of_pool === true || p.attribution === 'fallback'"
+                    style="color:var(--ink-soft)"
+                    title="池外仓不进虚拟账本，与代卖授权无关">—</span>
+              <button v-else class="btn btn-sm" :class="isScopeAuthorized(p.stock_code) ? 'btn-primary' : ''"
+                      data-test="position-scope-toggle"
+                      :title="scopeCellTitle(p.stock_code)"
+                      @click="openScopeConfirm(p)">
+                {{ isScopeAuthorized(p.stock_code) ? '已授权代卖' : '未授权·仅平台仓' }}
+              </button>
+            </td>
         <span style="font-size:12px;color:var(--ink-faint)">按北京时间自然日 · 聚合与统计随筛选重算 · 共 {{ filteredDecisions.length }} 条事件</span>
         <span style="margin-left:auto;font-size:12px;color:var(--ink-soft)">
           未处理 {{ decisionAckSummary.open }} 条 · 已确认 {{ decisionAckSummary.acked }} 条 · 已归档 {{ decisionAckSummary.archived }} 条
+      <p v-if="scopeFeedback" style="margin:8px 0 0;font-size:12px"
+         :style="{ color: scopeFeedback.ok ? 'var(--ink-soft)' : 'var(--danger, #c0392b)' }">
+        {{ scopeFeedback.text }}
+      </p>
         </span>
       </div>
       <!-- 批量确认：必须带筛选条件（不提供「全选所有」）；高危门类永远排除，只能逐条确认。
@@ -3162,6 +3254,35 @@ onUnmounted(() => {
         ⑤ <strong>去重</strong>：同代码 + 同日 + 同方向各认第一条（买卖互不吞并；同方向重复推送不重复下单）。去重键 = 代码 + 交易日 + 方向（会话内生效，跨会话不共享）。未知/不可解析的动作一律忽略并节流告警，绝不猜测方向或默认成买入。
       </p>
       <div class="opt-block">
+  <!-- 按标的授权代卖：二次确认（展示整仓数量/当前价/预估金额，确认后才调接口） -->
+  <div v-if="scopeModal" class="modal-overlay" data-test="position-scope-modal" @click.self="scopeModal = null">
+    <div class="modal-content">
+      <h3>{{ scopeModal.enabled ? '放开代卖授权' : '收回代卖授权' }}「{{ scopeModal.code }}」</h3>
+      <div class="modal-body">
+        <p class="muted">会话 #{{ scopeModal.sessionId }} · 授权按标的（代码）生效，同代码多子策略共享</p>
+        <ul class="guard-check-list">
+          <li class="ok"><b>整仓数量</b><span>{{ scopeModal.row.quantity }} 股</span></li>
+          <li class="ok"><b>当前价（估算）</b><span>{{ fmtCost(scopePrice(scopeModal.row)) }}</span></li>
+          <li class="ok"><b>预估金额</b><span>{{ fmtMoney(scopeAmount(scopeModal.row)) }}</span></li>
+        </ul>
+        <p v-if="scopeModal.enabled" class="baseline-preview warn">
+          放开后：该代码触发止损/移动止损/止盈时按<b>整仓可卖量</b>下单（不再只卖平台仓），
+          仍受 T+1、涨跌停、审批、时点等既有闸门约束；下一轮 tick 生效，变更写审计事件。
+        </p>
+        <p v-else class="baseline-preview">
+          收回后：立即恢复「仅卖平台仓」，存量/外部部分不下单（但仍纳入风控计算，
+          触发时记 sell_scope/skip 并每日首条 warn 告警）。
+        </p>
+      </div>
+      <div class="modal-actions">
+        <button class="btn btn-primary" :disabled="scopeBusy" data-test="position-scope-confirm" @click="confirmScopeToggle">
+          {{ scopeBusy ? '提交中…' : (scopeModal.enabled ? '确认放开代卖' : '确认收回授权') }}
+        </button>
+        <button class="btn" :disabled="scopeBusy" @click="scopeModal = null">取消</button>
+      </div>
+    </div>
+  </div>
+
         <div class="opt-grid">
           <input v-model="form.advance_close_enabled" type="checkbox" class="opt-check" />
           <span class="opt-title">14:50 提前收盘价（pre_close_1450，仅日线 1d，当日尾盘报单）</span>
@@ -3616,8 +3737,12 @@ onUnmounted(() => {
               goldminer=7801；ths execute_mode=file_builtin、price_mode=latest、work_dir=data/ths。</p>
             <p class="guide-note">· <b>卖出范围</b>（tq_trade.live_sell_scope）：仅作<b>新建会话的初始档位</b>，
               会话级开关优先且运行中可切（不重启会话、不反向改写本配置）：
-              platform_only＝只卖平台自建仓（默认关闭，纯外部仓不代卖并记一条 gate=sell_scope / action=skip）；
-              full＝按整仓卖（含存量/外部仓）。开启 full 前会先做全量对账，账不齐拒绝开启；
+              platform_only＝默认：存量/外部仓仍纳入风控计算、触发后落
+              stop_loss/trailing_stop 等事件并每日首条 warn 告警，仅在下单前把数量夹到平台仓，
+              为 0 即未授权代卖 → 不下单并记 gate=sell_scope / action=skip；
+              可在持仓表「代卖授权」列逐只放开（按整仓可卖量放行，T+1/涨跌停/审批/时点照旧）；
+              池外仓不在虚拟账本内，与卖出范围/代卖授权无关；
+              full＝整会话按整仓卖（含存量/外部仓）。开启 full 前会先做全量对账，账不齐拒绝开启；
               已提交未成交委托不撤销。买入侧不受影响。</p>
             <p class="guide-note">· <b>次日盘前集合竞价</b>（tq_trade.pre_open_auction_*）：enabled 默认 <b>true</b>、
               end_time 默认 09:20、price_bias_pct 默认 2.0。窗口 09:15 ≤ now &lt; end_time；当日 due 的

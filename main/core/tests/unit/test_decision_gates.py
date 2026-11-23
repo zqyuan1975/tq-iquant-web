@@ -628,11 +628,34 @@ class TestSellScope:
         assert ev.action == "skip"
         assert ev.stock_code == "000001.SZ"
         assert ev.requested_qty == 1000
-        assert "不代卖" in ev.message
+        assert "未代卖" in ev.message
         # 第二根 bar 同票再次命中：不再重复记事件
         t2 = datetime(2026, 7, 30, 15, 1)
         assert port.on_bar(_risk_bar(t=t2), signal_cache=None) == []
         assert "sell_scope" not in _gates(r.drain())
+
+    def test_platform_only_authorized_code_sells_whole_position(self):
+        """按标的授权代卖：命中授权集合 → 与 full 同口径整仓卖出，不记 skip。"""
+        r = DecisionRecorder()
+        port, ctx = _portfolio(recorder=r)
+        port.sell_scope = "platform_only"
+        port.sell_scope_authorized = {"000001.SZ"}
+        _external_pos(ctx)
+        orders = port.on_bar(_risk_bar(), signal_cache=None)
+        assert len(orders) == 1
+        assert orders[0].trade_type == TradeType.SELL
+        assert orders[0].quantity == 1000  # 整仓放行（不再夹到平台仓 0）
+        assert "sell_scope" not in _gates(r.drain())
+
+    def test_platform_only_authorization_is_per_code(self):
+        """授权只对被授权代码生效：同会话未授权代码仍跳过并记事件。"""
+        r = DecisionRecorder()
+        port, ctx = _portfolio(recorder=r)
+        port.sell_scope = "platform_only"
+        port.sell_scope_authorized = {"000002.SZ"}
+        _external_pos(ctx, code="000001.SZ")
+        assert port.on_bar(_risk_bar(), signal_cache=None) == []
+        assert _find(r.drain(), "sell_scope").action == "skip"
 
     def test_platform_only_reduce_capped_then_lot_rounded(self):
         """platform_only + REDUCE：意图量先夹到平台仓，再按整手向下取整。"""

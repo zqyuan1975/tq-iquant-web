@@ -2,7 +2,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { mount, flushPromises } from '@vue/test-utils'
 
 // 会话 CRUD/启停 + 工作台历史查询 + 组合选单全走 ../api 客户端（import 的即 mock 的 vi.fn）
-const { mockGetLiveSessions, mockCreateLiveSession, mockStartLiveSession, mockStopLiveSession, mockGetLiveChannel, mockTestLiveChannel, mockGetLiveSession, mockGetWatchdogStatus, mockGetLiveAccountPreview, mockResetLiveBaseline, mockGetLiveParamsDrift, mockGetLiveCashFlows, mockCreateLiveCashFlow, mockGetLiveDataHealth } = vi.hoisted(() => ({
+const { mockGetLiveSessions, mockCreateLiveSession, mockStartLiveSession, mockStopLiveSession, mockGetLiveChannel, mockTestLiveChannel, mockGetLiveSession, mockGetWatchdogStatus, mockGetLiveAccountPreview, mockResetLiveBaseline, mockGetLiveParamsDrift, mockGetLiveCashFlows, mockCreateLiveCashFlow, mockGetLiveDataHealth, mockGetLivePositionScopes, mockSetLivePositionScope, mockAdjustLivePosition, mockGetLiveReconciliationDiffs, mockResolveLiveReconciliationDiff } = vi.hoisted(() => ({
   mockGetLiveSessions: vi.fn(),
   mockCreateLiveSession: vi.fn(),
   mockStartLiveSession: vi.fn(),
@@ -17,6 +17,8 @@ const { mockGetLiveSessions, mockCreateLiveSession, mockStartLiveSession, mockSt
   mockGetLiveCashFlows: vi.fn(),
   mockCreateLiveCashFlow: vi.fn(),
   mockGetLiveDataHealth: vi.fn(),
+  mockGetLivePositionScopes: vi.fn(),
+  mockSetLivePositionScope: vi.fn(),
 }))
 vi.mock('../api', () => ({
   getLiveSessions: mockGetLiveSessions,
@@ -30,6 +32,8 @@ vi.mock('../api', () => ({
   resetLiveBaseline: mockResetLiveBaseline,
   getLiveParamsDrift: mockGetLiveParamsDrift,
   getLiveCashFlows: mockGetLiveCashFlows,
+  getLivePositionScopes: mockGetLivePositionScopes,
+  setLivePositionScope: mockSetLivePositionScope,
   createLiveCashFlow: mockCreateLiveCashFlow,
   getLiveDataHealth: mockGetLiveDataHealth,
   getLivePositions: vi.fn(),
@@ -112,6 +116,7 @@ beforeEach(() => {
       { key: 'tdx', channel: 'tdx_tq', label: '通达信 TQ 交易', configured: true, detail: '' },
       { key: 'ths', channel: 'ths_ui', label: '同花顺独立交易（UI 自动化）', configured: true, detail: '' },
     ],
+  ;(mockGetLivePositionScopes as any).mockResolvedValue({ session_id: 0, enabled_codes: [], items: [] })
     ths_ui: { enabled: false, available: false, window_title: '网上股票交易系统5.0', client_exe_path: '', driver: 'clipboard' },
     bridge: { simulation: 'http://127.0.0.1:8790', live: 'http://127.0.0.1:8791' },
   })
@@ -428,6 +433,61 @@ describe('LiveSessions.vue 工作台(B4b)', () => {
         portfolio_id: 1, strategy_id: 1, source: 'strategy', attribution: 'fallback' },
     ])
     const w = mount(LiveSessions)
+  it('持仓「代卖授权」：未授权→确认框展示整仓/价格/金额→确认后按代码调接口', async () => {
+    ;(getLiveSessions as any).mockResolvedValue([runningSession])
+    ;(getLivePositions as any).mockResolvedValue([
+      { stock_code: '002922.SZ', quantity: 2500, avg_cost: 10, market_value: 25000,
+        portfolio_id: 1, strategy_id: 1, source: 'strategy', out_of_pool: false },
+    ])
+    ;(mockGetLivePositionScopes as any).mockResolvedValue({
+      session_id: 7, enabled_codes: [], items: [],
+    })
+    ;(mockSetLivePositionScope as any).mockResolvedValue({
+      session_id: 7, code: '002922.SZ', enabled: true, changed: true,
+      updated_by: '无鉴权，无法识别操作者', effective_at: 'next_tick',
+      message: '已放开代卖授权：002922.SZ',
+    })
+    const w = mount(LiveSessions)
+    await flushPromises()
+
+    const btn = w.find('[data-test="position-scope-toggle"]')
+    expect(btn.exists()).toBe(true)
+    expect(btn.text()).toContain('未授权')
+    await btn.trigger('click')
+
+    // 二次确认：展示整仓数量 / 当前价（市值÷数量）/ 预估金额；未确认不下单
+    const modal = w.find('[data-test="position-scope-modal"]')
+    expect(modal.exists()).toBe(true)
+    expect(modal.text()).toContain('2500 股')
+    expect(modal.text()).toContain('10.000')
+    expect(modal.text()).toContain('25000.00')
+    expect(mockSetLivePositionScope).not.toHaveBeenCalled()
+
+    await w.find('[data-test="position-scope-confirm"]').trigger('click')
+    await flushPromises()
+
+    expect(mockSetLivePositionScope).toHaveBeenCalledWith(7, '002922.SZ', true)
+    expect(w.find('[data-test="position-scope-modal"]').exists()).toBe(false)
+    expect(w.text()).toContain('已放开代卖授权：002922.SZ')
+    expect(w.find('[data-test="position-scope-toggle"]').text()).toContain('已授权')
+    w.unmount()
+  })
+
+  it('池外仓不显示「代卖授权」开关（与 sell_scope 无关）', async () => {
+    ;(getLiveSessions as any).mockResolvedValue([runningSession])
+    ;(getLivePositions as any).mockResolvedValue([
+      { stock_code: '002745.SZ', quantity: 5300, avg_cost: 10.221, market_value: 54171,
+        portfolio_id: null, strategy_id: null, source: 'external', out_of_pool: true },
+    ])
+    ;(mockGetLivePositionScopes as any).mockResolvedValue({
+      session_id: 7, enabled_codes: [], items: [],
+    })
+    const w = mount(LiveSessions)
+    await flushPromises()
+    expect(w.find('[data-test="position-scope-toggle"]').exists()).toBe(false)
+    w.unmount()
+  })
+
     await flushPromises()
     const es = FakeEventSource.instances[0]
 
@@ -446,7 +506,9 @@ describe('LiveSessions.vue 工作台(B4b)', () => {
     await flushPromises()
 
     expect(w.text()).toContain('暂无持仓')
-    expect(w.text()).toContain('池外外部仓仅展示/对账、不进风控、不占槽位、不代卖')
+    // 池外仓与 sell_scope / 代卖授权无关（不进虚拟账本）
+    expect(w.text()).toContain('池外仓不进虚拟账本、与卖出范围/代卖授权无关')
+    expect(w.text()).toContain('未授权代卖')
     w.unmount()
   })
 

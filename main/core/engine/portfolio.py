@@ -142,9 +142,18 @@ class Portfolio:
         # 纯外部仓不下单（记 gate=sell_scope 决策事件）。回测不读配置 → 恒 full；
         # 且回测 platform_quantity 与 quantity 等价，两种口径结果一致。
         self.sell_scope: str = "full"
-        # platform_only 下「仅外部持仓不代卖」事件的去重键 (strategy_id, stock_code)，
-        # 同一组合策略同一只票每进程只记一条（实盘 session 内一个 Portfolio 实例）。
+        # platform_only 下「仅外部持仓不代卖」事件的去重键 (strategy_id, stock_code, date)，
+        # 同一组合策略同一只票每个交易日只记一条（跨日重记，便于每日核对）。
         self._sell_scope_skipped: set = set()
+        # 实盘注入：风控已触发但被 sell_scope 跳过时的显式告警回调
+        # 签名 (sig, pos, bar, requested_qty, price, amplitude_pct)；回测保持 None。
+        self.scope_skip_notify = None
+        # 显式告警去重键 (stock_code, trade_date)：按 (会话, 代码, 交易日) 每日首条。
+        self._scope_skip_notified: set = set()
+        # 按标的授权代卖（live_position_scope.enabled=1 的代码集合）：命中则
+        # platform_only 下不再把数量夹到平台仓，按整仓可卖量放行；空集合（默认）
+        # 与旧行为逐字一致。实盘引擎每轮 tick 注入；回测恒空。
+        self.sell_scope_authorized: Set[str] = set()
         # 持仓最新价快照（code → close）。BarPoller 逐票完成会发残缺 bar，
         # 实盘分钟 bar 只含本轮新完成的股票；停牌股整天无 bar。估值必须对所有
         # 持仓用最近已知价，不能把缺席持仓当 0（否则组合总市值瞬间塌掉误触发
@@ -657,29 +666,83 @@ class Portfolio:
         """按卖出范围口径收窄意图数量（full 原样返回 / platform_only 夹到平台仓）。
 
         - full（默认）：返回意图量，行为与改动前逐字一致。
-        - platform_only：返回 min(意图量, Position.platform_quantity)——只卖平台
-          自己买入且尚未平掉的部分；platform_quantity<=0（纯外部/手工仓）返回 0，
-          并记一条 gate=sell_scope / action=skip 决策事件（同一组合策略同一只票
-          每进程只记一条，避免每根 bar 刷屏）。
+        - platform_only：若该代码在 ``sell_scope_authorized`` 内（按标的授权代卖，
+          见 live_position_scope 表）→ 原样返回意图量（整仓可卖量）；否则返回
+          min(意图量, Position.platform_quantity)——只卖平台自己买入且尚未平掉的
+          部分；platform_quantity<=0（纯外部/手工仓）返回 0，并记一条
+          gate=sell_scope / action=skip 决策事件（同一组合策略同一只票每交易日
+          只记一条，避免每根 bar 刷屏）+ 每日首条 warn 告警。
         阈值判定（止损/止盈/移动止损）仍在 _check_risks 按整仓成本计算，本方法只
         收窄卖出数量（已知偏差：可能出现「按整仓成本触发、只卖平台那部分」）。
         """
         intent = max(0, int(intent))
         if self.sell_scope != "platform_only":
             return intent
+        if sig.stock_code in self.sell_scope_authorized:
+            # 已授权代卖：按整仓可卖量放行；T+1/涨跌停/审批/时点等下游闸门照旧
+            return intent
         platform = max(0, getattr(pos, "platform_quantity", 0))
         if platform <= 0:
-            key = (ctx.strategy_id, sig.stock_code)
+            day = bar.bar_time.date() if getattr(bar, "bar_time", None) else None
+            price = self._bar_close(bar, sig.stock_code)
+            amplitude = self._price_amplitude(pos, price)
+            rule = self._signal_rule(sig)
+            key = (ctx.strategy_id, sig.stock_code, day)
             if key not in self._sell_scope_skipped:
                 self._sell_scope_skipped.add(key)
                 self._rec(
                     "sell_scope", "signal_gate", "skip", ctx, sig, bar,
                     requested_qty=intent,
-                    message="仅外部持仓（platform_quantity=0），"
-                            "按 live_sell_scope=platform_only 口径不代卖",
+                    final_qty=0,
+                    actual_value=amplitude,
+                    message=(
+                        "风控已触发但未代卖：规则=%s，触发价=%s，整仓成本=%.3f，"
+                        "触发幅度=%s，整仓=%d 股，请求卖出=%d 股；"
+                        "live_sell_scope=platform_only、平台仓=0 且该标的未授权"
+                        "代卖，下单前数量收窄为 0（可在持仓表开启「代卖授权」）"
+                        % (rule or "—",
+                           "%.3f" % price if price is not None else "—",
+                           float(getattr(pos, "avg_cost", 0) or 0),
+                           "%+.2f%%" % amplitude if amplitude is not None else "—",
+                           int(getattr(pos, "quantity", 0) or 0), intent)
+                    ),
                 )
+            # 显式告警：按 (会话, 代码, 交易日) 每日首条（信号事件本身可能每 bar 重触发）
+            if day is not None and self.scope_skip_notify is not None:
+                nkey = (sig.stock_code, day)
+                if nkey not in self._scope_skip_notified:
+                    self._scope_skip_notified.add(nkey)
+                    try:
+                        self.scope_skip_notify(sig, pos, bar, intent, price, amplitude)
+                    except Exception:  # noqa: BLE001 — 告警失败不影响风控/交易
+                        logger.warning("sell_scope 跳过告警发送失败", exc_info=True)
             return 0
         return min(intent, platform)
+
+    @staticmethod
+    def _signal_rule(sig: SignalEvent) -> str:
+        """信号规则名（STOP_LOSS / TRAILING_STOP / TAKE_PROFIT…），供告警与事件展示。"""
+        rule = getattr(sig, "signal_type", "")
+        return str(getattr(rule, "value", rule) or "")
+
+    @staticmethod
+    def _bar_close(bar: BarEvent, stock_code: str) -> Optional[float]:
+        """本根 bar 该票收盘价（实盘残缺 bar 可能不含该票 → None）。"""
+        stocks = getattr(bar, "stocks", None) or {}
+        row = stocks.get(stock_code) or {}
+        try:
+            close = row.get("close")
+            return float(close) if close is not None else None
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _price_amplitude(pos: Position, price: Optional[float]) -> Optional[float]:
+        """相对整仓成本价（avg_cost）的触发幅度（%）。"""
+        avg = float(getattr(pos, "avg_cost", 0) or 0)
+        if price is None or avg <= 0:
+            return None
+        return round((price / avg - 1.0) * 100.0, 2)
 
     def on_bar(
         self,

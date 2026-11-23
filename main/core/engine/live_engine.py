@@ -137,6 +137,7 @@ from ..services.notify_service import notify
 from core.models import (
     LiveAccountPositionSnapshot, LiveAccountSnapshot, LiveCashFlow,
     LiveDecisionEvent, LiveBarOrderMark, LiveOrder, LivePositionPeak,
+    LivePositionScope,
     LiveSession, LiveSessionPortfolio, LiveSignal, LiveTrade,
     LiveCorporateAction, LiveCapitalShadow,
     LiveApprovalQueue, LiveManualAction, LiveOutOfPoolDecision,
@@ -2568,6 +2569,12 @@ class LiveEngine:
         value = str(value or "").strip()
         if value not in ("full", "platform_only"):
             return
+        # 注入「风控触发但未代卖」的显式告警回调（每轮 tick 都会走到这里，
+        # 值不变时也要确保已注入；回测 Portfolio 无此回调，不会误发）。
+        skip_notify = getattr(self, "_notify_sell_scope_skip", None)
+        if skip_notify is not None:
+            for port in getattr(self.ctx, "portfolios", None) or []:
+                port.scope_skip_notify = skip_notify
         old = getattr(self, "_sell_scope", "platform_only")
         if value == old:
             return
@@ -2580,6 +2587,56 @@ class LiveEngine:
         logger.warning(
             "实盘会话卖出范围生效 #%s: %s → %s（%s；已提交未成交委托不撤销）",
             self.session_id, old, value, process_tag())
+
+    def _notify_sell_scope_skip(self, sig, pos, bar, requested_qty: int,
+                                price, amplitude) -> None:
+        """风控已触发但未代卖：按 (会话, 代码, 交易日) 每日首条 warn 外发告警。
+
+        会话级去重在这里做（同代码多组合/多策略只发一条）；这里只组装可读文案
+        （代码、方向、触发价/幅度、整仓与请求数量），事件本身由 Portfolio 落
+        ``gate=sell_scope`` 供关键事件检索与健康总览计数。
+        """
+        try:
+            from core.services.notify_service import notify
+            trade_date_obj = (bar.bar_time.date()
+                              if getattr(bar, "bar_time", None) else None)
+            if trade_date_obj is not None:
+                if not hasattr(self, "_scope_skip_notified"):
+                    self._scope_skip_notified = set()
+                nkey = (str(sig.stock_code), trade_date_obj)
+                if nkey in self._scope_skip_notified:
+                    return
+                self._scope_skip_notified.add(nkey)
+            rule = str(getattr(getattr(sig, "signal_type", None), "value", "")
+                       or getattr(sig, "signal_type", "") or "—")
+            trade_date = (trade_date_obj.isoformat()
+                          if trade_date_obj is not None else "")
+            price_text = "%.3f" % price if price is not None else "—"
+            amp_text = "%+.2f%%" % amplitude if amplitude is not None else "—"
+            avg_cost = float(getattr(pos, "avg_cost", 0) or 0)
+            quantity = int(getattr(pos, "quantity", 0) or 0)
+            notify(
+                "warn", "风控触发但未代卖",
+                "风控已触发但未代卖：%s %s，触发价 %s，整仓成本 %.3f，"
+                "触发幅度 %s，整仓 %d 股，请求卖出 %d 股"
+                "（live_sell_scope=platform_only、平台仓 0 且该标的未授权代卖，"
+                "未生成卖单；可在实盘工作台持仓表开启「代卖授权」）"
+                % (sig.stock_code, rule, price_text, avg_cost, amp_text,
+                   quantity, int(requested_qty)),
+                gate="sell_scope", code=str(sig.stock_code),
+                trade_date=trade_date,
+                fields={
+                    "代码": str(sig.stock_code),
+                    "方向": "卖出",
+                    "规则": rule,
+                    "触发价": price_text,
+                    "触发幅度": amp_text,
+                    "请求数量": str(int(requested_qty)),
+                    "整仓数量": str(quantity),
+                },
+            )
+        except Exception:  # noqa: BLE001 — 告警失败不影响风控/交易
+            logger.warning("sell_scope 跳过告警发送失败", exc_info=True)
 
     def _refresh_sell_scope(self) -> None:
         """每轮 tick 重读 ``live_sessions.sell_scope``（运行中可切，下一轮生效）。
@@ -2609,6 +2666,32 @@ class LiveEngine:
             logger.warning("refresh sell_scope failed (session %s)",
                            self.session_id, exc_info=True)
             return
+
+    def _refresh_sell_scope_authorized(self) -> None:
+        """每轮 tick 重读 ``live_position_scope`` 启用集合（按标的授权代卖）。
+
+        默认无记录 = 空集合 = 维持 ``platform_only`` 原逻辑（纯外部仓不下单并记
+        skip）。读库失败保持上一轮集合：既不会凭空扩大代卖范围，也不会因一次
+        抖动把已授权的票退回「只卖平台仓」。
+        """
+        if self._db_session_factory is None:
+            return
+        try:
+            db = self._db_session_factory()
+            try:
+                rows = (db.query(LivePositionScope.code)
+                        .filter(LivePositionScope.session_id == self.session_id,
+                                LivePositionScope.enabled.is_(True)).all())
+            finally:
+                db.close()
+        except Exception:  # noqa: BLE001 — 读失败沿用上一轮集合
+            logger.warning("refresh sell_scope authorized failed (session %s)",
+                           self.session_id, exc_info=True)
+            return
+        codes = {str(row[0]) for row in rows if row and row[0]}
+        self._authorized_sell_codes = codes
+        for port in getattr(self.ctx, "portfolios", None) or []:
+            port.sell_scope_authorized = codes
 
     def arm_sell_scope_first_check(self, db: Optional[Session] = None) -> None:
         """开启 full 后武装「首笔存量/外部仓成交」前后对账（一次性，内存态）。
@@ -2836,6 +2919,8 @@ class LiveEngine:
         self._last_tick_at = now  # 存活心跳（进程内 watchdog 读）
         # 卖出范围会话级开关：每轮重读一次（只读一列），运行中切换下一轮即生效。
         self._refresh_sell_scope()
+        # 按标的授权代卖：每轮重读启用集合（默认空 = 维持 platform_only 原逻辑）
+        self._refresh_sell_scope_authorized()
         # P2-8：分段耗时画像（ms）。只观测不改执行顺序——风控/对账/清扫一律保留。
         t_round = time.monotonic()
         prof: Dict[str, int] = {}

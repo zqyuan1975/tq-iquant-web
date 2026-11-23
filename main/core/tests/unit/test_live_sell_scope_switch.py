@@ -8,6 +8,7 @@
 - 切换只改卖出数量口径：不撤单、不改持仓数量；
 - 切换服务立即通知运行中引擎、且不反向改写全局配置。
 """
+from datetime import datetime
 from types import SimpleNamespace
 
 from core.services import live_service as svc
@@ -128,6 +129,90 @@ def test_apply_sell_scope_does_not_touch_orders_or_positions():
     assert port.sell_scope == "full"
     assert pos.quantity == 1000 and pos.platform_quantity == 300
     assert disp.calls == []
+
+
+# ---------------------------------------------------------------------------
+# 按标的授权代卖：引擎每轮同步启用集合
+# ---------------------------------------------------------------------------
+class _ScopeFakeDB:
+    """query().filter().all() 替身（LivePositionScope 启用集合）。"""
+
+    def __init__(self, codes=None, exc=None):
+        self._codes, self._exc = codes or [], exc
+        self.closed = False
+
+    def query(self, *args, **kwargs):
+        return self
+
+    def filter(self, *args, **kwargs):
+        return self
+
+    def all(self):
+        if self._exc is not None:
+            raise self._exc
+        return [(c,) for c in self._codes]
+
+    def close(self):
+        self.closed = True
+
+
+def test_refresh_authorized_sets_codes_on_all_portfolios():
+    ports = [SimpleNamespace(), SimpleNamespace()]
+    eng = SimpleNamespace(
+        session_id=7, ctx=SimpleNamespace(portfolios=ports),
+        _db_session_factory=lambda: _ScopeFakeDB(["002745.SZ", "002922.SZ"]))
+    LiveEngine._refresh_sell_scope_authorized(eng)
+    expected = {"002745.SZ", "002922.SZ"}
+    assert eng._authorized_sell_codes == expected
+    assert [p.sell_scope_authorized for p in ports] == [expected, expected]
+
+
+def test_refresh_authorized_empty_means_no_authorization():
+    """无记录（默认）→ 空集合 = 维持 platform_only 原逻辑。"""
+    port = SimpleNamespace(sell_scope_authorized={"600211.SH"})
+    eng = SimpleNamespace(
+        session_id=7, ctx=SimpleNamespace(portfolios=[port]),
+        _db_session_factory=lambda: _ScopeFakeDB([]))
+    LiveEngine._refresh_sell_scope_authorized(eng)
+    assert port.sell_scope_authorized == set()
+
+
+def test_refresh_authorized_keeps_previous_on_db_error():
+    """读库失败沿用上一轮集合：不凭空扩大，也不把已授权票退回平台仓。"""
+    port = SimpleNamespace(sell_scope_authorized={"600211.SH"})
+    eng = SimpleNamespace(
+        session_id=7, ctx=SimpleNamespace(portfolios=[port]),
+        _db_session_factory=lambda: _ScopeFakeDB(exc=RuntimeError("db down")))
+    LiveEngine._refresh_sell_scope_authorized(eng)
+    assert port.sell_scope_authorized == {"600211.SH"}
+
+
+def test_notify_sell_scope_skip_is_daily_first_per_code(monkeypatch):
+    """按 (会话, 代码, 交易日) 每日首条：同代码重复触发只发一条 warn。"""
+    calls = []
+    from core.services import notify_service as ns
+    monkeypatch.setattr(ns, "notify",
+                        lambda *a, **k: calls.append((a, k)))
+    eng = SimpleNamespace(session_id=7)
+    sig = SimpleNamespace(stock_code="002922.SZ",
+                          signal_type=SimpleNamespace(value="STOP_LOSS"))
+    pos = SimpleNamespace(avg_cost=10.0, quantity=2500)
+    bar = SimpleNamespace(bar_time=datetime(2026, 11, 23, 10, 0))
+    LiveEngine._notify_sell_scope_skip(eng, sig, pos, bar, 2500, 8.0, -20.0)
+    LiveEngine._notify_sell_scope_skip(eng, sig, pos, bar, 2500, 8.0, -20.0)
+    assert len(calls) == 1
+    args, kwargs = calls[0]
+    assert args[0] == "warn"
+    assert kwargs["gate"] == "sell_scope"
+    assert kwargs["code"] == "002922.SZ"
+    assert kwargs["trade_date"] == "2026-11-23"
+    assert kwargs["fields"]["规则"] == "STOP_LOSS"
+    assert kwargs["fields"]["请求数量"] == "2500"
+
+    # 次日重新告警
+    bar2 = SimpleNamespace(bar_time=datetime(2026, 11, 24, 10, 0))
+    LiveEngine._notify_sell_scope_skip(eng, sig, pos, bar2, 2500, 7.8, -22.0)
+    assert len(calls) == 2
 
 
 # ---------------------------------------------------------------------------

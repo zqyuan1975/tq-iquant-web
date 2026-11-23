@@ -2749,6 +2749,47 @@ export async function setLiveSessionSellScope(
   return res.data.data
 }
 
+// ---- 按标的授权代卖（platform_only 下的逐票放行；默认无记录 = 不代卖）----
+export interface LivePositionScopeItem {
+  code: string
+  enabled: boolean
+  updated_at: string | null
+  updated_by: string | null
+}
+
+export interface LivePositionScopeList {
+  session_id: number
+  enabled_codes: string[]
+  items: LivePositionScopeItem[]
+}
+
+export interface LivePositionScopeChangeResult {
+  session_id: number
+  code: string
+  enabled: boolean
+  changed: boolean
+  updated_by: string
+  effective_at: string
+  message: string
+}
+
+/** 该会话的代卖授权清单（含已收回行，enabled 区分）。 */
+export async function getLivePositionScopes(sessionId: number) {
+  const res = await api.get<ApiResponse<LivePositionScopeList>>(
+    `/live-position-scope/${sessionId}`)
+  return res.data.data
+}
+
+/** 放开/收回单个标的的代卖授权（下一轮 tick 生效；后端写审计事件）。 */
+export async function setLivePositionScope(
+  sessionId: number, code: string, enabled: boolean,
+) {
+  const res = await api.put<ApiResponse<LivePositionScopeChangeResult>>(
+    `/live-position-scope/${sessionId}/${encodeURIComponent(code)}`,
+    { enabled })
+  return res.data.data
+}
+
 /** H2 参数漂移（绑定回测记录时）：当前组合参数 vs params_snapshot 的差异。 */
 export interface ParamsDriftField {
   field: string
