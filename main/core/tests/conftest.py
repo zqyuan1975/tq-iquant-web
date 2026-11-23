@@ -5,6 +5,14 @@ from pathlib import Path
 # 测试环境禁用内嵌备份调度：集成测试用 `with TestClient(app)` 会触发 lifespan，
 # 否则 15:10 之后会真的 VACUUM 真实 dev.db 并写备份记录/文件（测试不应有副作用）。
 os.environ.setdefault("TQ_BACKUP_SCHEDULER_DISABLED", "1")
+# P0-1（2026-11-23）：公司行为审计在回测启动/15:05 轮次后台自动触发，
+# 会卡通道取数并写诊断表。测试进程统一关闭自动触发，避免异步写库与取数。
+os.environ.setdefault("TQ_AUTO_CA_AUDIT_DISABLED", "1")
+# N3（2026-11-23）：体检轮换抽样游标落临时文件，避免测试写仓库 data/。
+import tempfile as _tempfile
+os.environ.setdefault(
+    "TQ_HEALTH_CURSOR_PATH",
+    os.path.join(_tempfile.gettempdir(), "tq_health_sample_cursor_test.json"))
 # 同理禁用增量回测调度（每日 15:10 会读真实 DB 并卡通达信取数）。
 os.environ.setdefault("TQ_INCREMENTAL_SCHEDULER_DISABLED", "1")
 # 告警外发（飞书 Webhook）：测试期间强制关闭，绝不给真实机器人发消息

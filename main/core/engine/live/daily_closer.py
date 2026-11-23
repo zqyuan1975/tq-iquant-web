@@ -593,6 +593,14 @@ class DailyCloser:
             self._reconcile_advance_close(today, daily_time, bars_by_code, advance_codes)
             self._advance_recheck_done_date = today
         self._mark_daily_bars_done(today)
+        # P0-1（2026-11-23）：15:05 日线轮次后触发一次公司行为漏记检测。
+        # 后台线程、只写诊断表；失败只告警，不影响日终收尾与实盘下单语义。
+        try:
+            from core.services.data_observability import trigger_auto_audit
+
+            trigger_auto_audit(list(bars_by_code.keys()), reason="daily_close")
+        except Exception:  # noqa: BLE001 — 观测触发失败不影响日终收尾
+            logger.warning("日终自动审计触发失败（忽略）", exc_info=True)
         logger.info(
             "daily bar driven (session %s, %s): %s completed bar over %d code(s), "
             "1w/1mon reinject=%s",

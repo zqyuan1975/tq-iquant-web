@@ -2073,6 +2073,9 @@ def test_params_snapshot_round_trips_source_attributes(db_session, monkeypatch):
         # 0021 A5：总开关开启时 params_snapshot 冻结资金池版本块；
         # config.yaml 属部署配置，测试需同时兼容开启/关闭两种状态。
         expected_keys.add("capital_pool")
+    if "data" in data:
+        # P1-5：回测快照并入数据指纹块（每票末根/行数/区间摘要 hash）。
+        expected_keys.add("data")
     assert set(data) == expected_keys
     # 默认不选新口径：写入 same_day_bar（与改动前一致，禁止默认走 prev5d）
     assert data["liquidity_caliber"] == "same_day_bar"

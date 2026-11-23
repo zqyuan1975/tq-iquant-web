@@ -425,6 +425,12 @@ def _defaults() -> dict:
                 "enabled": False,
                 "path": "data/kline_ledger.sqlite3",
             },
+            # P1-1（2026-11-23）：分钟级公式输出与 K 线逐根日期对齐守卫。
+            # off=不检查；diagnose=只写诊断/预检警告（默认，不阻断信号）；
+            # block=对未对齐的 code 丢弃该批公式信号（需显式开启）。
+            "formula_align": {
+                "mode": "diagnose",
+            },
         },
         # 资金池（docs/plans/0019 / 0020 / 0021）：四个开关默认全关。
         # 关闭时额度推导器不计算、不落库、不影响任何既有回测/实盘结果；

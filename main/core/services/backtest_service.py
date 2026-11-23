@@ -13,6 +13,7 @@ P1 #9（审计）第一块：把回测路由的业务逻辑下沉到 service，�
 故测试零改动。纯重构，行为不变。
 """
 
+import hashlib
 import json
 import logging
 import math
@@ -372,6 +373,24 @@ def summarize_data_quality(per_stock: dict, klines: dict, stocks: list,
     periods = sorted({p for ps in (per_stock or {}).values() for p in ps})
     if not periods:
         periods = sorted({p for per in (klines or {}).values() for p in per})
+    # P1-7b：无权威上市日时用「首根 bar」推导，仅诊断、不裁剪。
+    listing_inferred: Dict[str, str] = {}
+    for code in stocks:
+        firsts: List[datetime] = []
+        for df in ((klines or {}).get(code) or {}).values():
+            if df is None or "datetime" not in df.columns:
+                continue
+            for ts in df["datetime"].to_list():
+                if _ts_in_window(ts, (start, end)):
+                    firsts.append(_normalize_ts(ts))
+        if firsts:
+            listing_inferred[code] = min(firsts).date().isoformat()
+    # P1-7a：空日三分类用内置交易日历判「非交易日」，其余再用是否有数据区分。
+    try:
+        from core.engine.live.calendar import TradingCalendar
+        _cal = TradingCalendar(lambda: [])
+    except Exception:  # noqa: BLE001 — 日历不可用时只跳过该诊断
+        _cal = None
     per_period: dict = {}
     total_kept = 0
     total_expected = 0
@@ -391,6 +410,27 @@ def summarize_data_quality(per_stock: dict, klines: dict, stocks: list,
         union: set = set()
         for own in by_code.values():
             union |= own
+        # P1-7a：窗口内「没有任何股票有 bar」的日期三分类（只诊断，不改 bar 选择）。
+        empty_cls = {"non_trading_days": 0, "all_halted_days": 0,
+                     "not_published_days": 0, "samples": []}
+        if _cal is not None:
+            union_dates = {_normalize_ts(t).date() for t in union}
+            last_data = max(union_dates) if union_dates else None
+            day = start
+            while day <= end:
+                if not _cal.is_trading_day(day):
+                    empty_cls["non_trading_days"] += 1
+                elif day not in union_dates:
+                    if last_data is not None and day > last_data:
+                        empty_cls["not_published_days"] += 1
+                        kind = "not_published"
+                    else:
+                        empty_cls["all_halted_days"] += 1
+                        kind = "all_halted"
+                    if len(empty_cls["samples"]) < 10:
+                        empty_cls["samples"].append(
+                            {"day": day.isoformat(), "kind": kind})
+                day += timedelta(days=1)
         kept = 0
         missing = 0
         for own in by_code.values():
@@ -418,6 +458,7 @@ def summarize_data_quality(per_stock: dict, klines: dict, stocks: list,
             "coverage_ratio": round(coverage, 4),
             "dropped_artifact_bars": dropped_artifact,
             "dropped_no_trade_bars": dropped_no_trade,
+            "empty_day_classification": empty_cls,
         }
         total_kept += kept
         total_expected += expected
@@ -433,6 +474,12 @@ def summarize_data_quality(per_stock: dict, klines: dict, stocks: list,
         "requested_stocks": len(stocks),
         "stocks_with_data": stocks_with_data,
         "missing_stocks": [c for c in stocks if not (klines or {}).get(c)],
+        # P1-7b：首根 bar 推导的「上市日」仅作诊断，不参与裁剪/信号。
+        "listing_inferred": {
+            "source": "first_bar",
+            "note": "无权威上市日来源；仅诊断，不裁剪行情",
+            "dates": listing_inferred,
+        },
         "periods": per_period,
         "summary": {
             "coverage_ratio": round(coverage_all, 4),
@@ -1085,6 +1132,52 @@ def build_corporate_timeline(db: Session, start: Optional[date] = None,
                 and (r.end_date is None or r.end_date >= start))
         ]
     return build_timeline_from_rows(rows)
+
+
+DATA_FINGERPRINT_VERSION = "data_fingerprint_v1"
+
+
+def build_data_fingerprint(klines: dict, start: date, end: date) -> dict:
+    """回测数据指纹（P1-5）：每票「首根/最后一根/行数」+ 区间摘要 hash。
+
+    只读快照元数据，**不参与任何计算**，也不改动 bar 选择。用于事后判断
+    「两次回测结果差异是否来自行情数据本身」。
+    """
+    per_code: Dict[str, Dict[str, dict]] = {}
+    digest = hashlib.sha256()
+    for code in sorted((klines or {}).keys()):
+        per_period = klines[code] or {}
+        for period in sorted(per_period.keys()):
+            df = per_period.get(period)
+            if df is None or len(df) == 0 or "datetime" not in df.columns:
+                continue
+            stamps = [_normalize_ts(x) for x in df["datetime"].to_list()]
+            if not stamps:
+                continue
+            first = min(stamps).date().isoformat()
+            last = max(stamps).date().isoformat()
+            n = len(stamps)
+            per_code.setdefault(code, {})[period] = {
+                "bars": n, "first": first, "last": last,
+            }
+            digest.update(f"{code}|{period}|{n}|{first}|{last};".encode("utf-8"))
+    return {
+        "version": DATA_FINGERPRINT_VERSION,
+        "window": {"start": start.isoformat(), "end": end.isoformat()},
+        "codes": len(per_code),
+        "hash": digest.hexdigest()[:16],
+        "per_code": per_code,
+        "note": "每票首根/最后一根/行数；仅快照元数据，不参与计算",
+    }
+
+
+def attach_data_fingerprint(rec, fingerprint: dict) -> None:
+    """把数据指纹并入 ``params_snapshot['data']``（不清空已有键）。"""
+    if rec is None or not fingerprint:
+        return
+    payload = json.loads(rec.params_snapshot or "{}")
+    payload["data"] = fingerprint
+    rec.params_snapshot = json.dumps(payload, ensure_ascii=False, sort_keys=True)
 
 
 def build_params_snapshot(ps, dividend_mode: str = "exact",
@@ -2341,6 +2434,7 @@ _FORMULA_META_KEYS = ("Date", "ErrorId", "Error", "Time")
 def _convert_formula_output(
     raw: dict, strategy_id: int, stocks: list,
     bar_times_by_code: Optional[Dict[str, List[datetime]]] = None,
+    align_sink: Optional[List[dict]] = None,
 ) -> dict:
     """TQ 公式输出（formula_process_mul_zb）→ signal_cache 条目。
 
@@ -2371,6 +2465,12 @@ def _convert_formula_output(
         if not isinstance(stock_data, dict):
             continue
         bar_times = bar_times_by_code.get(code) if bar_times_by_code else None
+        if bar_times is not None and align_sink is not None:
+            # P1-1：逐根日期对齐诊断（默认只诊断，不影响下面实际采用哪些条目）。
+            _diag = align_formula_bars(
+                stock_data, bar_times, code=code, strategy_id=strategy_id)
+            if _diag is not None:
+                align_sink.append(_diag)
         # 按 bar_time 聚合该股票所有变量
         by_time: dict = {}
         if bar_times is not None:
@@ -2442,6 +2542,80 @@ def _parse_date_str(d: str):
         except ValueError:
             continue
     return None
+
+
+def formula_align_mode() -> str:
+    """逐根对齐守卫档位（P1-1）。
+
+    ``backtest.formula_align.mode``：
+
+    - ``off``：不检查；
+    - ``diagnose``（默认）：只写诊断/警告，不阻断信号；
+    - ``block``：该 code 对齐失败时丢弃该批公式信号（默认关闭，需显式开启）。
+    """
+    try:
+        cfg = (load_config().get("backtest") or {}).get("formula_align") or {}
+        mode = str(cfg.get("mode") or "diagnose").strip().lower()
+    except Exception:  # noqa: BLE001 — 配置不可读按默认档
+        mode = "diagnose"
+    return mode if mode in ("off", "diagnose", "block") else "diagnose"
+
+
+def align_formula_bars(stock_data: dict, bar_times: List[datetime], *,
+                       code: str, strategy_id: int) -> Optional[dict]:
+    """逐根日期对齐诊断（P1-1，复用判定价的「标签严格相等」范式）。
+
+    分钟级公式输出的 ``Date`` 只到日（丢时分），因此只能做到「按日严格相等 +
+    日内根数相等」：
+
+    - 公式出现的日期必须是真实 K 线日期（否则 ``date_not_in_klines``）；
+    - 同一日期公式输出根数必须等于该日真实 bar 数（否则
+      ``bar_count_mismatch``），这正是全局索引对齐会漂移的那类问题。
+
+    只返回诊断，不修改入参、不丢弃信号；是否升级为阻断由调用方按档位决定。
+    """
+    if not bar_times:
+        return None
+    bars_by_date: Dict[date, List[datetime]] = {}
+    for bt in bar_times:
+        bars_by_date.setdefault(bt.date(), []).append(bt)
+    problems: List[dict] = []
+    seen_days: set = set()
+    checked_days = 0
+    for var_name, val_list in (stock_data or {}).items():
+        if var_name in _FORMULA_META_KEYS or not isinstance(val_list, list):
+            continue
+        counts: Dict[date, int] = {}
+        for entry in val_list:
+            if not isinstance(entry, dict) or entry.get("Value") is None:
+                continue
+            d = _parse_date_str(entry.get("Date"))
+            if d is None:
+                continue
+            counts[d.date()] = counts.get(d.date(), 0) + 1
+        for day, n in counts.items():
+            if day in seen_days:
+                continue
+            seen_days.add(day)
+            checked_days += 1
+            bars = bars_by_date.get(day)
+            if not bars:
+                problems.append({"day": day.isoformat(),
+                                 "kind": "date_not_in_klines",
+                                 "formula": n, "bars": 0})
+            elif n != len(bars):
+                problems.append({"day": day.isoformat(),
+                                 "kind": "bar_count_mismatch",
+                                 "formula": n, "bars": len(bars)})
+    if not problems:
+        return None
+    return {
+        "strategy_id": strategy_id,
+        "code": code,
+        "checked_days": checked_days,
+        "problem_count": len(problems),
+        "problems": problems[:10],
+    }
 
 
 # 索引对齐周期：TQ 公式输出 Date 只标到日（丢时分），但 bar 时间带时分，
@@ -2721,6 +2895,9 @@ def build_signal_cache(
         # 两键始终初始化，消费方可直接索引（成功时 errors 为空 dict）
         diagnostics.setdefault("errors", {})
         diagnostics.setdefault("output_lines", {})
+    # P1-1：逐根对齐守卫档位（默认 diagnose 只写诊断；block 才丢该 code 信号）
+    _align_mode = formula_align_mode()
+    _align_sink: List[dict] = []
 
     # W-C 按 (formula_id, period) 分组：同组一次 compute（stocks=并集），
     # 转换/诊断按策略拆分——多策略共享公式+周期时把 N 次 TQ 往返降为 1 次
@@ -2803,9 +2980,18 @@ def build_signal_cache(
                 else:
                     diagnostics.setdefault("output_lines", {})[strat.id] = lines
             entries = _convert_formula_output(
-                raw, strat.id, strat_stocks, bar_times_by_code=bt
+                raw, strat.id, strat_stocks, bar_times_by_code=bt,
+                align_sink=_align_sink if _align_mode != "off" else None,
             )
+            if _align_mode == "block" and _align_sink:
+                bad_codes = {d["code"] for d in _align_sink
+                             if d.get("strategy_id") == strat.id}
+                if bad_codes:
+                    entries = {k: v for k, v in entries.items()
+                               if k[1] not in bad_codes}
             cache.update(entries)
+    if diagnostics is not None and _align_sink:
+        diagnostics["align_errors"] = _align_sink
     if start is not None:
         start_ts = datetime(start.year, start.month, start.day)
         cache = {k: v for k, v in cache.items() if k[2] >= start_ts}
@@ -2834,6 +3020,23 @@ def build_signal_warnings(
     errors = diagnostics.get("errors") or {}
     output_lines = diagnostics.get("output_lines") or {}
     warnings: List[str] = []
+    # P1-1：逐根对齐诊断（默认档只提示，不阻断；block 档也在此提示被丢信号）
+    align_errors = diagnostics.get("align_errors") or []
+    for strat in strategies:
+        items = [d for d in align_errors if d.get("strategy_id") == strat.id]
+        if not items:
+            continue
+        period = getattr(strat, "period", "?")
+        total = sum(int(d.get("problem_count") or 0) for d in items)
+        sample = items[0]
+        first = (sample.get("problems") or [{}])[0]
+        warnings.append(
+            f"策略「{strat.name}」({period}) 的分钟级公式输出与 K 线日期未严格对齐："
+            f"{len(items)} 个代码、共 {total} 处"
+            f"（示例 {sample.get('code')} {first.get('day')}：{first.get('kind')}，"
+            f"公式 {first.get('formula')} 根 / K线 {first.get('bars')} 根）。"
+            f"当前档位={formula_align_mode()}，默认只诊断不阻断信号。"
+        )
     for strat in strategies:
         period = getattr(strat, "period", "?")
         if strat.id in errors:
@@ -3227,15 +3430,11 @@ def _persist_result(
 # ---------------------------------------------------------------------------
 # 序列化
 # ---------------------------------------------------------------------------
-def _caliber_stale(record) -> Tuple[bool, Optional[str]]:
-    """派生「口径已过期」（不改历史行、不写库）。
+def caliber_stale_from_snapshot(raw) -> Tuple[bool, Optional[str]]:
+    """纯函数版「口径已过期」判据（供记录序列化与观测汇总共用）。
 
-    口径过期判据（用户拍板 2026-11-23）：
-    - ``dividend_mode != 'exact'``（含快照写入口径字段缺失）；
-    - ``params_snapshot`` 缺 ``price_caliber_version``（新快照实际落在
-      ``price_caliber.version``，两处都认）。
+    ``raw`` 为 ``params_snapshot`` 原值（dict 或 JSON 字符串）。不读库、不写库。
     """
-    raw = getattr(record, "params_snapshot", None)
     if not raw:
         return True, "params_snapshot 缺失"
     snap = raw
@@ -3258,6 +3457,11 @@ def _caliber_stale(record) -> Tuple[bool, Optional[str]]:
     if not reasons:
         return False, None
     return True, "；".join(reasons)
+
+
+def _caliber_stale(record) -> Tuple[bool, Optional[str]]:
+    """记录级包装：口径过期判据见 ``caliber_stale_from_snapshot``。"""
+    return caliber_stale_from_snapshot(getattr(record, "params_snapshot", None))
 
 
 def _serialize_record(r: BacktestRecord) -> dict:
@@ -4809,6 +5013,19 @@ def run_backtest(db: Session, ps: PortfolioStrategy, req,
                 else:
                     setattr(s, field, clamp_perturbed_value(field, base * factor))
 
+    # P0-1（2026-11-23）：回测启动触发一次公司行为漏记检测。后台线程执行、
+    # 只写 corporate_action_diagnostics，失败只告警，绝不阻断/拖慢主链路。
+    try:
+        from core.services.data_observability import trigger_auto_audit
+        from core.services.corporate_action_sync import resolve_backfill_codes
+
+        pool_ids = sorted({s.stock_pool_id for s in strategies if s.stock_pool_id})
+        if pool_ids:
+            scope = resolve_backfill_codes(db, pool_ids=pool_ids)
+            trigger_auto_audit(scope.get("codes") or [], reason="backtest_start")
+    except Exception:  # noqa: BLE001 — 观测触发失败不影响回测
+        logger.warning("回测启动自动审计触发失败（忽略，不影响回测）", exc_info=True)
+
     # 策略级单笔最大买入金额 run 级覆盖（None=跟随各策略配置）：
     # 仅在内存里改策略对象的 max_order_amount，先脱管再赋值（后续 db.commit()
     # 不会把覆盖值 flush 回 strategies 表）。仅本次回测生效，不落任何持久配置。
@@ -5118,6 +5335,14 @@ def run_backtest(db: Session, ps: PortfolioStrategy, req,
             **_kl_kwargs,
         )
         t2 = datetime.now()
+        # P1-5：把数据指纹并入快照['data']（只写元数据，不参与计算）。
+        try:
+            attach_data_fingerprint(
+                rec, build_data_fingerprint(
+                    klines_full, req.start_date, req.end_date))
+            db.commit()
+        except Exception:  # noqa: BLE001 — 指纹写入失败不影响回测
+            logger.warning("数据指纹写入快照失败（忽略，不影响回测）", exc_info=True)
         # B1：1w/1mon 末根周期完整性复核（只打标 + 告警，不改 bar 选择/成交）
         period_warnings = _mark_partial_period_tails(klines_full)
         # 数据量摘要：各周期多少根 bar、多少只股票，帮助判断瓶颈
@@ -5645,6 +5870,8 @@ def run_multi_backtest(db: Session, portfolios: list, req) -> dict:
         for code, periods in (full or {}).items():
             merged.setdefault(code, periods)
     klines_full = _slice_klines_from(merged, start_date)
+    # P1-5：整批共享同一份行情，指纹只需算一次，写入每条子记录快照。
+    _data_fp = build_data_fingerprint(klines_full, start_date, end_date)
     if not klines_full:
         raise ValueError(
             f"未取到任何行情数据：区间 {start_date}~{end_date}，"
@@ -5734,6 +5961,7 @@ def run_multi_backtest(db: Session, portfolios: list, req) -> dict:
                 ),
                 evaluation_profile=evaluation_profile,
             )
+            attach_data_fingerprint(rec, _data_fp)
             db.add(rec)
             db.commit()
             db.refresh(rec)
