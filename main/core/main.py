@@ -37,6 +37,7 @@ from core.engine.live.engine_watchdog import (
     EngineWatchdog, record_channel_decision,
 )
 from core.services.backup_service import BackupScheduler
+from core.services.corporate_action_sync import CorporateActionSyncScheduler
 from core.services.board_auto_refresh import BoardAutoRefreshScheduler
 from core.services.incremental_backtest import IncrementalBacktestScheduler
 from core.services.auto_shutdown import arm as arm_auto_shutdown
@@ -185,6 +186,20 @@ async def lifespan(app: FastAPI):
         except Exception:  # noqa: BLE001 — 调度失败不得阻断交易主服务
             logger.exception("增量回测调度启动失败（主服务继续运行）")
             incr_scheduler = None
+    # 公司行为自动同步（daemon 线程，交易日 15:20 后 P2 窗内只补缺失票）：
+    # 复用覆盖清单做幂等，单票失败下一轮自然重试；被 TQ 闸拒绝只退避不突破。
+    ca_sync_scheduler = None
+    if os.environ.get("TQ_CORPORATE_ACTION_SYNC_SCHEDULER_DISABLED") == "1":
+        logger.info("公司行为同步调度已禁用"
+                    "（TQ_CORPORATE_ACTION_SYNC_SCHEDULER_DISABLED=1）")
+    else:
+        try:
+            ca_sync_scheduler = CorporateActionSyncScheduler()
+            ca_sync_scheduler.start()
+            logger.info("公司行为同步调度已启动（进程内，交易日 15:20 后补缺失）")
+        except Exception:  # noqa: BLE001 — 调度失败不得阻断交易主服务
+            logger.exception("公司行为同步调度启动失败（主服务继续运行）")
+            ca_sync_scheduler = None
     # 决策事件过期归档调度（daemon 线程，每小时）：把超过
     # live.decision_archive_days（默认 7 天）仍 open 的非高危事件标为 archived，
     # 只移出「未处理」计数，不删除；<=0 时调度自身空转（maybe_run 直接返回）。
@@ -216,6 +231,8 @@ async def lifespan(app: FastAPI):
     yield
     if board_scheduler is not None:
         board_scheduler.stop()
+    if ca_sync_scheduler is not None:
+        ca_sync_scheduler.stop()
     if archive_scheduler is not None:
         archive_scheduler.stop()
     if incr_scheduler is not None:

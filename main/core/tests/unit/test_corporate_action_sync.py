@@ -156,3 +156,45 @@ def test_resolve_backfill_codes_unions_pool_records_and_holdings(db_session):
     assert scope["codes"] == ["000001.SZ", "000002.SZ", "300286.SZ"]
     assert scope["pool_ids"] == [1, 2]
     assert scope["holdings"] == ["300286.SZ"]
+
+
+def test_coverage_summary_partitions_pools_and_holdings(db_session):
+    db_session.add_all([
+        StockPool(id=1, code="TQCS", name="成长精选"),
+        StockPool(id=2, code="TQZT", name="题材精选"),
+        StockPoolStock(pool_id=1, stock_code="000001.SZ"),
+        StockPoolStock(pool_id=1, stock_code="000002.SZ"),
+        StockPoolStock(pool_id=1, stock_code="000003.SZ"),
+        StockPoolStock(pool_id=2, stock_code="600211.SH"),
+    ])
+    snapshot = LiveAccountSnapshot(live_session_id=1, engine="tdx",
+                                   captured_at=datetime(2026, 11, 24, 15, 0, 0))
+    db_session.add(snapshot)
+    db_session.flush()
+    db_session.add(LiveAccountPositionSnapshot(
+        snapshot_id=snapshot.id, stock_code="600000.SH", quantity=100))
+    db_session.add(CorporateAction(code="600211.SH", event_type="dividend",
+                                   ex_date=date(2026, 9, 15),
+                                   cash_per_share=1.146))
+    db_session.commit()
+
+    cas._mark_coverage("000001.SZ", "covered")
+    cas._mark_coverage("000002.SZ", "no_events")
+    cas._mark_coverage("000003.SZ", "failed")
+
+    summary = cas.coverage_summary(db_session, pool_ids=[1, 2])
+
+    by_id = {p["pool_id"]: p for p in summary["pools"]}
+    assert by_id[1] == {
+        "pool_id": 1, "pool_name": "成长精选", "total": 3,
+        "covered": 1, "no_events": 1, "failed": 1, "missing": 0,
+    }
+    assert by_id[2]["covered"] == 1 and by_id[2]["missing"] == 0
+
+    # 池外持仓单列：未回填 → missing（不混进池合计）
+    assert summary["holdings"]["codes"] == ["600000.SH"]
+    assert summary["holdings"]["missing"] == 1
+    assert summary["totals"] == {
+        "total": 5, "covered": 2, "no_events": 1, "failed": 1, "missing": 1,
+    }
+    assert "last_sync" in summary and "scheduler" in summary

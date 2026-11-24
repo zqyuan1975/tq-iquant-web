@@ -23,10 +23,11 @@ from __future__ import annotations
 import json
 import logging
 import os
-from datetime import date, datetime
+import threading
+from datetime import date, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Set
+from typing import Callable, Dict, Iterable, List, Optional, Set
 
 from sqlalchemy.orm import Session
 
@@ -408,3 +409,420 @@ def resolve_backfill_codes(db: Session, pool_ids: Iterable[int] = (1,)) -> dict:
                    | set(holdings))
     return {"codes": codes, "by_pool": by_pool, "holdings": holdings,
             "pool_ids": sorted(pools)}
+
+
+# ---------------------------------------------------------------- 同步状态
+# 定时/手工/CLI 共用一份「最近一次同步」状态，供运维页展示与跨重启当日判重。
+# 与覆盖清单同目录、同样纯 JSON 原子写：不新增表/迁移，避免多进程写库风险。
+STATE_FILE_NAME = "corporate_actions_sync_state.json"
+DEFAULT_SYNC_ENABLED = True
+DEFAULT_SYNC_DAILY_AT = "15:20"
+DEFAULT_SYNC_RETRY_MINUTES = 30
+#: 被 TQ 闸（P0/交易窗口）拒绝时的短退避：不记失败，几分钟后自动再试。
+GATE_RETRY_MINUTES = 5
+
+#: 进程内同步互斥：定时与手工同时触发时后来者直接让路（不排队、不重复打 TQ）。
+SYNC_LOCK = threading.Lock()
+
+
+def try_acquire_sync() -> bool:
+    """非阻塞抢同步锁；返回 False 表示已有同步在跑。"""
+    return SYNC_LOCK.acquire(blocking=False)
+
+
+def release_sync() -> None:
+    try:
+        SYNC_LOCK.release()
+    except RuntimeError:
+        pass
+
+
+def sync_state_path() -> Path:
+    from core.db import _db_path
+    return _db_path().parent / STATE_FILE_NAME
+
+
+def read_sync_state(path: Optional[Path] = None) -> dict:
+    target = Path(path) if path else sync_state_path()
+    try:
+        data = json.loads(target.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _write_sync_state(data: dict, path: Optional[Path] = None) -> None:
+    target = Path(path) if path else sync_state_path()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    tmp = target.with_name(target.name + ".tmp")
+    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=1, sort_keys=True),
+                   encoding="utf-8")
+    os.replace(tmp, target)
+
+
+def record_sync_state(trigger: str, status: str, result: Optional[dict] = None,
+                      scope: Optional[dict] = None,
+                      message: Optional[str] = None,
+                      path: Optional[Path] = None,
+                      now: Optional[datetime] = None) -> dict:
+    """记录一次同步结果（失败只告警，不影响同步本身）。
+
+    ``last_success_date`` 仅在「无 failed」的成功/跳过时推进，定时调度据此
+    做当日判重；部分失败留待下一轮只补失败票。
+    """
+    now = now or datetime.now()
+    prev = read_sync_state(path)
+    result = result or {}
+    failed = list(result.get("failed") or [])
+    payload = {
+        "last_run_at": now.isoformat(timespec="seconds"),
+        "last_success_date": prev.get("last_success_date"),
+        "trigger": trigger,
+        "status": status,
+        "result": {
+            "requested": int(result.get("requested") or 0),
+            "covered": len(result.get("covered") or []),
+            "no_events": len(result.get("no_events") or []),
+            "failed": failed,
+            "added": int(result.get("added") or 0),
+            "updated": int(result.get("updated") or 0),
+            "rights": int(result.get("rights") or 0),
+        },
+        "scope": scope or {},
+        "message": message,
+    }
+    if status in ("success", "skipped") and not failed:
+        payload["last_success_date"] = now.date().isoformat()
+    try:
+        _write_sync_state(payload, path)
+    except OSError:
+        logger.warning("公司行为同步状态写入失败（忽略，不影响同步结果）",
+                       exc_info=True)
+    return payload
+
+
+DEFAULT_SYNC_CONFIG: dict = {
+    "enabled": DEFAULT_SYNC_ENABLED,
+    "daily_at": DEFAULT_SYNC_DAILY_AT,
+    "retry_cooldown_minutes": DEFAULT_SYNC_RETRY_MINUTES,
+}
+
+
+def _parse_hm(raw, default: str) -> tuple:
+    try:
+        hh, mm = str(raw or "").strip().split(":")
+        hh, mm = int(hh), int(mm)
+        if 0 <= hh <= 23 and 0 <= mm <= 59:
+            return hh, mm
+    except (TypeError, ValueError):
+        pass
+    hh, mm = default.split(":")
+    return int(hh), int(mm)
+
+
+def sync_settings(overrides: Optional[dict] = None) -> dict:
+    """读取 ``corporate_action_sync`` 配置；缺省/非法回退默认（同 audit_config）。"""
+    cfg = dict(DEFAULT_SYNC_CONFIG)
+    if overrides is None:
+        try:
+            from core.config import load_config
+            section = (load_config() or {}).get("corporate_action_sync")
+        except Exception:  # noqa: BLE001 — 配置读不到就按默认值
+            logger.debug("公司行为同步配置读取失败，使用默认值", exc_info=True)
+            section = None
+        overrides = section if isinstance(section, dict) else {}
+    cfg["enabled"] = bool(overrides.get("enabled", DEFAULT_SYNC_ENABLED))
+    cfg["daily_at"] = str(overrides.get("daily_at") or DEFAULT_SYNC_DAILY_AT)
+    cfg["daily_at_hm"] = _parse_hm(cfg["daily_at"], DEFAULT_SYNC_DAILY_AT)
+    try:
+        cooldown = int(overrides.get(
+            "retry_cooldown_minutes", DEFAULT_SYNC_RETRY_MINUTES))
+    except (TypeError, ValueError):
+        cooldown = DEFAULT_SYNC_RETRY_MINUTES
+    cfg["retry_cooldown_minutes"] = cooldown if cooldown > 0 else DEFAULT_SYNC_RETRY_MINUTES
+    return cfg
+
+
+def all_pool_ids(db: Session) -> List[int]:
+    from core.models import StockPool
+
+    return [int(pid) for (pid,) in db.query(StockPool.id).order_by(StockPool.id).all()]
+
+
+def _coverage_buckets(db: Session) -> tuple:
+    """返回 (status_by_code, codes_with_events)，供覆盖统计一次算完。"""
+    from core.models import CorporateAction
+
+    status_by_code = {
+        code: str(item.get("status") or "")
+        for code, item in _read_coverage().items() if isinstance(item, dict)
+    }
+    try:
+        rows = db.query(CorporateAction.code).distinct().all()
+        codes_with_events = {row[0] for row in rows}
+    except Exception:  # noqa: BLE001 — 读事件表失败按未覆盖处理
+        logger.warning("公司行为覆盖统计读取事件表失败（按未覆盖处理）",
+                       exc_info=True)
+        codes_with_events = set()
+    return status_by_code, codes_with_events
+
+
+def _bucket_counts(codes: Iterable[str], status_by_code: dict,
+                   codes_with_events: Set[str]) -> dict:
+    out = {"total": 0, "covered": 0, "no_events": 0, "failed": 0, "missing": 0}
+    for code in codes:
+        out["total"] += 1
+        status = status_by_code.get(code) or ""
+        if status == "covered" or code in codes_with_events:
+            out["covered"] += 1
+        elif status == "no_events":
+            out["no_events"] += 1
+        elif status == "failed":
+            out["failed"] += 1
+        else:
+            out["missing"] += 1
+    return out
+
+
+def coverage_summary(db: Session, pool_ids: Optional[Iterable[int]] = None) -> dict:
+    """覆盖统计（只读、零 TQ 调用）：分池 + 持仓 + 最近同步 + 调度状态。
+
+    四类严格分割：有事件行 / status=covered → covered；status=no_events →
+    no_events；status=failed → failed；其余 → missing（与
+    ``missing_coverage_codes`` 的判定保持一致）。
+    """
+    from core.models import StockPool, StockPoolStock
+
+    wanted = sorted({int(p) for p in (pool_ids or all_pool_ids(db))})
+    status_by_code, codes_with_events = _coverage_buckets(db)
+
+    names = dict(db.query(StockPool.id, StockPool.name).all())
+    by_pool: Dict[int, List[str]] = {}
+    if wanted:
+        rows = (db.query(StockPoolStock.pool_id, StockPoolStock.stock_code)
+                .filter(StockPoolStock.pool_id.in_(wanted))
+                .order_by(StockPoolStock.pool_id, StockPoolStock.stock_code).all())
+        for pool_id, code in rows:
+            by_pool.setdefault(int(pool_id), []).append(str(code))
+
+    pools = []
+    for pid in wanted:
+        counts = _bucket_counts(by_pool.get(pid, []), status_by_code,
+                                codes_with_events)
+        counts.update({"pool_id": pid, "pool_name": names.get(pid) or "池 %s" % pid})
+        pools.append(counts)
+
+    # 持仓（各会话最新快照 quantity>0）：不在池内时单列，避免漏看真实持仓缺口。
+    from sqlalchemy import func
+
+    from core.models import LiveAccountPositionSnapshot, LiveAccountSnapshot
+
+    latest_ids = [
+        sid for (_, sid) in
+        db.query(LiveAccountSnapshot.live_session_id,
+                 func.max(LiveAccountSnapshot.id))
+        .group_by(LiveAccountSnapshot.live_session_id).all()
+    ]
+    holdings: List[str] = []
+    if latest_ids:
+        rows = (db.query(LiveAccountPositionSnapshot.stock_code)
+                .filter(LiveAccountPositionSnapshot.snapshot_id.in_(latest_ids),
+                        LiveAccountPositionSnapshot.quantity > 0)
+                .distinct().all())
+        holdings = sorted(str(row[0]) for row in rows)
+    in_pools = {code for bucket in by_pool.values() for code in bucket}
+    holdings_only = [code for code in holdings if code not in in_pools]
+
+    totals = {"total": 0, "covered": 0, "no_events": 0, "failed": 0, "missing": 0}
+    for item in pools:
+        for key in totals:
+            totals[key] += int(item[key])
+    holdings_counts = _bucket_counts(holdings_only, status_by_code,
+                                     codes_with_events)
+    for key in totals:
+        totals[key] += int(holdings_counts[key])
+
+    scheduler = sync_settings()
+    try:
+        from core.tq import gate as tq_gate
+        policy = tq_gate.evaluate_policy()
+        next_open = policy.get("next_p2_open_at")
+        scheduler_view = {
+            "enabled": bool(scheduler["enabled"]),
+            "daily_at": scheduler["daily_at"],
+            "p2_allowed": bool(policy.get("p2_allowed")),
+            "next_p2_open_at": (next_open.isoformat()
+                                if hasattr(next_open, "isoformat") else None),
+        }
+    except Exception:  # noqa: BLE001 — 闸状态读不到不影响只读统计
+        logger.debug("TQ 闸状态读取失败（覆盖统计降级）", exc_info=True)
+        scheduler_view = {
+            "enabled": bool(scheduler["enabled"]),
+            "daily_at": scheduler["daily_at"],
+            "p2_allowed": None,
+            "next_p2_open_at": None,
+        }
+
+    return {
+        "pools": pools,
+        "holdings": dict(holdings_counts, codes=holdings_only),
+        "totals": totals,
+        "last_sync": read_sync_state(),
+        "scheduler": scheduler_view,
+        "generated_at": datetime.now().isoformat(timespec="seconds"),
+    }
+
+
+class CorporateActionSyncScheduler:
+    """进程内每交易日自动补公司行为（daemon 线程，60s 轮询）。
+
+    只在 P2 放行窗内跑（默认 15:20，晚于收盘放行 15:15）；范围 = 全部股票池
+    ∪ 回测涉及池 ∪ 最新快照持仓，再过滤 ``missing_coverage_codes``，因此
+    「已覆盖的票跳过、只补缺失」天然幂等。单票失败已在
+    ``sync_corporate_actions`` 内记 ``failed`` 且当次不重试，下一轮自然重试；
+    被 TQ 闸拒绝按短退避等待，不突破闸门。
+    """
+
+    def __init__(self, *, cfg_provider: Optional[Callable[[], dict]] = None,
+                 session_factory=None,
+                 now_fn: Optional[Callable[[], datetime]] = None,
+                 interval_seconds: float = 60.0):
+        self._cfg = cfg_provider or _load_sync_section
+        if session_factory is None:
+            from core.db import SessionLocal
+            session_factory = SessionLocal
+        self._session_factory = session_factory
+        if now_fn is None:
+            from core.engine.live.timing import now_shanghai
+            now_fn = now_shanghai
+        self._now = now_fn
+        self._interval = max(float(interval_seconds), 5.0)
+        self._stop = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+        self._lock = threading.Lock()
+        self._last_attempt_at: Optional[datetime] = None
+        self._last_attempt_ok = False
+        self._next_attempt_at: Optional[datetime] = None
+
+    def start(self) -> None:
+        with self._lock:
+            if self._thread is not None and self._thread.is_alive():
+                return
+            self._stop.clear()
+            self._thread = threading.Thread(
+                target=self._loop, name="corporate-action-sync-scheduler",
+                daemon=True)
+            self._thread.start()
+
+    def stop(self, timeout: float = 2.0) -> None:
+        self._stop.set()
+        thread = self._thread
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=timeout)
+        self._thread = None
+
+    def _loop(self) -> None:
+        while not self._stop.is_set():
+            try:
+                self.maybe_run()
+            except Exception:  # noqa: BLE001 — 调度失败不得拖垮进程
+                logger.exception("公司行为自动同步调度异常（下轮重试）")
+            if self._stop.wait(self._interval):
+                break
+
+    def maybe_run(self) -> Optional[dict]:
+        """单次检查（测试直接调用）：未启用/未到点/非交易日/已完成 → None。"""
+        settings = sync_settings(self._cfg())
+        if not settings["enabled"]:
+            return None
+        now = self._now()
+        if (now.hour, now.minute) < settings["daily_at_hm"]:
+            return None
+        from core.tq.gate import is_trading_day
+
+        if not is_trading_day(now.date()):
+            return None
+        today = now.date().isoformat()
+        if read_sync_state().get("last_success_date") == today:
+            return None
+        if (self._last_attempt_ok and self._last_attempt_at is not None
+                and self._last_attempt_at.date() == now.date()):
+            return None
+        if self._next_attempt_at is not None and now < self._next_attempt_at:
+            return None
+
+        from core.tq import gate as tq_gate
+
+        if not tq_gate.evaluate_policy().get("p2_allowed"):
+            self._next_attempt_at = now + timedelta(minutes=GATE_RETRY_MINUTES)
+            logger.info("公司行为自动同步等待 P2 放行（%s），%d 分钟后重试",
+                        now.strftime("%Y-%m-%d %H:%M"), GATE_RETRY_MINUTES)
+            return {"status": "deferred", "reason": "p2_blocked"}
+
+        if not try_acquire_sync():
+            self._next_attempt_at = now + timedelta(minutes=GATE_RETRY_MINUTES)
+            logger.info("公司行为同步正在进行中，本轮让路，%d 分钟后重试",
+                        GATE_RETRY_MINUTES)
+            return {"status": "deferred", "reason": "busy"}
+
+        from core.tq.gate import P2, TdxTaskBlocked, tdx_priority
+
+        try:
+            with self._session_factory() as db:
+                scope = resolve_backfill_codes(db, pool_ids=all_pool_ids(db))
+                missing = missing_coverage_codes(db, scope["codes"])
+                scope_view = {
+                    "pool_ids": scope["pool_ids"],
+                    "pool_counts": {str(k): len(v)
+                                    for k, v in scope["by_pool"].items()},
+                    "holdings": len(scope["holdings"]),
+                    "missing": len(missing),
+                }
+                if not missing:
+                    record_sync_state("scheduled", "skipped", scope=scope_view,
+                                      message="无缺失代码", now=now)
+                    self._last_attempt_at = now
+                    self._last_attempt_ok = True
+                    return {"status": "skipped", "missing": 0}
+                logger.info("开始公司行为自动同步：缺失 %d 只（%s）",
+                            len(missing), now.strftime("%Y-%m-%d %H:%M"))
+                try:
+                    with tdx_priority(P2):
+                        result = sync_corporate_actions(db, missing)
+                except TdxTaskBlocked:
+                    self._next_attempt_at = now + timedelta(
+                        minutes=GATE_RETRY_MINUTES)
+                    logger.info("公司行为自动同步被 TQ 闸拒绝（交易时段），"
+                                "%d 分钟后重试", GATE_RETRY_MINUTES)
+                    return {"status": "deferred", "reason": "gate_blocked"}
+                status = "failed" if result["failed"] else "success"
+                record_sync_state("scheduled", status, result=result,
+                                  scope=scope_view, now=now)
+                self._last_attempt_at = now
+                self._last_attempt_ok = status == "success"
+                if status == "failed":
+                    self._next_attempt_at = now + timedelta(
+                        minutes=settings["retry_cooldown_minutes"])
+                logger.info("公司行为自动同步完成：requested=%d added=%d "
+                            "updated=%d failed=%d", result["requested"],
+                            result["added"], result["updated"],
+                            len(result["failed"]))
+                return dict(result, status=status)
+        finally:
+            release_sync()
+
+
+def _load_config() -> dict:
+    from core.config import load_config
+    return load_config()
+
+
+def _load_sync_section() -> dict:
+    """调度默认配置来源：只取 ``corporate_action_sync`` 段（缺省回退默认值）。"""
+    try:
+        cfg = _load_config()
+    except Exception:  # noqa: BLE001 — 配置读不到按默认值跑
+        return {}
+    section = cfg.get("corporate_action_sync") if isinstance(cfg, dict) else None
+    return section if isinstance(section, dict) else {}
+

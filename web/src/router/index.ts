@@ -19,6 +19,7 @@ const router = createRouter({
     { path: '/events', name: 'events', component: () => import('../views/EventSearch.vue') },
     { path: '/troubleshooting', name: 'troubleshooting', component: () => import('../views/Troubleshooting.vue') },
     { path: '/system', name: 'system', component: () => import('../views/SystemConfig.vue') },
+    { path: '/corporate-action', name: 'corporate-action', component: () => import('../views/CorporateActionSync.vue') },
     { path: '/guide', name: 'guide', component: () => import('../views/Guide.vue') },
   ],
 })

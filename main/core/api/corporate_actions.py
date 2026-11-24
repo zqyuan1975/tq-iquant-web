@@ -51,6 +51,8 @@ class SyncReq(BaseModel):
     pool_ids: Optional[List[int]] = None
     start: str = ""
     end: str = ""
+    # 只补「未回填」的代码（默认 False = 保持既有行为：按传入范围全量刷新）
+    only_missing: bool = False
 
 
 class AuditReq(BaseModel):
@@ -96,11 +98,23 @@ def create_corporate_action(req: CorporateActionReq, db: Session = Depends(get_d
         return err(409, str(exc))
 
 
+def _scope_view(scope: Optional[dict], missing: Optional[int] = None) -> dict:
+    view = {
+        "pool_ids": scope["pool_ids"],
+        "pool_counts": {str(k): len(v) for k, v in scope["by_pool"].items()},
+        "holdings": scope["holdings"],
+    }
+    if missing is not None:
+        view["missing_filtered"] = int(missing)
+    return view
+
+
 @router.post("/sync")
 def sync_from_tdx(req: SyncReq, db: Session = Depends(get_db)):
     """从通达信批量回填公司行为（逐票独立成败，不阻塞其它票）。"""
     from core.services.corporate_action_sync import (
-        resolve_backfill_codes, sync_corporate_actions,
+        missing_coverage_codes, record_sync_state, release_sync,
+        resolve_backfill_codes, sync_corporate_actions, try_acquire_sync,
     )
     from core.tq import gate as tq_gate
     from core.tq.gate import P2, tdx_priority
@@ -111,22 +125,58 @@ def sync_from_tdx(req: SyncReq, db: Session = Depends(get_db)):
         return err(409, "公司行为回填在交易时段暂停（实盘优先），%s 后可用"
                    % (nxt.strftime("%m-%d %H:%M") if nxt else "收盘后"))
 
-    codes = req.codes or []
+    codes = [str(c).strip() for c in (req.codes or []) if str(c).strip()]
     scope = None
+    missing_filtered = None
     if not codes:
         scope = resolve_backfill_codes(db, pool_ids=req.pool_ids or [1])
         codes = scope["codes"]
+    if req.only_missing:
+        missing = missing_coverage_codes(db, codes)
+        missing_filtered = len(missing)
+        codes = missing
+        if not codes:
+            return ok({"requested": 0, "covered": [], "no_events": [],
+                       "failed": [], "added": 0, "updated": 0, "rights": 0,
+                       "missing_filtered": 0, "skipped": True,
+                       "message": "当前无缺失代码，无需同步"})
     if not codes:
         return err(400, "回填范围为空：请显式传 codes 或先导入股票池")
-    with tdx_priority(P2):
-        result = sync_corporate_actions(db, codes, start=req.start, end=req.end)
-    if scope is not None:
-        result["scope"] = {
-            "pool_ids": scope["pool_ids"],
-            "pool_counts": {str(k): len(v) for k, v in scope["by_pool"].items()},
-            "holdings": scope["holdings"],
-        }
+
+    if not try_acquire_sync():
+        return err(409, "公司行为同步正在进行中，请稍后刷新结果")
+
+    try:
+        with tdx_priority(P2):
+            result = sync_corporate_actions(db, codes, start=req.start, end=req.end)
+    finally:
+        release_sync()
+
+    scope_view = _scope_view(scope, missing_filtered) if scope is not None else None
+    record_sync_state(
+        "manual", "failed" if result["failed"] else "success",
+        result=result, scope=scope_view,
+        message="only_missing" if req.only_missing else None)
+    if scope_view is not None:
+        result["scope"] = scope_view
+    elif missing_filtered is not None:
+        result["missing_filtered"] = missing_filtered
     return ok(result)
+
+
+@router.get("/coverage")
+def get_coverage(db: Session = Depends(get_db), pool_ids: Optional[str] = None):
+    """公司行为覆盖统计（只读、零 TQ 调用）：分池 covered/no_events/failed/missing
+    + 最近一次同步结果 + 调度状态。``pool_ids`` 支持逗号分隔，留空 = 全部池。"""
+    from core.services.corporate_action_sync import coverage_summary
+
+    wanted: Optional[List[int]] = None
+    if pool_ids:
+        try:
+            wanted = [int(x) for x in pool_ids.split(",") if x.strip()]
+        except ValueError:
+            return err(400, "pool_ids 应为逗号分隔的整数")
+    return ok(coverage_summary(db, pool_ids=wanted))
 
 
 @router.get("/diagnostics")
