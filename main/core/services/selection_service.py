@@ -18,6 +18,7 @@ from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from core.models.selection import SelectionScheme, SelectionSchemeVersion
+from core.selection.engine import DEFAULT_PE_MODE, PE_MODES
 from core.selection.field_dict import (
     FIELD_SET_VERSION, assert_scorable, field_set_fingerprint, get_field)
 
@@ -84,6 +85,9 @@ def spec_fingerprint(spec: dict) -> str:
 
 def default_spec(pool_key: str) -> dict:
     """返回带默认闸门的参数模板（深拷贝，调用方可直接改）。"""
+    if pool_key.startswith(INDUSTRY_PREFIX):
+        from core.selection import sector_pools
+        return sector_pools.default_spec(pool_key)
     base = DEFAULT_SPECS.get(pool_key)
     if base is None:
         raise SpecError("暂不支持该池的默认参数：%s" % pool_key)
@@ -91,6 +95,8 @@ def default_spec(pool_key: str) -> dict:
     spec["gates"] = dict(DEFAULT_GATES)
     #: 默认做行业+市值中性化（版本参数的一部分，可随版本回退）
     spec["neutralize"] = True
+    #: PE 处理口径：strict=现值（PE<=0 全挡）；loss_discount=亏损股进候选但降权
+    spec["pe_mode"] = DEFAULT_PE_MODE
     return spec
 
 
@@ -141,10 +147,27 @@ def validate_spec(spec: dict) -> dict:
     if not (pool in POOL_KEYS or pool.startswith(INDUSTRY_PREFIX)):
         raise SpecError("pool_key 非法：%r" % pool)
 
-    _check_weights(spec.get("weights"), "weights")
+    industry = pool.startswith(INDUSTRY_PREFIX)
+    industry_def: Dict = {}
+    if industry:
+        from core.selection import sector_pools
+        try:
+            industry_def = sector_pools.get_pool(pool)
+        except sector_pools.SectorPoolError as exc:
+            raise SpecError(str(exc)) from None
+    # 金融地产只分组、L2 标签池沿用个股 L1 权重 → 都不要求自带权重
+    group_only = bool(spec.get("group_only")
+                      or (industry and industry_def.get("group_only")))
+    cross_pool = bool(spec.get("cross_pool")
+                      or (industry and industry_def.get("cross_pool")))
+    if not (group_only or cross_pool):
+        _check_weights(spec.get("weights"), "weights")
+    elif spec.get("weights"):
+        _check_weights(spec["weights"], "weights")
 
+    supports_track = pool == "growth" or bool(industry and industry_def.get("track"))
     track = spec.get("track", "both")
-    if pool == "growth":
+    if supports_track:
         if track not in TRACKS:
             raise SpecError("track 必须是 %s 之一" % "/".join(TRACKS))
         # 只有 both 需要历史轨权重；forward/historical 单轨时 weights 即该轨权重
@@ -153,7 +176,7 @@ def validate_spec(spec: dict) -> dict:
         elif spec.get("weights_hist"):
             _check_weights(spec["weights_hist"], "weights_hist")
     elif "track" in spec:
-        raise SpecError("只有成长池支持 track")
+        raise SpecError("只有成长池/科技行业池支持 track")
 
     top_n = spec.get("top_n", 100)
     if isinstance(top_n, bool) or not isinstance(top_n, int) or not 1 <= top_n <= 1000:
@@ -161,6 +184,10 @@ def validate_spec(spec: dict) -> dict:
 
     if "neutralize" in spec and not isinstance(spec["neutralize"], bool):
         raise SpecError("neutralize 必须是布尔值")
+
+    pe_mode = spec.get("pe_mode", DEFAULT_PE_MODE)
+    if pe_mode not in PE_MODES:
+        raise SpecError("pe_mode 必须是 %s 之一" % "/".join(PE_MODES))
 
     gates = spec.get("gates", {})
     _check_gates(gates)
@@ -292,6 +319,47 @@ def version_payload(version: SelectionSchemeVersion) -> Dict:
         "note": version.note,
         "created_at": version.created_at.isoformat() if version.created_at else None,
     }
+
+
+def seed_industry_schemes(db: Session) -> int:
+    """幂等种子：9 个 L1 主池 + 14 个 L2 标签池，各建方案与 v1 版本。
+
+    金融地产 v1 只分组不打分（权重为空），L2 池沿用个股所属 L1 权重，
+    两者都在 spec 里显式标记，避免被误当成「权重缺失」。
+    """
+    from core.selection import sector_pools
+
+    created = 0
+    for item in sector_pools.pools_payload():
+        scheme = db.query(SelectionScheme).filter_by(code=item["code"]).first()
+        if scheme is None:
+            desc = "行业%s池：%s" % (
+                "标签" if item["kind"] == "l2" else "主",
+                sector_pools.get_pool(item["key"]).get("description") or "")
+            scheme = SelectionScheme(
+                code=item["code"], name="行业·" + item["label"],
+                pool_key=item["key"], description=desc[:300],
+                status="active")
+            db.add(scheme)
+            db.flush()
+            created += 1
+        if db.query(SelectionSchemeVersion).filter_by(scheme_id=scheme.id).first():
+            continue
+        spec = sector_pools.default_spec(item["key"])
+        validate_spec(spec)
+        fields = sorted(set(spec.get("weights") or {})
+                        | set(spec.get("weights_hist") or {}))
+        db.add(SelectionSchemeVersion(
+            scheme_id=scheme.id, version=1,
+            spec_json=_dump(spec), spec_hash=spec_fingerprint(spec),
+            field_set_version=FIELD_SET_VERSION,
+            field_fingerprint=field_set_fingerprint(fields),
+            weight_sum=sum(float(w) for w in (spec.get("weights") or {}).values()),
+            uncalibrated=True, status="active",
+            note="行业池内置 v1（未校准）",
+        ))
+    db.commit()
+    return created
 
 
 def seed_default_schemes(db: Session) -> int:

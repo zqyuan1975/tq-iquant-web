@@ -206,8 +206,27 @@ def create_scheme(req: SchemeReq, db: Session = Depends(get_db)):
 
 @router.post("/schemes/seed")
 def seed_schemes(db: Session = Depends(get_db)):
-    """幂等种子：四风格池各建一个空方案（不含版本）。"""
-    return ok({"created": svc.seed_default_schemes(db)})
+    """幂等种子：四风格池 + 9 个行业 L1 主池 + 14 个 L2 标签池。"""
+    created = svc.seed_default_schemes(db)
+    industry_created = svc.seed_industry_schemes(db)
+    return ok({"created": created, "industry_created": industry_created})
+
+
+@router.post("/industry/refresh")
+def refresh_industry(db: Session = Depends(get_db)):
+    """按当前导入仓刷新行业归属（幂等，只补缺失 as_of 行）。"""
+    from core.selection import sector_pools
+
+    meta = engine.warehouse_meta(db)
+    if meta is None:
+        return err(400, "尚未导入宽库：请先在「数据体检」执行导入")
+    try:
+        added = sector_pools.refresh_membership(db, meta.as_of)
+    except Exception as exc:  # pragma: no cover - 防御性
+        db.rollback()
+        return err(500, "刷新行业归属失败：%s" % exc)
+    return ok({"as_of": meta.as_of.isoformat(), "added": added,
+               "counts": sector_pools.membership_counts(db, meta.as_of)})
 
 
 @router.get("/schemes/{scheme_id}")

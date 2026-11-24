@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, reactive, ref } from 'vue'
+import { computed, onMounted, onUnmounted, reactive, ref } from 'vue'
 import PageHeader from '../components/PageHeader.vue'
 import {
   activateSelectionVersion,
@@ -11,6 +11,7 @@ import {
   deliverSelection,
   freezeSelectionSnapshot,
   getSelectionDataStatus,
+  getSelectionBuildStatus,
   getSelectionDefaults,
   getSelectionFactorValidation,
   getSelectionFormulas,
@@ -29,8 +30,10 @@ import {
   publishSelectionSnapshot,
   resolveSelectionPool,
   seedSelectionSchemes,
+  startSelectionBuild,
   unbindSelectionSession,
   type SelectionBindResult,
+  type SelectionBuildStatus,
   type SelectionDataStatus,
   type SelectionDeliverResult,
   type SelectionFactorValidation,
@@ -54,6 +57,14 @@ import {
   type SelectionVersionItem,
   type WideDbStatus,
 } from '../api'
+import {
+  POOL_GROUPS,
+  groupPoolItems,
+  optgroupLabel,
+  poolGroupKey,
+  poolKeyFromCode,
+  poolLabel,
+} from '../utils/selectionPoolGroups'
 
 type TabKey = 'schemes' | 'filters' | 'results' | 'snapshots' | 'data'
 
@@ -64,10 +75,6 @@ const TABS: { key: TabKey; label: string }[] = [
   { key: 'snapshots', label: '快照与历史' },
   { key: 'data', label: '数据体检' },
 ]
-
-const POOL_LABEL: Record<string, string> = {
-  growth: '成长', quality: '质量', value: '价值', dividend: '红利',
-}
 
 const TRACK_LABEL: Record<string, string> = {
   both: '双轨（前瞻+历史）', forward: '仅前瞻', historical: '仅历史',
@@ -106,6 +113,15 @@ const meta = ref<SelectionMeta | null>(null)
 const schemes = ref<SelectionSchemeItem[]>([])
 const defaults = ref<Record<string, SelectionSpec>>({})
 const wideDb = ref<WideDbStatus | null>(null)
+const buildStatus = ref<SelectionBuildStatus | null>(null)
+const buildStarting = ref(false)
+const buildMode = ref<'incremental' | 'full'>('incremental')
+let buildTimer: number | undefined
+
+const BUILD_PHASE_LABEL: Record<string, string> = {
+  universe: '名单', profile: '估值/市值', fin: '财报', dividend: '分红',
+  sector: '行业归属', daily: '日线回补', publish: '发布 as_of',
+}
 
 const selected = ref<{
   id: number; code: string; name: string; pool_key: string
@@ -121,10 +137,17 @@ const editor = reactive({
   weights: {} as Record<string, number>,
   weights_hist: {} as Record<string, number>,
   gates: {} as Record<string, number>,
+  pe_mode: 'strict' as 'strict' | 'loss_discount',
   note: '',
 })
+
+const PE_MODE_LABEL: Record<string, string> = {
+  strict: '严格（PE≤0 一律挡在候选外）',
+  loss_discount: '亏损股降权（PE≤0 进候选，按亏损幅度打折）',
+}
 const addFieldKey = ref('')
 const saving = ref(false)
+const seeding = ref(false)
 
 // 运行与结果
 const running = ref(false)
@@ -186,25 +209,116 @@ const activeVersion = computed<SelectionVersionItem | null>(() => {
   return selected.value.versions.find((v) => v.status === 'active') || null
 })
 
+const industryPools = computed(() => meta.value?.industry_pools || [])
+const industryPoolMap = computed(
+  () => new Map(industryPools.value.map((p) => [p.key, p])))
+const poolOptions = computed(() => [
+  ...(meta.value?.pools || []),
+  ...industryPools.value.map((p) => p.key),
+])
+const industryMembershipText = computed(() => {
+  const counts = meta.value?.industry_membership || {}
+  const keys = Object.keys(counts)
+  if (!keys.length) return ''
+  const order = ['周期', '消费', '科技', '医药', '高端制造', '金融地产',
+    '公用事业', '农业', '其他综合']
+  return order.filter((k) => k in counts)
+    .map((k) => `${k} ${counts[k]}`).join(' · ')
+})
+
+function isGroupOnlyPool(key: string | null | undefined): boolean {
+  if (!key) return false
+  const def = industryPoolMap.value.get(key)
+  return Boolean(def?.group_only || def?.kind === 'l2')
+}
+
+/**
+ * 方案列表分组：因子风格 → 行业·一级 → 行业·二级标签。
+ * 组内保持后端返回顺序，不跨组混排；折叠状态落在 localStorage，刷新/切换
+ * Tab/操作后仍保持，默认全部展开。
+ */
+const SCHEME_GROUP_STORAGE = 'selection:scheme-groups-collapsed'
+const collapsedGroups = ref<Record<string, boolean>>(loadCollapsedGroups())
+
+function loadCollapsedGroups(): Record<string, boolean> {
+  try {
+    const raw = localStorage.getItem(SCHEME_GROUP_STORAGE)
+    return raw ? JSON.parse(raw) : {}
+  } catch {
+    return {}
+  }
+}
+
+function toggleSchemeGroup(key: string) {
+  const next = { ...collapsedGroups.value, [key]: !collapsedGroups.value[key] }
+  if (!next[key]) delete next[key]
+  collapsedGroups.value = next
+  try {
+    localStorage.setItem(SCHEME_GROUP_STORAGE, JSON.stringify(next))
+  } catch {
+    /* 隐私模式等存储不可用时只影响持久化，不影响本次折叠 */
+  }
+}
+
+/**
+ * 列表分组：列表非空时三组恒定输出（空组 items=[]，便于表头/下拉结构稳定），
+ * 列表为空时交给各表自己的空态提示，不再渲染三行 0 条组头。
+ */
+function pooledGroups<T>(items: T[], keyOf: (item: T) => string | null | undefined) {
+  return items.length ? groupPoolItems(items, keyOf, true, true) : []
+}
+
+const schemeGroups = computed(() =>
+  pooledGroups(schemes.value, (s) => s.pool_key))
+
+/** 运行列表 / 快照列表 / 池列表共用同一套分组定义。 */
+const runGroups = computed(() => pooledGroups(runs.value, (r) => r.pool_key))
+const snapshotGroups = computed(() =>
+  pooledGroups(snapshots.value, (s) => s.pool_key))
+const poolGroups = computed(() =>
+  pooledGroups(pools.value, (p) => poolKeyFromCode(p.code)))
+const frozenSnapshotGroups = computed(() =>
+  pooledGroups(frozenSnapshots.value, (s) => s.pool_key))
+
+/** 所有池下拉统一用分组选项：风格 / 行业一级 / 行业二级标签（注明可重叠）。 */
+const poolOptionGroups = computed(() => {
+  const known = new Set(poolOptions.value)
+  return POOL_GROUPS
+    .map((def) => ({
+      def,
+      keys: poolOptions.value.filter((key) => known.has(key) && poolGroupKey(key) === def.key),
+    }))
+    .filter((g) => g.keys.length > 0)
+})
+
+function isCollapsed(key: string): boolean {
+  return Boolean(collapsedGroups.value[key])
+}
+
 const weightSum = computed(() =>
   Object.values(editor.weights).reduce((a, b) => a + (Number(b) || 0), 0))
 const histSum = computed(() =>
   Object.values(editor.weights_hist).reduce((a, b) => a + (Number(b) || 0), 0))
-const sumOk = computed(() =>
-  Math.abs(weightSum.value - 1) < 1e-6
-  && (selected.value?.pool_key !== 'growth' || editor.track !== 'both'
-    || Math.abs(histSum.value - 1) < 1e-6))
+const sumOk = computed(() => {
+  if (isGroupOnlyPool(selected.value?.pool_key)) return true
+  if (Math.abs(weightSum.value - 1) >= 1e-6) return false
+  const dualTrack = (selected.value?.pool_key === 'growth'
+    || selected.value?.pool_key === 'industry:tech') && editor.track === 'both'
+  return dualTrack ? Math.abs(histSum.value - 1) < 1e-6 : true
+})
 
 const weightKeys = computed(() => Object.keys(editor.weights))
 const histKeys = computed(() => Object.keys(editor.weights_hist))
 
-/** 可选字段：已接入打分 + 属于当前池 + 尚未使用的权重字段。 */
+/** 可选字段：已接入打分 + 属于当前池（行业池不限）+ 尚未使用的权重字段。 */
 const addableFields = computed(() => {
   if (!selected.value) return []
   const pool = selected.value.pool_key
+  const industry = pool.startsWith('industry:')
   const used = new Set([...weightKeys.value, ...histKeys.value])
   return fields.value
-    .filter((f) => scorable.value.has(f.key) && f.pools.includes(pool) && !used.has(f.key))
+    .filter((f) => scorable.value.has(f.key)
+      && (industry || f.pools.includes(pool)) && !used.has(f.key))
     .map((f) => f.key)
 })
 
@@ -223,11 +337,6 @@ function errMsg(e: any): string {
   if (Array.isArray(d?.detail)) return d.detail.map((x: any) => `${(x.loc || []).join('.')}: ${x.msg}`).join('; ')
   if (typeof d?.detail === 'string') return d.detail
   return e?.message || '请求失败'
-}
-
-function poolLabel(key: string | null): string {
-  if (!key) return '—'
-  return POOL_LABEL[key] || key
 }
 
 function trackLabel(key: string | null): string {
@@ -278,6 +387,7 @@ function buildEditor(spec: SelectionSpec | undefined) {
   editor.weights = { ...(src?.weights || {}) }
   editor.weights_hist = { ...(src?.weights_hist || {}) }
   fillGates(src?.gates)
+  editor.pe_mode = (src?.pe_mode as 'strict' | 'loss_discount') || 'strict'
   editor.note = ''
   addFieldKey.value = ''
   activeTarget.value = 'forward'
@@ -286,18 +396,27 @@ function buildEditor(spec: SelectionSpec | undefined) {
 async function loadAll() {
   loading.value = true
   errorMsg.value = ''
+  const failed: string[] = []
+  // 局部数据失败不阻塞整页，但必须把失败项汇总出来，避免静默空页面
+  const part = <T>(label: string, p: Promise<T>, fallback: T): Promise<T> =>
+    p.catch(() => { failed.push(label); return fallback })
+  // 兜底超时：接口挂住时也要退出 loading，不能一直转圈
+  const withTimeout = <T>(p: Promise<T>, ms = 15000): Promise<T> => Promise.race([
+    p,
+    new Promise<T>((_, reject) => setTimeout(() => reject(new Error(`请求超时（${ms / 1000} 秒）`)), ms)),
+  ])
   try {
     const [metaRes, schemeRes, wideRes, defRes, dataRes, runRes, snapRes, poolRes, valRes, formulaRes] = await Promise.all([
-      getSelectionMeta(),
-      getSelectionSchemes(true),
-      getSelectionWideDbStatus().catch(() => null),
-      getSelectionDefaults().catch(() => ({})),
-      getSelectionDataStatus().catch(() => null),
-      getSelectionRuns(50).catch(() => []),
-      getSelectionSnapshots(50).catch(() => []),
-      getSelectionPools().catch(() => []),
-      getSelectionFactorValidation().catch(() => null),
-      getSelectionFormulas().catch(() => []),
+      withTimeout(getSelectionMeta()),
+      withTimeout(getSelectionSchemes(true)),
+      part<WideDbStatus | null>('宽库状态', withTimeout(getSelectionWideDbStatus()), null),
+      part<Record<string, SelectionSpec>>('默认参数', withTimeout(getSelectionDefaults()), {}),
+      part<SelectionDataStatus | null>('数据体检', withTimeout(getSelectionDataStatus()), null),
+      part<SelectionRunItem[]>('运行记录', withTimeout(getSelectionRuns(50)), []),
+      part<SelectionSnapshotItem[]>('快照', withTimeout(getSelectionSnapshots(50)), []),
+      part<SelectionPoolItem[]>('选股池', withTimeout(getSelectionPools()), []),
+      part<SelectionFactorValidation | null>('因子回验', withTimeout(getSelectionFactorValidation()), null),
+      part<SelectionFormulaItem[]>('公式', withTimeout(getSelectionFormulas()), []),
     ])
     meta.value = metaRes
     schemes.value = schemeRes
@@ -314,6 +433,9 @@ async function loadAll() {
     }
     if (!resolvePoolId.value && poolRes.length) {
       resolvePoolId.value = poolRes[0].pool_id
+    }
+    if (failed.length) {
+      errorMsg.value = `以下数据加载失败：${failed.join('、')}。常见原因是后端进程未加载最新路由（需重启后端）或接口异常；其余内容可正常查看，修复后请点「重试」。`
     }
   } catch (e: any) {
     errorMsg.value = errMsg(e)
@@ -366,12 +488,15 @@ async function submitScheme() {
 
 async function seedDefaults() {
   errorMsg.value = ''
+  seeding.value = true
   try {
     const res = await seedSelectionSchemes()
     await refreshSchemes()
     infoMsg.value = `已初始化 ${res.created} 个默认方案（四风格池），每个方案带 v1 未校准参数`
   } catch (e: any) {
     errorMsg.value = errMsg(e)
+  } finally {
+    seeding.value = false
   }
 }
 
@@ -388,6 +513,7 @@ async function saveVersion() {
     top_n: editor.top_n,
     weights: { ...editor.weights },
     gates: { ...editor.gates },
+    pe_mode: editor.pe_mode,
   }
   if (selected.value.pool_key === 'growth') {
     spec.track = editor.track
@@ -434,7 +560,8 @@ async function runAll() {
       : '没有方案产出结果，请检查启用版本与数据状态'
     if (ok.length) await openRun(ok[0])
   } catch (e: any) {
-    errorMsg.value = errMsg(e)
+    errorMsg.value = `${errMsg(e)}（可点上方「重试」，或按空态指引先构建宽库/初始化方案）`
+    dataStatus.value = await getSelectionDataStatus().catch(() => dataStatus.value)
   } finally {
     running.value = false
   }
@@ -604,6 +731,55 @@ async function doImport() {
   }
 }
 
+async function loadBuildStatus() {
+  try {
+    buildStatus.value = await getSelectionBuildStatus()
+  } catch {
+    return
+  }
+  if (buildStatus.value?.running) startBuildPolling()
+}
+
+function startBuildPolling() {
+  if (buildTimer !== undefined) return
+  buildTimer = window.setInterval(async () => {
+    try {
+      buildStatus.value = await getSelectionBuildStatus()
+      if (!buildStatus.value?.running && buildTimer !== undefined) {
+        window.clearInterval(buildTimer)
+        buildTimer = undefined
+        dataStatus.value = await getSelectionDataStatus().catch(() => dataStatus.value)
+      }
+    } catch {
+      /* 轮询失败保留上一次进度，下轮再试 */
+    }
+  }, 5000)
+}
+
+async function doBuild() {
+  if (buildMode.value === 'full'
+    && !window.confirm('full 是灾备模式，会重取全量并可能耗时数小时。确认执行？')) {
+    return
+  }
+  errorMsg.value = ''
+  infoMsg.value = ''
+  buildStarting.value = true
+  try {
+    const res = await startSelectionBuild({ mode: buildMode.value })
+    if (res.status === 'busy') {
+      infoMsg.value = `已有构建在运行（${res.run_id}），下方进度会继续刷新`
+    } else {
+      infoMsg.value = `已启动内置${buildMode.value === 'full' ? '全量' : '增量'}构建（${res.run_id}）`
+    }
+    await loadBuildStatus()
+    startBuildPolling()
+  } catch (e: any) {
+    errorMsg.value = errMsg(e)
+  } finally {
+    buildStarting.value = false
+  }
+}
+
 async function runGpAudit() {
   errorMsg.value = ''
   gpAudit.value = null
@@ -662,7 +838,13 @@ function causeLabel(key: string): string {
   return key
 }
 
-onMounted(loadAll)
+onMounted(() => {
+  loadAll()
+  loadBuildStatus()
+})
+onUnmounted(() => {
+  if (buildTimer !== undefined) window.clearInterval(buildTimer)
+})
 </script>
 
 <template>
@@ -671,7 +853,10 @@ onMounted(loadAll)
   </PageHeader>
 
   <div v-if="errorMsg" class="card" style="padding:12px;color:var(--red);margin-bottom:12px">
-    {{ errorMsg }}
+    <div class="form-row" style="align-items:center;justify-content:space-between">
+      <span>{{ errorMsg }}</span>
+      <button class="btn btn-sm" :disabled="loading" @click="loadAll">重试</button>
+    </div>
   </div>
   <div v-if="infoMsg" class="card" style="padding:12px;margin-bottom:12px">
     {{ infoMsg }}
@@ -692,8 +877,17 @@ onMounted(loadAll)
     <div v-show="tab === 'schemes'">
       <div class="card" style="padding:12px;margin-bottom:12px">
         <div class="form-row">
-          <button class="btn btn-sm" @click="seedDefaults">初始化四池默认方案</button>
-          <span class="hint">幂等：已有方案不会被覆盖；每个方案只补一个 v1（未校准）。</span>
+          <button class="btn btn-sm" :disabled="seeding" @click="seedDefaults">
+            {{ seeding ? '初始化中…' : '初始化默认方案（四风格 + 行业池）' }}
+          </button>
+          <span class="hint">幂等：已有方案不会被覆盖；四风格 + 9 个行业主池 + 14 个标签池各补一个 v1（未校准）。</span>
+        </div>
+        <div v-if="industryMembershipText" class="hint" style="margin-top:6px">
+          行业归属（当前 as_of）：{{ industryMembershipText }}
+        </div>
+        <div v-if="schemes.length === 0" class="form-row" style="margin-top:8px">
+          <button class="btn btn-primary btn-sm" @click="tab = 'data'">去「数据体检」构建宽库</button>
+          <span class="hint">导入约 60–90 秒，导入后再运行选股。</span>
         </div>
       </div>
 
@@ -703,7 +897,9 @@ onMounted(loadAll)
           <input v-model="newScheme.code" placeholder="code，如 value_core" />
           <input v-model="newScheme.name" placeholder="名称" />
           <select v-model="newScheme.pool_key">
-            <option v-for="p in meta?.pools || []" :key="p" :value="p">{{ poolLabel(p) }}</option>
+            <optgroup v-for="g in poolOptionGroups" :key="g.def.key" :label="optgroupLabel(g.def)">
+              <option v-for="p in g.keys" :key="p" :value="p">{{ poolLabel(p) }}</option>
+            </optgroup>
           </select>
           <button class="btn btn-primary btn-sm" @click="submitScheme">创建</button>
         </div>
@@ -713,21 +909,36 @@ onMounted(loadAll)
         <table>
           <thead><tr><th>名称</th><th>code</th><th>池</th><th>状态</th><th>最新版本</th><th>操作</th></tr></thead>
           <tbody>
-            <tr v-for="s in schemes" :key="s.id">
-              <td>{{ s.name }}</td>
-              <td style="color:var(--ink-soft)">{{ s.code }}</td>
-              <td>{{ poolLabel(s.pool_key) }}</td>
-              <td><span class="badge badge-gray">{{ s.status }}</span></td>
-              <td>
-                v{{ s.latest_version ?? '—' }}
-                <span v-if="s.latest_status === 'active'" class="badge badge-green" style="margin-left:6px">启用中</span>
-              </td>
-              <td><button class="btn btn-sm" @click="openScheme(s)">编辑/版本</button></td>
-            </tr>
+            <template v-for="g in schemeGroups" :key="g.def.key">
+              <tr class="group-row" @click="toggleSchemeGroup(g.def.key)">
+                <td colspan="6">
+                  <span class="group-toggle">{{ isCollapsed(g.def.key) ? '▶' : '▼' }}</span>
+                  <strong>{{ g.def.label }}</strong>
+                  <span class="badge badge-gray" style="margin-left:6px">{{ g.items.length }}</span>
+                  <span class="hint" style="margin-left:8px">{{ g.def.hint }}</span>
+                </td>
+              </tr>
+              <template v-if="!isCollapsed(g.def.key)">
+                <tr v-if="!g.items.length">
+                  <td colspan="6" class="hint" style="padding-left:28px">该分组暂无方案</td>
+                </tr>
+                <tr v-for="s in g.items" :key="s.id">
+                  <td>{{ s.name }}</td>
+                  <td style="color:var(--ink-soft)">{{ s.code }}</td>
+                  <td>{{ poolLabel(s.pool_key) }}</td>
+                  <td><span class="badge badge-gray">{{ s.status }}</span></td>
+                  <td>
+                    v{{ s.latest_version ?? '—' }}
+                    <span v-if="s.latest_status === 'active'" class="badge badge-green" style="margin-left:6px">启用中</span>
+                  </td>
+                  <td><button class="btn btn-sm" @click="openScheme(s)">编辑/版本</button></td>
+                </tr>
+              </template>
+            </template>
           </tbody>
         </table>
         <div v-if="schemes.length === 0" class="empty-state">
-          <p>暂无方案，点上方「初始化四池默认方案」开始</p>
+          <p>暂无方案，点上方「初始化默认方案（四风格 + 行业池）」开始</p>
         </div>
       </div>
 
@@ -775,9 +986,14 @@ onMounted(loadAll)
         <div class="card" style="padding:12px;margin-top:12px">
           <h3 style="margin-top:0">参数编辑（保存为新版本）</h3>
           <div class="form-row" style="margin-bottom:8px">
-            <label class="hint">Top N
+            <label class="hint">Top N（每轨上限）
               <input v-model.number="editor.top_n" type="number" min="1" max="1000" style="width:80px" />
             </label>
+            <span class="hint">
+              目标池规模 ≈
+              {{ selected.pool_key === 'growth' && editor.track === 'both' ? editor.top_n * 2 : editor.top_n }}
+              只（上限；成长双轨 = 2×Top N，实际还受闸门后可选数量限制）。
+            </span>
             <label v-if="selected.pool_key === 'growth'" class="hint">轨道
               <select v-model="editor.track">
                 <option value="both">双轨（前瞻+历史）</option>
@@ -840,6 +1056,18 @@ onMounted(loadAll)
             </label>
           </div>
 
+          <h4 style="margin:14px 0 6px">PE 处理口径</h4>
+          <div class="form-row">
+            <select v-model="editor.pe_mode">
+              <option value="strict">strict — 严格（PE≤0 一律挡在候选外）</option>
+              <option value="loss_discount">loss_discount — 亏损股降权（PE≤0 进候选，按亏损幅度打折）</option>
+            </select>
+            <span class="hint">
+              PE &gt; 上限两种口径都挡；降权只乘综合得分（亏损&lt;1%×0.90、1%~3.3%×0.75、
+              3.3%~10%×0.55、&gt;10%×0.35），不改因子与权重。
+            </span>
+          </div>
+
           <div class="form-row" style="margin-top:12px">
             <input v-model="editor.note" placeholder="变更说明（可选）" style="flex:1;min-width:220px" />
             <button class="btn btn-primary btn-sm" :disabled="saving" @click="saveVersion">
@@ -859,9 +1087,11 @@ onMounted(loadAll)
         <div class="form-row">
           <select v-model="filterPool">
             <option value="">全部池</option>
-            <option v-for="p in meta?.pools || []" :key="p" :value="p">{{ poolLabel(p) }}</option>
+            <optgroup v-for="g in poolOptionGroups" :key="g.def.key" :label="optgroupLabel(g.def)">
+              <option v-for="p in g.keys" :key="p" :value="p">{{ poolLabel(p) }}</option>
+            </optgroup>
           </select>
-          <span class="hint">字段集版本：{{ meta?.field_set_version }} · 可打分字段 {{ meta?.scorable_fields.length || 0 }} 个</span>
+          <span class="hint">字段集版本：{{ meta?.field_set_version }} · 可打分字段 {{ meta?.scorable_fields?.length || 0 }} 个</span>
         </div>
       </div>
 
@@ -916,8 +1146,17 @@ onMounted(loadAll)
                 <td>{{ (activeVersion.spec as SelectionSpec).gates?.[g.key] ?? '—' }}</td>
               </tr>
               <tr>
-                <td>Top N</td>
-                <td>{{ (activeVersion.spec as SelectionSpec).top_n ?? 100 }}</td>
+                <td>PE 处理口径</td>
+                <td>{{ PE_MODE_LABEL[(activeVersion.spec as SelectionSpec).pe_mode || 'strict'] }}</td>
+              </tr>
+              <tr>
+                <td>Top N（每轨上限）</td>
+                <td>
+                  {{ (activeVersion.spec as SelectionSpec).top_n ?? 100 }}
+                  <span class="hint">
+                    （{{ (activeVersion.spec as SelectionSpec).track === 'both' ? '双轨，池规模≈2×' : '池规模=' }}Top N，实际受可选数量限制）
+                  </span>
+                </td>
               </tr>
             </tbody>
           </table>
@@ -930,10 +1169,32 @@ onMounted(loadAll)
 
     <!-- 3. 选股结果 -->
     <div v-show="tab === 'results'">
+      <div v-if="!dataStatus?.ready" class="card empty-state" style="padding:16px;margin-bottom:12px">
+        <p>平台导入仓还没有数据，暂时无法运行选股。按下面两步补齐：</p>
+        <div class="form-row" style="justify-content:center">
+          <button class="btn btn-primary btn-sm" @click="tab = 'data'">去「数据体检」构建宽库</button>
+          <button class="btn btn-sm" :disabled="seeding" @click="seedDefaults">
+            {{ seeding ? '初始化中…' : '初始化默认方案（四风格 + 行业池）' }}
+          </button>
+        </div>
+        <p class="hint">
+          导入约 60–90 秒（整表替换、可重跑）；初始化约 1 秒。完成后回到本页点「运行全部启用方案」，四池合计约 40 秒。
+        </p>
+      </div>
+      <div v-else-if="schemes.length === 0" class="card empty-state" style="padding:16px;margin-bottom:12px">
+        <p>宽库已导入（{{ dataStatus?.as_of }}），但还没有选股方案，无法运行。</p>
+        <div class="form-row" style="justify-content:center">
+          <button class="btn btn-primary btn-sm" :disabled="seeding" @click="seedDefaults">
+            {{ seeding ? '初始化中…' : '初始化默认方案（四风格 + 行业池）' }}
+          </button>
+        </div>
+        <p class="hint">初始化约 1 秒，生成成长/质量/价值/红利四套 v1 方案（未校准参数）。</p>
+      </div>
+
       <div class="card" style="padding:12px;margin-bottom:12px">
         <div class="form-row">
           <button class="btn btn-primary btn-sm" :disabled="running" @click="runAll">
-            {{ running ? '运行中…' : '运行全部启用方案' }}
+            {{ running ? '运行中…（四池约 40 秒）' : '运行全部启用方案' }}
           </button>
           <button class="btn btn-sm" :disabled="delivering" @click="deliverAll">
             {{ delivering ? '交付中…' : '收盘交付（运行→冻结→双池）' }}
@@ -951,17 +1212,29 @@ onMounted(loadAll)
         <table>
           <thead><tr><th>#</th><th>池</th><th>方案</th><th>as_of</th><th>状态</th><th>命中</th><th>快照</th><th>时间</th><th>操作</th></tr></thead>
           <tbody>
-            <tr v-for="r in runs" :key="r.id">
-              <td>{{ r.id }}</td>
-              <td>{{ poolLabel(r.pool_key) }}</td>
-              <td>{{ r.scheme_name }} <span style="color:var(--ink-soft)">v{{ r.version ?? '—' }}</span></td>
-              <td>{{ r.as_of }}</td>
-              <td><span :class="statusClass(r.status)">{{ r.status }}</span></td>
-              <td>{{ r.stock_count }}</td>
-              <td>{{ r.snapshot_id ?? '—' }}<span v-if="r.frozen" class="badge badge-green" style="margin-left:6px">冻结</span></td>
-              <td style="color:var(--ink-soft)">{{ r.finished_at || r.created_at || '—' }}</td>
-              <td><button class="btn btn-sm" @click="openRun(r)">查看</button></td>
-            </tr>
+            <template v-for="g in runGroups" :key="g.def.key">
+              <tr class="group-row">
+                <td colspan="9">
+                  <strong>{{ g.def.label }}</strong>
+                  <span class="badge badge-gray" style="margin-left:6px">{{ g.items.length }}</span>
+                  <span class="hint" style="margin-left:8px">{{ g.def.hint }}</span>
+                </td>
+              </tr>
+              <tr v-if="!g.items.length">
+                <td colspan="9" class="hint" style="padding-left:28px">该分组暂无运行记录</td>
+              </tr>
+              <tr v-for="r in g.items" :key="r.id">
+                <td>{{ r.id }}</td>
+                <td>{{ poolLabel(r.pool_key) }}</td>
+                <td>{{ r.scheme_name }} <span style="color:var(--ink-soft)">v{{ r.version ?? '—' }}</span></td>
+                <td>{{ r.as_of }}</td>
+                <td><span :class="statusClass(r.status)">{{ r.status }}</span></td>
+                <td>{{ r.stock_count }}</td>
+                <td>{{ r.snapshot_id ?? '—' }}<span v-if="r.frozen" class="badge badge-green" style="margin-left:6px">冻结</span></td>
+                <td style="color:var(--ink-soft)">{{ r.finished_at || r.created_at || '—' }}</td>
+                <td><button class="btn btn-sm" @click="openRun(r)">查看</button></td>
+              </tr>
+            </template>
           </tbody>
         </table>
         <div v-if="runs.length === 0" class="empty-state"><p>还没有运行记录</p></div>
@@ -979,7 +1252,7 @@ onMounted(loadAll)
           <div><span class="hint">过闸门</span><b>{{ runDetail.stats?.gate_passed ?? '—' }}</b></div>
           <div><span class="hint">可打分</span><b>{{ runDetail.stats?.eligible ?? '—' }}</b></div>
           <div><span class="hint">命中</span><b>{{ runDetail.stats?.selected ?? '—' }}</b></div>
-          <div><span class="hint">Top N</span><b>{{ runDetail.stats?.top_n ?? '—' }}</b></div>
+          <div><span class="hint">Top N（每轨）</span><b>{{ runDetail.stats?.top_n ?? '—' }}</b></div>
           <div v-if="runDetail.stats?.track_mode"><span class="hint">轨道</span><b>{{ trackLabel(runDetail.stats.track_mode) }}</b></div>
         </div>
 
@@ -1033,9 +1306,12 @@ onMounted(loadAll)
           <div class="form-row" style="flex-wrap:wrap;gap:8px;margin-bottom:8px">
             <select v-model.number="recallSnapshotId">
               <option :value="null">选择已冻结快照</option>
-              <option v-for="s in frozenSnapshots" :key="s.id" :value="s.id">
-                #{{ s.id }} {{ s.scheme_name }} · {{ s.as_of }}
-              </option>
+              <optgroup v-for="g in frozenSnapshotGroups" :key="g.def.key" :label="optgroupLabel(g.def)">
+                <option v-if="!g.items.length" disabled>（暂无冻结快照）</option>
+                <option v-for="s in g.items" :key="s.id" :value="s.id">
+                  #{{ s.id }} {{ s.scheme_name }} · {{ s.as_of }}
+                </option>
+              </optgroup>
             </select>
             <select v-model.number="recallFormulaId">
               <option :value="null">选择择时公式</option>
@@ -1231,21 +1507,33 @@ onMounted(loadAll)
           <table>
             <thead><tr><th>池</th><th>类型</th><th>as_of</th><th>冻结</th><th>当前成分</th><th>PIT 区间</th><th>操作</th></tr></thead>
             <tbody>
-              <tr v-for="p in pools" :key="p.pool_id">
-                <td>{{ p.code }}</td>
-                <td>
-                  <span :class="p.kind === 'series' ? 'badge badge-gray' : 'badge badge-green'">
-                    {{ p.kind === 'series' ? '序列（回测）' : '版本（实盘）' }}
-                  </span>
-                </td>
-                <td>{{ p.as_of || '—' }}</td>
-                <td>{{ p.frozen ? '是' : '—' }}</td>
-                <td>{{ p.stock_count }}</td>
-                <td>{{ p.interval_count }}</td>
-                <td>
-                  <button class="btn btn-sm" @click="resolvePoolId = p.pool_id; doResolvePool()">解析</button>
-                </td>
-              </tr>
+              <template v-for="g in poolGroups" :key="g.def.key">
+                <tr class="group-row">
+                  <td colspan="7">
+                    <strong>{{ g.def.label }}</strong>
+                    <span class="badge badge-gray" style="margin-left:6px">{{ g.items.length }}</span>
+                    <span class="hint" style="margin-left:8px">{{ g.def.hint }}</span>
+                  </td>
+                </tr>
+                <tr v-if="!g.items.length">
+                  <td colspan="7" class="hint" style="padding-left:28px">该分组暂无池</td>
+                </tr>
+                <tr v-for="p in g.items" :key="p.pool_id">
+                  <td>{{ p.code }}</td>
+                  <td>
+                    <span :class="p.kind === 'series' ? 'badge badge-gray' : 'badge badge-green'">
+                      {{ p.kind === 'series' ? '序列（回测）' : '版本（实盘）' }}
+                    </span>
+                  </td>
+                  <td>{{ p.as_of || '—' }}</td>
+                  <td>{{ p.frozen ? '是' : '—' }}</td>
+                  <td>{{ p.stock_count }}</td>
+                  <td>{{ p.interval_count }}</td>
+                  <td>
+                    <button class="btn btn-sm" @click="resolvePoolId = p.pool_id; doResolvePool()">解析</button>
+                  </td>
+                </tr>
+              </template>
             </tbody>
           </table>
           <div v-if="pools.length === 0" class="empty-state"><p>还没有条件选股池，先做一次「收盘交付」</p></div>
@@ -1254,7 +1542,10 @@ onMounted(loadAll)
         <div class="form-row" style="margin-bottom:8px">
           <select v-model.number="resolvePoolId">
             <option :value="null">选择池</option>
-            <option v-for="p in pools" :key="p.pool_id" :value="p.pool_id">{{ p.code }}</option>
+            <optgroup v-for="g in poolGroups" :key="g.def.key" :label="optgroupLabel(g.def)">
+              <option v-if="!g.items.length" disabled>（暂无池）</option>
+              <option v-for="p in g.items" :key="p.pool_id" :value="p.pool_id">{{ p.code }}</option>
+            </optgroup>
           </select>
           <input v-model="resolveDay" type="date" />
           <button class="btn btn-sm" :disabled="!resolvePoolId" @click="doResolvePool">按日解析成分</button>
@@ -1294,22 +1585,34 @@ onMounted(loadAll)
         <table>
           <thead><tr><th>#</th><th>池</th><th>方案</th><th>as_of</th><th>命中</th><th>冻结</th><th>已发布池</th><th>指纹</th><th>操作</th></tr></thead>
           <tbody>
-            <tr v-for="s in snapshots" :key="s.id">
-              <td>{{ s.id }}</td>
-              <td>{{ poolLabel(s.pool_key) }}</td>
-              <td>{{ s.scheme_name }} <span style="color:var(--ink-soft)">v{{ s.version ?? '—' }}</span></td>
-              <td>{{ s.as_of }}</td>
-              <td>{{ s.stock_count ?? '—' }}</td>
-              <td>
-                <span :class="s.frozen ? 'badge badge-green' : 'badge badge-gray'">{{ s.frozen ? '已冻结' : '未冻结' }}</span>
-              </td>
-              <td>{{ s.published_pool_code || '—' }}</td>
-              <td style="color:var(--ink-soft)">{{ s.fingerprint }}</td>
-              <td>
-                <button class="btn btn-sm" @click="openSnapshot(s)">查看</button>
-                <button v-if="!s.frozen" class="btn btn-sm" @click="doFreeze(s)">冻结</button>
-              </td>
-            </tr>
+            <template v-for="g in snapshotGroups" :key="g.def.key">
+              <tr class="group-row">
+                <td colspan="9">
+                  <strong>{{ g.def.label }}</strong>
+                  <span class="badge badge-gray" style="margin-left:6px">{{ g.items.length }}</span>
+                  <span class="hint" style="margin-left:8px">{{ g.def.hint }}</span>
+                </td>
+              </tr>
+              <tr v-if="!g.items.length">
+                <td colspan="9" class="hint" style="padding-left:28px">该分组暂无快照</td>
+              </tr>
+              <tr v-for="s in g.items" :key="s.id">
+                <td>{{ s.id }}</td>
+                <td>{{ poolLabel(s.pool_key) }}</td>
+                <td>{{ s.scheme_name }} <span style="color:var(--ink-soft)">v{{ s.version ?? '—' }}</span></td>
+                <td>{{ s.as_of }}</td>
+                <td>{{ s.stock_count ?? '—' }}</td>
+                <td>
+                  <span :class="s.frozen ? 'badge badge-green' : 'badge badge-gray'">{{ s.frozen ? '已冻结' : '未冻结' }}</span>
+                </td>
+                <td>{{ s.published_pool_code || '—' }}</td>
+                <td style="color:var(--ink-soft)">{{ s.fingerprint }}</td>
+                <td>
+                  <button class="btn btn-sm" @click="openSnapshot(s)">查看</button>
+                  <button v-if="!s.frozen" class="btn btn-sm" @click="doFreeze(s)">冻结</button>
+                </td>
+              </tr>
+            </template>
           </tbody>
         </table>
         <div v-if="snapshots.length === 0" class="empty-state"><p>还没有快照，先在「选股结果」运行一次</p></div>
@@ -1365,13 +1668,59 @@ onMounted(loadAll)
     <!-- 5. 数据体检 -->
     <div v-show="tab === 'data'">
       <div class="card" style="padding:12px;margin-bottom:12px">
-        <h3 style="margin-top:0">平台导入仓（运行期唯一数据源）</h3>
-        <div class="form-row" style="margin-bottom:8px">
-          <button class="btn btn-primary btn-sm" :disabled="importing" @click="doImport">
-            {{ importing ? '导入中…（约 15 秒）' : '从宽库导入' }}
+        <h3 style="margin-top:0">内置宽库构建（默认数据源）</h3>
+        <div class="form-row" style="margin-bottom:8px;align-items:center;gap:8px">
+          <select v-model="buildMode" :disabled="buildStarting || buildStatus?.running" style="width:180px">
+            <option value="incremental">增量（只补缺口）</option>
+            <option value="full">全量（灾备，需确认）</option>
+          </select>
+          <button class="btn btn-primary btn-sm" :disabled="buildStarting || buildStatus?.running" @click="doBuild">
+            {{ buildStatus?.running ? '构建中…' : '开始构建' }}
           </button>
-          <span class="hint">整表替换、可重跑；导入期间不要运行选股。</span>
+          <span class="hint">后台线程执行，可离开本页；页面每 5 秒刷新阶段与进度。</span>
         </div>
+        <template v-if="buildStatus">
+          <div class="stat-grid">
+            <div><span class="hint">快照 as_of</span><b>{{ buildStatus.as_of || '—' }}</b></div>
+            <div><span class="hint">日线覆盖</span><b>{{ buildStatus.daily.min_date || '—' }} ~ {{ buildStatus.daily.max_date || '—' }}</b></div>
+            <div><span class="hint">日线行数</span><b>{{ buildStatus.daily.rows }}</b></div>
+            <div><span class="hint">运行号</span><b>{{ buildStatus.run_id }}</b></div>
+            <div><span class="hint">状态</span><b>{{ buildStatus.running ? '运行中' : (buildStatus.last_build?.status || '空闲') }}</b></div>
+            <div><span class="hint">最近完成</span><b>{{ buildStatus.last_build?.last_run_at || '—' }}</b></div>
+          </div>
+          <div v-if="buildStatus.phases.length" class="card table-wrap" style="margin:10px 0">
+            <table>
+              <thead><tr><th>阶段</th><th>批次完成</th><th>累计行数</th><th>进度</th><th>错误</th></tr></thead>
+              <tbody>
+                <tr v-for="p in buildStatus.phases" :key="p.phase">
+                  <td>{{ BUILD_PHASE_LABEL[p.phase] || p.phase }}</td>
+                  <td>{{ p.done_batches }}/{{ p.batches }}<span v-if="p.failed_batches" style="color:var(--red)">（失败 {{ p.failed_batches }}）</span></td>
+                  <td>{{ p.rows_done }}</td>
+                  <td>{{ p.percent }}%</td>
+                  <td class="hint">{{ p.errors.join('；') || '—' }}</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+          <p v-else class="hint">暂无构建批次（点「开始构建」，或等待交易日 15:30 调度）。</p>
+          <p v-if="buildStatus.last_build?.error" class="hint" style="color:var(--red)">
+            最近失败：{{ buildStatus.last_build.error }}
+          </p>
+        </template>
+        <p v-else class="hint">未获取到构建状态（后端未加载新路由时需重启后端）。</p>
+      </div>
+
+      <div class="card" style="padding:12px;margin-bottom:12px">
+        <h3 style="margin-top:0">平台导入仓（运行期读取层）</h3>
+        <div class="form-row" style="margin-bottom:8px">
+          <button class="btn btn-sm" :disabled="importing" @click="doImport">
+            {{ importing ? '导入中…（约 60–90 秒，请勿离开）' : '从外部宽库导入（对账/兜底）' }}
+          </button>
+          <span class="hint">默认走上方内置构建；此入口仅用于外部宽库对账或灾备兜底，整表替换、可重跑。</span>
+        </div>
+        <p v-if="dataStatus?.ready" class="hint" style="color:var(--ink-soft)">
+          导入仓已就绪（{{ dataStatus.as_of }}）。下一步：到「选股方案」初始化默认方案（四风格 + 行业池），再到「选股结果」点「运行全部启用方案」。
+        </p>
 
         <template v-if="dataStatus">
           <p v-if="!dataStatus.ready" class="hint" style="color:var(--red)">
@@ -1540,4 +1889,7 @@ onMounted(loadAll)
 .two-col { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
 @media (max-width: 900px) { .two-col { grid-template-columns: 1fr; } }
 .badge-red { background: var(--red); color: #fff; }
+.group-row td { background: var(--bg-soft, #f6f7f9); cursor: pointer; user-select: none; }
+.group-row:hover td { background: var(--bg-hover, #eef0f4); }
+.group-toggle { display: inline-block; width: 14px; color: var(--ink-soft); font-size: 11px; }
 </style>

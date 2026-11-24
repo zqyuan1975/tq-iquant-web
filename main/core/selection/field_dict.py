@@ -165,6 +165,9 @@ _SPECS: Tuple[FieldSpec, ...] = (
     # --- L1：风险（K 线 / GP 时序） ---
     _spec("volatility", SOURCE_KLINE, "Close", "%", False, True, pools=(QUALITY, DIVIDEND),
           note="std(日收益)*sqrt(250)；<60 日剔除"),
+    _spec("volatility_rev", SOURCE_KLINE, "Close", "反向%", False, True,
+          pools=(QUALITY, DIVIDEND, "industry:utility"),
+          note="低波因子：-volatility，越大越稳（公用事业池用）"),
     _spec("max_drawdown", SOURCE_KLINE, "Close", "%", False, True, pools=(DIVIDEND,),
           note="min(Close/cummax(Close)-1)；<60 日剔除"),
     _spec("dp_5y_pct", SOURCE_GP, "GP21", "0-1", False, True, pools=(DIVIDEND,),
@@ -209,7 +212,7 @@ SCORABLE_FIELDS = frozenset({
     "g_fwd_2y", "g_rev_2y", "peg_fwd", "neg_peg_fwd",
     "g_hist_3y", "np_yoy", "rev_yoy", "accel", "deliver",
     "peg_hist", "neg_peg_hist", "roic_trend",
-    "volatility", "max_drawdown", "size",
+    "volatility", "volatility_rev", "max_drawdown", "size",
 })
 
 

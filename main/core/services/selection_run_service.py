@@ -265,11 +265,13 @@ def _stock_payload(row: SelectionSnapshotStock) -> Dict[str, Any]:
         "code": row.code,
         "rank": row.rank,
         "score": float(row.score) if row.score is not None else None,
+        "score_status": detail.get("score_status"),
         "selected": bool(row.selected),
         "pool_key": row.pool_key,
         "exclude_reason": row.exclude_reason,
         "name": detail.get("name"),
         "sector": detail.get("sector"),
+        "l1": detail.get("l1"),
         "track": detail.get("track"),
         "coverage": detail.get("coverage"),
         "factors": detail.get("factors") or {},
@@ -337,14 +339,16 @@ def publish(db, snapshot_id: int, code: Optional[str] = None,
     if not snap.frozen:
         raise RunError("快照未冻结，先冻结再发布")
     version, scheme = _version_scheme(db, snap.scheme_version_id)
-    pool_key = scheme.pool_key if scheme else "selection"
+    pool_key = (scheme.pool_key if scheme else "selection")
+    # 行业池 key 形如 industry:l2:high_rd；落 StockPool.code 前把冒号换成下划线
+    pool_tag = pool_key.upper().replace(":", "_")
     if series:
-        pool_code = (code or "SEL_%s" % pool_key.upper()).strip()
+        pool_code = (code or "SEL_%s" % pool_tag).strip()
         pool_name = (name or "%s选股序列" % (
             scheme.name if scheme else "条件")).strip()
     else:
         pool_code = (code or "SEL_%s_%s" % (
-            pool_key.upper(), snap.as_of.strftime("%Y%m%d"))).strip()
+            pool_tag, snap.as_of.strftime("%Y%m%d"))).strip()
         pool_name = (name or "%s选股 %s" % (
             scheme.name if scheme else "条件", snap.as_of.isoformat())).strip()
 

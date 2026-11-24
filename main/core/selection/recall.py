@@ -180,7 +180,8 @@ def _cause(row: Optional[SelectionSnapshotStock]) -> str:
 
 
 def _recheck_gates(db, codes: List[str], as_of: date,
-                   gates: Dict[str, Any]) -> Dict[str, str]:
+                   gates: Dict[str, Any],
+                   pe_mode: str = "strict") -> Dict[str, str]:
     """对快照未留痕的漏票，用仓库快照重放可复核的硬闸门。
 
     快照只留痕「入选 + 2×TopN 边缘」，其余漏票没有淘汰原因可读。这里按引擎
@@ -222,7 +223,10 @@ def _recheck_gates(db, codes: List[str], as_of: date,
         if pe is None:
             out[s.code] = "gate:pe_missing"
             continue
-        if pe <= 0 or pe > max_pe:
+        if pe > max_pe:
+            out[s.code] = "gate:pe_out_of_range"
+            continue
+        if pe <= 0 and pe_mode == "strict":
             out[s.code] = "gate:pe_out_of_range"
             continue
         pb = _num(more.get("PB_MRQ"))
@@ -353,13 +357,16 @@ def compute_recall(db, snapshot_id: int, formula_id: int,
     # 快照只留痕边缘票；其余漏票用仓库快照重放基础闸门，避免清一色「未进候选」
     version = db.get(SelectionSchemeVersion, snapshot.scheme_version_id)
     gates: Dict[str, Any] = {}
+    pe_mode = "strict"
     if version is not None:
         try:
-            gates = (json.loads(version.spec_json) or {}).get("gates") or {}
+            spec = json.loads(version.spec_json) or {}
         except (TypeError, ValueError):
-            gates = {}
+            spec = {}
+        gates = spec.get("gates") or {}
+        pe_mode = spec.get("pe_mode") or "strict"
     unknown = [it["code"] for it in detail if it["cause"] == "not_candidate"]
-    recheck = _recheck_gates(db, unknown, snapshot.as_of, gates)
+    recheck = _recheck_gates(db, unknown, snapshot.as_of, gates, pe_mode)
     for item in detail:
         if item["cause"] == "not_candidate" and item["code"] in recheck:
             item["cause"] = recheck[item["code"]]
@@ -381,6 +388,7 @@ def compute_recall(db, snapshot_id: int, formula_id: int,
                     "engine": formula.engine, "open_signals": triggers},
         "horizon_days": horizon_days,
         "signal_window_days": window,
+        "pe_mode": pe_mode,
         "universe_size": len(universe),
         "pool_size": len(pool_codes),
         "formula_selected_market": len(market_sel),
@@ -402,6 +410,8 @@ def compute_recall(db, snapshot_id: int, formula_id: int,
             "漏票成因：快照留痕优先；未留痕票按仓库快照重放基础闸门"
             "（ST/退市/次新/PE/PB/流通市值/财报期数），全部通过计 rank_cut"
             "（被 TopN 或风格专属闸门淘汰）。",
+            "PE 口径：%s（strict=PE≤0 全挡；loss_discount=亏损股进候选但按亏损幅度降权）。"
+            % pe_mode,
             "IC/分组单调性仅作参考，不参与任何决策。",
         ],
         "computed_at": datetime.now().isoformat(timespec="seconds"),

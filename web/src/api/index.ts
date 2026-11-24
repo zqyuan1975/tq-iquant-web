@@ -4495,8 +4495,22 @@ export interface SelectionMeta {
   field_set_version: string
   pools: string[]
   industry_prefix: string
+  industry_pools?: SelectionIndustryPool[]
+  industry_membership?: Record<string, number>
   scorable_fields: string[]
   fields: SelectionFieldSpec[]
+}
+
+export interface SelectionIndustryPool {
+  key: string
+  code: string
+  label: string
+  kind: 'l1' | 'l2'
+  l1: string | null
+  l2_tag: string | null
+  group_only: boolean
+  no_truncate: boolean
+  top_n: number
 }
 
 export interface SelectionSchemeItem {
@@ -4615,6 +4629,8 @@ export interface SelectionSpec {
   track?: 'both' | 'forward' | 'historical'
   top_n?: number
   fields?: string[]
+  /** PE 处理口径：strict=PE<=0 全挡；loss_discount=亏损股进候选但按亏损幅度降权 */
+  pe_mode?: 'strict' | 'loss_discount'
 }
 
 export interface SelectionStats {
@@ -4631,6 +4647,9 @@ export interface SelectionStats {
   rows_kept?: number
   rows_dropped_detail_omitted?: number
   capped?: boolean
+  pe_mode?: string
+  loss_candidates?: number
+  loss_selected?: number
 }
 
 export interface SelectionQuality {
@@ -4818,6 +4837,55 @@ export async function getSelectionDataStatus() {
 
 export async function importSelectionWarehouse() {
   const res = await api.post<ApiResponse<SelectionImportResult>>('/selection/warehouse/import')
+  return res.data.data
+}
+
+// 内置宽库构建（阶段二）：增量默认，full 仅灾备
+export interface SelectionBuildPhase {
+  phase: string
+  batches: number
+  done_batches: number
+  failed_batches: number
+  running_batches: number
+  rows_done: number
+  errors: string[]
+  percent: number
+}
+
+export interface SelectionBuildStatus {
+  ready: boolean
+  as_of: string | null
+  source_path: string | null
+  imported_at: string | null
+  stock_count: number
+  fin_count: number
+  dividend_count: number
+  counts: {
+    stock_count: number
+    fin_count: number
+    dividend_count: number
+    daily_count: number
+  }
+  daily: { min_date: string | null; max_date: string | null; rows: number }
+  running: boolean
+  run_id: string
+  latest_run_id: string | null
+  phases: SelectionBuildPhase[]
+  last_build: Record<string, any>
+}
+
+export async function getSelectionBuildStatus() {
+  const res = await api.get<ApiResponse<SelectionBuildStatus>>(
+    '/selection/warehouse/build/status')
+  return res.data.data
+}
+
+export async function startSelectionBuild(
+  req: { mode?: 'incremental' | 'full'; as_of?: string; daily_start?: string } = {},
+) {
+  const res = await api.post<ApiResponse<{
+    status: string; running: boolean; run_id: string; mode?: string
+  }>>('/selection/warehouse/build', req)
   return res.data.data
 }
 
