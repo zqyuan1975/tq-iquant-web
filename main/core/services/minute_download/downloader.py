@@ -105,12 +105,16 @@ class DownloadConfig:
             high_watermark=_ratio(section.get("high_watermark"), 0.9),
             max_raise_tiers=max(_int(section.get("max_raise_tiers"), 1), 0),
             retry_times=max(_int(section.get("retry_times"), 2), 0),
-            retry_backoff_seconds=_float(
+            # 0 = 不等待退避 / 不隔离，均为合法语义（见 _wait 与 HostPool），
+            # 用 _float0 保留；缺省/None/空串才回落默认。
+            retry_backoff_seconds=_float0(
                 section.get("retry_backoff_seconds"), 1.5),
             request_timeout_seconds=_float(
                 section.get("request_timeout_seconds"), 5.0),
             failure_threshold=max(_int(section.get("failure_threshold"), 3), 1),
-            isolation_seconds=_float(section.get("isolation_seconds"), 60.0),
+            # HostPool 对 isolation_seconds 做 max(..., 0.0)，0 = 不隔离是合法值。
+            isolation_seconds=_float0(
+                section.get("isolation_seconds"), 60.0),
             window_start=str(
                 section.get("window_start") or DEFAULT_WINDOW_START),
             window_end=str(section.get("window_end") or DEFAULT_WINDOW_END),
@@ -1052,6 +1056,15 @@ def _float(value, default: float) -> float:
     except (TypeError, ValueError):
         return default
     return v if v > 0 else default
+
+
+def _float0(value, default: float) -> float:
+    """同 :func:`_float`，但保留显式 0（0 有明确语义时用：0=不等待退避/不隔离）。"""
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return default
+    return v if v >= 0 else default
 
 
 def _optional_int(value) -> Optional[int]:

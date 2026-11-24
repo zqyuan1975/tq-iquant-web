@@ -550,6 +550,8 @@ def create_plan(db: Session, payload: dict,
     principal = _dec(payload.get("principal"))
     if principal is None or principal <= 0:
         raise PairingError("借出本金必须大于 0")
+    # 借期/召回通知期 0 非法：<=0 回退默认（365 / 2）；下游
+    # GateReleaseBook 另有 `max(1, recall_notice_days)` 兜底。
     loan_term_days = int(payload.get("loan_term_days") or 365)
     recall_notice_days = int(payload.get("recall_notice_days") or 2)
     release_delay_days = int(payload.get("release_delay_days") or 0)
@@ -693,6 +695,7 @@ def _create_queued_plan(db: Session, payload: dict, now: datetime,
                         recall_notice_days: int, release_delay_days: int,
                         max_share: Decimal, specs: List[dict]) -> dict:
     """超过 3 个借款方：整个申请进入 QUEUED，不预分配额度/不建边。"""
+    # 排队有效期 0 非法（0 交易日 = 立即过期），<=0 回退默认。
     ttl = int(payload.get("queue_ttl_days") or QUEUE_TTL_TRADING_DAYS)
     if ttl <= 0:
         ttl = QUEUE_TTL_TRADING_DAYS

@@ -1161,3 +1161,18 @@ def test_supervise_noop_when_thread_alive(monkeypatch):
         ls._MINUTE_SUPERVISION, 8, {"attempts": [], "gave_up": False})
     ls.supervise_minute_download(8)
     assert svc.starts == 0
+
+
+def test_download_config_preserves_zero_backoff_and_isolation():
+    """回归：0 = 不等待退避 / 不隔离，必须有明确语义并原样保留。"""
+    cfg = DownloadConfig.from_section(
+        {"retry_backoff_seconds": 0, "isolation_seconds": 0})
+    assert cfg.retry_backoff_seconds == 0.0
+    assert cfg.isolation_seconds == 0.0
+    # 缺省仍回落默认
+    default = DownloadConfig.from_section({})
+    assert default.retry_backoff_seconds == 1.5
+    assert default.isolation_seconds == 60.0
+    # 未声明 0 语义的字段保持原行为：0 回落默认
+    assert DownloadConfig.from_section(
+        {"interval_seconds": 0}).interval_seconds == 60.0

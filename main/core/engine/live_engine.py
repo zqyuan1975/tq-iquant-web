@@ -9689,6 +9689,8 @@ class LiveEngine:
         tq = (load_config() or {}).get("tq_trade") or {}
         if not isinstance(tq, dict):
             tq = {}
+        # approval_ttl_seconds 的 0 不是合法语义（审批单 0 秒即过期），
+        # 下游 `ttl if ttl > 0 else 900.0` 也会拒绝 <=0，这里按违约回退默认。
         try:
             ttl = float(tq.get("approval_ttl_seconds") or 900)
         except (TypeError, ValueError):
@@ -9697,8 +9699,14 @@ class LiveEngine:
             max_amount = Decimal(str(tq.get("manual_order_max_amount") or 0))
         except (ArithmeticError, TypeError, ValueError):
             max_amount = Decimal("0")
+        # 显式 0 = 不限制同名人工操作间隔（`_manual_throttle` 文档与
+        # `interval_ms if interval_ms >= 0` 均允许 0），不能被 `or 1000` 折叠；
+        # 只有缺省/None/空串才回落 1000ms。
+        raw_interval = tq.get("manual_action_min_interval_ms")
+        if raw_interval is None or raw_interval == "":
+            raw_interval = 1000
         try:
-            interval_ms = int(tq.get("manual_action_min_interval_ms") or 1000)
+            interval_ms = int(raw_interval)
         except (TypeError, ValueError):
             interval_ms = 1000
         self._approval_cfg_cache = {

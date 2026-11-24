@@ -511,3 +511,20 @@ def test_manual_trade_requires_manual_mode():
     except ManualActionError as exc:
         assert exc.http_status == 409
 
+
+def test_approval_cfg_preserves_zero_manual_interval(monkeypatch):
+    """回归：manual_action_min_interval_ms 显式 0（不限制）不得被 `or 1000` 折叠。"""
+    from core.engine import live_engine as le
+
+    def probe(tq):
+        monkeypatch.setattr(le, "load_config", lambda: {"tq_trade": tq})
+        obj = le.LiveEngine.__new__(le.LiveEngine)
+        obj._approval_cfg_cache = None
+        return le.LiveEngine._approval_cfg(obj)
+
+    assert probe({"manual_action_min_interval_ms": 0})["min_interval_ms"] == 0
+    assert probe({})["min_interval_ms"] == 1000
+    assert probe({"manual_action_min_interval_ms": ""})["min_interval_ms"] == 1000
+    # approval_ttl_seconds 的 0 非法：回退 900（审批单不能 0 秒过期）
+    assert probe({"approval_ttl_seconds": 0})["ttl_seconds"] == 900.0
+
