@@ -1,5 +1,5 @@
 """G1：待放行顺延委托的人工放行 / 放弃（2026-11-18）单元测试。"""
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from decimal import Decimal
 
 import pytest
@@ -8,7 +8,7 @@ from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
 from core.engine.bar_poller import BarPoller
-from core.engine.event import OrderEvent
+from core.engine.event import BarEvent, OrderEvent
 from core.engine.live_engine import LiveEngine
 from core.engine.portfolio import Portfolio
 from core.engine.risk_manager import PortfolioRiskManager, StrategyRiskManager
@@ -147,6 +147,8 @@ def _deferred_row(db, bar_time=None, status="deferred", retry=2):
 def _queue_order(engine, row):
     order = _order()
     order._deferred_row_id = row.id
+    # 生产口径：入队时固化信号 bar 日（recover / 正常建单都会写）。
+    order.signal_bar_date = order.bar_time.date()
     engine._signal_bar_deferred.append(order)
     return order
 
@@ -253,10 +255,83 @@ def test_release_submit_error_requeues_and_keeps_deferred_row():
 
     assert result["status"] == "blocked"
     assert target in engine._signal_bar_deferred
+    # 回队必须保留原信号 bar 时间：否则后续每根 bar 的跨日判定永假，静默冻结。
+    assert target.bar_time == _SIGNAL_DAY
     db.expire_all()
     deferred = db.query(LiveOrder).filter(
         LiveOrder.status == "deferred").all()
     assert deferred and deferred[0].id == target._deferred_row_id
+    db.close()
+
+
+def test_release_submit_exception_requeues_with_original_bar_time():
+    """提交链抛异常的回队分支同样要还原 bar_time。"""
+    factory, _ = _db_factory()
+    port, _ = _portfolio()
+    engine = _engine(factory, port, _StubDispatcher())
+    engine._refresh_release_price = lambda order: None
+    db = factory()
+    row = _deferred_row(db)
+    target = _queue_order(engine, row)
+
+    def _boom(*_args, **_kwargs):
+        raise RuntimeError("submit boom")
+
+    engine._submit_one_order = _boom
+    with pytest.raises(RuntimeError):
+        engine.release_deferred_order(row.id)
+
+    assert target in engine._signal_bar_deferred
+    assert target.bar_time == _SIGNAL_DAY
+    db.close()
+
+
+def test_release_signal_bar_uses_signal_date_even_if_bar_time_rewritten():
+    """bar_time 被人工放行改写成当日时，跨日判定仍按 signal_bar_date 放行。"""
+    factory, _ = _db_factory()
+    port, _ = _portfolio()
+    engine = _engine(factory, port, _StubDispatcher())
+    engine._refresh_release_price = lambda order: None
+    engine._started_at = None
+    engine._calendar.is_fail_open = lambda _d: False
+    db = factory()
+    row = _deferred_row(db)
+    target = _queue_order(engine, row)
+    # 模拟 2026-11-24 事故：内存 bar_time 已被改成当日
+    target.bar_time = datetime(2026, 8, 5, 9, 25)
+
+    bar = BarEvent(bar_time=datetime(2026, 8, 5, 9, 31), period="1m")
+    released = engine._release_signal_bar_deferred(port, bar)
+
+    assert released == [target]
+    assert target.bar_time == bar.bar_time
+    assert target not in engine._signal_bar_deferred
+    db.close()
+
+
+def test_deferred_expired_when_bar_passes_due_window():
+    """原有过期判定不受影响：due 当日收到过 bar，次日首根 bar 判过期取消。"""
+    factory, _ = _db_factory()
+    port, _ = _portfolio()
+    engine = _engine(factory, port, _StubDispatcher())
+    engine._refresh_release_price = lambda order: None
+    engine._started_at = None
+    engine._calendar.is_fail_open = lambda _d: False
+    engine._alert_message_safe = lambda _msg: None
+    db = factory()
+    row = _deferred_row(db)
+    target = _queue_order(engine, row)
+    # due=2026-08-05 当天收到过分钟 bar → 不顺延
+    engine._prev_minute_bar_date = date(2026, 8, 5)
+
+    bar = BarEvent(bar_time=datetime(2026, 8, 6, 9, 31), period="1m")
+    released = engine._release_signal_bar_deferred(port, bar)
+
+    assert released == []
+    assert target not in engine._signal_bar_deferred
+    db.expire_all()
+    kept = db.query(LiveOrder).filter(LiveOrder.id == row.id).first()
+    assert kept.status == "canceled"
     db.close()
 
 

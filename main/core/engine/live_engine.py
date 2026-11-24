@@ -9955,6 +9955,10 @@ class LiveEngine:
             if portfolio is None:
                 raise ValueError("组合不在本会话运行实例中，请停止后重新启动会话")
             now = self.ctx.clock()
+            # 回队必须还原原信号 bar 时间：若把改写后的 now 留在内存，后续每根
+            # bar 的跨日判定都不再成立，单子会被静默跳过（2026-11-24 实盘事故）。
+            # now 只用于本次放行尝试的决策时间。
+            orig_bar_time = target.bar_time
             with self._book_lock:
                 self._signal_bar_deferred = [
                     o for o in self._signal_bar_deferred if o is not target]
@@ -9965,6 +9969,7 @@ class LiveEngine:
                 self._submit_one_order(
                     db, portfolio, target, "1m", emit_signal=False)
             except Exception:
+                target.bar_time = orig_bar_time
                 with self._book_lock:
                     if all(o is not target for o in self._signal_bar_deferred):
                         self._signal_bar_deferred.append(target)
@@ -9977,6 +9982,7 @@ class LiveEngine:
             submitted = (row_id is not None
                          and getattr(target, "_deferred_row_id", None) is None)
             if not submitted:
+                target.bar_time = orig_bar_time
                 with self._book_lock:
                     if all(o is not target for o in self._signal_bar_deferred):
                         self._signal_bar_deferred.append(target)
@@ -12542,9 +12548,15 @@ class LiveEngine:
         released: List[OrderEvent] = []
         remaining: List[OrderEvent] = []
         for order in self._signal_bar_deferred:
+            # 跨日判定以入队时固化的 signal_bar_date 为准：bar_time 可能被人工放行
+            # 等路径临时改写为当日，若只看 bar_time.date() 会让该单当天及以后永远
+            # 不满足严格小于而被静默跳过（2026-11-24）。缺失时回退 bar_time。
+            signal_date = order.signal_bar_date
+            if signal_date is None and order.bar_time is not None:
+                signal_date = order.bar_time.date()
             if not (order.portfolio_id == portfolio.portfolio_id
-                    and order.bar_time is not None
-                    and order.bar_time.date() < bar_date):
+                    and signal_date is not None
+                    and signal_date < bar_date):
                 remaining.append(order)
                 continue
             signal_day = order.signal_bar_date
