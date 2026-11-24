@@ -3,7 +3,7 @@ import logging
 
 import pandas as pd
 import polars as pl
-from typing import Dict, List, Callable, Optional
+from typing import Any, Dict, List, Callable, Optional
 from .utils import get_tdx_lock, get_tq, P2, current_priority, gate_config, parse_priority
 
 logger = logging.getLogger(__name__)
@@ -296,6 +296,21 @@ class TQData:
             return pd.DataFrame()
         return frames[0] if len(frames) == 1 else pd.concat(frames, axis=0)
 
+    @staticmethod
+    def _dict_frames(data: Any) -> pd.DataFrame:
+        """SDK 的 ``Dict[code, DataFrame]`` → 带 Code 列的纵向表。"""
+        if not isinstance(data, dict):
+            return data if isinstance(data, pd.DataFrame) else pd.DataFrame()
+        frames = []
+        for code, frame in data.items():
+            if not isinstance(frame, pd.DataFrame) or frame.empty:
+                continue
+            part = frame.copy()
+            part.columns = [str(c).strip() for c in part.columns]
+            part.insert(0, "Code", code)
+            frames.append(part)
+        return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+
     def get_financial_data(
         self, stocks: List[str], table_list: List[str],
         start_time: str = "", report_type: str = "report_time", priority=None,
@@ -311,9 +326,9 @@ class TQData:
         level = current_priority() if priority is None else parse_priority(priority)
         chunk = self._selection_chunk(level, len(codes))
         return self._selection_fetch(
-            lambda part: get_tq().get_financial_data(
-                stock_list=part, table_list=list(table_list),
-                start_time=start_time, report_type=report_type),
+            lambda part: self._dict_frames(get_tq().get_financial_data(
+                stock_list=part, field_list=list(table_list),
+                start_time=start_time, report_type=report_type)),
             codes, level, chunk)
 
     def get_gpjy_value_by_date(
@@ -330,8 +345,9 @@ class TQData:
         level = current_priority() if priority is None else parse_priority(priority)
         chunk = self._selection_chunk(level, len(codes))
         return self._selection_fetch(
-            lambda part: get_tq().get_gpjy_value_by_date(
-                stock_list=part, year=year, mmdd=mmdd, table_list=list(table_list)),
+            lambda part: self._dict_frames(get_tq().get_gpjy_value_by_date(
+                stock_list=part, field_list=list(table_list),
+                year=int(year), mmdd=int(mmdd))),
             codes, level, chunk)
 
     def get_gp_one_data(
@@ -344,8 +360,8 @@ class TQData:
         level = current_priority() if priority is None else parse_priority(priority)
         chunk = self._selection_chunk(level, len(codes))
         return self._selection_fetch(
-            lambda part: get_tq().get_gp_one_data(
-                stock_list=part, table_list=list(table_list)),
+            lambda part: self._dict_frames(get_tq().get_gp_one_data(
+                stock_list=part, field_list=list(table_list))),
             codes, level, chunk)
 
     def get_history(
