@@ -4973,6 +4973,252 @@ def build_capacity_warnings(
     ))
 
 
+# ---------------------------------------------------------------------------
+# 单笔金额上限（异常保护）：参数一致性校验 + 带数字的成因说明。
+# 只做诊断，不放开上限、不改 shrink 语义、不影响回测数值。
+# ---------------------------------------------------------------------------
+#: 被金额上限缩量的买入占比超过该值才提示（与历史 5% 口径一致）。
+AMOUNT_CAP_WARN_RATIO = 0.05
+
+
+def _fmt_cap_yuan(value) -> str:
+    try:
+        return format(float(value), ",.0f")
+    except (TypeError, ValueError):
+        return str(value)
+
+
+def _fmt_pct(value, digits: int = 1) -> str:
+    try:
+        return "%.*f%%" % (digits, float(value))
+    except (TypeError, ValueError):
+        return str(value)
+
+
+def _amount_cap_thresholds(strategies) -> list:
+    """每策略的「阈值权益」= max_order_amount / (single_open_ratio × capital_ratio)。
+
+    与引擎开仓口径一致（单仓目标 = single_open_ratio × capital_ratio × 权益）；
+    capital_ratio=1 时即 max_order_amount / single_open_ratio。按阈值升序返回，
+    第一项是「最先越线」的约束来源。
+    """
+    out = []
+    for s in strategies or []:
+        try:
+            moa = float(getattr(s, "max_order_amount", 0) or 0)
+            ratio = float(getattr(s, "single_open_ratio", 0) or 0)
+            capital = float(getattr(s, "capital_ratio", 1) or 1)
+        except (TypeError, ValueError):
+            continue
+        if moa <= 0 or ratio <= 0 or capital <= 0:
+            continue
+        out.append({
+            "threshold": moa / (ratio * capital),
+            "name": getattr(s, "name", "") or "",
+            "max_order_amount": moa,
+            "single_open_ratio": ratio,
+            "capital_ratio": capital,
+        })
+    out.sort(key=lambda item: item["threshold"])
+    return out
+
+
+def _first_equity_crossing(snapshots, threshold):
+    """日级快照中首个 total_value > threshold 的 (日期, 权益)。"""
+    for snap in _dedup_daily_by_date(list(snapshots or [])):
+        try:
+            value = float(snap.get("total_value"))
+        except (TypeError, ValueError):
+            continue
+        if value > threshold:
+            raw = snap.get("snap_date")
+            return (str(raw)[:10] if raw else "", value)
+    return None
+
+
+def _floor_cap_amount(value: float) -> int:
+    """建议 equity_cap 向下取整到万元，避免建议值本身仍略高于阈值。"""
+    if value <= 0:
+        return 0
+    if value < 10000:
+        return int(value)
+    return int(value // 10000) * 10000
+
+
+def _cap_advice(binding: dict, max_equity, position_sizing: str,
+                initial_capital) -> List[str]:
+    suggestions: List[str] = []
+    if position_sizing == "fixed":
+        try:
+            fund = binding["capital_ratio"] * float(initial_capital or 0)
+        except (TypeError, ValueError):
+            fund = 0.0
+        if fund > 0 and binding["single_open_ratio"] * fund > binding["max_order_amount"]:
+            new_ratio = binding["max_order_amount"] / fund
+            suggestions.append(
+                "把 single_open_ratio 降到 ≤ %s（按固定策略资金 %s 元计）"
+                % (_fmt_pct(new_ratio * 100, 2), _fmt_cap_yuan(fund)))
+        return suggestions
+    suggestions.append("把 equity_cap 设为 ≤ %s 元"
+                       % _fmt_cap_yuan(_floor_cap_amount(binding["threshold"])))
+    if max_equity and max_equity > 0:
+        new_ratio = binding["max_order_amount"] / max_equity
+        if new_ratio < binding["single_open_ratio"]:
+            suggestions.append(
+                "或把 single_open_ratio 降到 ≤ %s（按区间最高权益 %s 元计）"
+                % (_fmt_pct(new_ratio * 100, 2), _fmt_cap_yuan(max_equity)))
+    return suggestions
+
+
+def build_amount_cap_precheck(strategies, position_sizing="dynamic",
+                              equity_cap=None, initial_capital=None):
+    """回测启动时的参数一致性校验（只返回提示文本，不改任何参数）。"""
+    thresholds = _amount_cap_thresholds(strategies)
+    if not thresholds:
+        return None
+    binding = thresholds[0]
+    thr = binding["threshold"]
+    issues = []
+    try:
+        cap = float(equity_cap) if equity_cap not in (None, "") else None
+    except (TypeError, ValueError):
+        cap = None
+    if cap is not None and cap > thr:
+        per_order = (cap * binding["single_open_ratio"]
+                     * binding["capital_ratio"])
+        issues.append(
+            "equity_cap %s 元 × 单仓比例 %s × 资金占比 %s = %s 元，"
+            "已高于 max_order_amount %s 元（阈值权益 %s 元）"
+            % (_fmt_cap_yuan(cap),
+               _fmt_pct(binding["single_open_ratio"] * 100),
+               _fmt_pct(binding["capital_ratio"] * 100),
+               _fmt_cap_yuan(per_order),
+               _fmt_cap_yuan(binding["max_order_amount"]), _fmt_cap_yuan(thr)))
+    try:
+        init = float(initial_capital or 0)
+    except (TypeError, ValueError):
+        init = 0.0
+    fund = init * binding["capital_ratio"]
+    if position_sizing == "fixed":
+        if binding["single_open_ratio"] * fund > binding["max_order_amount"]:
+            issues.append(
+                "fixed 口径策略资金固定为 %s 元，单仓目标 %s 元已超过上限 %s 元"
+                % (_fmt_cap_yuan(fund),
+                   _fmt_cap_yuan(binding["single_open_ratio"] * fund),
+                   _fmt_cap_yuan(binding["max_order_amount"])))
+    elif fund > thr:
+        issues.append("起始权益 %s 元已超过阈值权益 %s 元"
+                      % (_fmt_cap_yuan(fund), _fmt_cap_yuan(thr)))
+    if not issues:
+        return None
+    advice = _cap_advice(binding, fund, position_sizing, init)
+    return ("单笔金额上限参数校验：" + "；".join(issues) + "。"
+            + ("建议" + "，".join(advice) + "。" if advice else ""))
+
+
+def build_amount_cap_warning(strategies, execution_stats, snapshots=None,
+                             position_sizing="dynamic", equity_cap=None,
+                             initial_capital=None):
+    """把「单笔金额上限」告警变成带数字、可判断成因的说明。
+
+    两种成因：
+    - 区间内权益越过阈值权益 → 固定上限 vs 复利后权益错配（复利越过）；
+    - 权益从未越过阈值却高频缩量 → 订单金额本身异常。
+    仅说明，不改变 shrink/拒单语义与回测数值。
+    """
+    stats = execution_stats or {}
+    buy = int(stats.get("buy_orders") or 0)
+    hits = int(stats.get("amount_cap_hits") or 0)
+    thresholds = _amount_cap_thresholds(strategies)
+    if buy <= 0 or not thresholds:
+        return None
+    binding = thresholds[0]
+    thr = binding["threshold"]
+    pct = hits * 100.0 / buy
+    try:
+        cap = float(equity_cap) if equity_cap not in (None, "") else None
+    except (TypeError, ValueError):
+        cap = None
+    inconsistent = cap is not None and cap > thr
+    daily = _dedup_daily_by_date(list(snapshots)) if snapshots else []
+    crossing = _first_equity_crossing(daily, thr) if daily else None
+    max_equity = None
+    first_date = ""
+    if daily:
+        values = []
+        for snap in daily:
+            try:
+                values.append(float(snap.get("total_value")))
+            except (TypeError, ValueError):
+                pass
+        max_equity = max(values) if values else None
+        first_raw = daily[0].get("snap_date")
+        first_date = str(first_raw)[:10] if first_raw else ""
+    # 无缩量且参数一致 → 无需告警；有缩量但占比很低且未越线 → 保持原静默。
+    if hits <= 0 and not inconsistent:
+        return None
+    if not (inconsistent or crossing or hits / buy > AMOUNT_CAP_WARN_RATIO):
+        return None
+
+    if hits > 0:
+        head = ("单笔金额上限（异常保护）触发 %d/%d 笔买入（%.1f%% > %.1f%%）"
+                % (hits, buy, pct, AMOUNT_CAP_WARN_RATIO * 100))
+    else:
+        head = "单笔金额上限参数不一致（本轮未实际触发缩量）"
+    params = ("%s：max_order_amount %s 元 ÷ (单仓比例 %s × 资金占比 %s) = "
+              "阈值权益 %s 元"
+              % (head, _fmt_cap_yuan(binding["max_order_amount"]),
+                 _fmt_pct(binding["single_open_ratio"] * 100),
+                 _fmt_pct(binding["capital_ratio"] * 100), _fmt_cap_yuan(thr)))
+
+    try:
+        init = float(initial_capital or 0)
+    except (TypeError, ValueError):
+        init = 0.0
+    fixed_fund = binding["capital_ratio"] * init
+    if hits <= 0:
+        cause = ("本轮没有订单实际被缩量（可能受现金/持仓约束），但按当前参数，"
+                 "任何超过阈值权益的开仓都会先被压到上限")
+        advice = _cap_advice(binding, max_equity, position_sizing, init)
+    elif position_sizing == "fixed":
+        cause = ("fixed 口径下策略资金固定为 %s 元，单仓目标 %s 元超过上限，"
+                 "属参数本身超限（不随权益增长）"
+                 % (_fmt_cap_yuan(fixed_fund),
+                    _fmt_cap_yuan(fixed_fund * binding["single_open_ratio"])))
+        advice = _cap_advice(binding, None, position_sizing, init)
+    elif crossing:
+        date_text, value = crossing
+        if first_date and date_text == first_date:
+            cause = ("区间起始权益 %s 元已超过阈值（起始即越线），"
+                     "此后开仓目标持续被压缩到上限" % _fmt_cap_yuan(value))
+        else:
+            cause = ("区间内权益 %s 首次达到 %s 元越过阈值（复利增长），"
+                     "此后开仓目标持续被压缩到上限"
+                     % (date_text or "（日期缺失）", _fmt_cap_yuan(value)))
+        advice = _cap_advice(binding, max_equity, position_sizing, init)
+    else:
+        if max_equity is not None:
+            cause = ("区间内权益最高仅 %s 元、未越过阈值，说明订单金额本身异常"
+                     "（价格/数量或公式下单价异常），请检查数据与下单参数，"
+                     "而非上调 max_order_amount" % _fmt_cap_yuan(max_equity))
+        else:
+            cause = ("区间内无权益快照可判断，但上限高频触发，"
+                     "请检查订单金额（价格/数量）与参数口径")
+        advice = ["检查订单金额（价格/数量）与公式下单价是否异常"]
+
+    cap_note = ""
+    if cap is not None and cap > thr:
+        per_order = cap * binding["single_open_ratio"] * binding["capital_ratio"]
+        cap_note = ("；当前 equity_cap %s 元 × 单仓比例 %s × 资金占比 %s = %s 元，"
+                    "仍高于上限（参数不一致）"
+                    % (_fmt_cap_yuan(cap),
+                       _fmt_pct(binding["single_open_ratio"] * 100),
+                       _fmt_pct(binding["capital_ratio"] * 100),
+                       _fmt_cap_yuan(per_order)))
+    tail = ("建议" + "，".join(advice) + "。") if advice else ""
+    return params + "；" + cause + cap_note + "。" + tail
+
+
 def run_backtest(db: Session, ps: PortfolioStrategy, req,
                  param_overrides: Optional[dict] = None,
                  walk_forward_run_id: Optional[int] = None,
@@ -5265,6 +5511,15 @@ def run_backtest(db: Session, ps: PortfolioStrategy, req,
     record_id = rec.id
     # K1 协作式取消：登记取消令牌（API 取消接口按 record_id 置位，引擎逐 bar 检查）
     cancel_event = backtest_cancel.register([record_id])
+    # 单笔金额上限参数一致性校验（启动即告警；只写日志，不改参数与结果）。
+    try:
+        _cap_precheck = build_amount_cap_precheck(
+            strategies, getattr(ps, "position_sizing", "dynamic"),
+            equity_cap, getattr(ps, "initial_capital", None))
+        if _cap_precheck:
+            logger.warning("[回测#%s] %s", record_id, _cap_precheck)
+    except Exception:  # noqa: BLE001 — 预检失败不得影响回测
+        logger.debug("单笔金额上限预检失败（忽略，不影响回测）", exc_info=True)
 
     try:
         t0 = datetime.now()
@@ -5528,17 +5783,16 @@ def run_backtest(db: Session, ps: PortfolioStrategy, req,
             getattr(ps, "position_sizing", "dynamic"),
             getattr(ps, "equity_cap", None),
         ))
-        # 层 1：单笔金额上限已回归「异常保护」语义；被它缩量/拒单的订单占比
-        # 超过 5% 说明阈值偏低或策略下单价异常，显式告警（不自动调参）。
-        _exec_stats = result.get("execution_stats") or {}
-        _buy_orders = int(_exec_stats.get("buy_orders") or 0)
-        _cap_hits = int(_exec_stats.get("amount_cap_hits") or 0)
-        if _buy_orders > 0 and _cap_hits / _buy_orders > 0.05:
-            warnings.append(
-                "单笔金额上限（异常保护）触发 %d/%d 笔买入（%.1f%% > 5%%）："
-                "阈值可能偏低或订单金额异常，请检查 max_order_amount / 单仓目标"
-                % (_cap_hits, _buy_orders, _cap_hits * 100.0 / _buy_orders)
-            )
+        # 层 1：单笔金额上限只作异常保护；带数字说明阈值权益与成因（不改语义）。
+        _cap_warning = build_amount_cap_warning(
+            strategies, result.get("execution_stats") or {},
+            result.get("snapshots") or [],
+            getattr(ps, "position_sizing", "dynamic"),
+            equity_cap,
+            getattr(ps, "initial_capital", None),
+        )
+        if _cap_warning:
+            warnings.append(_cap_warning)
 
         _persist_result(db, record_id, ps.id, result, strategies)
         t8 = datetime.now()
@@ -5774,6 +6028,16 @@ def run_multi_backtest(db: Session, portfolios: list, req) -> dict:
             db.query(Strategy).filter_by(portfolio_id=ps.id)
             .order_by(Strategy.id).all()
         )
+        # 单笔金额上限参数一致性校验（启动即告警；只写日志，不改参数与结果）。
+        try:
+            _cap_precheck = build_amount_cap_precheck(
+                strategies, getattr(ps, "position_sizing", "dynamic"),
+                getattr(ps, "equity_cap", None),
+                getattr(ps, "initial_capital", None))
+            if _cap_precheck:
+                logger.warning("[回测组合#%s] %s", ps.id, _cap_precheck)
+        except Exception:  # noqa: BLE001 — 预检失败不得影响回测
+            logger.debug("单笔金额上限预检失败（忽略，不影响回测）", exc_info=True)
         portfolio = _assemble_portfolio(
             ps, strategies, db, enable_manual_recovery=False)
         exact_mode = dividend_mode == "exact"
@@ -6013,14 +6277,6 @@ def run_multi_backtest(db: Session, portfolios: list, req) -> dict:
             }
         decisions = results.pop("_decisions", []) if isinstance(results, dict) else []
         _exec_stats = results.pop("execution_stats", {}) if isinstance(results, dict) else {}
-        _buy_orders = int(_exec_stats.get("buy_orders") or 0)
-        _cap_hits = int(_exec_stats.get("amount_cap_hits") or 0)
-        _cap_warning = None
-        if _buy_orders > 0 and _cap_hits / _buy_orders > 0.05:
-            _cap_warning = (
-                "单笔金额上限（异常保护）触发 %d/%d 笔买入（%.1f%% > 5%%）："
-                "阈值可能偏低或订单金额异常，请检查 max_order_amount / 单仓目标"
-                % (_cap_hits, _buy_orders, _cap_hits * 100.0 / _buy_orders))
         per_portfolio: Dict[int, dict] = {}
         for e in entries:
             ps = e["ps"]
@@ -6044,12 +6300,19 @@ def run_multi_backtest(db: Session, portfolios: list, req) -> dict:
                 # F1 数据质量冻结（只观测）：成员记录各自保存自己的取数质量。
                 rec.data_quality_json = json.dumps(
                     dq_by_ps.get(ps.id), ensure_ascii=False, default=str)
+                _cap_warning = build_amount_cap_warning(
+                    e.get("strategies") or [], _exec_stats,
+                    res.get("snapshots") or [],
+                    getattr(ps, "position_sizing", "dynamic"),
+                    getattr(ps, "equity_cap", None),
+                    getattr(ps, "initial_capital", None),
+                )
                 _rec_warnings: List[str] = []
                 _rec_warnings.extend(period_warnings_by_ps.get(ps.id) or [])
                 if res.get("pending_order_count"):
                     _rec_warnings.append(
                         f"回测结束时仍有 {res['pending_order_count']} 笔信号未成交")
-                elif _cap_warning:
+                if _cap_warning:
                     _rec_warnings.append(_cap_warning)
                 _missing = e.get("ca_missing") or []
                 if _missing:
