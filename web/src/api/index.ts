@@ -4495,6 +4495,7 @@ export interface SelectionMeta {
   field_set_version: string
   pools: string[]
   industry_prefix: string
+  scorable_fields: string[]
   fields: SelectionFieldSpec[]
 }
 
@@ -4513,7 +4514,7 @@ export interface SelectionVersionItem {
   id: number
   scheme_id: number
   version: number
-  spec: Record<string, unknown>
+  spec: SelectionSpec
   spec_hash: string
   field_set_version: string
   field_fingerprint: string
@@ -4571,7 +4572,7 @@ export async function getSelectionScheme(id: number) {
 
 export async function createSelectionVersion(
   schemeId: number,
-  req: { spec: Record<string, unknown>; note?: string; uncalibrated?: boolean },
+  req: { spec: SelectionSpec; note?: string; uncalibrated?: boolean },
 ) {
   const res = await api.post<ApiResponse<SelectionVersionItem>>(
     `/selection/schemes/${schemeId}/versions`, req)
@@ -4600,5 +4601,520 @@ export async function getSelectionGpAudit(day: string, thresholdPct = 5) {
   const res = await api.get<ApiResponse<Record<string, unknown>>>('/selection/gp/audit', {
     params: { day, threshold_pct: thresholdPct },
   })
+  return res.data.data
+}
+
+// --- 运行 / 快照 / 发布 / 导入仓 -------------------------------------------
+
+/** 方案参数树（与后端 spec_json 一一对应）。 */
+export interface SelectionSpec {
+  pool_key: string
+  weights: Record<string, number>
+  weights_hist?: Record<string, number>
+  gates?: Record<string, number>
+  track?: 'both' | 'forward' | 'historical'
+  top_n?: number
+  fields?: string[]
+}
+
+export interface SelectionStats {
+  pool_key?: string
+  universe?: number
+  gate_passed?: number
+  eligible?: number
+  selected?: number
+  top_n?: number
+  track_mode?: string | null
+  gate_drops?: Record<string, number>
+  factor_coverage?: Record<string, number>
+  tracks?: Record<string, { eligible: number; selected: number }>
+  rows_kept?: number
+  rows_dropped_detail_omitted?: number
+  capped?: boolean
+}
+
+export interface SelectionQuality {
+  field_set_version?: string
+  field_fingerprint?: string
+  fields?: string[]
+  warehouse_as_of?: string
+  warehouse_imported_at?: string | null
+  is_financial_source?: string
+  valuation_source?: string
+  kline_source?: string
+  missing_policy?: string
+  survivorship?: string
+  uncalibrated?: string
+  notes?: string[]
+  factor_validation?: {
+    available?: boolean
+    reason?: string
+    as_of?: string
+    n_periods?: number
+    horizon_days?: number
+    factors?: Record<string, {
+      n_periods?: number
+      insufficient?: boolean
+      reason?: string
+      mean_ic?: number
+      icir?: number | null
+      positive_ratio?: number
+      monotonic?: boolean
+      monotonic_rho?: number | null
+      quintile_means_pct?: (number | null)[]
+    }>
+    unvalidated_used?: string[]
+  }
+}
+
+export interface SelectionStockRow {
+  code: string
+  name: string | null
+  sector: string | null
+  track: string | null
+  score: number | null
+  coverage: number | null
+  rank: number | null
+  selected: boolean
+  exclude_reason: string | null
+  gate: string | null
+  pool_key?: string
+  factors?: Record<string, number>
+  pcts?: Record<string, number>
+  raw_pcts?: Record<string, number>
+  explain?: {
+    factor: string
+    value: number
+    pct: number
+    weight: number
+    contribution: number
+  }[]
+}
+
+export interface SelectionRunItem {
+  id: number
+  scheme_version_id: number
+  scheme_id: number | null
+  scheme_code: string | null
+  scheme_name: string | null
+  pool_key: string | null
+  version: number | null
+  as_of: string | null
+  status: string
+  stock_count: number
+  params_hash: string | null
+  error: string | null
+  started_at: string | null
+  finished_at: string | null
+  created_at: string | null
+  snapshot_id: number | null
+  frozen: boolean
+  published_pool_id: number | null
+}
+
+export interface SelectionRunDetail extends SelectionRunItem {
+  stats?: SelectionStats
+  quality?: SelectionQuality
+  stocks?: SelectionStockRow[]
+}
+
+export interface SelectionSkippedItem {
+  scheme_id: number
+  scheme_code: string
+  scheme_name: string
+  pool_key: string
+  status: string
+  error: string
+  as_of: string
+}
+
+export interface SelectionRunResult {
+  as_of: string
+  warehouse_as_of: string | null
+  runs: SelectionRunItem[]
+  skipped: SelectionSkippedItem[]
+}
+
+export interface SelectionSnapshotItem {
+  id: number
+  run_id: number
+  scheme_version_id: number
+  scheme_id: number | null
+  scheme_code: string | null
+  scheme_name: string | null
+  pool_key: string | null
+  version: number | null
+  as_of: string | null
+  fingerprint: string
+  field_set_version: string
+  spec_hash: string
+  config_fingerprint: string
+  frozen: boolean
+  published_pool_id: number | null
+  published_pool_code: string | null
+  published_pool_name: string | null
+  stock_count: number | null
+  stats: SelectionStats
+  quality: SelectionQuality
+  created_at: string | null
+}
+
+export interface SelectionSnapshotDetail extends SelectionSnapshotItem {
+  stocks?: SelectionStockRow[]
+}
+
+export interface SelectionWarehouseCounts {
+  universe?: number
+  fin?: number
+  dividend?: number
+  kline?: number
+  gp16?: number
+  more_info?: number
+  stock_info?: number
+  go?: number
+  gp?: number
+  sector_missing?: number
+  is_financial_marked?: number
+  fin_history_lt8?: number
+  notes?: string[]
+}
+
+export interface SelectionDataStatus {
+  ready: boolean
+  message?: string
+  as_of?: string
+  imported_at?: string | null
+  source_path?: string
+  source_size_mb?: number | null
+  stale_days?: number
+  stock_count?: number
+  fin_count?: number
+  dividend_count?: number
+  counts?: SelectionWarehouseCounts
+  wide_db?: WideDbStatus | null
+}
+
+export interface SelectionImportResult {
+  as_of: string
+  source_path: string
+  counts: SelectionWarehouseCounts
+  imported_at: string
+}
+
+export async function seedSelectionSchemes() {
+  const res = await api.post<ApiResponse<{ created: number }>>('/selection/schemes/seed')
+  return res.data.data
+}
+
+export async function getSelectionDefaults() {
+  const res = await api.get<ApiResponse<Record<string, SelectionSpec>>>('/selection/defaults')
+  return res.data.data
+}
+
+export async function getSelectionDataStatus() {
+  const res = await api.get<ApiResponse<SelectionDataStatus>>('/selection/data-status')
+  return res.data.data
+}
+
+export async function importSelectionWarehouse() {
+  const res = await api.post<ApiResponse<SelectionImportResult>>('/selection/warehouse/import')
+  return res.data.data
+}
+
+export async function createSelectionRuns(req: { as_of?: string; scheme_ids?: number[] } = {}) {
+  const res = await api.post<ApiResponse<SelectionRunResult>>('/selection/runs', req)
+  return res.data.data
+}
+
+export async function getSelectionRuns(limit = 50, schemeId?: number) {
+  const res = await api.get<ApiResponse<SelectionRunItem[]>>('/selection/runs', {
+    params: { limit, scheme_id: schemeId },
+  })
+  return res.data.data
+}
+
+export async function getSelectionRun(
+  runId: number,
+  opts: { includeStocks?: boolean; selectedOnly?: boolean; limit?: number } = {},
+) {
+  const res = await api.get<ApiResponse<SelectionRunDetail>>(`/selection/runs/${runId}`, {
+    params: {
+      include_stocks: opts.includeStocks ?? true,
+      selected_only: opts.selectedOnly ?? false,
+      limit: opts.limit ?? 500,
+    },
+  })
+  return res.data.data
+}
+
+export async function getSelectionSnapshots(limit = 50) {
+  const res = await api.get<ApiResponse<SelectionSnapshotItem[]>>('/selection/snapshots', {
+    params: { limit },
+  })
+  return res.data.data
+}
+
+export async function getSelectionSnapshot(
+  snapshotId: number,
+  opts: { includeStocks?: boolean; selectedOnly?: boolean; limit?: number } = {},
+) {
+  const res = await api.get<ApiResponse<SelectionSnapshotDetail>>(
+    `/selection/snapshots/${snapshotId}`, {
+      params: {
+        include_stocks: opts.includeStocks ?? false,
+        selected_only: opts.selectedOnly ?? true,
+        limit: opts.limit ?? 500,
+      },
+    })
+  return res.data.data
+}
+
+export async function freezeSelectionSnapshot(snapshotId: number) {
+  const res = await api.post<ApiResponse<SelectionSnapshotItem>>(
+    `/selection/snapshots/${snapshotId}/freeze`)
+  return res.data.data
+}
+
+export async function publishSelectionSnapshot(
+  snapshotId: number,
+  req: { code?: string; name?: string; series?: boolean } = {},
+) {
+  const res = await api.post<ApiResponse<{
+    snapshot_id: number
+    pool_id: number
+    pool_code: string
+    pool_name: string
+    stock_count: number
+    kind?: string
+  }>>(`/selection/snapshots/${snapshotId}/publish`, req)
+  return res.data.data
+}
+
+export interface SelectionDeliverItem {
+  run_id: number
+  snapshot_id: number
+  pool_key: string
+  scheme_name: string
+  stock_count: number
+  version_pool: { pool_id: number; pool_code: string; pool_name: string }
+  series_pool: { pool_id: number; pool_code: string; pool_name: string }
+}
+
+export interface SelectionDeliverResult extends SelectionRunResult {
+  delivered: SelectionDeliverItem[]
+}
+
+export async function deliverSelection(asOf?: string) {
+  const res = await api.post<ApiResponse<SelectionDeliverResult>>(
+    '/selection/deliver', { as_of: asOf })
+  return res.data.data
+}
+
+export interface SelectionPoolItem {
+  pool_id: number
+  code: string
+  name: string
+  kind: 'series' | 'version'
+  snapshot_id: number | null
+  as_of: string | null
+  frozen: boolean
+  stock_count: number
+  interval_count: number
+  synced_at: string | null
+}
+
+export interface SelectionPoolResolve {
+  pool_id: number
+  code: string
+  kind: string
+  day: string
+  available: boolean
+  covered: boolean
+  codes: string[]
+  source: string
+  note: string | null
+}
+
+export interface SelectionSessionBindingItem {
+  portfolio_strategy_id: number
+  portfolio_name: string
+  stock_pool_id: number | null
+  pool_code: string | null
+  pool_kind: string | null
+  snapshot_id: number | null
+  as_of: string | null
+  frozen: boolean | null
+  pool_pit_enabled: boolean
+}
+
+export interface SelectionSessionBinding {
+  session_id: number
+  session_name: string
+  items: SelectionSessionBindingItem[]
+}
+
+export interface SelectionBindResult {
+  session_id: number
+  session_name: string
+  pool_id: number
+  pool_code: string
+  pool_name: string
+  snapshot_id: number | null
+  as_of: string | null
+  frozen: boolean | null
+  stock_count: number
+  portfolios: { portfolio_strategy_id: number; stock_pool_id: number | null; pool_pit_enabled: boolean }[]
+}
+
+export interface SelectionFactorValidation {
+  available: boolean
+  reason?: string
+  as_of?: string
+  horizon_days?: number
+  step_days?: number
+  n_periods?: number
+  computed_at?: string
+  factors?: Record<string, {
+    n_periods?: number
+    insufficient?: boolean
+    reason?: string
+    mean_ic?: number
+    ic_std?: number
+    icir?: number | null
+    positive_ratio?: number
+    quintile_means_pct?: (number | null)[]
+    monotonic_rho?: number | null
+    monotonic?: boolean
+  }>
+  unvalidated?: Record<string, string>
+  method?: Record<string, string>
+}
+
+export async function getSelectionPools() {
+  const res = await api.get<ApiResponse<SelectionPoolItem[]>>('/selection/pools')
+  return res.data.data
+}
+
+export async function resolveSelectionPool(poolId: number, day?: string) {
+  const res = await api.get<ApiResponse<SelectionPoolResolve>>(
+    `/selection/pools/${poolId}/resolve`, { params: { day } })
+  return res.data.data
+}
+
+export async function getSelectionSessionBinding(sessionId: number) {
+  const res = await api.get<ApiResponse<SelectionSessionBinding>>(
+    `/selection/sessions/${sessionId}/binding`)
+  return res.data.data
+}
+
+export async function bindSelectionSession(
+  sessionId: number,
+  req: { pool_id?: number; snapshot_id?: number },
+) {
+  const res = await api.post<ApiResponse<SelectionBindResult>>(
+    `/selection/sessions/${sessionId}/bind`, req)
+  return res.data.data
+}
+
+export async function unbindSelectionSession(
+  sessionId: number,
+  bindings: SelectionBindResult['portfolios'],
+) {
+  const res = await api.post<ApiResponse<{ session_id: number; restored: unknown[] }>>(
+    `/selection/sessions/${sessionId}/unbind`, { bindings })
+  return res.data.data
+}
+
+export async function getSelectionFactorValidation() {
+  const res = await api.get<ApiResponse<SelectionFactorValidation>>(
+    '/selection/factor-validation')
+  return res.data.data
+}
+
+export interface SelectionFormulaSignal {
+  signal_name: string
+  signal_type: string
+  trigger_value: string
+}
+
+export interface SelectionFormulaItem {
+  formula_id: number
+  name: string
+  engine: string
+  signals: SelectionFormulaSignal[]
+  open_signals: string[]
+}
+
+export interface SelectionRecallMissed {
+  code: string
+  cause: string
+  forward_return_pct: number | null
+  horizon_days: number
+  rank?: number | null
+  score?: number | null
+  raw_pcts?: Record<string, number>
+  top_factors?: Array<{
+    factor: string
+    pct?: number
+    weight?: number
+    contribution?: number
+  }>
+  note?: string
+}
+
+export interface SelectionPoolRecall {
+  snapshot_id: number
+  as_of: string
+  formula: { id: number; name: string; engine: string; open_signals: Record<string, number> }
+  horizon_days: number
+  universe_size: number
+  pool_size: number
+  formula_selected_market: number
+  formula_selected_pool: number
+  recall: number | null
+  in_pool_hit: string[]
+  missed_count: number
+  cause_counts: Record<string, number>
+  missed: SelectionRecallMissed[]
+  eval_error_count: number
+  eval_error_sample: string[]
+  method: string
+  notes: string[]
+  computed_at: string
+  cached?: boolean
+}
+
+export interface SelectionPoolRecallSummary {
+  id: number
+  as_of: string
+  snapshot_id: number
+  formula_id: number
+  horizon_days: number
+  recall: number | null
+  formula_selected_market: number | null
+  formula_selected_pool: number | null
+  missed_count: number | null
+  cause_counts: Record<string, number>
+  computed_at: string | null
+}
+
+export async function getSelectionFormulas() {
+  const res = await api.get<ApiResponse<SelectionFormulaItem[]>>('/selection/formulas')
+  return res.data.data
+}
+
+export async function computeSelectionRecall(req: {
+  snapshot_id: number
+  formula_id: number
+  horizon_days?: number
+  refresh?: boolean
+}) {
+  const res = await api.post<ApiResponse<SelectionPoolRecall>>('/selection/pool-recall', req)
+  return res.data.data
+}
+
+export async function getSelectionRecalls(snapshotId?: number) {
+  const res = await api.get<ApiResponse<SelectionPoolRecallSummary[]>>(
+    '/selection/pool-recall', { params: { snapshot_id: snapshotId } })
   return res.data.data
 }

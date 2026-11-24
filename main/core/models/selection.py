@@ -10,8 +10,8 @@
 """
 
 from sqlalchemy import (
-    Boolean, Column, Date, DateTime, ForeignKey, Index, Integer, Numeric,
-    String, Text, UniqueConstraint,
+    Boolean, Column, Date, DateTime, ForeignKey, Index, Integer, LargeBinary,
+    Numeric, String, Text, UniqueConstraint,
 )
 from sqlalchemy.sql import func
 
@@ -179,3 +179,126 @@ class SelectionGpSnapshot(Base):
         UniqueConstraint("code", "as_of", name="uq_selection_gp_snapshots_code_asof"),
         Index("ix_selection_gp_snapshots_asof", "as_of"),
     )
+
+
+# ---------------------------------------------------------------------------
+# 宽库导入仓（D1：宽库只在导入期读取；运行期只读这几张平台表）
+# 单行元数据 + 每票一行（行情/估值/一致预期快照）+ 每票一行（财报序列）
+# + 每票一行（分红事件序列）。序列统一 zlib(JSON) 压缩，控制主库体积。
+# ---------------------------------------------------------------------------
+
+class SelectionWarehouseMeta(Base):
+    """导入仓元数据：固定单行（id=1），记录源路径、快照日与导入时间。"""
+
+    __tablename__ = "selection_wh_meta"
+
+    id = Column(Integer, primary_key=True)
+    as_of = Column(Date, nullable=False)
+    source_path = Column(String(400), nullable=False)
+    source_size_mb = Column(Numeric(10, 1), nullable=True)
+    imported_at = Column(DateTime, nullable=False, server_default=func.now())
+    stock_count = Column(Integer, nullable=False, default=0)
+    fin_count = Column(Integer, nullable=False, default=0)
+    dividend_count = Column(Integer, nullable=False, default=0)
+    # 覆盖与缺口披露（一致性检查、字段覆盖率、缺失项）
+    counts_json = Column(Text, nullable=True)
+
+
+class SelectionWarehouseStock(Base):
+    """每票一行的导入快照（估值/上市信息/GO/GP/K 线派生指标）。"""
+
+    __tablename__ = "selection_wh_stocks"
+
+    code = Column(String(20), primary_key=True)
+    name = Column(String(60), nullable=True)
+    exchange = Column(String(10), nullable=True)
+    sector_code = Column(String(40), nullable=True)
+    sector_name = Column(String(60), nullable=True)
+    pool = Column(String(40), nullable=True)
+    tags = Column(String(200), nullable=True)
+    is_financial = Column(Boolean, nullable=False, default=False)
+    # 原始宽库 payload（已是 zlib 压缩的 JSON，导入时原样搬运）
+    more_blob = Column(LargeBinary, nullable=True)
+    info_blob = Column(LargeBinary, nullable=True)
+    go_blob = Column(LargeBinary, nullable=True)
+    gp_blob = Column(LargeBinary, nullable=True)
+    # K 线派生：导入日收盘、近 252 日波动率（%）、近 252 日最大回撤（%）
+    close = Column(Numeric(12, 4), nullable=True)
+    volatility_pct = Column(Numeric(10, 4), nullable=True)
+    max_drawdown_pct = Column(Numeric(10, 4), nullable=True)
+    fin_periods = Column(Integer, nullable=False, default=0)
+    fin_last_tag = Column(String(8), nullable=True)
+
+    __table_args__ = (
+        Index("ix_selection_wh_stocks_sector", "sector_name"),
+    )
+
+
+class SelectionWarehouseFin(Base):
+    """每票一行的财报序列：tag_time / announce_time / 各 FN 值，整体压缩。"""
+
+    __tablename__ = "selection_wh_fin"
+
+    code = Column(String(20), primary_key=True)
+    n_periods = Column(Integer, nullable=False, default=0)
+    last_tag_time = Column(String(8), nullable=True)
+    last_announce_time = Column(String(8), nullable=True)
+    series_blob = Column(LargeBinary, nullable=False)
+
+
+class SelectionWarehouseDividend(Base):
+    """每票一行的分红事件序列：[[ex_date, year, bonus], ...]，整体压缩。"""
+
+    __tablename__ = "selection_wh_dividend"
+
+    code = Column(String(20), primary_key=True)
+    n_events = Column(Integer, nullable=False, default=0)
+    last_ex_date = Column(String(8), nullable=True)
+    rows_blob = Column(LargeBinary, nullable=False)
+
+
+class SelectionFactorValidation(Base):
+    """因子稳定性验证摘要（单行）：导入时用宽库 K 线前向收益回算。
+
+    只存汇总结果（均值 IC、ICIR、分组单调性），不存逐期明细；``as_of`` 与
+    导入快照日绑定，重新导入即整行替换——避免验证结果与数据版本错位。
+    """
+
+    __tablename__ = "selection_factor_validations"
+
+    id = Column(Integer, primary_key=True)
+    as_of = Column(Date, nullable=False)
+    horizon_days = Column(Integer, nullable=False, default=20)
+    step_days = Column(Integer, nullable=False, default=21)
+    n_periods = Column(Integer, nullable=False, default=0)
+    # {factor: {mean_ic, icir, positive_ratio, quintile_means, monotonic, n_periods}}
+    payload_json = Column(Text, nullable=False)
+    computed_at = Column(DateTime, server_default=func.now())
+
+
+class SelectionPoolRecall(Base):
+    """池子有效性（召回）验证结果：池只是候选域，最终由公式择时决定买什么。
+
+    口径：同一 as_of，分别取「公式在全市场入选集合」与「公式在池内入选集合」，
+    召回率 = 池内入选 / 全市场入选；并给出池外漏票明细与成因分类。
+    IC/分组单调性仅作参考数据，不参与任何决策。
+
+    唯一键（snapshot_id, formula_id, horizon_days）：同一口径重复计算直接覆盖，
+    避免结果与快照/公式版本错位。
+    """
+
+    __tablename__ = "selection_pool_recalls"
+
+    id = Column(Integer, primary_key=True)
+    as_of = Column(Date, nullable=False)
+    formula_id = Column(Integer, nullable=False)
+    snapshot_id = Column(Integer, nullable=False)
+    horizon_days = Column(Integer, nullable=False, default=20)
+    payload_json = Column(Text, nullable=False)
+    computed_at = Column(DateTime, server_default=func.now())
+
+    __table_args__ = (
+        UniqueConstraint("snapshot_id", "formula_id", "horizon_days",
+                         name="uq_selection_pool_recall"),
+    )
+

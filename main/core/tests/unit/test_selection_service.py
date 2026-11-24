@@ -80,7 +80,7 @@ def test_versions_are_immutable_and_increment(db_session):
     v1 = svc.create_version(db_session, scheme.id, SPEC)
     v1_hash = v1.spec_hash
     v2 = svc.create_version(db_session, scheme.id,
-                            {"pool_key": "growth",
+                            {"pool_key": "growth", "track": "historical",
                              "weights": {"g_hist_3y": 1.0}, "top_n": 100})
     assert v2.version == 2
     db_session.refresh(v1)

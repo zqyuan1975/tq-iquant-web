@@ -19,13 +19,55 @@ from sqlalchemy.orm import Session
 
 from core.models.selection import SelectionScheme, SelectionSchemeVersion
 from core.selection.field_dict import (
-    FIELD_SET_VERSION, field_set_fingerprint, get_field)
+    FIELD_SET_VERSION, assert_scorable, field_set_fingerprint, get_field)
 
 POOL_KEYS = ("growth", "quality", "value", "dividend")
 INDUSTRY_PREFIX = "industry:"
 WEIGHT_TOLERANCE = 1e-6
 SCHEME_STATUSES = ("active", "archived")
 VERSION_STATUSES = ("draft", "active", "archived")
+TRACKS = ("both", "forward", "historical")
+
+#: D3 拍板：首发默认权重直接采用外部方案 v4 的 STYLE_WEIGHTS（未校准），
+#: 全部字段都落在 field_dict.SCORABLE_FIELDS 内。用户可改权重，但只能改这些字段。
+DEFAULT_GATES = {
+    "min_float_mv": 20.0,       # 流通市值下限（亿元）
+    "max_pe": 500.0,            # PE 上限
+    "min_div_streak": 3,        # 红利：连续分红年数
+    "max_payout": 100.0,        # 红利：分红率上限 %
+    "min_fcf_cover": 1.0,       # 红利：自由现金流覆盖
+    "max_roic_trend_drop": -5.0,  # 价值否决：ROIC 趋势下限
+}
+
+DEFAULT_SPECS: Dict[str, dict] = {
+    "dividend": {
+        "pool_key": "dividend",
+        "top_n": 100,
+        "weights": {"dp3": .25, "ep": .20, "cfp": .15, "roic_adj": .15,
+                    "dps_growth": .10, "payout_stab": .10, "size": .05},
+    },
+    "growth": {
+        "pool_key": "growth",
+        "track": "both",
+        "top_n": 100,
+        "weights": {"g_fwd_2y": .35, "neg_peg_fwd": .30, "g_rev_2y": .15,
+                    "accel": .10, "roic_trend": .10},
+        "weights_hist": {"np_yoy": .35, "neg_peg_hist": .30, "rev_yoy": .20,
+                         "g_hist_3y": .10, "roic_trend": .05},
+    },
+    "quality": {
+        "pool_key": "quality",
+        "top_n": 100,
+        "weights": {"roic_adj": .25, "roe_adj": .20, "gm": .15,
+                    "earn_qual": .15, "solvency": .15, "govern": .10},
+    },
+    "value": {
+        "pool_key": "value",
+        "top_n": 100,
+        "weights": {"ep": .30, "bp": .20, "cfp": .20, "dp3": .15,
+                    "sp": .10, "size": .05},
+    },
+}
 
 
 class SpecError(ValueError):
@@ -40,6 +82,57 @@ def spec_fingerprint(spec: dict) -> str:
     return hashlib.sha256(_dump(spec).encode("utf-8")).hexdigest()[:16]
 
 
+def default_spec(pool_key: str) -> dict:
+    """返回带默认闸门的参数模板（深拷贝，调用方可直接改）。"""
+    base = DEFAULT_SPECS.get(pool_key)
+    if base is None:
+        raise SpecError("暂不支持该池的默认参数：%s" % pool_key)
+    spec = json.loads(json.dumps(base))
+    spec["gates"] = dict(DEFAULT_GATES)
+    #: 默认做行业+市值中性化（版本参数的一部分，可随版本回退）
+    spec["neutralize"] = True
+    return spec
+
+
+def _check_weights(weights: dict, label: str) -> float:
+    if not isinstance(weights, dict) or not weights:
+        raise SpecError("%s 不能为空" % label)
+    total = 0.0
+    for key, weight in weights.items():
+        get_field(key)          # 未登记字段直接抛 UnregisteredField
+        assert_scorable([key])  # D3：未接入打分的字段不许进权重
+        if isinstance(weight, bool) or not isinstance(weight, (int, float)):
+            raise SpecError("%s 权重必须是数字：%s=%r" % (label, key, weight))
+        if weight < 0:
+            raise SpecError("%s 权重不能为负：%s=%r" % (label, key, weight))
+        total += float(weight)
+    if abs(total - 1.0) > WEIGHT_TOLERANCE:
+        raise SpecError("%s 权重和必须为 1，实际 %.6f" % (label, total))
+    return total
+
+
+def _check_gates(gates: dict) -> None:
+    if not isinstance(gates, dict):
+        raise SpecError("gates 必须是对象")
+    limits = {
+        "min_float_mv": (0.0, 100000.0),
+        "max_pe": (0.0, 10000.0),
+        "min_div_streak": (0, 30),
+        "max_payout": (0.0, 1000.0),
+        "min_fcf_cover": (-100.0, 100.0),
+        "max_roic_trend_drop": (-100.0, 0.0),
+    }
+    unknown = sorted(set(gates) - set(limits))
+    if unknown:
+        raise SpecError("未知闸门：%s" % ", ".join(unknown))
+    for key, value in gates.items():
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise SpecError("闸门必须是数字：%s=%r" % (key, value))
+        low, high = limits[key]
+        if not low <= float(value) <= high:
+            raise SpecError("闸门 %s 超出范围 %.2f..%.2f" % (key, low, high))
+
+
 def validate_spec(spec: dict) -> dict:
     """校验参数树；只校验不改写，返回原对象。"""
     if not isinstance(spec, dict):
@@ -48,23 +141,29 @@ def validate_spec(spec: dict) -> dict:
     if not (pool in POOL_KEYS or pool.startswith(INDUSTRY_PREFIX)):
         raise SpecError("pool_key 非法：%r" % pool)
 
-    weights = spec.get("weights")
-    if not isinstance(weights, dict) or not weights:
-        raise SpecError("weights 不能为空")
-    total = 0.0
-    for key, weight in weights.items():
-        get_field(key)  # 未登记字段直接抛 UnregisteredField
-        if isinstance(weight, bool) or not isinstance(weight, (int, float)):
-            raise SpecError("权重必须是数字：%s=%r" % (key, weight))
-        if weight < 0:
-            raise SpecError("权重不能为负：%s=%r" % (key, weight))
-        total += float(weight)
-    if abs(total - 1.0) > WEIGHT_TOLERANCE:
-        raise SpecError("权重和必须为 1，实际 %.6f" % total)
+    _check_weights(spec.get("weights"), "weights")
 
-    top_n = spec.get("top_n", 200)
+    track = spec.get("track", "both")
+    if pool == "growth":
+        if track not in TRACKS:
+            raise SpecError("track 必须是 %s 之一" % "/".join(TRACKS))
+        # 只有 both 需要历史轨权重；forward/historical 单轨时 weights 即该轨权重
+        if track == "both":
+            _check_weights(spec.get("weights_hist"), "weights_hist")
+        elif spec.get("weights_hist"):
+            _check_weights(spec["weights_hist"], "weights_hist")
+    elif "track" in spec:
+        raise SpecError("只有成长池支持 track")
+
+    top_n = spec.get("top_n", 100)
     if isinstance(top_n, bool) or not isinstance(top_n, int) or not 1 <= top_n <= 1000:
         raise SpecError("top_n 必须是 1..1000 的整数")
+
+    if "neutralize" in spec and not isinstance(spec["neutralize"], bool):
+        raise SpecError("neutralize 必须是布尔值")
+
+    gates = spec.get("gates", {})
+    _check_gates(gates)
 
     fields = spec.get("fields")
     if fields is not None:
@@ -139,6 +238,9 @@ def create_version(db: Session, scheme_id: int, spec: dict,
         raise LookupError("方案不存在：%s" % scheme_id)
     validate_spec(spec)
     fields = spec.get("fields") or list(spec["weights"].keys())
+    if spec.get("weights_hist"):
+        fields = list(fields) + list(spec["weights_hist"].keys())
+    fields = sorted(set(fields))
     latest = (db.query(func.max(SelectionSchemeVersion.version))
               .filter(SelectionSchemeVersion.scheme_id == scheme_id).scalar())
     version = SelectionSchemeVersion(
@@ -193,17 +295,36 @@ def version_payload(version: SelectionSchemeVersion) -> Dict:
 
 
 def seed_default_schemes(db: Session) -> int:
-    """幂等种子：四风格池各建一个方案（不建版本，参数由用户填）。"""
+    """幂等种子：四风格池各建一个方案，并各建 v1 默认参数版本（启用）。
+
+    v1 权重来自外部方案 v4 的经验值，统一标 ``uncalibrated=True``；
+    用户改参数只能新建版本，v1 永远不会被覆盖。
+    """
     created = 0
+    names = {"growth": "成长", "quality": "质量",
+             "value": "价值", "dividend": "红利"}
     for pool in POOL_KEYS:
-        if db.query(SelectionScheme).filter_by(code=pool).first():
+        scheme = db.query(SelectionScheme).filter_by(code=pool).first()
+        if scheme is None:
+            scheme = SelectionScheme(
+                code=pool, name=names[pool], pool_key=pool,
+                description="内置模板（首发权重未校准）", status="active")
+            db.add(scheme)
+            db.flush()
+            created += 1
+        if db.query(SelectionSchemeVersion).filter_by(scheme_id=scheme.id).first():
             continue
-        db.add(SelectionScheme(
-            code=pool, name={"growth": "成长", "quality": "质量",
-                             "value": "价值", "dividend": "红利"}[pool],
-            pool_key=pool, description="内置模板（权重未校准，需先建版本）",
-            status="active"))
-        created += 1
-    if created:
-        db.commit()
+        spec = default_spec(pool)
+        validate_spec(spec)
+        fields = sorted(set(spec["weights"]) | set(spec.get("weights_hist") or {}))
+        db.add(SelectionSchemeVersion(
+            scheme_id=scheme.id, version=1,
+            spec_json=_dump(spec), spec_hash=spec_fingerprint(spec),
+            field_set_version=FIELD_SET_VERSION,
+            field_fingerprint=field_set_fingerprint(fields),
+            weight_sum=sum(float(w) for w in spec["weights"].values()),
+            uncalibrated=True, status="active",
+            note="内置 v1（未校准）",
+        ))
+    db.commit()
     return created

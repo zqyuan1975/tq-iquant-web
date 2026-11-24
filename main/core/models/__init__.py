@@ -73,6 +73,12 @@ from .selection import (
     SelectionSchemeVersion,
     SelectionSnapshot,
     SelectionSnapshotStock,
+    SelectionWarehouseDividend,
+    SelectionWarehouseFin,
+    SelectionFactorValidation,
+    SelectionPoolRecall,
+    SelectionWarehouseMeta,
+    SelectionWarehouseStock,
 )
 
 __all__ = [
@@ -144,4 +150,10 @@ __all__ = [
     "SelectionSnapshot",
     "SelectionSnapshotStock",
     "SelectionGpSnapshot",
+    "SelectionWarehouseMeta",
+    "SelectionWarehouseStock",
+    "SelectionWarehouseFin",
+    "SelectionWarehouseDividend",
+    "SelectionFactorValidation",
+    "SelectionPoolRecall",
 ]

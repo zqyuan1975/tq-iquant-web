@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
-"""条件选股 API（A1）。
+"""条件选股 API（A1 + A2）。
 
-只做「方案 / 版本 / 元数据 / 宽库状态」四类读接口与两类写接口；
-选股执行、快照冻结、发布到股票池在后续批次（依赖 D3 字段集定稿）。
+方案 / 版本 / 宽库导入 / 运行 / 快照冻结 / 发布股票池。
+选股引擎只读平台导入仓（D1），历史回放明确拒绝而不是用未来数据凑结果。
 """
 
 from datetime import date
@@ -16,8 +16,10 @@ from sqlalchemy.orm import Session
 from core.api.response import err, ok
 from core.db import get_db
 from core.models.selection import SelectionScheme
-from core.selection import field_dict, wide_db
+from core.selection import field_dict, recall as recall_svc, wide_db, warehouse
 from core.selection.field_dict import UnregisteredField
+from core.services import selection_pool_service as pool_svc
+from core.services import selection_run_service as run_svc
 from core.services import selection_service as svc
 
 router = APIRouter(prefix="/api/selection", tags=["selection"])
@@ -42,6 +44,37 @@ class VersionReq(BaseModel):
     uncalibrated: bool = True
 
 
+class RunReq(BaseModel):
+    as_of: Optional[date] = None
+    scheme_ids: Optional[List[int]] = None
+
+
+class PublishReq(BaseModel):
+    code: Optional[str] = None
+    name: Optional[str] = None
+    series: bool = False
+
+
+class DeliverReq(BaseModel):
+    as_of: Optional[date] = None
+
+
+class BindReq(BaseModel):
+    pool_id: Optional[int] = None
+    snapshot_id: Optional[int] = None
+
+
+class RecallReq(BaseModel):
+    snapshot_id: int
+    formula_id: int
+    horizon_days: int = 20
+    refresh: bool = False
+
+
+class UnbindReq(BaseModel):
+    bindings: List[dict] = []
+
+
 def _bad(exc: Exception):
     return err(400, str(exc))
 
@@ -58,8 +91,35 @@ def selection_meta():
         "field_set_version": field_dict.FIELD_SET_VERSION,
         "pools": list(svc.POOL_KEYS),
         "industry_prefix": svc.INDUSTRY_PREFIX,
+        "scorable_fields": sorted(field_dict.SCORABLE_FIELDS),
         "fields": fields,
     })
+
+
+@router.get("/defaults")
+def selection_defaults():
+    """四池默认参数（D3 窄字段集 + 外部 v4 经验权重，未校准）。"""
+    return ok({pool: svc.default_spec(pool) for pool in svc.POOL_KEYS})
+
+
+@router.get("/data-status")
+def data_status(db: Session = Depends(get_db)):
+    """导入仓状态（运行期视角）+ 外部宽库只读探针（仅体检展示）。"""
+    return ok(run_svc.warehouse_status(db))
+
+
+@router.post("/warehouse/import")
+def warehouse_import(db: Session = Depends(get_db)):
+    """宽库 → 平台导入仓：唯一读取外部宽库的入口，可重跑。"""
+    try:
+        result = warehouse.import_warehouse(db)
+    except warehouse.WarehouseError as exc:
+        db.rollback()
+        return err(400, str(exc))
+    except Exception as exc:  # pragma: no cover - 防御性
+        db.rollback()
+        return err(500, "导入失败：%s" % exc)
+    return ok(result)
 
 
 @router.get("/wide-db/status")
@@ -191,3 +251,188 @@ def gp_audit(day: date = Query(...), threshold_pct: float = 5.0,
     from core.services import selection_gp as gp
 
     return ok(gp.audit_day(db, day, threshold_pct=threshold_pct))
+
+
+# --- 运行 / 快照 / 发布 ---------------------------------------------------
+
+@router.post("/runs")
+def create_runs(req: RunReq, db: Session = Depends(get_db)):
+    """跑一次选股并落库；返回逐方案结果（含跳过原因）。"""
+    try:
+        result = run_svc.run_schemes(db, scheme_ids=req.scheme_ids,
+                                     as_of=req.as_of)
+    except run_svc.RunError as exc:
+        return _bad(exc)
+    except Exception as exc:  # pragma: no cover - 防御性
+        db.rollback()
+        return err(500, "选股失败：%s" % exc)
+    return ok(result)
+
+
+@router.get("/runs")
+def list_runs(limit: int = 50, scheme_id: Optional[int] = None,
+              db: Session = Depends(get_db)):
+    return ok(run_svc.list_runs(db, limit=max(1, min(limit, 200)),
+                                scheme_id=scheme_id))
+
+
+@router.get("/runs/{run_id}")
+def get_run(run_id: int, include_stocks: bool = True,
+            selected_only: bool = False, limit: int = 500,
+            db: Session = Depends(get_db)):
+    try:
+        return ok(run_svc.run_detail(db, run_id, include_stocks=include_stocks,
+                                     selected_only=selected_only, limit=limit))
+    except LookupError as exc:
+        return err(404, str(exc))
+
+
+@router.get("/snapshots")
+def list_snapshots(limit: int = 50, db: Session = Depends(get_db)):
+    return ok(run_svc.list_snapshots(db, limit=max(1, min(limit, 200))))
+
+
+@router.get("/snapshots/{snapshot_id}")
+def get_snapshot(snapshot_id: int, include_stocks: bool = False,
+                 selected_only: bool = True, limit: int = 500,
+                 db: Session = Depends(get_db)):
+    try:
+        return ok(run_svc.snapshot_detail(
+            db, snapshot_id, include_stocks=include_stocks,
+            selected_only=selected_only, limit=limit))
+    except LookupError as exc:
+        return err(404, str(exc))
+
+
+@router.post("/snapshots/{snapshot_id}/freeze")
+def freeze_snapshot(snapshot_id: int, db: Session = Depends(get_db)):
+    try:
+        return ok(run_svc.freeze(db, snapshot_id))
+    except LookupError as exc:
+        return err(404, str(exc))
+
+
+@router.post("/snapshots/{snapshot_id}/publish")
+def publish_snapshot(snapshot_id: int, req: PublishReq,
+                     db: Session = Depends(get_db)):
+    """冻结后的快照发布为平台股票池（当前成分 + PIT 成员区间）。
+
+    ``series=false``（默认）发版本池，供实盘钉版本；``series=true`` 发同风格
+    序列池，供回测按日期取成分。
+    """
+    try:
+        return ok(run_svc.publish(db, snapshot_id, code=req.code,
+                                  name=req.name, series=req.series))
+    except LookupError as exc:
+        return err(404, str(exc))
+    except run_svc.RunError as exc:
+        return _bad(exc)
+    except IntegrityError:
+        db.rollback()
+        return err(409, "股票池 code 冲突，请换一个 code")
+    except Exception as exc:  # pragma: no cover - 防御性
+        db.rollback()
+        return err(500, "发布失败：%s" % exc)
+
+
+@router.post("/deliver")
+def deliver_selection(req: DeliverReq, db: Session = Depends(get_db)):
+    """T 盘后一次交付：运行 → 冻结 → 发版本池 → 发序列池。"""
+    try:
+        return ok(run_svc.deliver(db, as_of=req.as_of))
+    except run_svc.RunError as exc:
+        return _bad(exc)
+    except Exception as exc:  # pragma: no cover - 防御性
+        db.rollback()
+        return err(500, "交付失败：%s" % exc)
+
+
+@router.get("/factor-validation")
+def factor_validation(db: Session = Depends(get_db)):
+    """因子稳定性摘要（导入期回算，随快照日冻结）。仅作参考数据，不参与决策。"""
+    return ok(run_svc.factor_validation(db))
+
+
+# --- 池子有效性（召回）：池是候选域，最终由公式择时决定买什么 ---------------
+
+@router.get("/formulas")
+def list_formulas(db: Session = Depends(get_db)):
+    """可做择时验证的导入公式及其实效 OPEN 信号线。"""
+    return ok(recall_svc.list_formulas(db))
+
+
+@router.post("/pool-recall")
+def compute_pool_recall(req: RecallReq, db: Session = Depends(get_db)):
+    """按 as_of 比较公式全市场入选 vs 池内入选，算召回率 + 漏票明细。"""
+    try:
+        return ok(recall_svc.compute_recall(
+            db, req.snapshot_id, req.formula_id,
+            horizon_days=req.horizon_days, refresh=req.refresh))
+    except recall_svc.RecallError as exc:
+        return _bad(exc)
+    except LookupError as exc:
+        return err(404, str(exc))
+    except Exception as exc:  # pragma: no cover - 公式求值等外部失败
+        db.rollback()
+        return err(500, "召回验证失败：%s" % exc)
+
+
+@router.get("/pool-recall")
+def list_pool_recalls(snapshot_id: Optional[int] = None, limit: int = 20,
+                      db: Session = Depends(get_db)):
+    return ok(recall_svc.list_recalls(db, snapshot_id=snapshot_id, limit=limit))
+
+
+# --- 池接入：回测取成分 / 实盘挂版本 -------------------------------------
+
+@router.get("/pools")
+def list_pools(db: Session = Depends(get_db)):
+    """条件选股池清单：series（回测用）/ version（实盘钉版本用）。"""
+    return ok(pool_svc.list_pools(db))
+
+
+@router.get("/pools/{pool_id}/resolve")
+def resolve_pool(pool_id: int, day: Optional[date] = None,
+                 db: Session = Depends(get_db)):
+    """按日期解析池成分（PIT）；未覆盖日显式 available=false。"""
+    try:
+        return ok(pool_svc.resolve_pool(db, pool_id, day=day))
+    except LookupError as exc:
+        return err(404, str(exc))
+
+
+@router.get("/sessions/{session_id}/binding")
+def session_binding(session_id: int, db: Session = Depends(get_db)):
+    try:
+        return ok(pool_svc.session_binding(db, session_id))
+    except LookupError as exc:
+        return err(404, str(exc))
+
+
+@router.post("/sessions/{session_id}/bind")
+def bind_session(session_id: int, req: BindReq,
+                 db: Session = Depends(get_db)):
+    """把实盘会话关联组合挂到条件选股**版本池**（frozen 才允许）。"""
+    try:
+        return ok(pool_svc.bind_session(db, session_id,
+                                        pool_id=req.pool_id,
+                                        snapshot_id=req.snapshot_id))
+    except LookupError as exc:
+        return err(404, str(exc))
+    except pool_svc.PoolBindError as exc:
+        return _bad(exc)
+    except Exception as exc:  # pragma: no cover - 防御性
+        db.rollback()
+        return err(500, "绑定失败：%s" % exc)
+
+
+@router.post("/sessions/{session_id}/unbind")
+def unbind_session(session_id: int, req: UnbindReq,
+                   db: Session = Depends(get_db)):
+    """按 bind 返回的 before 快照回退。"""
+    try:
+        return ok(pool_svc.unbind_session(db, session_id, req.bindings))
+    except LookupError as exc:
+        return err(404, str(exc))
+    except pool_svc.PoolBindError as exc:
+        return _bad(exc)

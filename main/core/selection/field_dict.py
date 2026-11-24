@@ -102,7 +102,7 @@ _SPECS: Tuple[FieldSpec, ...] = (
 
     # --- L1：红利 ---
     _spec("dp_annual", SOURCE_DIVIDEND, "Bonus", "%", False, True, pools=(DIVIDEND,),
-          note="sum(Bonus/10)/当年均价；一年多次分红须先年度聚合"),
+          note="本年度 Bonus 合计（元/股）/ 导入日收盘；一年多次须先年度聚合"),
     _spec("div_streak", SOURCE_DIVIDEND, "Bonus", "年", False, True, pools=(DIVIDEND,),
           note="按年度聚合 Bonus>0 后向前连续计数；<3 淘汰"),
     _spec("dp3", SOURCE_DIVIDEND, "Bonus", "%", False, True, pools=(DIVIDEND,),
@@ -130,7 +130,7 @@ _SPECS: Tuple[FieldSpec, ...] = (
     _spec("solvency", SOURCE_FN, "FN170", "%", True, True, pools=(QUALITY,),
           note="FN170/FN210/FN327 合成；金融股不适用"),
     _spec("govern", SOURCE_FN, "FN336", "布尔", False, True, pools=(QUALITY,),
-          note="FN336 in {1,2} 且 GP20<阈值；不否决但标注"),
+          note="审计意见取负（0 标准无保留最佳）；越低越好"),
 
     # --- L1：成长（前瞻轨） ---
     _spec("g_fwd_2y", SOURCE_GO, "GO8", "%", True, False, pools=(GROWTH,),
@@ -185,9 +185,41 @@ _SPECS: Tuple[FieldSpec, ...] = (
           note="审计意见；>=3 视为非标"),
     _spec("pledge_ratio", SOURCE_GP, "GP20", "%", True, True,
           note="质押比例（治理项辅助）"),
+
+    # --- L1：红利稳定性 / 成长 PEG / 规模（打分链路实际调用） ---
+    _spec("payout_stab", SOURCE_FN, "FN337", "pp", True, True, pools=(DIVIDEND,),
+          note="-pstdev(近 8 期 FN337)；越稳越高，缺失置空"),
+    _spec("neg_peg_fwd", SOURCE_GO, "GO23/GO8", "1/倍", True, False, pools=(GROWTH,),
+          note="0<peg_fwd<100 时取 -peg_fwd；未覆盖或增速<=0 置空"),
+    _spec("neg_peg_hist", SOURCE_MORE_INFO, "StaticPE_TTM/FN184", "1/倍", True, False,
+          pools=(GROWTH,), note="0<peg_hist<100 时取 -peg_hist；增速<=0 置空"),
+    _spec("size", SOURCE_MORE_INFO, "Ltsz", "亿元", True, False,
+          pools=(VALUE, DIVIDEND), note="流通市值；与 GP16 总市值口径不同，勿混用"),
 )
 
 FIELD_REGISTRY: Dict[str, FieldSpec] = {s.key: s for s in _SPECS}
+
+#: D3 拍板（2026-11-24）：首发只开放「外部方案 v4 已实现 + 导入仓可取」的窄字段集。
+#: 不在本集合里的登记字段可以展示与留存，但**不允许**进入权重，避免用未验证列打分。
+SCORABLE_FIELDS = frozenset({
+    "ep", "bp", "cfp", "sp",
+    "dp_annual", "dp3", "div_streak", "payout", "payout_stab",
+    "dps_growth", "fcf_cover",
+    "roic_adj", "roe_adj", "roe_yoy", "gm", "earn_qual", "solvency", "govern",
+    "g_fwd_2y", "g_rev_2y", "peg_fwd", "neg_peg_fwd",
+    "g_hist_3y", "np_yoy", "rev_yoy", "accel", "deliver",
+    "peg_hist", "neg_peg_hist", "roic_trend",
+    "volatility", "max_drawdown", "size",
+})
+
+
+def assert_scorable(keys: Iterable[str]) -> None:
+    """权重字段必须落在首发可打分子集内。"""
+    unknown = sorted(set(keys) - SCORABLE_FIELDS)
+    if unknown:
+        raise UnregisteredField(
+            "字段 %s 尚未接入打分（D3 窄集合）；可展示但不可用于权重"
+            % ", ".join(unknown))
 
 
 def get_field(key: str) -> FieldSpec:
