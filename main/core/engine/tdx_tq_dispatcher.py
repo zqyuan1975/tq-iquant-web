@@ -675,9 +675,21 @@ class TdxTqDispatcher(OrderDispatcher):
             code = re.sub(r"\D", "", str(o.get("symbol") or ""))[:6]
             if not ref or filled <= 0 or len(code) != 6:
                 continue
-            price = float(o.get("fill_price") or 0) or float(o.get("price") or 0)
+            fill_px = float(o.get("fill_price") or 0)
+            price = fill_px or float(o.get("price") or 0)
             if price <= 0:
                 continue
+            price_source = "fill" if fill_px > 0 else "order_price_fallback"
+            if price_source == "order_price_fallback":
+                warned = getattr(self, "_deal_price_fallback_warned", None)
+                if warned is None:
+                    warned = set()
+                    self._deal_price_fallback_warned = warned
+                if ref not in warned:
+                    warned.add(ref)
+                    logger.warning(
+                        "通达信成交回报缺少 fill_price，order_ref=%s 用委托价 "
+                        "%s 顶替成交价（已标注 price_source）", ref, price)
             trade_date, trade_time = self._submit_times.get(
                 ref, (now_shanghai().strftime("%Y%m%d"), now_shanghai().strftime("%H%M%S")))
             row = {
@@ -693,6 +705,7 @@ class TdxTqDispatcher(OrderDispatcher):
                 "stamp_duty": 0,
                 "trade_date": trade_date,
                 "trade_time": trade_time,
+                "price_source": price_source,
             }
             # ① 本行自带方向字段
             if o.get("direction_known"):
@@ -1332,8 +1345,15 @@ class TdxTqDispatcher(OrderDispatcher):
         price = float(order.price) if order.price is not None else 0.0
         if len(code6) != 6:
             raise BridgeOrderRejected("invalid stock code %s" % order.stock_code)
-        if vol <= 0 or price <= 0:
-            raise BridgeOrderRejected("invalid order volume/price %s/%s" % (vol, price))
+        if vol <= 0:
+            raise BridgeOrderRejected(
+                "invalid order volume %s (must be > 0)" % vol)
+        if price <= 0:
+            # 通达信下单框结构上必须有价：这里必须给出「价非法」的明确语义，
+            # 不能与「量非法」混成一条含糊的 volume/price 失败。
+            raise BridgeOrderRejected(
+                "invalid order price %r (must be > 0): TDX requires an "
+                "explicit order price" % (order.price,))
 
         direction = "buy" if order.trade_type.value == "BUY" else "sell"
         # 涨跌停前置校验已上移引擎提交链（price_limit_check_enabled 门控，

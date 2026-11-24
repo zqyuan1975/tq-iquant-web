@@ -438,6 +438,10 @@ def _position_market_value(row, volume: int, cost: Decimal) -> Decimal:
 # 深交所收盘时点（上海 15:00）。收盘后禁止新下单——报不进交易所，会成待报单
 # 冻结持仓永不成交（真机 2026-08-14 id40-41，bar_time=15:02:42）。
 # 用 bar.bar_time 判定（非墙钟：不依赖本机时钟/时区）。仅拦新落单，信号仍推。
+# 提交前价格刷新可接受的快照年龄（秒）。同日但超过该年龄的采样不再当作
+# 「实时价」用于报单（陈旧价不标注当新价），退回信号价并记真实年龄。
+_SUBMIT_PRICE_MAX_AGE_SECONDS = 180
+
 _MARKET_CLOSE_TIME = (15, 0)
 # 盘中持仓对账节流（秒）：快照采集 5s/60s 级，对账判定 5 分钟一次足够
 _INTRADAY_RECONCILE_INTERVAL = 300.0
@@ -1354,6 +1358,8 @@ class LiveEngine:
         self._reconcile_mismatches: List[dict] = []
         # I-7：收盘复查对账的幂等日期标记（每交易日一次，见 _maybe_reconcile_after_close）
         self._last_reconcile_date: Optional[date] = None
+        # 取价梳理 F5：「顺延单在等首根 1m bar」的显式告警去重日期（每交易日一条）
+        self._deferred_waiting_warned: set = set()
         # 人工干预：柜台持仓里「平台台账 + 在途单」解释不了的增减量的已报去重键
         # （code, virtual, real, action），防同一差异每轮采集重复刷审计/SSE。
         self._manual_intervention_reported: set = set()
@@ -2980,6 +2986,8 @@ class LiveEngine:
             self._maybe_pre_open_auction(now)
             # G3：顺延单积压告警（默认关闭；每交易日每规则最多一条）
             self._check_deferred_backlog(now)
+            # F5：显式标注「在等首根 1m bar」（每交易日一条，只观测不阻断）
+            self._note_deferred_waiting_first_bar(now)
             # poll() 内部对每根完成的 bar 触发 self._on_bar 回调
             # 行情轮询窗口（收盘后停拉行情）：窗口外（交易日 15:05 后 / 次日 09:15 前 /
             # 非交易日）整轮不拉行情、不注入外部信号——这是收盘后对掘金桥 /quote
@@ -6900,6 +6908,8 @@ class LiveEngine:
         today = now_shanghai().date()
         original = order.price
         stale = False
+        stale_snapshot_age: Optional[int] = None
+        snapshot_rejected = False
         price: Optional[Decimal] = None
         source = "signal"
         try:
@@ -6922,23 +6932,47 @@ class LiveEngine:
                     self._warn_stale_quote(order, bar_time)
         if price is None:
             snap = self._snapshot_latest_price(code)
-            if snap is not None and (snap[1] is None or snap[1].date() == today):
-                price, source = snap[0], "snapshot"
+            if snap is not None:
+                snap_price, snap_at = snap
+                # P1（2026-11-24 取价梳理）：同日 ≠ 新鲜。快照样本可能是几十分钟
+                # 前的采样，旧实现只校验日期就当成「实时价」用于报单，属「陈旧价
+                # 不标注当新价用」。超过阈值（或时间戳缺失/非当日）一律不采用，
+                # 退回信号价（报单委托价不依赖盘口 → 不阻断），并在事件中标注
+                # 真实年龄，供复盘区分「信号价」与「过期快照价」。
+                if snap_at is None or snap_at.date() != today:
+                    snapshot_rejected = True
+                else:
+                    try:
+                        age_s = int(
+                            (self.ctx.clock() - snap_at).total_seconds())
+                    except Exception:  # noqa: BLE001
+                        age_s = None
+                    if age_s is None or age_s > _SUBMIT_PRICE_MAX_AGE_SECONDS:
+                        snapshot_rejected = True
+                        stale_snapshot_age = age_s
+                    else:
+                        price, source = snap_price, "snapshot"
         if price is not None:
             order.price = price
+        elif snapshot_rejected:
+            source = "snapshot_stale"
         elif stale:
             source = "quote_stale_fallback"
+        stale_note = (
+            " snapshot_age_seconds=%s" % stale_snapshot_age
+            if stale_snapshot_age is not None else "")
         logger.info(
-            "提交前价格刷新 code=%s price_source=%s price=%s signal_price=%s "
-            "(session %s)", code, source, order.price, original, self.session_id,
+            "提交前价格刷新 code=%s price_source=%s price=%s signal_price=%s%s "
+            "(session %s)", code, source, order.price, original, stale_note,
+            self.session_id,
         )
         self._recorder.record(
             gate="submit_price", layer="live_gate", action="refresh",
             portfolio_id=getattr(order, "portfolio_id", None),
             strategy_id=getattr(order, "strategy_id", None),
             stock_code=code, bar_time=order.bar_time,
-            message="提交前价格刷新 price_source=%s price=%s signal_price=%s"
-                    % (source, order.price, original),
+            message="提交前价格刷新 price_source=%s price=%s signal_price=%s%s"
+                    % (source, order.price, original, stale_note),
         )
         return source
 
@@ -12564,6 +12598,99 @@ class LiveEngine:
         if self._last_minute_bar_date is None or d > self._last_minute_bar_date:
             self._prev_minute_bar_date = self._last_minute_bar_date
             self._last_minute_bar_date = d
+
+    def _note_deferred_waiting_first_bar(self, now: datetime) -> None:
+        """显式标记「顺延单在等首根 1m bar」，避免复盘误判成引擎故障。
+
+        行情链路未就绪时（当日还没有任何分钟 bar）deferred 单一律没有放行触发，
+        旧实现只留下「未提交」计数，页面上与报单失败无法区分。这里在交易日
+        09:31 后检查一次，每交易日最多一条 risk 事件 + INFO 日志；只做观测，
+        不改变任何放行/下单行为（等已闭合 bar 是与回测对齐的设计，不在此处改）。
+        """
+        try:
+            today = now.date()
+            if (now.hour, now.minute) < (9, 31):
+                return
+            if (self._last_minute_bar_date is not None
+                    and self._last_minute_bar_date >= today):
+                return
+            queue = list(self._signal_bar_deferred)
+            if not queue:
+                return
+            calendar = getattr(self, "_calendar", None)
+            if calendar is not None and not calendar.is_trading_day(today):
+                return
+            if today in self._deferred_waiting_warned:
+                return
+            self._deferred_waiting_warned.add(today)
+            self._deferred_waiting_warned = {
+                d for d in self._deferred_waiting_warned
+                if (today - d).days <= 3
+            }
+            oldest_at = min(
+                (getattr(o, "bar_time", now) or now) for o in queue)
+            message = (
+                "等待首根 1m bar：行情链路未就绪，%d 笔顺延单尚未放行"
+                "（最早信号 %s，等待起点 %s）。这是等待，不是报单失败。"
+                % (len(queue), oldest_at.strftime("%Y-%m-%d %H:%M"),
+                   now.strftime("%H:%M"))
+            )
+            logger.info("%s (session %s, now %s)",
+                        message, self.session_id, now)
+            self._emit_risk_safe({
+                "session_id": self.session_id,
+                "engine": self._engine_key,
+                "gate": "deferred_release",
+                "rule": "deferred_waiting_first_bar",
+                "action": "waiting",
+                "portfolio_id": getattr(queue[0], "portfolio_id", None),
+                "strategy_id": getattr(queue[0], "strategy_id", None),
+                "stock_code": getattr(queue[0], "stock_code", None),
+                "count": len(queue),
+                "oldest_signal_date": oldest_at.date().isoformat(),
+                "waiting_since": oldest_at.isoformat(),
+                "observed_at": now.isoformat(),
+                "reason": "no_minute_bar_today",
+                "message": message,
+            })
+            self._mark_deferred_waiting_rows(queue, oldest_at)
+        except Exception:  # noqa: BLE001 — 观测失败不影响主链路
+            logger.debug("deferred waiting-first-bar note failed", exc_info=True)
+
+    def _mark_deferred_waiting_rows(self, queue: List[OrderEvent],
+                                    since: datetime) -> None:
+        """把「等首根 1m bar」的等待原因与起点写到 deferred 行的 error_message。
+
+        仅标注不改 status（仍是 deferred，与 canceled 明确区分）；marker 幂等，
+        页面/重启后都能看到 ``waiting_first_bar:since=<信号时间>``。best-effort，
+        失败不影响主链路。
+        """
+        factory = getattr(self, "_db_session_factory", None)
+        if factory is None:
+            return
+        row_ids = {
+            getattr(o, "_deferred_row_id", None) for o in queue
+        }
+        row_ids.discard(None)
+        if not row_ids:
+            return
+        marker = "waiting_first_bar:since=%s" % since.strftime("%Y-%m-%dT%H:%M")
+        db = factory()
+        try:
+            rows = db.query(LiveOrder).filter(LiveOrder.id.in_(row_ids)).all()
+            for row in rows:
+                if marker in str(row.error_message or ""):
+                    continue
+                row.error_message = (
+                    ((row.error_message + "; ") if row.error_message else "")
+                    + marker)[:500]
+            db.commit()
+        except Exception:  # noqa: BLE001
+            db.rollback()
+            logger.debug("mark deferred waiting rows failed (session %s)",
+                         self.session_id, exc_info=True)
+        finally:
+            db.close()
 
     # 掘金桥 1m 放行探测的硬预算：单轮最多占用主循环的秒数（实测单只 ~5s）
     _BRIDGE_PROBE_BUDGET_SECONDS = 15.0

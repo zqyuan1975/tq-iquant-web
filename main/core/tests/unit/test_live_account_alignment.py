@@ -440,7 +440,9 @@ def test_submit_price_refresh_snapshot_stale_not_used():
     engine = _mk_engine(disp, factory, port, engine_key="tdx", snapshot_synth=synth)
     order = _order(Decimal("18.35"))
     source = engine._refresh_submit_price(order)
-    assert source == "signal"
+    # 2026-11-24 取价梳理：跨日快照不再伪装成 signal，而是显式标 snapshot_stale
+    # （价格行为不变：仍不采用、保持信号价）。
+    assert source == "snapshot_stale"
     assert order.price == Decimal("18.35")
 
 

@@ -535,6 +535,16 @@ class HttpBridgeDispatcher(OrderDispatcher):
         self.last_broker_order_id = None
         self.last_order_rejection = None
         self.last_order_price_type = None
+        # 按单覆盖优先（盘前单显式 limit：prType=11、审批价原样下发），否则用
+        # 配置解析值（盘中默认 opponent→prType=14，与既有行为一致）。
+        effective_price_type = price_type or self.resolved_price_type()
+        if (effective_price_type == "limit"
+                and (order.price is None or float(order.price) <= 0)):
+            # limit 模式下 price 是权威委托价，0/None 会被桥原样下发成废单；
+            # 在本地显式拒绝（opponent 模式 price 被忽略，保持原行为）。
+            raise BridgeOrderRejected(
+                "invalid order price %r (price_type=limit requires > 0)"
+                % (order.price,))
         # 认领键护栏：派生 20 位 remark 并做在途唯一性校验（不足 20 位或撞键
         # → BridgeOrderIdError 拒绝下单，绝不静默截断/放过）。保持既有 ID 格式。
         claim = self.remark_of(oid)
@@ -557,7 +567,6 @@ class HttpBridgeDispatcher(OrderDispatcher):
         }
         # 按单覆盖优先（盘前单显式 limit：prType=11、审批价原样下发），否则用
         # 配置解析值（盘中默认 opponent→prType=14，与既有行为一致）。
-        effective_price_type = price_type or self.resolved_price_type()
         if effective_price_type:
             payload["price_type"] = effective_price_type
         try:

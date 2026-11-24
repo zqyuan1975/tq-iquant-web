@@ -1950,9 +1950,21 @@ class ThsUiDispatcher(OrderDispatcher):
             code = str(o.get("symbol") or "")
             if not self._CODE_RE.match(code):
                 continue
-            price = float(o.get("trade_price") or 0) or float(o.get("price") or 0)
+            fill_px = float(o.get("trade_price") or 0)
+            price = fill_px or float(o.get("price") or 0)
             if price <= 0:
                 continue
+            price_source = "fill" if fill_px > 0 else "order_price_fallback"
+            if price_source == "order_price_fallback":
+                warned = getattr(self, "_deal_price_fallback_warned", None)
+                if warned is None:
+                    warned = set()
+                    self._deal_price_fallback_warned = warned
+                if ref not in warned:
+                    warned.add(ref)
+                    logger.warning(
+                        "同花顺成交回报缺少成交价，order_ref=%s 用委托价 %s "
+                        "顶替成交价（已标注 price_source）", ref, price)
             trade_date, trade_time = self._split_time(o.get("time"))
             out.append({
                 "order_ref": ref,
@@ -1967,6 +1979,7 @@ class ThsUiDispatcher(OrderDispatcher):
                 "stamp_duty": 0,
                 "trade_date": trade_date,
                 "trade_time": trade_time,
+                "price_source": price_source,
             })
         return out
 
@@ -2076,8 +2089,13 @@ class ThsUiDispatcher(OrderDispatcher):
             raise BridgeOrderRejected(f"invalid code {order.stock_code}")
         vol = int(order.quantity)
         price = float(order.price) if order.price is not None else 0.0
-        if vol <= 0 or price <= 0:
-            raise BridgeOrderRejected(f"invalid order vol/price {vol}/{price}")
+        if vol <= 0:
+            raise BridgeOrderRejected(
+                f"invalid order volume {vol} (must be > 0)")
+        if price <= 0:
+            raise BridgeOrderRejected(
+                f"invalid order price {order.price!r} (must be > 0): "
+                "THS UI requires an explicit order price")
         self._last_enqueued_order_id = None
         oid = self.order_id(order)
         entry = {
@@ -2575,8 +2593,14 @@ class ThsUiDispatcher(OrderDispatcher):
             raise BridgeOrderRejected(f"invalid code {order.stock_code}")
         vol = int(order.quantity)
         price = float(order.price) if order.price is not None else 0.0
-        if vol <= 0 or price <= 0:
-            raise BridgeOrderRejected(f"invalid order vol/price {vol}/{price}")
+        if vol <= 0:
+            raise BridgeOrderRejected(
+                f"invalid order volume {vol} (must be > 0)")
+        if price <= 0:
+            # THS UI 价格框结构上必须有价：明确区分「价非法」与「量非法」。
+            raise BridgeOrderRejected(
+                f"invalid order price {order.price!r} (must be > 0): "
+                "THS UI requires an explicit order price")
         if not self._captcha_ocr:
             # 下单后必须复制委托表回查合同编号；THS 复制会弹验证码，
             # OCR 未启用时宁可拒单，也不能先发单再因查不到而误报失败。

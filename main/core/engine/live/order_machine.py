@@ -19,7 +19,7 @@ import logging
 import time as _time_mod
 from datetime import date, datetime, time, timedelta, timezone
 from decimal import Decimal
-from typing import Callable, Dict, Optional
+from typing import Callable, Dict, Optional, Tuple
 
 from sqlalchemy import and_, or_
 from sqlalchemy.orm import Session
@@ -36,6 +36,42 @@ from .context import EngineContext
 from .timing import _parse_insert_utc, now_shanghai
 
 logger = logging.getLogger("core.engine.live.order_machine")
+
+
+def _aggregate_deals(matched_deals: list) -> Tuple[int, Decimal, bool]:
+    """聚合成交回报：返回 (总量, 总金额, 是否含委托价回退来源)。
+
+    金额缺失时用 ``price × volume`` 还原（部分通道只给价/量）；价也缺失则
+    该笔金额记 0，交由调用方 fail-safe（绝不反推 0 成交价）。``price_source``
+    为 ``order_price_fallback`` 的 deal 表示通道没给 fill_price、成交价由
+    委托价顶替，调用方需标注而非当作真实成交价。
+    """
+    total_qty = 0
+    total_amount = Decimal("0")
+    price_fallback = False
+    for d in matched_deals or []:
+        try:
+            qty = int(d.get("volume") or 0)
+        except (TypeError, ValueError):
+            qty = 0
+        if qty <= 0:
+            continue
+        total_qty += qty
+        try:
+            amount = Decimal(str(d.get("amount") or 0))
+        except (ArithmeticError, TypeError, ValueError):
+            amount = Decimal("0")
+        if amount <= 0:
+            try:
+                px = Decimal(str(d.get("price") or 0))
+            except (ArithmeticError, TypeError, ValueError):
+                px = Decimal("0")
+            if px > 0:
+                amount = px * qty
+        total_amount += amount
+        if str(d.get("price_source") or "") == "order_price_fallback":
+            price_fallback = True
+    return total_qty, total_amount, price_fallback
 
 
 def detach_loaded(db: Session, *objs) -> None:
@@ -269,6 +305,10 @@ class OrderStateMachine:
         self._deals_stale_alerted: set = set()
         # 已发过「撤单未确认」告警的单 id（一次性；订单仍每轮重试撤单）
         self._cancel_unconfirmed_alerted: set = set()
+        # 成交回报缺金额/价 → 拒绝按 0 价回填的告警去重（一次性）
+        self._deal_amount_missing_alerted: set = set()
+        # 成交价来自委托价回退（通道未给 fill_price）的告警去重（一次性）
+        self._deal_price_fallback_alerted: set = set()
         # 未知方向外部成交的告警抑制表：key=(code, direction, order_ref)
         # → {"first_at": 首次时刻, "count": 当前窗口计数, "last_log_at": 上次聚合时点}
         self._unknown_deal_dirs: Dict[tuple, dict] = {}
@@ -1965,10 +2005,54 @@ class OrderStateMachine:
         推 SSE 事件，**不动虚拟持仓与现金**——数量/成本由 60s 桥快照镜面覆盖，
         避免「桥持仓已含该成交 + 平台再 apply」的双计（2026-11-06 实测
         000001 虚拟=200/实际=100）。"""
-        total_qty = sum(int(d.get("volume") or 0) for d in matched_deals)
+        total_qty, total_amount, price_fallback = _aggregate_deals(matched_deals)
         if total_qty <= 0:
             return  # 无实际成交（可能已撤），下轮重查
-        total_amount = sum(Decimal(str(d.get("amount") or 0)) for d in matched_deals)
+        if total_amount <= 0:
+            # 静默 0 修复：金额与价全缺时旧实现会算出 avg_price=0，随后
+            # apply_trade 造成「持仓成本 0、现金少扣」。这里保持订单原状态，
+            # 等下一轮回报补齐（与 _advance_filled_from_order_row 同口径）。
+            if live_order.id not in self._deal_amount_missing_alerted:
+                self._deal_amount_missing_alerted.add(live_order.id)
+                logger.error(
+                    "backfill: order %s %s 成交回报缺少金额与价格，"
+                    "拒绝按 0 价落库（保持 %s，等下一轮回报）",
+                    live_order.id, live_order.stock_code, live_order.status,
+                )
+                self._emit("risk", {
+                    "portfolio_id": live_order.portfolio_strategy_id,
+                    "order_id": live_order.id,
+                    "rule": "deal_amount_missing",
+                    "action": "blocked",
+                    "stock_code": live_order.stock_code,
+                    "trade_type": (live_order.trade_type or "").upper(),
+                    "quantity": live_order.quantity,
+                    "filled_quantity": total_qty,
+                    "bar_time": (live_order.bar_time.isoformat()
+                                 if live_order.bar_time else None),
+                })
+            return
+        if price_fallback and live_order.id not in self._deal_price_fallback_alerted:
+            # 通道不暴露 fill_price 时用委托价顶替成交价：保留回填但明确标注，
+            # 让成交核对/滑点分析能区分真实成交价与委托价回退。
+            self._deal_price_fallback_alerted.add(live_order.id)
+            logger.warning(
+                "backfill: order %s %s 成交价来自委托价回退"
+                "（通道未返回 fill_price），已标注 price_source",
+                live_order.id, live_order.stock_code,
+            )
+            self._emit("risk", {
+                "portfolio_id": live_order.portfolio_strategy_id,
+                "order_id": live_order.id,
+                "rule": "deal_price_fallback",
+                "action": "fallback",
+                "stock_code": live_order.stock_code,
+                "trade_type": (live_order.trade_type or "").upper(),
+                "quantity": live_order.quantity,
+                "filled_quantity": total_qty,
+                "bar_time": (live_order.bar_time.isoformat()
+                             if live_order.bar_time else None),
+            })
         total_commission = sum(Decimal(str(d.get("commission") or 0)) for d in matched_deals)
         # 附加核查：/orders 全成兜底合成的 deal 佣金恒 0（/deals 断流时），按组合
         # 费率补算，避免虚拟现金比回测多出一整笔佣金；桥给了真实佣金（>0）则原样用。

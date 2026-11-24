@@ -930,6 +930,18 @@ class Portfolio:
                 close = (bar.stocks.get(stock_code) or {}).get("close")
                 price = _order_price(bar, stock_code, close)
                 if price is None or price <= 0:
+                    # 取价梳理 F6：无价跳过必须留痕（旧实现静默 continue，
+                    # 熔断清仓会表现为「什么都没发生」，复盘无法区分行情缺失
+                    # 与策略未触发；不改变控制流）。
+                    self.recorder.record(
+                        gate="breaker_action", layer="portfolio_risk",
+                        action="skip", portfolio_id=self.portfolio_id,
+                        strategy_id=ctx.strategy_id, stock_code=stock_code,
+                        bar_time=bar.bar_time, param_name="breaker_action",
+                        value=close,
+                        message="熔断处置跳过：无有效价格（close=%r），"
+                                "无法生成本次 %s 卖单" % (close, action),
+                    )
                     continue
                 orders.append(OrderEvent(
                     strategy_id=ctx.strategy_id,
