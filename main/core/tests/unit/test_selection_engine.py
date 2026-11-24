@@ -216,9 +216,14 @@ def test_engine_four_pools_real_hits(imported):
     assert ("000003.SZ", "historical") in tracks
 
 
-def test_engine_rejects_non_warehouse_asof(imported):
+def test_engine_replay_asof_uses_pit_only(imported):
+    """历史 as_of 走 PIT 重建：重建不出因子时明确报错，绝不回落导入日快照。
+
+    回放内核落地后，历史 as_of 不再直接拒绝；这里用「没有 GP/历史 K 线」的
+    最小导入仓验证它不会拿导入日数据冒充历史值，而是抛 PIT 相关错误。
+    """
     db, _ = imported
-    with pytest.raises(engine.EngineError, match="历史回放暂不支持"):
+    with pytest.raises(engine.EngineError, match="历史回放"):
         engine.compute(db, svc.default_spec("value"), date(2026, 11, 12))
 
 

@@ -119,7 +119,33 @@ def resolve_pool(db: Session, pool_id: int,
             .filter_by(pool_id=pool_id).all())
     timeline = build_pool_timeline(rows)
     target = day or date.today()
+
+    def _interval_codes() -> Optional[List[str]]:
+        """回放补建的历史区间（selection_pool_intervals）优先于当前成分。"""
+        from core.selection import replay as replay_svc
+        from core.models.selection import SelectionPoolInterval
+        from sqlalchemy import or_
+        key = replay_svc.pool_key_for_code(db, pool.code)
+        if not key:
+            return None
+        hits = (db.query(SelectionPoolInterval.code)
+                .filter(SelectionPoolInterval.pool_key == key,
+                        SelectionPoolInterval.effective_from <= target,
+                        or_(SelectionPoolInterval.effective_to.is_(None),
+                            SelectionPoolInterval.effective_to >= target))
+                .all())
+        return sorted({code for (code,) in hits}) if hits else None
+
     if timeline.is_empty:
+        interval_codes = _interval_codes()
+        if interval_codes is not None:
+            return {
+                "pool_id": pool.id, "code": pool.code, "kind": _kind(pool.code),
+                "day": target.isoformat(), "available": True,
+                "covered": True, "codes": interval_codes,
+                "source": "selection_intervals",
+                "note": "按回放补建的成员区间解析（回放封闭、当期开口）",
+            }
         current = [r.stock_code for r in
                    db.query(StockPoolStock).filter_by(pool_id=pool_id).all()]
         return {
@@ -130,6 +156,16 @@ def resolve_pool(db: Session, pool_id: int,
             "note": "该池没有任何成员区间（从未发布过快照），只能回落当前成分",
         }
     covered = timeline.covered(target)
+    if not covered:
+        interval_codes = _interval_codes()
+        if interval_codes is not None:
+            return {
+                "pool_id": pool.id, "code": pool.code, "kind": _kind(pool.code),
+                "day": target.isoformat(), "available": True,
+                "covered": True, "codes": interval_codes,
+                "source": "selection_intervals",
+                "note": "该日不在 membership 覆盖内，按回放成员区间解析",
+            }
     codes = list(timeline.codes_on(target)) if covered else [
         r.stock_code for r in db.query(StockPoolStock).filter_by(pool_id=pool_id).all()
     ]

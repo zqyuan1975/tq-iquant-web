@@ -227,23 +227,65 @@ def _dividend_factors(rows: list, price: Optional[float]) -> Dict[str, Any]:
             "dp3": dp3, "dp_annual": dp_annual, "dps_growth": dps_growth}
 
 
-def _build_records(db, meta) -> List[Dict[str, Any]]:
+def _build_records(db, meta, pit: Optional[dict] = None) -> List[Dict[str, Any]]:
+    """构造打分记录。
+
+    ``pit`` 非空 = 历史回放时点重建（见 ``replay.py``）：财报只用截断序列，
+    K 线派生与总市值取 as_of 当日，PE/PB/一致预期/ST 标记等不可重建项留空，
+    绝不用导入日快照冒充历史值。
+    """
     stocks = db.query(SelectionWarehouseStock).all()
-    fins = _series_map(db.query(SelectionWarehouseFin).all())
-    divs = _div_map(db.query(SelectionWarehouseDividend).all())
+    if pit is None:
+        fins = _series_map(db.query(SelectionWarehouseFin).all())
+        divs = _div_map(db.query(SelectionWarehouseDividend).all())
+        metrics: Dict[str, dict] = {}
+        gp_map: Dict[str, dict] = {}
+    else:
+        fins = pit.get("series") or {}
+        divs = pit.get("dividends") or {}
+        metrics = pit.get("metrics") or {}
+        gp_map = pit.get("gp") or {}
 
     recs: List[Dict[str, Any]] = []
     for stock in stocks:
-        more = _json_blob(stock.more_blob)
         info = _json_blob(stock.info_blob)
-        go = _json_blob(stock.go_blob)
-
-        series = fins.get(stock.code, {})
-        price = float(stock.close) if stock.close else None
-        pe = _num(more.get("StaticPE_TTM"))
-        pb = _num(more.get("PB_MRQ"))
-        zsz = _num(more.get("Zsz"))
-        ltsz = _num(more.get("Ltsz"))
+        if pit is None:
+            more = _json_blob(stock.more_blob)
+            go = _json_blob(stock.go_blob)
+            series = fins.get(stock.code, {})
+            price = float(stock.close) if stock.close else None
+            pe = _num(more.get("StaticPE_TTM"))
+            pb = _num(more.get("PB_MRQ"))
+            zsz = _num(more.get("Zsz"))
+            ltsz = _num(more.get("Ltsz"))
+            volatility = float(stock.volatility_pct) \
+                if stock.volatility_pct is not None else None
+            drawdown = float(stock.max_drawdown_pct) \
+                if stock.max_drawdown_pct is not None else None
+            is_st = (_num(info.get("IsSTGP")) or 0) != 0
+            is_quit = (_num(info.get("IsQuitGP")) or 0) != 0
+            fin_periods = int(stock.fin_periods or 0)
+            gp_yield = None
+        else:
+            more = {}
+            go = {}
+            series = fins.get(stock.code, {})
+            metric = metrics.get(stock.code) or {}
+            price = _num(metric.get("close"))
+            pe = None
+            pb = None
+            gp = gp_map.get(stock.code) or {}
+            gp16 = _num(gp.get("GP16"))
+            # GP16 单位万元 → 亿元；流通市值无时点数据，规模因子用总市值代理
+            zsz = gp16 / 1e4 if gp16 else None
+            ltsz = zsz
+            volatility = _num(metric.get("volatility_pct"))
+            drawdown = _num(metric.get("max_drawdown_pct"))
+            # ST/退市标记只有当前值，不可 PIT 重建 → 一律置否并在 quality 披露
+            is_st = False
+            is_quit = False
+            fin_periods = len(series.get("tag_time") or [])
+            gp_yield = _num(gp.get("GP21"))
         rev = _last(series, "FN319")
         ocf = _last(series, "FN107")
         capex = _last(series, "FN114")
@@ -260,7 +302,14 @@ def _build_records(db, meta) -> List[Dict[str, Any]]:
             if val is not None:
                 solvency_vals.append(sign * val)
         audit = _last(series, "FN336")
-        payout = _last(series, "FN337")
+        if pit is None:
+            payout = _last(series, "FN337")
+        else:
+            # PIT：TQ 的 FN337 在多数季报为 0（分红率只在年报口径完整），直取
+            # 「最近一期」会把正常分红的票误杀。改用 ≤T 最近年报的非零值，仍
+            # 属纯 PIT 口径（只用到 as_of 前已公告数据）。
+            payout = next((v for _tag, v in reversed(_annual(series, "FN337"))
+                           if v not in (None, 0.0)), None)
         payouts = _tail_nonzero(series, "FN337", 8)
 
         fcf = None
@@ -294,6 +343,11 @@ def _build_records(db, meta) -> List[Dict[str, Any]]:
         neg_peg_hist = -peg_hist if peg_hist is not None and 0 < peg_hist < 100 else None
 
         div = _dividend_factors(divs.get(stock.code), price)
+        if gp_yield is not None and gp_yield > 0:
+            # GP21 = as_of 当日股息率（%）：可直接重建，优先于「用滞后分红除以
+            # 当日股价」的近似（后者在分红序列不完整时会低估）
+            div["dp_annual"] = gp_yield
+            div["dp3"] = gp_yield
 
         factors = {
             "ep": 1.0 / pe if pe and pe > 0 else None,
@@ -329,10 +383,9 @@ def _build_records(db, meta) -> List[Dict[str, Any]]:
             "roic_trend": (_trend(series, "FN329", 12)
                            if _trend(series, "FN329", 12) is not None
                            else _trend(series, "FN197", 12)),
-            "volatility": float(stock.volatility_pct)
-            if stock.volatility_pct is not None else None,
-            "max_drawdown": float(stock.max_drawdown_pct)
-            if stock.max_drawdown_pct is not None else None,
+            "volatility": volatility,
+            "volatility_rev": -volatility if volatility is not None else None,
+            "max_drawdown": drawdown,
             "size": ltsz,
         }
         # 财报名义字段做极值护栏（与外部方案一致）
@@ -400,12 +453,13 @@ def _apply_gates(recs: List[Dict[str, Any]], as_of: date,
         drops[reason] = drops.get(reason, 0) + 1
 
     for rec in recs:
-        if rec["is_st"]:
-            drop(rec, "st")
-            continue
-        if rec["is_quit"]:
-            drop(rec, "quit")
-            continue
+        if not pit:
+            if rec["is_st"]:
+                drop(rec, "st")
+                continue
+            if rec["is_quit"]:
+                drop(rec, "quit")
+                continue
         start = rec["j_start"]
         if len(start) == 8:
             try:
@@ -584,6 +638,21 @@ def _score(rec: Dict[str, Any], weights: Dict[str, float]) -> Tuple[Optional[flo
     if total_w <= 0 or covered < MIN_COVERAGE:
         return None, covered
     return total / total_w, covered
+
+
+def _renorm_weights(weights: Optional[Dict[str, float]],
+                    available: set) -> Tuple[Dict[str, float], List[str]]:
+    """剔除全列不可得的因子后按剩余权重归一化；返回 (新权重, 被剔除因子)。"""
+    raw = {k: float(v) for k, v in (weights or {}).items()
+           if float(v) > 0}
+    if not raw:
+        return {}, []
+    kept = {k: v for k, v in raw.items() if k in available}
+    dropped = sorted(set(raw) - set(kept))
+    total = sum(kept.values())
+    if not kept or total <= 0:
+        return {}, dropped
+    return {k: round(v / total, 6) for k, v in kept.items()}, dropped
 
 
 def _rank_select(recs: List[Dict[str, Any]], pool: str, spec: dict,
@@ -1029,11 +1098,60 @@ def compute(db, spec: dict, as_of: Optional[date] = None,
             "中性化未生效：%s" % neutral["reason"]),
         "correlation_check": (
             "风格内因子两两 Spearman，|ρ|≥0.8 的在高相关对中列出（只报告，不自动改权重）"),
+        "pe_handling": (
+            "严格：PE≤0 或 PE>max_pe 挡在候选外"
+            if pe_mode == "strict" else
+            "亏损股降权：PE≤0 允许进候选，按亏损收益率(-1/PE)分档对综合得分打折"
+            "（<-100×0.90；-100~-30×0.75；-30~-10×0.55；>-10×0.35），PE>max_pe 仍挡"
+            if pe_mode == "loss_discount" else
+            "周期/农业放宽 PE>0：PE≤0 与 PE 缺失都不剔除，按 PB>0 + 财务序列≥8 期"
+            "把关，不做折扣；PE 缺失在因子层自然置空"),
         "validation": "因子稳定性（滚动 IC/分组单调性）见 /api/selection/factor-validation；估值类因子无历史快照，不可回验",
         "survivorship": "universe 只有导入日成分，历史回放暂不支持，存在幸存者偏差",
         "uncalibrated": "内置权重未校准，仅作起点",
         "notes": json.loads(meta.counts_json).get("notes", [])
         if meta.counts_json else [],
     }
+    if pit_mode:
+        ctx_quality = replay_ctx.get("quality") or {}
+        quality.update({
+            "mode": "replay",
+            "valuation_source": "PIT：PE/PB/一致预期不可重建 → 留空，不用今日值冒充",
+            "kline_source": "selection_wh_daily 不复权收盘；as_of 前 252 个交易日（取区间后二次截断）",
+            "missing_policy": "回放：整列不可得因子剔除后权重归一化；单票覆盖<50% 不排序；全池皆不可得才报错",
+            "survivorship": ("universe 为当前导入名单：已退市票缺失（幸存者偏差）；"
+                             "未上市票由 new_listing 闸门剔除"),
+            "pit_unavailable": ctx_quality.get("pit_unavailable") or [],
+            "pit": ctx_quality,
+            "gates_skipped": ["st", "quit", "pe_missing", "pe_out_of_range",
+                              "pb_invalid", "float_mv_low"],
+            "factors_dropped": dropped_factors,
+            "weights_renormalized": renormalized,
+        })
+        if industry:
+            quality["sector_membership"] = (
+                "回放按 ≤as_of 的最近一期行业归属取成员（%s）：归属仅有刷新日快照，"
+                "存在分类偏差，已在 quality 披露"
+                % (membership_used.isoformat() if membership_used else "无"))
+    if industry:
+        quality["sector_pool"] = {
+            "key": pool,
+            "label": pool_def["label"],
+            "kind": "l2" if pool_def.get("cross_pool") else "l1",
+            "group_only": group_only,
+            "weights_source": (
+                "L2 标签池：按个股所属 L1 主池权重打分，跨 L1 分值不可直接比较，"
+                "排序先按 L1 分组" if pool_def.get("cross_pool")
+                else "L1 主池专属权重（未经回测校准）"),
+            "pe_mode": pe_mode,
+        }
+        if not pit_mode:
+            quality["sector_membership"] = (
+                "行业归属只有当前值，无法按公告日重建；历史 as_of 早于首次刷新日时"
+                "属于按当前名单回看，存在分类偏差")
+        if group_only:
+            quality["group_only"] = (
+                "金融地产第一阶段只分组不打分：综合分留空，不用 0.5 等占位值冒充；"
+                "不套估值/财务门槛")
     return {"as_of": as_of, "pool_key": pool, "stats": stats,
             "quality": quality, "rows": rows}

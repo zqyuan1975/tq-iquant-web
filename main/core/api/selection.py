@@ -2,11 +2,13 @@
 """条件选股 API（A1 + A2）。
 
 方案 / 版本 / 宽库导入 / 运行 / 快照冻结 / 发布股票池。
-选股引擎只读平台导入仓（D1），历史回放明确拒绝而不是用未来数据凑结果。
+选股引擎只读平台导入仓（D1）；历史 as_of 走 replay 的 PIT 重建，不可重建的
+字段留空并在 quality 披露，不用今日值冒充。
 """
 
 from datetime import date
-from typing import List, Optional
+from typing import Dict, List, Optional
+import threading
 
 from fastapi import APIRouter, Depends, Query
 from pydantic import BaseModel
@@ -513,3 +515,67 @@ def unbind_session(session_id: int, req: UnbindReq,
         return err(404, str(exc))
     except pool_svc.PoolBindError as exc:
         return _bad(exc)
+
+
+# --- 历史回放（PIT 重建）-------------------------------------------------
+
+class ReplayReq(BaseModel):
+    as_ofs: Optional[List[date]] = None
+    force: bool = False
+    publish_version: bool = True
+
+
+class ReplayGpReq(BaseModel):
+    as_of: date
+    force: bool = False
+
+
+_REPLAY_LOCK = threading.Lock()
+
+
+@router.post("/replay/run")
+def replay_run(req: ReplayReq):
+    """批量回放（后台线程）；断点续跑，进度看 /selection/replay/status。"""
+    if not _REPLAY_LOCK.acquire(blocking=False):
+        return err(409, "回放任务已在运行")
+    as_ofs = req.as_ofs or list(replay_svc.REPLAY_AS_OFS)
+
+    def worker():
+        try:
+            replay_svc.run_batch(as_ofs,
+                                 publish_version=req.publish_version,
+                                 force=req.force)
+        finally:
+            _REPLAY_LOCK.release()
+
+    threading.Thread(target=worker, name="selection-replay", daemon=True).start()
+    return ok({"started": True,
+               "as_ofs": [day.isoformat() for day in as_ofs],
+               "note": "后台执行；重复提交会续跑未完成的 as_of"})
+
+
+@router.get("/replay/status")
+def replay_status(db: Session = Depends(get_db)):
+    return ok(replay_svc.status(db))
+
+
+@router.post("/replay/gp")
+def replay_gp(req: ReplayGpReq, db: Session = Depends(get_db)):
+    """补 as_of 当日 GP16/GP20/GP21 缓存（P2 队列，抢不到锁直接报原因）。"""
+    try:
+        return ok(replay_svc.ensure_gp(db, req.as_of, force=req.force))
+    except replay_svc.ReplayError as exc:
+        return err(409, str(exc))
+    except Exception as exc:  # pragma: no cover - 防御性
+        db.rollback()
+        return err(500, "GP 取数失败：%s" % exc)
+
+
+@router.post("/replay/intervals")
+def replay_intervals(db: Session = Depends(get_db)):
+    """按已有快照重算成员区间（回放封闭、当期开口），写入前做重叠检测。"""
+    try:
+        return ok(replay_svc.rebuild_intervals(db))
+    except replay_svc.ReplayError as exc:
+        db.rollback()
+        return err(409, str(exc))
