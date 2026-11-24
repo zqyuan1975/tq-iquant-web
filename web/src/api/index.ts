@@ -4987,7 +4987,10 @@ export interface SelectionPoolItem {
   as_of: string | null
   frozen: boolean
   stock_count: number
+  // PIT 区间条数：有 membership 按 membership，否则用回放补建的区间
   interval_count: number
+  // 仅 stock_pool_memberships 的条数（与 interval_count 分开口径）
+  membership_count: number
   synced_at: string | null
 }
 

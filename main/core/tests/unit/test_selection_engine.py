@@ -22,6 +22,8 @@ from core.models.live_session import LiveSession
 from core.models.live_session_portfolio import LiveSessionPortfolio
 from core.models.portfolio_strategy import PortfolioStrategy
 from core.models.selection import (
+    SelectionPoolInterval,
+    SelectionScheme,
     SelectionWarehouseDividend,
     SelectionWarehouseFin,
     SelectionWarehouseMeta,
@@ -319,6 +321,29 @@ def test_deliver_dual_pools_and_backtest_resolve(imported):
         db, value_version["pool_id"], day=date(2026, 11, 13))["available"] is True
     assert pool_svc.resolve_pool(
         db, value_version["pool_id"], day=date(2026, 11, 12))["available"] is False
+
+
+def test_pool_list_counts_selection_intervals_without_membership(db_session):
+    """只有 selection_pool_intervals 的序列池也要显示非 0 PIT 区间。
+
+    回放补建历史成分时只写区间表、不写 ``stock_pool_memberships``；池清单若只
+    统计后者，新建序列池的「PIT 区间」恒为 0，与按日解析结果矛盾。
+    """
+    db_session.add(SelectionScheme(code="only_interval", name="仅区间池",
+                                   pool_key="test:only", status="active"))
+    db_session.add(StockPool(code="SEL_TEST_ONLY", name="仅区间池"))
+    db_session.flush()
+    for code in ("000001.SZ", "000002.SZ"):
+        db_session.add(SelectionPoolInterval(
+            pool_key="test:only", code=code,
+            effective_from=date(2024, 4, 30), effective_to=None,
+            source="backfill", note="replay:test"))
+    db_session.commit()
+
+    item = next(p for p in pool_svc.list_pools(db_session)
+                if p["code"] == "SEL_TEST_ONLY")
+    assert item["membership_count"] == 0
+    assert item["interval_count"] == 2
 
 
 def test_bind_session_to_version_pool_and_rollback(imported):

@@ -20,6 +20,7 @@ import re
 from datetime import date
 from typing import Any, Dict, List, Optional
 
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from core.engine.pool_timeline import build_pool_timeline
@@ -71,23 +72,24 @@ def list_pools(db: Session) -> List[Dict[str, Any]]:
              .order_by(StockPool.code).all())
     pool_ids = [p.id for p in pools]
     current_counts: Dict[int, int] = {}
+    membership_counts: Dict[int, int] = {}
     interval_counts: Dict[int, int] = {}
     if pool_ids:
-        for pool_id, count in (db.query(StockPoolStock.pool_id,
-                                        __import__("sqlalchemy").func.count())
+        for pool_id, count in (db.query(StockPoolStock.pool_id, func.count())
                                .filter(StockPoolStock.pool_id.in_(pool_ids))
                                .group_by(StockPoolStock.pool_id).all()):
             current_counts[pool_id] = count
-        for pool_id, count in (db.query(StockPoolMembership.pool_id,
-                                        __import__("sqlalchemy").func.count())
+        for pool_id, count in (db.query(StockPoolMembership.pool_id, func.count())
                                .filter(StockPoolMembership.pool_id.in_(pool_ids))
                                .group_by(StockPoolMembership.pool_id).all()):
-            interval_counts[pool_id] = count
+            membership_counts[pool_id] = count
+    interval_counts = _selection_interval_counts(db, pools)
 
     out = []
     for pool in pools:
         snap = snap_by_code.get(pool.code)
         kind = _kind(pool.code)
+        membership_count = membership_counts.get(pool.id, 0)
         out.append({
             "pool_id": pool.id,
             "code": pool.code,
@@ -98,11 +100,40 @@ def list_pools(db: Session) -> List[Dict[str, Any]]:
             "pool_key": None,
             "frozen": bool(snap.frozen) if snap else False,
             "stock_count": current_counts.get(pool.id, 0),
-            "interval_count": interval_counts.get(pool.id, 0),
+            # 与 resolve_pool 的取数优先级一致：有 membership 按 membership，
+            # 否则用回放补建的 selection_pool_intervals（回放不写 membership，
+            # 只统计后者会让新建序列池的「PIT 区间」恒为 0）。
+            "interval_count": membership_count or interval_counts.get(pool.id, 0),
+            "membership_count": membership_count,
             "synced_at": pool.synced_at.isoformat(timespec="seconds")
             if pool.synced_at else None,
         })
     return out
+
+
+def _selection_interval_counts(db: Session,
+                               pools: List[StockPool]) -> Dict[int, int]:
+    """序列池在 ``selection_pool_intervals`` 的区间条数（pool.id → count）。
+
+    回放只写这张表、不写 ``stock_pool_memberships``；若池清单只统计后者，
+    新建序列池的「PIT 区间」会恒显示 0，与按日解析结果矛盾。
+    """
+    from core.models.selection import SelectionPoolInterval, SelectionScheme
+    from core.selection.replay import series_pool_code
+
+    keys = [key for (key,) in (db.query(SelectionScheme.pool_key)
+                               .filter(SelectionScheme.status == "active")
+                               .distinct().all())]
+    key_by_code = {series_pool_code(key): key for key in keys}
+    pairs = [(pool.id, key_by_code.get(pool.code)) for pool in pools]
+    wanted = sorted({key for (_pool_id, key) in pairs if key})
+    by_key: Dict[str, int] = {}
+    if wanted:
+        for key, count in (db.query(SelectionPoolInterval.pool_key, func.count())
+                           .filter(SelectionPoolInterval.pool_key.in_(wanted))
+                           .group_by(SelectionPoolInterval.pool_key).all()):
+            by_key[key] = count
+    return {pool_id: by_key.get(key, 0) for (pool_id, key) in pairs}
 
 
 def resolve_pool(db: Session, pool_id: int,
