@@ -66,6 +66,14 @@ from .investment_board import (
     BoardIndustrySnapshot,
     BoardStockSnapshot,
 )
+from .selection import (
+    SelectionGpSnapshot,
+    SelectionRun,
+    SelectionScheme,
+    SelectionSchemeVersion,
+    SelectionSnapshot,
+    SelectionSnapshotStock,
+)
 
 __all__ = [
     "Base",
@@ -130,4 +138,10 @@ __all__ = [
     "BoardRun",
     "BoardIndustrySnapshot",
     "BoardStockSnapshot",
+    "SelectionScheme",
+    "SelectionSchemeVersion",
+    "SelectionRun",
+    "SelectionSnapshot",
+    "SelectionSnapshotStock",
+    "SelectionGpSnapshot",
 ]

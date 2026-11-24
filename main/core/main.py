@@ -20,6 +20,7 @@ from core.api.market_gate import router as market_gate_router
 from core.api.capital import router as capital_router
 from core.api.pairing import router as pairing_router
 from core.api.investment_board import router as investment_board_router
+from core.api.selection import router as selection_router
 from core.api.tdx_gate import router as tdx_gate_router
 from core.api.kline_coverage import router as kline_coverage_router
 from core.api.data_observability import router as data_observability_router
@@ -243,6 +244,7 @@ app.include_router(corporate_actions_router)
 app.include_router(capital_router)
 app.include_router(pairing_router)
 app.include_router(investment_board_router)
+app.include_router(selection_router)
 app.include_router(tdx_gate_router)
 app.include_router(kline_coverage_router)
 app.include_router(data_observability_router)

@@ -7,6 +7,7 @@ const router = createRouter({
     { path: '/dashboard', name: 'dashboard', component: () => import('../views/Dashboard.vue') },
     { path: '/stock-pools', name: 'stock-pools', component: () => import('../views/StockPools.vue') },
     { path: '/investment-board', name: 'investment-board', component: () => import('../views/InvestmentBoard.vue') },
+    { path: '/selection', name: 'selection', component: () => import('../views/Selection.vue') },
     { path: '/formulas', name: 'formulas', component: () => import('../views/Formulas.vue') },
     { path: '/portfolios', name: 'portfolios', component: () => import('../views/Portfolios.vue') },
     { path: '/backtest', name: 'backtest', component: () => import('../views/Backtest.vue') },

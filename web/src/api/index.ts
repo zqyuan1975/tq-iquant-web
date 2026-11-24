@@ -4460,3 +4460,130 @@ export async function clearTdxGateOverride(reason?: string) {
     '/system/tdx-gate/override/clear', { reason })
   return res.data.data
 }
+
+// ---------------------------------------------------------------------------
+// 条件选股（/api/selection）— 方案 / 版本 / 字段字典 / 宽库状态 / GP16
+// ---------------------------------------------------------------------------
+
+export interface SelectionFieldSpec {
+  key: string
+  source: string
+  column: string
+  unit: string
+  zero_is_missing: boolean
+  pit_safe: boolean
+  pools: string[]
+  note: string
+}
+
+export interface SelectionMeta {
+  field_set_version: string
+  pools: string[]
+  industry_prefix: string
+  fields: SelectionFieldSpec[]
+}
+
+export interface SelectionSchemeItem {
+  id: number
+  code: string
+  name: string
+  pool_key: string
+  description: string | null
+  status: string
+  latest_version: number | null
+  latest_status: string | null
+}
+
+export interface SelectionVersionItem {
+  id: number
+  scheme_id: number
+  version: number
+  spec: Record<string, unknown>
+  spec_hash: string
+  field_set_version: string
+  field_fingerprint: string
+  weight_sum: number | null
+  uncalibrated: boolean
+  status: string
+  note: string | null
+  created_at: string | null
+}
+
+export interface SelectionSchemeDetail extends SelectionSchemeItem {
+  versions: SelectionVersionItem[]
+}
+
+export interface WideDbTableInfo {
+  name: string
+  columns: number
+  has_rows: boolean
+  rows_estimate: number | null
+}
+
+export interface WideDbStatus {
+  path: string
+  ready: boolean
+  readonly: boolean
+  size_mb: number | null
+  tables: WideDbTableInfo[]
+  error: string | null
+}
+
+export async function getSelectionMeta() {
+  const res = await api.get<ApiResponse<SelectionMeta>>('/selection/meta')
+  return res.data.data
+}
+
+export async function getSelectionSchemes(includeArchived = false) {
+  const res = await api.get<ApiResponse<SelectionSchemeItem[]>>('/selection/schemes', {
+    params: { include_archived: includeArchived },
+  })
+  return res.data.data
+}
+
+export async function createSelectionScheme(req: {
+  code: string; name: string; pool_key: string; description?: string
+}) {
+  const res = await api.post<ApiResponse<{ id: number; code: string; name: string }>>(
+    '/selection/schemes', req)
+  return res.data.data
+}
+
+export async function getSelectionScheme(id: number) {
+  const res = await api.get<ApiResponse<SelectionSchemeDetail>>(`/selection/schemes/${id}`)
+  return res.data.data
+}
+
+export async function createSelectionVersion(
+  schemeId: number,
+  req: { spec: Record<string, unknown>; note?: string; uncalibrated?: boolean },
+) {
+  const res = await api.post<ApiResponse<SelectionVersionItem>>(
+    `/selection/schemes/${schemeId}/versions`, req)
+  return res.data.data
+}
+
+export async function activateSelectionVersion(schemeId: number, versionId: number) {
+  const res = await api.post<ApiResponse<SelectionVersionItem>>(
+    `/selection/schemes/${schemeId}/versions/${versionId}/activate`)
+  return res.data.data
+}
+
+export async function getSelectionWideDbStatus() {
+  const res = await api.get<ApiResponse<WideDbStatus>>('/selection/wide-db/status')
+  return res.data.data
+}
+
+export async function ingestSelectionGp(day: string, codes?: string[]) {
+  const res = await api.post<ApiResponse<{
+    requested: number; written: number; as_of: string
+  }>>('/selection/gp/ingest', { day, codes })
+  return res.data.data
+}
+
+export async function getSelectionGpAudit(day: string, thresholdPct = 5) {
+  const res = await api.get<ApiResponse<Record<string, unknown>>>('/selection/gp/audit', {
+    params: { day, threshold_pct: thresholdPct },
+  })
+  return res.data.data
+}

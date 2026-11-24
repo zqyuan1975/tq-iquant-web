@@ -255,6 +255,92 @@ class TQData:
             return get_tq().get_more_info_batch(
                 stock_list=list(stocks), field_list=list(field_list)) or {}
 
+    # --- 条件选股取数（2026-11-24，A0-1）------------------------------------
+    # 三个方法都只做「薄透传 + P2 分片」，不在这里做 PIT 截断、单位换算或缺失判定：
+    # 财报必须由调用方按 announce_time ≤ 决策日逐只逐期切片，否则重述会泄漏未来信息。
+    # 分片语义与 get_history_raw 一致：逐片持闸、片间放锁；任一片异常即整体抛出，
+    # 不做「部分成功」的静默降级——财务少一片等于口径不全，必须失败可见。
+
+    def _selection_chunk(self, level: int, n: int) -> int:
+        """P2 且票数超阈值时返回分片大小，否则 0（不分片）。"""
+        cfg = gate_config()
+        try:
+            chunk = int(cfg.get("p2_chunk_size") or 0)
+        except (TypeError, ValueError):
+            chunk = 0
+        if level == P2 and cfg.get("enabled", True) and chunk > 0 and n > chunk:
+            return chunk
+        return 0
+
+    def _selection_fetch(self, fetch, stocks, level: int, chunk: int) -> pd.DataFrame:
+        """按片调用 ``fetch(part)`` 并纵向合并；空片跳过，全空返回空表。"""
+        if chunk <= 0:
+            with get_tdx_lock(priority=level):
+                df = fetch(list(stocks))
+            return df if isinstance(df, pd.DataFrame) else pd.DataFrame()
+        frames = []
+        for i in range(0, len(stocks), chunk):
+            part = list(stocks[i:i + chunk])
+            with get_tdx_lock(priority=P2):
+                df = fetch(part)
+            if isinstance(df, pd.DataFrame) and not df.empty:
+                frames.append(df)
+        if not frames:
+            return pd.DataFrame()
+        return frames[0] if len(frames) == 1 else pd.concat(frames, axis=0)
+
+    def get_financial_data(
+        self, stocks: List[str], table_list: List[str],
+        start_time: str = "", report_type: str = "report_time", priority=None,
+    ) -> pd.DataFrame:
+        """批量财报序列（FN 字段 × 报告期）。
+
+        ``report_type="report_time"`` 按公告日返回；结果同时带 tag_time /
+        announce_time 平行数组，PIT 截断由调用方完成。
+        """
+        codes = [c for c in (stocks or []) if c]
+        if not codes or not table_list:
+            return pd.DataFrame()
+        level = current_priority() if priority is None else parse_priority(priority)
+        chunk = self._selection_chunk(level, len(codes))
+        return self._selection_fetch(
+            lambda part: get_tq().get_financial_data(
+                stock_list=part, table_list=list(table_list),
+                start_time=start_time, report_type=report_type),
+            codes, level, chunk)
+
+    def get_gpjy_value_by_date(
+        self, stocks: List[str], year: int, mmdd: str,
+        table_list: List[str], priority=None,
+    ) -> pd.DataFrame:
+        """按「年 + 月日」定位取历史逐日指标（如 GP16 = 当日总市值，万元）。
+
+        一次只取一天；跨日/跨年由调用方循环，本方法只负责单日批量 + P2 分片。
+        """
+        codes = [c for c in (stocks or []) if c]
+        if not codes or not table_list:
+            return pd.DataFrame()
+        level = current_priority() if priority is None else parse_priority(priority)
+        chunk = self._selection_chunk(level, len(codes))
+        return self._selection_fetch(
+            lambda part: get_tq().get_gpjy_value_by_date(
+                stock_list=part, year=year, mmdd=mmdd, table_list=list(table_list)),
+            codes, level, chunk)
+
+    def get_gp_one_data(
+        self, stocks: List[str], table_list: List[str], priority=None,
+    ) -> pd.DataFrame:
+        """批量一致预期（GO 字段）。只有 T/T+1/T+2 三个时点，没有历史序列。"""
+        codes = [c for c in (stocks or []) if c]
+        if not codes or not table_list:
+            return pd.DataFrame()
+        level = current_priority() if priority is None else parse_priority(priority)
+        chunk = self._selection_chunk(level, len(codes))
+        return self._selection_fetch(
+            lambda part: get_tq().get_gp_one_data(
+                stock_list=part, table_list=list(table_list)),
+            codes, level, chunk)
+
     def get_history(
         self, stocks: List[str], periods: List[str],
         start: str = "", end: str = "",
