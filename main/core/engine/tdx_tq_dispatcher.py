@@ -150,15 +150,39 @@ def _call(fn, *args, **kwargs):
     """调用 TQ 接口并吞掉其控制台输出。
 
     打包后是无控制台的 GUI 程序，``sys.stdout`` 可能为 None；TQ 内部 print 会抛
-    AttributeError。统一重定向到 StringIO，同时保留最后一行用于错误信息。
+    AttributeError。统一重定向到 StringIO，同时保留本次调用的输出尾部，供下单失败
+    时回显真实原因（P0-3 2026-11-24：真机 09:15 两笔 BUY 只回裸 ``-1``，SDK 的
+    「未登录/句柄失效/参数被拒」全在 stdout 里被丢弃）。
 
     优先级 P0（实盘主链）：行情/下单/撤单/账户/成交全部经此，任何时段可拿通道，
     等待中的 P1/P2 在当前单次调用结束后让出（见 core.tq.gate）。
     """
     out = io.StringIO()
+    # 每次调用前清空：保证 _last_output_tail() 只反映「本次」调用，不串上一单的输出。
+    _LAST_CALL_OUTPUT["text"] = ""
     with get_tdx_lock(priority=P0):
         with contextlib.redirect_stdout(out):
-            return fn(*args, **kwargs)
+            try:
+                return fn(*args, **kwargs)
+            finally:
+                _LAST_CALL_OUTPUT["text"] = (out.getvalue() or "")[-800:]
+
+
+#: 最近一次 _call 的 stdout 尾部（下单失败回显用；仅诊断，不参与业务判定）。
+_LAST_CALL_OUTPUT: Dict[str, str] = {"text": ""}
+
+#: ``-1``/None 回执里出现这些词 → 通道/登录/连接类故障（置离线，不做可重排）。
+_TDX_OFFLINE_HINTS = (
+    "未登录", "登录失败", "请登录", "重新登录", "登录已失效", "登录状态",
+    "未连接", "连接失败", "连接中断", "断开", "断线", "通信失败", "通信异常",
+    "句柄无效", "句柄失效", "账号无效", "账户不存在", "超时", "timeout",
+    "socket", "disconnect", "not logged", "login",
+)
+
+
+def _last_output_tail() -> str:
+    """最近一次 TQ 调用的 stdout 尾部（可能为空）。"""
+    return str(_LAST_CALL_OUTPUT.get("text") or "").strip()
 
 
 def raw_to_bars(raw: dict, period: str) -> Dict[str, list]:
@@ -1344,7 +1368,18 @@ class TdxTqDispatcher(OrderDispatcher):
             raise BridgeOrderRejected("tdx place order error: %s" % e)
 
         if res is None or res == -1:
-            raise BridgeOrderRejected("通达信下单失败，返回 %r" % (res,))
+            # P0-3（2026-11-24）：旧逻辑只报「返回 -1」，09:15 两笔 BUY 的真实原因
+            # （未登录/句柄失效/参数被拒）全被吞。TQ 的真实提示走 stdout，这里回显
+            # 尾部；登录/连接/超时类 → BridgeUnavailableError（引擎置通道离线并告警，
+            # 不再当「可重排」反复撞同一故障）。
+            tail = _last_output_tail()
+            err_text = "通达信下单失败，返回 %r" % (res,)
+            if tail:
+                err_text += "；客户端输出：%s" % tail
+            low = tail.lower()
+            if any(h in low for h in _TDX_OFFLINE_HINTS):
+                raise BridgeUnavailableError(err_text)
+            raise BridgeOrderRejected(err_text)
         if isinstance(res, dict):
             err_id = str(res.get("ErrorId", ""))
             if err_id not in ("", "0"):

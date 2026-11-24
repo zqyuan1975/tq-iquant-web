@@ -839,6 +839,8 @@ class LiveEngine:
         # live_portfolio_daily 缺失行（同一窗口只补一次，失败只告警）。
         self._acct_untrusted_since = None
         self._acct_gap_backfilled = False
+        # P0-4（2026-11-24）：账户可信度拦截的外发告警节流（monotonic 秒）。
+        self._account_trust_alerted_at = 0.0
         # 快照写入日志节流：每进程首条 INFO（带 pid/port），其余降 DEBUG——
         # 用于从日志区分「哪个进程在写快照」（2026-11-18 进程错配排查）。
         self._acct_snapshot_write_logged = False
@@ -4749,6 +4751,48 @@ class LiveEngine:
         except (TypeError, ValueError):
             return False
 
+    #: 账户读取连续不可信超过该秒数才拦新开仓（单次抖动/正常重连不拦）。
+    _ACCOUNT_TRUST_BLOCK_AFTER_SECONDS = 120.0
+    #: 账户可信度拦截的外发告警节流（秒）：同一故障不逐单刷 notify。
+    _ACCOUNT_TRUST_ALERT_INTERVAL = 600.0
+
+    def _account_trust_gate(self) -> Optional[str]:
+        """提交链账户可信度闸门（P0-4 2026-11-24）→ 拦截原因或 None。
+
+        仅当「本会话曾成功读到可信账户快照、随后连续不可信超过
+        ``_ACCOUNT_TRUST_BLOCK_AFTER_SECONDS``」时返回原因：
+        - 08:54 TDX 连接失败期间快照整轮跳过（`_acct_untrusted_since` 置位），
+          但 `_latest_account_cash` 保留旧值，提交链 fail-open → BUY 额度继续按
+          旧快照放大，直到 09:22 重启。此闸把「持有旧值」显式变成「停止新开仓」。
+        - 从未成功过（`_latest_account_cash_at is None`）不拦：通道不支持账户
+          查询/刚启动时真实侧由 live_capital 兜底，拦了会误伤。
+        - 恢复后 `_acct_untrusted_since` 归零（成功快照路径），自动放行。
+        """
+        since = self._acct_untrusted_since
+        if since is None or self._latest_account_cash_at is None:
+            return None
+        gap = time.monotonic() - since
+        if gap < self._ACCOUNT_TRUST_BLOCK_AFTER_SECONDS:
+            return None
+        return ("账户读取不可信已持续 %ds（最后成功快照 %s），停止新开仓 BUY；"
+                "持仓/可卖不受影响，恢复可信读取后自动放行"
+                % (int(gap),
+                   self._latest_account_cash_at.strftime("%Y-%m-%d %H:%M:%S")))
+
+    def _notify_account_trust_block(self, reason: str) -> None:
+        """账户可信度拦截的外发告警（10 分钟节流，失败不影响主链路）。"""
+        nowm = time.monotonic()
+        if nowm - getattr(self, "_account_trust_alerted_at", 0.0) < \
+                self._ACCOUNT_TRUST_ALERT_INTERVAL:
+            return
+        self._account_trust_alerted_at = nowm
+        try:
+            notify("warning", "交易通道账户读取异常", reason,
+                   gate="account_untrusted")
+        except Exception:  # noqa: BLE001 — 外发失败只记日志
+            logger.warning("account trust alert notify failed (session %s)",
+                           self.session_id, exc_info=True)
+
     def _note_cash_diff(self, real_cash: Decimal) -> None:
         """③ 柜台可用现金 vs 虚拟现金偏差告警（只告警，不改账）。
 
@@ -4800,10 +4844,15 @@ class LiveEngine:
             trade_date=now_shanghai().date(),
             fields={"会话": self.session_id},
         )
-        # C1（2026-11-18）：差异台账（默认关闭）。现金差按既有规则只留痕不改账。
+        # C1（2026-11-18）：差异台账。现金差按既有规则只留痕不改账。
+        # P1-2（2026-11-24）：台账默认开启，detail 带完整口径与已知归因候选，
+        # 让「差 -1,555.54」这类告警事后可核对，而不是只留一条 SSE。
         self._note_reconciliation_diff(
             "cash", expected=expected, actual=real_cash,
-            detail="virtual=%s;diff=%s" % (virtual, diff))
+            detail=("virtual=%s;expected=%s;real=%s;diff=%s;reserved=%s;"
+                    "候选归因：外部买入按快照价计入/佣金税费/成交未回填/人工调账"
+                    % (virtual, expected, real_cash, diff,
+                       virtual - expected)))
 
     # ---------------- 真实总资产 vs 虚拟净值（⑥） ----------------
     def virtual_equity(self) -> Decimal:
@@ -10525,11 +10574,17 @@ class LiveEngine:
 
     # ------------------------------------------- C1/I2 差异台账 + 接受柜台口径
     def _diff_ledger_enabled(self) -> bool:
-        """C1 差异台账开关（`tq_trade.reconciliation_ledger_enabled`，默认关闭）。"""
+        """C1 差异台账开关（`tq_trade.reconciliation_ledger_enabled`）。
+
+        P1-2（2026-11-24）：默认改为**开启**。现金差每天只发一条 SSE/外发，
+        实际无人处置（2026-11-24 17:19 差 -1,555.54 仅告警）；落一行台账才能
+        事后归因/闭环。写台账不改账，失败只告警，不影响主链；需要静默时仍可
+        在配置里显式置 false。
+        """
         try:
             cfg = load_config()
             tq = cfg.get("tq_trade", {}) if isinstance(cfg, dict) else {}
-            return bool(tq.get("reconciliation_ledger_enabled", False)) \
+            return bool(tq.get("reconciliation_ledger_enabled", True)) \
                 if isinstance(tq, dict) else False
         except Exception:  # noqa: BLE001 — 配置坏了不影响主链
             return False
@@ -10951,6 +11006,16 @@ class LiveEngine:
             if decision.accepted:
                 continue
             skipped.add(id(decision.order))
+            # P0-1（2026-11-24）：批量资金分配跳过的单从未调用 dispatcher，不可能
+            # 重复成交；标记可重试，放行单在收口时回 deferred 而不是判死 canceled。
+            # 具体原因写进 _submit_reason，供收口事件回显（不再只剩一句「闸门拦截」）。
+            decision.order._safe_to_retry = True
+            if decision.reason == REASON_INSUFFICIENT_CASH:
+                decision.order._submit_reason = (
+                    "资金不足跳过（低于目标份额 %d%% 门槛）" % int(_MIN_FILL_RATIO * 100))
+            else:
+                decision.order._submit_reason = (
+                    "资金分配跳过（%s）" % (decision.reason or "cap"))
             if decision.reason != REASON_INSUFFICIENT_CASH:
                 continue
             o = decision.order
@@ -11291,6 +11356,9 @@ class LiveEngine:
         # 顺延/受理点各自覆盖 reason（一键全平按此统计，不再靠事后数订单表）。
         order._submit_outcome = _SUBMIT_BLOCKED
         order._submit_reason = _SUBMIT_REASON_DEFAULT
+        # P0-1（2026-11-24）：可重排标记逐次复位——只有本次确实「未发出且闸门可重试」
+        # 才由具体闸门点置 True，避免上一根 bar 的标记残留到另一次提交。
+        order._safe_to_retry = False
         ctx = portfolio.find_strategy(order.strategy_id)
         if ctx is None:
             return
@@ -11380,16 +11448,36 @@ class LiveEngine:
         # 由放行时（次日首根分钟 bar）重新判定。
         if (bt is not None and not deferred_by_close
                 and not self._trading_allowed_for(bt, period)):
+            # P1（2026-11-24）：旧消息只有「非交易日/非交易时段」，事后无法区分
+            # 是日历判休市、连续竞价时段外还是午休——事件只剩计数没有原因。
+            # 这里补子原因（不改拦截语义）：
+            #   calendar_closed / lunch_break / pre_open / after_close / outside_session
+            if not self._calendar.is_trading_day(bt.date()):
+                why = "calendar_closed"
+            elif period in self._DAILY_PERIODS:
+                why = "outside_session"
+            elif (bt.hour, bt.minute) >= (15, 0):
+                why = "after_close"
+            elif (bt.hour, bt.minute) < (9, 30):
+                why = "pre_open"
+            elif (11, 30) <= (bt.hour, bt.minute) < (13, 0):
+                why = "lunch_break"
+            else:
+                why = "outside_session"
             logger.info(
-                "skip non-trading order %s %s %s bar=%s period=%s (calendar/closed)",
+                "skip non-trading order %s %s %s bar=%s period=%s (calendar/closed: %s)",
                 order.trade_type.value, order.stock_code, order.signal_name,
-                bt, period,
+                bt, period, why,
             )
             self._rec_live(
                 "non_trading_block", "block", portfolio, order,
-                message="非交易日/非交易时段 period=%s bar=%s" % (period, bt),
+                param_name="non_trading_reason:%s" % why,
+                message=("非交易日/非交易时段（%s）period=%s bar=%s"
+                         % (why, period, bt)),
             )
-            order._submit_reason = "非交易日/非交易时段"
+            order._submit_reason = "非交易日/非交易时段（%s）" % why
+            # 未发出、无重复成交风险：放行单被本闸拦下时可安全回 deferred 重排
+            order._safe_to_retry = True
             return
         # B-1 未来函数闸门（与回测同式判定 t.date() <= signal_bar_date）：
         # 日线级信号（signal_bar_date 非 None，signal bar 为当日 00:00，close
@@ -11454,6 +11542,26 @@ class LiveEngine:
             order._submit_outcome = _SUBMIT_DEFERRED
             order._submit_reason = "顺延至次一交易日"
             return
+        # P0-4（2026-11-24）：账户读取可信度闸门（仅拦新开仓 BUY）。
+        # 2026-11-24 08:54 TDX 连接失败 → 快照整轮跳过，但 `_latest_account_cash`
+        # 保留失败前的旧值、提交链没有任何可信度判定（fail-open），BUY 资金额度
+        # 与仓位上限继续按旧快照放大；直到 09:22 重启会话才恢复。
+        # 口径：只拦「曾成功读取、随后连续不可信超过阈值」的场景；从未成功过
+        # （通道不支持账户查询/刚启动）不拦，真实侧仍由 live_capital 兜底，避免
+        # 误伤无账户快照的通道。SELL（降敞口）永不拦。
+        # 位置在「顺延」之后：日线信号该 defer 的仍先落 deferred 行，不因本闸丢信号。
+        if _is_buy_trade_type(order.trade_type):
+            trust_block = self._account_trust_gate()
+            if trust_block:
+                order._submit_reason = trust_block
+                # 未发出、无重复成交风险：账户可信度恢复后可安全重排
+                order._safe_to_retry = True
+                self._rec_live(
+                    "account_untrusted", "block", portfolio, order,
+                    message=trust_block,
+                )
+                self._notify_account_trust_block(trust_block)
+                return
         # 审批（cap_quantity）+ 拆单 + submitted 落库注册整体下移到
         # _approve_split_and_register，与 pending 注册同处 _book_lock 临界区
         # （P1#5，2026-11-16：BUY 资金上限在锁外算会让 deals 池 requote 与主池新单
@@ -11552,6 +11660,8 @@ class LiveEngine:
                 message="同向在途单未确认 order=%s status=%s" % (inflight.id, inflight.status),
             )
             order._submit_reason = "同向在途单未确认（order=%s）" % inflight.id
+            # 未发出、无重复成交风险；在途单收敛后可安全重排（P0-1 2026-11-24）
+            order._safe_to_retry = True
             return
         # 人工核对闸（2026-11-11）：桥通道超过 grace 仍无法追溯的单不再判 rejected，
         # 而是打 bridge_order_manual_review 标记留在途（柜台可能仍挂着旧单）。这里挡住
@@ -11580,6 +11690,8 @@ class LiveEngine:
                         "禁止自动重报" % review.id,
             )
             order._submit_reason = "同向委托 %s 待人工核对" % review.id
+            # 未发出、无重复成交风险；人工核对收敛后可安全重排（P0-1 2026-11-24）
+            order._safe_to_retry = True
             return
         # 批次1 外部信号改造：BUY 槽位/排重闸（SELL 不受限——风控卖出必须放行）。
         # ① 槽位闸：已持仓数 + 本策略在途 BUY 单数 >= max_positions → 拦截
@@ -11620,6 +11732,8 @@ class LiveEngine:
                                 "跳过 BUY" % (held, inflight_buys, pos_limit),
                     )
                     order._submit_reason = "槽位已满（max_positions=%d）" % pos_limit
+                    # 未发出、无重复成交风险；槽位释放后可安全重排（P0-1 2026-11-24）
+                    order._safe_to_retry = True
                     return
             # T+1 排重按订单 bar_time 的自然日（bar 驱动口径，与收盘/日历闸一致；
             # bar_time 缺省回退当前上海时间）。
@@ -12073,12 +12187,17 @@ class LiveEngine:
                                 if cash_cap is not None else "")),
                 )
                 order._submit_reason = "资金/T+1/仓位审批未通过"
+                # 未发出、无重复成交风险；资金/可卖量/仓位任一放开后可安全重排
+                # （P0-1 2026-11-24：旧逻辑仅凭 deferred 行存在就判 canceled → 漏单）
+                order._safe_to_retry = True
                 return None
             order.quantity = capped
             # 成交量约束（实盘化，对齐回测 #2）：快照合成 bar 量 × volume_limit_ratio。
             # BUY 薄量拒单标 _volume_capped_out → 不落库不进在途（量足后的信号重试）。
             self._apply_volume_cap(order, portfolio)
             if getattr(order, "_volume_capped_out", False):
+                # 薄量拒单由「量足后的新信号」重试，不是 deferred 重排：不放行 _safe_to_retry
+                order._submit_reason = "成交量上限（薄量）拒单"
                 return None
             # 批次2：TDX 大额拆单——资格命中则不提交原单，拆为等量子单队列：
             # 仅立即提交子单 1，其余由 _tick_split_children 在前子单成交回填后
@@ -12957,16 +13076,21 @@ class LiveEngine:
     def _settle_unsubmitted_released(
         self, db: Session, portfolio: Portfolio, orders: List[OrderEvent]
     ) -> None:
-        """放行但未提交的 deferred 单收尾：DB 行 deferred → canceled（终态）。
+        """放行但未提交的 deferred 单收尾：可重试 → 回 deferred；否则 canceled。
 
         放行后单已离开内存队列；若被资金/仓位/交易时段/去重等闸门拦下而不收尾，
         该行会一直以 deferred 留在库里，下次重启被再次恢复 → 永远重试的脏足迹。
-        「未提交 = 未执行」，故记 canceled + 决策事件（原因见消息）。
 
-        判据：_submit_one_order 只有在真正落 submitted 时才会清空
-        order._deferred_row_id；仍带行 id = 本次未提交。
+        P0-1（2026-11-24）：旧实现仅凭 `_deferred_row_id` 非空就判 canceled，把
+        「未发出（dispatcher 根本没调用，不可能重复成交）」与「可能已发出」混为一谈，
+        10:16 放行单因资金分配 80% 门槛被整笔跳过 → 静默 canceled（漏单）。
+        现在按三态收口：
+        - `_submit_outcome == submitted`：绝不在这里改终态（防御性跳过）；
+        - 未发出且 `_safe_to_retry`：`_requeue_rejected_order` 回 deferred 计次
+          （受 `_DEFERRED_RETRY_MAX` 上限约束，随 error_message 落库）；
+        - 其余（不可重试闸门 / 重排次数用尽）：才写 canceled，并带回真实原因。
 
-        P1-3 例外：被桥明确拒单/价格闸拦截后**已重排**（`_requeued_for_retry`）
+        P1-3 例外保持：被桥明确拒单/价格闸拦截后**已重排**（`_requeued_for_retry`）
         的单行已是 deferred 且已回队，绝不能在这里改 canceled（否则重试被吞）。
         """
         for order in orders:
@@ -12975,21 +13099,46 @@ class LiveEngine:
             row_id = getattr(order, "_deferred_row_id", None)
             if not row_id:
                 continue
+            # 已真正发出的单不会带 deferred 行 id（提交链已删旧行建新行）；防御性跳过。
+            if getattr(order, "_submit_outcome", None) == _SUBMIT_SUBMITTED:
+                continue
+            reason = (getattr(order, "_submit_reason", None)
+                      or _SUBMIT_REASON_DEFAULT)
+            row = db.query(LiveOrder).filter(LiveOrder.id == row_id).first()
+            if row is None:
+                order._deferred_row_id = None
+                continue
+            if getattr(order, "_safe_to_retry", False):
+                try:
+                    requeued = self._requeue_rejected_order(
+                        db, portfolio, order, row,
+                        "released_not_submitted: %s" % reason,
+                        gate="deferred_release",
+                        event_message=(
+                            "放行后未提交（%s）：未发出、无重复成交风险 → 回 deferred "
+                            "等下一窗口重试（第 %d/%d 次尝试；上限 %d 次重排）"
+                            % (reason,
+                               int(getattr(order, "_deferred_retry_count", 0) or 0) + 1,
+                               _DEFERRED_RETRY_MAX + 1, _DEFERRED_RETRY_MAX)),
+                    )
+                except Exception:  # noqa: BLE001 — 重排失败退回终态，不阻断本批
+                    logger.exception(
+                        "released deferred requeue failed: %s %s row=%s",
+                        order.trade_type.value, order.stock_code, row_id)
+                    requeued = False
+                if requeued:
+                    order._submit_outcome = _SUBMIT_DEFERRED
+                    continue
             logger.warning(
-                "released deferred %s %s not submitted, mark canceled (row %s)",
-                order.trade_type.value, order.stock_code, row_id)
+                "released deferred %s %s not submitted (%s), mark canceled (row %s)",
+                order.trade_type.value, order.stock_code, reason, row_id)
             self._rec_live(
                 "deferred_release", "drop", portfolio, order,
-                message=("放行后未提交（资金/仓位/交易时段/去重/T+1 可用不足等闸门拦截）→"
-                         "取消原 deferred 单（宁可漏一次，不冒重复成交风险），避免重启后"
-                         "重复恢复"),
+                message=("放行后未提交（%s）→ 取消原 deferred 单（该闸门不可重试，"
+                         "或重排次数已用尽；已发出的单绝不在此收口）" % reason),
             )
-            row = db.query(LiveOrder).filter(LiveOrder.id == row_id).first()
-            if row is not None:
-                row.status = "canceled"
-                row.error_message = (
-                    "released_not_submitted: 放行后未提交（闸门拦截），转 canceled"
-                )[:500]
+            row.status = "canceled"
+            row.error_message = ("released_not_submitted: %s" % reason)[:500]
             order._deferred_row_id = None
 
     def _find_duplicate_deferred_row(

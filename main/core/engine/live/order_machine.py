@@ -1323,6 +1323,8 @@ class OrderStateMachine:
         # （/deals 也无成交）才 rejected。同时覆盖两条调用路径（poll_deals 顺序 bug +
         # _tick_main 饿死场景不查 /deals）。deals 只在确有超时待兜底单时 lazy 查一次，复用。
         deals_cache: Optional[list] = None  # None=未查；list=已查（含空列表），全循环复用
+        # 非 remark 通道判废前 legacy 复核用的「已被其它单占用」的柜台单号集合（lazy）。
+        claimed_refs: Optional[set] = None
         deals_online = True  # 桥离线时禁止收口（查不到 ≠ 不存在，防误杀）
         grace = self._untraceable_grace_seconds()
         for lo in pending:
@@ -1358,7 +1360,8 @@ class OrderStateMachine:
             #   - ≥grace：收口前最后一次追溯（精确 /orders + /deals，防误杀），
             #     仍毫无踪迹才 rejected，释放同股同向在途门（否则卡住的止损卖单会
             #     一直挡住后续风控卖出）；迟到成交由 poll_deals 的迟到回填兜底纠正。
-            # 非 remark 通道（通达信/同花顺 UI）维持原「超时收口 rejected」语义不变。
+            # 非 remark 通道（通达信/同花顺 UI）：remark 恒空，只能靠委托表 legacy
+            # 模糊匹配认领 order_ref；判废前同样强制复核一次（P0-2 2026-11-24，见下）。
             if getattr(self._ctx.dispatcher, "supports_remark", False):
                 if age >= timedelta(seconds=grace):
                     traced, late_deals, query_ok = self._probe_untraceable_trace(
@@ -1499,10 +1502,49 @@ class OrderStateMachine:
                         ),
                     })
                 continue
+            # P0-2（2026-11-24）：非 remark 通道（通达信/同花顺 UI）判废前强制复核。
+            # TDX 的 remark 恒空，180s 内没认领到 order_ref 不代表柜台没这张单——
+            # 委托表里的陌生 ref（insert_fabricated）此前被 legacy 匹配一律跳过，
+            # 真机 2026-11-18 301600 卖 220 股即因此被判 rejected；而 rejected 会
+            # 释放同股同向门，旧单仍挂在柜台时后续风控卖出会再报一张 → 双份成交。
+            # 复核口径：
+            #   ① 委托表查询失败 → 查不到≠不存在，保持 pending（不判废）；
+            #   ② legacy 模糊匹配（代码+方向+数量+时间窗，跳过 fabricated）认领 ref；
+            #   ③ 认领到 ref 的单交给后续终态同步/成交回填，不判废；
+            #   ④ 查询成功且确认无踪迹，才 rejected，并留查询时间与依据。
+            try:
+                orders_now = self._ctx.dispatcher.query_orders()
+            except BridgeUnavailableError as exc:
+                lo.error_message = (
+                    _UNTRACEABLE_PENDING_MARKER
+                    + ("非 remark 通道委托查询失败（%s），无法确认委托是否存在，"
+                       "保持 pending" % exc))[:400]
+                logger.warning(
+                    "expire: order %s %s %s query failed (%r) — keep pending "
+                    "(non-remark channel)", lo.id, lo.trade_type, lo.stock_code, exc)
+                continue
+            if lo.order_ref is None:
+                if claimed_refs is None:
+                    claimed_refs = set(
+                        r[0] for r in db.query(LiveOrder.order_ref).filter(
+                            LiveOrder.live_session_id == session_id,
+                            LiveOrder.order_ref.isnot(None),
+                        ).all()
+                    )
+                self.try_match_order_ref(lo, claimed_refs, orders=orders_now)
+                if lo.order_ref is not None:
+                    claimed_refs.add(lo.order_ref)
+                    logger.info(
+                        "expire: order %s %s %s claimed order_ref %s via legacy match "
+                        "before expiry — keep for terminal/deal sync",
+                        lo.id, lo.trade_type, lo.stock_code, lo.order_ref)
+                    continue
             lo.status = "rejected"
             lo.error_message = (
                 "order match timeout: no bridge order_ref within %ds"
-                % int(age.total_seconds())
+                "（已复核委托表：查询成功、无匹配候选；%s）"
+                % (int(age.total_seconds()),
+                   now_shanghai().strftime("%Y-%m-%d %H:%M:%S"))
             )
             logger.warning(
                 "expire: order %s %s %s rejected (no order_ref and no /deals match "

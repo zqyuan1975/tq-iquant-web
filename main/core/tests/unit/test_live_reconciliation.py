@@ -7,7 +7,7 @@
 - `cash`/`equity` + accept 只确认口径，不改虚拟现金；
 - 现金流红冲是「反向补一笔 + 原行作废」，可审计、幂等、禁止套娃红冲；
 - 现金流日期边界：未来日期拒绝、早于会话起账日仅显式 allow_backfill 放行；
-- 差异台账开关默认关闭（关闭时不写任何行）。
+- 差异台账默认开启（只留痕不改账；显式 false 时不写任何行）。
 """
 
 from datetime import date, datetime, timedelta
@@ -137,9 +137,9 @@ def test_diff_accept_cash_and_equity_do_not_touch_ledger():
         db.close()
 
 
-def test_diff_ledger_disabled_by_default(monkeypatch):
+def test_diff_ledger_default_on_and_can_be_disabled(monkeypatch):
+    """P1-2（2026-11-24）：差异台账默认开启（只留痕不改账），可显式关闭。"""
     from core.engine import live_engine as le
-    monkeypatch.setattr(le, "load_config", lambda: {"tq_trade": {}})
 
     class _Shim:
         _db_session_factory = None
@@ -147,6 +147,12 @@ def test_diff_ledger_disabled_by_default(monkeypatch):
         _note_reconciliation_diff = LiveEngine._note_reconciliation_diff
 
     shim = _Shim()
+    monkeypatch.setattr(le, "load_config", lambda: {"tq_trade": {}})
+    assert shim._diff_ledger_enabled() is True
+
+    monkeypatch.setattr(
+        le, "load_config",
+        lambda: {"tq_trade": {"reconciliation_ledger_enabled": False}})
     assert shim._diff_ledger_enabled() is False
     # 关闭时写入函数第一行返回，不触碰数据库
     shim._note_reconciliation_diff("cash", expected=1, actual=2)

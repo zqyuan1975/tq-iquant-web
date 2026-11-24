@@ -272,6 +272,11 @@ class _UnconfirmedTdxDispatcher(_StubDispatcher):
     def query_deals(self):
         return []
 
+    def query_orders(self, order_id=None):
+        # P0-2（2026-11-24）：非 remark 通道判废前会强制复核委托表；本 stub 模拟
+        # 「委托表查询成功但无该单」→ 仍按既有语义收口 rejected。
+        return []
+
     def pending_row_state(self, live_order):
         self.row_checks.append(live_order.id)
         return self._row_state
