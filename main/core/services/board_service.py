@@ -55,6 +55,10 @@ BOARD_PERIODS = ("1d", "30m")
 SCOPE_INDUSTRIES = "industries"
 SCOPE_STOCKS = "stocks"
 
+#: 看板刷新互斥：手动 API（api/investment_board.py）与进程内自动调度
+#: （services/board_auto_refresh.py）共用，同一时刻只允许一次全量刷新。
+REFRESH_LOCK = threading.Lock()
+
 #: 通达信二级行业代码：严格 881 + 3 位数字（881999 之类混入项一律剔除）
 _INDUSTRY_CODE_RE = re.compile(r"^881\d{3}(\.SH)?$")
 EXPECTED_INDUSTRY_COUNT = 128
@@ -687,7 +691,7 @@ def execute_run(run_id: int, period: str, scope: str,
         run.stats_json = json.dumps(stats, ensure_ascii=False)
         db.commit()
         return {"status": status, "run_id": run_id, "as_of": target_day.isoformat(),
-                "stats": stats}
+                "error": run.error, "stats": stats}
     finally:
         db.close()
 

@@ -208,6 +208,11 @@ def _trading_day(d: date) -> bool:
     return d not in closed
 
 
+def is_trading_day(d: date) -> bool:
+    """交易日判定公开入口（与闸同口径，供进程内调度复用）。"""
+    return _trading_day(d)
+
+
 def _hm_minutes(raw) -> int:
     """'HH:MM' → 当日分钟数；兼容 YAML 把未加引号的 ``08:00`` 解析成 480 的情况。"""
     if isinstance(raw, int):

@@ -494,6 +494,28 @@ def _defaults() -> dict:
                 "max_drawdown_dev_pct": 1.0,
             },
         },
+        # 投资看板自动刷新（进程内 daemon 调度，core/services/board_auto_refresh.py）：
+        # 交易日按 times（日线）/ times_30m（30m 行业层）刷新看板快照（只写
+        # board_* 表，不碰实盘取数/下单/风控/回测）。时点可配，enabled=false 即关闭。
+        "investment_board": {
+            "auto_refresh": {
+                "enabled": True,
+                # 日线：09:05 盘前、16:00 盘后（都在 P2 放行窗，避开 14:55–15:10）
+                "times": ["09:05", "16:00"],
+                "period": "1d",
+                # 刷新口径：行业指数 + 成分股（与手动「行业 + 成分股」一致）
+                "scope": "all",
+                # 30m：11:35 午休（补 10:00–11:30 四根）、16:00 盘后（全天八根）。
+                # 30m 标签 10:00–11:00 / 13:30–14:30 落在交易时段，P2 会被闸拒，
+                # 因此只在放行窗一次性补齐；数据与手动刷新同源同精度。
+                "times_30m": ["11:35", "16:00"],
+                # 30m 只刷行业层；成分股 30m 仍按抽屉打开时 lazy 计算
+                "scope_30m": "industries",
+                # 被闸截断（partial/failed）后，下一个放行窗自动补跑一次
+                "retry_partial": True,
+                "retry_cooldown_minutes": 5,
+            },
+        },
         # J6（2026-11-18）：回测 K 线本地 parquet 缓存（默认关闭）。按
         # (code, period, 复权, 区间) 缓存原始行情；闭区间长期有效，含当日按
         # today_ttl_seconds 按 mtime 失效。开启后回测结果与不开缓存一致。

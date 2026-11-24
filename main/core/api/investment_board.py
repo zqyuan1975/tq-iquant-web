@@ -31,7 +31,13 @@ router = APIRouter(prefix="/api/investment-board", tags=["investment-board"])
 
 _CACHE_TTL_SECONDS = 60
 _cache: dict = {}
-_refresh_lock = threading.Lock()
+# 与自动刷新调度共用同一把锁（见 board_service.REFRESH_LOCK）
+_refresh_lock = svc.REFRESH_LOCK
+
+
+def clear_query_cache() -> None:
+    """清看板查询缓存（自动刷新落库后调用，让页面立即读到新快照）。"""
+    _cache.clear()
 
 
 def _cached(key: tuple, producer):

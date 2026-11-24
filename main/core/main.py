@@ -36,6 +36,7 @@ from core.engine.live.engine_watchdog import (
     EngineWatchdog, record_channel_decision,
 )
 from core.services.backup_service import BackupScheduler
+from core.services.board_auto_refresh import BoardAutoRefreshScheduler
 from core.services.incremental_backtest import IncrementalBacktestScheduler
 from core.services.auto_shutdown import arm as arm_auto_shutdown
 from core import runtime
@@ -197,7 +198,23 @@ async def lifespan(app: FastAPI):
         except Exception:  # noqa: BLE001 — 归档调度失败不得阻断交易主服务
             logger.exception("决策事件归档调度启动失败（主服务继续运行）")
             archive_scheduler = None
+    # 投资看板自动刷新（daemon 线程，交易日 09:05/16:00 各刷新一次行业 + 成分股）：
+    # 只写 board_* 表，不碰实盘取数/下单/风控/回测主链；时点与开关见 config。
+    board_scheduler = None
+    if os.environ.get("TQ_BOARD_AUTO_REFRESH_DISABLED") == "1":
+        logger.info("投资看板自动刷新调度已禁用（TQ_BOARD_AUTO_REFRESH_DISABLED=1）")
+    else:
+        try:
+            board_scheduler = BoardAutoRefreshScheduler()
+            board_scheduler.start()
+            logger.info("投资看板自动刷新调度已启动"
+                        "（进程内，交易日日线 09:05/16:00、30m 11:35/16:00）")
+        except Exception:  # noqa: BLE001 — 调度失败不得阻断交易主服务
+            logger.exception("投资看板自动刷新调度启动失败（主服务继续运行）")
+            board_scheduler = None
     yield
+    if board_scheduler is not None:
+        board_scheduler.stop()
     if archive_scheduler is not None:
         archive_scheduler.stop()
     if incr_scheduler is not None:

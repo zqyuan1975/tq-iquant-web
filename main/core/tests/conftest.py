@@ -15,6 +15,9 @@ os.environ.setdefault(
     os.path.join(_tempfile.gettempdir(), "tq_health_sample_cursor_test.json"))
 # 同理禁用增量回测调度（每日 15:10 会读真实 DB 并卡通达信取数）。
 os.environ.setdefault("TQ_INCREMENTAL_SCHEDULER_DISABLED", "1")
+# 投资看板自动刷新调度（交易日 09:05/16:00 全量取数）：测试进程禁用，
+# 否则 `with TestClient(app)` 触发 lifespan 后会在时点后真的刷新临时库/取数。
+os.environ.setdefault("TQ_BOARD_AUTO_REFRESH_DISABLED", "1")
 # 告警外发（飞书 Webhook）：测试期间强制关闭，绝不给真实机器人发消息
 # （本机 config.yaml 可能已配真实 webhook_url 且 enabled=true）。
 os.environ.setdefault("TQ_NOTIFY_DISABLED", "1")

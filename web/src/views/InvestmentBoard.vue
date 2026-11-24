@@ -2,7 +2,7 @@
 // 投资看板（只读）：市场多空状态（整体迁移自备选股池）+ 128 个 881 二级行业
 // 相对大盘的多头先后 + 行业成分股相对行业指数的领先 + 日线/30m 双视图。
 // 不接下单、不进 market_gate、不改变任何策略与风控行为。
-import { onMounted, ref } from 'vue'
+import { computed, onMounted, ref } from 'vue'
 import PageHeader from '../components/PageHeader.vue'
 import MarketGatePanel from '../components/board/MarketGatePanel.vue'
 import {
@@ -77,9 +77,28 @@ function triggerLabel(t: string | null): string {
   if (!t) return '未知来源'
   if (t === 'manual') return '手动'
   if (t === 'lazy') return '按需'
-  if (t.startsWith('auto:')) return `自动 ${t.slice(5, 7)}:${t.slice(7, 9)}`
+  // auto:0905 / auto:0905r（r = 截断后的自动补跑）
+  if (t.startsWith('auto:')) {
+    const retry = t.endsWith('r')
+    const body = retry ? t.slice(0, -1) : t
+    return `自动 ${body.slice(5, 7)}:${body.slice(7, 9)}${retry ? '（补跑）' : ''}`
+  }
   return t
 }
+
+// 当前周期对应的自动刷新时点提示（日线 / 30m 不同）
+const autoHint = computed(() => period.value === '30m'
+  ? '每交易日 11:35 / 16:00 自动刷新 30m 行业层（盘中标签由放行窗补齐）'
+  : '每交易日 09:05 / 16:00 自动刷新')
+
+// 30m 视图下当前快照的最后一根已闭合 bar（判断序列更新到哪一根）
+const lastBarAt = computed(() => {
+  if (period.value !== '30m') return null
+  const values = industries.value
+    .map((r) => r.bar_closed_at)
+    .filter((v): v is string => !!v)
+  return values.length ? values.sort()[values.length - 1] : null
+})
 
 const RUN_STATUS_LABELS: Record<string, string> = {
   ok: '成功', partial: '部分成功', failed: '失败', running: '刷新中',
@@ -258,16 +277,19 @@ onMounted(loadAll)
   <div v-if="tqP2Blocked" class="tq-gate-notice">{{ tqP2Reason }}</div>
   <div v-if="gatePausedMsg" class="tq-gate-notice">{{ gatePausedMsg }}</div>
 
-  <!-- 最近一次刷新（手动/自动 09:05、16:00）：判断当前数据是否是这两个时点后最新的 -->
+  <!-- 最近一次刷新（手动/自动）：时间 / 来源 / 结果 / 数据日 / 30m 最后一根 bar -->
   <div v-if="latestRun" class="board-refresh-meta" :title="latestRun.error || ''">
     上次刷新：<span class="num">{{ runTime(latestRun.started_at) }}</span>
     · {{ triggerLabel(latestRun.trigger) }}
     · <span :class="`run-${latestRun.status}`">{{ runStatusLabel(latestRun.status) }}</span>
-    <span v-if="latestRun.as_of" class="muted">（数据日 {{ latestRun.as_of }}）</span>
-    <span v-if="latestRun.status === 'failed' && latestRun.error" class="run-failed">
-      ：{{ latestRun.error }}
+    <span v-if="latestRun.as_of" class="muted">
+      （数据日 {{ latestRun.as_of }}<template v-if="lastBarAt">，最后一根 {{ runTime(lastBarAt) }}</template>）
     </span>
-    <span v-else class="muted">· 每交易日 09:05 / 16:00 自动刷新</span>
+    <span v-if="latestRun.status === 'partial'" class="run-partial">
+      （跳过 {{ latestRun.skipped }} 项，将在放行窗补跑）
+    </span>
+    <span v-if="latestRun.error" class="run-failed">：{{ latestRun.error }}</span>
+    <span class="muted">· {{ autoHint }}</span>
   </div>
 
   <div v-if="errorMsg" class="card board-error">{{ errorMsg }}</div>
