@@ -5059,6 +5059,7 @@ export interface SelectionRecallMissed {
     weight?: number
     contribution?: number
   }>
+  last_fire?: string | null
   note?: string
 }
 
@@ -5067,6 +5068,7 @@ export interface SelectionPoolRecall {
   as_of: string
   formula: { id: number; name: string; engine: string; open_signals: Record<string, number> }
   horizon_days: number
+  signal_window_days?: number
   universe_size: number
   pool_size: number
   formula_selected_market: number
@@ -5107,6 +5109,7 @@ export async function computeSelectionRecall(req: {
   snapshot_id: number
   formula_id: number
   horizon_days?: number
+  signal_window_days?: number
   refresh?: boolean
 }) {
   const res = await api.post<ApiResponse<SelectionPoolRecall>>('/selection/pool-recall', req)

@@ -20,8 +20,8 @@ from typing import Any, Dict, List, Optional
 from core.models.formula import Formula
 from core.models.formula_signal import FormulaSignal
 from core.models.selection import (
-    SelectionPoolRecall, SelectionSnapshot, SelectionSnapshotStock,
-    SelectionWarehouseStock,
+    SelectionPoolRecall, SelectionSchemeVersion, SelectionSnapshot,
+    SelectionSnapshotStock, SelectionWarehouseStock,
 )
 
 OPEN = "OPEN"
@@ -58,9 +58,9 @@ def _fmt_day(day: date) -> str:
     return day.strftime("%Y%m%d")
 
 
-def _line_value(series, day: date) -> Optional[float]:
-    """取公式输出序列在 day（含）之前的最后一个值。"""
-    last = None
+def _line_rows(series, day: date) -> List[tuple]:
+    """公式输出序列在 day（含）之前的 (日期串, 值) 列表，按日期升序。"""
+    rows: List[tuple] = []
     for item in series or []:
         if not isinstance(item, dict):
             continue
@@ -74,20 +74,30 @@ def _line_value(series, day: date) -> Optional[float]:
         if v is None:
             continue
         try:
-            last = float(v)
+            fv = float(v)
         except (TypeError, ValueError):
             continue
-    return last
+        rows.append((ds, fv))
+    rows.sort()
+    return rows
 
 
 def _evaluate(db, formula: Formula, open_signals: Dict[str, float],
               codes: List[str], as_of: date, warmup_days: int = 300,
-              chunk: int = 80) -> Dict[str, Dict[str, Any]]:
-    """逐批调用公式，返回 {code: {selected, lines}}；只保留 as_of 当日值。"""
+              chunk: int = 80, signal_window_days: int = 20,
+              ) -> Dict[str, Dict[str, Any]]:
+    """逐批调用公式，返回 {code: {selected, lines, last_fire}}。
+
+    入选判定：OPEN 信号线在 as_of 及之前最近 ``signal_window_days`` 个**交易bar**
+    内出现过触发值。择时公式的 OPEN 是稀疏脉冲（实测单票每年仅 1-3 次，单日
+    全市场经常 0 只），只用 as_of 单日会把召回口径退化成 0/0，故按「同期窗口」
+    取集合；``signal_window_days=1`` 即用户最初要求的严格单日口径。
+    """
     from core.tq.formula import TQFormula
 
     if not open_signals:
         raise RecallError("公式 %s 没有 OPEN 信号线，无法做择时验证" % formula.name)
+    window = max(1, int(signal_window_days or 1))
     start = _fmt_day(as_of - timedelta(days=warmup_days))
     end = _fmt_day(as_of)
     api = TQFormula()
@@ -104,19 +114,24 @@ def _evaluate(db, formula: Formula, open_signals: Dict[str, float],
         for code in part:
             series_by_line = raw.get(code) or {}
             lines = {}
+            last_fire = None
             hit = False
             seen = False
             for name, trigger in open_signals.items():
-                val = _line_value(series_by_line.get(name), as_of)
-                if val is None:
+                rows = _line_rows(series_by_line.get(name), as_of)
+                if not rows:
                     continue
                 seen = True
-                lines[name] = val
-                if abs(val - trigger) < 1e-6:
-                    hit = True
+                lines[name] = rows[-1][1]
+                for ds, val in rows[-window:]:
+                    if abs(val - trigger) < 1e-6:
+                        hit = True
+                        if last_fire is None or ds > last_fire:
+                            last_fire = ds
             out[code] = {
                 "selected": hit if seen else None,
                 "lines": lines,
+                "last_fire": last_fire,
             }
     return out
 
@@ -164,13 +179,79 @@ def _cause(row: Optional[SelectionSnapshotStock]) -> str:
     return "rank_cut"
 
 
+def _recheck_gates(db, codes: List[str], as_of: date,
+                   gates: Dict[str, Any]) -> Dict[str, str]:
+    """对快照未留痕的漏票，用仓库快照重放可复核的硬闸门。
+
+    快照只留痕「入选 + 2×TopN 边缘」，其余漏票没有淘汰原因可读。这里按引擎
+    ``_apply_gates`` 的顺序重放 ST/退市/次新/PE/PB/流通市值/财报期数六道基础闸门，
+    能归因的给出 ``gate:xxx``，全部通过则归为 ``rank_cut``（排名在 TopN 之外或
+    被风格专属闸门淘汰）。
+    """
+    if not codes:
+        return {}
+    from core.selection.engine import (  # 与引擎共用阈值，避免口径漂移
+        MAX_PE, MIN_FIN_PERIODS, MIN_FLOAT_MV, _json_blob, _num,
+    )
+    max_pe = float(gates.get("max_pe") or MAX_PE)
+    min_mv = float(gates.get("min_float_mv") or MIN_FLOAT_MV)
+    stocks = (db.query(SelectionWarehouseStock)
+              .filter(SelectionWarehouseStock.code.in_(codes)).all())
+    known = set()
+    out: Dict[str, str] = {}
+    for s in stocks:
+        known.add(s.code)
+        info = _json_blob(s.info_blob)
+        more = _json_blob(s.more_blob)
+        if (_num(info.get("IsSTGP")) or 0) != 0:
+            out[s.code] = "gate:st"
+            continue
+        if (_num(info.get("IsQuitGP")) or 0) != 0:
+            out[s.code] = "gate:quit"
+            continue
+        j = str(info.get("J_start") or "")
+        if len(j) == 8:
+            try:
+                listed = date(int(j[:4]), int(j[4:6]), int(j[6:8]))
+                if (as_of - listed).days < 365:
+                    out[s.code] = "gate:new_listing"
+                    continue
+            except ValueError:
+                pass
+        pe = _num(more.get("StaticPE_TTM"))
+        if pe is None:
+            out[s.code] = "gate:pe_missing"
+            continue
+        if pe <= 0 or pe > max_pe:
+            out[s.code] = "gate:pe_out_of_range"
+            continue
+        pb = _num(more.get("PB_MRQ"))
+        if pb is None or pb <= 0:
+            out[s.code] = "gate:pb_invalid"
+            continue
+        ltsz = _num(more.get("Ltsz"))
+        if ltsz is None or ltsz < min_mv:
+            out[s.code] = "gate:float_mv_low"
+            continue
+        if int(s.fin_periods or 0) < MIN_FIN_PERIODS:
+            out[s.code] = "gate:fin_history_short"
+            continue
+        out[s.code] = "rank_cut"
+    for c in codes:
+        if c not in known:
+            out[c] = "not_in_warehouse"
+    return out
+
+
 def _missed_detail(row: Optional[SelectionSnapshotStock], code: str,
-                   fwd: Optional[float], horizon_days: int) -> Dict[str, Any]:
+                   fwd: Optional[float], horizon_days: int,
+                   last_fire: Optional[str] = None) -> Dict[str, Any]:
     item: Dict[str, Any] = {
         "code": code,
         "cause": _cause(row),
         "forward_return_pct": None if fwd is None else round(fwd * 100, 2),
         "horizon_days": horizon_days,
+        "last_fire": last_fire,
     }
     if row is not None:
         item["rank"] = row.rank
@@ -208,7 +289,8 @@ def _upsert(db, snapshot: SelectionSnapshot, formula_id: int, horizon_days: int,
 
 
 def compute_recall(db, snapshot_id: int, formula_id: int,
-                   horizon_days: int = 20, refresh: bool = False) -> Dict[str, Any]:
+                   horizon_days: int = 20, refresh: bool = False,
+                   signal_window_days: int = 20) -> Dict[str, Any]:
     """计算（或读取缓存）某快照 × 某公式的召回验证结果。"""
     snapshot = db.get(SelectionSnapshot, snapshot_id)
     if snapshot is None:
@@ -220,6 +302,7 @@ def compute_recall(db, snapshot_id: int, formula_id: int,
         raise RecallError("公式不存在：%s" % formula_id)
     if horizon_days < 1 or horizon_days > 120:
         raise RecallError("horizon_days 需在 1..120")
+    window = max(1, int(signal_window_days or 1))
 
     if not refresh:
         cached = (db.query(SelectionPoolRecall)
@@ -227,8 +310,10 @@ def compute_recall(db, snapshot_id: int, formula_id: int,
                              horizon_days=horizon_days).one_or_none())
         if cached is not None:
             data = json.loads(cached.payload_json)
-            data["cached"] = True
-            return data
+            # 口径变了（窗口不同）不能复用旧结果，避免新旧口径混看
+            if int(data.get("signal_window_days") or 1) == window:
+                data["cached"] = True
+                return data
 
     sig_rows = (db.query(FormulaSignal)
                 .filter_by(formula_id=formula_id).all())
@@ -251,8 +336,10 @@ def compute_recall(db, snapshot_id: int, formula_id: int,
         raise RecallError("该快照没有命中成分，无法验证召回")
     universe = [r[0] for r in db.query(SelectionWarehouseStock.code).all()]
 
-    market = _evaluate(db, formula, triggers, universe, snapshot.as_of)
-    pool = _evaluate(db, formula, triggers, pool_codes, snapshot.as_of)
+    market = _evaluate(db, formula, triggers, universe, snapshot.as_of,
+                       signal_window_days=window)
+    pool = _evaluate(db, formula, triggers, pool_codes, snapshot.as_of,
+                     signal_window_days=window)
 
     market_sel = {c for c, v in market.items() if v.get("selected")}
     pool_sel = {c for c, v in pool.items() if v.get("selected")}
@@ -260,13 +347,32 @@ def compute_recall(db, snapshot_id: int, formula_id: int,
     in_pool_hit = sorted(market_sel & set(pool_codes))
 
     fwd = _forward_return(missed, snapshot.as_of, horizon_days) if missed else {}
-    detail = [_missed_detail(by_code.get(c), c, fwd.get(c), horizon_days)
+    detail = [_missed_detail(by_code.get(c), c, fwd.get(c), horizon_days,
+                             (market.get(c) or {}).get("last_fire"))
               for c in missed]
+    # 快照只留痕边缘票；其余漏票用仓库快照重放基础闸门，避免清一色「未进候选」
+    version = db.get(SelectionSchemeVersion, snapshot.scheme_version_id)
+    gates: Dict[str, Any] = {}
+    if version is not None:
+        try:
+            gates = (json.loads(version.spec_json) or {}).get("gates") or {}
+        except (TypeError, ValueError):
+            gates = {}
+    unknown = [it["code"] for it in detail if it["cause"] == "not_candidate"]
+    recheck = _recheck_gates(db, unknown, snapshot.as_of, gates)
+    for item in detail:
+        if item["cause"] == "not_candidate" and item["code"] in recheck:
+            item["cause"] = recheck[item["code"]]
     causes: Dict[str, int] = {}
     for item in detail:
         causes[item["cause"]] = causes.get(item["cause"], 0) + 1
 
     eval_errors = [c for c, v in market.items() if v.get("selected") is None]
+    # 求值大面积失败（TQ 公式服务不可用/并发冲突）时不能把 0 入选写成真实结论
+    if len(eval_errors) > max(20, int(len(universe) * 0.5)):
+        raise RecallError(
+            "公式求值失败 %d/%d（疑似 TQ 公式服务不可用或并发冲突），"
+            "本次不落库，请稍后重试" % (len(eval_errors), len(universe)))
     payload: Dict[str, Any] = {
         "snapshot_id": snapshot.id,
         "as_of": snapshot.as_of.isoformat(),
@@ -274,6 +380,7 @@ def compute_recall(db, snapshot_id: int, formula_id: int,
         "formula": {"id": formula.id, "name": formula.name,
                     "engine": formula.engine, "open_signals": triggers},
         "horizon_days": horizon_days,
+        "signal_window_days": window,
         "universe_size": len(universe),
         "pool_size": len(pool_codes),
         "formula_selected_market": len(market_sel),
@@ -289,7 +396,12 @@ def compute_recall(db, snapshot_id: int, formula_id: int,
         "method": "single_pass_intersection",
         "notes": [
             "池只是候选域，最终买入由公式择时决定；召回率=池内入选/全市场入选。",
+            "入选=OPEN 信号线在 as_of 前最近 %d 个交易 bar 内触发（择时脉冲稀疏，"
+            "单日口径常为 0/0）；signal_window_days=1 即严格单日口径。" % window,
             "漏票收益为 as_of 起第 N 个交易日的不复权涨幅，取不到时置 null。",
+            "漏票成因：快照留痕优先；未留痕票按仓库快照重放基础闸门"
+            "（ST/退市/次新/PE/PB/流通市值/财报期数），全部通过计 rank_cut"
+            "（被 TopN 或风格专属闸门淘汰）。",
             "IC/分组单调性仅作参考，不参与任何决策。",
         ],
         "computed_at": datetime.now().isoformat(timespec="seconds"),

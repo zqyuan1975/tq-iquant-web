@@ -68,6 +68,9 @@ class RecallReq(BaseModel):
     snapshot_id: int
     formula_id: int
     horizon_days: int = 20
+    # 入选判定窗口（交易 bar）：择时 OPEN 脉冲稀疏，单日常为 0/0；
+    # 1=严格单日口径，默认 20 个交易 bar。
+    signal_window_days: int = 20
     refresh: bool = False
 
 
@@ -367,7 +370,8 @@ def compute_pool_recall(req: RecallReq, db: Session = Depends(get_db)):
     try:
         return ok(recall_svc.compute_recall(
             db, req.snapshot_id, req.formula_id,
-            horizon_days=req.horizon_days, refresh=req.refresh))
+            horizon_days=req.horizon_days, refresh=req.refresh,
+            signal_window_days=req.signal_window_days))
     except recall_svc.RecallError as exc:
         return _bad(exc)
     except LookupError as exc:

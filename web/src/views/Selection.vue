@@ -166,6 +166,8 @@ const formulas = ref<SelectionFormulaItem[]>([])
 const recallSnapshotId = ref<number | null>(null)
 const recallFormulaId = ref<number | null>(null)
 const recallHorizon = ref(20)
+// 入选判定窗口（交易 bar）：择时 OPEN 脉冲稀疏，严格单日口径常为 0/0
+const recallWindow = ref(20)
 const recallResult = ref<SelectionPoolRecall | null>(null)
 const computingRecall = ref(false)
 const missedExpanded = ref(false)
@@ -639,6 +641,7 @@ async function computeRecall() {
       snapshot_id: recallSnapshotId.value,
       formula_id: recallFormulaId.value,
       horizon_days: recallHorizon.value,
+      signal_window_days: recallWindow.value,
       refresh: true,
     })
     missedExpanded.value = false
@@ -748,7 +751,7 @@ onMounted(loadAll)
                   <td style="color:var(--ink-soft)">{{ v.spec_hash }}</td>
                   <td style="color:var(--ink-soft)">{{ v.field_fingerprint }}</td>
                   <td>
-                    <span v-if="v.uncalibrated" class="badge" style="background:var(--line);color:var(--ink-soft)">未校准</span>
+                    <span v-if="v.uncalibrated" class="badge" style="background:var(--line);color:var(--ink-soft)" title="排序未经全买型验证；本池按候选域口径验证召回">排序未验证（候选域口径）</span>
                     <span v-else class="badge badge-green">已校准</span>
                   </td>
                   <td style="color:var(--ink-soft)">{{ v.note || '—' }}</td>
@@ -889,7 +892,7 @@ onMounted(loadAll)
       <div v-if="activeVersion" class="card" style="padding:12px;margin-top:12px">
         <h3 style="margin-top:0">
           当前启用参数：{{ selected?.name }} v{{ activeVersion.version }}
-          <span v-if="activeVersion.uncalibrated" class="badge" style="margin-left:8px;background:var(--line);color:var(--ink-soft)">未校准</span>
+          <span v-if="activeVersion.uncalibrated" class="badge" style="margin-left:8px;background:var(--line);color:var(--ink-soft)" title="排序未经全买型验证；本池按候选域口径验证召回">排序未验证（候选域口径）</span>
         </h3>
         <div class="card table-wrap" style="margin-bottom:10px">
           <table>
@@ -1045,14 +1048,21 @@ onMounted(loadAll)
               <input v-model.number="recallHorizon" type="number" min="1" max="120" style="width:64px" />
               个交易日
             </label>
+            <label class="hint">
+              入选窗口
+              <input v-model.number="recallWindow" type="number" min="1" max="120" style="width:64px" />
+              个交易 bar
+            </label>
             <button class="btn btn-sm btn-primary" :disabled="computingRecall" @click="computeRecall">
               {{ computingRecall ? '计算中…' : '计算召回' }}
             </button>
           </div>
           <p class="hint">
-            口径：同一 as_of 取「公式在全市场入选集合」与「公式在池内入选集合」，
+            口径：同一期取「公式在全市场入选集合」与「公式在池内入选集合」，
             召回率 = 池内入选 / 全市场入选；漏票为公式选中但落在池外的票，
-            成因按「排名截断 / 闸门 / 未进候选」分类计数。
+            成因按「排名截断 / 闸门 / 未进候选」分类计数。择时 OPEN 是稀疏脉冲
+            （实测单票每年 1-3 次），故「入选」指 as_of 前最近 N 个交易 bar 内触发，
+            窗口填 1 为严格单日口径。
           </p>
           <template v-if="recallResult">
             <div class="form-row" style="gap:16px;margin-bottom:8px">
