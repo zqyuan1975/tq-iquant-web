@@ -339,6 +339,21 @@ def test_place_order_refuses_without_captcha_ocr():
         d.place_order(order)
 
 
+def test_place_order_refuses_when_no_ocr_backend(monkeypatch):
+    """captcha_ocr 开启但 ddddocr 与 WinRT 都不可用 → 仍 fail-closed 拒单。"""
+    order = SimpleNamespace(
+        stock_code="000001.SZ", quantity=100, price=Decimal("10.00"),
+        trade_type=TradeType.BUY,
+    )
+    d = ThsUiDispatcher(captcha_ocr=True, execute_mode="direct")
+    d._connected = True
+    monkeypatch.setattr(
+        "core.engine.ths_ui_dispatcher._get_ddddocr", lambda: None)
+    monkeypatch.setattr(d, "_get_ocr_engine", lambda: None)
+    with pytest.raises(BridgeUnavailableError):
+        d.place_order(order)
+
+
 # ---------------- file_builtin 双模式 ----------------
 
 def test_file_mode_place_order_enqueues_and_returns_none_without_ui(tmp_path, monkeypatch):

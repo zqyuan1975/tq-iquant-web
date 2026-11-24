@@ -126,6 +126,72 @@ def test_solve_captcha_retry_retypes_code(monkeypatch):
     assert edit.keys == ["^a{DELETE}", "1", "2", "3", "4"] * 2
 
 
+# ---- OCR 可用性守卫：ddddocr 或 WinRT 任一可用即放行，两者皆无则拒单 ----
+
+def _mk_direct_dispatcher():
+    return ThsUiDispatcher(captcha_ocr=True, execute_mode="direct")
+
+
+def test_ocr_ready_true_with_only_ddddocr(monkeypatch):
+    """仅 ddddocr 可用（WinRT 未就绪）→ 放行，不得因 WinRT 缺失误拒。"""
+    d = _mk_direct_dispatcher()
+    monkeypatch.setattr(
+        "core.engine.ths_ui_dispatcher._get_ddddocr", lambda: object())
+    monkeypatch.setattr(d, "_get_ocr_engine", lambda: None)
+    assert d._ocr_ready() is True
+
+
+def test_ocr_ready_true_with_only_winrt(monkeypatch):
+    """仅 WinRT 可用（ddddocr 不可用）→ 放行，WinOCR 兜底路径仍成立。"""
+    d = _mk_direct_dispatcher()
+    monkeypatch.setattr(
+        "core.engine.ths_ui_dispatcher._get_ddddocr", lambda: None)
+    monkeypatch.setattr(d, "_get_ocr_engine", lambda: object())
+    assert d._ocr_ready() is True
+
+
+def test_ocr_ready_false_when_both_unavailable(monkeypatch):
+    """两者都不可用 → 不放行（fail-closed）。"""
+    d = _mk_direct_dispatcher()
+    monkeypatch.setattr(
+        "core.engine.ths_ui_dispatcher._get_ddddocr", lambda: None)
+    monkeypatch.setattr(d, "_get_ocr_engine", lambda: None)
+    assert d._ocr_ready() is False
+
+
+def test_solve_captcha_allows_ddddocr_only(monkeypatch):
+    """仅 ddddocr 可用时验证码流程照常走完（识别顺序不变，仍用 _ocr_digits）。"""
+    d, edit, dlg, ok_btn = _mk_captcha_env(monkeypatch)
+    monkeypatch.setattr(
+        "core.engine.ths_ui_dispatcher._get_ddddocr", lambda: object())
+    monkeypatch.setattr(d, "_get_ocr_engine", lambda: None)
+    state = {"n": 0}
+
+    def _find():
+        state["n"] += 1
+        return dlg if state["n"] == 1 else None
+    monkeypatch.setattr(d, "_find_captcha_dialog", _find)
+    assert d._solve_captcha(dlg) is True
+    assert edit.keys == ["^a{DELETE}", "1", "2", "3", "4"]
+
+
+def test_solve_captcha_rejects_when_no_ocr_backend(monkeypatch):
+    """两者都不可用 → 关弹窗并返回 False（拒单，不进入识别/键入）。"""
+    d = _mk_direct_dispatcher()
+    monkeypatch.setattr(
+        "core.engine.ths_ui_dispatcher._get_ddddocr", lambda: None)
+    monkeypatch.setattr(d, "_get_ocr_engine", lambda: None)
+    # ImageGrab 可用，确保守卫走到 OCR 可用性判断而非前置分支
+    monkeypatch.setattr(
+        "core.engine.ths_ui_dispatcher.ImageGrab",
+        SimpleNamespace(grab=lambda bbox=None: None))
+    dismissed = []
+    monkeypatch.setattr(d, "_dismiss_captcha", lambda dlg: dismissed.append(dlg))
+    assert d._solve_captcha(object()) is False
+    assert dismissed
+    assert "OCR" in d._last_error
+
+
 # ---- TDX「下单确认」弹窗自动点击（无人值守）----
 
 def test_tdx_pick_confirm_dialog_selects_new_dialog(monkeypatch):

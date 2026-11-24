@@ -959,8 +959,8 @@ class ThsUiDispatcher(OrderDispatcher):
         if not self._captcha_ocr:
             self._last_error = "验证码 OCR 未启用，无法复制同花顺表格"
             return ""
-        if self._get_ocr_engine() is None:
-            self._last_error = "验证码 OCR 不可用（Windows OCR 未就绪）"
+        if not self._ocr_ready():
+            self._last_error = "验证码 OCR 不可用（ddddocr 与 Windows OCR 均未就绪）"
             return ""
         for _ in range(3):
             try:
@@ -1102,12 +1102,20 @@ class ThsUiDispatcher(OrderDispatcher):
         except Exception:
             return False
 
+    def _ocr_ready(self) -> bool:
+        """验证码 OCR 是否有可用路径：ddddocr 或 Windows/WinRT 任一就绪即放行。
+
+        识别顺序仍是 ddddocr 优先、WinOCR 兜底（见 `_ocr_digits`）；本守卫只判断
+        “能否识别验证码”，两者都不可用时才 fail-closed 拒单。
+        """
+        return _get_ddddocr() is not None or self._get_ocr_engine() is not None
+
     def _solve_captcha(self, dlg) -> bool:
         if ImageGrab is None or not self._captcha_ocr:
             self._dismiss_captcha(dlg)
             return False
-        if self._get_ocr_engine() is None:
-            self._last_error = "验证码 OCR 不可用（Windows OCR 未就绪）"
+        if not self._ocr_ready():
+            self._last_error = "验证码 OCR 不可用（ddddocr 与 Windows OCR 均未就绪）"
             self._dismiss_captcha(dlg)
             return False
         try:
@@ -2542,7 +2550,7 @@ class ThsUiDispatcher(OrderDispatcher):
             # OCR 未启用时宁可拒单，也不能先发单再因查不到而误报失败。
             raise BridgeUnavailableError(
                 "ths ui captcha_ocr disabled: cannot verify order after submit")
-        if self._get_ocr_engine() is None:
+        if not self._ocr_ready():
             raise BridgeUnavailableError(
                 "ths ui OCR unavailable: cannot verify order after submit")
         if not self._gui_guard():
