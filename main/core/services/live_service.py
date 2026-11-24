@@ -104,6 +104,239 @@ logger = logging.getLogger(__name__)
 # 故放进程级 dict（单用户系统，无需分布式协调）。
 ENGINES: Dict[int, LiveEngine] = {}
 
+# 会话级内置分钟下载器：session_id -> MinuteDownloadService。
+# 会话启动成功即启动（开关 live.minute_download.enabled，默认 false），
+# 停止会话时弹出并停止；daemon 线程，进程退出不阻塞。
+MINUTE_DOWNLOADERS: Dict[int, object] = {}
+
+
+def minute_download_section() -> dict:
+    """读 ``live.minute_download`` 配置段（缺失/类型异常一律空 dict）。"""
+    try:
+        cfg = load_config()
+        live = cfg.get("live") if isinstance(cfg, dict) else {}
+        section = (live or {}).get("minute_download") if isinstance(live, dict) else {}
+    except Exception:  # pragma: no cover - 配置异常按关闭处理
+        return {}
+    return section if isinstance(section, dict) else {}
+
+
+def wrap_store_first_minute(dispatcher, live_cfg: Optional[dict] = None,
+                            pool_codes_provider=None):
+    """在行情 dispatcher 外再包一层「自有分钟存储优先读」（默认关）。
+
+    只做包装：落后 1 根/空/非 1m/异常时原样委托 inner，不改
+    ``NativeMinuteDispatcher`` 语义；构建失败返回原对象。
+
+    ``pool_codes_provider`` 仅用于覆盖缺口观测（返回下载池 6 位代码集合），
+    不参与取数决策。
+    """
+    section = ((live_cfg or {}).get("minute_download") or {})
+    try:
+        from core.services.minute_download import (
+            MinuteStore, StoreFirstMinuteDispatcher, store_first_enabled,
+        )
+    except Exception:  # pragma: no cover - 模块缺失时不影响会话
+        logger.exception("分钟下载模块导入失败，沿用原 dispatcher")
+        return dispatcher
+    if not store_first_enabled(section):
+        return dispatcher
+    try:
+        wrapped = StoreFirstMinuteDispatcher(
+            dispatcher,
+            MinuteStore(section.get("store_path") or None),
+            frontier_max_lag=int(section.get("frontier_max_lag", 1) or 1),
+            pool_codes_provider=pool_codes_provider,
+        )
+        logger.info(
+            "分钟数据优先读层已启用（store=%s，落后 %s 根即回落）",
+            section.get("store_path") or "data/minute_store.sqlite3",
+            wrapped.frontier_max_lag)
+        return wrapped
+    except Exception:
+        logger.exception("分钟优先读层构建失败，沿用原 dispatcher")
+        return dispatcher
+
+
+def _collect_position_codes(port, codes: set) -> None:
+    for ctx in list(getattr(port, "strategies", None) or []):
+        codes.update(list(getattr(ctx, "positions", {}) or {}))
+
+
+def session_minute_codes_provider(session_id: int, engine):
+    """每轮现取「组合股票池 ∪ 当前会话持仓」，供下载器刷新标的清单。
+
+    池走 DB（每轮新开 Session，避免跨线程复用请求级 Session）；持仓读引擎
+    内存（有 ``book_lock`` 时加锁，防遍历中变更）。
+    """
+    def _provider():
+        codes: set = set()
+        db = None
+        try:
+            db = SessionLocal()
+            links = (
+                db.query(LiveSessionPortfolio)
+                .filter(LiveSessionPortfolio.session_id == session_id)
+                .all()
+            )
+            for link in links:
+                codes.update(resolve_stock_codes(db, link.portfolio_strategy_id))
+        except Exception:
+            logger.warning(
+                "分钟下载：取会话股票池失败 (session %s)", session_id,
+                exc_info=True)
+        finally:
+            if db is not None:
+                try:
+                    db.close()
+                except Exception:
+                    pass
+        for port in list(getattr(engine, "portfolios", None) or []):
+            lock = getattr(port, "book_lock", None)
+            try:
+                if lock is None:
+                    _collect_position_codes(port, codes)
+                else:
+                    with lock:
+                        _collect_position_codes(port, codes)
+            except Exception:
+                logger.debug(
+                    "分钟下载：读会话持仓失败 (session %s)", session_id,
+                    exc_info=True)
+        return sorted(codes)
+
+    return _provider
+
+
+def maybe_start_minute_download(session_id: int, engine) -> None:
+    """会话启动成功时启动分钟下载 daemon（失败只告警，不阻断会话）。"""
+    section = minute_download_section()
+    try:
+        from core.services.minute_download import build_service, is_enabled
+    except Exception:  # pragma: no cover
+        logger.exception("分钟下载模块导入失败，不启动下载器")
+        return
+    if not is_enabled(section):
+        return
+    # 新会话启动：清空上一轮监督计数（不动仍在运行的旧服务引用）。
+    _MINUTE_SUPERVISION.pop(session_id, None)
+    existing = MINUTE_DOWNLOADERS.get(session_id)
+    if existing is not None and getattr(existing, "running", False):
+        return
+    try:
+        service = build_service(
+            codes_provider=session_minute_codes_provider(session_id, engine),
+            section=section,
+        )
+        if service.start():
+            MINUTE_DOWNLOADERS[session_id] = service
+            logger.info("内置分钟下载器已随会话启动 (session %s)", session_id)
+        else:
+            logger.warning("内置分钟下载器未能启动 (session %s)", session_id)
+    except Exception:
+        logger.exception(
+            "内置分钟下载器启动失败，不影响会话 (session %s)", session_id)
+
+
+def stop_minute_download(session_id: int, timeout: float = 0.5) -> None:
+    """停止并移除会话级下载器（幂等；join 超时短，避免阻塞 API 线程）。"""
+    service = MINUTE_DOWNLOADERS.pop(session_id, None)
+    _MINUTE_SUPERVISION.pop(session_id, None)
+    if service is None:
+        return
+    try:
+        service.stop(timeout=timeout)
+    except Exception:
+        logger.exception("内置分钟下载器停止失败 (session %s)", session_id)
+
+
+#: 下载线程监督：session_id -> {"attempts": [monotonic...], "gave_up": bool}。
+#: 会 tick 由引擎周期钩子调用 ``supervise_minute_download``；不新起独立线程。
+_MINUTE_SUPERVISION: Dict[int, dict] = {}
+_MINUTE_SUPERVISE_WINDOW_SECONDS = 600.0
+_MINUTE_SUPERVISE_MAX_ATTEMPTS = 3
+
+
+def supervise_minute_download(session_id: int) -> None:
+    """会话周期钩子：下载线程已死则重建（10 分钟最多 3 次，之后放弃并告警）。
+
+    只在 ``live.minute_download.enabled`` 已建服务时生效；重建失败只告警，
+    绝不阻断会话主循环。线程存活时不做事（卡死由 ``status().stalled`` 暴露）。
+    """
+    service = MINUTE_DOWNLOADERS.get(session_id)
+    if service is None:
+        return
+    try:
+        alive = bool(getattr(service, "running", False))
+    except Exception:  # noqa: BLE001 — 监督自身不得抛异常打断 tick
+        alive = False
+    if alive:
+        return
+    state = _MINUTE_SUPERVISION.setdefault(
+        session_id, {"attempts": [], "gave_up": False})
+    if state.get("gave_up"):
+        return
+    now = time.monotonic()
+    state["attempts"] = [t for t in state["attempts"]
+                         if now - t < _MINUTE_SUPERVISE_WINDOW_SECONDS]
+    if len(state["attempts"]) >= _MINUTE_SUPERVISE_MAX_ATTEMPTS:
+        state["gave_up"] = True
+        logger.warning(
+            "分钟下载线程 10 分钟内已重建 %d 次仍不可用，停止自动重建"
+            "（session %s，需人工排查）",
+            len(state["attempts"]), session_id)
+        return
+    state["attempts"].append(now)
+    try:
+        started = bool(service.start())
+    except Exception:  # noqa: BLE001 — 重建失败不阻断会话
+        logger.warning("分钟下载线程重建失败 (session %s)", session_id,
+                       exc_info=True)
+        return
+    if started:
+        logger.warning(
+            "分钟下载线程已退出，已重建 (session %s，10 分钟内第 %d 次)",
+            session_id, len(state["attempts"]))
+    else:
+        logger.warning("分钟下载线程重建未成功 (session %s)", session_id)
+
+
+def _minute_download_status(session_id: int) -> dict:
+    """下载器运行态（含线程监督状态）；未启用 → ``{"enabled": False}``。"""
+    service = MINUTE_DOWNLOADERS.get(session_id)
+    if service is None:
+        return {"enabled": False}
+    try:
+        data = dict(service.status())
+    except Exception:  # noqa: BLE001 — 观测字段异常不影响会话详情
+        return {"enabled": True, "error": "status unavailable"}
+    data["enabled"] = True
+    state = _MINUTE_SUPERVISION.get(session_id) or {}
+    data["supervision"] = {
+        "attempts_in_window": len(state.get("attempts") or []),
+        "gave_up": bool(state.get("gave_up")),
+        "window_seconds": int(_MINUTE_SUPERVISE_WINDOW_SECONDS),
+        "max_attempts": _MINUTE_SUPERVISE_MAX_ATTEMPTS,
+    }
+    return data
+
+
+def _minute_store_layers(engine) -> Optional[dict]:
+    """优先读层的覆盖缺口 + 实际生效层级计数（未启用优先读层 → None）。"""
+    try:
+        dispatcher = getattr(
+            getattr(engine, "_bar_poller", None), "_dispatcher", None)
+        cov = getattr(dispatcher, "coverage_status", None)
+        routes = getattr(dispatcher, "route_status", None)
+        if not callable(cov) and not callable(routes):
+            return None
+        return {
+            "coverage": cov() if callable(cov) else None,
+            "routes": routes() if callable(routes) else None,
+        }
+    except Exception:  # noqa: BLE001
+        return None
+
 
 # ---------------------------------------------------------------------------
 # 桥配置 / 股票池 / 引擎组装
@@ -1783,6 +2016,13 @@ def build_engine(
     # 原生分钟数据源健康态（开关 live.native_minute.enabled；None=未启用/构建失败
     # → 沿用快照合成）。引擎创建后挂 on_transition，回落/恢复写 risk 事件留痕。
     _native_minute_health = None
+    # 下载池标的提供者：仅给优先读层做覆盖缺口观测（不在池内的票走 inner/快照）。
+    # 下载器在 start_session 才建，这里按 session_id 延迟查注册表。
+    def _minute_pool_codes_provider():
+        service = MINUTE_DOWNLOADERS.get(session_id)
+        if service is None:
+            return None
+        return getattr(service, "pool_codes", None)
     try:
         from core.tq.data import TQData
         from core.engine.live.snapshot_bars import (
@@ -1828,6 +2068,11 @@ def build_engine(
                 except Exception:
                     logger.exception("原生分钟数据源构建失败，沿用快照合成")
                     _native_minute_health = None
+            # 自有分钟存储优先读（默认关）：包在 native/快照外层，未命中、
+            # 落后、非 1m、异常一律原样委托 inner，不改原生语义。
+            _poller_dispatcher = wrap_store_first_minute(
+                _poller_dispatcher, _live_cfg,
+                pool_codes_provider=_minute_pool_codes_provider)
             poller = BarPoller(
                 _poller_dispatcher, poll_codes,
                 period="1m", count=10,
@@ -1840,6 +2085,9 @@ def build_engine(
         # J5：行情降级链（默认关闭 → build_quote_fallback 原样返回 dispatcher）。
         # 仅包装 poller 的行情读取；dispatcher 本体仍用于下单/持仓/撤单。
         quote_dispatcher = build_quote_fallback(dispatcher, engine)
+        quote_dispatcher = wrap_store_first_minute(
+            quote_dispatcher, load_config().get("live") or {},
+            pool_codes_provider=_minute_pool_codes_provider)
         try:
             poller = BarPoller(
                 quote_dispatcher, poll_codes, period="1m", count=10)
@@ -2128,6 +2376,9 @@ def build_engine(
     if cal is not None and hasattr(cal, "on_degraded"):
         cal.on_degraded = lambda payload: eng._emit(
             "risk", dict(payload, session_id=session_id, engine=_engine_key))
+    # 下载线程监督：引擎每轮 tick 调用（不新起线程）。未启用下载器时函数内直接返回。
+    eng._minute_download_supervisor = (
+        lambda: supervise_minute_download(session_id))
     return eng
 
 
@@ -3039,6 +3290,14 @@ def get_session(db: Session, session_id: int, engine: Optional[LiveEngine] = Non
         # 原生分钟数据源（开关 live.native_minute.enabled）：最后前进时刻 /
         # 滞后秒数 / 是否已回落快照合成；未启用或未运行 {"enabled": False}。
         data["minute_source"] = _native_minute_status(engine)
+        # 内置 7709 分钟下载器运行态（alive/stalled/轮次/监督重建次数/下载池）。
+        data["minute_download"] = _minute_download_status(session_id)
+        # 优先读层：覆盖缺口（不在下载池、只能走原生/快照）+ 生效层级计数。
+        _layers = _minute_store_layers(engine)
+        data["minute_coverage"] = (_layers or {}).get("coverage") \
+            if _layers else None
+        data["minute_route"] = (_layers or {}).get("routes") \
+            if _layers else None
     else:
         data["engine_running"] = False
         data["bridge_online"] = None
@@ -3046,6 +3305,9 @@ def get_session(db: Session, session_id: int, engine: Optional[LiveEngine] = Non
         data["last_backfill_time"] = None
         data["reconcile_mismatches"] = []
         data["minute_source"] = {"enabled": False}
+        data["minute_download"] = _minute_download_status(session_id)
+        data["minute_coverage"] = None
+        data["minute_route"] = None
         data["signal_source"] = (
             {"enabled": False, "path": session.signal_file_path,
              "note": "会话未运行：信号链路状态需启动后可见"}
@@ -5629,6 +5891,8 @@ def start_session(
         logger.warning(
             "daily portfolio snapshot backfill on start failed (session %s)",
             session_id, exc_info=True)
+    # 内置分钟下载：会话启动成功后启动 daemon（开关默认关；失败只告警）。
+    maybe_start_minute_download(session_id, engine)
     return engine, session, None
 
 
@@ -5646,6 +5910,8 @@ def stop_session(
     if not session:
         return None
     engine = engines.pop(session_id, None)
+    # 内置分钟下载：会话停止即随之停止（daemon + 停止事件 + 短 join）。
+    stop_minute_download(session_id)
     # stopping 中间态（2026-11-16）：有引擎时先置 stopping（仍算占用，防「刚停就
     # 启另一会话」双开），等路由 asyncio 任务里 engine.stop() 收敛后再置 stopped；
     # 无引擎（已在停止/未运行）直接 stopped。只有 stopped 才释放 C1/C2 占用。

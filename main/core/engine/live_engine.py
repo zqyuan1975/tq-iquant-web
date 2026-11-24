@@ -2943,6 +2943,16 @@ class LiveEngine:
                 prof[name] = prof.get(name, 0) + int((time.monotonic() - t0) * 1000)
 
         try:
+            # 内置分钟下载线程监督：线程意外退出时在会话 tick 里重建（不新起线程）。
+            # 未接下载器的会话（该属性不存在）零开销；监督异常绝不影响主循环。
+            _minute_sup = getattr(self, "_minute_download_supervisor", None)
+            if _minute_sup is not None:
+                try:
+                    _seg("minute_supervise", _minute_sup)
+                except Exception:
+                    logger.warning(
+                        "minute download supervisor failed (session %s)",
+                        self.session_id, exc_info=True)
             if self.execution_mode == "alert":
                 _seg("alert", lambda: self._tick_alert(now))
                 return

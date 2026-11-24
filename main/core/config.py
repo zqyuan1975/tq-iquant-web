@@ -393,6 +393,33 @@ def _defaults() -> dict:
                 "enabled": False,
                 "stall_timeout_seconds": 180,
             },
+            # 内置分钟数据下载（2026-11-24，默认关闭）：通达信 7709 主站直连，
+            # 只下「会话组合 + 备选股池」的标的，落平台自有 SQLite（不写 vipdoc）。
+            # store_first 打开后作为实盘 1m 的优先读层包在 native/快照外层，
+            # 落后/空/非 1m/异常一律原样委托内层。两个开关都置 false 即完全回到
+            # 接入前行为。hosts 为空 → 用内置公开主站列表（可配置覆盖）。
+            "minute_download": {
+                "enabled": False,
+                "store_first": False,
+                "store_path": "data/minute_store.sqlite3",
+                "period": "1m",
+                "lookback_trading_days": 15,
+                "interval_seconds": 60,
+                "page_size": 800,
+                "max_req_per_second": 12.0,
+                "connections": 4,
+                # 拉取窗口（含两端）：窗口外不请求、不写库；结束 15:05 是为了
+                # 让收盘后那一轮落在 15:00 之后（当日覆盖才登记）。
+                "window_start": "09:15",
+                "window_end": "15:05",
+                "retry_times": 2,
+                "retry_backoff_seconds": 1.5,
+                "request_timeout_seconds": 5.0,
+                "frontier_max_lag": 1,
+                "failure_threshold": 3,
+                "isolation_seconds": 60.0,
+                "hosts": [],
+            },
             # F4（2026-11-18）：收盘后抽样交叉校验（默认关闭）。15:05 收盘清扫后
             # 抽样若干代码，比较两路日线收盘价，偏差超 max_dev_pct 记 risk 事件
             # （gate=data_cross_check）。只观测，不影响交易判定。
