@@ -350,6 +350,53 @@ def _frame_for(df: pl.DataFrame, period: str, as_of: date,
     return frame, closed_at, effective
 
 
+def _skip_reason(df: pl.DataFrame, period: str, as_of: date,
+                 now: datetime) -> str:
+    """``_frame_for`` 返回 None 时的原因，决定是否值得补跑。
+
+    - ``insufficient``：有行情但已闭合 bar < ``MIN_BARS``（次新股/新行业指数），
+      结构性缺口，补跑无用，只能等历史自然累积；
+    - ``no_data`` / ``no_rating``：行情缺失或公式无输出，可能是取数抖动，
+      计入可重试的 pending，由调度在下一个放行窗补跑。
+    """
+    if df is None or df.height == 0:
+        return "no_data"
+    df = _truncate_as_of(df, as_of)
+    kept, _, _ = _closed_bars(df, period, now)
+    if kept.height == 0:
+        return "no_data"
+    if kept.height < MIN_BARS:
+        return "insufficient"
+    return "no_rating"
+
+
+def _split_skips(codes: List[str], frames: Dict[str, pl.DataFrame],
+                 period: str, as_of: date,
+                 now: datetime) -> Tuple[List[str], List[str]]:
+    """按原因拆分跳过标的：可重试（pending） / 结构性缺口（补跑无用）。
+
+    - 整批 ``frames`` 为空 → 取数失败（TQ 抖动/闸拒），全部可重试；
+    - 批次有数据但该标的无序列 → 未上市/退市/代码变更，补跑也取不到；
+    - 有序列但已闭合 bar < ``MIN_BARS`` → 历史不足，等自然累积。
+    """
+    batch_failed = not frames
+    pending: List[str] = []
+    insufficient: List[str] = []
+    for code in codes:
+        if batch_failed:
+            pending.append(code)
+            continue
+        df = frames.get(code)
+        if df is None or df.height == 0:
+            insufficient.append(code)
+            continue
+        if _skip_reason(df, period, as_of, now) == "insufficient":
+            insufficient.append(code)
+        else:
+            pending.append(code)
+    return pending, insufficient
+
+
 def _snapshot_values(frame, period: str, as_of: date, now: datetime,
                      run_id: Optional[int], name: str) -> dict:
     last = frame.iloc[-1]
@@ -458,11 +505,16 @@ def compute_industries(db: Session, period: str, as_of: date,
         rows.append(vals)
     _upsert_industry_snapshots(db, rows)
     db.commit()
+    pending, insufficient = _split_skips(skipped, frames, period, as_of, now)
     return {
         "total": len(target),
         "ok": len(rows),
-        "skipped": len(skipped),
-        "skipped_codes": skipped[:20],
+        # skipped = 可重试（取数缺失/公式无输出），会触发放行窗补跑；
+        # insufficient = 历史不足 300 根，补跑无意义，单独计数不拉低状态
+        "skipped": len(pending),
+        "skipped_codes": pending[:20],
+        "insufficient": len(insufficient),
+        "insufficient_codes": insufficient[:20],
         "benchmark_bull_dur": bench_bull,
         "benchmark": None if bench is None else {
             "as_of": as_of.isoformat(),
@@ -531,7 +583,8 @@ def compute_stocks(db: Session, period: str, as_of: date,
     target = list(dict.fromkeys(industry_codes or []))
     t0 = time.monotonic()
     rows: List[dict] = []
-    skipped = 0
+    skipped: List[str] = []
+    all_frames: Dict[str, pl.DataFrame] = {}
     total = 0
 
     def _one_industry(code: str) -> List[dict]:
@@ -555,11 +608,12 @@ def compute_stocks(db: Session, period: str, as_of: date,
         codes = [m["stock_code"] for m in members]
         total += len(codes)
         frames = _fetch_many(codes, period, as_of)
+        all_frames.update(frames)
         ind_b = ind_bull.get(ind_code)
         for m in members:
             got = _frame_for(frames.get(m["stock_code"]), period, as_of, now)
             if not got:
-                skipped += 1
+                skipped.append(m["stock_code"])
                 continue
             frame, closed_at, effective = got
             last = frame.iloc[-1]
@@ -592,11 +646,16 @@ def compute_stocks(db: Session, period: str, as_of: date,
         rows = []
         db.commit()
     db.commit()
+    pending, insufficient = _split_skips(skipped, all_frames, period, as_of, now)
     return {
         "industries": len(by_industry),
         "total": total,
-        "ok": total - skipped,
-        "skipped": skipped,
+        "ok": total - len(skipped),
+        # 同 compute_industries：只有可重试缺口算 skipped
+        "skipped": len(pending),
+        "skipped_codes": pending[:20],
+        "insufficient": len(insufficient),
+        "insufficient_codes": insufficient[:20],
         "duration_sec": round(time.monotonic() - t0, 1),
     }
 
@@ -680,11 +739,14 @@ def execute_run(run_id: int, period: str, scope: str,
         if status == "ok":
             ind = stats.get("industries") or {}
             stk = stats.get("stocks") or {}
-            if (ind.get("skipped") or 0) > 0 or (stk.get("skipped") or 0) > 0:
+            # 只有「可重试」缺口才算 partial；历史不足 300 根属结构性缺口，
+            # 补跑也不会变，单独记在 stats.insufficient，不拉低状态、不触发补跑。
+            pending = int(ind.get("skipped") or 0) + int(stk.get("skipped") or 0)
+            if pending > 0:
                 status = "partial"
             run.total = int(ind.get("total") or 0) + int(stk.get("total") or 0)
             run.ok = int(ind.get("ok") or 0) + int(stk.get("ok") or 0)
-            run.skipped = int(ind.get("skipped") or 0) + int(stk.get("skipped") or 0)
+            run.skipped = pending
         run.status = status
         run.as_of = target_day
         run.finished_at = datetime.now()

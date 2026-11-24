@@ -270,6 +270,14 @@ class BoardAutoRefreshScheduler:
                 result = None
             if result is not None:
                 results.append(result)
+        # 手动/CLI 触发的 partial 不在定时轨的时点内，单独补跑一次
+        try:
+            retry = self._maybe_retry_pending(cfg, now)
+        except Exception:  # noqa: BLE001 — 补跑异常不得终止调度
+            logger.exception("投资看板自动刷新：pending 补跑异常")
+            retry = None
+        if retry is not None:
+            results.append(retry)
         return results
 
     def _run_track(self, track: dict, cfg: dict,
@@ -353,6 +361,88 @@ class BoardAutoRefreshScheduler:
                 logger.warning(
                     "投资看板自动刷新部分失败：trigger=%s skipped=%s（将在放行窗补跑一次）",
                     trigger, skipped)
+
+    def _maybe_retry_pending(self, cfg: dict, now: datetime) -> Optional[dict]:
+        """手动/CLI 刷新留下可重试缺口时，在下一个放行窗补跑一次。
+
+        定时轨的补跑由 ``_run_track`` 负责（trigger=``auto:HHMMr``）；这里只处理
+        非 auto 触发（trigger=``manual``/``cli``）的 partial。补跑 trigger 加 ``r``
+        后缀，因此「一次 run 最多补一次」对重启同样生效。
+        """
+        if not cfg["retry_partial"]:
+            return None
+        for period in dict.fromkeys(t["period"] for t in cfg["tracks"]):
+            latest = self._latest_run_today(now.date(), period)
+            if latest is None or latest["status"] != "partial":
+                continue
+            trigger = str(latest["trigger"] or "")
+            # 自动轨已由 _run_track 处理；已带 r 说明补跑过，不再叠加
+            if trigger.startswith("auto:") or trigger.endswith("r"):
+                continue
+            if int(latest["skipped"] or 0) <= 0:
+                continue
+            last_at = latest["finished_at"] or latest["started_at"]
+            if last_at is not None:
+                waited = (now - last_at).total_seconds() / 60.0
+                if waited < cfg["retry_cooldown_minutes"]:
+                    continue
+            policy = self._policy_fn() or {}
+            if not policy.get("p2_allowed"):
+                key = (now.date(), trigger + "r")
+                if key not in self._blocked_noted:
+                    self._blocked_noted.add(key)
+                    logger.info(
+                        "投资看板自动刷新：%s 有可重试缺口，遇 TQ 闸（%s），"
+                        "等待放行后补跑", trigger, policy.get("window"))
+                continue
+            if not svc.REFRESH_LOCK.acquire(blocking=False):
+                logger.info("投资看板自动刷新：补跑时已有刷新任务运行，稍后重试")
+                return None
+            retry_trigger = trigger + "r"
+            try:
+                logger.info("投资看板自动刷新补跑开始：trigger=%s period=%s scope=%s",
+                            retry_trigger, period, latest["scope"])
+                result = self._run_fn(retry_trigger, period,
+                                      latest["scope"], None) or {}
+                status = str(result.get("status") or "unknown")
+                logger.info("投资看板自动刷新补跑完成：trigger=%s status=%s",
+                            retry_trigger, status)
+                self._report(retry_trigger, period, latest["scope"],
+                             status, result)
+                return result
+            finally:
+                svc.REFRESH_LOCK.release()
+        return None
+
+    def _latest_run_today(self, day: date, period: str) -> Optional[dict]:
+        """当天该周期最新一条 run（不限触发方式），供 pending 补跑判定。"""
+        factory = self._session_factory or _default_session_factory
+        db = factory()
+        try:
+            start = datetime.combine(day, dtime.min)
+            end = start + timedelta(days=1)
+            row = db.execute(
+                select(BoardRun.trigger, BoardRun.status, BoardRun.scope,
+                       BoardRun.skipped, BoardRun.started_at,
+                       BoardRun.finished_at)
+                .where(BoardRun.period == period,
+                       BoardRun.started_at >= start,
+                       BoardRun.started_at < end)
+                .order_by(BoardRun.id.desc()).limit(1)
+            ).first()
+            if row is None:
+                return None
+            return {"trigger": row[0], "status": row[1], "scope": row[2],
+                    "skipped": row[3], "started_at": row[4],
+                    "finished_at": row[5]}
+        except Exception:  # noqa: BLE001 — 读失败按无缺口处理
+            logger.exception("投资看板自动刷新：读取最新 run 失败")
+            return None
+        finally:
+            try:
+                db.close()
+            except Exception:  # noqa: BLE001
+                pass
 
     def _runs_today(self, day: date, period: str, base_trigger: str) -> List[dict]:
         """当天该时点（含补跑）的 run 记录，按开始时间升序。"""

@@ -2,7 +2,7 @@
 // 投资看板（只读）：市场多空状态（整体迁移自备选股池）+ 128 个 881 二级行业
 // 相对大盘的多头先后 + 行业成分股相对行业指数的领先 + 日线/30m 双视图。
 // 不接下单、不进 market_gate、不改变任何策略与风控行为。
-import { computed, onMounted, ref } from 'vue'
+import { computed, onMounted, onUnmounted, ref } from 'vue'
 import PageHeader from '../components/PageHeader.vue'
 import MarketGatePanel from '../components/board/MarketGatePanel.vue'
 import {
@@ -76,6 +76,8 @@ function runTime(t: string | null): string {
 function triggerLabel(t: string | null): string {
   if (!t) return '未知来源'
   if (t === 'manual') return '手动'
+  if (t === 'manualr') return '手动（补跑）'
+  if (t === 'clir') return 'CLI（补跑）'
   if (t === 'lazy') return '按需'
   // auto:0905 / auto:0905r（r = 截断后的自动补跑）
   if (t.startsWith('auto:')) {
@@ -103,9 +105,50 @@ const lastBarAt = computed(() => {
 const RUN_STATUS_LABELS: Record<string, string> = {
   ok: '成功', partial: '部分成功', failed: '失败', running: '刷新中',
 }
-
 function runStatusLabel(s: string): string {
   return RUN_STATUS_LABELS[s] || s
+}
+
+// 历史不足 300 根（次新股/新行业）属结构性缺口，不参与补跑、单独提示
+const notComputed = computed(() => {
+  const s: any = latestRun.value?.stats
+  if (!s) return 0
+  return Number(s.industries?.insufficient || 0) + Number(s.stocks?.insufficient || 0)
+})
+
+// partial/running 时轮询 summary：补跑成功后提示与状态自动消失，无需手动刷新
+let summaryTimer: ReturnType<typeof setInterval> | null = null
+let summaryTicks = 0
+
+function stopSummaryPolling() {
+  if (summaryTimer) {
+    clearInterval(summaryTimer)
+    summaryTimer = null
+  }
+  summaryTicks = 0
+}
+
+function syncSummaryPolling() {
+  const st = latestRun.value?.status
+  if (st !== 'partial' && st !== 'running') {
+    stopSummaryPolling()
+    return
+  }
+  if (summaryTimer) return
+  summaryTicks = 0
+  summaryTimer = setInterval(async () => {
+    summaryTicks += 1
+    const s = await getBoardSummary({ period: period.value }).catch(() => null)
+    if (s?.latest_run) latestRun.value = s.latest_run
+    const cur = latestRun.value?.status
+    if (cur !== 'partial' && cur !== 'running') {
+      stopSummaryPolling()
+      if (cur === 'ok') loadAll()
+      return
+    }
+    // 最多观察 30 分钟：仍有可重试缺口说明需人工排查，停止轮询避免常驻请求
+    if (summaryTicks >= 30) stopSummaryPolling()
+  }, 60000)
 }
 
 function turnText(t: string | null): string {
@@ -146,6 +189,7 @@ async function loadAll() {
     levelCounts.value = summary?.level_counts || {}
     watchCounts.value = summary?.watch_counts || { overbought: 0, oversold: 0 }
     latestRun.value = summary?.latest_run || null
+    syncSummaryPolling()
   } catch (e) {
     const paused = gatePauseText(e)
     if (paused) gatePausedMsg.value = paused
@@ -259,6 +303,7 @@ function sortMark(key: string): string {
 }
 
 onMounted(loadAll)
+onUnmounted(stopSummaryPolling)
 </script>
 
 <template>
@@ -287,6 +332,10 @@ onMounted(loadAll)
     </span>
     <span v-if="latestRun.status === 'partial'" class="run-partial">
       （跳过 {{ latestRun.skipped }} 项，将在放行窗补跑）
+    </span>
+    <span v-if="notComputed > 0" class="muted"
+          title="已闭合日线不足 300 根（次新股/新上市行业），评级公式暂不输出方向；历史累积够后自动参与计算">
+      （另有 {{ notComputed }} 项数据不足，暂不计算）
     </span>
     <span v-if="latestRun.error" class="run-failed">：{{ latestRun.error }}</span>
     <span class="muted">· {{ autoHint }}</span>

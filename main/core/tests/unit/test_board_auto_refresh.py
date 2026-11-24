@@ -246,3 +246,87 @@ def test_manual_refresh_lock_skips_then_resumes(session_factory):
         svc.REFRESH_LOCK.release()
     sched.maybe_run()
     assert calls == [("auto:0905", "1d", "all", None)]
+
+
+# ---------------- 手动/CLI partial 的放行窗补跑 ----------------
+
+def _seed_run(Session, when, trigger, *, status="ok", skipped=0,
+              period="1d", scope="all"):
+    db = Session()
+    try:
+        run = svc.create_run(db, period, scope, trigger=trigger)
+        run.started_at = when
+        run.finished_at = when
+        run.status = status
+        run.skipped = skipped
+        db.commit()
+        return run.id
+    finally:
+        db.close()
+
+
+def _seed_tracks_done(Session):
+    """把两条定时轨当天时点都标成已成功，隔离出 pending 补跑逻辑。"""
+    _seed_run(Session, datetime(2026, 11, 24, 16, 0), "auto:1600", status="ok")
+    _seed_run(Session, datetime(2026, 11, 24, 16, 1), "auto:1600", period="30m",
+              scope="industries", status="ok")
+
+
+def test_manual_partial_retried_once_after_cooldown(session_factory):
+    """手动刷新留下可重试缺口 → 冷却后在放行窗自动补跑一次（trigger=manualr）。"""
+    calls, now = [], [datetime(2026, 11, 24, 19, 55)]
+    _seed_tracks_done(session_factory)
+    _seed_run(session_factory, datetime(2026, 11, 24, 19, 50), "manual",
+              status="partial", skipped=3)
+    sched = _make(session_factory, calls, now, cooldown=5)
+    sched.maybe_run()
+    assert _triggers(calls) == ["manualr"]
+    assert calls[0][1:] == ("1d", "all", None)
+
+    # 补跑成功（默认 status=ok）→ 不再补第二次
+    now[0] = datetime(2026, 11, 24, 20, 30)
+    sched.maybe_run()
+    assert _triggers(calls) == ["manualr"]
+
+
+def test_manual_partial_waits_cooldown(session_factory):
+    calls, now = [], [datetime(2026, 11, 24, 19, 52)]
+    _seed_tracks_done(session_factory)
+    _seed_run(session_factory, datetime(2026, 11, 24, 19, 50), "manual",
+              status="partial", skipped=3)
+    _make(session_factory, calls, now, cooldown=5).maybe_run()
+    assert calls == []
+
+
+def test_manual_partial_waits_for_open_window(session_factory):
+    """闸未放行时每分钟轮询，等待下一个放行窗再补跑。"""
+    calls, now = [], [datetime(2026, 11, 24, 19, 55)]
+    _seed_tracks_done(session_factory)
+    _seed_run(session_factory, datetime(2026, 11, 24, 19, 50), "manual",
+              status="partial", skipped=3)
+    policy = {"p2_allowed": False, "window": "trading"}
+    sched = _make(session_factory, calls, now, policy=policy, cooldown=0)
+    sched.maybe_run()
+    assert calls == []
+
+    sched._policy_fn = lambda: {"p2_allowed": True, "window": "after_close"}
+    sched.maybe_run()
+    assert _triggers(calls) == ["manualr"]
+
+
+def test_manual_retry_not_repeated_when_retry_also_partial(session_factory):
+    calls, now = [], [datetime(2026, 11, 24, 20, 0)]
+    _seed_tracks_done(session_factory)
+    _seed_run(session_factory, datetime(2026, 11, 24, 19, 55), "manualr",
+              status="partial", skipped=2)
+    _make(session_factory, calls, now, cooldown=0).maybe_run()
+    assert calls == []
+
+
+def test_manual_ok_run_not_retried(session_factory):
+    calls, now = [], [datetime(2026, 11, 24, 20, 0)]
+    _seed_tracks_done(session_factory)
+    _seed_run(session_factory, datetime(2026, 11, 24, 19, 55), "manual",
+              status="ok", skipped=0)
+    _make(session_factory, calls, now, cooldown=0).maybe_run()
+    assert calls == []
