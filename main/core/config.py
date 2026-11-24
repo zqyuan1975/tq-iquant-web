@@ -242,6 +242,15 @@ def _defaults() -> dict:
             # 并在替换前自动备份当前库（备份失败即中止）。
             "restore_enabled": False,
         },
+        # 内置宽库构建（阶段二）：默认关闭，避免升级后自动跑长任务；
+        # enabled=true 后交易日 daily_at（默认 15:30）触发，P2 未放行按
+        # retry_slots 退避；run_id=wide-YYYYMMDD 跨重启判重。
+        "selection_wide_build": {
+            "enabled": False,
+            "daily_at": "15:30",
+            "retry_slots": ["15:45", "16:15", "16:45"],
+            "daily_start": "2023-12-01",
+        },
         # 告警外发（core/services/notify_service.py）：默认关闭，未配置时行为与
         # 接入前逐字一致（不建线程、不发请求）。只做「既有事件旁路再发一条」，
         # 不参与任何交易闸门、不改落库。发送在独立 daemon 线程内、超时 ≤5 秒，

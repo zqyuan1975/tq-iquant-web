@@ -16,7 +16,9 @@ from sqlalchemy.orm import Session
 from core.api.response import err, ok
 from core.db import get_db
 from core.models.selection import SelectionScheme
-from core.selection import field_dict, recall as recall_svc, wide_db, warehouse
+from core.selection import (engine, field_dict, recall as recall_svc,
+                            replay as replay_svc, wide_build, wide_db,
+                            warehouse)
 from core.selection.field_dict import UnregisteredField
 from core.services import selection_pool_service as pool_svc
 from core.services import selection_run_service as run_svc
@@ -78,22 +80,41 @@ class UnbindReq(BaseModel):
     bindings: List[dict] = []
 
 
+class WarehouseBuildReq(BaseModel):
+    """内置宽库构建：incremental 日常补缺，full 仅灾备且必须显式传参。"""
+    mode: str = "incremental"
+    as_of: Optional[date] = None
+    daily_start: Optional[date] = None
+
+
 def _bad(exc: Exception):
     return err(400, str(exc))
 
 
 @router.get("/meta")
-def selection_meta():
+def selection_meta(db: Session = Depends(get_db)):
     """字段字典与池枚举：前端筛选面板直接消费，避免硬编码。"""
+    from core.selection import sector_pools
+
     fields = [{
         "key": s.key, "source": s.source, "column": s.column, "unit": s.unit,
         "zero_is_missing": s.zero_is_missing, "pit_safe": s.pit_safe,
         "pools": list(s.pools), "note": s.note,
     } for s in field_dict.FIELD_REGISTRY.values()]
+    industry_pools = sector_pools.pools_payload()
+    membership: Dict[str, int] = {}
+    meta = engine.warehouse_meta(db)
+    if meta is not None:
+        try:
+            membership = sector_pools.membership_counts(db, meta.as_of)
+        except Exception:  # pragma: no cover - 空表/旧库兼容
+            membership = {}
     return ok({
         "field_set_version": field_dict.FIELD_SET_VERSION,
         "pools": list(svc.POOL_KEYS),
         "industry_prefix": svc.INDUSTRY_PREFIX,
+        "industry_pools": industry_pools,
+        "industry_membership": membership,
         "scorable_fields": sorted(field_dict.SCORABLE_FIELDS),
         "fields": fields,
     })
@@ -123,6 +144,39 @@ def warehouse_import(db: Session = Depends(get_db)):
         db.rollback()
         return err(500, "导入失败：%s" % exc)
     return ok(result)
+
+
+@router.post("/warehouse/build")
+def warehouse_build(req: WarehouseBuildReq):
+    """触发内置宽库构建（后台线程，不阻塞请求）。
+
+    ``full`` 是灾备模式，必须显式传 ``mode=full``；默认 ``incremental`` 只补缺口。
+    """
+    if req.mode not in ("incremental", "full"):
+        return err(400, "mode 只能是 incremental 或 full")
+    if not wide_build.try_acquire_build():
+        return ok({"status": "busy", "running": True,
+                   "run_id": wide_build.today_run_id()})
+    run_id = wide_build.today_run_id()
+
+    def _worker() -> None:
+        try:
+            wide_build.run_build(
+                mode=req.mode, run_id=run_id, as_of=req.as_of,
+                daily_start=req.daily_start, trigger="api")
+        finally:
+            wide_build.release_build()
+
+    threading.Thread(target=_worker, name="selection-wide-build",
+                     daemon=True).start()
+    return ok({"status": "started", "running": True, "run_id": run_id,
+               "mode": req.mode})
+
+
+@router.get("/warehouse/build/status")
+def warehouse_build_status(db: Session = Depends(get_db)):
+    """构建进度：阶段、批次完成度、as_of 与最近一次结果。"""
+    return ok(wide_build.build_status(db))
 
 
 @router.get("/wide-db/status")

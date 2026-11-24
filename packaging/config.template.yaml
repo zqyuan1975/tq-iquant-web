@@ -287,3 +287,11 @@ capital_pool:
   pairing_enabled: false
   loan_model_enabled: false
   cash_outlet_enabled: false
+selection_wide_build:
+  enabled: false
+  daily_at: '15:30'
+  retry_slots:
+  - '15:45'
+  - '16:15'
+  - '16:45'
+  daily_start: '2023-12-01'

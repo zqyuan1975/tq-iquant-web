@@ -40,6 +40,7 @@ from core.services.backup_service import BackupScheduler
 from core.services.corporate_action_sync import CorporateActionSyncScheduler
 from core.services.board_auto_refresh import BoardAutoRefreshScheduler
 from core.services.incremental_backtest import IncrementalBacktestScheduler
+from core.selection.wide_build import SelectionWideBuildScheduler
 from core.services.auto_shutdown import arm as arm_auto_shutdown
 from core import runtime
 
@@ -228,7 +229,23 @@ async def lifespan(app: FastAPI):
         except Exception:  # noqa: BLE001 — 调度失败不得阻断交易主服务
             logger.exception("投资看板自动刷新调度启动失败（主服务继续运行）")
             board_scheduler = None
+    # 选股内置宽库构建（daemon 线程）：交易日 15:30，P2 未放行则按配置退避；
+    # run_id=wide-YYYYMMDD 跨重启判重；开关见 config.selection_wide_build.enabled。
+    wide_build_scheduler = None
+    if os.environ.get("TQ_SELECTION_WIDE_BUILD_SCHEDULER_DISABLED") == "1":
+        logger.info("选股宽库构建调度已禁用"
+                    "（TQ_SELECTION_WIDE_BUILD_SCHEDULER_DISABLED=1）")
+    else:
+        try:
+            wide_build_scheduler = SelectionWideBuildScheduler()
+            wide_build_scheduler.start()
+            logger.info("选股宽库构建调度已启动（进程内，交易日 15:30）")
+        except Exception:  # noqa: BLE001 — 调度失败不得阻断交易主服务
+            logger.exception("选股宽库构建调度启动失败（主服务继续运行）")
+            wide_build_scheduler = None
     yield
+    if wide_build_scheduler is not None:
+        wide_build_scheduler.stop()
     if board_scheduler is not None:
         board_scheduler.stop()
     if ca_sync_scheduler is not None:
