@@ -42,6 +42,7 @@ def build_service(
     section: Optional[dict] = None,
     clock=None,
     request_fn=None,
+    on_event: Optional[Callable[[dict], None]] = None,
 ) -> MinuteDownloadService:
     """按配置段组装下载器（不启动）。"""
     section = section if isinstance(section, dict) else {}
@@ -55,6 +56,7 @@ def build_service(
     return MinuteDownloadService(
         store=store, config=cfg, host_pool=pool,
         codes_provider=codes_provider, request_fn=request_fn, clock=clock,
+        on_event=on_event,
     )
 
 

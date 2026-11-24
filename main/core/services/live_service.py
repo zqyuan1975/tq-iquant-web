@@ -224,9 +224,18 @@ def maybe_start_minute_download(session_id: int, engine) -> None:
     if existing is not None and getattr(existing, "running", False):
         return
     try:
+        def _emit_download_event(payload: dict) -> None:
+            try:
+                engine._emit("risk", dict(
+                    payload, session_id=session_id,
+                    engine=getattr(engine, "_engine_key", None)))
+            except Exception:  # noqa: BLE001 — 告警投递失败不影响下载
+                logger.debug("分钟下载告警投递失败", exc_info=True)
+
         service = build_service(
             codes_provider=session_minute_codes_provider(session_id, engine),
             section=section,
+            on_event=_emit_download_event,
         )
         if service.start():
             MINUTE_DOWNLOADERS[session_id] = service
@@ -319,6 +328,18 @@ def _minute_download_status(session_id: int) -> dict:
         "max_attempts": _MINUTE_SUPERVISE_MAX_ATTEMPTS,
     }
     return data
+
+
+def _minute_fallback_status(engine) -> dict:
+    """保护窗分钟合成兜底的只读状态；未启用 → ``{"enabled": False}``。"""
+    guard = (getattr(engine, "_minute_snapshot_fallback", None)
+             if engine is not None else None)
+    if guard is None or not hasattr(guard, "status"):
+        return {"enabled": False}
+    try:
+        return guard.status()
+    except Exception:  # noqa: BLE001 — 观测字段异常不影响会话详情
+        return {"enabled": True, "error": "status unavailable"}
 
 
 def _minute_store_layers(engine) -> Optional[dict]:
@@ -2013,6 +2034,9 @@ def build_engine(
     # 轮询（盘中 1m 退化，行为同旧版）。
     snapshot_synth = None
     poller = None
+    # 保护窗分钟合成兜底守卫（P3 只读、窄触发、独立限频）；构建失败为 None，
+    # 行为退回今天的「保护窗内快照取数被闸拒绝」。
+    _snapshot_fallback = None
     # 原生分钟数据源健康态（开关 live.native_minute.enabled；None=未启用/构建失败
     # → 沿用快照合成）。引擎创建后挂 on_transition，回落/恢复写 risk 事件留痕。
     _native_minute_health = None
@@ -2034,19 +2058,43 @@ def build_engine(
             d for d in (_TdxDisp, _ThsDisp, AlertDataDispatcher)
             if d is not None
         )
+        _live_cfg = load_config().get("live") or {}
+        _md_cfg = (_live_cfg.get("minute_download") or {})
+        # 守卫的状态提供者必须延迟解析：此时 native / store_first 尚未构建完。
+        _snapshot_state = {"store": None, "native": None}
+
+        def _fetch_snapshot(codes, priority=None, timeout=None):
+            return TQData().get_market_snapshot_batch(
+                list(codes), [], priority=priority, timeout=timeout)
+
+        from core.services.minute_download.snapshot_fallback import (
+            SnapshotFallbackGuard,
+        )
+        _snapshot_fallback = SnapshotFallbackGuard(
+            fetch_normal=lambda codes: _fetch_snapshot(codes),
+            fetch_fallback=lambda codes: _fetch_snapshot(
+                codes, priority="P3",
+                timeout=float(
+                    _md_cfg.get("fallback_lock_timeout_seconds", 0.5) or 0.5)),
+            store_state=lambda: (
+                _snapshot_state["store"].store_state()
+                if _snapshot_state["store"] is not None else None),
+            native_state=lambda: (
+                _snapshot_state["native"].status()
+                if _snapshot_state["native"] is not None else None),
+            config=_md_cfg,
+        )
         # goldminer 引擎：交易走掘金桥，**行情走通达信快照合成**（行情与交易
         # 分离——gm history_n 单只 ~13s 云端往返，120 只全池轮询会饿死主循环）
         _goldminer_quotes = engine == "goldminer"
         if _goldminer_quotes or isinstance(dispatcher, _tq_quote_types):
             snapshot_synth = SnapshotBarSynthesizer(
                 poll_codes,
-                fetch_snapshot=lambda codes: TQData().get_market_snapshot_batch(
-                    list(codes), []),
+                fetch_snapshot=_snapshot_fallback,
             )
             _poller_dispatcher = SnapshotQuoteDispatcher(snapshot_synth)
             # 可选开关（默认关）：1m/5m 读原生 .lc1/.lc5，停滞自动回落上面的
             # 快照合成。开关打开但构建失败 → 记异常并保持快照合成（默认路径）。
-            _live_cfg = load_config().get("live") or {}
             _native_cfg = _live_cfg.get("native_minute") or {}
             if bool(_native_cfg.get("enabled", False)):
                 try:
@@ -2068,11 +2116,16 @@ def build_engine(
                 except Exception:
                     logger.exception("原生分钟数据源构建失败，沿用快照合成")
                     _native_minute_health = None
+            _snapshot_state["native"] = _native_minute_health
             # 自有分钟存储优先读（默认关）：包在 native/快照外层，未命中、
             # 落后、非 1m、异常一律原样委托 inner，不改原生语义。
             _poller_dispatcher = wrap_store_first_minute(
                 _poller_dispatcher, _live_cfg,
                 pool_codes_provider=_minute_pool_codes_provider)
+            # 仅当优先读层确实启用时才提供库状态；否则保持 None（不触发兜底）。
+            _snapshot_state["store"] = (
+                _poller_dispatcher
+                if hasattr(_poller_dispatcher, "store_state") else None)
             poller = BarPoller(
                 _poller_dispatcher, poll_codes,
                 period="1m", count=10,
@@ -2366,6 +2419,12 @@ def build_engine(
     # 回调在此挂；开关关闭时为 None，零行为变化。
     if _native_minute_health is not None:
         _native_minute_health.on_transition = lambda payload: eng._emit(
+            "risk", dict(payload, session_id=session_id, engine=_engine_key))
+    # 保护窗分钟合成兜底：守卫挂到引擎上供会话详情读取；事件走 risk 流
+    # （不落库——该路径要求只读）。仅在快照合成确实启用时挂载。
+    if _snapshot_fallback is not None and snapshot_synth is not None:
+        eng._minute_snapshot_fallback = _snapshot_fallback
+        _snapshot_fallback.emit_event = lambda payload: eng._emit(
             "risk", dict(payload, session_id=session_id, engine=_engine_key))
     # 桥慢响应告警接引擎事件流（risk/bridge_slow，dispatcher 侧已按 endpoint
     # 冷却去重）；仅 HTTP 桥 dispatcher 有 on_slow 钩子，其它通道不受影响。
@@ -3291,7 +3350,10 @@ def get_session(db: Session, session_id: int, engine: Optional[LiveEngine] = Non
         # 滞后秒数 / 是否已回落快照合成；未启用或未运行 {"enabled": False}。
         data["minute_source"] = _native_minute_status(engine)
         # 内置 7709 分钟下载器运行态（alive/stalled/轮次/监督重建次数/下载池）。
-        data["minute_download"] = _minute_download_status(session_id)
+        # fallback 嵌在同一条里，前端 MinuteObservability 无需新增 props。
+        _md = _minute_download_status(session_id)
+        _md["fallback"] = _minute_fallback_status(engine)
+        data["minute_download"] = _md
         # 优先读层：覆盖缺口（不在下载池、只能走原生/快照）+ 生效层级计数。
         _layers = _minute_store_layers(engine)
         data["minute_coverage"] = (_layers or {}).get("coverage") \
@@ -3305,7 +3367,9 @@ def get_session(db: Session, session_id: int, engine: Optional[LiveEngine] = Non
         data["last_backfill_time"] = None
         data["reconcile_mismatches"] = []
         data["minute_source"] = {"enabled": False}
-        data["minute_download"] = _minute_download_status(session_id)
+        _md = _minute_download_status(session_id)
+        _md["fallback"] = _minute_fallback_status(engine)
+        data["minute_download"] = _md
         data["minute_coverage"] = None
         data["minute_route"] = None
         data["signal_source"] = (

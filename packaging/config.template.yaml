@@ -25,6 +25,8 @@ tq_gate:
   p0_only: ["14:55", "15:10"]
   p1_max_per_minute: 600
   p2_max_per_minute: 600
+  # P3 保护窗只读兜底配额（仅 14:55–14:57 分钟合成兜底使用）
+  p3_max_per_minute: 30
   p2_chunk_size: 60
   override_max_minutes: 120
 
@@ -156,9 +158,23 @@ live:
     lookback_trading_days: 15
     interval_seconds: 60
     page_size: 800
-    max_req_per_second: 12.0
-    # 并发连接数（1 = 旧的单线程顺序实现；4 = 每轮约 4 只票并行）
-    connections: 4
+    # 按池规模自适应（默认）：留空 connections / max_req_per_second 即由映射
+    # 决定（251→4/12、621→6/18、2000→8/24、5581→10/30）；显式填写=人工覆盖。
+    adaptive_enabled: true
+    connections_max: 12
+    max_req_per_second_max: 36.0
+    high_streak_threshold: 3
+    max_raise_tiers: 1
+    # 保护窗分钟合成只读兜底（P3）：仅 14:55–14:57 且库失败/落后/原生停滞时
+    # 触发；14:57 起收盘集合竞价明确不兜底。
+    protected_fallback_enabled: true
+    protected_fallback_window_start: "14:55"
+    protected_fallback_window_end: "14:57"
+    store_lag_threshold_minutes: 2
+    fallback_min_interval_seconds: 5
+    fallback_max_per_minute: 12
+    fallback_event_cooldown_seconds: 60
+    fallback_lock_timeout_seconds: 0.5
     # 拉取窗口（含两端）：窗口外不请求不写库；结束 15:05 是为了让收盘后那一轮
     # 落在 15:00 之后（当日覆盖登记依赖这一点，不要缩到 15:00 之前）
     window_start: "09:15"

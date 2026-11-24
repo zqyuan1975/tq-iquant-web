@@ -237,9 +237,16 @@ class TQData:
             df = get_tq().get_divid_factors(stock_code, start_time=start, end_time=end)
         return df if isinstance(df, pd.DataFrame) else pd.DataFrame()
 
-    def get_market_snapshot_batch(self, stocks: List[str], field_list: List[str]) -> dict:
-        """批量市场快照（备用透传，return_df=False 默认 dict）。"""
-        with get_tdx_lock():
+    def get_market_snapshot_batch(
+        self, stocks: List[str], field_list: List[str],
+        priority=None, timeout: Optional[float] = None,
+    ) -> dict:
+        """批量市场快照（备用透传，return_df=False 默认 dict）。
+
+        ``priority`` / ``timeout`` 供保护窗分钟合成兜底使用（P3 + 短超时）：
+        不传时行为与接入前逐字一致（默认 P1、默认 30s 超时）。
+        """
+        with get_tdx_lock(timeout=timeout, priority=priority):
             return get_tq().get_market_snapshot_batch(
                 stock_list=list(stocks), field_list=list(field_list)) or {}
 

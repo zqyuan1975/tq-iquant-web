@@ -22,7 +22,7 @@ from core.services import kline_coverage_ledger as ledger
 from core.services.minute_download import protocol
 from core.services.minute_download.downloader import (
     SOURCE, DownloadConfig, MinuteDownloadService, RateLimiter,
-    planned_missing_days,
+    planned_missing_days, sizing_for_pool, sizing_table,
 )
 from core.services.minute_download.hosts import HostPool, load_host_pool
 from core.services.minute_download.store import MinuteStore
@@ -355,8 +355,12 @@ def test_empty_codes_short_circuits(tmp_path):
 
 def test_config_connections_default_and_clamp():
     cfg = DownloadConfig.from_section({})
-    assert cfg.connections == 4
-    assert cfg.max_req_per_second == 12.0
+    # 默认不再写死 4/12：None 表示按池规模自适应；显式值才人工覆盖。
+    assert cfg.connections is None
+    assert cfg.max_req_per_second is None
+    assert cfg.adaptive_enabled is True
+    assert cfg.connections_max == 12
+    assert cfg.max_req_per_second_max == 36.0
     assert DownloadConfig.from_section({"connections": 0}).connections == 1
     assert DownloadConfig.from_section({"connections": 99}).connections == 16
     assert DownloadConfig.from_section(
@@ -740,6 +744,118 @@ def test_host_pool_isolation_and_latency_order():
     pool.report_success("a", 1, 50.0)
     pool.report_success("b", 2, 200.0)
     assert pool.candidates()[0] == ("a", 1)
+
+
+# ---------------------------------------------------------------------------
+# 按池规模自适应 + 利用率观测
+# ---------------------------------------------------------------------------
+
+def _adaptive_service(tmp_path, codes, now=None, **cfg):
+    config = DownloadConfig(**cfg)
+    return MinuteDownloadService(
+        store=MinuteStore(tmp_path / "minute.sqlite3"),
+        config=config,
+        host_pool=HostPool([("127.0.0.1", 7709)]),
+        codes_provider=lambda: list(codes),
+        ledger_db_path=tmp_path / "ledger.sqlite3",
+        request_fn=lambda *a: [],
+        clock=(lambda: now) if now else None,
+    )
+
+
+def test_sizing_for_pool_is_deterministic_and_clamped():
+    assert sizing_for_pool(251)["connections"] == 4
+    assert sizing_for_pool(251)["max_req_per_second"] == 12.0
+    assert sizing_for_pool(621)["connections"] == 6
+    assert sizing_for_pool(621)["max_req_per_second"] == 18.0
+    assert sizing_for_pool(2000)["connections"] == 8
+    assert sizing_for_pool(2000)["single_host_sustainable"] is False
+    assert sizing_for_pool(5581)["connections"] == 10
+    assert sizing_for_pool(5581)["max_req_per_second"] == 30.0
+    assert sizing_for_pool(5581)["single_host_sustainable"] is False
+    # 上下限夹取：小池不浪费连接，大池不顶格。
+    assert sizing_for_pool(10)["connections"] == 2
+    assert sizing_for_pool(99999)["connections"] == 12
+    assert sizing_for_pool(5581, connections_max=6)["connections"] == 6
+    assert sizing_for_pool(5581, max_req_per_second_max=20)[
+        "max_req_per_second"] == 20.0
+    # 抬档仍受上限约束。
+    assert sizing_for_pool(251, tier_bonus=9)["tier_index"] == len(
+        sizing_table()) - 1
+    table = sizing_table()
+    assert [r["tier"] for r in table] == [
+        "≤150", "151–400", "401–800", "801–2000", "2001–6000", ">6000"]
+
+
+def test_adaptive_applies_mapping_then_raises_once(tmp_path):
+    codes = [f"6{i:05d}" for i in range(251)]
+    now = datetime(2026, 11, 20, 10, 10)
+    svc = _adaptive_service(
+        tmp_path, codes, now=now, adaptive_enabled=True,
+        high_streak_threshold=3, max_raise_tiers=1, interval_seconds=60)
+    svc._codes = list(codes)
+    svc._apply_adaptive(251)
+    assert svc._effective_connections == 4
+    assert svc._effective_rps == 12.0
+
+    # 连续 3 轮 actual_rps 顶格（12/12）→ 告警一次并抬一档到 6/18。
+    for _ in range(3):
+        svc._observe_utilization({"requests": 12}, 1.0, "active")
+    util = svc.status()["utilization"]
+    assert util["alerts"] == 1
+    assert util["auto_raised_tiers"] == 1
+    assert util["raise_exhausted"] is False
+    assert svc._effective_connections == 6
+    assert svc._effective_rps == 18.0
+
+    # 再连续 3 轮顶格：已到抬档上限 → 只告警。
+    for _ in range(3):
+        svc._observe_utilization({"requests": 18}, 1.0, "active")
+    util = svc.status()["utilization"]
+    assert util["alerts"] == 2
+    assert util["raise_exhausted"] is True
+    assert svc._effective_connections == 6
+    assert svc._effective_rps == 18.0
+
+
+def test_explicit_config_disables_adaptive_raise(tmp_path):
+    codes = [f"6{i:05d}" for i in range(251)]
+    svc = _adaptive_service(
+        tmp_path, codes, now=datetime(2026, 11, 20, 10, 10),
+        adaptive_enabled=True, connections=4, max_req_per_second=12.0,
+        high_streak_threshold=3, max_raise_tiers=1)
+    svc._codes = list(codes)
+    svc._apply_adaptive(251)
+    assert svc._effective_connections == 4
+    assert svc._effective_rps == 12.0
+    for _ in range(3):
+        svc._observe_utilization({"requests": 12}, 1.0, "active")
+    util = svc.status()["utilization"]
+    assert util["explicit_override"] is True
+    assert util["auto_raised_tiers"] == 0
+    assert svc._effective_rps == 12.0
+
+
+def test_status_exposes_utilization_and_sizing(tmp_path):
+    today = date(2026, 11, 20)
+    now = datetime(2026, 11, 20, 10, 10)
+
+    def req(host, port, market, code, start, count):
+        return [_rec(today, 9, 31), _rec(today, 9, 32)]
+
+    codes = [f"6{i:05d}" for i in range(251)]
+    svc = _service(tmp_path, req, codes=codes, now=now, connections=2)
+    svc.run_once()
+    st = svc.status()
+    assert st["sizing"]["pool_size"] == 251
+    assert st["sizing"]["tier"] == "151–400"
+    assert len(st["sizing"]["table"]) == 6
+    assert st["utilization"]["rps_cap"] == 0.0   # 用例显式不限频
+    assert st["utilization"]["actual_rps"] is not None
+    assert st["utilization"]["round_seconds"] is not None
+    assert st["utilization"]["elapsed_ratio"] is not None
+    assert st["config"]["connections"] == 2
+    assert st["config"]["max_req_per_second"] == 0.0
 
 
 def test_load_host_pool_config_override(monkeypatch):

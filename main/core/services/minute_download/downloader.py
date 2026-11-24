@@ -59,9 +59,19 @@ class DownloadConfig:
     interval_seconds: float = 60.0
     page_size: int = MAX_PAGE
     #: 全局请求速率（不是每连接），所有连接共用同一个限频器。
-    max_req_per_second: float = 12.0
-    #: 并发连接数；1 = 与旧的单线程顺序实现完全一致。
-    connections: int = 4
+    #: ``None`` = 按池规模自适应；显式值 = 人工覆盖（0 仍表示不限频）。
+    max_req_per_second: Optional[float] = None
+    #: 并发连接数；`None` = 按池规模自适应；1 = 单线程顺序。
+    connections: Optional[int] = None
+    #: 按池规模自适应开关；关闭时退回「显式值或保守默认 4/12」。
+    adaptive_enabled: bool = True
+    #: 自适应上下限夹取（防止映射把连接/限频推出可接受范围）。
+    connections_max: int = 12
+    max_req_per_second_max: float = 36.0
+    #: 利用率观测与自动抬档：连续 N 轮顶格/超时 → 告警一次并抬一档。
+    high_streak_threshold: int = 3
+    high_watermark: float = 0.9
+    max_raise_tiers: int = 1
     retry_times: int = 2
     retry_backoff_seconds: float = 1.5
     request_timeout_seconds: float = 5.0
@@ -82,8 +92,18 @@ class DownloadConfig:
             interval_seconds=_float(section.get("interval_seconds"), 60.0),
             page_size=min(max(_int(section.get("page_size"), MAX_PAGE), 1),
                           MAX_PAGE),
-            max_req_per_second=_float(section.get("max_req_per_second"), 12.0),
-            connections=min(max(_int(section.get("connections"), 4), 1), 16),
+            max_req_per_second=_optional_float(
+                section.get("max_req_per_second")),
+            connections=_clamp_connections(section.get("connections")),
+            adaptive_enabled=_bool(section.get("adaptive_enabled"), True),
+            connections_max=min(max(
+                _int(section.get("connections_max"), 12), 1), 16),
+            max_req_per_second_max=_float(
+                section.get("max_req_per_second_max"), 36.0),
+            high_streak_threshold=max(
+                _int(section.get("high_streak_threshold"), 3), 1),
+            high_watermark=_ratio(section.get("high_watermark"), 0.9),
+            max_raise_tiers=max(_int(section.get("max_raise_tiers"), 1), 0),
             retry_times=max(_int(section.get("retry_times"), 2), 0),
             retry_backoff_seconds=_float(
                 section.get("retry_backoff_seconds"), 1.5),
@@ -95,6 +115,82 @@ class DownloadConfig:
                 section.get("window_start") or DEFAULT_WINDOW_START),
             window_end=str(section.get("window_end") or DEFAULT_WINDOW_END),
         )
+
+
+#: 池规模 → (connections, rps) 确定性映射。每档按「单连接约 3 req/s」的实测
+#: 吞吐外推；``single_host_sustainable`` 指 60s 轮询间隔内能否跑完全池。
+SIZING_TIERS: Tuple[dict, ...] = (
+    {"max_pool": 150, "label": "≤150", "connections": 2,
+     "max_req_per_second": 6.0, "single_host_sustainable": True,
+     "note": "小池不浪费连接"},
+    {"max_pool": 400, "label": "151–400", "connections": 4,
+     "max_req_per_second": 12.0, "single_host_sustainable": True,
+     "note": "251 只实测档（11.95 req/s 顶格）"},
+    {"max_pool": 800, "label": "401–800", "connections": 6,
+     "max_req_per_second": 18.0, "single_host_sustainable": True,
+     "note": "621 只约 35s/轮，余量 <20s"},
+    {"max_pool": 2000, "label": "801–2000", "connections": 8,
+     "max_req_per_second": 24.0, "single_host_sustainable": False,
+     "note": "2000 只约 83s/轮，单主站 60s 不可持续；建议 interval≥120s 或 2 主站分片"},
+    {"max_pool": 6000, "label": "2001–6000", "connections": 10,
+     "max_req_per_second": 30.0, "single_host_sustainable": False,
+     "note": "5581 只约 186s/轮，必须多主站分片（≥3–4）"},
+    {"max_pool": None, "label": ">6000", "connections": 12,
+     "max_req_per_second": 36.0, "single_host_sustainable": False,
+     "note": "已达连接/限频上限，需分片+扩间隔"},
+)
+
+
+def _tier_for_pool(pool_size: int) -> int:
+    size = max(int(pool_size or 0), 0)
+    for idx, tier in enumerate(SIZING_TIERS):
+        limit = tier["max_pool"]
+        if limit is None or size <= limit:
+            return idx
+    return len(SIZING_TIERS) - 1
+
+
+def sizing_for_pool(pool_size: int, *, connections_max: int = 12,
+                    max_req_per_second_max: float = 36.0,
+                    tier_bonus: int = 0) -> dict:
+    """确定性「池规模 → connections / rps」映射（含上下限夹取）。"""
+    base_idx = _tier_for_pool(pool_size)
+    bonus = max(int(tier_bonus or 0), 0)
+    idx = min(base_idx + bonus, len(SIZING_TIERS) - 1)
+    tier = SIZING_TIERS[idx]
+    conn = min(max(int(tier["connections"]), 1),
+               max(int(connections_max), 1), 16)
+    rps = min(max(float(tier["max_req_per_second"]), 1.0),
+              max(float(max_req_per_second_max), 1.0))
+    return {
+        "tier_index": idx,
+        "base_tier_index": base_idx,
+        "tier": tier["label"],
+        "connections": conn,
+        "max_req_per_second": rps,
+        "single_host_sustainable": bool(tier["single_host_sustainable"]),
+        "note": tier["note"],
+    }
+
+
+def sizing_table(*, connections_max: int = 12,
+                 max_req_per_second_max: float = 36.0) -> List[dict]:
+    """完整建议配置表（供前端按池规模对照）。"""
+    out: List[dict] = []
+    for idx, tier in enumerate(SIZING_TIERS):
+        out.append({
+            "tier_index": idx,
+            "tier": tier["label"],
+            "max_pool": tier["max_pool"],
+            "connections": min(max(int(tier["connections"]), 1),
+                               max(int(connections_max), 1), 16),
+            "max_req_per_second": min(
+                max(float(tier["max_req_per_second"]), 1.0),
+                max(float(max_req_per_second_max), 1.0)),
+            "single_host_sustainable": bool(tier["single_host_sustainable"]),
+            "note": tier["note"],
+        })
+    return out
 
 
 class RateLimiter:
@@ -167,6 +263,7 @@ class MinuteDownloadService:
         ledger_db_path=None,
         request_fn: Optional[Callable] = None,
         clock: Optional[Callable[[], datetime]] = None,
+        on_event: Optional[Callable[[dict], None]] = None,
     ) -> None:
         self.store = store
         self.config = config or DownloadConfig()
@@ -177,10 +274,18 @@ class MinuteDownloadService:
         self.ledger_db_path = ledger_db_path
         self._request = request_fn
         self._clock = clock
+        self._on_event = on_event
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self._round_lock = threading.Lock()
-        self._limiter = RateLimiter(self.config.max_req_per_second)
+        # 自适应生效值（初始保守 4/12；首个 active 轮按池规模重算）。
+        self._effective_connections = min(
+            max(_int(self.config.connections, 4), 1), 16)
+        initial_rps = self.config.max_req_per_second
+        self._effective_rps = float(initial_rps) if initial_rps is not None \
+            else 12.0
+        self._raise_bonus = 0
+        self._limiter = RateLimiter(self._effective_rps)
         # 客户端按「工作线程 × 主站」缓存：同一 socket 绝不被两个线程同时使用。
         self._clients: Dict[Tuple[int, str, int], object] = {}
         self._clients_lock = threading.Lock()
@@ -194,6 +299,23 @@ class MinuteDownloadService:
         self._last_round_at: Optional[str] = None
         self._last_summary: dict = {}
         self._last_error = ""
+        # 利用率观测（每轮 actual_rps/上限、轮次耗时/interval）与自动抬档状态。
+        self._util_lock = threading.Lock()
+        self._util: dict = {
+            "actual_rps": None,
+            "rps_cap": self._effective_rps,
+            "rps_ratio": None,
+            "round_seconds": None,
+            "interval_seconds": float(self.config.interval_seconds or 0),
+            "elapsed_ratio": None,
+            "high_streak": 0,
+            "saturated": False,
+            "alerts": 0,
+            "last_alert_at": None,
+            "last_alert_reason": "",
+            "raise_exhausted": False,
+            "last_round_at": None,
+        }
         # 线程监督（会话 tick 据此判断是否需要重建）：启动时刻、异常退出原因。
         self._started_at: Optional[datetime] = None
         self._thread_error = ""
@@ -241,9 +363,10 @@ class MinuteDownloadService:
         self._thread.start()
         logger.info(
             "分钟下载器已启动：lookback=%d 交易日 interval=%.0fs qps=%.1f "
-            "connections=%d 窗口=%s-%s",
+            "connections=%d 自适应=%s 窗口=%s-%s",
             self.config.lookback_trading_days, self.config.interval_seconds,
-            self.config.max_req_per_second, self._connections(),
+            self._effective_rps, self._connections(),
+            "on" if self.config.adaptive_enabled else "off",
             self._window_start.strftime("%H:%M"),
             self._window_end.strftime("%H:%M"))
         return True
@@ -329,10 +452,14 @@ class MinuteDownloadService:
                 "failures": 0, "empty_days": 0,
             }
             if codes:
+                self._apply_adaptive(len(codes))
+                started = time.monotonic()
                 if self._connections() <= 1:
                     self._run_sequential(codes, summary)
                 else:
                     self._run_pool(codes, summary)
+                self._observe_utilization(
+                    summary, time.monotonic() - started, state)
             self._rounds += 1
             self._last_round_at = now.strftime("%Y-%m-%d %H:%M:%S")
             self._last_summary = summary
@@ -453,7 +580,128 @@ class MinuteDownloadService:
             self._last_error = text
 
     def _connections(self) -> int:
-        return min(max(_int(getattr(self.config, "connections", 1), 1), 1), 16)
+        return min(max(_int(getattr(self, "_effective_connections", 1), 1), 1),
+                   16)
+
+    # ------------------------------------------------------------------
+    # 自适应（池规模 → connections/rps）+ 利用率观测
+    # ------------------------------------------------------------------
+
+    def _apply_adaptive(self, pool_size: int) -> None:
+        """按当前池规模重算生效连接/限频；仅在轮次边界调用（无 worker 在跑）。"""
+        cfg = self.config
+        explicit_conn = cfg.connections is not None
+        explicit_rps = cfg.max_req_per_second is not None
+        if cfg.adaptive_enabled:
+            sizing = sizing_for_pool(
+                pool_size,
+                connections_max=cfg.connections_max,
+                max_req_per_second_max=cfg.max_req_per_second_max,
+                tier_bonus=self._raise_bonus)
+            conn = sizing["connections"]
+            rps = sizing["max_req_per_second"]
+        else:
+            conn = _int(cfg.connections, 4)
+            rps = float(cfg.max_req_per_second) \
+                if cfg.max_req_per_second is not None else 12.0
+        if explicit_conn:
+            conn = int(cfg.connections)
+        if explicit_rps:
+            rps = float(cfg.max_req_per_second)
+        conn = min(max(int(conn), 1), max(int(cfg.connections_max), 1), 16)
+        rps_cap = max(float(cfg.max_req_per_second_max), 1.0)
+        rps = 0.0 if rps == 0 else min(max(float(rps), 1.0), rps_cap)
+        changed = (conn != self._effective_connections
+                   or rps != self._effective_rps)
+        self._effective_connections = conn
+        self._effective_rps = rps
+        if changed:
+            self._limiter = RateLimiter(rps)
+            logger.info(
+                "分钟下载自适应：池=%d 生效 connections=%d rps=%.1f（档位 +%d）",
+                pool_size, conn, rps, self._raise_bonus)
+
+    def _observe_utilization(self, summary: dict, elapsed: float,
+                             state: str) -> None:
+        """记录本轮 actual_rps/上限、耗时/interval；连续顶格则告警并抬档。"""
+        if state != "active" or elapsed <= 0:
+            return
+        requests = int(summary.get("requests") or 0)
+        actual_rps = requests / elapsed if requests > 0 else 0.0
+        cap = float(self._effective_rps)
+        rps_ratio = (actual_rps / cap) if cap > 0 else 0.0
+        interval = float(self.config.interval_seconds or 0)
+        elapsed_ratio = (elapsed / interval) if interval > 0 else 0.0
+        saturated = (
+            rps_ratio >= float(self.config.high_watermark)
+            or elapsed_ratio >= 1.0)
+        now_text = self._now().strftime("%Y-%m-%d %H:%M:%S")
+        with self._util_lock:
+            self._util.update({
+                "actual_rps": round(actual_rps, 3),
+                "rps_cap": cap,
+                "rps_ratio": round(rps_ratio, 4),
+                "round_seconds": round(elapsed, 3),
+                "interval_seconds": interval,
+                "elapsed_ratio": round(elapsed_ratio, 4),
+                "saturated": bool(saturated),
+                "last_round_at": now_text,
+            })
+            if not saturated:
+                self._util["high_streak"] = 0
+                return
+            streak = int(self._util.get("high_streak") or 0) + 1
+            self._util["high_streak"] = streak
+            threshold = max(int(self.config.high_streak_threshold or 1), 1)
+            if streak < threshold:
+                return
+            self._util["high_streak"] = 0
+            self._util["alerts"] = int(self._util.get("alerts") or 0) + 1
+            self._util["last_alert_at"] = now_text
+            self._util["last_alert_reason"] = (
+                "round_timeout" if elapsed_ratio >= 1.0 else "rps_saturated")
+            alerts = self._util["alerts"]
+            reason = self._util["last_alert_reason"]
+        explicit = (self.config.connections is not None
+                    or self.config.max_req_per_second is not None)
+        can_raise = (self.config.adaptive_enabled and not explicit
+                     and self._raise_bonus < int(self.config.max_raise_tiers))
+        message = (
+            "分钟下载利用率告警：actual_rps=%.2f/%.1f(%.0f%%) 轮次=%.1fs/"
+            "%.0fs(%.0f%%) 连续%d轮顶格；%s"
+            % (actual_rps, cap, rps_ratio * 100, elapsed, interval,
+               elapsed_ratio * 100, threshold,
+               ("自动抬一档" if can_raise else "已达上限，仅告警")))
+        logger.warning("%s", message)
+        self._emit_event({
+            "gate": "minute_download",
+            "rule": "adaptive_utilization",
+            "message": message,
+            "reason": reason,
+            "actual_rps": round(actual_rps, 3),
+            "rps_cap": cap,
+            "rps_ratio": round(rps_ratio, 4),
+            "round_seconds": round(elapsed, 3),
+            "interval_seconds": interval,
+            "elapsed_ratio": round(elapsed_ratio, 4),
+            "alerts": alerts,
+            "at": now_text,
+        })
+        if can_raise:
+            self._raise_bonus += 1
+            # 轮次已结束，安全地换到下一档（下一个 active 轮生效）。
+            self._apply_adaptive(len(self._codes))
+        else:
+            with self._util_lock:
+                self._util["raise_exhausted"] = True
+
+    def _emit_event(self, payload: dict) -> None:
+        if self._on_event is None:
+            return
+        try:
+            self._on_event(payload)
+        except Exception:  # noqa: BLE001 — 告警投递失败不影响下载
+            logger.debug("分钟下载事件投递失败", exc_info=True)
 
     def _ensure_pool(self) -> ThreadPoolExecutor:
         size = self._connections()
@@ -668,6 +916,8 @@ class MinuteDownloadService:
         with self._stats_lock:
             stats = dict(self._stats)
             last_error = self._last_error
+        with self._util_lock:
+            util = dict(self._util)
         alive = self.running
         now = self._now()
         last_round_age = self._seconds_since_last_round(now)
@@ -676,6 +926,29 @@ class MinuteDownloadService:
         stalled = bool(
             alive and last_round_age is not None
             and last_round_age > max(3.0 * interval, 30.0))
+        pool_size = len(self._codes)
+        cfg = self.config
+        sizing = sizing_for_pool(
+            pool_size, connections_max=cfg.connections_max,
+            max_req_per_second_max=cfg.max_req_per_second_max,
+            tier_bonus=self._raise_bonus) if cfg.adaptive_enabled else {
+                "tier_index": None, "base_tier_index": None, "tier": "manual",
+                "connections": self._effective_connections,
+                "max_req_per_second": self._effective_rps,
+                "single_host_sustainable": None,
+                "note": "adaptive_enabled=false（人工配置）",
+            }
+        util.update({
+            "rps_cap": self._effective_rps,
+            "interval_seconds": interval,
+            "effective_connections": self._effective_connections,
+            "effective_max_req_per_second": self._effective_rps,
+            "tier_index": sizing.get("tier_index"),
+            "auto_raised_tiers": self._raise_bonus,
+            "max_raise_tiers": int(cfg.max_raise_tiers),
+            "explicit_override": (cfg.connections is not None
+                                  or cfg.max_req_per_second is not None),
+        })
         return {
             "running": alive,
             "alive": alive,
@@ -703,13 +976,28 @@ class MinuteDownloadService:
                 "calendar": self._calendar_mode,
             },
             "config": {
-                "lookback_trading_days": self.config.lookback_trading_days,
-                "interval_seconds": self.config.interval_seconds,
-                "page_size": self.config.page_size,
-                "max_req_per_second": self.config.max_req_per_second,
-                "connections": self._connections(),
-                "window_start": self.config.window_start,
-                "window_end": self.config.window_end,
+                "lookback_trading_days": cfg.lookback_trading_days,
+                "interval_seconds": cfg.interval_seconds,
+                "page_size": cfg.page_size,
+                "adaptive_enabled": bool(cfg.adaptive_enabled),
+                # 生效值（自适应或人工覆盖后的真实值）。
+                "max_req_per_second": self._effective_rps,
+                "connections": self._effective_connections,
+                # 原始配置值（None = 交给自适应）。
+                "configured_max_req_per_second": cfg.max_req_per_second,
+                "configured_connections": cfg.connections,
+                "connections_max": cfg.connections_max,
+                "max_req_per_second_max": cfg.max_req_per_second_max,
+                "window_start": cfg.window_start,
+                "window_end": cfg.window_end,
+            },
+            "utilization": util,
+            "sizing": {
+                "pool_size": pool_size,
+                **sizing,
+                "table": sizing_table(
+                    connections_max=cfg.connections_max,
+                    max_req_per_second_max=cfg.max_req_per_second_max),
             },
         }
 
@@ -766,7 +1054,57 @@ def _float(value, default: float) -> float:
     return v if v > 0 else default
 
 
+def _optional_int(value) -> Optional[int]:
+    if value is None or str(value).strip() == "":
+        return None
+    try:
+        v = int(value)
+    except (TypeError, ValueError):
+        return None
+    return v if v >= 0 else None
+
+
+def _clamp_connections(value) -> Optional[int]:
+    """显式连接数夹取到 [1, 16]；``None`` 保留给「按池规模自适应」。"""
+    v = _optional_int(value)
+    if v is None:
+        return None
+    return min(max(v, 1), 16)
+
+
+def _optional_float(value) -> Optional[float]:
+    if value is None or str(value).strip() == "":
+        return None
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return None
+    return v if v >= 0 else None
+
+
+def _bool(value, default: bool) -> bool:
+    if value is None or str(value).strip() == "":
+        return default
+    if isinstance(value, bool):
+        return value
+    text = str(value).strip().lower()
+    if text in ("1", "true", "yes", "on"):
+        return True
+    if text in ("0", "false", "no", "off"):
+        return False
+    return default
+
+
+def _ratio(value, default: float) -> float:
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return default
+    return min(max(v, 0.0), 1.0)
+
+
 __all__ = [
     "DownloadConfig", "MinuteDownloadService", "RateLimiter",
-    "planned_missing_days", "SOURCE", "PERIOD",
+    "planned_missing_days", "sizing_for_pool", "sizing_table",
+    "SIZING_TIERS", "SOURCE", "PERIOD",
 ]

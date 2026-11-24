@@ -91,6 +91,63 @@ def test_protected_window_blocks_p1_and_p2_but_not_p0():
     g.GATE.release()
 
 
+def test_protected_window_allows_p3_readonly_fallback():
+    """保护窗内 P3 是唯一新增放行级：供分钟合成只读兜底使用。"""
+    _use_clock(_at(15, 0))
+    policy = g.evaluate_policy()
+    assert policy["protected"] is True
+    assert policy["p3_allowed"] is True
+    assert g.GATE.acquire(g.P3, timeout=1)
+    g.GATE.release()
+    # P1/P2 的收紧不受影响。
+    with pytest.raises(g.TdxTaskBlocked):
+        g.GATE.acquire(g.P1, timeout=1)
+    with pytest.raises(g.TdxTaskBlocked):
+        g.GATE.acquire(g.P2, timeout=1)
+
+
+def test_p3_blocked_outside_protected_window():
+    """非保护窗有 P1 正路可走：P3 立即拒绝，避免被其它任务借用。"""
+    _use_clock(_at(10, 0))
+    assert g.evaluate_policy()["p3_allowed"] is False
+    with pytest.raises(g.TdxTaskBlocked) as ei:
+        g.GATE.acquire(g.P3, timeout=1)
+    assert ei.value.reason == "p3_window_only"
+
+
+def test_p3_yields_to_waiting_p0():
+    """P3 最低优先级：P0 等待时 P3 不得插队，必须让 P0 先拿到通道。"""
+    _use_clock(_at(15, 0))
+    assert g.GATE.acquire(g.P3, timeout=1)
+    p0_result = {}
+    p3_result = {}
+
+    def p0_worker():
+        p0_result["ok"] = g.GATE.acquire(g.P0, timeout=2)
+        time.sleep(0.1)
+        g.GATE.release()
+
+    def p3_worker():
+        p3_result["ok"] = g.GATE.acquire(g.P3, timeout=0.2)
+
+    t0 = threading.Thread(target=p0_worker)
+    t0.start()
+    time.sleep(0.05)   # 确保 P0 已在等待
+    t3 = threading.Thread(target=p3_worker)
+    t3.start()
+    t3.join(2)
+    assert p3_result.get("ok") is False, "P3 不得插队 P0"
+    g.GATE.release()
+    t0.join(2)
+    assert p0_result.get("ok") is True
+
+
+def test_parse_priority_accepts_p3():
+    assert g.parse_priority("P3") == g.P3
+    assert g.parse_priority(3) == g.P3
+    assert g.parse_priority("p3") == g.P3
+
+
 def test_lunch_break_opens_p2():
     _use_clock(_at(12, 0))
     assert g.GATE.acquire(g.P2, timeout=1)

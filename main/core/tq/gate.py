@@ -44,7 +44,10 @@ logger = logging.getLogger(__name__)
 P0 = 0
 P1 = 1
 P2 = 2
-PRIORITY_NAMES = {P0: "P0", P1: "P1", P2: "P2"}
+#: P3 最低优先级：仅保护窗内「分钟数据合成」只读兜底使用。任何时刻让行于
+#: P0/P1/P2；非保护窗直接拒绝（``p3_window_only``），避免被其它任务误用。
+P3 = 3
+PRIORITY_NAMES = {P0: "P0", P1: "P1", P2: "P2", P3: "P3"}
 
 _SH_TZ = timezone(timedelta(hours=8))
 _SHANGHAI = "Asia/Shanghai"
@@ -65,6 +68,9 @@ DEFAULT_GATE_CONFIG: Dict = {
     # 交易时段 P1/P2 每分钟最大放行次数（令牌桶，防单类任务长期占满通道）
     "p1_max_per_minute": 600,
     "p2_max_per_minute": 600,
+    # P3 保护窗只读兜底配额：仅 14:55–14:57 的分钟合成兜底使用，独立限频；
+    # 默认 30/min（本地守卫还会再限 12/min，双保险）。
+    "p3_max_per_minute": 30,
     # P2 取数分片：每次 TQ 调用最多取多少只票，片间放锁让 P0 插队
     "p2_chunk_size": 60,
     # 手工紧急放开的最长有效期（分钟）
@@ -316,9 +322,13 @@ def evaluate_policy(now: Optional[datetime] = None) -> Dict:
         "protected": protected,
         "p1_allowed": p1_open,
         "p2_allowed": p2_open,
+        # P3 只在保护窗内放行（唯一合法用途=分钟合成只读兜底）；非保护窗
+        # 有 P1 正路可走，直接拒绝，避免该级别被其它任务借用。
+        "p3_allowed": bool(protected),
         # 配额与分片始终保留（即使无实盘/放开窗口）：保护 TQ 通道本身
         "p2_quota_active": trading_day,
         "p1_quota_active": trading_day,
+        "p3_quota_active": bool(protected),
         "next_p2_open_at": None if p2_open else _next_p2_open(now, cfg),
     }
     if _clock is None:
@@ -413,11 +423,11 @@ def tdx_priority(priority) -> Iterator[int]:
 
 
 def parse_priority(value) -> int:
-    """'P0'/'P1'/'P2'（大小写不敏感）或 0/1/2 → int；非法值按 P1。"""
-    if isinstance(value, int) and value in (P0, P1, P2):
+    """'P0'/'P1'/'P2'/'P3'（大小写不敏感）或 0/1/2/3 → int；非法值按 P1。"""
+    if isinstance(value, int) and value in (P0, P1, P2, P3):
         return value
     text = str(value or "").strip().upper()
-    return {"P0": P0, "P1": P1, "P2": P2}.get(text, P1)
+    return {"P0": P0, "P1": P1, "P2": P2, "P3": P3}.get(text, P1)
 
 
 # ---------------------------------------------------------------- 紧急放开
@@ -489,26 +499,29 @@ class TdxChannelGate:
     def __init__(self) -> None:
         self._cv = threading.Condition(threading.Lock())
         self._owner: Optional[int] = None
-        self._waiters: Dict[int, int] = {P0: 0, P1: 0, P2: 0}
-        self._buckets = {P1: _TokenBucket(600), P2: _TokenBucket(600)}
-        self._bucket_cfg: Dict[int, int] = {P1: 600, P2: 600}
+        self._waiters: Dict[int, int] = {P0: 0, P1: 0, P2: 0, P3: 0}
+        self._buckets = {P1: _TokenBucket(600), P2: _TokenBucket(600),
+                         P3: _TokenBucket(30)}
+        self._bucket_cfg: Dict[int, int] = {P1: 600, P2: 600, P3: 30}
         self._stats = {
-            "granted": {P0: 0, P1: 0, P2: 0},
-            "blocked": {P0: 0, P1: 0, P2: 0},
-            "timeouts": {P0: 0, P1: 0, P2: 0},
-            "last_wait_ms": {P0: 0.0, P1: 0.0, P2: 0.0},
-            "max_wait_ms": {P0: 0.0, P1: 0.0, P2: 0.0},
+            "granted": {P0: 0, P1: 0, P2: 0, P3: 0},
+            "blocked": {P0: 0, P1: 0, P2: 0, P3: 0},
+            "timeouts": {P0: 0, P1: 0, P2: 0, P3: 0},
+            "last_wait_ms": {P0: 0.0, P1: 0.0, P2: 0.0, P3: 0.0},
+            "max_wait_ms": {P0: 0.0, P1: 0.0, P2: 0.0, P3: 0.0},
             "low_priority_granted": 0,
             "low_priority_yielded_to_p0": 0,
         }
 
     # -- 配置同步 ------------------------------------------------------
     def _sync_buckets(self, cfg: Dict) -> None:
-        for level, key in ((P1, "p1_max_per_minute"), (P2, "p2_max_per_minute")):
+        for level, key in ((P1, "p1_max_per_minute"),
+                           (P2, "p2_max_per_minute"),
+                           (P3, "p3_max_per_minute")):
             try:
-                per_min = int(cfg.get(key) or 600)
+                per_min = int(cfg.get(key) or (30 if level == P3 else 600))
             except (TypeError, ValueError):
-                per_min = 600
+                per_min = 30 if level == P3 else 600
             if per_min != self._bucket_cfg[level]:
                 self._bucket_cfg[level] = per_min
                 self._buckets[level] = _TokenBucket(per_min)
@@ -536,6 +549,11 @@ class TdxChannelGate:
                 % (nxt.strftime("%m-%d %H:%M") if nxt else "收盘后"),
                 priority=priority, reason="trading_window",
                 window=policy["window"], next_available_at=nxt)
+        if priority == P3 and not policy["p3_allowed"]:
+            raise TdxTaskBlocked(
+                "P3 只允许在实盘收盘保护窗口内用于分钟数据只读兜底；当前不在窗口内",
+                priority=priority, reason="p3_window_only",
+                window=policy["window"])
         return policy
 
     def _higher_waiting(self, priority: int) -> bool:
@@ -571,10 +589,12 @@ class TdxChannelGate:
                                 self._stats["low_priority_yielded_to_p0"] += 1
                         else:
                             quota_wait = 0.0
-                            if level in (P1, P2) and cfg.get("enabled", True):
-                                quota_active = (
-                                    policy["p1_quota_active"] if level == P1
-                                    else policy["p2_quota_active"])
+                            if level in (P1, P2, P3) and cfg.get("enabled", True):
+                                quota_active = {
+                                    P1: policy["p1_quota_active"],
+                                    P2: policy["p2_quota_active"],
+                                    P3: policy.get("p3_quota_active", False),
+                                }[level]
                                 if quota_active:
                                     quota_wait = self._buckets[level].try_take()
                             if quota_wait <= 0.0:
@@ -616,7 +636,7 @@ class TdxChannelGate:
         cfg = gate_config()
         with self._cv:
             self._owner = None
-            for level in (P0, P1, P2):
+            for level in (P0, P1, P2, P3):
                 self._waiters[level] = 0
                 for key in ("granted", "blocked", "timeouts"):
                     self._stats[key][level] = 0
@@ -624,7 +644,20 @@ class TdxChannelGate:
                 self._stats["max_wait_ms"][level] = 0.0
             self._stats["low_priority_granted"] = 0
             self._stats["low_priority_yielded_to_p0"] = 0
-        self._sync_buckets(cfg)
+            # 令牌桶一并重建：否则跨用例残留的消耗会让配额用例随机失败。
+            self._bucket_cfg = {}
+            self._buckets = {P1: _TokenBucket(600), P2: _TokenBucket(600),
+                             P3: _TokenBucket(30)}
+            for level, key in ((P1, "p1_max_per_minute"),
+                               (P2, "p2_max_per_minute"),
+                               (P3, "p3_max_per_minute")):
+                default = 30 if level == P3 else 600
+                try:
+                    per_min = int(cfg.get(key) or default)
+                except (TypeError, ValueError):
+                    per_min = default
+                self._bucket_cfg[level] = per_min
+                self._buckets[level] = _TokenBucket(per_min)
 
     def stats(self) -> Dict:
         with self._cv:
@@ -657,6 +690,7 @@ def status() -> Dict:
             "p0_only": cfg.get("p0_only"),
             "p1_max_per_minute": cfg.get("p1_max_per_minute"),
             "p2_max_per_minute": cfg.get("p2_max_per_minute"),
+            "p3_max_per_minute": cfg.get("p3_max_per_minute"),
             "p2_chunk_size": cfg.get("p2_chunk_size"),
         },
         "policy": policy,

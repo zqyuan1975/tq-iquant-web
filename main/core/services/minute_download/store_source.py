@@ -63,6 +63,19 @@ class StoreFirstMinuteDispatcher:
         self._coverage_key: Optional[tuple] = None
         # 实际生效层级计数：store=自有库命中，inner=(原生/快照)委托。只做观测。
         self._routes = {"requests": 0, "store": 0, "inner": 0}
+        # 供保护窗兜底守卫判断的只读状态（库读失败 / 落后 / 空）。
+        self._state_lock = threading.Lock()
+        self._state: dict = {
+            "last_query_at": None,
+            "last_lag_minutes": None,
+            "last_read_error_at": None,
+            "last_ok_at": None,
+            "read_errors_total": 0,
+            "codes": 0,
+            "fresh": 0,
+            "stale": 0,
+            "last_error": "",
+        }
 
     @property
     def minute_health(self):
@@ -81,12 +94,20 @@ class StoreFirstMinuteDispatcher:
         now = self._clock()
         out: Dict[str, list] = {}
         stale: List[str] = []
+        lags: List[int] = []
+        read_error = False
         for code in want:
-            bars = self._read_store(code, n, now)
-            if bars and self._is_fresh(bars, now):
+            bars, failed = self._read_store(code, n, now)
+            read_error = read_error or failed
+            lag = self._lag_minutes(bars, now)
+            if lag is not None:
+                lags.append(lag)
+            if bars and self._is_fresh(bars, now, lag=lag):
                 out[code] = bars
             else:
                 stale.append(code)
+        self._note_query(now, len(want), len(want) - len(stale),
+                         len(stale), lags, read_error)
         if stale:
             try:
                 delegated = self._inner.query_quotes_batch(stale, period, count)
@@ -108,33 +129,105 @@ class StoreFirstMinuteDispatcher:
     # 内部
     # ------------------------------------------------------------------
 
-    def _read_store(self, code: str, count: int, now: datetime) -> List[dict]:
-        """读存储并只保留已闭合 bar；任何异常都按「未命中」处理。"""
+    def _read_store(self, code: str, count: int,
+                    now: datetime) -> tuple[List[dict], bool]:
+        """读存储并只保留已闭合 bar；任何异常都按「未命中」处理。
+
+        返回 ``(bars, failed)``：``failed`` 供保护窗兜底守卫识别「库读失败」。
+        """
         try:
             raw = self._store.recent_bars(code, PERIOD_1M, count + 2)
         except Exception:
             logger.warning("分钟存储读取失败 code=%s（回落内层）", code,
                            exc_info=True)
-            return []
-        return closed_bars(raw or [], now)[-count:]
+            self._note_read_error()
+            return [], True
+        return closed_bars(raw or [], now)[-count:], False
 
-    def _is_fresh(self, bars: List[dict], now: datetime) -> bool:
+    def _lag_minutes(self, bars: List[dict], now: datetime) -> Optional[int]:
+        """最新已闭合 bar 相对当前分钟桶的落后分钟数；无 bar → None。"""
         if not bars:
-            return False
+            return None
         labels = [t for t in (parse_bar_time(b) for b in bars) if t is not None]
         if not labels:
+            return None
+        if not self._in_session(now):
+            return 0
+        expected = now.replace(second=0, microsecond=0)
+        return max(0, int((expected - max(labels)).total_seconds() // 60))
+
+    def _is_fresh(self, bars: List[dict], now: datetime,
+                  lag: Optional[int] = None) -> bool:
+        if not bars:
+            return False
+        if lag is None:
+            lag = self._lag_minutes(bars, now)
+        if lag is None:
             return False
         # 非交易时段（午休/收盘/非交易日）不要求新鲜：上一时段数据即最优。
         if not self._in_session(now):
             return True
-        expected = now.replace(second=0, microsecond=0)
-        lag_minutes = int(
-            (expected - max(labels)).total_seconds() // 60)
-        return lag_minutes <= self.frontier_max_lag
+        return lag <= self.frontier_max_lag
 
     def _delegate(self, codes: List[str], period: str,
                   count: int) -> Dict[str, list]:
         return self._inner.query_quotes_batch(codes, period, count)
+
+    # ------------------------------------------------------------------
+    # 只读状态（保护窗兜底守卫据此判断「库读失败 / 落后 / 空」）
+    # ------------------------------------------------------------------
+
+    def _note_read_error(self) -> None:
+        now_text = self._clock().strftime("%Y-%m-%d %H:%M:%S")
+        with self._state_lock:
+            self._state["last_read_error_at"] = now_text
+            self._state["read_errors_total"] += 1
+            self._state["last_error"] = "read_failed"
+
+    def _note_query(self, now: datetime, codes: int, fresh: int, stale: int,
+                    lags: List[int], read_error: bool) -> None:
+        now_text = now.strftime("%Y-%m-%d %H:%M:%S")
+        with self._state_lock:
+            state = self._state
+            state["last_query_at"] = now
+            state["codes"] = codes
+            state["fresh"] = fresh
+            state["stale"] = stale
+            # 有数据取最大 lag（最差票）；整批无数据 → None（等同「库空」）。
+            state["last_lag_minutes"] = max(lags) if lags else None
+            if read_error:
+                state["last_error"] = state["last_error"] or "read_failed"
+            else:
+                state["last_ok_at"] = now_text
+                state["last_error"] = ""
+
+    def store_state(self) -> dict:
+        """只读快照：最近一次库查询的 lag / 失败 / 空覆盖情况。"""
+        now = self._clock()
+        with self._state_lock:
+            state = dict(self._state)
+        last_query = state.get("last_query_at")
+        age: Optional[float] = None
+        if isinstance(last_query, datetime):
+            try:
+                age = max(0.0, (now - last_query).total_seconds())
+            except TypeError:  # naive/aware 混用时不猜测
+                age = None
+        return {
+            "last_query_at": (
+                last_query.strftime("%Y-%m-%d %H:%M:%S")
+                if isinstance(last_query, datetime) else None),
+            "last_query_age_seconds": (
+                round(age, 3) if age is not None else None),
+            "last_lag_minutes": state.get("last_lag_minutes"),
+            "last_read_error_at": state.get("last_read_error_at"),
+            "last_ok_at": state.get("last_ok_at"),
+            "read_errors_total": state.get("read_errors_total", 0),
+            "codes": state.get("codes", 0),
+            "fresh": state.get("fresh", 0),
+            "stale": state.get("stale", 0),
+            "last_error": state.get("last_error", ""),
+        }
 
     # ------------------------------------------------------------------
     # 覆盖缺口观测（下载池之外、只能走 inner/快照的票）
@@ -194,6 +287,7 @@ class StoreFirstMinuteDispatcher:
                        if hasattr(self.minute_health, "status") else None),
             "coverage": self.coverage_status(),
             "routes": self.route_status(),
+            "freshness": self.store_state(),
         }
 
 
