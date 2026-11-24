@@ -171,6 +171,9 @@ class SelectionGpSnapshot(Base):
     as_of = Column(Date, nullable=False)
     # GP16：当日总市值（万元）
     total_mv_wan = Column(Numeric(20, 4), nullable=True)
+    # GP20：质押比例（%）；GP21：当日股息率（%）——回放只用当日值，不做时点外推
+    pledge_ratio = Column(Numeric(10, 4), nullable=True)
+    div_yield_pct = Column(Numeric(10, 4), nullable=True)
     # tq:GP16 / import:wide_db
     source = Column(String(40), nullable=False, default="tq:GP16")
     ingested_at = Column(DateTime, server_default=func.now())
@@ -274,6 +277,111 @@ class SelectionFactorValidation(Base):
     # {factor: {mean_ic, icir, positive_ratio, quintile_means, monotonic, n_periods}}
     payload_json = Column(Text, nullable=False)
     computed_at = Column(DateTime, server_default=func.now())
+
+
+class SelectionSectorMembership(Base):
+    """行业归属快照（as_of, code）：L1 互斥主池 + L2 可重叠标签。
+
+    行业分类接口只有当前值，无法按公告日重建；因此历史归属只能**从首次刷新
+    起按 as_of 累积**。用历史 as_of 回看时，早于首次刷新日的行业池属于「按
+    当前名单回看」，存在分类偏差，必须在质量披露里标注。
+    """
+
+    __tablename__ = "selection_sector_membership"
+
+    as_of = Column(Date, primary_key=True)
+    code = Column(String(20), primary_key=True)
+    sector_code = Column(String(20), nullable=True)
+    sector_name = Column(String(60), nullable=True)
+    l1_pool = Column(String(20), nullable=False)
+    l2_tags = Column(String(200), nullable=True)
+    created_at = Column(DateTime, server_default=func.now())
+
+    __table_args__ = (
+        Index("ix_sel_sector_membership_l1", "as_of", "l1_pool"),
+    )
+
+
+class SelectionWarehouseDaily(Base):
+    """日线收盘序列（内置构建/回补产物）：回放窗口只需 2023-12 起。
+
+    与 ``kline_cache`` 不同：本表是选股专用、随宽库快照 as_of 对齐的**不复权**
+    收盘价，供回放时重算波动率/最大回撤与成员区间定价使用。
+    """
+
+    __tablename__ = "selection_wh_daily"
+
+    code = Column(String(20), primary_key=True)
+    trade_date = Column(Date, primary_key=True)
+    open = Column(Numeric(12, 4), nullable=True)
+    high = Column(Numeric(12, 4), nullable=True)
+    low = Column(Numeric(12, 4), nullable=True)
+    close = Column(Numeric(12, 4), nullable=True)
+    volume = Column(Numeric(20, 2), nullable=True)
+    amount = Column(Numeric(20, 2), nullable=True)
+    source = Column(String(24), nullable=False, default="tq:history")
+    ingested_at = Column(DateTime, server_default=func.now())
+
+    __table_args__ = (
+        Index("ix_selection_wh_daily_date", "trade_date"),
+    )
+
+
+class SelectionWarehouseBuildProgress(Base):
+    """内置构建断点：``(run_id, phase, batch_key)`` 唯一，重复执行按 upsert 去重。
+
+    ``status`` 取值 pending / running / done / failed；失败批次保留 error，
+    续跑只重做非 done 的批次，因此失败后可直接再跑一次而不会产生重复行。
+    """
+
+    __tablename__ = "selection_wh_build_progress"
+
+    id = Column(Integer, primary_key=True)
+    run_id = Column(String(40), nullable=False)
+    mode = Column(String(16), nullable=False, default="incremental")
+    phase = Column(String(40), nullable=False)
+    batch_key = Column(String(80), nullable=False)
+    status = Column(String(16), nullable=False, default="pending")
+    total = Column(Integer, nullable=True)
+    done = Column(Integer, nullable=True)
+    error = Column(String(500), nullable=True)
+    payload_json = Column(Text, nullable=True)
+    started_at = Column(DateTime, nullable=True)
+    updated_at = Column(DateTime, server_default=func.now())
+
+    __table_args__ = (
+        UniqueConstraint("run_id", "phase", "batch_key",
+                         name="uq_selection_wh_build_progress_batch"),
+        Index("ix_selection_wh_build_progress_run", "run_id", "phase"),
+    )
+
+
+class SelectionPoolInterval(Base):
+    """选股池成员区间（选股侧时间线）。
+
+    与 ``stock_pool_memberships`` 并行：行业池不建 ``stock_pools`` 行也能按日期
+    解析成分。``effective_to`` 为空表示仍是开口区间；唯一键
+    ``(pool_key, code, effective_from)`` 保证重复交付不刷重复行。
+    """
+
+    __tablename__ = "selection_pool_intervals"
+
+    id = Column(Integer, primary_key=True)
+    pool_key = Column(String(60), nullable=False)
+    code = Column(String(20), nullable=False)
+    effective_from = Column(Date, nullable=False)
+    effective_to = Column(Date, nullable=True)
+    # snapshot / backfill / live
+    source = Column(String(20), nullable=False, default="snapshot")
+    snapshot_id = Column(Integer, nullable=True)
+    note = Column(String(200), nullable=True)
+    created_at = Column(DateTime, server_default=func.now())
+
+    __table_args__ = (
+        UniqueConstraint("pool_key", "code", "effective_from",
+                         name="uq_selection_pool_intervals_member"),
+        Index("ix_selection_pool_intervals_lookup", "pool_key", "effective_from"),
+    )
 
 
 class SelectionPoolRecall(Base):
