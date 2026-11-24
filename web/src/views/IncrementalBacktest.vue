@@ -7,11 +7,14 @@ import {
 } from '../api'
 import PageHeader from '../components/PageHeader.vue'
 import { useTdxGate } from '../composables/useTdxGate'
+import { gatePauseText } from '../utils/tqGatePause'
 
 const loading = ref(false)
 const validating = ref(false)
 const rebuilding = ref(false)
 const errorMsg = ref('')
+// 闸门暂停（实盘优先 / 保护窗口）是设计让路，不是失败：走中性提示
+const gatePausedMsg = ref('')
 const sessions = ref<LiveSessionItem[]>([])
 const portfolios = ref<PortfolioItem[]>([])
 const sessionId = ref<number | null>(null)
@@ -63,6 +66,7 @@ async function loadSummary() {
   if (!sessionId.value || !portfolioId.value) return
   loading.value = true
   errorMsg.value = ''
+  gatePausedMsg.value = ''
   try {
     summary.value = await getIncrementalSummary(sessionId.value, portfolioId.value)
   } catch (e: any) {
@@ -77,11 +81,14 @@ async function onValidate() {
   if (!sessionId.value || !portfolioId.value) return
   validating.value = true
   errorMsg.value = ''
+  gatePausedMsg.value = ''
   try {
     await runIncrementalValidation(sessionId.value, portfolioId.value)
     await loadSummary()
   } catch (e: any) {
-    errorMsg.value = e?.message || '双跑校验失败'
+    const paused = gatePauseText(e)
+    if (paused) gatePausedMsg.value = paused
+    else errorMsg.value = e?.message || '双跑校验失败'
   } finally {
     validating.value = false
   }
@@ -93,11 +100,14 @@ async function onRebuild() {
   if (!confirm('确定重建接缝？将丢弃当前 checkpoint 并从接缝日全量重算（耗时较长）。')) return
   rebuilding.value = true
   errorMsg.value = ''
+  gatePausedMsg.value = ''
   try {
     await rebuildIncremental(sessionId.value, portfolioId.value)
     await loadSummary()
   } catch (e: any) {
-    errorMsg.value = e?.message || '重建接缝失败'
+    const paused = gatePauseText(e)
+    if (paused) gatePausedMsg.value = paused
+    else errorMsg.value = e?.message || '重建接缝失败'
   } finally {
     rebuilding.value = false
   }
@@ -139,6 +149,7 @@ onMounted(async () => {
     </PageHeader>
 
     <div v-if="tqP2Blocked" class="tq-gate-notice">{{ tqP2Reason }}</div>
+    <div v-if="gatePausedMsg" class="tq-gate-notice">{{ gatePausedMsg }}</div>
 
     <div class="card" style="padding:12px; margin-bottom:12px; display:flex; gap:16px; flex-wrap:wrap; align-items:center">
       <label>

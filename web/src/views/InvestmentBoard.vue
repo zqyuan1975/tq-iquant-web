@@ -8,10 +8,12 @@ import MarketGatePanel from '../components/board/MarketGatePanel.vue'
 import {
   getBoardBreakdown, getBoardIndustries, getBoardIndustry, getBoardIndustryStocks,
   getBoardRun, getBoardLeaders, getBoardMeta, getBoardSummary, refreshBoard,
-  type BoardBreakdown, type BoardIndustryItem, type BoardMeta, type BoardStockItem,
+  type BoardBreakdown, type BoardIndustryItem, type BoardMeta, type BoardRunInfo,
+  type BoardStockItem,
 } from '../api'
 import { gateDirectionTone } from '../utils/marketGate'
 import { DEFAULT_BENCHMARK } from '../utils/benchmarks'
+import { gatePauseText } from '../utils/tqGatePause'
 import { useTdxGate } from '../composables/useTdxGate'
 
 type Period = '1d' | '30m'
@@ -26,8 +28,12 @@ const leaders = ref<{ sustained: BoardIndustryItem[]; reversal: BoardIndustryIte
   sustained: [], reversal: [], excess: [],
 })
 const asOf = ref<string | null>(null)
+// 最近一次刷新任务（含自动刷新）：时间 / 触发方式 / 结果，用来判断数据是否新
+const latestRun = ref<BoardRunInfo | null>(null)
 const loading = ref(false)
 const errorMsg = ref('')
+// 闸门暂停（实盘优先）是设计让路，不是失败：单独用中性提示展示
+const gatePausedMsg = ref('')
 // TQ 通道闸：看板全量刷新属 P2 后台重任务，交易时段后端直接拒绝 → 前端提前置灰
 const { p2Blocked: tqP2Blocked, p2Reason: tqP2Reason } = useTdxGate()
 
@@ -62,6 +68,27 @@ function signed(v: number | null | undefined): string {
   return v > 0 ? `+${v}` : String(v)
 }
 
+function runTime(t: string | null): string {
+  // started_at 形如 2026-11-24T16:00:03 → 11-24 16:00
+  return t ? t.slice(5, 16).replace('T', ' ') : '—'
+}
+
+function triggerLabel(t: string | null): string {
+  if (!t) return '未知来源'
+  if (t === 'manual') return '手动'
+  if (t === 'lazy') return '按需'
+  if (t.startsWith('auto:')) return `自动 ${t.slice(5, 7)}:${t.slice(7, 9)}`
+  return t
+}
+
+const RUN_STATUS_LABELS: Record<string, string> = {
+  ok: '成功', partial: '部分成功', failed: '失败', running: '刷新中',
+}
+
+function runStatusLabel(s: string): string {
+  return RUN_STATUS_LABELS[s] || s
+}
+
 function turnText(t: string | null): string {
   if (!t) return '—'
   return period.value === '1d' ? t.slice(0, 10) : t.slice(5, 16)
@@ -84,6 +111,7 @@ function toneOf(row: BoardIndustryItem): string {
 async function loadAll() {
   loading.value = true
   errorMsg.value = ''
+  gatePausedMsg.value = ''
   try {
     const p = period.value
     const [ind, lead, m] = await Promise.all([
@@ -98,8 +126,11 @@ async function loadAll() {
     const summary = await getBoardSummary({ period: p }).catch(() => null)
     levelCounts.value = summary?.level_counts || {}
     watchCounts.value = summary?.watch_counts || { overbought: 0, oversold: 0 }
+    latestRun.value = summary?.latest_run || null
   } catch (e) {
-    errorMsg.value = '加载失败：' + errMsg(e)
+    const paused = gatePauseText(e)
+    if (paused) gatePausedMsg.value = paused
+    else errorMsg.value = '加载失败：' + errMsg(e)
   } finally {
     loading.value = false
   }
@@ -156,7 +187,9 @@ async function openIndustry(row: BoardIndustryItem) {
     stocksReason.value = stocks.reason || ''
     breakdown.value = bd
   } catch (e) {
-    errorMsg.value = '加载成分股失败：' + errMsg(e)
+    const paused = gatePauseText(e)
+    if (paused) gatePausedMsg.value = paused
+    else errorMsg.value = '加载成分股失败：' + errMsg(e)
   } finally {
     drawerLoading.value = false
     breakdownLoading.value = false
@@ -179,11 +212,14 @@ async function doRefresh() {
   if (refreshing.value) return
   refreshing.value = true
   errorMsg.value = ''
+  gatePausedMsg.value = ''
   try {
     const r = await refreshBoard({ period: period.value, scope: refreshScope.value })
     await pollRun(r.run_id)
   } catch (e) {
-    errorMsg.value = '刷新失败：' + errMsg(e)
+    const paused = gatePauseText(e)
+    if (paused) gatePausedMsg.value = paused
+    else errorMsg.value = '刷新失败：' + errMsg(e)
   } finally {
     refreshing.value = false
   }
@@ -220,6 +256,19 @@ onMounted(loadAll)
   </PageHeader>
 
   <div v-if="tqP2Blocked" class="tq-gate-notice">{{ tqP2Reason }}</div>
+  <div v-if="gatePausedMsg" class="tq-gate-notice">{{ gatePausedMsg }}</div>
+
+  <!-- 最近一次刷新（手动/自动 09:05、16:00）：判断当前数据是否是这两个时点后最新的 -->
+  <div v-if="latestRun" class="board-refresh-meta" :title="latestRun.error || ''">
+    上次刷新：<span class="num">{{ runTime(latestRun.started_at) }}</span>
+    · {{ triggerLabel(latestRun.trigger) }}
+    · <span :class="`run-${latestRun.status}`">{{ runStatusLabel(latestRun.status) }}</span>
+    <span v-if="latestRun.as_of" class="muted">（数据日 {{ latestRun.as_of }}）</span>
+    <span v-if="latestRun.status === 'failed' && latestRun.error" class="run-failed">
+      ：{{ latestRun.error }}
+    </span>
+    <span v-else class="muted">· 每交易日 09:05 / 16:00 自动刷新</span>
+  </div>
 
   <div v-if="errorMsg" class="card board-error">{{ errorMsg }}</div>
 
@@ -482,6 +531,16 @@ onMounted(loadAll)
   padding: 10px 14px; margin-bottom: 12px; color: var(--red);
   background: var(--red-wash); font-size: 12.5px;
 }
+
+/* 最近一次刷新结果 */
+.board-refresh-meta {
+  margin: 2px 0 10px; font-size: 12px; color: var(--ink-soft);
+  display: flex; flex-wrap: wrap; align-items: center; gap: 4px;
+}
+.board-refresh-meta .run-ok { color: var(--green, #1a9c5b); font-weight: 600; }
+.board-refresh-meta .run-partial { color: var(--amber, #b7791f); font-weight: 600; }
+.board-refresh-meta .run-failed { color: var(--red); font-weight: 600; }
+.board-refresh-meta .run-running { color: var(--ink-soft); font-weight: 600; }
 
 /* 周期切换 */
 .board-tabs { display: flex; align-items: center; gap: 8px; margin: 4px 0 12px; }

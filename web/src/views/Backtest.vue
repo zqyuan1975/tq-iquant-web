@@ -51,6 +51,7 @@ import TableToolbar from '../components/TableToolbar.vue'
 import TablePager from '../components/TablePager.vue'
 import { useTheme } from '../composables/useTheme'
 import { onNavReselect } from '../utils/navReselect'
+import { gatePauseText } from '../utils/tqGatePause'
 
 function cssVar(name: string): string {
   if (typeof document === 'undefined') return '#000000'
@@ -136,7 +137,7 @@ const showBacktestGuide = ref(false)
 const showParamGuide = ref(false)
 const submitting = ref(false)
 // TQ 通道闸：交易时段后台重任务（P2）被后端直接拒绝 → 提前置灰并说明原因
-const { p2Blocked: tqP2Blocked, p2Reason: tqP2Reason } = useTdxGate()
+const { p2Blocked: tqP2Blocked, p2Reason: tqP2Reason, refresh: refreshTqGate } = useTdxGate()
 // 高级选项（评估口径 / IS-OOS 采纳门槛 / 费用预留 / 自适应滑点）默认折叠：发起回测默认走增强前的基础方式
 const showAdvanced = ref(false)
 const form = ref({ portfolio_strategy_id: 0, name: '', start_date: '', end_date: '', dividend_mode: 'exact', evaluation_profile: 'absolute', is_oos_gate_enabled: false, oos_gate_min_ratio: 0.5, fee_reserve_enabled: false, bond_t0_enabled: false, bond_lot_enabled: false, adaptive_slippage_enabled: undefined as boolean | undefined, slippage_impact_coef: undefined as string | undefined, volume_limit_enabled: undefined as boolean | undefined, volume_limit_ratio: undefined as string | undefined, equity_cap: undefined as string | undefined, capacity_model: '' as '' | 'linear' | 'sqrt', capacity_impact_k: '0.1' as string, liquidity_caliber: '' as '' | 'same_day_bar' | 'prev5d_avg', max_order_amount: undefined as string | undefined, daily_close_peak_enabled: false, daily_loss_basis: '' as '' | 'equity' | 'initial', market_gate_enabled: '' as '' | 'true' | 'false', industry_override: '' as '' | 'ab' | 'off' | 'all_relief' | 'all_strict', loan_model_plan: undefined as Record<string, unknown> | undefined, pairing_plan_id: undefined as number | undefined })
@@ -2016,7 +2017,14 @@ async function submit() {
     await load()
     if (res?.record_id) await openDetail(res.record_id)
   } catch (e) {
-    alert(`发起失败：${errMsg(e)}`)
+    const paused = gatePauseText(e)
+    if (paused) {
+      // 闸门暂停是设计让路：中性文案 + 刷新闸门状态，不报「发起失败」
+      void refreshTqGate()
+      alert(paused)
+    } else {
+      alert(`发起失败：${errMsg(e)}`)
+    }
   } finally {
     submitting.value = false
   }

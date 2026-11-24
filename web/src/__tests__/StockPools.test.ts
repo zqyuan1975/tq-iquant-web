@@ -153,6 +153,30 @@ describe('StockPools.vue', () => {
     w.unmount()
   })
 
+  it('闸门暂停（收盘保护窗口）→ 中性提示带恢复时点，不显示加载失败', async () => {
+    ;(getTdxPools as any).mockRejectedValue({
+      response: {
+        data: {
+          code: 409,
+          message: '实盘收盘保护窗口（14:55–15:10）内暂停实盘辅助 TQ 任务；15:10 后恢复',
+          data: {
+            reason: 'protected_window',
+            next_available_at: '2026-11-24T15:10:00+08:00',
+          },
+        },
+      },
+    })
+    const w = mount(StockPools)
+    await flushPromises()
+
+    expect(w.text()).toContain('保护窗口内已暂停')
+    expect(w.text()).toContain('15:10')
+    expect(w.text()).toContain('后自动恢复')
+    expect(w.text()).not.toContain('加载失败')
+    expect(w.find('.tq-gate-notice').exists()).toBe(true)
+    w.unmount()
+  })
+
   it('删除失败 → alert 提示，不崩', async () => {
     ;(deleteStockPool as any).mockRejectedValue({ response: { data: { message: '被引用，无法删除' } } })
     const alertMock = vi.fn()

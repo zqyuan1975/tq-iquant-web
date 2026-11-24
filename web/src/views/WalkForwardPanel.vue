@@ -6,6 +6,7 @@ import {
 } from '../api'
 import { fmtPct, fmtSignedPct, DASH } from '../utils/format'
 import { useTdxGate } from '../composables/useTdxGate'
+import { gatePauseText } from '../utils/tqGatePause'
 
 const props = withDefaults(defineProps<{ portfolios?: PortfolioItem[] }>(), { portfolios: () => [] })
 const emit = defineEmits<{ done: [] }>()
@@ -13,6 +14,8 @@ const emit = defineEmits<{ done: [] }>()
 const runs = ref<WalkForwardRunItem[]>([])
 const loading = ref(false)
 const errMsg = ref('')
+// 闸门暂停（实盘优先）是设计让路，不是失败：走中性提示
+const gatePausedMsg = ref('')
 const showForm = ref(false)
 const detail = ref<WalkForwardRunItem | null>(null)
 // TQ 通道闸：滚动回测属 P2 后台重任务，交易时段后端直接拒绝 → 提前置灰
@@ -87,6 +90,7 @@ async function submit() {
   if (spanErr) { alert(spanErr); return }
   // WF 整轮同步执行且持全局回测并发槽：防重复点击（二次点击必 409）。
   submitting.value = true
+  gatePausedMsg.value = ''
   try {
     const res = await runWalkForward({ ...form })
     if (res.status === 'failed') {
@@ -99,7 +103,9 @@ async function submit() {
     await load()
     emit('done')
   } catch (e) {
-    alert(errText(e))
+    const paused = gatePauseText(e)
+    if (paused) gatePausedMsg.value = paused
+    else alert(errText(e))
   } finally {
     submitting.value = false
   }
@@ -302,6 +308,7 @@ onMounted(load)
           </div>
         </div>
         <div v-if="tqP2Blocked" class="tq-gate-notice">{{ tqP2Reason }}</div>
+        <div v-if="gatePausedMsg" class="tq-gate-notice">{{ gatePausedMsg }}</div>
         <div class="modal-actions">
           <button @click="submit" class="btn btn-primary" :disabled="submitting || tqP2Blocked"
                   :title="tqP2Blocked ? tqP2Reason : ''">{{ submitting ? '运行中...' : (tqP2Blocked ? '实盘优先，暂不可用' : '确认') }}</button>

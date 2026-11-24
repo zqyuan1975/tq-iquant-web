@@ -5,11 +5,14 @@ import {
   type TdxPoolItem, type TdxPoolStockItem,
 } from '../api'
 import PageHeader from '../components/PageHeader.vue'
+import { gatePauseText } from '../utils/tqGatePause'
 
 const pools = ref<TdxPoolItem[]>([])
 const localIdByCode = ref<Record<string, number>>({})  // 删除用：code → 本地池 id
 const loading = ref(true)
 const errorMsg = ref('')
+// 收盘保护窗口 / 实盘优先导致的「暂停」不是故障：用中性提示，别落到加载失败
+const pausedMsg = ref('')
 const showStocks = ref(false)
 const stocksList = ref<TdxPoolStockItem[]>([])
 const stocksPoolName = ref('')
@@ -27,6 +30,7 @@ function errMsg(e: any): string {
 
 async function load() {
   errorMsg.value = ''
+  pausedMsg.value = ''
   try {
     // 并行拉通达信板块 + 本地已同步池（取 id 供删除）
     const [tdxRes, localRes] = await Promise.all([
@@ -39,8 +43,14 @@ async function load() {
       localIdByCode.value[p.code] = p.id
     }
   } catch (e) {
-    // getTdxPools 失败（拦截器 reject 或 HTTP 错误）→ 提示，清空列表
-    errorMsg.value = '加载失败：' + errMsg(e)
+    // 闸门暂停（保护窗口/实盘优先）→ 中性提示；真失败才走错误条
+    const paused = gatePauseText(e)
+    if (paused) {
+      pausedMsg.value = paused
+    } else {
+      // getTdxPools 失败（拦截器 reject 或 HTTP 错误）→ 提示，清空列表
+      errorMsg.value = '加载失败：' + errMsg(e)
+    }
     pools.value = []
   } finally {
     loading.value = false
@@ -52,7 +62,13 @@ async function viewStocks(p: TdxPoolItem) {
     stocksPoolName.value = p.name
     stocksList.value = await getTdxPoolStocks(p.code)
     showStocks.value = true
+    pausedMsg.value = ''
   } catch (e) {
+    const paused = gatePauseText(e)
+    if (paused) {
+      pausedMsg.value = paused
+      return
+    }
     alert(`查看成分股失败：${errMsg(e)}`)
   }
 }
@@ -62,6 +78,11 @@ async function syncPool(p: TdxPoolItem) {
   try {
     await syncStockPool({ code: p.code })
   } catch (e) {
+    const paused = gatePauseText(e)
+    if (paused) {
+      pausedMsg.value = paused
+      return
+    }
     alert(`同步失败：${errMsg(e)}`)
     return
   }
@@ -97,6 +118,9 @@ onMounted(() => {
     {{ errorMsg }}
   </div>
 
+  <!-- 闸门暂停：中性提示（不是失败），带上恢复时点 -->
+  <div v-if="pausedMsg" class="tq-gate-notice">{{ pausedMsg }}</div>
+
   <div v-if="loading" class="card" style="padding:12px"><p>加载中…</p></div>
   <div v-else class="card table-wrap">
     <table>
@@ -121,7 +145,7 @@ onMounted(() => {
         </tr>
       </tbody>
     </table>
-    <div v-if="pools.length === 0 && !errorMsg" class="empty-state"><p>暂无股票池</p></div>
+    <div v-if="pools.length === 0 && !errorMsg && !pausedMsg" class="empty-state"><p>暂无股票池</p></div>
   </div>
 
   <!-- 成分股清单 Modal -->
