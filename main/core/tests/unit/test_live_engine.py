@@ -7471,15 +7471,18 @@ def test_handle_bar_before_close_places_order_normally():
     db.close()
 
 
-def test_after_close_defer_released_next_day_at_first_1m_open(monkeypatch):
-    """方案 A：收盘 deferred 单在次日首根 1m bar 放行，限价=当日首根 1m 开盘价。"""
-    from core.engine.live.snapshot_bars import SnapshotBarSynthesizer
+def test_after_close_defer_released_next_day_on_same_period_bar(monkeypatch):
+    """方案 A（2026-11-24 分档）：收盘 deferred 的 5m 单在次日**同周期 5m bar** 放行，
+    限价 = 该 5m bar 的开盘价（回测口径：下一根同周期 bar 的 open 成交）。
 
+    旧行为是「次日首根 1m bar 就放行」——对分钟策略提前 4 分钟且用了 1m 的开盘价，
+    与回测周期路由不一致，已按用户要求改为等自身周期 bar。
+    """
     factory, _ = _db_factory()
     port, _ = _portfolio_single(period="5m")
     stock = "600000.SH"
     day1 = datetime(2026, 8, 5, 15, 1)
-    day2 = datetime(2026, 8, 6, 9, 31)
+    day2 = datetime(2026, 8, 6, 9, 35)
     rec = _Recorder()
     disp, _ = _make_dispatcher(rec)
     engine = _calendar_engine(
@@ -7490,42 +7493,36 @@ def test_after_close_defer_released_next_day_at_first_1m_open(monkeypatch):
     engine._handle_bar(port, bar1)
     assert len(engine._signal_bar_deferred) == 1
 
-    # 次日：首根 1m bar（09:30）open=9.50，次根 9.60
+    # 次日 09:30–09:35 的 5m bar：open=9.50（= 当日开盘价），收 9.60
     monkeypatch.setattr("core.engine.live_engine.now_shanghai",
-                        lambda: datetime(2026, 8, 6, 9, 31, 2))
-    snaps = {stock: {"Now": "9.50", "Volume": "1000"}}
-    synth = SnapshotBarSynthesizer(
-        [stock],
-        fetch_snapshot=lambda codes: {c: dict(snaps[c]) for c in codes if c in snaps},
-        in_session=lambda dt: True,
-    )
-    synth.sample(datetime(2026, 8, 6, 9, 30, 5))
-    engine._snapshot_synth = synth
-
+                        lambda: datetime(2026, 8, 6, 9, 35, 2))
     engine.signal_cache = {}
-    bar2 = _bar(stock, "9.60", day2)
-    bar2.period = "1m"
+    bar2 = BarEvent(
+        stocks={stock: {
+            "open": Decimal("9.50"), "high": Decimal("9.60"),
+            "low": Decimal("9.50"), "close": Decimal("9.60"), "volume": 10000,
+        }},
+        bar_time=day2, period="5m",
+    )
     engine._handle_bar(port, bar2)
 
     db = factory()
     orders = db.query(LiveOrder).all()
     assert len(orders) == 1 and orders[0].status == "submitted"
     assert orders[0].bar_time == day2          # 决策时间戳 = 放行 bar
-    assert Decimal(str(orders[0].price)) == Decimal("9.50")  # 首根 1m open
+    assert Decimal(str(orders[0].price)) == Decimal("9.50")  # 同周期 bar open
     db.close()
     assert engine._signal_bar_deferred == []
     assert any(r.url.path == "/order" for r in rec.requests)
 
 
 def test_after_close_defer_survives_restart_recover_and_releases(monkeypatch):
-    """方案 A：收盘 deferred 行可跨重启由 recover 重建队列，次日仍能放行。"""
-    from core.engine.bar_poller import BarPoller
-
+    """方案 A：收盘 deferred 行可跨重启由 recover 重建队列，次日同周期 bar 仍能放行。"""
     factory, _ = _db_factory()
     port, _ = _portfolio_single(period="5m")
     stock = "600000.SH"
     day1 = datetime(2026, 8, 5, 15, 1)
-    day2 = datetime(2026, 8, 6, 9, 31)
+    day2 = datetime(2026, 8, 6, 9, 35)
     rec = _Recorder()
     disp, _ = _make_dispatcher(rec)
     engine = _calendar_engine(
@@ -7537,7 +7534,7 @@ def test_after_close_defer_survives_restart_recover_and_releases(monkeypatch):
 
     # 模拟重启：新引擎从 DB 足迹重建内存队列（时钟固定到次日，避免新鲜度清扫）
     monkeypatch.setattr("core.engine.live_engine.now_shanghai",
-                        lambda: datetime(2026, 8, 6, 9, 31, 2))
+                        lambda: datetime(2026, 8, 6, 9, 35, 2))
     port2, _ = _portfolio_single(period="5m")
     engine2 = _calendar_engine(
         factory, port2, disp, [date(2026, 8, 5), date(2026, 8, 6)], stock)
@@ -7548,7 +7545,7 @@ def test_after_close_defer_survives_restart_recover_and_releases(monkeypatch):
 
     engine2.signal_cache = {}
     bar2 = _bar(stock, "9.40", day2)
-    bar2.period = "1m"
+    bar2.period = "5m"
     engine2._handle_bar(port2, bar2)
 
     db = factory()
@@ -13123,7 +13120,7 @@ def test_engine_mismatched_risk_flag_passed_to_portfolio(monkeypatch):
 
 
 def test_release_price_uses_first_1m_bar_open(monkeypatch):
-    """09:31 兜底：限价 = 当日首根 1m bar 的 open，夹涨跌停并 quantize。"""
+    """日线兜底放行：限价 = 当日开盘价（09:30–09:31 那根 open），夹涨跌停并 quantize。"""
     factory, _ = _db_factory()
     port, _ctx = _portfolio_single(period="1d")
     rec = _Recorder(respond=_bridge_ping(("/ping", "/order", "/price_limit")))
@@ -13138,7 +13135,9 @@ def test_release_price_uses_first_1m_bar_open(monkeypatch):
     ])
     order = _deferred_order("600000.SH", date(2026, 8, 24))
     source = engine._refresh_release_price(order)
-    assert source == "first_bar_open"
+    # 2026-11-24 起日线单只看「当日开盘价」，不再用「当日最早一根」冒充
+    # （两者在本例同为 09:30–09:31，故价格不变，来源标签改为 day_open）
+    assert source == "day_open"
     assert order.price == Decimal("10.05")
     assert order._price_type_override == "limit"
 

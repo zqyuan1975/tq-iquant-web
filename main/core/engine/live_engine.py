@@ -218,6 +218,12 @@ _PRE_OPEN_UI_PER_ORDER = 25
 # 缺 open、撤单一时未收敛时保留后续 1m bar 的重试机会；10:00 之后开盘价对撤单决策
 # 已无意义，停止重试并记 risk 事件（action=skip/rule=open_check_timeout）。
 _PRE_OPEN_OPEN_CHECK_DEADLINE = (10, 0)
+# 日线级 deferred 单的「开盘档」放行窗口（2026-11-24）：回测成交价是**下一根日线
+# bar 的 open**（次日开盘价），所以日线单在开盘时刻就该报出，不能等首根已闭合的
+# 1m bar——首根迟到（实证 10:16 才来）时成交价变成盘中价，与开盘价偏移方向不定。
+# 09:30 起集合竞价已结束、开盘价可得；09:35 后交给既有首根 bar 路径兜底。
+_OPEN_RELEASE_START = (9, 30)
+_OPEN_RELEASE_END = (9, 35)
 # P2-6：桥离线恢复补派的拉取根数区间。断线 3 分钟 → ~8 根；30 分钟 → ~35 根；
 # 上午断到下午（跨午休）按墙钟分钟放大但超过 240 根（约一个交易日）就封顶，
 # 更早的 bar 不再尝试（跨日缺口直接不做补派，见 _plan_gap_recovery）。
@@ -792,6 +798,14 @@ class LiveEngine:
         self._pre_open_open_check_bar: Optional[datetime] = None
         self._pre_open_day: Optional[date] = None
         self._pre_open_attempted: Set[tuple] = set()
+        # 日线「开盘档」兜底放行（2026-11-24）：与盘前 attempted 隔离——盘前
+        # 09:15 尝试失败（通道拒单 -1）不能挡住 09:30 用开盘价再报一次。
+        self._open_release_day: Optional[date] = None
+        self._open_release_attempted: Set[tuple] = set()
+        # 「开盘价不可得 → 交首根 bar 路径」每交易日一条 risk 事件去重
+        self._open_release_missing_noted: Set[date] = set()
+        # 当日开盘价缓存（正价才缓存；取不到不缓存，留给后续 tick 重试）
+        self._day_open_price_cache: Dict[Tuple[date, str], Decimal] = {}
         # 盘前能力闸拦截（QMT 桥不能确认指定价）：按日只记一条
         # gate=pre_open_auction/action=block 风险事件，避免 60s 主循环每轮刷屏。
         self._pre_open_blocked_day: Optional[date] = None
@@ -2984,6 +2998,9 @@ class LiveEngine:
             # 之前——09:15 一开窗就把昨日 deferred 日线单报进集合竞价。关闭时
             # 方法首行 return，队列/DB/价格/事件一律不动（旧行为逐字不变）。
             self._maybe_pre_open_auction(now)
+            # 日线级 deferred 单「开盘档」兜底放行（2026-11-24）：09:30 开盘价
+            # 一可得就报出，不等首根已闭合 1m bar（回测按次日 open 成交）。
+            self._maybe_daily_open_release(now)
             # G3：顺延单积压告警（默认关闭；每交易日每规则最多一条）
             self._check_deferred_backlog(now)
             # F5：显式标注「在等首根 1m bar」（每交易日一条，只观测不阻断）
@@ -3377,9 +3394,230 @@ class LiveEngine:
                 threshold=self._deferred_backlog_warn_days,
             )
 
-    def _pre_open_release(self, portfolio: Portfolio, now: datetime) -> None:
-        """单组合的盘前放行：摘单 → 定价 → 批量资金分配 → 逐单提交 → 未报出回队。"""
+    def _daily_open_release_candidates(self, today: date) -> List[OrderEvent]:
+        """当日 due 的**日线级** deferred 单（开盘档与「开盘价缺失」事件共用）。"""
+        out: List[OrderEvent] = []
+        if not self._signal_bar_deferred:
+            return out
+        by_pid = {p.portfolio_id: p for p in self.portfolios}
+        with self._book_lock:
+            for order in self._signal_bar_deferred:
+                portfolio = by_pid.get(order.portfolio_id)
+                if portfolio is None:
+                    continue
+                if order.bar_time is None or order.signal_bar_date is None:
+                    continue
+                if getattr(order, "_deferred_extended", False):
+                    continue
+                if self._next_trading_day(order.signal_bar_date) != today:
+                    continue
+                op = (self._order_period(portfolio, order) or "").lower()
+                if op and op not in _DAILY_PERIODS:
+                    continue
+                out.append(order)
+        return out
+
+    def _maybe_daily_open_release(self, now: datetime) -> None:
+        """日线级 deferred 单「开盘档」放行（2026-11-24）：09:30–09:35。
+
+        回测口径是 `period=1d` 的信号在**下一根日线 bar 的 open** 成交——实盘对应
+        集合竞价结束后的开盘价。旧实现只由「已完成的分钟 bar」触发放行：首根 1m
+        bar 迟到/缺失（2026-11-24 实证：09:24 缺首根，10:16 才放行）时，日线单被
+        拖到开盘后 46 分钟才报，成交价变成盘中价，与开盘价偏移方向不定——这是
+        **偏离**回测，不是对齐。
+
+        本方法在开盘后直接放行：价格取当日开盘价（集合竞价成交价，
+        `_day_open_price`），走与盘前同一条 `_pre_open_release` 提交链。取不到
+        开盘价 → 本轮不报、单留队列，下一轮再试；过了 09:35 交给既有首根 bar
+        路径兜底，并记 `open_price_missing` 风险事件（不再静默）。
+        """
+        if self.execution_mode != "auto":
+            return
+        hm = (now.hour, now.minute)
+        if hm >= _OPEN_RELEASE_END:
+            self._note_open_release_fallback(now)
+            return
+        if hm < _OPEN_RELEASE_START:
+            return
         today = now.date()
+        try:
+            if not self._calendar.is_trading_day(today):
+                return
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                "open release calendar check failed (session %s)", self.session_id)
+            return
+        if self._open_release_day != today:
+            self._open_release_day = today
+            self._open_release_attempted.clear()
+            self._open_release_missing_noted = {
+                d for d in self._open_release_missing_noted
+                if (today - d).days <= 3
+            }
+            self._day_open_price_cache = {
+                k: v for k, v in self._day_open_price_cache.items() if k[0] == today
+            }
+        if not self._daily_open_release_candidates(today):
+            return
+        # 同 tick 内同代码只查一次（多组合/多单共用），避免 60s 窗口内重复打 TQ
+        resolved: Dict[str, Optional[Decimal]] = {}
+
+        def _resolve(code: str) -> Optional[Decimal]:
+            if code not in resolved:
+                resolved[code] = self._day_open_price(code)
+            return resolved[code]
+
+        for portfolio in list(self.portfolios):
+            try:
+                self._pre_open_release(
+                    portfolio, now,
+                    price_resolver=_resolve,
+                    attempted=self._open_release_attempted,
+                    gate_tag="daily_open_release",
+                )
+            except Exception:  # noqa: BLE001
+                logger.exception(
+                    "daily open release failed portfolio=%s (session %s)",
+                    getattr(portfolio, "portfolio_id", None), self.session_id)
+
+    def _note_open_release_fallback(self, now: datetime) -> None:
+        """开盘档结束后仍有日线单未报出：明确标注「开盘价不可得，走首根 bar 兜底」。
+
+        只观测，不改变放行行为；每交易日一条（persist=True 便于复盘，刷新页面不丢）。
+        """
+        today = now.date()
+        if today in self._open_release_missing_noted:
+            return
+        # 只有「今天确实进入过开盘档」才谈「开盘档没取到价」；进程 10:00 才启动
+        # 或订单是开盘后才 deferred 的，不产生这条事件（避免误导为开盘失败）。
+        if self._open_release_day != today:
+            return
+        try:
+            if not self._calendar.is_trading_day(today):
+                return
+        except Exception:  # noqa: BLE001
+            return
+        pending = self._daily_open_release_candidates(today)
+        if not pending:
+            return
+        self._open_release_missing_noted.add(today)
+        msg = ("日线顺延单 %d 笔未能在开盘档（09:30–09:35）取到当日开盘价，"
+               "交由首根 1m bar 路径兜底（成交价可能偏离开盘价）" % len(pending))
+        logger.warning("%s (session %s, now %s)", msg, self.session_id, now)
+        self._emit_risk_safe({
+            "session_id": self.session_id,
+            "engine": self._engine_key,
+            "gate": "daily_open_release",
+            "layer": "live_gate",
+            "rule": "open_price_missing",
+            "action": "fallback",
+            "reason": "open_price_missing",
+            "count": len(pending),
+            "observed_at": now.isoformat(),
+            "portfolio_id": getattr(pending[0], "portfolio_id", None),
+            "message": msg,
+        }, persist=True)
+
+    def _day_open_price(self, code: str) -> Optional[Decimal]:
+        """当日开盘价（集合竞价成交价）；取不到返回 None，绝不伪造。
+
+        与 `_day_first_bar_open` 的关键区别：这里**只认当日 09:30–09:31 那根**
+        1m bar 的 open。`_day_first_bar_open` 取「当日最早一根」，首根迟到时
+        （实证 10:16 才来）拿到的是盘中价，不是开盘价。通道 bar 的 `bar_time`
+        是**结束时间**（`parse_bar_time`），故只认 09:30–09:31 这一分钟（兼容
+        09:30 起始标签与 09:31 结束标签，取更早者），其余时间一律视为取不到；
+        再退一步只认「当日日线 bar 的 open」（部分通道 1m 盘中不落库）。
+        正价结果按 (交易日, code) 缓存，避免 60s 窗口内重复查询。
+        """
+        c = str(code or "").strip()
+        if not c:
+            return None
+        today = now_shanghai().date()
+        cached = self._day_open_price_cache.get((today, c))
+        if cached is not None:
+            return cached
+        price = self._day_open_price_uncached(c, today)
+        if price is not None:
+            self._day_open_price_cache[(today, c)] = price
+        return price
+
+    def _day_open_price_uncached(self, code: str, today: date) -> Optional[Decimal]:
+        synth = getattr(self, "_snapshot_synth", None)
+        if synth is not None:
+            start = datetime(today.year, today.month, today.day, 9, 30)
+            try:
+                opens = synth.open_at([code], start)
+            except Exception:  # noqa: BLE001
+                opens = None
+            raw = (opens or {}).get(code)
+            if raw is not None:
+                try:
+                    price = Decimal(str(raw))
+                except Exception:  # noqa: BLE001
+                    price = None
+                if price is not None and price > 0:
+                    return price
+            # 合成器在但 09:30 那根没有（会话中途启动/丢采样）→ 继续试通道 1m
+        try:
+            bars = self._dispatcher.query_quote(code, period="1m", count=250)
+        except Exception:  # noqa: BLE001
+            return None
+        labels: Dict[Tuple[int, int], Optional[Decimal]] = {
+            (9, 31): None, (9, 30): None,
+        }
+        for row in bars or []:
+            if not isinstance(row, dict):
+                continue
+            bar_time = parse_bar_time(row)
+            if bar_time is None or bar_time.date() != today:
+                continue
+            hm = (bar_time.hour, bar_time.minute)
+            if hm not in labels or labels[hm] is not None:
+                continue
+            try:
+                px = Decimal(str(row.get("open")))
+            except Exception:  # noqa: BLE001
+                continue
+            if px > 0:
+                labels[hm] = px
+        first_minute = labels.get((9, 30)) or labels.get((9, 31))
+        if first_minute is not None:
+            return first_minute
+        # 最后一档：当日日线 bar 的 open（部分通道的 1m 盘中不落库，但日线当日行
+        # 带 open）。严格校验 bar 日期 == 今天且 open > 0，避免把昨收当开盘价。
+        try:
+            daily = self._dispatcher.query_quote(code, period="1d", count=2)
+        except Exception:  # noqa: BLE001
+            return None
+        for row in daily or []:
+            if not isinstance(row, dict):
+                continue
+            bar_time = parse_bar_time(row)
+            if bar_time is None or bar_time.date() != today:
+                continue
+            try:
+                px = Decimal(str(row.get("open")))
+            except Exception:  # noqa: BLE001
+                continue
+            if px > 0:
+                return px
+        return None
+
+    def _pre_open_release(self, portfolio: Portfolio, now: datetime,
+                          *, price_resolver: Optional[Callable] = None,
+                          attempted: Optional[Set[tuple]] = None,
+                          gate_tag: str = "pre_open_auction") -> None:
+        """单组合的盘前放行：摘单 → 定价 → 批量资金分配 → 逐单提交 → 未报出回队。
+
+        ``price_resolver``/``attempted``/``gate_tag`` 供「日线开盘档」复用（2026-11-24）：
+        - 默认（None）＝盘前集合竞价，价格用 `_pre_open_price`，attempted 用
+          `_pre_open_attempted`，行为逐字不变；
+        - 传入 resolver 时以该函数返回的价为准（开盘价），返回 None 的单**不摘
+          DB 行、不消耗尝试配额**，恢复原 bar_time 回队等下一轮（09:30–09:35 内
+          每分钟重试），拿不到价绝不拿实时价冒充开盘价。
+        """
+        today = now.date()
+        attempted = self._pre_open_attempted if attempted is None else attempted
         candidates: List[OrderEvent] = []
         with self._book_lock:
             for order in list(self._signal_bar_deferred):
@@ -3402,9 +3640,11 @@ class LiveEngine:
                 if op and op.lower() not in _DAILY_PERIODS:
                     continue
                 key = self._pre_open_key(portfolio, order)
-                if key in self._pre_open_attempted:
+                if key in attempted:
                     continue
-                self._pre_open_attempted.add(key)
+                if price_resolver is None:
+                    # 盘前档：选中即消耗当日尝试配额（at-most-once，失败也不重试）
+                    attempted.add(key)
                 candidates.append(order)
             if candidates:
                 # 按身份摘除（OrderEvent 是 dataclass，remove 会按字段相等误删同值单）
@@ -3430,25 +3670,49 @@ class LiveEngine:
                         portfolio, order, now, recheck_reason)
                     continue
                 order._pre_open_bar_time = order.bar_time  # 原信号 bar 时间（回队恢复）
-                order.bar_time = now  # 决策时间戳语义：本次盘前报单时点
-                price = self._pre_open_price(order)
-                if price is not None:
-                    order.price = price
+                order.bar_time = now  # 决策时间戳语义：本次报单时点
+                if price_resolver is not None:
+                    # 开盘档：只认当日开盘价。取不到 → 恢复原 bar_time 回队，
+                    # 不落库、不消耗尝试配额（下一轮 tick 再试）。
+                    resolved = price_resolver(order.stock_code)
+                    if resolved is None:
+                        order.bar_time = order._pre_open_bar_time
+                        requeue.append(order)
+                        continue
+                    key = self._pre_open_key(portfolio, order)
+                    if key in attempted:
+                        order.bar_time = order._pre_open_bar_time
+                        requeue.append(order)
+                        continue
+                    attempted.add(key)
+                    order.price = Decimal(str(resolved))
+                else:
+                    price = self._pre_open_price(order)
+                    if price is not None:
+                        order.price = price
+                if price_resolver is not None:
+                    release_msg = (
+                        "日线开盘放行：signal_bar_date=%s，委托价 %s"
+                        "（当日开盘价/集合竞价成交价）"
+                        % (order.signal_bar_date, fmt_price(order.price)))
+                else:
+                    release_msg = (
+                        "盘前集合竞价放行：signal_bar_date=%s，委托价 %s"
+                        "（信号价让价 %s%%，涨跌停内收 1 跳）"
+                        % (order.signal_bar_date, fmt_price(order.price),
+                           self._pre_open.price_bias_pct))
                 self._rec_live(
-                    "pre_open_auction", "release", portfolio, order,
-                    message="盘前集合竞价放行：signal_bar_date=%s，委托价 %s"
-                            "（信号价让价 %s%%，涨跌停内收 1 跳）"
-                            % (order.signal_bar_date,
-                               fmt_price(order.price),
-                               self._pre_open.price_bias_pct),
+                    gate_tag, "release", portfolio, order, message=release_msg,
                 )
                 logger.info(
-                    "[pre-open] release %s %s qty=%s price=%s signal_bar_time=%s "
-                    "cutoff=%s pre_open=True (session %s)",
+                    "[%s] release %s %s qty=%s price=%s signal_bar_time=%s "
+                    "cutoff=%s pre_open=%s (session %s)",
+                    gate_tag,
                     order.trade_type.value, order.stock_code, order.quantity,
                     fmt_price(order.price), order._pre_open_bar_time,
                     (self._pre_open_release_cutoff.strftime("%H:%M:%S")
                      if self._pre_open_release_cutoff else "-"),
+                    price_resolver is None,
                     self.session_id,
                 )
             orders = self._allocate_batch_buys(portfolio, orders, post_close=False)
@@ -3502,13 +3766,14 @@ class LiveEngine:
                 except Exception:  # noqa: BLE001
                     db.rollback()
                     logger.exception(
-                        "[pre-open] submit failed, keep deferred for 09:31 path: "
+                        "[%s] submit failed, keep deferred for bar fallback: "
                         "%s %s qty=%s (session %s)",
+                        gate_tag,
                         order.trade_type.value, order.stock_code,
                         order.quantity, self.session_id)
                     self._rec_live(
-                        "pre_open_auction", "block", portfolio, order,
-                        message="盘前提交异常，保持 deferred 交由首根 1m bar 路径重试",
+                        gate_tag, "block", portfolio, order,
+                        message="提交异常，保持 deferred 交由首根 1m bar 路径重试",
                     )
                 if self._pre_open_placed(db, order):
                     # 已真正报出（或已交给拆单队列承接）：不回队，防 09:31 重复
@@ -3541,8 +3806,8 @@ class LiveEngine:
                     if id(order) not in existing:
                         self._signal_bar_deferred.append(order)
             logger.info(
-                "[pre-open] requeued %d order(s) for 09:31 first-bar path "
-                "(session %s)", len(requeue), self.session_id)
+                "[%s] requeued %d order(s) for bar fallback (session %s)",
+                gate_tag, len(requeue), self.session_id)
 
     @staticmethod
     def _pre_open_key(portfolio: Portfolio, order: OrderEvent) -> tuple:
@@ -7104,45 +7369,58 @@ class LiveEngine:
         )
 
     def _refresh_release_price(self, order) -> str:
-        """09:31 deferred 放行定价（P4，2026-11-11）：可复现优先（限价）。
+        """deferred 放行定价兜底（P4，2026-11-11；2026-11-24 分档修正）。
 
-        默认：限价 = **当日首根 1m bar 的开盘价**（夹当日涨跌停、quantize 到
-        最小价位），按单下发 ``limit``——与回测「次日开盘成交」同价源，可复现。
-        首根 open 取不到 → 退回 `_refresh_submit_price` 的当日实时 close，并记
+        分钟单：调用方已优先用「本周期 bar 的 open」定价（与回测下一根同周期
+        bar open 一致），走到这里说明该 bar 无 open → 退回当日首根 1m bar 的
+        open / 实时 close。
+
+        日线单（`signal_bar_date` 非空，见 OrderEvent 注释）：只看**当日开盘价**
+        （`_day_open_price`，严格要求 09:30 那根）。旧实现用「当日最早一根 1m
+        bar」的 open——首根迟到（实证 10:16 才来）时那是盘中价而非开盘价，与
+        回测「次日开盘成交」偏离。
+
+        取不到 → 退回 `_refresh_submit_price` 的当日实时 close，并记
         `gate=deferred_release / action=fallback` 风险事件（价格来源可审计）。
-
         `deferred_release_ensure_fill=True`（保证成交，默认关）→ 不覆盖价型，
         即通道默认对手价，优先成交。
         """
-        # P1-5：放行价已按「首根 open / 实时 close」定好，不得再叠加分钟让价。
+        # P1-5：放行价已按「开盘价 / 实时 close」定好，不得再叠加分钟让价。
         order._release_priced = True
         if self._deferred_release_ensure_fill:
             source = self._refresh_submit_price(order)
             order._price_type_override = None
             return "ensure_fill:" + source
-        open_price = self._day_first_bar_open(order.stock_code)
+        # signal_bar_date 非空 = 日线级信号（OrderEvent 字段语义）
+        is_daily = getattr(order, "signal_bar_date", None) is not None
+        if is_daily:
+            open_price = self._day_open_price(order.stock_code)
+            source_label = "当日开盘价"
+        else:
+            open_price = self._day_first_bar_open(order.stock_code)
+            source_label = "当日首根 1m bar 开盘价"
         if open_price is not None:
             order.price = self._clamp_release_price(order, open_price)
             order._price_type_override = self._pre_open_price_type()
             logger.info(
-                "[deferred] release price = first 1m open %s (limit) code=%s "
-                "(session %s)", fmt_price(order.price), order.stock_code,
-                self.session_id)
+                "[deferred] release price = %s %s (limit) code=%s "
+                "(session %s)", source_label, fmt_price(order.price),
+                order.stock_code, self.session_id)
             self._recorder.record(
                 gate="deferred_release", layer="live_gate", action="release",
                 portfolio_id=getattr(order, "portfolio_id", None),
                 strategy_id=getattr(order, "strategy_id", None),
                 stock_code=order.stock_code, bar_time=order.bar_time,
-                message="放行价=当日首根 1m bar 开盘价 %s（限价，涨跌停内收 1 跳）"
-                        % fmt_price(order.price),
+                message="放行价=%s %s（限价，涨跌停内收 1 跳）"
+                        % (source_label, fmt_price(order.price)),
             )
-            return "first_bar_open"
+            return "day_open" if is_daily else "first_bar_open"
         source = self._refresh_submit_price(order)
         order._price_type_override = self._pre_open_price_type()
         logger.warning(
-            "[deferred] first 1m open unavailable, fallback to %s price=%s "
-            "code=%s (session %s)", source, fmt_price(order.price),
-            order.stock_code, self.session_id)
+            "[deferred] %s unavailable, fallback to %s price=%s "
+            "code=%s (session %s)", source_label, source,
+            fmt_price(order.price), order.stock_code, self.session_id)
         self._emit_risk_safe({
             "session_id": self.session_id,
             "portfolio_id": getattr(order, "portfolio_id", None),
@@ -7154,7 +7432,7 @@ class LiveEngine:
             "rule": "first_bar_open_missing",
             "price": float(order.price),
             "price_source": source,
-            "message": "当日首根 1m bar 开盘价不可得，退回实时价放行（非开盘价）",
+            "message": "%s不可得，退回实时价放行（非开盘价）" % source_label,
         }, persist=True)
         return "quote_close_fallback:" + source
 
@@ -12605,7 +12883,12 @@ class LiveEngine:
         行情链路未就绪时（当日还没有任何分钟 bar）deferred 单一律没有放行触发，
         旧实现只留下「未提交」计数，页面上与报单失败无法区分。这里在交易日
         09:31 后检查一次，每交易日最多一条 risk 事件 + INFO 日志；只做观测，
-        不改变任何放行/下单行为（等已闭合 bar 是与回测对齐的设计，不在此处改）。
+        不改变任何放行/下单行为。
+
+        注意（2026-11-24 修正）：对**日线级**策略，「等首根已闭合 1m bar」不是
+        与回测对齐——回测按下一根日线 bar 的 open 成交；日线单已由
+        `_maybe_daily_open_release` 在 09:30 开盘档放行。这里只描述分钟级
+        （尤其分钟策略自身周期 bar 迟到）的等待。
         """
         try:
             today = now.date()
@@ -12709,8 +12992,9 @@ class LiveEngine:
 
         背景：goldminer 的 1m 驱动行情走快照合成（gm history_n 单只 ~5s 云端往返，
         150 只一轮 ~12 分钟，不能当 1m 轮询源）；合成器启动时没有历史，最早要等
-        启动后的下一分钟边界才有首根完成 bar（开盘约 09:31、午休/盘中重启更晚），
-        昨日 deferred 日线单因此迟迟不放行。
+        启动后的下一分钟边界才有首根完成 bar。**日线级**单自 2026-11-24 起由
+        `_maybe_daily_open_release` 在 09:30 用开盘价放行，不再依赖本探测；本探测
+        只服务分钟级 deferred 单的「今日已完成同周期 bar」放行。
 
         数值不混用：只用桥 bar 的日期/时间判定「今日已有完成 bar」，构造
         baseline=True 的 BarEvent 交给 _on_bar——baseline 只放行 deferred + 走提交
@@ -12795,6 +13079,11 @@ class LiveEngine:
         故障/快照合成停摆），说明「没机会放行」而非「信号过期」→ 顺延一个交易日
         放行一次。DB 行 error_message 记 ``deferred_extended:due=<原due>``（重启
         recover 读回），第二个到期日仍无机会才正常取消，绝不无限顺延。
+
+        分档（2026-11-24）：日线级单的主放行点是 `_maybe_daily_open_release`
+        （09:30 开盘价，不等首根已闭合 1m bar——回测按次日 open 成交）；本方法
+        对日线单只是**兜底**（开盘档取不到价/错过窗口时）。分钟级单只在其**自身
+        周期** bar 上放行，并按该 bar 的 open 定价（对齐回测周期路由）。
         """
         if not self._signal_bar_deferred:
             return []
@@ -12821,6 +13110,17 @@ class LiveEngine:
             if not (order.portfolio_id == portfolio.portfolio_id
                     and signal_date is not None
                     and signal_date < bar_date):
+                remaining.append(order)
+                continue
+            # W4 周期路由（实盘侧，2026-11-24）：回测里 5m 单只在下一根 **5m** bar
+            # 的 open 成交（backtest_engine 周期路由闸），实盘若用首根 1m bar 放行，
+            # 会提前并以 1m 开盘价成交，两端错位。分钟级单只在其自身周期 bar 上
+            # 放行；日线级单不受此闸限制（由 `_maybe_daily_open_release` 在开盘档
+            # 负责，本路径仅兜底）。
+            order_period = (self._order_period(portfolio, order) or "").lower()
+            bar_period = (getattr(bar, "period", "") or "1m").lower()
+            if (order_period and order_period not in _DAILY_PERIODS
+                    and order_period != bar_period):
                 remaining.append(order)
                 continue
             signal_day = order.signal_bar_date
@@ -12901,10 +13201,41 @@ class LiveEngine:
                     portfolio, order, bar.bar_time, recheck_reason)
                 continue
             order.bar_time = bar.bar_time
-            # 价格刷新（P4）：默认用**当日首根 1m bar 开盘价**做限价（对齐回测
-            # 「次日开盘成交」，可复现）；取不到首根 open 才退回实时 close 并记
-            # fallback 事件。保证成交开关开启时走通道对手价。
-            self._refresh_release_price(order)
+            # 放行定价（2026-11-24 分档）：
+            # - 分钟单 → 本周期 bar 的 open（= 回测「下一根同周期 bar open」）；
+            # - 日线单（bar 兜底路径）→ 当日开盘价（`_day_open_price`，只认
+            #   09:30 那根），不再用「当日最早一根 1m bar」的 open 冒充开盘价。
+            # 取不到才退回实时 close 并记 fallback 事件（价格来源可审计）。
+            bar_open = None
+            if (order_period and order_period not in _DAILY_PERIODS
+                    and order_period == bar_period):
+                ohlcv = (getattr(bar, "stocks", {}) or {}).get(order.stock_code)
+                if isinstance(ohlcv, dict):
+                    raw_open = ohlcv.get("open")
+                    try:
+                        raw_open = Decimal(str(raw_open))
+                    except Exception:  # noqa: BLE001
+                        raw_open = None
+                    if raw_open is not None and raw_open > 0:
+                        bar_open = raw_open
+            if bar_open is not None:
+                order._release_priced = True
+                order.price = self._clamp_release_price(order, bar_open)
+                order._price_type_override = self._pre_open_price_type()
+                logger.info(
+                    "[deferred] release price = %s bar open %s (limit) code=%s "
+                    "(session %s)", bar_period, fmt_price(order.price),
+                    order.stock_code, self.session_id)
+                self._recorder.record(
+                    gate="deferred_release", layer="live_gate", action="release",
+                    portfolio_id=getattr(order, "portfolio_id", None),
+                    strategy_id=getattr(order, "strategy_id", None),
+                    stock_code=order.stock_code, bar_time=order.bar_time,
+                    message="放行价=同周期 %s bar 开盘价 %s（限价，涨跌停内收 1 跳）"
+                            % (bar_period, fmt_price(order.price)),
+                )
+            else:
+                self._refresh_release_price(order)
             released.append(order)
         self._signal_bar_deferred = remaining
         return released

@@ -10,13 +10,25 @@
 
 全部用注入时钟 / 假 dispatcher / object.__new__ 轻量桩，不连通道、不落库。
 """
-from datetime import datetime, time as dtime
+from datetime import date, datetime, time as dtime
 from decimal import Decimal
+import json
 from types import SimpleNamespace
 
 import pytest
 
-from core.engine.event import OrderEvent
+from core.engine.event import BarEvent, OrderEvent
+from core.models import LiveDecisionEvent, LiveOrder
+from core.tests.unit.test_live_engine import (
+    _bridge_ping,
+    _db_factory,
+    _deferred_order,
+    _make_dispatcher,
+    _portfolio_single,
+    _pre_open_engine,
+    _pre_open_fixture,
+    _Recorder,
+)
 from core.engine.http_bridge_dispatcher import (
     BridgeOrderRejected,
     HttpBridgeDispatcher,
@@ -284,3 +296,123 @@ def test_breaker_skip_records_event_when_no_price():
     assert orders == []
     assert any(r.get("action") == "skip" and "无有效价格" in r.get("message", "")
                for r in recorded)
+
+
+# ---------------------------------------------------------------- 分档放行
+# 回测口径（backtest_engine/execution_engine）：成交价 = 下一根 bar 的 open。
+# 日线策略 → 次日开盘价；分钟策略 → 下一根**同周期** bar 的 open。
+# 旧实盘实现全局等「首根已闭合 1m bar」，对日线策略是偏离回测（成交价变成
+# 开盘后 1 分钟甚至 10:16 的盘中价）。以下用例锁定改造后的分档行为。
+_D1 = date(2026, 8, 24)
+_D2 = date(2026, 8, 25)
+_STOCK = "600000.SH"
+
+
+def _open_bar(period: str, hh: int, mm: int, open_price: str) -> BarEvent:
+    return BarEvent(
+        stocks={_STOCK: {
+            "open": float(open_price), "high": float(open_price),
+            "low": float(open_price), "close": float(open_price),
+            "volume": 10000,
+        }},
+        bar_time=datetime(2026, 8, 25, hh, mm), period=period,
+    )
+
+
+def test_daily_deferred_released_at_open_without_any_bar():
+    """日线顺延单在 09:30 开盘档直接放行，不需要任何已完成 1m bar。"""
+    factory, port, _ctx, rec, _disp, engine, stock = _pre_open_fixture(
+        price_type="limit")
+    assert len(engine._signal_bar_deferred) == 1
+    engine._day_open_price = lambda code: Decimal("9.42")
+
+    # 注意：全程没有任何 bar 喂给引擎
+    engine._maybe_daily_open_release(datetime(2026, 8, 25, 9, 30, 20))
+
+    assert engine._signal_bar_deferred == []
+    orders = [r for r in rec.requests if r.url.path == "/order"]
+    assert len(orders) == 1
+    payload = json.loads(orders[0].content.decode("utf-8"))
+    assert Decimal(str(payload["price"])) == Decimal("9.42")
+    db = factory()
+    assert db.query(LiveOrder).filter_by(status="submitted").count() == 1
+    evs = db.query(LiveDecisionEvent).filter_by(
+        gate="daily_open_release", action="release").all()
+    db.close()
+    assert [e.stock_code for e in evs] == [stock]
+
+
+def test_daily_open_release_skips_when_open_price_missing():
+    """取不到开盘价：不报单、留队列、下一轮重试；过窗明确标注交首根 bar 兜底。"""
+    _factory, _port, _ctx, rec, _disp, engine, _stock = _pre_open_fixture(
+        price_type="limit")
+    engine._day_open_price = lambda code: None
+
+    engine._maybe_daily_open_release(datetime(2026, 8, 25, 9, 30, 20))
+    assert len(engine._signal_bar_deferred) == 1
+    assert not any(r.url.path == "/order" for r in rec.requests)
+
+    events = []
+    engine._emit_risk_safe = lambda payload, persist=True: events.append(payload)
+    engine._maybe_daily_open_release(datetime(2026, 8, 25, 9, 35))
+    assert [p["rule"] for p in events] == ["open_price_missing"]
+    assert events[0]["action"] == "fallback" and events[0]["count"] == 1
+    # 每交易日一条，不刷屏
+    engine._maybe_daily_open_release(datetime(2026, 8, 25, 9, 36))
+    assert len(events) == 1
+
+
+def test_minute_deferred_released_only_on_its_own_period_bar():
+    """5m 顺延单只在 5m bar 放行（1m bar 不放），价取该 5m bar 的 open。"""
+    factory, _ = _db_factory()
+    port, _ctx = _portfolio_single(period="5m")
+    rec = _Recorder(respond=_bridge_ping(("/ping", "/order", "/price_limit")))
+    disp, _ = _make_dispatcher(rec)
+    engine = _pre_open_engine(factory, port, disp, [_D1, _D2], _STOCK)
+    order = _deferred_order(_STOCK, _D1)
+    engine._signal_bar_deferred = [order]
+
+    released = engine._release_signal_bar_deferred(
+        port, _open_bar("1m", 9, 31, "9.31"))
+    assert released == []
+    assert engine._signal_bar_deferred == [order]   # 等自己的 5m bar
+
+    released = engine._release_signal_bar_deferred(
+        port, _open_bar("5m", 9, 35, "9.35"))
+    assert [o.stock_code for o in released] == [_STOCK]
+    assert order.price == Decimal("9.35")           # = 该周期 bar 的 open
+
+
+def test_daily_deferred_still_released_by_bar_fallback():
+    """日线单的兜底路径仍在（开盘档错过窗口时由分钟 bar 放行，防回归）。"""
+    _factory, port, _ctx, _rec, _disp, engine, stock = _pre_open_fixture(
+        price_type="limit")
+    engine._day_open_price = lambda code: None
+    engine._refresh_release_price = lambda order: "fallback"
+
+    released = engine._release_signal_bar_deferred(
+        port, _open_bar("1m", 9, 31, "9.50"))
+
+    assert [o.stock_code for o in released] == [stock]
+    assert engine._signal_bar_deferred == []
+
+
+def test_day_open_price_rejects_late_first_bar(monkeypatch):
+    """当日首根 bar 迟到（10:15）时不得拿它的 open 冒充开盘价。"""
+    _factory, _port, _ctx, _rec, disp, engine, stock = _pre_open_fixture(
+        price_type="limit")
+    monkeypatch.setattr("core.engine.live_engine.now_shanghai",
+                        lambda: datetime(2026, 8, 25, 10, 16))
+    monkeypatch.setattr(
+        disp, "query_quote",
+        lambda code, period="1m", **kw: (
+            [{"stime": "20260825101500", "open": 9.6, "close": 9.7}]
+            if period == "1m" else []))
+    assert engine._day_open_price(stock) is None
+
+    monkeypatch.setattr(
+        disp, "query_quote",
+        lambda code, period="1m", **kw: (
+            [{"stime": "20260825093100", "open": 9.42, "close": 9.5}]
+            if period == "1m" else []))
+    assert engine._day_open_price(stock) == Decimal("9.42")
