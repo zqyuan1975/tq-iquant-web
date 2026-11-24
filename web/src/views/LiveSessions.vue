@@ -47,6 +47,7 @@ import {
 } from '../api'
 import PageHeader from '../components/PageHeader.vue'
 import ApprovalPanel from '../components/ApprovalPanel.vue'
+import MinuteObservability from '../components/MinuteObservability.vue'
 import { deriveBlockCode } from '../utils/blockCode'
 
 const sessions = ref<LiveSessionItem[]>([])
@@ -435,6 +436,10 @@ const sessionChannelBadgeTitle = computed(() => {
 // 原生分钟数据源（会话详情 minute_source）：默认关闭时展示启用说明；开启后
 // 常驻展示最后前进时刻，停顿时按滞后秒数升级为醒目告警。
 const minuteSource = ref<any>(null)
+// 分钟下载观测（只读）：取数路由 / 下载线程 / 覆盖缺口；缺字段时组件自行兜底
+const minuteRoute = ref<any>(null)
+const minuteCoverage = ref<any>(null)
+const minuteDownload = ref<any>(null)
 const minuteSourceAlert = computed(
   () => minuteSource.value?.enabled === true && minuteSource.value?.stalled === true,
 )
@@ -2128,6 +2133,9 @@ async function refreshBridgeOnline() {
     bridgeOnline.value = null
     watchdogAlarms.value = []
     minuteSource.value = null
+    minuteRoute.value = null
+    minuteCoverage.value = null
+    minuteDownload.value = null
     return
   }
   const target = sessions.value.find((s) => s.id === id)
@@ -2135,6 +2143,9 @@ async function refreshBridgeOnline() {
     bridgeOnline.value = null
     watchdogAlarms.value = []
     minuteSource.value = null
+    minuteRoute.value = null
+    minuteCoverage.value = null
+    minuteDownload.value = null
     return
   }
   try {
@@ -2142,6 +2153,9 @@ async function refreshBridgeOnline() {
     if (activeSessionId !== id) return  // 在途期间已切走 → 丢弃
     bridgeOnline.value = typeof d?.bridge_online === 'boolean' ? d.bridge_online : null
     minuteSource.value = (d as any)?.minute_source ?? null
+    minuteRoute.value = (d as any)?.minute_route ?? null
+    minuteCoverage.value = (d as any)?.minute_coverage ?? null
+    minuteDownload.value = (d as any)?.minute_download ?? null
   } catch { /* 保持现状 */ }
   try {
     const w = await getWatchdogStatus()
@@ -2224,6 +2238,11 @@ onUnmounted(() => {
           （滞后 {{ minuteSourceText.lag }}），当前 1m/5m 读本地原生文件；停滞将自动回落快照合成。
         </template>
       </div>
+      <MinuteObservability
+        :route="minuteRoute"
+        :coverage="minuteCoverage"
+        :download="minuteDownload"
+      />
     </div>
   </div>
 
