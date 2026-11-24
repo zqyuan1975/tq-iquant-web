@@ -115,8 +115,13 @@ def settings(cfg: Optional[dict]) -> dict:
             # 盘中/盘后都要当日 as_of，否则 15:00 前会被截断到上一交易日
             "as_of_today": True,
         })
+    # 显式 0 表示「不等待、立即补跑」，不能被 `or 5` 吞掉；
+    # 只有缺省/None/空串才回落默认 5 分钟。
+    raw_cooldown = raw.get("retry_cooldown_minutes")
+    if raw_cooldown is None or raw_cooldown == "":
+        raw_cooldown = 5
     try:
-        cooldown = float(raw.get("retry_cooldown_minutes", 5) or 5)
+        cooldown = float(raw_cooldown)
     except (TypeError, ValueError):
         cooldown = 5.0
     return {

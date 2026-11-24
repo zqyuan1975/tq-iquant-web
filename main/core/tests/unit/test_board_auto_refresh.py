@@ -92,6 +92,21 @@ def test_settings_two_tracks_and_yaml_sexagesimal():
     assert _hm_minutes("oops") is None
 
 
+def test_retry_cooldown_explicit_zero_preserved():
+    """回归：显式 0 表示「不等待、立即补跑」，不得被 `or 5` 折叠回默认。"""
+    def cooldown(raw):
+        return settings({"investment_board": {
+            "auto_refresh": {"retry_cooldown_minutes": raw}}})[
+                "retry_cooldown_minutes"]
+
+    assert cooldown(0) == 0.0
+    assert cooldown(0.0) == 0.0
+    assert cooldown(-3) == 0.0          # 负数夹到 0，仍不是默认 5
+    assert cooldown(None) == 5.0        # 缺省
+    assert cooldown("") == 5.0          # 空串
+    assert cooldown("oops") == 5.0      # 非法
+
+
 def test_non_trading_day_skipped(session_factory):
     calls, now = [], [SATURDAY]
     sched = _make(session_factory, calls, now)
