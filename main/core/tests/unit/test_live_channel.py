@@ -217,6 +217,12 @@ def test_channel_ths_no_engine_probes_client_window(monkeypatch):
     """同花顺：xiadan/hexin 窗口在 → 在线；同一套 online 布尔语义。"""
     monkeypatch.setattr(svc, "load_config", lambda: _cfg(False))
     monkeypatch.setattr(svc, "_window_present", lambda key: key == "ths")
+    # OCR 就绪探测走独立用例；这里只关心在线判定，避免真实加载 ddddocr/WinRT。
+    monkeypatch.setattr(
+        svc, "_ths_ocr_status",
+        lambda running=None: {"ready": True,
+                              "backends": {"ddddocr": True, "winrt": True},
+                              "last_error": None})
     svc._PROBE_CACHE.clear()
     data = svc.channel_status(engine_key="ths", engines={})
     assert data["online"] is True
@@ -225,6 +231,50 @@ def test_channel_ths_no_engine_probes_client_window(monkeypatch):
     monkeypatch.setattr(svc, "_window_present", lambda key: False)
     data = svc.channel_status(engine_key="ths", engines={})
     assert data["online"] is False
+
+
+def test_channel_status_ths_exposes_ocr_ready_and_backends(monkeypatch):
+    """验证码 OCR 真实可用性随通道状态返回（字段名即前端契约）。"""
+    monkeypatch.setattr(svc, "load_config", lambda: _cfg(True))
+    monkeypatch.setattr(svc, "_window_present", lambda key: True)
+    monkeypatch.setattr(
+        svc, "_ths_ocr_status",
+        lambda running=None: {
+            "ready": True,
+            "backends": {"ddddocr": True, "winrt": False},
+            "last_error": {"message": "验证码识别失败（OCR 未返回 4 位数字）",
+                           "at": "2026-11-24T09:31:05"},
+        })
+    svc._PROBE_CACHE.clear()
+    data = svc.channel_status(engine_key="ths", engines={})
+    assert data["ocr_ready"] is True
+    assert data["ocr_backends"] == {"ddddocr": True, "winrt": False}
+    assert data["ocr_last_error"] == {
+        "message": "验证码识别失败（OCR 未返回 4 位数字）",
+        "at": "2026-11-24T09:31:05",
+    }
+    # 其它通道不伪造该字段
+    tdx = svc.channel_status(engine_key="tdx", engines={})
+    assert "ocr_ready" not in tdx
+
+
+def test_channel_health_passes_through_ocr_fields(monkeypatch):
+    """channel-health 的 primary/backup 明细透传 OCR 三字段，不丢信息。"""
+    monkeypatch.setattr(
+        svc, "channel_status",
+        lambda **kw: {
+            "label": "同花顺", "online": True, "online_source": "probe",
+            "engine_running": False, "configured": True, "detail": "",
+            "stale": False, "checked_at": None, "probe_note": "",
+            "probe_degraded": False,
+            "ocr_ready": False,
+            "ocr_backends": {"ddddocr": False, "winrt": False},
+            "ocr_last_error": None,
+        })
+    out = svc._channel_health_one("ths", {}, None)
+    assert out["ocr_ready"] is False
+    assert out["ocr_backends"] == {"ddddocr": False, "winrt": False}
+    assert out["ocr_last_error"] is None
 
 
 def test_channel_running_engine_reports_real_heartbeat(monkeypatch):

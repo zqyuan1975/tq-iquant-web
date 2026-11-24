@@ -34,7 +34,7 @@ import {
   getLiveGateSnapshots,
   type LiveSplitRemainderItem,
   type LiveGateSnapshotItem,
-  type LiveSessionChannelHealth, type LiveChannelGuard,
+  type LiveSessionChannelHealth, type LiveChannelGuard, type LiveOcrStatus,
   recoverLiveBreaker, getLiveChannel, testLiveChannel, sendUserBlock, getFormulas, getWatchdogStatus,
   getLiveAccountPreview, resetLiveBaseline,
   getLiveParamsDrift, getLiveCashFlows, createLiveCashFlow,
@@ -2025,6 +2025,21 @@ const editForm = ref({
   pairing_plan_id: null as number | null,
 })
 const editHealth = ref<LiveSessionChannelHealth | null>(null)
+/** 验证码 OCR 结构化诊断：兼容顶层/主通道两种挂载位置；字段未就绪为 null。 */
+const editOcr = computed<LiveOcrStatus | null>(() => {
+  const h = editHealth.value as any
+  if (!h) return null
+  const raw = h.ocr_status ?? h.ocr ?? h.primary?.ocr_status ?? h.primary?.ocr
+  return raw && typeof raw === 'object' ? (raw as LiveOcrStatus) : null
+})
+/** 验证码 OCR 可用性：后端字段未就绪（旧版本/未返回）时按「未知」展示，不误报不可用。 */
+const editOcrReady = computed<boolean | null>(() => {
+  const structured = editOcr.value
+  if (structured && typeof structured.ready === 'boolean') return structured.ready
+  const h = editHealth.value
+  const legacy = h?.ocr_ready ?? h?.primary?.ocr_ready
+  return typeof legacy === 'boolean' ? legacy : null
+})
 const editSwitching = ref(false)
 async function loadEditHealth(sessionId: number) {
   editHealth.value = null
@@ -3893,6 +3908,29 @@ onUnmounted(() => {
             :disabled="editSwitching" data-test="channel-failover"
             @click="switchToBackup"
           >{{ editSwitching ? '切换中…' : '一键切换备用通道' }}</button>
+          <span
+            v-if="editHealth.primary?.engine === 'ths'"
+            class="badge" style="margin-left:8px"
+            :class="editOcrReady === true ? 'badge-green'
+              : editOcrReady === false ? 'badge-red' : 'badge-gray'"
+            data-test="channel-ocr-ready"
+            :title="editOcrReady === true
+              ? (editOcr?.backends
+                ? `ddddocr：${editOcr.backends.ddddocr ? '就绪' : '未就绪'}；Windows OCR：${editOcr.backends.winrt ? '就绪' : '未就绪'}`
+                : 'ddddocr 或 Windows OCR 已就绪：可识别验证码并回查合同编号')
+              : editOcrReady === false
+                ? 'ddddocr 与 Windows OCR 均未就绪：同花顺下单会被 fail-closed 拒绝'
+                : '后端未返回 OCR 可用性字段（旧版本），无法判定；不代表不可用'"
+          >验证码 OCR：{{
+            editOcrReady === true ? '可用'
+              : editOcrReady === false ? '不可用（下单将被拒）' : '状态未知'
+          }}</span>
+          <div
+            v-if="editOcr?.last_error"
+            style="font-size:11px;color:var(--red);margin-top:4px"
+          >
+            最近一次验证码失败：{{ editOcr.last_error.message }}（{{ editOcr.last_error.at || '时间未知' }}）
+          </div>
           <div style="font-size:11px;color:var(--ink-faint);margin-top:4px">{{ editHealth.advice }}</div>
         </div>
         <label>资金池模式</label>

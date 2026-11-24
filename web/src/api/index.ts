@@ -3143,6 +3143,12 @@ export async function reorderLiveSplitRemainders(id: number, changeIds?: number[
 }
 
 /** B2：主/备通道健康探活（只读）。 */
+export interface LiveOcrStatus {
+  ready: boolean
+  backends?: { ddddocr?: boolean; winrt?: boolean }
+  last_error?: { message: string; at?: string | null } | null
+}
+
 export interface LiveChannelHealth {
   engine: string
   label: string
@@ -3153,6 +3159,11 @@ export interface LiveChannelHealth {
   detail?: string
   stale?: boolean
   checked_at?: string | null
+  /** 同花顺验证码 OCR 可用性（ddddocr 或 Windows OCR 任一就绪）；缺省=未知 */
+  ocr_ready?: boolean | null
+  /** 结构化 OCR 诊断（后端字段落地后使用；缺省=未提供） */
+  ocr_status?: LiveOcrStatus | null
+  ocr?: LiveOcrStatus | null
 }
 
 export interface LiveSessionChannelHealth {
@@ -3161,6 +3172,10 @@ export interface LiveSessionChannelHealth {
   backup: LiveChannelHealth | null
   failover_enabled: boolean
   advice: string
+  /** 验证码 OCR 可用性（同花顺）；缺省=后端未提供，界面显示「状态未知」 */
+  ocr_ready?: boolean | null
+  ocr_status?: LiveOcrStatus | null
+  ocr?: LiveOcrStatus | null
 }
 
 export async function getLiveSessionChannelHealth(id: number) {

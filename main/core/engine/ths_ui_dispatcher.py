@@ -234,6 +234,9 @@ class ThsUiDispatcher(OrderDispatcher):
         self._last_submit_time: tuple = ("", "")
         #: 最近一次真实键入的数量（钳量后）；0=未产生有效指令。
         self._last_final_qty = 0
+        #: 验证码 OCR 诊断：最近一次**识别失败**的原因与时间（只读状态出口用）。
+        self._captcha_last_error = ""
+        self._captcha_last_error_at: Optional[str] = None
         self._last_enqueued_order_id: Optional[str] = None
         # 遮挡校验诊断：最近一次点击点最上层的非 THS 窗口句柄（错误文案用）
         self._last_occluder_hwnd = 0
@@ -1102,6 +1105,31 @@ class ThsUiDispatcher(OrderDispatcher):
         except Exception:
             return False
 
+    def _record_captcha_error(self, message: str) -> None:
+        """记录最近一次验证码识别失败（只读诊断，不影响 fail-closed 判定）。"""
+        self._captcha_last_error = str(message or "")
+        self._captcha_last_error_at = datetime.now().isoformat(timespec="seconds")
+
+    def ocr_status(self) -> dict:
+        """验证码 OCR 只读状态：总开关结果 + 分后端就绪 + 最近一次失败。
+
+        只做就绪探测（ddddocr 单例/缓存的 WinRT 引擎），不弹窗、不下单、
+        不改 ``captcha_ocr`` 语义。
+        """
+        ddddocr_ok = _get_ddddocr() is not None
+        winrt_ok = self._get_ocr_engine() is not None
+        last_error = None
+        if self._captcha_last_error:
+            last_error = {
+                "message": self._captcha_last_error,
+                "at": self._captcha_last_error_at,
+            }
+        return {
+            "ready": ddddocr_ok or winrt_ok,
+            "backends": {"ddddocr": ddddocr_ok, "winrt": winrt_ok},
+            "last_error": last_error,
+        }
+
     def _ocr_ready(self) -> bool:
         """验证码 OCR 是否有可用路径：ddddocr 或 Windows/WinRT 任一就绪即放行。
 
@@ -1116,6 +1144,7 @@ class ThsUiDispatcher(OrderDispatcher):
             return False
         if not self._ocr_ready():
             self._last_error = "验证码 OCR 不可用（ddddocr 与 Windows OCR 均未就绪）"
+            self._record_captcha_error(self._last_error)
             self._dismiss_captcha(dlg)
             return False
         try:
@@ -1144,6 +1173,7 @@ class ThsUiDispatcher(OrderDispatcher):
                 code = self._ocr_digits(crop)
                 if not code:
                     self._last_error = "验证码识别失败"
+                    self._record_captcha_error("验证码识别失败（OCR 未返回 4 位数字）")
                     self._dismiss_captcha(dlg)
                     return False
                 if not self._type_edit_keys(edit, code):
@@ -1170,9 +1200,11 @@ class ThsUiDispatcher(OrderDispatcher):
                 if self._find_captcha_dialog() is None:
                     return True
             self._dismiss_captcha(self._find_captcha_dialog())
+            self._record_captcha_error("验证码识别未通过（5 次尝试后弹窗仍未关闭）")
             return False
-        except Exception:
+        except Exception as exc:
             self._dismiss_captcha(self._find_captcha_dialog())
+            self._record_captcha_error("验证码识别异常：%s" % type(exc).__name__)
             return False
 
     @staticmethod
@@ -2768,4 +2800,19 @@ class ThsUiDispatcher(OrderDispatcher):
             signal_type=order.signal_type,
             signal_name=order.signal_name,
         )
+
+
+def ths_ocr_status() -> dict:
+    """环境级验证码 OCR 状态（无运行实例时供只读接口展示）。
+
+    与 ``ThsUiDispatcher.ocr_status()`` 同口径，只是没有实例、因此没有
+    “最近一次失败”历史（``last_error`` 恒为 None）。
+    """
+    ddddocr_ok = _get_ddddocr() is not None
+    winrt_ok = ThsUiDispatcher._get_ocr_engine() is not None
+    return {
+        "ready": ddddocr_ok or winrt_ok,
+        "backends": {"ddddocr": ddddocr_ok, "winrt": winrt_ok},
+        "last_error": None,
+    }
 

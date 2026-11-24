@@ -421,8 +421,15 @@ function testTdx() { return testChannel('tdx_tq') }
             <div class="field">
               <label style="display:flex;align-items:center;gap:8px;cursor:pointer">
                 <input v-model="config.ths_ui.captcha_ocr" type="checkbox" style="width:auto" />
-                启用验证码 OCR（使用 Windows 内置 OCR，默认关闭）
+                启用验证码 OCR（ddddocr 优先，Windows 内置 OCR 兜底；默认关闭）
               </label>
+              <p v-if="!config.ths_ui.captcha_ocr" class="cfg-hint" style="color:var(--warn)">
+                关闭即拒单：同花顺下单后必须复制委托表回查合同编号，而复制会触发验证码；
+                OCR 未启用时后端按 fail-closed 直接拒绝下单，不会先发单再报错。
+              </p>
+              <p v-else class="cfg-hint">
+                两条识别路径任一可用即可工作；ddddocr 与 Windows OCR 都未就绪时仍会 fail-closed 拒单。
+              </p>
             </div>
             <div class="field">
               <label>执行模式</label>

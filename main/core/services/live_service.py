@@ -1298,6 +1298,31 @@ def _tdx_account_detail(engine) -> str:
             else "未检测到客户端登录账号")
 
 
+def _ths_ocr_status(running: Optional[LiveEngine] = None) -> dict:
+    """同花顺验证码 OCR 只读状态（供 /channel 与 channel-health 复用）。
+
+    - 有运行中的引擎：读实例上的 ``ocr_status()``（含最近一次识别失败）；
+    - 无引擎：只探测两个后端是否就绪，不构造 UI 客户端、不弹窗、不下单。
+    """
+    dispatcher = getattr(running, "dispatcher", None) if running is not None else None
+    getter = getattr(dispatcher, "ocr_status", None)
+    if callable(getter):
+        try:
+            status = getter()
+            if isinstance(status, dict):
+                return status
+        except Exception:  # noqa: BLE001 - 状态探测失败不能拖垮通道健康接口
+            logger.warning("ths ocr status probe failed", exc_info=True)
+    try:
+        from core.engine.ths_ui_dispatcher import ths_ocr_status
+        return ths_ocr_status()
+    except Exception:  # noqa: BLE001
+        logger.warning("ths ocr backend probe failed", exc_info=True)
+        return {"ready": False,
+                "backends": {"ddddocr": False, "winrt": False},
+                "last_error": None}
+
+
 def channel_status(engine: Optional[LiveEngine] = None,
                    engine_key: Optional[str] = None,
                    engines: Optional[Dict[int, LiveEngine]] = None,
@@ -1387,6 +1412,12 @@ def channel_status(engine: Optional[LiveEngine] = None,
         if running is None and online:
             detail += "（桥在线，无运行引擎）"
     data["detail"] = detail
+    # P1：同花顺验证码 OCR 真实可用性（只读；字段缺省=非该通道，不伪造 False）
+    if key == "ths":
+        ocr = _ths_ocr_status(running)
+        data["ocr_ready"] = ocr.get("ready")
+        data["ocr_backends"] = ocr.get("backends")
+        data["ocr_last_error"] = ocr.get("last_error")
     return data
 
 
@@ -3685,7 +3716,7 @@ def _channel_health_one(engine_key: Optional[str],
         return None
     data = channel_status(engine_key=engine_key, engines=engines,
                           probe_deadline=probe_deadline)
-    return {
+    out = {
         "engine": engine_key,
         "label": data.get("label") or ENGINES_META.get(engine_key, (None, engine_key))[1],
         "online": data.get("online"),
@@ -3699,6 +3730,11 @@ def _channel_health_one(engine_key: Optional[str],
         "probe_note": data.get("probe_note") or "",
         "probe_degraded": bool(data.get("probe_degraded")),
     }
+    # 同花顺：透传验证码 OCR 就绪状态与最近一次识别失败（其它通道无此字段）
+    for field in ("ocr_ready", "ocr_backends", "ocr_last_error"):
+        if field in data:
+            out[field] = data.get(field)
+    return out
 
 
 def session_channel_health(db: Session, session_id: int,

@@ -192,6 +192,88 @@ def test_solve_captcha_rejects_when_no_ocr_backend(monkeypatch):
     assert "OCR" in d._last_error
 
 
+# ---- 只读状态出口：ocr_status() 的四组合与最近失败 ----
+
+def test_ocr_status_both_backends(monkeypatch):
+    d = _mk_direct_dispatcher()
+    monkeypatch.setattr(
+        "core.engine.ths_ui_dispatcher._get_ddddocr", lambda: object())
+    monkeypatch.setattr(d, "_get_ocr_engine", lambda: object())
+    assert d.ocr_status() == {
+        "ready": True,
+        "backends": {"ddddocr": True, "winrt": True},
+        "last_error": None,
+    }
+
+
+def test_ocr_status_only_ddddocr(monkeypatch):
+    d = _mk_direct_dispatcher()
+    monkeypatch.setattr(
+        "core.engine.ths_ui_dispatcher._get_ddddocr", lambda: object())
+    monkeypatch.setattr(d, "_get_ocr_engine", lambda: None)
+    assert d.ocr_status() == {
+        "ready": True,
+        "backends": {"ddddocr": True, "winrt": False},
+        "last_error": None,
+    }
+
+
+def test_ocr_status_only_winrt(monkeypatch):
+    d = _mk_direct_dispatcher()
+    monkeypatch.setattr(
+        "core.engine.ths_ui_dispatcher._get_ddddocr", lambda: None)
+    monkeypatch.setattr(d, "_get_ocr_engine", lambda: object())
+    assert d.ocr_status() == {
+        "ready": True,
+        "backends": {"ddddocr": False, "winrt": True},
+        "last_error": None,
+    }
+
+
+def test_ocr_status_neither_backend(monkeypatch):
+    d = _mk_direct_dispatcher()
+    monkeypatch.setattr(
+        "core.engine.ths_ui_dispatcher._get_ddddocr", lambda: None)
+    monkeypatch.setattr(d, "_get_ocr_engine", lambda: None)
+    assert d.ocr_status() == {
+        "ready": False,
+        "backends": {"ddddocr": False, "winrt": False},
+        "last_error": None,
+    }
+
+
+def test_ocr_status_reports_last_recognition_failure(monkeypatch):
+    """识别失败后 status 带原因与时间；就绪性判定不受诊断字段影响。"""
+    d = _mk_direct_dispatcher()
+    monkeypatch.setattr(
+        "core.engine.ths_ui_dispatcher._get_ddddocr", lambda: None)
+    monkeypatch.setattr(d, "_get_ocr_engine", lambda: None)
+    monkeypatch.setattr(
+        "core.engine.ths_ui_dispatcher.ImageGrab",
+        SimpleNamespace(grab=lambda bbox=None: None))
+    monkeypatch.setattr(d, "_dismiss_captcha", lambda dlg: None)
+    assert d._solve_captcha(object()) is False
+
+    status = d.ocr_status()
+    assert status["ready"] is False
+    assert status["backends"] == {"ddddocr": False, "winrt": False}
+    assert status["last_error"]["message"].startswith("验证码 OCR 不可用")
+    assert status["last_error"]["at"]  # ISO 时间戳非空
+
+
+def test_ocr_status_env_probe_without_instance(monkeypatch):
+    """无运行实例的环境级探测：同样给出分后端明细，last_error 恒为 None。"""
+    from core.engine import ths_ui_dispatcher as mod
+    monkeypatch.setattr(mod, "_get_ddddocr", lambda: object())
+    monkeypatch.setattr(
+        mod.ThsUiDispatcher, "_get_ocr_engine", staticmethod(lambda: None))
+    assert mod.ths_ocr_status() == {
+        "ready": True,
+        "backends": {"ddddocr": True, "winrt": False},
+        "last_error": None,
+    }
+
+
 # ---- TDX「下单确认」弹窗自动点击（无人值守）----
 
 def test_tdx_pick_confirm_dialog_selects_new_dialog(monkeypatch):
