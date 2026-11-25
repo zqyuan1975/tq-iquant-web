@@ -15049,7 +15049,6 @@ class LiveEngine:
                 break
         return done
 
-
     # ---------------- 持仓恢复 ----------------
     @staticmethod
     def _seam_anchor_payload(raw) -> Tuple[list, Optional[int]]:
