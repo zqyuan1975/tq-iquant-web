@@ -16,7 +16,7 @@
 from dataclasses import dataclass, field
 from datetime import date
 from decimal import Decimal
-from typing import Callable, Dict, Iterable, List, Optional
+from typing import Callable, Dict, Iterable, List, Optional, Tuple
 
 from .market_rules import trading_days_between
 
@@ -98,6 +98,23 @@ class CorporateActionTimeline:
 
     def suspended_codes(self, day: date) -> frozenset:
         return frozenset(c for c in self._by_code if self.is_suspended(c, day))
+
+    def ex_rights_days(self) -> Dict[Tuple[str, date], Tuple[Decimal, Decimal]]:
+        """按 ``(code, ex_date)`` 汇总除权除息参考价所需的「每股现金 + 送转比例」。
+
+        交易所除权参考价 = (前收 - 每股现金红利) / (1 + 每股送转比例)。配股不参与
+        （与 ``apply_day`` 放弃配股同口径）。同一天既有分红又有送转时按加总处理。
+        """
+        out: Dict[Tuple[str, date], list] = {}
+        for ev in self._events:
+            if ev.event_type not in ("dividend", "split"):
+                continue
+            cell = out.setdefault((ev.code, ev.ex_date), [Decimal("0"), Decimal("0")])
+            if ev.event_type == "dividend" and ev.cash_per_share is not None:
+                cell[0] += ev.cash_per_share
+            elif ev.event_type == "split" and ev.share_ratio is not None:
+                cell[1] += ev.share_ratio
+        return {k: (v[0], v[1]) for k, v in out.items() if v[0] or v[1]}
 
     def digest(self) -> str:
         """事件集合指纹（进 params_snapshot，供跨记录口径核对）。"""
@@ -291,6 +308,21 @@ def apply_day(portfolio, timeline: Optional[CorporateActionTimeline], day: date,
                     continue
                 # 分红现金入组合账户（实盘与回测同一处落账；实盘另有台账持久化）
                 portfolio.account.add_cash(amount)
+                # 除息基准调整（2026-11-25）：不复权价空间下除息日价格下跳≈每股
+                # 派息，若成本/峰值不随之同减，"分红"会被算成"亏损/回撤"而凭空
+                # 触发固定止损/移动止损。前复权/后复权序列在除息日本就连续，
+                # 此时再减一次属双重扣减，必须跳过。
+                if mode in ("backtest_raw", "live"):
+                    dps = amount / Decimal(pos.quantity)
+                    pos.adjust_cash_dividend(
+                        dps, adjust_cost=(mode != "live"))
+                    hook = getattr(portfolio, "peak_adjust_hook", None)
+                    if hook is not None and pos.highest_price > 0:
+                        try:
+                            hook(portfolio.portfolio_id, code,
+                                 pos.highest_price)
+                        except Exception:  # noqa: BLE001 — 观测链路不得打断主链路
+                            pass
                 actions.append(AppliedAction(
                     KIND_DIVIDEND_CASH, code, cash=amount,
                     strategy_id=getattr(ctx, "strategy_id", None),

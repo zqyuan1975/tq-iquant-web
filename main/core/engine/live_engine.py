@@ -1065,11 +1065,13 @@ class LiveEngine:
         # live_position_peaks；回测不注入 hook，零影响。_peak_rows = 已知在表里的
         # (组合, 代码) 键，用于清仓删行与空转早退。
         self._peak_buffer: Dict[
-            Tuple[int, str], Tuple[Decimal, Optional[datetime], str]] = {}
+            Tuple[int, str],
+            Tuple[Decimal, Optional[datetime], str, bool]] = {}
         self._peak_rows: Set[Tuple[int, str]] = set()
         self._peak_lock = threading.Lock()
         for p in portfolios:
             p.peak_persist_hook = self._note_peak_raised
+            p.peak_adjust_hook = self._note_peak_adjusted
         self._poll_interval = poll_interval
         # B5 市场状态闸（默认关）：regime_provider(code, end_date) → {date: Decimal}
         # 基准收盘全量历史；每组合每日首个 bar 重建因果跟踪器并注入
@@ -14657,7 +14659,31 @@ class LiveEngine:
             prev = self._peak_buffer.get(key)
             if prev is not None and value <= prev[0]:
                 return
-            self._peak_buffer[key] = (value, bar_time, source)
+            # 待写缓冲里若是一条「除息强制下调」，DB 里仍是除息前的旧峰值，
+            # 这次抬峰必须继续带强制标记，否则灌库时的「只升不降」WHERE 会把
+            # 下调后的新基准挡在库外。
+            force = bool(prev[3]) if prev is not None else False
+            self._peak_buffer[key] = (value, bar_time, source, force)
+
+    def _note_peak_adjusted(self, portfolio_id: int, code: str, price) -> None:
+        """现金分红除息：峰值随价格空间同减，强制落库（2026-11-25）。
+
+        与 ``_note_peak_raised`` 的「只升不降」相反，这里必须覆盖库里更高的
+        除息前峰值，否则重启补种会把旧峰值读回来、除息日误触发移动止损。
+        ``peak_bar_time`` / ``peak_source`` 保持原值（下调不是新高峰）。
+        """
+        try:
+            value = Decimal(str(price))
+        except Exception:  # noqa: BLE001
+            return
+        if value <= 0:
+            return
+        key = (int(portfolio_id), str(code))
+        with self._peak_lock:
+            prev = self._peak_buffer.get(key)
+            if prev is not None and prev[3] and prev[0] >= value:
+                return
+            self._peak_buffer[key] = (value, None, "corporate_action", True)
 
     def _load_position_peaks(
             self, db: Session
@@ -14763,7 +14789,7 @@ class LiveEngine:
             with self._peak_lock:
                 pending = list(self._peak_buffer.items())
                 self._peak_buffer.clear()
-            for (pid, code), (price, bar_time, source) in pending:
+            for (pid, code), (price, bar_time, source, force) in pending:
                 stmt = sqlite_insert(LivePositionPeak).values(
                     live_session_id=self.session_id,
                     portfolio_strategy_id=pid,
@@ -14773,6 +14799,23 @@ class LiveEngine:
                     peak_source=source,
                     updated_at=now,
                 )
+                if force:
+                    # 除息下调（2026-11-25）：必须覆盖库里更高的旧峰值，
+                    # 只改 highest_price（peak_bar_time/source 保持原值）。
+                    stmt = stmt.on_conflict_do_update(
+                        index_elements=[
+                            "live_session_id", "portfolio_strategy_id",
+                            "stock_code"],
+                        set_={
+                            "highest_price": stmt.excluded.highest_price,
+                            "updated_at": stmt.excluded.updated_at,
+                        },
+                    )
+                    db.execute(stmt)
+                    with self._peak_lock:
+                        self._peak_rows.add((pid, code))
+                    changed = True
+                    continue
                 # 等值（excluded == 当前）也命中 WHERE：只刷新 updated_at 心跳，
                 # 峰值与 peak_bar_time 用 CASE 保持原值 → 绝不写低、也不清空来源时间。
                 raised = LivePositionPeak.highest_price < stmt.excluded.highest_price

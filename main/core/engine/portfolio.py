@@ -318,6 +318,10 @@ class Portfolio:
         # （live_position_peaks），重启后 recover 优先读表。回测保持 None → 零影响。
         # 签名：hook(portfolio_id, stock_code, highest_price, bar_time)。
         self.peak_persist_hook: Optional[Callable] = None
+        # 峰值「下调」回调（2026-11-25）：现金分红除息时峰值随价格空间同减，
+        # 与抬峰 hook 的「只升不降」语义相反，必须走独立入口强制落库。
+        # 仅实盘注入；回测不注入（峰值只在内存里）。
+        self.peak_adjust_hook: Optional[Callable] = None
 
     def set_recorder(self, recorder) -> None:
         """注入决策采集器（回测/实盘引擎在装配后调用），同步给 risk_manager。"""

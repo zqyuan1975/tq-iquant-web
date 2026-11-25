@@ -442,3 +442,206 @@ def test_sh_split_falls_back_when_next_trade_day_unknown():
     assert pos.available_shares_on(date(2026, 7, 20)) == 1300
 
 
+# ---------------- 除息基准调整（2026-11-25） ----------------
+# 真实样本：600256.SH 2025-07-18 除息，每股派 0.622 元（前收 6.08 → 除息日
+# 开 5.48 / 收 5.45，下跳幅度 = 派息额）。若成本与峰值不随同减，
+# 收盘 5.45 相对成本 6.08 的 -10.36% 会被算成止损/移动止损回撤 → 凭空触发。
+DIV_CODE = "600256.SH"
+DIV_CPS = Decimal("0.622")
+DIV_PREV_CLOSE = Decimal("6.08")
+DIV_EX_DATE = date(2025, 7, 18)
+
+
+def _hold_div(port, qty=1000):
+    ctx = port.strategies[0]
+    pos = Position(DIV_CODE)
+    ctx.positions[DIV_CODE] = pos
+    pos.buy(qty, DIV_PREV_CLOSE, datetime(2025, 7, 17))
+    pos.highest_price = DIV_PREV_CLOSE
+    return pos
+
+
+def _div_timeline():
+    return CorporateActionTimeline([
+        CorporateActionEvent(code=DIV_CODE, event_type="dividend",
+                             ex_date=DIV_EX_DATE,
+                             cash_per_share=DIV_CPS),
+    ])
+
+
+def _div_klines():
+    """真实日线（通达信 .day 原始价，不复权）。"""
+    return {DIV_CODE: {"1d": pl.DataFrame({
+        "datetime": [datetime(2025, 7, 16), datetime(2025, 7, 17),
+                     datetime(2025, 7, 18), datetime(2025, 7, 21)],
+        "Open": [Decimal("6.03"), Decimal("6.09"), Decimal("5.48"), Decimal("5.45")],
+        "High": [Decimal("6.10"), Decimal("6.11"), Decimal("5.50"), Decimal("5.54")],
+        "Low": [Decimal("6.02"), Decimal("6.02"), Decimal("5.43"), Decimal("5.45")],
+        "Close": [Decimal("6.09"), Decimal("6.08"), Decimal("5.45"), Decimal("5.53")],
+        "Volume": [1000, 1000, 1000, 1000],
+    })}}
+
+
+def _risk_ctx(port, *, stop=Decimal("0.05"), take=Decimal("0.99"),
+              trail=Decimal("0")):
+    port.strategies[0].strategy_risk = StrategyRiskManager(
+        stop_loss_ratio=stop, take_profit_ratio=take,
+        trailing_stop_ratio=trail)
+
+
+def test_ex_dividend_no_false_stop_loss_backtest_raw():
+    """不复权回测（exact）：除息日不因价格下跳触发固定止损。"""
+    port = _portfolio()
+    _risk_ctx(port)
+    pos = _hold_div(port)
+    port.corporate_action_mode = "backtest_raw"
+    port.corporate_timeline = _div_timeline()
+
+    result = BacktestEngine().run(
+        port, klines=_div_klines(), signal_cache={})
+
+    assert not [t for t in result["trades"] if t.trade_type == TradeType.SELL]
+    # 成本按每股派息同减：6.08 - 0.622 = 5.458（峰值除息日同样下调到 5.458，
+    # 之后被 2025-07-21 收盘 5.53 重新抬高）
+    assert pos.avg_cost == Decimal("5.458")
+    assert pos.highest_price == Decimal("5.53")
+    # 现金分红照常入账（0.622 × 1000）
+    assert port.account.cash == Decimal("100000") + Decimal("622.00")
+
+
+def test_ex_dividend_no_false_trailing_stop_backtest_raw():
+    """不复权回测（exact）：除息日不因价格下跳触发移动止损。"""
+    port = _portfolio()
+    _risk_ctx(port, stop=Decimal("0.99"), trail=Decimal("0.03"))
+    pos = _hold_div(port)
+    port.corporate_action_mode = "backtest_raw"
+    port.corporate_timeline = _div_timeline()
+
+    result = BacktestEngine().run(
+        port, klines=_div_klines(), signal_cache={})
+
+    assert not [t for t in result["trades"] if t.trade_type == TradeType.SELL]
+    # 除息日收盘 5.45 相对下调后的峰值 5.458 仅 -0.15%，远小于 3%；
+    # 若峰值仍是除息前的 6.08，回撤 10.36% 必然触发（这正是修复前的情形）。
+    assert pos.highest_price == Decimal("5.53")
+
+
+def test_ex_dividend_no_false_stop_loss_live():
+    """实盘：柜台成本已摊薄（mirror_bridge），内核只调峰值且不二次扣减成本。"""
+    from core.engine.event import BarEvent
+
+    port = _portfolio()
+    _risk_ctx(port)
+    pos = _hold_div(port)
+    # 模拟柜台合并均价：已按分红摊薄为 5.458（内核不得再减一次）
+    pos.mirror_bridge(1000, 1000, "5.458", date(2025, 7, 17))
+
+    apply_day(port, _div_timeline(), DIV_EX_DATE, mode="live",
+              apply_split=False, price_resolver=lambda code: DIV_PREV_CLOSE,
+              last_action_date=date(2025, 7, 17))
+
+    assert pos.avg_cost == Decimal("5.458")   # 不被内核二次扣减
+    assert pos.highest_price == Decimal("5.458")
+    assert port.account.cash == Decimal("100000") + Decimal("622.00")
+
+    bar = BarEvent(stocks={DIV_CODE: {
+        "open": Decimal("5.48"), "high": Decimal("5.50"),
+        "low": Decimal("5.43"), "close": Decimal("5.45"),
+        "volume": 1000,
+    }}, bar_time=datetime(2025, 7, 18, 15, 0), period="1d")
+    orders = port.on_bar(bar, signal_cache={}, period="1d")
+    assert not [o for o in orders if o.trade_type == TradeType.SELL]
+
+
+def test_dividend_preserves_cost_plus_cash_book_value():
+    """分红后口径正确：成本市值 + 现金合计不变（只是左口袋换右口袋）。"""
+    port = _portfolio()
+    pos = _hold_div(port)
+    before = pos.avg_cost * pos.quantity + port.account.cash
+
+    apply_day(port, _div_timeline(), DIV_EX_DATE, mode="backtest_raw",
+              apply_split=False, price_resolver=lambda code: DIV_PREV_CLOSE,
+              last_action_date=date(2025, 7, 17))
+
+    after = pos.avg_cost * pos.quantity + port.account.cash
+    assert after == before
+
+
+def test_dividend_front_adjusted_mode_does_not_double_adjust():
+    """前复权空间序列本身连续：不再下调成本/峰值（避免双重扣减）。"""
+    port = _portfolio()
+    pos = _hold_div(port)
+    before_cost, before_high = pos.avg_cost, pos.highest_price
+
+    apply_day(port, _div_timeline(), DIV_EX_DATE, mode="backtest",
+              apply_split=False, price_resolver=lambda code: DIV_PREV_CLOSE,
+              last_action_date=date(2025, 7, 17))
+
+    assert pos.avg_cost == before_cost
+    assert pos.highest_price == before_high
+
+
+# ---------------- 峰值下调的强制落库 ----------------
+
+def test_peak_adjust_force_overwrites_higher_persisted_peak(db_session):
+    """除息下调必须覆盖库里更高的旧峰值，且不改 peak_source/peak_bar_time。"""
+    import threading
+    from types import SimpleNamespace
+
+    from core.engine.live_engine import LiveEngine
+    from core.models import LivePositionPeak
+
+    engine = object.__new__(LiveEngine)
+    engine.ctx = SimpleNamespace(session_id=7)
+    engine._peak_buffer = {}
+    engine._peak_rows = set()
+    engine._peak_lock = threading.Lock()
+    engine._db_session_factory = lambda: db_session
+
+    db_session.add(LivePositionPeak(
+        live_session_id=7, portfolio_strategy_id=1, stock_code=DIV_CODE,
+        highest_price=Decimal("6.08"),
+        peak_bar_time=datetime(2025, 7, 17, 15, 0), peak_source="bar"))
+    db_session.commit()
+
+    engine._note_peak_adjusted(1, DIV_CODE, Decimal("5.458"))
+    assert engine._flush_position_peaks(db_session) is True
+    db_session.commit()
+
+    row = db_session.query(LivePositionPeak).one()
+    assert row.highest_price == Decimal("5.458")
+    assert row.peak_source == "bar"
+    assert row.peak_bar_time == datetime(2025, 7, 17, 15, 0)
+
+
+def test_peak_raise_after_adjust_still_forces_write(db_session):
+    """下调待写期间又创新高：仍带强制标记，不被库里旧高值挡住。"""
+    import threading
+    from types import SimpleNamespace
+
+    from core.engine.live_engine import LiveEngine
+    from core.models import LivePositionPeak
+
+    engine = object.__new__(LiveEngine)
+    engine.ctx = SimpleNamespace(session_id=7)
+    engine._peak_buffer = {}
+    engine._peak_rows = set()
+    engine._peak_lock = threading.Lock()
+    engine._db_session_factory = lambda: db_session
+
+    db_session.add(LivePositionPeak(
+        live_session_id=7, portfolio_strategy_id=1, stock_code=DIV_CODE,
+        highest_price=Decimal("6.08"), peak_source="bar"))
+    db_session.commit()
+
+    engine._note_peak_adjusted(1, DIV_CODE, Decimal("5.458"))
+    engine._note_peak_raised(1, DIV_CODE, Decimal("5.70"),
+                             datetime(2025, 7, 22, 15, 0))
+    engine._flush_position_peaks(db_session)
+    db_session.commit()
+
+    row = db_session.query(LivePositionPeak).one()
+    assert row.highest_price == Decimal("5.70")
+
+
+

@@ -101,6 +101,26 @@ class Position:
         if price > self.highest_price:
             self.highest_price = price
 
+    def adjust_cash_dividend(self, per_share: Decimal, *,
+                             adjust_cost: bool = True) -> None:
+        """现金分红除息：按每股派息同减成本与峰值（2026-11-25）。
+
+        除息日价格自然下跳≈每股派息；不同步下调基准，未实现盈亏与移动止损回撤
+        会被凭空放大而误触发。只在**不复权价空间**调用（``backtest_raw`` /
+        ``live``）：前复权/后复权序列在除息日本就连续，再减一次等于双重扣减。
+
+        ``adjust_cost=False``（实盘）：实盘成本基准是柜台合并均价，柜台已按分红
+        摊薄（送转分红后可为负，见 ``mirror_bridge``），内核再减一次会双重扣减，
+        且下一次快照仍会被柜台值覆盖 —— 故实盘只调内核自有的峰值。
+        """
+        dps = Decimal(str(per_share))
+        if dps <= 0:
+            return
+        if adjust_cost and self.avg_cost > 0:
+            self.avg_cost = max(Decimal("0"), self.avg_cost - dps)
+        if self.highest_price > 0:
+            self.highest_price = max(Decimal("0"), self.highest_price - dps)
+
     def sell(self, quantity: int, price: Decimal, trade_time: Optional[datetime] = None,
              fees: Decimal = Decimal("0")) -> tuple:
         """卖出减仓，返回 (已实现盈亏, 卖出金额)。
