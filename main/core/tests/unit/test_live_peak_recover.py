@@ -1,19 +1,17 @@
-"""recover 峰值补种单测（2026-11-12）。
+"""实盘峰值补种口径（2026-11-25 收敛）。
 
-回测峰值 = max(建仓成交价, 建仓后每根该周期 bar 的 close)，逐根累积、只升不降。
-实盘 recover 只有成交记录，中间 bar 的 close 从未落盘 → 峰值退化为买入价/成本，
-移动止损基准偏低（触发更晚、保护更弱）。`LiveEngine._seed_position_peaks` 用
-「日线 close 重算 → 账户快照 highest_price 历史 MAX → 现状（成本）」三级补种，
-且只 update_high（只升不降）。
+实盘峰值 = max(基准价（入场价/成本）, 建仓后逐 bar 抬峰并落库的表值)，只升不降。
+``LiveEngine._seed_position_peaks`` 只认两个来源：``live_position_peaks`` 表值
+与基准价 ``peak_base_price``（缺失用 ``avg_cost``）。历史上「策略周期 bar /
+日线 close / 账户快照 highest_price 历史 MAX」的补历史来源已删除——它们把继承
+仓/存量仓的峰值抬到入场前的高点，与回测「峰值从建仓价起算」不同源。
 
 本文件覆盖：
-1. 日线 close 重算得到真实峰值
-2. 快照脏值（被写成成本）不污染结果
-3. 日线取数失败 → 快照 MAX 兜底
-4. 日线与快照都无 → 维持现状 + `gate=peak_seed/action=fallback` 事件
-5. 锚点取 live_trades 最早一笔 BUY
-6. 日线与快照 MAX 取较大者
-7. 只升不降：重算值低于现有内存峰值时不覆盖
+1. 只认基准价：日线 bar 与账户快照都不参与补种（零 TQ、无 peak_seed 事件）
+2. 基准价/基准时刻回填 peak_base_price / peak_base_at
+3. 表值优先且完全不调 TQ
+4. 只升不降：补种不压低现有内存峰值
+5. UPSERT 不写低 / 清仓删行 / 超期清理
 """
 from datetime import datetime, timedelta
 from decimal import Decimal
@@ -178,9 +176,13 @@ def _events(db, gate="peak_seed"):
     return db.query(LiveDecisionEvent).filter(LiveDecisionEvent.gate == gate).all()
 
 
-# ---------------- 1. 日线重算 ----------------
-def test_recover_peak_from_daily_closes():
-    """日线 close 序列 [22.00, 22.04, 22.07, 21.32] → recover 后峰值 22.07。"""
+# ---------------- 1. 只认基准价，不补历史 ----------------
+def test_recover_peak_baseline_only_ignores_bars_and_snapshot():
+    """日线 bar 与账户快照都不再参与补种：峰值 = 基准价（买入价），零 TQ 取数。
+
+    历史口径会把峰值抬到入场前的高点（22.07 / 22.63），与回测「峰值从建仓价
+    起算」不同源 → 这里显式断言不再回补。
+    """
     factory, _ = _db_factory()
     port = _portfolio()
     disp = _StubDispatcher(bars=[
@@ -190,134 +192,38 @@ def test_recover_peak_from_daily_closes():
     engine = _engine(factory, disp, port)
     db = factory()
     _buy_trade(db, datetime(2026, 11, 10, 9, 31, 54))
-    engine.recover(db)
-    db.close()
-
-    pos = port.strategies[0].positions[_STOCK]
-    assert pos.highest_price == Decimal("22.07")
-    assert pos.quantity == 2500
-    # 取数走日线、且每 code 只拉一次
-    assert [c[1] for c in disp.quote_calls] == ["1d"]
-
-
-# ---------------- 2. 脏快照不污染 ----------------
-def test_recover_peak_ignores_dirty_snapshot():
-    """快照峰值被写成成本 22.003（脏），日线给 22.07 → 取 22.07。"""
-    factory, _ = _db_factory()
-    port = _portfolio()
-    disp = _StubDispatcher(bars=[
-        _bar("2026-11-10", "22.00"), _bar("2026-11-11", "22.04"),
-        _bar("2026-11-12", "22.07"), _bar("2026-11-13", "21.32"),
-    ])
-    engine = _engine(factory, disp, port)
-    db = factory()
-    _buy_trade(db, datetime(2026, 11, 10, 9, 31, 54))
-    _snapshot(db, datetime(2026, 11, 12, 13, 21, 17), "22.003")
-    engine.recover(db)
-    db.close()
-
-    assert port.strategies[0].positions[_STOCK].highest_price == Decimal("22.07")
-
-
-# ---------------- 3. 日线失败 → 快照 MAX ----------------
-def test_recover_peak_tq_failure_falls_back_to_snapshot_max():
-    """日线取数抛异常 → 用历史快照 highest_price MAX（22.07），不落 fallback 事件。"""
-    factory, _ = _db_factory()
-    port = _portfolio()
-    disp = _StubDispatcher(exc=TimeoutError("tdx lock timeout"))
-    engine = _engine(factory, disp, port)
-    db = factory()
-    _buy_trade(db, datetime(2026, 11, 10, 9, 31, 54))
-    _snapshot(db, datetime(2026, 11, 11, 9, 32), "22.07")
-    _snapshot(db, datetime(2026, 11, 12, 13, 21, 17), "22.003")  # 脏值
+    _snapshot(db, datetime(2026, 11, 12, 13, 21, 17), "22.63")
     engine.recover(db)
     events = _events(db)
     db.close()
 
-    assert port.strategies[0].positions[_STOCK].highest_price == Decimal("22.07")
+    pos = port.strategies[0].positions[_STOCK]
+    assert pos.quantity == 2500
+    # 峰值 = 基准价（含佣金成本），不是日线 22.07 / 快照 22.63
+    assert pos.highest_price == pos.avg_cost == Decimal("22.002")
+    assert disp.quote_calls == []
     assert events == []
 
 
-# ---------------- 4. 两级都无 → 维持现状 + fallback 事件 ----------------
-def test_recover_peak_no_history_keeps_cost_seed():
-    """日线返回空、无快照 → 峰值维持买入价（现状），并落 peak_seed/fallback 事件。"""
+# ---------------- 2. 基准价/基准时刻回填 ----------------
+def test_recover_writes_peak_base_price_and_at():
+    """表里没有基准列 → 按持仓成本 + 最早 BUY 时刻回填，供下次重启复用。"""
     factory, _ = _db_factory()
     port = _portfolio()
-    disp = _StubDispatcher(bars=[])
-    engine = _engine(factory, disp, port)
+    engine = _engine(factory, _StubDispatcher(bars=[]), port)
     db = factory()
     _buy_trade(db, datetime(2026, 11, 10, 9, 31, 54))
     engine.recover(db)
-    events = _events(db)
-    db.close()
-
-    # 成交重放的买入价，不因「无数据」被拉低或抬高
-    assert port.strategies[0].positions[_STOCK].highest_price == Decimal("22.00")
-    assert len(events) == 1
-    assert events[0].action == "fallback"
-    assert events[0].stock_code == _STOCK
-
-
-# ---------------- 5. 锚点取最早一笔 BUY ----------------
-def test_peak_anchor_uses_earliest_buy_trade():
-    """两笔买入（11-10 / 11-11）→ 锚点取 11-10，11-10 的高 close 计入峰值。"""
-    factory, _ = _db_factory()
-    port = _portfolio()
-    disp = _StubDispatcher(bars=[
-        _bar("2026-11-10", "22.50"), _bar("2026-11-11", "22.10"),
-        _bar("2026-11-12", "21.90"),
-    ])
-    engine = _engine(factory, disp, port)
-    db = factory()
-    _buy_trade(db, datetime(2026, 11, 11, 9, 31, 10), price="22.10", qty=1000)
-    _buy_trade(db, datetime(2026, 11, 10, 9, 31, 54), price="22.00", qty=1000)
-    engine.recover(db)
-    db.close()
-
+    row = db.query(LivePositionPeak).one()
     pos = port.strategies[0].positions[_STOCK]
-    assert pos.quantity == 2000
-    # 22.50 只在 11-10 出现：锚点若不是最早那笔就不会取到
-    assert pos.highest_price == Decimal("22.50")
-
-
-# ---------------- 6. 日线与快照 MAX 取较大者 ----------------
-def test_recover_peak_takes_max_of_daily_and_snapshot():
-    """日线 22.07、快照 MAX 22.63 → 取 22.63（快照兜底不压低更高值）。"""
-    factory, _ = _db_factory()
-    port = _portfolio()
-    disp = _StubDispatcher(bars=[
-        _bar("2026-11-10", "22.00"), _bar("2026-11-11", "22.07"),
-    ])
-    engine = _engine(factory, disp, port)
-    db = factory()
-    _buy_trade(db, datetime(2026, 11, 10, 9, 31, 54))
-    _snapshot(db, datetime(2026, 11, 11, 9, 32), "22.63")
-    engine.recover(db)
     db.close()
 
-    assert port.strategies[0].positions[_STOCK].highest_price == Decimal("22.63")
+    assert row.highest_price == pos.avg_cost
+    assert row.peak_base_price == pos.avg_cost
+    assert row.peak_base_at == datetime(2026, 11, 10, 9, 31, 54)
 
 
-# ---------------- 7. 只升不降 ----------------
-def test_peak_seed_never_lowers_existing_peak():
-    """重算值低于现有内存峰值 → 不覆盖（update_high 只升不降）。"""
-    factory, _ = _db_factory()
-    port = _portfolio()
-    disp = _StubDispatcher(bars=[_bar("2026-11-10", "21.50")])
-    engine = _engine(factory, disp, port)
-    pos = Position(_STOCK)
-    pos.buy(2500, Decimal("20.00"), datetime(2026, 11, 10, 9, 31, 54))
-    pos.update_high(Decimal("23.00"))
-    port.strategies[0].positions[_STOCK] = pos
-
-    db = factory()
-    engine._seed_position_peaks(db, {_SID: port}, {})
-    db.close()
-
-    assert port.strategies[0].positions[_STOCK].highest_price == Decimal("23.00")
-
-
-# ---------------- 阶段二 A：峰值表优先于取数 ----------------
+# ---------------- 3. 表值优先，不调 TQ ----------------
 def test_recover_prefers_persisted_peak_table_without_tq():
     """live_position_peaks 有值 → 直接采用，**完全不调 TQ**（重启零取数）。"""
     factory, _ = _db_factory()
@@ -332,6 +238,8 @@ def test_recover_prefers_persisted_peak_table_without_tq():
         stock_code=_STOCK,
         highest_price=Decimal("22.63"),
         peak_bar_time=datetime(2026, 11, 11, 15, 0),
+        peak_base_price=Decimal("22.00"),
+        peak_base_at=datetime(2026, 11, 10, 9, 31, 54),
     ))
     db.commit()
 
@@ -343,19 +251,35 @@ def test_recover_prefers_persisted_peak_table_without_tq():
     assert disp.quote_calls == []
 
 
-# ---------------- 阶段二 B：按策略自身周期补种 ----------------
-def test_recover_seeds_from_strategy_period_bars():
-    """策略周期 5m → 用 5m bar close 重算（不再默认走日线）。"""
+# ---------------- 4. 只升不降 ----------------
+def test_peak_seed_never_lowers_existing_peak():
+    """表值/基准价都低于现有内存峰值 → 不覆盖（update_high 只升不降）。"""
+    factory, _ = _db_factory()
+    port = _portfolio()
+    disp = _StubDispatcher(bars=[_bar("2026-11-10", "21.50")])
+    engine = _engine(factory, disp, port)
+    pos = Position(_STOCK)
+    pos.buy(2500, Decimal("20.00"), datetime(2026, 11, 10, 9, 31, 54))
+    pos.update_high(Decimal("23.00"))
+    port.strategies[0].positions[_STOCK] = pos
+
+    db = factory()
+    engine._seed_position_peaks(db, {_SID: port}, {})
+    db.close()
+
+    assert port.strategies[0].positions[_STOCK].highest_price == Decimal("23.00")
+    assert disp.quote_calls == []
+
+
+# ---------------- 5. 策略周期 bar 不再参与补种 ----------------
+def test_recover_does_not_seed_from_strategy_period_bars():
+    """策略周期 5m 也**不**用 5m bar close 补历史：峰值仍为基准价。"""
     factory, _ = _db_factory()
     port = _portfolio()
     port.strategies[0].period = "5m"
     disp = _StubDispatcher(bars=[
-        {"stime": "20261110103000", "open": "22.10", "high": "22.20",
-         "low": "22.00", "close": "22.10", "volume": 1000},
         {"stime": "20261111103000", "open": "22.40", "high": "22.60",
          "low": "22.30", "close": "22.50", "volume": 1000},
-        {"stime": "20261112103000", "open": "22.20", "high": "22.40",
-         "low": "22.10", "close": "22.30", "volume": 1000},
     ])
     engine = _engine(factory, disp, port)
     db = factory()
@@ -363,26 +287,9 @@ def test_recover_seeds_from_strategy_period_bars():
     engine.recover(db)
     db.close()
 
-    assert port.strategies[0].positions[_STOCK].highest_price == Decimal("22.50")
-    assert [c[1] for c in disp.quote_calls] == ["5m"]
-
-
-def test_recover_falls_back_to_daily_when_strategy_period_empty():
-    """5m 取不到（返回空）→ 降级日线 close，日志标注实际使用周期。"""
-    factory, _ = _db_factory()
-    port = _portfolio()
-    port.strategies[0].period = "5m"
-    disp = _StubDispatcher(bars=[])
-    engine = _engine(factory, disp, port)
-    db = factory()
-    _buy_trade(db, datetime(2026, 11, 10, 9, 31, 54))
-    _snapshot(db, datetime(2026, 11, 11, 9, 32), "22.63")
-    engine.recover(db)
-    db.close()
-
-    # 5m 空 → 日线也空 → 快照 MAX 兜底
-    assert port.strategies[0].positions[_STOCK].highest_price == Decimal("22.63")
-    assert [c[1] for c in disp.quote_calls] == ["5m", "1d"]
+    pos = port.strategies[0].positions[_STOCK]
+    assert pos.highest_price == pos.avg_cost
+    assert disp.quote_calls == []
 
 
 # ---------------- 阶段二 A：只升不降 / 清仓删行 / 超期清理 ----------------
@@ -465,7 +372,7 @@ def test_seed_first_pass_keeps_unimported_position_peak_row():
 
     assert before == 1 and after == 2  # 旧行保留 + 新种出 002922 行
     assert rows["002745.SZ"] == Decimal("10.83")  # 未被误删、未被写低
-    assert rows[_STOCK] == Decimal("22.00")
+    assert rows[_STOCK] == Decimal("20.00")       # 无表值 → 基准价（成本）
 
 
 def test_flush_without_allow_delete_never_deletes_rows():
@@ -489,7 +396,11 @@ def test_flush_without_allow_delete_never_deletes_rows():
 
 
 def test_recover_coexisting_traded_and_imported_positions():
-    """普通持仓 + 继承仓共存：两行都保留，各自峰值正确（002745 自愈到 10.83）。"""
+    """普通持仓 + 继承仓共存：两行都保留，各自峰值正确。
+
+    2026-11-25 口径：普通持仓无表值 → 峰值 = 基准价（成本 22.002，不再用日线/
+    快照回补）；继承仓有表值 10.46 → 直接采用表值，**不再**用快照 10.83 自愈。
+    """
     factory, _ = _db_factory()
     port = _portfolio()
     disp = _StubDispatcher(
@@ -520,10 +431,13 @@ def test_recover_coexisting_traded_and_imported_positions():
             for r in db.query(LivePositionPeak).all()}
     db.close()
 
-    assert rows[_STOCK] == Decimal("22.07")
-    assert rows["002745.SZ"] == Decimal("10.83")  # 第一轮没删、第二轮种出峰值
-    assert port.strategies[0].positions[_STOCK].highest_price == Decimal("22.07")
-    assert port.strategies[0].positions["002745.SZ"].highest_price == Decimal("10.83")
+    traded = port.strategies[0].positions[_STOCK]
+    imported = port.strategies[0].positions["002745.SZ"]
+    assert rows[_STOCK] == traded.avg_cost == Decimal("22.002")
+    assert rows["002745.SZ"] == Decimal("10.46")  # 表值权威，不用快照 10.83 抬高
+    assert traded.highest_price == Decimal("22.002")
+    assert imported.highest_price == Decimal("10.46")
+    assert disp.quote_calls == []
 
 
 # ---------------- 缺陷二：等值 UPSERT 刷新 updated_at（心跳） ----------------
@@ -641,7 +555,7 @@ def test_portfolio_peak_hook_fires_only_when_peak_raised():
 
 # ---------------- 缺口一：继承仓（无 live_trades）导入后补种 ----------------
 def test_recover_seeds_imported_position_without_trades():
-    """无 live_trades 的继承仓：补种移到导入之后 → 快照 MAX 10.83 胜出，不退成本。"""
+    """无 live_trades 的继承仓：导入后按基准价补种，不再用快照/bar 回补。"""
     factory, _ = _db_factory()
     port = _portfolio()
     disp = _StubDispatcher(
@@ -660,12 +574,12 @@ def test_recover_seeds_imported_position_without_trades():
 
     pos = port.strategies[0].positions["002745.SZ"]
     assert pos.quantity == 5300
-    # 成本 10.221 / 日线 close 10.46 / 快照 MAX 10.83 → 取最大者，而非成本兜底
-    assert pos.highest_price == Decimal("10.83")
-    assert [c[0] for c in disp.quote_calls] == ["002745.SZ"]
+    # 快照 MAX 10.83 / 日线 close 10.46 都不再参与 → 峰值从入场成本起算
+    assert pos.highest_price == Decimal("10.221")
+    assert disp.quote_calls == []
 
 
-# ---------------- 缺口二：表值只作下限，先与快照 MAX 比对 ----------------
+# ---------------- 表值优先：快照 MAX 不再参与比对 ----------------
 def test_peak_table_above_snapshot_max_uses_table_without_tq():
     """表值 22.63 ≥ 快照 MAX 22.07 → 直接采用表值，**零 TQ**。"""
     factory, _ = _db_factory()
@@ -693,40 +607,11 @@ def test_peak_table_above_snapshot_max_uses_table_without_tq():
     assert events == []  # 不落 fallback / recompute
 
 
-def test_peak_table_below_snapshot_max_triggers_recompute():
-    """表值 10.46 < 快照 MAX 10.83 → 判可疑，重算并取最大者 + recompute 审计。"""
-    factory, _ = _db_factory()
-    port = _portfolio()
-    disp = _StubDispatcher(bars=[_bar("2026-11-12", "10.46")])
-    engine = _engine(factory, disp, port)
-    db = factory()
-    _buy_trade(db, datetime(2026, 11, 10, 9, 31, 54), price="10.46", qty=5300)
-    _snapshot(db, datetime(2026, 11, 11, 9, 32), "10.83", qty=5300)
-    db.add(LivePositionPeak(
-        live_session_id=1,
-        portfolio_strategy_id=_SID,
-        stock_code=_STOCK,
-        highest_price=Decimal("10.46"),
-        peak_bar_time=datetime(2026, 11, 12, 15, 0),
-    ))
-    db.commit()
+def test_peak_table_below_snapshot_max_is_still_authoritative():
+    """表值 10.46 低于快照 MAX 10.83 也**不再重算**：快照不参与峰值口径。
 
-    engine.recover(db)
-    events = _events(db)
-    db.close()
-
-    assert port.strategies[0].positions[_STOCK].highest_price == Decimal("10.83")
-    assert [c[1] for c in disp.quote_calls] == ["1d"]  # 走了重算取数
-    assert len(events) == 1
-    assert events[0].action == "recompute"
-    assert "10.46" in events[0].message and "10.83" in events[0].message
-
-
-def test_peak_recompute_event_carries_recomputed_value():
-    """recompute 审计行必须含「代码 / 表值 / 重算值 / 快照 MAX」四项。
-
-    表值 10.46 < 快照 MAX 10.83 < 周期重算 10.95：final=10.95，审计行要在
-    message 里给出重算值，param/actual 分别落表值与快照 MAX，库内可直接核对。
+    历史口径会判可疑并用快照/周期重算抬高（10.83 → 10.95），与回测不同源；
+    2026-11-25 起表值即权威，恢复只 update_high，同样零 TQ、零审计事件。
     """
     factory, _ = _db_factory()
     port = _portfolio()
@@ -748,23 +633,14 @@ def test_peak_recompute_event_carries_recomputed_value():
     events = _events(db)
     db.close()
 
-    assert port.strategies[0].positions[_STOCK].highest_price == Decimal("10.95")
-    assert len(events) == 1
-    ev = events[0]
-    assert ev.action == "recompute"
-    assert ev.stock_code == _STOCK
-    assert ev.param_value == 10.46            # 表值
-    assert ev.actual_value == 10.83           # 快照 MAX
-    assert "10.95" in ev.message              # 重算值
+    assert port.strategies[0].positions[_STOCK].highest_price == Decimal("10.46")
+    assert disp.quote_calls == []
+    assert events == []
 
 
-# ---------------- 缺口三：继承仓表值退化自愈（002745 场景） ----------------
-def test_imported_position_heals_stale_table_peak():
-    """导入仓（buy_time=今日）+ 表值 10.46（已退化）+ 11-10 快照 10.83：
-
-    锚点回退到 11-10（快照首次见到该仓）→ 表值 < 快照 MAX → 重算取 10.83，
-    退化值不因落表而永久固化。
-    """
+# ---------------- 缺口三：导入仓表值退化不再自愈（002745 场景） ----------------
+def test_imported_position_keeps_table_peak_without_healing():
+    """导入仓 + 表值 10.46 + 快照 10.83：不再自愈到 10.83，峰值保持表值。"""
     factory, _ = _db_factory()
     port = _portfolio()
     disp = _StubDispatcher(
@@ -788,18 +664,16 @@ def test_imported_position_heals_stale_table_peak():
     db.commit()
 
     engine.recover(db)
-    events = _events(db)
     db.close()
 
     pos = port.strategies[0].positions["002745.SZ"]
-    assert pos.highest_price == Decimal("10.83")
-    assert any(e.action == "recompute" and e.stock_code == "002745.SZ"
-               for e in events)
+    assert pos.highest_price == Decimal("10.46")
+    assert disp.quote_calls == []
 
 
 # ---------------- 缺口一：已在 live_trades 的票不重复补种 ----------------
 def test_recover_import_pass_does_not_reseed_traded_codes():
-    """成交重放补过的票不进第二轮 → 每只票只取数一次。"""
+    """成交重放补过的票不进第二轮 → 各自补种一次、零 TQ 取数。"""
     factory, _ = _db_factory()
     port = _portfolio()
     disp = _StubDispatcher(
@@ -818,6 +692,7 @@ def test_recover_import_pass_does_not_reseed_traded_codes():
     engine.recover(db)
     db.close()
 
-    codes = [c[0] for c in disp.quote_calls]
-    assert codes.count(_STOCK) == 1
-    assert codes.count("002745.SZ") == 1
+    # 补种只读表/基准价 → 两个组合都不取数
+    assert disp.quote_calls == []
+    assert port.strategies[0].positions[_STOCK].highest_price == Decimal("22.002")
+    assert port.strategies[0].positions["002745.SZ"].highest_price == Decimal("10.221")

@@ -31,9 +31,13 @@ class LivePositionPeak(Base):
     highest_price = Column(Numeric(18, 4), nullable=False)
     # 最后一次抬峰所用 bar 的时间（补种/快照路径可能为 None）
     peak_bar_time = Column(DateTime, nullable=True)
-    # D6 峰值来源：bar（逐 bar 抬高）/ table（峰值表）/ period（策略周期补种）
-    # / daily（日线补种）/ snapshot（账户快照回填）/ cost（成本兜底）/ import（导入仓起点）
+    # D6 峰值来源：bar（逐 bar 抬高）/ table（峰值表）/ baseline（基准价补种）
+    # / import（导入仓起点）/ corporate_action（除息下调）/ recalibrated（人工校正）
     peak_source = Column(String(16), nullable=True)
+    # 峰值基准（2026-11-25）：入场价 + 入场时刻，重启补种只从这里起算，不再用
+    # 历史 bar/快照回补（与回测「峰值从建仓价起算」同源）。
+    peak_base_price = Column(Numeric(18, 4), nullable=True)
+    peak_base_at = Column(DateTime, nullable=True)
     updated_at = Column(
         DateTime, nullable=False, server_default=func.now(), onupdate=func.now())
 
