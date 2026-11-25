@@ -43,6 +43,8 @@ export interface TdxPoolItem {
   synced: boolean
   exists_in_tdx: boolean
   stock_count: number
+  // tdx=通达信板块/本地残留；internal=平台内部池（SEL_ 前缀，不参与通达信同步）
+  origin?: 'tdx' | 'internal'
 }
 
 // 通达信板块实时成分股（GET /stock-pools/tdx/{code}/stocks）— 对齐 tq.data.get_pool_stocks

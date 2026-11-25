@@ -113,6 +113,11 @@ onMounted(() => {
   </PageHeader>
 
   <!-- 市场多空状态卡与统一市场状态面板已迁移至「投资看板」(/investment-board) -->
+  <p class="hint" style="margin:-4px 0 12px">
+    「同步」只把通达信用户板块<b>导入</b>到本平台，不会反向写入通达信；
+    「已同步 / 未同步 / 通达信已删除」为本地与通达信板块的实时比对结果。
+    SEL_ 前缀为条件选股生成的<b>平台内部池</b>，不参与通达信同步，回测与实盘直接读取本地池与 PIT 区间。
+  </p>
 
   <div v-if="errorMsg" class="card" style="padding:12px;color:var(--red);margin-bottom:12px">
     {{ errorMsg }}
@@ -130,14 +135,15 @@ onMounted(() => {
           <td>{{ p.name }}</td>
           <td style="color:var(--ink-soft)">{{ p.code }}</td>
           <td>
-            <span v-if="!p.exists_in_tdx" class="badge" style="background:var(--line);color:var(--ink-soft)">通达信已删除</span>
+            <span v-if="p.origin === 'internal'" class="badge badge-blue" title="条件选股发布生成的平台内部池，不写入通达信">平台内部池</span>
+            <span v-else-if="!p.exists_in_tdx" class="badge" style="background:var(--line);color:var(--ink-soft)">通达信已删除</span>
             <span v-else-if="p.synced" class="badge badge-green">已同步</span>
             <span v-else class="badge badge-gray">未同步</span>
           </td>
           <td>{{ p.synced ? p.stock_count + ' 只' : '-' }}</td>
           <td>
             <button v-if="p.exists_in_tdx" @click="viewStocks(p)" class="btn btn-sm">查看</button>
-            <button v-if="p.exists_in_tdx" @click="syncPool(p)" class="btn btn-sm btn-primary" style="margin-left:6px">
+            <button v-if="p.exists_in_tdx" @click="syncPool(p)" class="btn btn-sm btn-primary" style="margin-left:6px" title="从通达信导入到本平台（不反向写入）">
               {{ p.synced ? '同步' : '同步' }}
             </button>
             <button v-if="p.synced" @click="remove(p)" class="btn btn-sm btn-danger" style="margin-left:6px">删除</button>

@@ -57,10 +57,12 @@ def list_local_pools(db: Session) -> list[dict]:
 def list_tdx_pools(db: Session) -> list[dict]:
     """直读通达信用户板块（get_user_sector），合并本地残留（通达信已删但本地还在的）。
 
-    返回 [{code, name, synced, exists_in_tdx, stock_count}]：
+    返回 [{code, name, synced, exists_in_tdx, stock_count, origin}]：
     - synced: 本地是否已同步
     - exists_in_tdx: 通达信是否还有此板块（False=本地残留）
     - stock_count: 本地成分股数（未同步为 0）
+    - origin: tdx=通达信板块/残留；internal=平台内部池（SEL_ 前缀，选股发布生成，
+      从不回写通达信，不能按「通达信已删除」展示）
 
     抛 TDXConnectionError：通达信不可达。
     """
@@ -69,6 +71,7 @@ def list_tdx_pools(db: Session) -> list[dict]:
     local_pools = db.query(StockPool).all()
     local_by_code = {p.code: p for p in local_pools}
     tdx_codes = {t["code"] for t in tdx_pools}
+    internal_prefix = "SEL_"
 
     result = []
     # 通达信板块
@@ -84,17 +87,20 @@ def list_tdx_pools(db: Session) -> list[dict]:
             "synced": p is not None,
             "exists_in_tdx": True,
             "stock_count": count,
+            "origin": "tdx",
         })
-    # 本地残留（通达信已删）
+    # 本地残留（通达信侧已不存在）
     for p in local_pools:
         if p.code not in tdx_codes:
             count = db.query(StockPoolStock).filter(StockPoolStock.pool_id == p.id).count()
+            internal = p.code.startswith(internal_prefix)
             result.append({
                 "code": p.code,
                 "name": p.name,
                 "synced": True,
                 "exists_in_tdx": False,
                 "stock_count": count,
+                "origin": "internal" if internal else "tdx",
             })
     return result
 
