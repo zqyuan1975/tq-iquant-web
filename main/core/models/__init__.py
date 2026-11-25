@@ -24,6 +24,7 @@ from .live_baseline_reset import LiveBaselineReset
 from .live_order import LiveOrder
 from .live_bar_order_mark import LiveBarOrderMark
 from .live_position_peak import LivePositionPeak
+from .live_daily_risk_judgement import LiveDailyRiskJudgement
 from .live_trade import LiveTrade
 from .live_cash_flow import LiveCashFlow
 from .live_signal import LiveSignal
@@ -108,6 +109,7 @@ __all__ = [
     "LiveOrder",
     "LiveBarOrderMark",
     "LivePositionPeak",
+    "LiveDailyRiskJudgement",
     "LiveTrade",
     "LiveCashFlow",
     "LiveSignal",

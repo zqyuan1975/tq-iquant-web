@@ -322,6 +322,10 @@ class Portfolio:
         # 与抬峰 hook 的「只升不降」语义相反，必须走独立入口强制落库。
         # 仅实盘注入；回测不注入（峰值只在内存里）。
         self.peak_adjust_hook: Optional[Callable] = None
+        # 日线风控两段式裁定 sink（2026-11-25）：仅实盘日线轮次注入。
+        # 签名 sink(phase, ctx, stock_code, pos, close, condition, threshold, bar)；
+        # phase = 'preliminary'（15:05，只留档不下单）/ 'final'（16:00，照常下单）。
+        self.risk_judgement_sink: Optional[Callable] = None
 
     def set_recorder(self, recorder) -> None:
         """注入决策采集器（回测/实盘引擎在装配后调用），同步给 risk_manager。"""
@@ -756,6 +760,7 @@ class Portfolio:
         inflight_opens: Optional[Dict[int, set]] = None,
         mismatched_risk: bool = False,
         inflight_risk_sells: Optional[Dict[int, set]] = None,
+        risk_only: bool = False,
     ) -> List[OrderEvent]:
         """处理一根 bar：取信号 + 风控检查 + 优先级排序 → 返回待执行订单列表。
 
@@ -774,6 +779,8 @@ class Portfolio:
         `live_sessions.intraday_mismatched_risk_enabled` 解析后传入：NULL（未显式设置）
         一律为关闭，不因会话内存在分钟策略自动开启；显式值优先。
         14:51 提前收盘价轮次同样显式传 False）。
+        risk_only：只跑风控、不跑公式信号（2026-11-25 日线 16:00 终审专用）：
+        终审重算风控时不得重复产生公式单/资金占用变化，故 include_signals=False。
         inflight_risk_sells：strategy_id → 在途未结清的风控卖单股票集合（回测
         BacktestEngine 从 deferred 队列注入，含缩量未成交残量）。命中时该票本 bar
         只刷新峰值、不再评估风控、不重复产生 trigger 事件与订单——残量由原单在
@@ -796,7 +803,9 @@ class Portfolio:
         )
         if rot_cap:
             self._feed_price_history(bar, rot_cap + 2)
-        orders: List[OrderEvent] = self._breaker_disposal_orders(bar)
+        # 终审重算（risk_only）不重复消费熔断处置单：15:05 轮次已消费，重算只补风控
+        orders: List[OrderEvent] = (
+            [] if risk_only else self._breaker_disposal_orders(bar))
         # B 跨策略 OPEN 排序（默认关）：仅在开关打开且行业轴可用时收集延迟下单；
         # 否则 open_sink=None，走原逐策略路径（行为逐位不变）。
         rank_opens = bool(self.industry_rank_enabled
@@ -817,12 +826,15 @@ class Portfolio:
                 continue
             strat_orders = self._process_strategy(
                 ctx, bar, signal_cache, inflight, skip_risk_codes=skip_risk,
-                open_sink=deferred_opens)
+                open_sink=deferred_opens, include_signals=not risk_only)
             orders.extend(strat_orders)
             # follow_master 状态镜像：slave 处理完自身信号后，对"master 已不再持有"的
             # 持仓股全平（本 bar 已自行卖出的股票去重）。以 master 的已成交持仓为准，
             # 故重启安全、跨周期闭环、REDUCE 不触发（master 仍持仓）。
-            if ctx.role == "slave" and ctx.slave_exit_mode == "follow_master":
+            # risk_only（16:00 终审重算）跳过：该轮只补风控裁定，不重复生成镜像单
+            # （15:05 已生成过，重复生成只会撞 deferred 去重、徒增噪音）。
+            if (not risk_only and ctx.role == "slave"
+                    and ctx.slave_exit_mode == "follow_master"):
                 already_sold = {
                     o.stock_code for o in strat_orders
                     if o.trade_type == TradeType.SELL
@@ -1240,6 +1252,11 @@ class Portfolio:
                             % (stock_code, fmt_price(close)),
                 )
                 continue
+            # 日线风控两段式裁定（2026-11-25）：bar 上带 risk_judgement 时
+            # （'preliminary' 15:05 / 'final' 16:00），逐票把判定结果交给 sink 留档；
+            # 预判阶段同时撤销刚生成的风控信号 → 只写状态与事件，不产生可执行单。
+            judgement_phase = getattr(bar, "risk_judgement", None)
+            risk_start = len(risks)
             # 移动止损基准：持仓期间最高价随每根 bar 收盘价刷新（只升不降）
             prev_high = pos.highest_price
             pos.update_high(close)
@@ -1271,7 +1288,11 @@ class Portfolio:
                 # `inflight_sell` 去重：一次触发 + 缩量分批，而非逐日重复触发）。
                 # 峰值刷新在其上方完成，移动止损基准不丢。
                 continue
+            condition = ""
+            threshold = None
             if risk_manager.check_stop_loss(pos, close):
+                condition = "stop_loss"
+                threshold = risk_manager.stop_loss_ratio
                 loss = (pos.avg_cost - close) / pos.avg_cost if pos.avg_cost else Decimal("0")
                 risks.append(SignalEvent(
                     strategy_id=ctx.strategy_id, stock_code=stock_code,
@@ -1290,6 +1311,8 @@ class Portfolio:
                         pos.cost_note()),
                 )
             elif risk_manager.check_take_profit(pos, close):
+                condition = "take_profit"
+                threshold = risk_manager.take_profit_ratio
                 profit = (close - pos.avg_cost) / pos.avg_cost if pos.avg_cost else Decimal("0")
                 risks.append(SignalEvent(
                     strategy_id=ctx.strategy_id, stock_code=stock_code,
@@ -1308,6 +1331,9 @@ class Portfolio:
                         pos.cost_note()),
                 )
             elif risk_manager.check_trailing_stop(pos, close, ratio=eff_trailing):
+                condition = "trailing_stop"
+                threshold = (eff_trailing if eff_trailing is not None
+                             else risk_manager.trailing_stop_ratio)
                 drawdown = (
                     (pos.highest_price - close) / pos.highest_price
                     if pos.highest_price else Decimal("0")
@@ -1331,6 +1357,21 @@ class Portfolio:
                         fmt_price(pos.avg_cost), fmt_price(pos.highest_price),
                         fmt_price(close), fmt_pct(drawdown), pos.cost_note()),
                 )
+            if self.risk_judgement_sink is not None and judgement_phase:
+                try:
+                    self.risk_judgement_sink(
+                        judgement_phase, ctx, stock_code, pos, close,
+                        condition, threshold, bar,
+                    )
+                except Exception:  # noqa: BLE001 — 留档失败绝不影响实盘主链路
+                    logger.warning(
+                        "risk judgement sink failed: portfolio=%s code=%s phase=%s",
+                        self.portfolio_id, stock_code, judgement_phase,
+                        exc_info=True,
+                    )
+                if judgement_phase == "preliminary" and condition:
+                    # 15:05 预判只写事件与状态：撤销刚生成的风控信号，不产生可执行单
+                    del risks[risk_start:]
         return risks
 
     def maybe_cash_enhancement(self, bar: BarEvent, total_value: Decimal) -> None:

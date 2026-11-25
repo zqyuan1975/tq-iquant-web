@@ -70,6 +70,10 @@ class LiveSession(Base):
     # 幂等标记：该交易日 15:05「收盘落定」日线级别轮次（1d/1w/1mon）已执行
     # （YYYY-MM-DD，跨重启不重复跑；B 开启时只用于 1w/1mon 周期末轮次）
     daily_bars_done_date = Column(String(10), nullable=True)
+    # 幂等标记：该交易日 16:00「日线风控终审」轮次已执行（YYYY-MM-DD）。
+    # 终审结果落 live_daily_risk_judgements(phase='final')，次日集合竞价只按它放行；
+    # 缺失 = 当日「未裁定」，该持仓的风控单不放行并告警。
+    daily_risk_final_done_date = Column(String(10), nullable=True)
     # 错周期 bar 是否跑风控（nullable 三态，2026-11-11；2026-11-20 收口为纯用户控制）：
     #   NULL = 未显式设置 → **生效＝关闭**（与接入前一致；不因存在分钟策略自动开启，
     #          也不再读全局开关）；分钟策略仅触发界面建议，不写库、不影响生效值

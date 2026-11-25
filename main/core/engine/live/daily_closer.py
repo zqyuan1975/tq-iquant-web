@@ -94,6 +94,7 @@ class DailyCloser:
         external_signals_only: bool = False,
         advance_close_enabled: bool = False,
         advance_close_time: str = "14:51",
+        daily_bars_time: str = "15:05",
         snapshot_synth=None,
         on_daily_snapshot: Optional[Callable[[date], None]] = None,
         on_daily_gap_report: Optional[Callable[[date], None]] = None,
@@ -124,6 +125,9 @@ class DailyCloser:
         if self._advance_time < _ADVANCE_EXEC_START:
             self._advance_time = _ADVANCE_EXEC_START
         self._advance_synth = snapshot_synth
+        # 日线轮次时点（默认 15:05，可配）：同一轮次既是公式信号驱动点，也是
+        # 「日线风控 15:05 预判」的取数/判定点（bar.risk_judgement='preliminary'）。
+        self._daily_bars_time = self._parse_hhmm(daily_bars_time, _DAILY_BARS_TIME)
         # 信号判定维度（规范 2026-11-23）：period_close / dynamic。pre_close_1450
         # 由 _advance_enabled 表达（仅 1d）。三者互斥，统一走 period_semantics。
         self._period_mode = ps.normalize_mode(period_signal_mode)
@@ -381,7 +385,7 @@ class DailyCloser:
         """
         if now is None:
             now = self._clock()
-        if (now.hour, now.minute) < _DAILY_BARS_TIME:
+        if (now.hour, now.minute) < self._daily_bars_time:
             return
         today = now.date()
         # 非交易日不驱动日线（周末/假期不用陈旧快照触发 1d/1w/1mon 信号）。
@@ -521,7 +525,7 @@ class DailyCloser:
         for period in periods:
             # post_close=True：收盘后报不进交易所，immediate 策略也必须 defer 到次日。
             bar_event = BarEvent(stocks=stocks, bar_time=daily_time, period=period,
-                                 post_close=True)
+                                 post_close=True, risk_judgement="preliminary")
             for portfolio in self._ctx.portfolios:
                 done_key = (today, period, portfolio.portfolio_id)
                 if done_key in self._daily_driven_keys:
@@ -607,6 +611,45 @@ class DailyCloser:
             self._ctx.session_id, daily_time, "+".join(periods) or "-",
             len(bars_by_code), reinjected,
         )
+
+    # ---------------- 日线风控两段式：终审取数（16:00）----------------
+    def daily_risk_periods(self, today: date) -> list:
+        """终审重算周期：1d + 当日为周期末的 1w/1mon（与 15:05 同口径）。
+
+        与 maybe_daily_bars 的 1d 口径对齐（含 B 开启且已提前成交时仍重算——
+        终审是**风控判定**，必须每天有，不因信号轮次提前而缺席）。
+        """
+        periods: list = ["1d"]
+        for period in ps.DYNAMIC_PERIODS:
+            if ps.is_dynamic(period, self._period_mode):
+                continue
+            if ps.is_period_end_day(self._calendar, period, today):
+                periods.append(period)
+        return periods
+
+    def fetch_daily_risk_stocks(self, today: date):
+        """16:00 终审取数：只保留**最新日线就是今日**的票。
+
+        与 15:05 同一 close 口径（已完成日线 bar 的 close，禁止 high/low）。
+        返回 ``(stocks, daily_time)``；无新鲜数据返回 ``(None, None)``，
+        由调用方标记「未裁定」并拦次日风控单（不拿错数据下单）。
+        """
+        bars_by_code = self._fetch_1d_bars()
+        if not bars_by_code:
+            return None, None
+        fresh: Dict[str, list] = {}
+        for code, rows in bars_by_code.items():
+            if not rows:
+                continue
+            last_st = parse_bar_time(rows[-1])
+            if last_st is None or last_st.date() != today:
+                continue
+            fresh[code] = rows[-1]
+        if not fresh:
+            return None, None
+        stocks = {code: to_ohlcv(row) for code, row in fresh.items()}
+        daily_time = parse_bar_time(next(iter(fresh.values())))
+        return stocks, daily_time
 
     # ---------------- 14:50 提前收盘价（仅 1d）----------------
     def _advance_judged_codes(self, today: date) -> Set[str]:

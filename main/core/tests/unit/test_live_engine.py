@@ -31,7 +31,7 @@ from core.engine.risk_manager import PortfolioRiskManager, StrategyRiskManager
 from core.engine.strategy_context import StrategyContext
 from core.models import (
     Base, LiveOrder, LiveTrade, LiveSession, LiveSessionPortfolio,
-    LiveDecisionEvent, LiveBarOrderMark,
+    LiveDecisionEvent, LiveBarOrderMark, LiveDailyRiskJudgement,
 )
 from tq_iquant_shared.constants import SignalType, TradeType
 
@@ -14767,4 +14767,250 @@ def test_on_daily_update_uses_market_value_not_cost():
     engine._breaker.on_daily_update(port, _date(2026, 8, 21))
 
     assert captured["total"] == port.account.cash + _D("1200")
+
+
+# ---------------- 日线风控两段式：15:05 预判 / 16:00 终审 ----------------
+def _risk_engine(factory, port, disp, trading_dates, stock):
+    """两段式裁定用引擎：auto 模式 + 已启动 + 交易日历。"""
+    engine = _pre_open_engine(factory, port, disp, trading_dates, stock)
+    engine.execution_mode = "auto"
+    engine._running = True
+    return engine
+
+
+def _risk_bar(code, close, day, phase, period="1d"):
+    """日线收盘 bar（close 口径，禁止 high/low），带裁定阶段标记。"""
+    return BarEvent(
+        stocks={code: {"close": Decimal(close)}},
+        bar_time=datetime.combine(day, datetime.min.time()),
+        period=period, post_close=True, risk_judgement=phase,
+    )
+
+
+def _risk_sell_order(code, day, signal_type=SignalType.STOP_LOSS):
+    return OrderEvent(
+        strategy_id=1, portfolio_id=1, stock_code=code,
+        trade_type=TradeType.SELL, signal_type=signal_type,
+        quantity=300, price=Decimal("9.0"),
+        bar_time=datetime.combine(day, datetime.min.time()),
+        signal_name="stop_loss", signal_bar_date=day,
+    )
+
+
+def test_daily_risk_preliminary_records_only_no_order():
+    """15:05 预判：只写 preliminary 行与事件，不产生任何可执行单。"""
+    factory, _ = _db_factory()
+    port, ctx = _portfolio_single(period="1d")
+    stock, day = "600000.SH", date(2026, 8, 24)
+    _seed_sellable(ctx, stock, price="10.0")   # 成本 10，收盘 9 → -10% 触发止损 5%
+    disp, _ = _make_dispatcher(_Recorder())
+    engine = _risk_engine(factory, port, disp, [day], stock)
+
+    orders = port.on_bar(_risk_bar(stock, "9.0", day, "preliminary"), period="1d")
+
+    assert orders == []                         # 预判不生成可执行单
+    assert engine._signal_bar_deferred == []
+    db = factory()
+    rows = db.query(LiveDailyRiskJudgement).all()
+    db.close()
+    assert len(rows) == 1
+    assert rows[0].phase == "preliminary" and rows[0].triggered is True
+    assert rows[0].condition == "stop_loss"
+
+
+def test_daily_risk_final_creates_deferred_order_and_is_idempotent():
+    """16:00 终审：生成一条 deferred 风控单；同日重跑不重复生成。"""
+    factory, _ = _db_factory()
+    port, ctx = _portfolio_single(period="1d")
+    stock, day = "600000.SH", date(2026, 8, 24)
+    _seed_sellable(ctx, stock, price="10.0")
+    disp, rec = _make_dispatcher(_Recorder(respond=_bridge_ping(("/ping", "/order"))))
+    engine = _risk_engine(factory, port, disp, [day], stock)
+    stocks = {stock: {"close": Decimal("9.0")}}
+    engine._closer.fetch_daily_risk_stocks = lambda today: (
+        stocks, datetime.combine(today, datetime.min.time()))
+    engine._closer.daily_risk_periods = lambda today: ["1d"]
+
+    engine._maybe_daily_risk_final(datetime(2026, 8, 24, 15, 59))
+    db = factory()
+    assert db.query(LiveDailyRiskJudgement).count() == 0   # 未到 16:00 不判
+    db.close()
+
+    # 15:05 预判（同一 close 口径）：留档但不产单 → 一致路径
+    port.on_bar(_risk_bar(stock, "9.0", day, "preliminary"), period="1d")
+    assert engine._signal_bar_deferred == []
+
+    engine._maybe_daily_risk_final(datetime(2026, 8, 24, 16, 0))
+    engine._maybe_daily_risk_final(datetime(2026, 8, 24, 16, 1))   # 幂等重跑
+
+    db = factory()
+    rows = db.query(LiveDailyRiskJudgement).all()
+    deferred = db.query(LiveOrder).filter_by(status="deferred").all()
+    db.close()
+    assert {r.phase for r in rows} == {"preliminary", "final"}
+    assert all(r.triggered is True for r in rows)
+    assert len(deferred) == 1 and deferred[0].stock_code == stock
+    assert len(engine._signal_bar_deferred) == 1           # 只排一单
+    assert not any(r.url.path == "/order" for r in rec.requests)  # 收盘后不真报
+
+
+def test_daily_risk_mismatch_pre_sell_final_hold_drops_order():
+    """15:05 判卖、16:00 不判：终审为准 → 不生成单，闸门对残留单返回 drop。"""
+    factory, _ = _db_factory()
+    port, ctx = _portfolio_single(period="1d")
+    stock, day = "600000.SH", date(2026, 8, 24)
+    _seed_sellable(ctx, stock, price="10.0")
+    disp, _ = _make_dispatcher(_Recorder(respond=_bridge_ping(("/ping", "/order"))))
+    engine = _risk_engine(factory, port, disp, [day], stock)
+    engine._closer.fetch_daily_risk_stocks = lambda today: (
+        {stock: {"close": Decimal("9.6")}}, datetime.combine(today, datetime.min.time()))
+    engine._closer.daily_risk_periods = lambda today: ["1d"]
+
+    port.on_bar(_risk_bar(stock, "9.0", day, "preliminary"), period="1d")
+    engine._maybe_daily_risk_final(datetime(2026, 8, 24, 16, 0))
+
+    db = factory()
+    rows = {r.phase: r for r in db.query(LiveDailyRiskJudgement).all()}
+    db.close()
+    assert rows["preliminary"].triggered is True
+    assert rows["final"].triggered is False
+    assert engine._signal_bar_deferred == []              # 终审不判 → 不下单
+    assert engine._daily_risk_release_gate(_risk_sell_order(stock, day)) == "drop"
+
+
+def test_daily_risk_mismatch_pre_hold_final_sell_creates_one_order():
+    """15:05 不判、16:00 判卖：以终审为准 → 仅一单，闸门 allow。"""
+    factory, _ = _db_factory()
+    port, ctx = _portfolio_single(period="1d")
+    stock, day = "600000.SH", date(2026, 8, 24)
+    _seed_sellable(ctx, stock, price="10.0")
+    disp, _ = _make_dispatcher(_Recorder(respond=_bridge_ping(("/ping", "/order"))))
+    engine = _risk_engine(factory, port, disp, [day], stock)
+    engine._closer.fetch_daily_risk_stocks = lambda today: (
+        {stock: {"close": Decimal("9.0")}}, datetime.combine(today, datetime.min.time()))
+    engine._closer.daily_risk_periods = lambda today: ["1d"]
+
+    port.on_bar(_risk_bar(stock, "9.6", day, "preliminary"), period="1d")
+    engine._maybe_daily_risk_final(datetime(2026, 8, 24, 16, 0))
+
+    db = factory()
+    rows = {r.phase: r for r in db.query(LiveDailyRiskJudgement).all()}
+    db.close()
+    assert rows["preliminary"].triggered is False
+    assert rows["final"].triggered is True
+    assert len(engine._signal_bar_deferred) == 1
+    assert engine._daily_risk_release_gate(_risk_sell_order(stock, day)) == "allow"
+
+
+def test_daily_risk_unadjudicated_blocks_release_and_alerts():
+    """只有预判、终审缺失：标记未裁定 → 闸门 block，保留队列并告警。"""
+    factory, _ = _db_factory()
+    port, ctx = _portfolio_single(period="1d")
+    stock, day = "600000.SH", date(2026, 8, 24)
+    _seed_sellable(ctx, stock, price="10.0")
+    disp, _ = _make_dispatcher(_Recorder(respond=_bridge_ping(("/ping", "/order"))))
+    engine = _risk_engine(factory, port, disp, [day], stock)
+    alerted = []
+    engine._notify_unadjudicated = lambda code, d: alerted.append((code, d))
+
+    port.on_bar(_risk_bar(stock, "9.0", day, "preliminary"), period="1d")
+    order = _risk_sell_order(stock, day)
+    engine._signal_bar_deferred.append(order)
+
+    assert engine._daily_risk_release_gate(order) == "block"
+    assert alerted == [(stock, day)]
+    # 一次性告警：重复调用不重复推
+    assert engine._daily_risk_release_gate(order) == "block"
+    assert len(alerted) == 1
+
+
+def test_daily_risk_final_missing_marks_unadjudicated_at_giveup():
+    """16:00 取不到新鲜日线：宽限内重试，16:30 收口标「未裁定」并停止重试。"""
+    factory, _ = _db_factory()
+    port, ctx = _portfolio_single(period="1d")
+    stock, day = "600000.SH", date(2026, 8, 24)
+    _seed_sellable(ctx, stock, price="10.0")
+    disp, _ = _make_dispatcher(_Recorder(respond=_bridge_ping(("/ping", "/order"))))
+    engine = _risk_engine(factory, port, disp, [day], stock)
+    engine._closer.fetch_daily_risk_stocks = lambda today: (None, None)
+    alerted = []
+    engine._notify_unadjudicated = lambda code, d: alerted.append((code, d))
+
+    port.on_bar(_risk_bar(stock, "9.0", day, "preliminary"), period="1d")
+
+    engine._maybe_daily_risk_final(datetime(2026, 8, 24, 16, 0))
+    assert engine._daily_risk_final_done_date is None      # 宽限内继续重试
+    assert alerted == []
+
+    engine._maybe_daily_risk_final(datetime(2026, 8, 24, 16, 30))
+    assert engine._daily_risk_final_done_date == day      # 收口，不再整夜重拉
+    assert alerted == [(stock, day)]
+
+    db = factory()
+    ev = db.query(LiveDecisionEvent).filter_by(action="unadjudicated").all()
+    db.close()
+    assert len(ev) == 1
+    assert engine._daily_risk_release_gate(_risk_sell_order(stock, day)) == "block"
+
+
+def test_pre_open_auction_blocked_then_dropped_by_daily_risk_final():
+    """09:15 竞价放行按终审：未裁定 → 不报；终审未触发 → 出队撤销。"""
+    factory, _ = _db_factory()
+    port, ctx = _portfolio_single(period="1d")
+    stock = "600000.SH"
+    d1, d2 = date(2026, 8, 24), date(2026, 8, 25)
+    _seed_sellable(ctx, stock, price="10.0")
+    rec = _Recorder(respond=_bridge_ping(("/ping", "/order", "/price_limit")))
+    disp, _ = _make_dispatcher(rec)
+    engine = _pre_open_engine(factory, port, disp, [d1, d2], stock)
+    engine.execution_mode = "auto"
+
+    db = factory()
+    db.add(LiveDailyRiskJudgement(
+        live_session_id=engine.session_id, portfolio_id=1, strategy_id=1,
+        stock_code=stock, trade_date=d1, phase="preliminary",
+        triggered=True, condition="stop_loss", close_price=Decimal("9.0"),
+        avg_cost=Decimal("10.0"), highest_price=Decimal("10.0"),
+        threshold=Decimal("0.05"),
+    ))
+    engine._submit_one_order(db, port, _risk_sell_order(stock, d1), "1d")
+    db.close()
+    assert len(engine._signal_bar_deferred) == 1
+
+    engine._maybe_pre_open_auction(datetime(2026, 8, 25, 9, 16))
+    assert len(engine._signal_bar_deferred) == 1           # 未裁定：不报、留队列
+    assert not any(r.url.path == "/order" for r in rec.requests)
+
+    db = factory()
+    db.add(LiveDailyRiskJudgement(
+        live_session_id=engine.session_id, portfolio_id=1, strategy_id=1,
+        stock_code=stock, trade_date=d1, phase="final",
+        triggered=False, condition="", close_price=Decimal("9.6"),
+        avg_cost=Decimal("10.0"), highest_price=Decimal("10.0"),
+        threshold=Decimal("0.05"),
+    ))
+    db.commit()
+    db.close()
+    engine._daily_risk_gate_cache.clear()
+
+    engine._maybe_pre_open_auction(datetime(2026, 8, 25, 9, 17))
+    assert engine._signal_bar_deferred == []               # 终审不判：出队撤销
+    db = factory()
+    canceled = db.query(LiveOrder).filter_by(
+        stock_code=stock, status=54).all()                 # 54 = 已撤（终态）
+    db.close()
+    assert len(canceled) == 1
+
+
+def test_daily_risk_minute_strategy_unaffected_by_gate():
+    """分钟级策略的风控卖单不受两段式闸门影响（按自身周期 bar 判定即执行）。"""
+    factory, _ = _db_factory()
+    port, ctx = _portfolio_single(period="5m")
+    stock, day = "600000.SH", date(2026, 8, 24)
+    _seed_sellable(ctx, stock, price="10.0")
+    disp, _ = _make_dispatcher(_Recorder())
+    engine = _risk_engine(factory, port, disp, [day], stock)
+
+    assert engine._daily_risk_release_gate(_risk_sell_order(stock, day)) == "allow"
+
 

@@ -32,6 +32,10 @@ class BarEvent:
     # 语义：不跑公式信号评估（防重放历史 bar），但允许放行已决定好的 deferred 单
     # （首根完成 bar 不必被基线白白吞掉）。默认 False = 正常触发 bar。
     baseline: bool = False
+    # 日线风控两段式裁定标记（2026-11-25）：'preliminary' = 15:05 预判（只留档、
+    # 不生成可执行单）；'final' = 16:00 终审（判定可落库，次日竞价按它放行）。
+    # None = 普通轮次（分钟策略 / 回测 / 未启用两段式），行为逐字不变。
+    risk_judgement: Optional[str] = None
 
 
 @dataclass

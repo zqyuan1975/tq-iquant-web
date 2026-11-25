@@ -136,6 +136,7 @@ from ..config import load_config
 from ..services.notify_service import notify
 from core.models import (
     LiveAccountPositionSnapshot, LiveAccountSnapshot, LiveCashFlow,
+    LiveDailyRiskJudgement,
     LiveDecisionEvent, LiveBarOrderMark, LiveOrder, LivePositionPeak,
     LivePositionScope,
     LiveSession, LiveSessionPortfolio, LiveSignal, LiveTrade,
@@ -232,6 +233,16 @@ _GAP_BACKFILL_MAX_BARS = 240
 # 日线及以上周期（与 Portfolio._DAILY_PERIODS 同口径）：这类轮次驱动日线策略，
 # 峰值更新允许；盘中的分钟 bar 对「全为日线策略」的组合只是噪声（P1-2）。
 _DAILY_PERIODS = ("1d", "1w", "1mon")
+# 日线风控终审的取数宽限（2026-11-25）：16:00 取不到（本地日线未落盘）时每 60s
+# tick 重试，至 16:30 仍未新鲜 → 当日按「未裁定」留档 + 告警并停止重试，绝不整夜
+# 反复全池拉日线，也不拿昨日 bar 冒充今日裁定。
+_DAILY_RISK_FINAL_GIVEUP = (16, 30)
+# 风控卖出信号类型（与 backtest_engine._RISK_SELL_TYPES 同口径）：风控卖单追价
+# （risk_chase_ticks / risk_chase_max_attempts）只作用于这些类型的 SELL；
+# 普通 CLOSE/REDUCE 仍走 requote_enabled 的既有追价口径。
+_RISK_SELL_SIGNAL_TYPES = frozenset({
+    SignalType.STOP_LOSS, SignalType.TAKE_PROFIT, SignalType.TRAILING_STOP,
+})
 
 # 提交链三态返回（M2 一键全平上报口径）：受理 / 被拦 / 顺延。
 # 旧调用点不读取返回值，改为返回字符串不影响既有行为；_submit_reason 由
@@ -262,6 +273,22 @@ def _allow_peak_update(portfolio: Portfolio, bar: BarEvent) -> bool:
         (getattr(s, "period", "") or "1m").lower() not in _DAILY_PERIODS
         for s in getattr(portfolio, "strategies", [])
     )
+
+
+def _parse_hhmm(value, default: Tuple[int, int]) -> Tuple[int, int]:
+    """``"HH:MM"`` → (时, 分)；缺省/非法回退 default（日线风控终审等时点用）。"""
+    text = str(value or "").strip()
+    if not text:
+        return default
+    try:
+        hour, minute = text.split(":", 1)
+        h, m = int(hour), int(minute)
+        if 0 <= h <= 23 and 0 <= m <= 59:
+            return (h, m)
+    except Exception:  # noqa: BLE001
+        pass
+    logger.warning("时点配置非法 %r，回退 %02d:%02d", value, *default)
+    return default
 
 
 def _finite_or_none(value):
@@ -855,6 +882,20 @@ class LiveEngine:
         # 14:50 提前收盘价（仅 1d）：原始配置，构造 DailyCloser 时再按 auto 模式收敛
         self._advance_close_enabled_cfg = bool(advance_close_enabled)
         self._advance_close_time_cfg = advance_close_time or "14:51"
+        # 日线风控两段式裁定时点（2026-11-25，config.tq_trade 可配）：
+        # - 15:05 预判 = 日线收盘落定轮次，只留档、不生成可执行单；
+        # - 16:00 终审 = 通达信本地日线收盘已落盘（判据与回测日线同源），同时
+        #   避开 15:05–15:30 盘后固定价格交易；看板自动刷新顺延 16:10 避免抢锁。
+        _trade_cfg = (load_config() or {}).get("tq_trade", {}) or {}
+        self._daily_risk_precheck_time_cfg = str(
+            _trade_cfg.get("daily_risk_precheck_time") or "15:05")
+        self._daily_risk_final_time = _parse_hhmm(
+            _trade_cfg.get("daily_risk_final_time"), (16, 0))
+        # 终审幂等标记（跨重启）：live_sessions.daily_risk_final_done_date
+        self._daily_risk_final_done_date = None
+        # 放行闸缓存：(strategy_id, code, trade_date) → allow/drop/block
+        self._daily_risk_gate_cache: Dict[tuple, str] = {}
+        self._daily_risk_gate_alerted: Set[tuple] = set()
         # 信号判定维度（规范 2026-11-23）：period_close（默认）/ dynamic（1w/1mon，
         # 仅预警）。pre_close_1450 只由会话级 advance_close_enabled 显式开启。
         self._period_signal_mode_cfg = ps.period_signal_mode()
@@ -1088,6 +1129,9 @@ class LiveEngine:
         for p in portfolios:
             p.peak_persist_hook = self._note_peak_raised
             p.peak_adjust_hook = self._note_peak_adjusted
+            # 日线风控两段式裁定 sink：15:05 只留档（不生成可执行单），16:00 终审
+            p.risk_judgement_sink = functools.partial(
+                self._on_daily_risk_judgement, p)
         self._poll_interval = poll_interval
         # B5 市场状态闸（默认关）：regime_provider(code, end_date) → {date: Decimal}
         # 基准收盘全量历史；每组合每日首个 bar 重建因果跟踪器并注入
@@ -1260,6 +1304,8 @@ class LiveEngine:
                 self._advance_close_enabled_cfg
                 and self.execution_mode in ("auto", "shadow")),
             advance_close_time=self._advance_close_time_cfg,
+            # 日线轮次（15:05 预判）时点可配；同一轮次带 risk_judgement=preliminary
+            daily_bars_time=self._daily_risk_precheck_time_cfg,
             snapshot_synth=self._snapshot_synth,
             # 规范 2026-11-23：周期末/动态模式的统一判定与预警回调
             period_signal_mode=self._period_signal_mode_cfg,
@@ -1448,6 +1494,10 @@ class LiveEngine:
         if lock is not None:
             for p in value:
                 p.book_lock = lock
+        # 2026-11-25：组合列表被替换（recover 重建）时补挂日线风控裁定 sink
+        for p in value:
+            p.risk_judgement_sink = functools.partial(
+                self._on_daily_risk_judgement, p)
 
     @property
     def _dispatcher(self) -> HttpBridgeDispatcher:
@@ -2258,6 +2308,7 @@ class LiveEngine:
                 now_shanghai())),
             ("daily_close", self._maybe_daily_close),
             ("daily_bars", self._maybe_daily_bars),
+            ("daily_risk_final", self._maybe_daily_risk_final),
             ("advance_close", self._maybe_advance_daily_close),
         ):
             # stop 已同步置 _running=False/_stop_requested=True：剩余段不再执行，
@@ -3421,6 +3472,7 @@ class LiveEngine:
         if not self._signal_bar_deferred:
             return out
         by_pid = {p.portfolio_id: p for p in self.portfolios}
+        drop: List[OrderEvent] = []
         with self._book_lock:
             for order in self._signal_bar_deferred:
                 portfolio = by_pid.get(order.portfolio_id)
@@ -3435,22 +3487,53 @@ class LiveEngine:
                 op = (self._order_period(portfolio, order) or "").lower()
                 if op and op not in _DAILY_PERIODS:
                     continue
+                # 日线风控终审闸（2026-11-25）：只放行 final 裁定触发的风控单；
+                # 未触发 → 撤销 15:05 预判单；无 final → 「未裁定」保留队列并告警。
+                verdict = self._daily_risk_release_gate(order)
+                if verdict == "block":
+                    continue
+                if verdict == "drop":
+                    drop.append(order)
+                    continue
                 out.append(order)
+        for order in drop:
+            self._discard_deferred_order(order)
         return out
 
+    def _discard_deferred_order(self, order: OrderEvent) -> None:
+        """撤销一条 deferred 单（终审未触发）：出内存队列 + DB 行置 canceled。"""
+        try:
+            self._signal_bar_deferred.remove(order)
+        except ValueError:
+            pass
+        rid = getattr(order, "_deferred_row_id", None)
+        if rid is None:
+            return
+        db = self._db_session_factory()
+        try:
+            row = db.get(LiveOrder, rid)
+            if row is not None and row.status == "deferred":
+                row.status = _ORDER_STATUS_CANCELED
+                row.error_message = "日线风控终审未触发，撤销 15:05 预判单"
+                db.commit()
+        except Exception:  # noqa: BLE001
+            db.rollback()
+            logger.exception("discard deferred order failed: id=%s", rid)
+        finally:
+            db.close()
+
     def _maybe_daily_open_release(self, now: datetime) -> None:
-        """日线级 deferred 单「开盘档」放行（2026-11-24）：09:30–09:35。
+        """日线级 deferred 单「开盘档」**补报**（09:30–09:35，非主档）。
 
-        回测口径是 `period=1d` 的信号在**下一根日线 bar 的 open** 成交——实盘对应
-        集合竞价结束后的开盘价。旧实现只由「已完成的分钟 bar」触发放行：首根 1m
-        bar 迟到/缺失（2026-11-24 实证：09:24 缺首根，10:16 才放行）时，日线单被
-        拖到开盘后 46 分钟才报，成交价变成盘中价，与开盘价偏移方向不定——这是
-        **偏离**回测，不是对齐。
+        主档是 09:15–09:20 的集合竞价（`_maybe_pre_open_auction`）：竞价按开盘价
+        单一价撮合，成交价 = 回测的 next open。本方法只在**竞价未报成/未尝试**时
+        兜底（引擎 09:20 后才启动、竞价被通道能力闸拦下、竞价窗口内未排上等），
+        此时 deferred 单仍在队列里。
 
-        本方法在开盘后直接放行：价格取当日开盘价（集合竞价成交价，
-        `_day_open_price`），走与盘前同一条 `_pre_open_release` 提交链。取不到
-        开盘价 → 本轮不报、单留队列，下一轮再试；过了 09:35 交给既有首根 bar
-        路径兜底，并记 `open_price_missing` 风险事件（不再静默）。
+        放开后的行为：价格取当日开盘价（`_day_open_price`，仍是竞价成交价），走
+        与盘前同一条 `_pre_open_release` 提交链。取不到开盘价 → 本轮不报、单留
+        队列，下一轮再试；过了 09:35 交给既有首根 bar 路径兜底，并记
+        `open_price_missing` 风险事件（不再静默）。
         """
         if self.execution_mode != "auto":
             return
@@ -3640,6 +3723,7 @@ class LiveEngine:
         today = now.date()
         attempted = self._pre_open_attempted if attempted is None else attempted
         candidates: List[OrderEvent] = []
+        dropped: List[OrderEvent] = []
         with self._book_lock:
             for order in list(self._signal_bar_deferred):
                 if order.portfolio_id != portfolio.portfolio_id:
@@ -3660,6 +3744,14 @@ class LiveEngine:
                 op = self._order_period(portfolio, order)
                 if op and op.lower() not in _DAILY_PERIODS:
                     continue
+                # 日线风控两段式放行闸（2026-11-25）：竞价放行只认前一日 16:00 终审。
+                # block（未裁定/终审缺失）→ 留队列不报；drop（终审未触发）→ 出队撤销。
+                risk_gate = self._daily_risk_release_gate(order)
+                if risk_gate == "block":
+                    continue
+                if risk_gate == "drop":
+                    dropped.append(order)
+                    continue
                 key = self._pre_open_key(portfolio, order)
                 if key in attempted:
                     continue
@@ -3673,6 +3765,8 @@ class LiveEngine:
                     o for o in self._signal_bar_deferred
                     if not any(o is c for c in candidates)
                 ]
+        for order in dropped:
+            self._discard_deferred_order(order)
         if not candidates:
             return
         db = self._db_session_factory()
@@ -7731,6 +7825,291 @@ class LiveEngine:
     def _maybe_advance_daily_close(self, now: Optional[datetime] = None) -> None:
         """14:50 提前收盘价轮次（薄委托 → DailyCloser；仅 1d，会话级开关）。"""
         self._closer.maybe_advance_daily_close(now)
+
+    # ---------------- 日线风控两段式裁定（15:05 预判 / 16:00 终审） ----------------
+    def _on_daily_risk_judgement(self, portfolio, phase, ctx, stock_code, pos,
+                                 close, condition, threshold, bar) -> None:
+        """风控判定留档：preliminary（15:05，只留档）/ final（16:00，唯一可执行依据）。
+
+        唯一键 (session, strategy, code, trade_date, phase) 幂等 upsert：同一交易日
+        同一持仓只有一条终审裁定，重复执行只更新、不产生新指令。
+        """
+        trade_date = bar.bar_time.date() if bar.bar_time else None
+        if trade_date is None:
+            return
+        db = self._db_session_factory()
+        try:
+            row = (
+                db.query(LiveDailyRiskJudgement)
+                .filter(
+                    LiveDailyRiskJudgement.live_session_id == self.session_id,
+                    LiveDailyRiskJudgement.strategy_id == ctx.strategy_id,
+                    LiveDailyRiskJudgement.stock_code == stock_code,
+                    LiveDailyRiskJudgement.trade_date == trade_date,
+                    LiveDailyRiskJudgement.phase == phase,
+                )
+                .first()
+            )
+            if row is None:
+                row = LiveDailyRiskJudgement(
+                    live_session_id=self.session_id,
+                    portfolio_id=portfolio.portfolio_id,
+                    strategy_id=ctx.strategy_id,
+                    stock_code=stock_code,
+                    trade_date=trade_date,
+                    phase=phase,
+                )
+                db.add(row)
+            row.triggered = bool(condition)
+            row.condition = condition or ""
+            row.close_price = close
+            row.avg_cost = pos.avg_cost
+            row.highest_price = pos.highest_price
+            row.threshold = threshold
+            db.commit()
+        except Exception:  # noqa: BLE001 — 留档失败不影响交易主链路
+            db.rollback()
+            logger.exception(
+                "daily risk judgement persist failed: session=%s strategy=%s %s %s",
+                self.session_id, getattr(ctx, "strategy_id", None), stock_code, phase)
+        finally:
+            db.close()
+
+    def _daily_risk_final_done(self, db, today: date) -> bool:
+        """终审幂等：内存标记 + live_sessions.daily_risk_final_done_date。"""
+        if self._daily_risk_final_done_date == today:
+            return True
+        try:
+            row = db.get(LiveSession, self.session_id)
+            if row is not None and row.daily_risk_final_done_date == today.isoformat():
+                self._daily_risk_final_done_date = today
+                return True
+        except Exception:  # noqa: BLE001
+            db.rollback()
+        return False
+
+    def _maybe_daily_risk_final(self, now: Optional[datetime] = None) -> None:
+        """16:00 日线风控终审（可配）：重判 → 落 final → 生成/校正次日风控单。
+
+        与 15:05 预判用**同一 close 口径**（当日已完成日线 bar 的 close，禁止
+        high/low）；取数新鲜度校验同 15:05。16:00 的选择依据：通达信本地日线
+        收盘已落盘，判据与回测日线同源，且避开 15:05–15:30 盘后固定价格交易。
+        缺数 → 不写 final（次日放行闸按「未裁定」告警并拦单）。
+        """
+        now = now or now_shanghai()
+        if (now.hour, now.minute) < self._daily_risk_final_time:
+            return
+        if self.execution_mode not in ("auto", "shadow"):
+            return
+        today = now.date()
+        if not self._calendar.is_trading_day(today):
+            return
+        if self._stop_requested or not self._running:
+            return
+        db = self._db_session_factory()
+        try:
+            if self._daily_risk_final_done(db, today):
+                return
+            stocks, daily_time = self._closer.fetch_daily_risk_stocks(today)
+            if not stocks:
+                if (now.hour, now.minute) < _DAILY_RISK_FINAL_GIVEUP:
+                    logger.warning(
+                        "daily risk final: 日线不新鲜/取数失败，下轮重试 (session=%s date=%s)",
+                        self.session_id, today)
+                    return
+                # 宽限过后仍无新鲜日线 → 当日「未裁定」：逐票记事件 + 告警，并标记
+                # 当日终审已收口，避免整夜每 60s 全池重拉。次日放行闸无 final → 拦单。
+                logger.error(
+                    "daily risk final: 16:30 仍无新鲜日线，当日标记未裁定 (session=%s date=%s)",
+                    self.session_id, today)
+                self._reconcile_daily_risk_judgements(db, today)
+                for portfolio in list(self.portfolios):
+                    self._drain_decisions(db, portfolio)
+                row = db.get(LiveSession, self.session_id)
+                if row is not None:
+                    row.daily_risk_final_done_date = today.isoformat()
+                db.commit()
+                self._daily_risk_final_done_date = today
+                return
+            periods = self._closer.daily_risk_periods(today)
+            for period in periods:
+                bar = BarEvent(stocks=stocks, bar_time=daily_time,
+                               period=period, post_close=True,
+                               risk_judgement="final")
+                for portfolio in list(self.portfolios):
+                    try:
+                        orders = portfolio.on_bar(
+                            bar, period=period, risk_only=True)
+                    except Exception:  # noqa: BLE001
+                        logger.exception(
+                            "daily risk final on_bar failed: session=%s portfolio=%s",
+                            self.session_id, portfolio.portfolio_id)
+                        continue
+                    for order in orders:
+                        if order.signal_bar_date is None and order.bar_time is not None:
+                            order.signal_bar_date = order.bar_time.date()
+                        try:
+                            self._submit_one_order(
+                                db, portfolio, order, period, post_close=True)
+                        except Exception:  # noqa: BLE001
+                            db.rollback()
+                            logger.exception(
+                                "daily risk final submit failed: session=%s %s",
+                                self.session_id, order.stock_code)
+            self._reconcile_daily_risk_judgements(db, today)
+            for portfolio in list(self.portfolios):
+                self._drain_decisions(db, portfolio)
+            self._flush_position_peaks()
+            row = db.get(LiveSession, self.session_id)
+            if row is not None:
+                row.daily_risk_final_done_date = today.isoformat()
+                db.commit()
+            self._daily_risk_final_done_date = today
+            logger.info(
+                "daily risk final done: session=%s date=%s periods=%s stocks=%s",
+                self.session_id, today, periods, len(stocks))
+        finally:
+            db.close()
+
+    def _reconcile_daily_risk_judgements(self, db: Session, today: date) -> None:
+        """逐票比对预判/终审，记不一致事件；预判有、终审无 → 未裁定告警。"""
+        try:
+            rows = (
+                db.query(LiveDailyRiskJudgement)
+                .filter(
+                    LiveDailyRiskJudgement.live_session_id == self.session_id,
+                    LiveDailyRiskJudgement.trade_date == today,
+                )
+                .all()
+            )
+        except Exception:  # noqa: BLE001
+            db.rollback()
+            return
+        pre = {(r.strategy_id, r.stock_code): r
+               for r in rows if r.phase == "preliminary"}
+        fin = {(r.strategy_id, r.stock_code): r
+               for r in rows if r.phase == "final"}
+        for key, f in fin.items():
+            p = pre.get(key)
+            if p is None:
+                self._recorder.record(
+                    gate="daily_risk_final", layer="live_gate", action="final",
+                    portfolio_id=f.portfolio_id, strategy_id=f.strategy_id,
+                    stock_code=f.stock_code, bar_time=datetime.combine(today, datetime.min.time()),
+                    message=("终审裁定（无 15:05 预判对照）：%s，收盘 %s，阈值 %s"
+                             % (f.condition or "未触发", f.close_price, f.threshold)),
+                )
+                continue
+            if bool(p.triggered) != bool(f.triggered) or (p.condition or "") != (f.condition or ""):
+                self._recorder.record(
+                    gate="daily_risk_final", layer="live_gate", action="mismatch",
+                    portfolio_id=f.portfolio_id, strategy_id=f.strategy_id,
+                    stock_code=f.stock_code, bar_time=datetime.combine(today, datetime.min.time()),
+                    message=("预判/终审不一致：15:05 %s(阈值 %s，价 %s) → 16:00 %s(阈值 %s，价 %s)；"
+                             "以终审为准"
+                             % (p.condition or "未触发", p.threshold, p.close_price,
+                                f.condition or "未触发", f.threshold, f.close_price)),
+                )
+        for key, p in pre.items():
+            if key in fin:
+                continue
+            self._recorder.record(
+                gate="daily_risk_final", layer="live_gate", action="unadjudicated",
+                portfolio_id=p.portfolio_id, strategy_id=p.strategy_id,
+                stock_code=p.stock_code, bar_time=datetime.combine(today, datetime.min.time()),
+                message=("终审缺失（未裁定）：15:05 预判 %s，16:00 无 final 裁定；"
+                         "次日不放行该持仓风控单" % (p.condition or "未触发")),
+            )
+            self._notify_unadjudicated(p.stock_code, today)
+
+    def _notify_unadjudicated(self, stock_code: str, trade_date: date) -> None:
+        try:
+            notify(
+                "日线风控终审缺失",
+                "%s 的 %s 当日无终审裁定，次日集合竞价不放行其风控单，请检查数据/通道"
+                % (trade_date.isoformat(), stock_code),
+                level="warning",
+            )
+        except Exception:  # noqa: BLE001
+            logger.debug("notify unadjudicated failed", exc_info=True)
+
+    def _daily_risk_release_gate(self, order: OrderEvent) -> str:
+        """末日线风控单放行闸：allow / drop / block。
+
+        - 仅作用于**日线级策略**的风控卖单（STOP_LOSS/TAKE_PROFIT/TRAILING_STOP），
+          分钟级策略（5m/15m/30m/1h/1m）不受影响（按各周期 bar 判定即执行）。
+        - 终审 triggered=True → allow；triggered=False → drop（撤销预判单）。
+        - 有预判（preliminary）但无 final → block（保留队列并告警「未裁定」，当日
+          不放行该持仓风控单，不拿错数据下单）。
+        - 既无 final 也无 preliminary（该股当日未跑两段式，如功能上线前遗留的
+          deferred 单）→ allow，保持旧行为，避免把存量队列整日卡死。
+        """
+        if order.signal_type not in _RISK_SELL_SIGNAL_TYPES:
+            return "allow"
+        signal_date = getattr(order, "signal_bar_date", None)
+        if signal_date is None:
+            return "allow"
+        ctx = None
+        for p in self.portfolios:
+            ctx = p.find_strategy(order.strategy_id)
+            if ctx is not None:
+                break
+        if ctx is None or (getattr(ctx, "period", "") or "1m").lower() not in _DAILY_PERIODS:
+            return "allow"
+        key = (order.strategy_id, order.stock_code, signal_date)
+        cached = self._daily_risk_gate_cache.get(key)
+        if cached is not None:
+            return cached
+        db = self._db_session_factory()
+        try:
+            row = (
+                db.query(LiveDailyRiskJudgement)
+                .filter(
+                    LiveDailyRiskJudgement.live_session_id == self.session_id,
+                    LiveDailyRiskJudgement.strategy_id == order.strategy_id,
+                    LiveDailyRiskJudgement.stock_code == order.stock_code,
+                    LiveDailyRiskJudgement.trade_date == signal_date,
+                    LiveDailyRiskJudgement.phase == "final",
+                )
+                .first()
+            )
+            preliminary_exists = False
+            if row is None:
+                preliminary_exists = (
+                    db.query(LiveDailyRiskJudgement.id)
+                    .filter(
+                        LiveDailyRiskJudgement.live_session_id == self.session_id,
+                        LiveDailyRiskJudgement.strategy_id == order.strategy_id,
+                        LiveDailyRiskJudgement.stock_code == order.stock_code,
+                        LiveDailyRiskJudgement.trade_date == signal_date,
+                        LiveDailyRiskJudgement.phase == "preliminary",
+                    )
+                    .first()
+                    is not None
+                )
+        except Exception:  # noqa: BLE001
+            db.rollback()
+            row = None
+            preliminary_exists = False
+        finally:
+            db.close()
+        if row is None and preliminary_exists:
+            verdict = "block"
+            if key not in self._daily_risk_gate_alerted:
+                self._daily_risk_gate_alerted.add(key)
+                self._recorder.record(
+                    gate="daily_risk_final", layer="live_gate", action="unadjudicated",
+                    portfolio_id=order.portfolio_id, strategy_id=order.strategy_id,
+                    stock_code=order.stock_code, bar_time=order.bar_time,
+                    message="终审缺失（未裁定）：%s 的风控单不放行" % signal_date,
+                )
+                self._notify_unadjudicated(order.stock_code, signal_date)
+        elif row is None:
+            verdict = "allow"      # 当日未跑两段式（存量 deferred 单）：保持旧行为
+        else:
+            verdict = "allow" if row.triggered else "drop"
+        self._daily_risk_gate_cache[key] = verdict
+        return verdict
 
     def _maybe_close_sweep(self, now: Optional[datetime] = None) -> None:
         """15:05 收盘清扫（薄委托 → DailyCloser）。
@@ -13196,6 +13575,7 @@ class LiveEngine:
         bar_date = bar.bar_time.date()
         released: List[OrderEvent] = []
         remaining: List[OrderEvent] = []
+        drop: List[OrderEvent] = []
         for order in self._signal_bar_deferred:
             # 跨日判定以入队时固化的 signal_bar_date 为准：bar_time 可能被人工放行
             # 等路径临时改写为当日，若只看 bar_time.date() 会让该单当天及以后永远
@@ -13218,6 +13598,15 @@ class LiveEngine:
             if (order_period and order_period not in _DAILY_PERIODS
                     and order_period != bar_period):
                 remaining.append(order)
+                continue
+            # 日线风控终审闸（2026-11-25）：与 09:15/09:30 档同口径——final 未触发
+            # → 撤销预判单；无 final → 保留队列并告警「未裁定」，不拿错数据下单。
+            verdict = self._daily_risk_release_gate(order)
+            if verdict == "block":
+                remaining.append(order)
+                continue
+            if verdict == "drop":
+                drop.append(order)
                 continue
             signal_day = order.signal_bar_date
             due = self._next_trading_day(signal_day) if signal_day is not None else None
@@ -13334,6 +13723,8 @@ class LiveEngine:
                 self._refresh_release_price(order)
             released.append(order)
         self._signal_bar_deferred = remaining
+        for order in drop:
+            self._discard_deferred_order(order)
         return released
 
     def _cancel_reversal_untradable(
@@ -15802,6 +16193,7 @@ class LiveEngine:
                 self.session_id)
         # D3：虚拟持仓 vs 桥实际 /positions 对账（仅告警不修正，见 _reconcile_positions）
         self._reconcile_positions()
+
     def _reconcile_positions(self) -> bool:
         """D3：对账——虚拟持仓(按 code 聚合) vs 桥实际 /positions，不一致仅记录+告警。
 
