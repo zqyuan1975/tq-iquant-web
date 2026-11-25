@@ -47,9 +47,9 @@ const DEFAULTS: SystemConfig = {
     client_path: '',
     default_engine: 'tdx',
     cancel_unfilled_minutes: 3,
-    pre_open_auction_enabled: false,
+    pre_open_auction_enabled: true,
     pre_open_auction_end_time: '09:20',
-    pre_open_auction_price_bias_pct: 2,
+    pre_open_auction_price_bias_pct: null,
   },
   goldminer: {
     base_url: 'http://127.0.0.1:7801',
@@ -532,8 +532,9 @@ function testTdx() { return testChannel('tdx_tq') }
               对通达信 TQ / 同花顺 / 掘金 / QMT 四条交易通道均生效，与各通道自身参数相互独立。
               默认开启；关闭后行为与旧版一致（次日首根完成 1m bar 约 09:31 放行）。
               开启后在交易日 09:15–结束时间 把「当日 due」的 deferred 日线信号单直接
-              报进集合竞价，不依赖 1 分钟 bar；未报成/闸门拦截的单回 deferred 队列，
-              由 09:31 首根 bar 路径兜底重试（同一单不会两次报出）。
+              报进集合竞价，不依赖 1 分钟 bar。集合竞价是单一价撮合，成交价 =
+              开盘价 = 回测的 next open；09:30 开盘价档只做「竞价未报成」的补报
+              （同一单不会两次报出）。
             </p>
             <div class="field">
               <label class="cfg-check">
@@ -550,14 +551,16 @@ function testTdx() { return testChannel('tdx_tq') }
               <p class="cfg-hint">09:15 起、左闭右开；默认 09:20（之后进入不可撤单撮合段，不再新报）</p>
             </div>
             <div class="field">
-              <label>盘前让价幅度(%)</label>
+              <label>让价上限(%)</label>
               <input
                 v-model.number="config.tq_trade!.pre_open_auction_price_bias_pct"
-                type="number" min="0" step="0.1" style="max-width:180px"
+                type="number" min="0" step="0.1" placeholder="留空=不设上限"
+                style="max-width:180px"
               />
               <p class="cfg-hint">
-                委托价 = 信号价 × (1 ± 幅度)，并夹进当日涨跌停（涨停−1 跳 / 跌停+1 跳）。
-                买向上让价提高竞价成交率，卖向下让价；不推到涨跌停（避免余量挂板追价）
+                留空（null）= 不设上限：委托价直接取涨跌停内收 1 跳（买=涨停−1 跳、
+                卖=跌停+1 跳）。集合竞价单一价撮合，成交价恒为开盘价，不会买贵/卖低。
+                填 0–10 时作为上限：买 min(涨停−1 跳, 信号价×(1+上限))，0 = 不让价
               </p>
             </div>
           </section>

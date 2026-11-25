@@ -2907,14 +2907,14 @@ def pre_open_auction_effective(session_row, tq_cfg: Optional[dict] = None) -> di
         raw = load_config().get("tq_trade") or {}
         tq_cfg = raw if isinstance(raw, dict) else {}
     cfg, overrides = resolve_pre_open_auction_config(session_row, tq_cfg)
-    default = {"enabled": True, "end_time": "09:20", "price_bias_pct": 2.0}
+    default = {"enabled": True, "end_time": "09:20", "price_bias_pct": None}
+    _bias = cfg.get("pre_open_auction_price_bias_pct")
     return {
         "enabled": bool(cfg.get("pre_open_auction_enabled", default["enabled"])),
         "end_time": str(cfg.get("pre_open_auction_end_time")
                         or default["end_time"]),
-        "price_bias_pct": float(cfg.get("pre_open_auction_price_bias_pct")
-                                if cfg.get("pre_open_auction_price_bias_pct")
-                                is not None else default["price_bias_pct"]),
+        # None = 不设让价上限（涨跌停内收 1 跳）
+        "price_bias_pct": None if _bias is None else float(_bias),
         "source": "session" if overrides else "global",
         "overrides": overrides,
     }

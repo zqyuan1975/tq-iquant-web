@@ -495,10 +495,15 @@ _REJECT_TERMINAL_HINTS = (
 )
 # 次日盘前（集合竞价）执行窗口：交易日 09:15（开盘集合竞价开始）至结束时间
 # （默认 09:20，之后进入不可撤单撮合段，不再新报）。左闭右开，按 (时, 分) 判定。
+# 09:15–09:20 可报可撤，09:20–09:25 只可报不可撤——我们在 09:20 停止新报，
+# 把「提交 + 撤单」都留在可撤窗口内。
 _PRE_OPEN_START = (9, 15)
 _PRE_OPEN_DEFAULT_END = (9, 20)
-# 盘前委托价让价幅度默认值（%，相对信号价；见 PreOpenAuctionConfig 注释）。
-_PRE_OPEN_DEFAULT_PRICE_BIAS_PCT = Decimal("2")
+# 盘前委托价的**可选让价上限**（%，相对信号价）。None（默认）= 不设上限：
+# 委托价直接取「涨跌停内收 1 跳」（买 = 涨停−1 跳，卖 = 跌停+1 跳）。集合竞价
+# 是单一价撮合，挂到板上不会买贵/卖低（成交价恒为开盘价），只把跳空漏单率压到
+# 最低；配置 0–10 时才作为上限生效（买 min(涨停−1 跳, 信号价×(1+上限))）。
+_PRE_OPEN_DEFAULT_PRICE_BIAS_PCT = None
 # 成交价偏离监控默认阈值（%）：桥通道回填的成交价相对审批价（委托价）绝对偏离超过
 # 该值即发 risk 事件。配置 config.live.fill_price_deviation_pct 覆盖，<=0 关闭。
 _DEFAULT_FILL_PRICE_DEVIATION_PCT = Decimal("1.0")
@@ -573,30 +578,30 @@ class PreOpenAuctionConfig:
     """次日盘前（集合竞价）执行日线级信号单的配置（config.tq_trade.pre_open_auction*）。
 
     默认开启（对齐回测「次日开盘执行」口径）：enabled=False 时引擎完全不进入盘前
-    路径，行为与旧版完全一致（deferred 单只由「次一交易日首根完成 1m bar」放行，
+    路径，行为与旧版一致（deferred 单只由「次一交易日首根完成 1m bar」放行，
     即约 09:31）。config.yaml 写 ``pre_open_auction_enabled: false`` 即可关闭。
 
     开启后仅在交易日 09:15 ≤ now < end_time 对「当日 due 的 deferred 日线信号
-    单」直接报单到柜台集合竞价。盘前没有开盘价，委托价用「信号价（前一日
-    deferred 单记录的 price，即信号 bar 收盘）× (1 ± bias%)」并在当日涨跌停
-    之内收 1 跳：买 = min(信号价×(1+bias), 涨停价−1 跳)，卖 =
-    max(信号价×(1−bias), 跌停价+1 跳)。取 1 跳是为绕开本地涨跌停校验
-    （买 ≥ 涨停 / 卖 ≤ 跌停一律拦），而不是把单打到涨跌停板上去追价。
+    单」直接报单到柜台集合竞价。依据：**集合竞价是单一价撮合，成交价就是开盘价
+    = 回测的 next open**，因此「挂到板上」并不会买贵/卖低，只是把「跳空导致
+    限价落在开盘价之外、整天漏单」的概率压到最低。
+
+    委托价规则（price_bias_pct 只是可选上限，默认为 None = 不设上限）：
+      - 默认：买 = 涨停价 − 1 跳，卖 = 跌停价 + 1 跳（收 1 跳是为绕开本地涨跌停
+        校验：买 ≥ 涨停 / 卖 ≤ 跌停一律拦，实际不会把单挂到板上）；
+      - 配置 0–10：在上述基础上再夹一层「信号价 × (1 ± 上限%)」的上限，供担心
+        极端一字板时收敛让价幅度（0 = 完全不让价）。
     """
 
-    def __init__(self, enabled: bool = False, end_time=None,
+    def __init__(self, enabled: bool = True, end_time=None,
                  price_bias_pct=None):
         self.enabled = bool(enabled)
         self.end_time = self._parse_clock(end_time, _PRE_OPEN_DEFAULT_END)
-        try:
-            bias = Decimal(str(price_bias_pct))
-            self.price_bias_pct = bias if bias >= 0 else Decimal("0")
-        except Exception:  # noqa: BLE001
-            self.price_bias_pct = _PRE_OPEN_DEFAULT_PRICE_BIAS_PCT
+        self.price_bias_pct = self._parse_bias(price_bias_pct)
 
     @classmethod
     def from_config(cls, cfg=None) -> "PreOpenAuctionConfig":
-        """config.tq_trade 段 → 配置。缺键/非 dict → 开启（默认对齐回测）。"""
+        """config.tq_trade 段 → 配置。缺键/非 dict → 用类默认（开启）。"""
         if not isinstance(cfg, dict):
             cfg = {}
         return cls(
@@ -604,6 +609,17 @@ class PreOpenAuctionConfig:
             end_time=cfg.get("pre_open_auction_end_time"),
             price_bias_pct=cfg.get("pre_open_auction_price_bias_pct"),
         )
+
+    @staticmethod
+    def _parse_bias(value) -> Optional[Decimal]:
+        """让价上限：None/空 = 不设上限（涨跌停内收 1 跳）；负数归 0。"""
+        if value is None or str(value).strip() == "":
+            return None
+        try:
+            bias = Decimal(str(value))
+        except Exception:  # noqa: BLE001
+            return _PRE_OPEN_DEFAULT_PRICE_BIAS_PCT
+        return bias if bias >= 0 else Decimal("0")
 
     @staticmethod
     def _parse_clock(value, default: Tuple[int, int]) -> Tuple[int, int]:
@@ -2996,12 +3012,12 @@ class LiveEngine:
                 # 按缺口长度放大 count 幂等补派（见 _plan_gap_recovery）；快照合成源
                 # 客观取不到断线期 bar，仍重建基线并记可审计缺口事件。
                 self._recover_after_offline(now)
-            # 次日盘前（集合竞价）执行日线信号单（默认关闭）：必须在行情 poll
+            # 次日盘前（集合竞价）执行日线信号单（默认开启，成交价=开盘价=回测 next open）：必须在行情 poll
             # 之前——09:15 一开窗就把昨日 deferred 日线单报进集合竞价。关闭时
             # 方法首行 return，队列/DB/价格/事件一律不动（旧行为逐字不变）。
             self._maybe_pre_open_auction(now)
-            # 日线级 deferred 单「开盘档」兜底放行（2026-11-24）：09:30 开盘价
-            # 一可得就报出，不等首根已闭合 1m bar（回测按次日 open 成交）。
+            # 09:30 开盘档**补报**（2026-11-25 降级）：只兜底「竞价未报成/未
+            # 尝试」的日线 deferred 单，不是主档（主档是上面的集合竞价）。
             self._maybe_daily_open_release(now)
             # G3：顺延单积压告警（默认关闭；每交易日每规则最多一条）
             self._check_deferred_backlog(now)
@@ -3108,14 +3124,14 @@ class LiveEngine:
             self._record_tick_profile(now, prof, t_round)
 
     def _maybe_pre_open_auction(self, now: datetime) -> None:
-        """次日盘前（集合竞价）执行「当日 due」的 deferred 日线信号单（默认关闭）。
+        """次日盘前（集合竞价）执行「当日 due」的 deferred 日线信号单（默认开启）。
 
         与 09:31 首根 bar 路径的关系（本需求最容易出错的地方）：
         - 开关关闭 → 本方法首行 return；deferred 队列、DB 行、价格、事件全不动，
           完全走既有「次一交易日首根完成 1m bar 放行」逻辑，行为逐字不变。
         - 开关开启 → 仅在交易日 09:15 ≤ now < end_time 的窗口内，把 due=今日 的
           deferred **日线**单从内存队列摘出（等价 bar 路径的放行动作），按
-          「信号价 ± bias% 并夹进当日涨跌停」定价后，走**同一条**
+          「涨跌停内收 1 跳（可选让价上限）」定价后，走**同一条**
           `_submit_one_order` 闸门链（资金/整手/在途预留/审批/T+1/熔断/风控
           优先级全部复用，不另起一套）。不依赖任何 1 分钟 bar，不需快照合成。
         - 幂等/at-most-once：①每单每日只尝试一次（`_pre_open_attempted` 用逻辑
@@ -3317,7 +3333,10 @@ class LiveEngine:
             "action": "effective",
             "enabled": bool(self._pre_open.enabled),
             "end_time": "%02d:%02d" % (end_h, end_m),
-            "price_bias_pct": str(self._pre_open.price_bias_pct),
+            # None = 不设上限（涨跌停内收 1 跳），字符串化时归一为 "none"
+            "price_bias_pct": (
+                "none" if self._pre_open.price_bias_pct is None
+                else str(self._pre_open.price_bias_pct)),
             "source": self._pre_open_config_source,
             "overrides": list(self._pre_open_config_overrides),
             "live_bar_volume_unit": "shares",
@@ -3698,11 +3717,13 @@ class LiveEngine:
                         "（当日开盘价/集合竞价成交价）"
                         % (order.signal_bar_date, fmt_price(order.price)))
                 else:
+                    _cap = self._pre_open.price_bias_pct
                     release_msg = (
                         "盘前集合竞价放行：signal_bar_date=%s，委托价 %s"
-                        "（信号价让价 %s%%，涨跌停内收 1 跳）"
+                        "（涨跌停内收 1 跳%s；集合竞价按开盘价撮合）"
                         % (order.signal_bar_date, fmt_price(order.price),
-                           self._pre_open.price_bias_pct))
+                           "，让价上限 %s%%" % _cap
+                           if _cap is not None else ""))
                 self._rec_live(
                     gate_tag, "release", portfolio, order, message=release_msg,
                 )
@@ -4212,16 +4233,23 @@ class LiveEngine:
             return None
 
     def _pre_open_price(self, order: OrderEvent) -> Optional[Decimal]:
-        """盘前委托价：信号价 × (1 ± bias%)，再夹进当日涨跌停（各收 1 跳）。
+        """盘前委托价：涨跌停内收 1 跳（买=涨停−1 跳，卖=跌停+1 跳）。
 
-        盘前没有开盘价（也不依赖 1 分钟 bar），基准取 deferred 单记录的 price
-        = 信号 bar 收盘价（前一日），作为 09:31 路径「首根 bar 开盘价」的盘前代理；
-        缺失时用通道昨收兜底，都拿不到就维持信号价原值。买 `min(基准×(1+bias),
-        涨停−tick)`、卖 `max(基准×(1−bias), 跌停+tick)`；收 1 跳是为绕开本地
-        涨跌停校验（买 ≥ 涨停 / 卖 ≤ 跌停一律拦），而不是把单挂到板上追价。
+        依据（2026-11-25 修正）：集合竞价是**单一价撮合**，无论挂多高的买价 /
+        多低的卖价，成交价都是开盘价（= 回测的 next open）。挂到板上不会买贵/
+        卖低，却能把「跳空超过让价幅度 → 限价落在开盘价之外 → 整天漏单」的概率
+        压到最低。收 1 跳是为绕开本地涨跌停校验（买 ≥ 涨停 / 卖 ≤ 跌停一律拦），
+        实际不会把单挂到板上。
+
+        `price_bias_pct` 仅在显式配置（0–10）时作为**上限**：买取
+        min(涨停−1 跳, 信号价×(1+上限))，卖取 max(跌停+1 跳, 信号价×(1−上限))。
+        0 = 完全不让价（等价旧「维持信号价」）。
+
+        涨跌停数据取不到（fail-open 通道）时无法算板价：按信号价（或配置上限）
+        保守报单，绝不猜板价。
         """
         tick = tick_size(order.stock_code) or Decimal("0.01")
-        bias = self._pre_open.price_bias_pct / Decimal("100")
+        cap = self._pre_open.price_bias_pct
         base = order.price if order.price is not None and order.price > 0 else None
         bounds = self._price_limit_bounds(order.stock_code)
         prev_close, limit_up, limit_down = bounds if bounds else (None, None, None)
@@ -4229,16 +4257,26 @@ class LiveEngine:
             base = Decimal(str(prev_close))
         if base is None:
             return None
+        cap_ratio = (cap / Decimal("100")) if cap is not None else None
         if order.trade_type == TradeType.BUY:
-            price = (base * (Decimal("1") + bias)).quantize(
-                tick, rounding=ROUND_HALF_UP)
             if limit_up:
-                price = min(price, Decimal(str(limit_up)) - tick)
+                price = Decimal(str(limit_up)) - tick
+            elif cap_ratio is not None:
+                price = base * (Decimal("1") + cap_ratio)
+            else:
+                price = base
+            if cap_ratio is not None:
+                price = min(price, base * (Decimal("1") + cap_ratio))
         else:
-            price = (base * (Decimal("1") - bias)).quantize(
-                tick, rounding=ROUND_HALF_UP)
             if limit_down:
-                price = max(price, Decimal(str(limit_down)) + tick)
+                price = Decimal(str(limit_down)) + tick
+            elif cap_ratio is not None:
+                price = base * (Decimal("1") - cap_ratio)
+            else:
+                price = base
+            if cap_ratio is not None:
+                price = max(price, base * (Decimal("1") - cap_ratio))
+        price = price.quantize(tick, rounding=ROUND_HALF_UP)
         return price if price > 0 else None
 
     def external_signal_status(self) -> Dict:

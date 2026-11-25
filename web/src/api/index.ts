@@ -2633,7 +2633,7 @@ export interface LiveSessionItem {
   pre_open_auction_effective?: {
     enabled: boolean
     end_time: string
-    price_bias_pct: number
+    price_bias_pct: number | null   // null=不设上限（涨跌停内收 1 跳）
     source: 'session' | 'global'
     overrides: string[]
   }
@@ -3306,9 +3306,9 @@ export interface TqTradeConfig {
   client_path: string
   default_engine: string       // tdx|iquant|ths：新建实盘会话未显式选引擎时使用
   cancel_unfilled_minutes: number  // >0：在途单超时未成交自动撤单；0=禁用
-  pre_open_auction_enabled: boolean       // 次日盘前（集合竞价）执行日线信号单，默认 false
+  pre_open_auction_enabled: boolean       // 次日盘前（集合竞价）执行日线信号单，默认 true
   pre_open_auction_end_time: string       // 盘前执行窗口结束时间（默认 09:20，左闭右开）
-  pre_open_auction_price_bias_pct: number // 盘前委托价相对信号价的让价幅度（%）
+  pre_open_auction_price_bias_pct: number | null // 让价上限（%）；null=不设上限，取涨跌停内收 1 跳
 }
 
 export interface BackupConfig {

@@ -13191,23 +13191,30 @@ def test_pre_open_window_boundaries():
     assert conf.is_open(datetime(2026, 8, 25, 9, 19, 59))
     assert not conf.is_open(datetime(2026, 8, 25, 9, 14, 59))
     assert not conf.is_open(datetime(2026, 8, 25, 9, 20))
-    # 默认关闭
-    assert not PreOpenAuctionConfig().is_open(datetime(2026, 8, 25, 9, 16))
-    # 非法值回退默认 09:20；负数让价归零
+    # 默认开启（竞价成交价 = 开盘价 = 回测 next open）
+    assert PreOpenAuctionConfig().is_open(datetime(2026, 8, 25, 9, 16))
+    # 非法值回退默认 09:20；负数让价归零；默认不设让价上限
     bad = PreOpenAuctionConfig(enabled=True, end_time="25:99", price_bias_pct=-3)
     assert bad.end_time == (9, 20)
     assert bad.price_bias_pct == Decimal("0")
+    assert PreOpenAuctionConfig().price_bias_pct is None
 
 
 def test_pre_open_config_defaults_enabled():
-    """代码默认开启：from_config 缺键/None → enabled=True；显式 False 仍可关。"""
+    """代码默认开启：from_config 缺键/None → enabled=True，让价上限 None。
+
+    依据：集合竞价单一价撮合，成交价 = 开盘价 = 回测 next open；默认挂
+    「涨跌停内收 1 跳」把跳空漏单率压到最低。显式关闭仍走 09:31 首根 bar。
+    """
     from core.config import _defaults
     from core.engine.live_engine import PreOpenAuctionConfig
     assert PreOpenAuctionConfig.from_config({}).enabled is True
     assert PreOpenAuctionConfig.from_config(None).enabled is True
     assert PreOpenAuctionConfig.from_config(
         {"pre_open_auction_enabled": False}).enabled is False
+    assert PreOpenAuctionConfig.from_config({}).price_bias_pct is None
     assert _defaults()["tq_trade"]["pre_open_auction_enabled"] is True
+    assert _defaults()["tq_trade"]["pre_open_auction_price_bias_pct"] is None
 
 
 def test_engine_mismatched_risk_flag_passed_to_portfolio(monkeypatch):
@@ -13530,8 +13537,45 @@ def test_pre_open_blocked_order_falls_back_to_first_bar_path():
     db.close()
 
 
-def test_pre_open_price_bias_and_limit_clamp():
-    """委托价 = 信号价 ± bias%，并夹进当日涨跌停（各收 1 跳）。"""
+def _pre_open_order(trade_type, price="9.0", code="600000.SH"):
+    return OrderEvent(
+        strategy_id=1, portfolio_id=1, stock_code=code,
+        trade_type=trade_type, signal_type=SignalType.OPEN,
+        quantity=100, price=Decimal(price), bar_time=datetime(2026, 8, 24),
+        signal_name="sig", signal_bar_date=date(2026, 8, 24),
+    )
+
+
+def test_pre_open_price_uses_limit_minus_one_tick():
+    """默认不设上限：买 = 涨停−1 跳，卖 = 跌停+1 跳（收 1 跳绕开本地校验）。"""
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single(period="1d")
+    disp, _ = _make_dispatcher(_Recorder())
+    engine = _pre_open_engine(
+        factory, port, disp, [date(2026, 8, 25)], "600000.SH")
+    # 昨收 9.00 / 涨停 9.90 / 跌停 8.10（主板 ±10%）
+    engine._price_limit_bounds = lambda code: (9.0, 9.90, 8.10)
+    assert engine._pre_open_price(_pre_open_order(TradeType.BUY)) == Decimal("9.89")
+    assert engine._pre_open_price(
+        _pre_open_order(TradeType.SELL, code="000001.SZ")) == Decimal("8.11")
+
+
+def test_pre_open_price_covers_gap_over_old_bias():
+    """跳空 5%：旧「信号价+2%」会漏单，新口径挂涨停−1 跳仍按开盘价成交。"""
+    factory, _ = _db_factory()
+    port, _ = _portfolio_single(period="1d")
+    disp, _ = _make_dispatcher(_Recorder())
+    engine = _pre_open_engine(
+        factory, port, disp, [date(2026, 8, 25)], "600000.SH")
+    engine._price_limit_bounds = lambda code: (9.0, 9.90, 8.10)
+    open_price = Decimal("9.45")          # 高开 5% > 旧让价 2%
+    price = engine._pre_open_price(_pre_open_order(TradeType.BUY))
+    assert price == Decimal("9.89")
+    assert price > open_price             # 买价高于开盘价 → 竞价必成交（成交价=开盘价）
+
+
+def test_pre_open_price_optional_cap_and_failopen():
+    """显式上限收敛让价（0=不让价）；无涨跌停数据时不猜板价。"""
     factory, _ = _db_factory()
     port, _ = _portfolio_single(period="1d")
     disp, _ = _make_dispatcher(_Recorder())
@@ -13539,28 +13583,16 @@ def test_pre_open_price_bias_and_limit_clamp():
         factory, port, disp, [date(2026, 8, 25)], "600000.SH",
         pre_open_auction_price_bias_pct=2,
     )
-    # 昨收 9.00 / 涨停 9.05 / 跌停 8.90
-    engine._price_limit_bounds = lambda code: (9.0, 9.05, 8.90)
-    buy = OrderEvent(
-        strategy_id=1, portfolio_id=1, stock_code="600000.SH",
-        trade_type=TradeType.BUY, signal_type=SignalType.OPEN,
-        quantity=100, price=Decimal("9.0"), bar_time=datetime(2026, 8, 24),
-        signal_name="open_sig", signal_bar_date=date(2026, 8, 24),
-    )
-    # 9.00 × 1.02 = 9.18 → 被涨停−1 跳夹到 9.04
-    assert engine._pre_open_price(buy) == Decimal("9.04")
-
-    sell = OrderEvent(
-        strategy_id=1, portfolio_id=1, stock_code="000001.SZ",
-        trade_type=TradeType.SELL, signal_type=SignalType.CLOSE,
-        quantity=100, price=Decimal("9.0"), bar_time=datetime(2026, 8, 24),
-        signal_name="stop_loss", signal_bar_date=date(2026, 8, 24),
-    )
-    # 9.00 × 0.98 = 8.82 → 被跌停+1 跳夹到 8.91
-    assert engine._pre_open_price(sell) == Decimal("8.91")
-    # 无涨跌停数据（fail-open）→ 只按让价
+    engine._price_limit_bounds = lambda code: (9.0, 10.8, 7.2)   # 20% 板
+    buy = _pre_open_order(TradeType.BUY)
+    assert engine._pre_open_price(buy) == Decimal("9.18")        # 9.00×1.02
+    # 0 = 完全不让价
+    engine._pre_open.price_bias_pct = Decimal("0")
+    assert engine._pre_open_price(buy) == Decimal("9.00")
+    # fail-open：拿不到板价 → 按信号价，绝不猜板价
+    engine._pre_open.price_bias_pct = None
     engine._price_limit_bounds = lambda code: None
-    assert engine._pre_open_price(sell) == Decimal("8.82")
+    assert engine._pre_open_price(buy) == Decimal("9.00")
 
 
 def test_pre_open_skips_non_trading_day_and_weekly_orders():

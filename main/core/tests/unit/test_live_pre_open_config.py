@@ -106,9 +106,10 @@ def test_pre_open_auction_effective_marks_source():
     )
     effective = live_service.pre_open_auction_effective(row, {})
     assert effective["source"] == "global"
-    assert effective["enabled"] is True
+    assert effective["enabled"] is True  # 默认开启：竞价成交价=开盘价=回测 next open
     assert effective["end_time"] == "09:20"
-    assert effective["price_bias_pct"] == 2.0
+    # None = 不设让价上限（涨跌停内收 1 跳）
+    assert effective["price_bias_pct"] is None
 
     row.pre_open_auction_enabled = False
     effective = live_service.pre_open_auction_effective(row, {})

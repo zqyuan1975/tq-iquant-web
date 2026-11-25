@@ -3597,7 +3597,7 @@ onUnmounted(() => {
       </div>
       <label>盘前集合竞价参数<span class="label-note">（会话级覆盖）</span></label>
       <select v-model="form.pre_open_auction_enabled" data-field="pre_open_auction_enabled">
-        <option :value="null">跟随全局（默认开启，09:15–09:20 / 让价 2%）</option>
+        <option :value="null">跟随全局（默认开启，09:15–09:20 / 涨跌停内收 1 跳）</option>
         <option :value="true">本会话开启</option>
         <option :value="false">本会话关闭（走次日首根 1m bar 放行）</option>
       </select>
@@ -3606,8 +3606,8 @@ onUnmounted(() => {
       </p>
       <label>盘前窗口结束时间<span class="label-note">（HH:MM，留空跟随全局 09:20）</span></label>
       <input v-model="form.pre_open_auction_end_time" placeholder="09:20（可选 09:15–09:30）" data-field="pre_open_auction_end_time" />
-      <label>盘前让价 %<span class="label-note">（留空跟随全局 2%）</span></label>
-      <input v-model="form.pre_open_auction_price_bias_pct" type="number" step="0.1" min="0" max="10" placeholder="2（0–10）" data-field="pre_open_auction_price_bias_pct" />
+      <label>让价上限 %<span class="label-note">（留空跟随全局：不设上限）</span></label>
+      <input v-model="form.pre_open_auction_price_bias_pct" type="number" step="0.1" min="0" max="10" placeholder="留空=不设上限" data-field="pre_open_auction_price_bias_pct" />
       <label>组合策略<span class="label-note">（可多选）</span></label>
       <div class="portfolio-check-list">
         <label v-for="p in portfolios" :key="p.id" class="portfolio-check">
@@ -3952,14 +3952,14 @@ onUnmounted(() => {
         </label>
         <label>盘前集合竞价参数<span class="label-note">（会话级覆盖）</span></label>
         <select v-model="editForm.pre_open_auction_enabled" data-field="edit-pre-open-enabled">
-          <option :value="null">跟随全局（默认开启，09:15–09:20 / 让价 2%）</option>
+          <option :value="null">跟随全局（默认开启，09:15–09:20 / 涨跌停内收 1 跳）</option>
           <option :value="true">本会话开启</option>
           <option :value="false">本会话关闭（走次日首根 1m bar 放行）</option>
         </select>
         <label>盘前窗口结束时间<span class="label-note">（HH:MM，留空跟随全局）</span></label>
         <input v-model="editForm.pre_open_auction_end_time" placeholder="09:20（可选 09:15–09:30）" data-field="edit-pre-open-end-time" />
-        <label>盘前让价 %<span class="label-note">（留空跟随全局）</span></label>
-        <input v-model="editForm.pre_open_auction_price_bias_pct" type="number" step="0.1" min="0" max="10" placeholder="2（0–10）" data-field="edit-pre-open-bias" />
+        <label>让价上限 %<span class="label-note">（留空跟随全局：不设上限）</span></label>
+        <input v-model="editForm.pre_open_auction_price_bias_pct" type="number" step="0.1" min="0" max="10" placeholder="留空=不设上限" data-field="edit-pre-open-bias" />
         <label>组合策略<span class="label-note">（可多选，运行中下次启动生效）</span></label>
         <div class="portfolio-check-list">
           <label v-for="p in portfolios" :key="p.id" class="portfolio-check">
