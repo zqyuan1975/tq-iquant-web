@@ -25,6 +25,7 @@ INHERIT_BINDING_FIELDS = (
     "signal_frequency", "signal_at", "risk_timing",
     "requote_enabled", "requote_max_attempts", "requote_price_mode",
     "requote_max_slippage_ticks", "max_order_amount",
+    "risk_chase_ticks", "risk_chase_max_attempts",
     "split_order_enabled", "split_order_threshold",
 )
 

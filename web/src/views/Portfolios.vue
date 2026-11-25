@@ -265,6 +265,8 @@ const STRATEGY_GROUPS: { title: string; hint?: string; fields: FieldMeta[] }[] =
     { key: 'requote_max_attempts', label: '追价重下次数', span: 1, type: 'number', placeholder: '2', hint: '对应 requote_max_attempts（0–10，默认 2）。与「撤单追价重下」是同一套参数的两个字段（开关 + 次数上限），不是「撤单重试次数」' },
     { key: 'requote_price_mode', label: '追价价源', span: 1, type: 'select', options: 'requotePriceModes', hint: 'tick=固定追 1 个最小变动价（原行为）；adaptive=按最新 1m 收盘价追，但不超过「最大追价档数」' },
     { key: 'requote_max_slippage_ticks', label: '最大追价档数', span: 1, type: 'number', placeholder: '5', hint: 'adaptive 模式下追价幅度上限（0–100 档）；0 等同 tick 行为' },
+    { key: 'risk_chase_ticks', label: '风控卖单让价跳数', span: 1, type: 'number', placeholder: '0', hint: '仅止损/止盈/移动止损的卖单：相对触发价最多让出 N 跳（默认 0=不让价，与回测成交价口径一致），且不越过跌停内收 1 跳' },
+    { key: 'risk_chase_max_attempts', label: '风控卖单重下次数', span: 1, type: 'number', placeholder: '0', hint: '风控卖单超时撤单后最多重下几次（默认 0=不重下，保持既有行为）；重下沿用同一让价价位并夹涨跌停' },
     { key: 'split_order_enabled', label: '大额拆单', span: 1, type: 'switch', hint: '单笔金额超阈值时拆单（TDX 通道，批次2 接线）' },
     { key: 'split_order_threshold', label: '拆单阈值（元）', span: 1, type: 'number', placeholder: '500000' },
     { key: 'split_order_count', label: '切片笔数', span: 1, type: 'number', placeholder: '留空=按阈值推导', hint: '显式指定拆单笔数；留空/0 按「成交额 ÷ 阈值」向上取整' },
@@ -292,6 +294,7 @@ function emptyStrategyForm(): Record<string, any> {
     max_order_amount: null,
     requote_enabled: false, requote_max_attempts: 2,
     requote_price_mode: 'tick', requote_max_slippage_ticks: 5,
+    risk_chase_ticks: 0, risk_chase_max_attempts: 0,
     split_order_enabled: false, split_order_threshold: 500000,
     split_order_count: null, split_order_min_qty: null,
     split_order_interval_seconds: null, split_order_interval_jitter: false,
@@ -600,6 +603,10 @@ function validateStrategyPayload(p: Record<string, unknown>): string | null {
   }
   const rms = num(p.requote_max_slippage_ticks)
   if (rms !== null && !(rms >= 0 && rms <= 100)) return '最大追价档数须在 [0,100]'
+  const rct = num(p.risk_chase_ticks)
+  if (rct !== null && !(rct >= 0 && rct <= 100)) return '风控卖单让价跳数须在 [0,100]'
+  const rcma = num(p.risk_chase_max_attempts)
+  if (rcma !== null && !(rcma >= 0 && rcma <= 20)) return '风控卖单重下次数须在 [0,20]'
   if (p.risk_timing && !['next_day', 'immediate'].includes(String(p.risk_timing))) {
     return '风控执行时点须为 next_day 或 immediate'
   }
@@ -779,6 +786,8 @@ function openEditStrategy(pid: number, s: StrategyDetail) {
     requote_max_attempts: s.requote_max_attempts ?? 2,
     requote_price_mode: s.requote_price_mode ?? 'tick',
     requote_max_slippage_ticks: s.requote_max_slippage_ticks ?? 5,
+    risk_chase_ticks: s.risk_chase_ticks ?? 0,
+    risk_chase_max_attempts: s.risk_chase_max_attempts ?? 0,
     split_order_enabled: s.split_order_enabled ?? false,
     split_order_threshold: s.split_order_threshold ?? 500000,
     split_order_count: s.split_order_count ?? null,

@@ -4604,7 +4604,12 @@ class LiveEngine:
             if portfolio is None:
                 continue
             ctx = portfolio.find_strategy(lo.strategy_id)
-            if ctx is None or not getattr(ctx, "requote_enabled", False):
+            if ctx is None:
+                continue
+            # 2026-11-25：风控卖单撤单重下与 requote_enabled 解耦，改由策略级
+            # risk_chase_max_attempts（默认 0=不重下）控制；普通单仍走 requote_enabled。
+            is_risk_sell = self._is_risk_sell_order(lo)
+            if not is_risk_sell and not getattr(ctx, "requote_enabled", False):
                 continue
             remaining = int(lo.quantity or 0) - int(lo.filled_quantity or 0)
             if remaining <= 0:
@@ -4621,7 +4626,11 @@ class LiveEngine:
                 lo.bar_time.date() if lo.bar_time else None,
             )
             attempts = self._requote_attempts.get(key, 0)
-            max_attempts = int(getattr(ctx, "requote_max_attempts", 2) or 0)
+            if is_risk_sell:
+                max_attempts = int(
+                    getattr(ctx, "risk_chase_max_attempts", 0) or 0)
+            else:
+                max_attempts = int(getattr(ctx, "requote_max_attempts", 2) or 0)
             if attempts >= max_attempts:
                 logger.info(
                     "requote skip: order %s %s attempts %d >= max %d (session %s)",
@@ -4646,9 +4655,13 @@ class LiveEngine:
                 continue  # 无原价依据，不盲目追价
             price = (orig_price + step if (lo.trade_type or "").lower() == "buy"
                      else orig_price - step)
+            if is_risk_sell:
+                # 风控卖单：提交时已按 risk_chase_ticks 让到「触发价 − N 跳」上限，
+                # 重下沿用同一价位（不再叠加漂移），并显式夹涨跌停内收 1 跳。
+                price = self._clamp_release_price(lo, orig_price)
             # H4 自适应追价：adaptive 模式按最新价追（穿一档），但追价幅度不超过
             # requote_max_slippage_ticks 档，防止行情跳变时变成无限追高/杀跌。
-            if (getattr(ctx, "requote_price_mode", "tick") == "adaptive"):
+            elif (getattr(ctx, "requote_price_mode", "tick") == "adaptive"):
                 price = choose_requote_price(
                     orig_price, step,
                     (lo.trade_type or "").lower() == "buy",
@@ -7305,6 +7318,20 @@ class LiveEngine:
                 price = max(price, down + tick)
         return price.quantize(tick, rounding=ROUND_HALF_UP)
 
+    @staticmethod
+    def _is_risk_sell_order(order) -> bool:
+        """是否为风控卖出单（STOP_LOSS / TAKE_PROFIT / TRAILING_STOP 的 SELL）。"""
+        trade_type = getattr(order, "trade_type", None)
+        if str(getattr(trade_type, "value", trade_type)).upper() != TradeType.SELL.value:
+            return False
+        signal_type = getattr(order, "signal_type", None)
+        if isinstance(signal_type, str):
+            try:
+                signal_type = SignalType(signal_type.upper())
+            except ValueError:
+                return False
+        return signal_type in _RISK_SELL_SIGNAL_TYPES
+
     def _apply_minute_price_bias(self, portfolio: Portfolio, order: OrderEvent,
                                  ctx) -> None:
         """P1-5（2026-11-11）：分钟级单提交价在信号价上让 1 跳。
@@ -7319,8 +7346,15 @@ class LiveEngine:
         未成交仍由既有追价路径兜底（`requote_max_attempts`、±1 跳）。日线及以上
         周期、deferred 放行价（`_release_priced`）、追价重下（±1 跳已加过）、
         盘前单（已按 bias% 让价）一律不动。
+
+        2026-11-25 风控卖单追价：风控 SELL（止损/止盈/移动止损）与
+        ``requote_enabled`` 解耦，按策略级 ``risk_chase_ticks``（默认 0=关闭，
+        不让价）让价，上限 = 涨跌停内收 1 跳（SELL 取 ``max(跌停+1跳, 触发价
+        - N跳)``，即 BUY 侧 ``min(涨停-1跳, 触发价 + N跳)`` 的卖方向镜像）。
+        让到底价后不再让。
         """
-        if not getattr(ctx, "requote_enabled", False):
+        risk_sell = self._is_risk_sell_order(order)
+        if not risk_sell and not getattr(ctx, "requote_enabled", False):
             return
         # 残量顺延 chunk 已在 `_advance_volume_residual` 里按最新价重算过提交价，
         # 不再叠加 1 跳让价（否则同一逻辑单每补一次就多偏 1 跳）。
@@ -7346,6 +7380,28 @@ class LiveEngine:
             return
         price = getattr(order, "price", None)
         if price is None or price <= 0:
+            return
+        if risk_sell:
+            n = getattr(ctx, "risk_chase_ticks", 0)
+            n = int(n) if n is not None else 0
+            if n <= 0:
+                return
+            step = tick_size(order.stock_code)
+            chase = price - step * n          # SELL 让价 = 向下 N 跳
+            clamped = self._clamp_release_price(order, chase)
+            if clamped is None or clamped >= price:
+                # 已到跌停内收 1 跳（或无限制价）：不再让价，保持触发价
+                return
+            order.price = clamped
+            order._price_biased = True
+            logger.info("[risk-chase] %s 风控卖单让价 %s 跳：%s → %s（策略 %s）",
+                        order.stock_code, n, price, clamped, ctx.strategy_id)
+            self._rec_live(
+                "risk_chase", "bias", portfolio, order,
+                param_name="risk_chase_ticks", param_value=float(n),
+                message=("风控卖单追价 %s 跳：%s → %s（上限=跌停内收 1 跳）"
+                         % (n, fmt_price(price), fmt_price(clamped))),
+            )
             return
         if order.trade_type == TradeType.BUY:
             biased = price + tick_size(order.stock_code)

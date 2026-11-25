@@ -11075,6 +11075,120 @@ def test_requote_skips_when_fully_filled_before_cancel(monkeypatch):
 # 真机事实：TDX/THS 当日委托表保留已撤单（不消失），超时撤单实际全走 5s 轮询
 # sync_terminal_order_status 的 53/54 终态路径收敛——requote 必须覆盖该路径。
 # ===========================================================================
+# ---- 2026-11-25：风控卖单追价（risk_chase_*，与 requote_enabled 解耦） ----
+def _risk_sell_pending(db, ref="W001", price="9.3", quantity=600):
+    """预置一笔风控卖单在途（STOP_LOSS SELL，10 分钟前创建 → 命中超时撤单）。"""
+    lo = LiveOrder(
+        live_session_id=1, portfolio_strategy_id=1, strategy_id=1,
+        stock_code="600000.SH", trade_type="sell", order_type="limit",
+        price=Decimal(price), quantity=quantity, filled_quantity=0,
+        filled_price=None, status="submitted", signal_name="stop_loss",
+        signal_type="STOP_LOSS", bar_time=datetime(2026, 8, 5, 10, 0),
+        order_ref=ref,
+        created_at=(
+            datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(minutes=10)),
+    )
+    db.add(lo)
+    db.flush()
+    return lo
+
+
+def test_risk_sell_requote_without_requote_enabled(monkeypatch):
+    """风控卖单与 requote_enabled 解耦：未开重下也按 risk_chase_max_attempts 重下。
+
+    重下沿用原触发价（提交侧已按 risk_chase_ticks 让价），不额外 −1 tick 漂移。
+    """
+    monkeypatch.setattr("core.engine.live.order_machine.load_config", _cfg_minutes(3))
+    factory, _ = _db_factory()
+    disp = FakeTdxDispatcher(orders=[_bridge_row("W001")])
+    port, ctx = _portfolio_single()
+    ctx.requote_enabled = False
+    ctx.risk_chase_max_attempts = 2
+    # 有可卖持仓：否则重下被「可用不足」闸门拦掉，测不到重下本身
+    pos = Position("600000.SH")
+    pos.buy(600, Decimal("9.0"), datetime(2026, 8, 4, 9, 30))
+    ctx.positions["600000.SH"] = pos
+    engine = _make_engine(disp, factory, port)
+    db = factory()
+    _risk_sell_pending(db)
+    db.commit()
+    db.close()
+
+    _sweep_two_rounds_to_cancel(engine, disp, factory)
+
+    db = factory()
+    orders = db.query(LiveOrder).order_by(LiveOrder.id).all()
+    assert len(orders) == 2
+    orig, requote = orders
+    assert orig.status == "canceled"
+    assert requote.status == "submitted"
+    assert requote.trade_type == "sell"
+    assert requote.signal_type == "STOP_LOSS"
+    assert requote.price == Decimal("9.30")   # 不叠加额外漂移
+    assert requote.quantity == 600
+    db.close()
+    assert engine._requote_attempts[
+        (1, "600000.SH", "stop_loss", date(2026, 8, 5))] == 1
+
+
+def test_risk_sell_requote_zero_attempts_disables(monkeypatch):
+    """risk_chase_max_attempts=0 → 风控卖单撤单后不重下（终态 canceled）。"""
+    monkeypatch.setattr("core.engine.live.order_machine.load_config", _cfg_minutes(3))
+    factory, _ = _db_factory()
+    disp = FakeTdxDispatcher(orders=[_bridge_row("W001")])
+    port, ctx = _portfolio_single()
+    ctx.requote_enabled = True          # 普通重下开着也不影响风控单次数口径
+    ctx.risk_chase_max_attempts = 0
+    engine = _make_engine(disp, factory, port)
+    db = factory()
+    _risk_sell_pending(db)
+    db.commit()
+    db.close()
+
+    _sweep_two_rounds_to_cancel(engine, disp, factory)
+
+    db = factory()
+    orders = db.query(LiveOrder).all()
+    assert len(orders) == 1 and orders[0].status == "canceled"
+    db.close()
+
+
+def test_risk_sell_submit_price_chase_ticks():
+    """提交侧：风控卖单让 N 跳；N=0 不动；普通 CLOSE 单不受影响。"""
+    from core.engine.event import OrderEvent
+    from tq_iquant_shared.constants import SignalType as _ST, TradeType as _TT
+
+    factory, _ = _db_factory()
+    port, ctx = _portfolio_single(period="1m")
+    rec = _Recorder()
+    disp, _ = _make_dispatcher(rec)
+    engine = _make_engine(disp, factory, port)
+
+    def _order(signal_type, price="9.30"):
+        return OrderEvent(
+            strategy_id=1, portfolio_id=1, stock_code="600000.SH",
+            trade_type=_TT.SELL, signal_type=signal_type,
+            quantity=100, price=Decimal(price),
+            bar_time=datetime(2026, 8, 5, 10, 0), signal_name="risk",
+        )
+
+    ctx.risk_chase_ticks = 1
+    o1 = _order(_ST.STOP_LOSS)
+    engine._apply_minute_price_bias(port, o1, ctx)
+    assert o1.price == Decimal("9.29")          # SELL 向下让 1 跳
+
+    ctx.risk_chase_ticks = 0
+    o2 = _order(_ST.TRAILING_STOP)
+    engine._apply_minute_price_bias(port, o2, ctx)
+    assert o2.price == Decimal("9.30")          # 0 = 不让价
+
+    # 普通卖出（CLOSE）不属风控单，且策略未开 requote → 原价不动
+    ctx.requote_enabled = False
+    o3 = _order(_ST.CLOSE)
+    engine._apply_minute_price_bias(port, o3, ctx)
+    assert o3.price == Decimal("9.30")
+
+
 def test_requote_fires_via_53_54_terminal_sync_path(monkeypatch):
     """带撤单标记的单走 53/54 终态同步收敛（此前 requote 不可达的路径）→ 追价重下。"""
     monkeypatch.setattr("core.engine.live.order_machine.load_config", _cfg_minutes(3))

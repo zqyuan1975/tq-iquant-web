@@ -190,6 +190,10 @@ def assemble_portfolio(
             requote_price_mode=getattr(strat, "requote_price_mode", None) or "tick",
             requote_max_slippage_ticks=int(
                 getattr(strat, "requote_max_slippage_ticks", None) or 5),
+            # 风控卖单追价（2026-11-25）：默认 0/0 = 关闭（不让价、不重下），仅风控 SELL 生效
+            risk_chase_ticks=int(getattr(strat, "risk_chase_ticks", 0) or 0),
+            risk_chase_max_attempts=int(
+                getattr(strat, "risk_chase_max_attempts", 0) or 0),
             split_order_enabled=bool(getattr(strat, "split_order_enabled", False)),
             split_order_threshold=Decimal(str(
                 getattr(strat, "split_order_threshold", None) or "500000")),

@@ -1476,6 +1476,9 @@ export interface StrategyDetail {
   requote_max_attempts: number
   requote_price_mode: string  // tick|adaptive（H4）
   requote_max_slippage_ticks: number  // H4 最大追价档数
+  // 风控卖单追价（仅止损/止盈/移动止损的 SELL）
+  risk_chase_ticks: number
+  risk_chase_max_attempts: number
   split_order_enabled: boolean
   split_order_threshold: number
   // H3 切片增强（null/0 = 按阈值默认推导）
@@ -1523,6 +1526,8 @@ export interface StrategyRequest {
   requote_max_attempts?: number
   requote_price_mode?: string  // tick|adaptive（H4）
   requote_max_slippage_ticks?: number
+  risk_chase_ticks?: number | null
+  risk_chase_max_attempts?: number | null
   split_order_enabled?: boolean
   split_order_threshold?: number
   split_order_count?: number | null

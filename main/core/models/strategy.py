@@ -66,6 +66,14 @@ class Strategy(Base):
     # 受 requote_max_slippage_ticks 限制（无行情回退 tick）
     requote_price_mode = Column(String(16), default="tick", server_default="tick", nullable=False)
     requote_max_slippage_ticks = Column(Integer, default=5, server_default="5", nullable=False)
+    # 风控卖单追价（2026-11-25，仅 STOP_LOSS/TAKE_PROFIT/TRAILING_STOP 的 SELL）：
+    # risk_chase_ticks = 相对触发价最多让出的跳数（**默认 0=关闭**，0 时不改委托价，
+    # 与回测「信号 bar 收盘价、下一 bar 开盘成交」的成交价口径保持一致；>0 才让价，
+    # 且不越过涨跌停内收 1 跳）；
+    # risk_chase_max_attempts = 撤单后重下次数上限（**默认 0=不重下**，保持既有
+    # 风控单「超时撤单后不追」的行为）。与 requote_enabled 解耦。
+    risk_chase_ticks = Column(Integer, default=0, server_default="0", nullable=False)
+    risk_chase_max_attempts = Column(Integer, default=0, server_default="0", nullable=False)
     # TDX 大额拆单（本批次仅落配置管线，拆单逻辑批次 2 实现）
     split_order_enabled = Column(Boolean, default=False, server_default=text("0"), nullable=False)
     split_order_threshold = Column(Float, default=500000.0, server_default="500000.0", nullable=False)

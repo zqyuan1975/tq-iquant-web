@@ -76,6 +76,12 @@ def serialize_strategy(s: Strategy) -> dict:
         "requote_max_slippage_ticks": (
             s.requote_max_slippage_ticks
             if s.requote_max_slippage_ticks is not None else 5),
+        "risk_chase_ticks": (
+            getattr(s, "risk_chase_ticks", None)
+            if getattr(s, "risk_chase_ticks", None) is not None else 0),
+        "risk_chase_max_attempts": (
+            getattr(s, "risk_chase_max_attempts", None)
+            if getattr(s, "risk_chase_max_attempts", None) is not None else 0),
         "risk_timing": s.risk_timing or "next_day",
         "reversal_disposition": getattr(s, "reversal_disposition", None) or "close_next_open",
         "signal_frequency": s.signal_frequency,
@@ -346,6 +352,9 @@ def _create_strategies_two_step(db: Session, pid: int, strategies: list) -> None
             requote_max_attempts=getattr(s, "requote_max_attempts", 2),
             requote_price_mode=getattr(s, "requote_price_mode", None) or "tick",
             requote_max_slippage_ticks=getattr(s, "requote_max_slippage_ticks", 5) or 5,
+            risk_chase_ticks=int(getattr(s, "risk_chase_ticks", 0) or 0),
+            risk_chase_max_attempts=int(
+                getattr(s, "risk_chase_max_attempts", 0) or 0),
             split_order_enabled=getattr(s, "split_order_enabled", False),
             split_order_threshold=getattr(s, "split_order_threshold", 500000.0),
             split_order_count=getattr(s, "split_order_count", None),
@@ -530,6 +539,14 @@ def _apply_strategy_fields(s: Strategy, req, is_update: bool = False) -> None:
     # 实盘执行配置（批次1；缺省字段回落默认，保持旧请求行为不变）
     s.requote_enabled = getattr(req, "requote_enabled", False)
     s.requote_max_attempts = getattr(req, "requote_max_attempts", 2)
+    # 风控卖单追价（2026-11-25）：None=沿用默认（0/0=关闭，不让价也不重下）；
+    # update 仅显式携带才改（与 rotation 等可选参数同口径，避免静默重置）。
+    _apply_opt("risk_chase_ticks", None)
+    _apply_opt("risk_chase_max_attempts", None)
+    if s.risk_chase_ticks is None:
+        s.risk_chase_ticks = 0
+    if s.risk_chase_max_attempts is None:
+        s.risk_chase_max_attempts = 0
     s.split_order_enabled = getattr(req, "split_order_enabled", False)
     s.split_order_threshold = getattr(req, "split_order_threshold", 500000.0)
     # H3/H4：None 表示沿用默认推导（切片笔数/最小量/间隔/量比）

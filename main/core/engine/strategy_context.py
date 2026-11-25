@@ -54,6 +54,10 @@ class StrategyContext:
         # H4 自适应追价：tick=固定一档（默认）/adaptive=按最新价追
         requote_price_mode: str = "tick",
         requote_max_slippage_ticks: int = 5,
+        # 风控卖单追价（2026-11-25，仅风控 SELL）：让价跳数 + 撤单重下次数上限
+        # 默认 0/0 = 关闭，保持「按触发价委托、不做人为让价」的原行为
+        risk_chase_ticks: int = 0,
+        risk_chase_max_attempts: int = 0,
         split_order_enabled: bool = False,
         split_order_threshold: Decimal = Decimal("500000"),
         # H3 切片增强（None/0 = 沿用按阈值推导）
@@ -115,6 +119,8 @@ class StrategyContext:
         self.requote_max_attempts = requote_max_attempts
         self.requote_price_mode = requote_price_mode
         self.requote_max_slippage_ticks = requote_max_slippage_ticks
+        self.risk_chase_ticks = risk_chase_ticks
+        self.risk_chase_max_attempts = risk_chase_max_attempts
         self.split_order_enabled = split_order_enabled
         self.split_order_threshold = split_order_threshold
         self.split_order_count = split_order_count

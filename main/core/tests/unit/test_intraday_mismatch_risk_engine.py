@@ -197,7 +197,8 @@ def test_1m_stop_loss_with_flag_on_submits_same_day_despite_next_day():
     assert order.trade_type == TradeType.SELL
     assert order.signal_type == SignalType.STOP_LOSS
     assert order.quantity == 1000          # 整仓
-    assert order.price == Decimal("9.0")   # 信号 bar 收盘价，未让价/未追价
+    # 信号 bar 收盘价 9.0；风控卖单默认不让价（risk_chase_ticks=0）→ 原价 9.0
+    assert order.price == Decimal("9.0")
     assert order.bar_time == _BAR_TIME     # 就是那根 1m bar，未被对齐成日线 00:00
     assert order.signal_bar_date is None   # 风控单不再携带未来函数日期
     assert ctx.period == "1d"              # 1m bar 真的驱动了 1d 策略

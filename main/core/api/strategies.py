@@ -97,6 +97,9 @@ class StrategyItem(BaseModel):
     # H4 自适应追价：tick=固定一档（默认）/ adaptive=按最新价追
     requote_price_mode: str = "tick"
     requote_max_slippage_ticks: int = 5
+    # 风控卖单追价（仅 STOP_LOSS/TAKE_PROFIT/TRAILING_STOP 的 SELL）
+    risk_chase_ticks: int | None = None
+    risk_chase_max_attempts: int | None = None
     split_order_enabled: bool = False
     split_order_threshold: float = 500000.0
     # H3 切片增强（None/0 = 按阈值默认推导）
@@ -327,6 +330,16 @@ def _validate_execution_config(req, label: str = "") -> str | None:
             f"{label}requote_max_slippage_ticks 须在 [0,100]，"
             f"收到 {req.requote_max_slippage_ticks}"
         )
+    # 风控卖单追价：None=不动（编辑）/ 默认（新建），显式值须在 [0, 100] / [0, 20]
+    for field, upper in (("risk_chase_ticks", 100),
+                         ("risk_chase_max_attempts", 20)):
+        value = getattr(req, field, None)
+        if value is None:
+            continue
+        if not isinstance(value, int) or isinstance(value, bool):
+            return f"{label}{field} 必须为整数，收到 {value!r}"
+        if not (0 <= value <= upper):
+            return f"{label}{field} 须在 [0,{upper}]，收到 {value}"
     if req.risk_timing not in VALID_RISK_TIMINGS:
         return (
             f"{label}risk_timing 必须为 {sorted(VALID_RISK_TIMINGS)}，"
@@ -624,6 +637,9 @@ class StrategyCreate(BaseModel):
     # H4 自适应追价：tick=固定一档（默认）/ adaptive=按最新价追
     requote_price_mode: str = "tick"
     requote_max_slippage_ticks: int = 5
+    # 风控卖单追价（仅 STOP_LOSS/TAKE_PROFIT/TRAILING_STOP 的 SELL）
+    risk_chase_ticks: int | None = None
+    risk_chase_max_attempts: int | None = None
     split_order_enabled: bool = False
     split_order_threshold: float = 500000.0
     # H3 切片增强（None/0 = 按阈值默认推导）

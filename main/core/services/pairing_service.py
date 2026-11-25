@@ -70,6 +70,7 @@ BINDING_FIELDS = (
     "signal_frequency", "signal_at", "risk_timing",
     "requote_enabled", "requote_max_attempts", "requote_price_mode",
     "requote_max_slippage_ticks", "max_order_amount",
+    "risk_chase_ticks", "risk_chase_max_attempts",
     "split_order_enabled", "split_order_threshold",
 )
 
@@ -130,6 +131,8 @@ def binding_snapshot(strategy: Strategy) -> dict:
         "requote_max_attempts": strategy.requote_max_attempts,
         "requote_price_mode": strategy.requote_price_mode,
         "requote_max_slippage_ticks": strategy.requote_max_slippage_ticks,
+        "risk_chase_ticks": getattr(strategy, "risk_chase_ticks", 0),
+        "risk_chase_max_attempts": getattr(strategy, "risk_chase_max_attempts", 0),
         "max_order_amount": _num(strategy.max_order_amount),
         "split_order_enabled": bool(strategy.split_order_enabled),
         "split_order_threshold": _num(strategy.split_order_threshold),
