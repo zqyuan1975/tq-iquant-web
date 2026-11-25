@@ -2,6 +2,7 @@
 import { ref, onMounted } from 'vue'
 import {
   getTdxPools, getTdxPoolStocks, syncStockPool, getStockPools, deleteStockPool,
+  pushSelectionPoolsToTdx,
   type TdxPoolItem, type TdxPoolStockItem,
 } from '../api'
 import PageHeader from '../components/PageHeader.vue'
@@ -16,8 +17,19 @@ const pausedMsg = ref('')
 const showStocks = ref(false)
 const stocksList = ref<TdxPoolStockItem[]>([])
 const stocksPoolName = ref('')
+// 推送到通达信：结果面板（板块数 / 股票数 / 落盘文件 / 备份目录）
+const tdxPushMsg = ref('')
+const tdxPushErr = ref('')
+const pushingCode = ref('')
 
 // 市场多空状态卡与统一市场状态面板已整体迁移至「投资看板」(/investment-board)。
+
+// 序列池 = SEL_ 开头且末段不是 8 位日期；版本池（带日期）不推送，避免板块泛滥
+function isSeriesPool(code: string) {
+  if (!code.startsWith('SEL_')) return false
+  const tail = code.split('_').pop() || ''
+  return !/^\d{8}$/.test(tail)
+}
 
 // 从 axios 错误里提取后端错误消息（统一响应 {code,message} 或 Pydantic 422 detail）
 function errMsg(e: any): string {
@@ -89,6 +101,27 @@ async function syncPool(p: TdxPoolItem) {
   load()
 }
 
+async function pushTdx(p: TdxPoolItem) {
+  if (!confirm(`确认把「${p.name}」（${p.stock_count} 只）写入通达信自定义板块？\n只会创建/覆盖平台自己的 SEL_ 板块，不动你的其他板块。`)) return
+  pushingCode.value = p.code
+  tdxPushMsg.value = ''
+  tdxPushErr.value = ''
+  try {
+    const r = await pushSelectionPoolsToTdx({ pool_codes: [p.code] })
+    const blocks = r.blocks.filter(b => b.status !== 'skipped_empty')
+    const parts = blocks.map(b => `${b.name}(${b.block_code}) ${b.verified}/${b.requested} 只`)
+    tdxPushMsg.value = `已写入 ${r.blocks_written} 个板块、${r.stocks_written} 只股票：${parts.join('；')}`
+      + `。文件目录：${r.target_dir}；备份：${r.backup_dir}`
+    if (r.blocks_partial) {
+      tdxPushErr.value = `有 ${r.blocks_partial} 个板块回读数量与请求不一致，通达信可能过滤了部分代码`
+    }
+  } catch (e) {
+    tdxPushErr.value = `推送到通达信失败：${errMsg(e)}`
+  } finally {
+    pushingCode.value = ''
+  }
+}
+
 async function remove(p: TdxPoolItem) {
   const id = localIdByCode.value[p.code]
   if (!id) return
@@ -116,12 +149,17 @@ onMounted(() => {
   <p class="hint" style="margin:-4px 0 12px">
     「同步」只把通达信用户板块<b>导入</b>到本平台，不会反向写入通达信；
     「已同步 / 未同步 / 通达信已删除」为本地与通达信板块的实时比对结果。
-    SEL_ 前缀为条件选股生成的<b>平台内部池</b>，不参与通达信同步，回测与实盘直接读取本地池与 PIT 区间。
+    SEL_ 前缀为条件选股生成的<b>平台内部池</b>，不参与通达信同步；
+    需要看盘/手工下单时点该行「推送到通达信」，只写平台自己的 SEL_ 板块（写入前自动备份，
+    不动你原有的自选与板块）。
   </p>
 
   <div v-if="errorMsg" class="card" style="padding:12px;color:var(--red);margin-bottom:12px">
     {{ errorMsg }}
   </div>
+
+  <div v-if="tdxPushMsg" class="card" style="padding:12px;color:var(--green);margin-bottom:12px">{{ tdxPushMsg }}</div>
+  <div v-if="tdxPushErr" class="card" style="padding:12px;color:var(--red);margin-bottom:12px">{{ tdxPushErr }}</div>
 
   <!-- 闸门暂停：中性提示（不是失败），带上恢复时点 -->
   <div v-if="pausedMsg" class="tq-gate-notice">{{ pausedMsg }}</div>
@@ -135,7 +173,7 @@ onMounted(() => {
           <td>{{ p.name }}</td>
           <td style="color:var(--ink-soft)">{{ p.code }}</td>
           <td>
-            <span v-if="p.origin === 'internal'" class="badge badge-blue" title="条件选股发布生成的平台内部池，不写入通达信">平台内部池</span>
+            <span v-if="p.origin === 'internal'" class="badge badge-blue" title="条件选股生成的平台内部池，可点「推送到通达信」写入自定义板块">平台内部池</span>
             <span v-else-if="!p.exists_in_tdx" class="badge" style="background:var(--line);color:var(--ink-soft)">通达信已删除</span>
             <span v-else-if="p.synced" class="badge badge-green">已同步</span>
             <span v-else class="badge badge-gray">未同步</span>
@@ -145,6 +183,9 @@ onMounted(() => {
             <button v-if="p.exists_in_tdx" @click="viewStocks(p)" class="btn btn-sm">查看</button>
             <button v-if="p.exists_in_tdx" @click="syncPool(p)" class="btn btn-sm btn-primary" style="margin-left:6px" title="从通达信导入到本平台（不反向写入）">
               {{ p.synced ? '同步' : '同步' }}
+            </button>
+            <button v-if="p.origin === 'internal' && isSeriesPool(p.code)" @click="pushTdx(p)" class="btn btn-sm" :disabled="!!pushingCode" title="写入通达信自定义板块，看盘/手工下单可直接调用">
+              {{ pushingCode === p.code ? '推送中…' : '推送到通达信' }}
             </button>
             <button v-if="p.synced" @click="remove(p)" class="btn btn-sm btn-danger" style="margin-left:6px">删除</button>
           </td>

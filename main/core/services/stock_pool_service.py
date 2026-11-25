@@ -62,7 +62,7 @@ def list_tdx_pools(db: Session) -> list[dict]:
     - exists_in_tdx: 通达信是否还有此板块（False=本地残留）
     - stock_count: 本地成分股数（未同步为 0）
     - origin: tdx=通达信板块/残留；internal=平台内部池（SEL_ 前缀，选股发布生成，
-      从不回写通达信，不能按「通达信已删除」展示）
+      可经「推送到通达信」写入自定义板块；镜像板块不重复列出）
 
     抛 TDXConnectionError：通达信不可达。
     """
@@ -72,10 +72,16 @@ def list_tdx_pools(db: Session) -> list[dict]:
     local_by_code = {p.code: p for p in local_pools}
     tdx_codes = {t["code"] for t in tdx_pools}
     internal_prefix = "SEL_"
+    # 平台推送产生的通达信板块（镜像）：由本地池行代表，不在通达信列表里重复出现
+    from core.services.tdx_sector_sync import _block_code
+    mirrored = {_block_code(p.code) for p in local_pools
+                if p.code.startswith(internal_prefix)}
 
     result = []
     # 通达信板块
     for t in tdx_pools:
+        if t["code"] in mirrored:
+            continue
         p = local_by_code.get(t["code"])
         count = (
             db.query(StockPoolStock).filter(StockPoolStock.pool_id == p.id).count()

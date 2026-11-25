@@ -579,3 +579,25 @@ def replay_intervals(db: Session = Depends(get_db)):
     except replay_svc.ReplayError as exc:
         db.rollback()
         return err(409, str(exc))
+
+
+class PushTdxReq(BaseModel):
+    pool_codes: Optional[List[str]] = None
+    all_series: bool = False
+
+
+@router.post("/push-tdx")
+def push_tdx(req: PushTdxReq, db: Session = Depends(get_db)):
+    """把 SEL_ 序列池反向写入通达信自定义板块（备份→创建/清空→写入→回读校验）。
+
+    只允许 SEL_ 前缀；通达信不可用或接口报错时明确返回错误，不静默成功。
+    """
+    from core.services import tdx_sector_sync
+
+    try:
+        return ok(tdx_sector_sync.push(db, pool_codes=req.pool_codes,
+                                       all_series=req.all_series))
+    except tdx_sector_sync.TdxPushError as exc:
+        return err(400, str(exc))
+    except Exception as exc:  # pragma: no cover - 防御性
+        return err(500, "推送通达信失败：%s" % exc)

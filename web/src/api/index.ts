@@ -5080,6 +5080,31 @@ export async function resolveSelectionPool(poolId: number, day?: string) {
   return res.data.data
 }
 
+export interface PushTdxBlock {
+  pool_code: string
+  block_code: string
+  name: string
+  requested: number
+  verified: number
+  status: 'ok' | 'partial' | 'skipped_empty'
+}
+
+export interface PushTdxResult {
+  blocks: PushTdxBlock[]
+  blocks_written: number
+  blocks_partial: number
+  blocks_skipped: number
+  stocks_written: number
+  target_dir: string
+  target_files: string[]
+  backup_dir: string
+}
+
+export async function pushSelectionPoolsToTdx(params: { pool_codes?: string[]; all_series?: boolean }) {
+  const res = await api.post<ApiResponse<PushTdxResult>>('/selection/push-tdx', params)
+  return res.data.data
+}
+
 export async function getSelectionSessionBinding(sessionId: number) {
   const res = await api.get<ApiResponse<SelectionSessionBinding>>(
     `/selection/sessions/${sessionId}/binding`)

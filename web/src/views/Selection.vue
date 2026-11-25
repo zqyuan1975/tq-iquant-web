@@ -28,10 +28,12 @@ import {
   getSelectionWideDbStatus,
   importSelectionWarehouse,
   publishSelectionSnapshot,
+  pushSelectionPoolsToTdx,
   resolveSelectionPool,
   seedSelectionSchemes,
   startSelectionBuild,
   unbindSelectionSession,
+  type PushTdxResult,
   type SelectionBindResult,
   type SelectionBuildStatus,
   type SelectionDataStatus,
@@ -176,6 +178,10 @@ const gpAudit = ref<Record<string, unknown> | null>(null)
 // 交付 / 池接入
 const delivering = ref(false)
 const deliverResult = ref<SelectionDeliverResult | null>(null)
+// 反向写入通达信：只写平台自己的 SEL_ 板块，写入前自动备份
+const tdxPushing = ref(false)
+const tdxPushResult = ref<PushTdxResult | null>(null)
+const tdxPushErr = ref('')
 const pools = ref<SelectionPoolItem[]>([])
 const resolvePoolId = ref<number | null>(null)
 const resolveDay = ref('')
@@ -606,6 +612,28 @@ async function deliverAll() {
     errorMsg.value = errMsg(e)
   } finally {
     delivering.value = false
+  }
+}
+
+async function pushAllToTdx() {
+  if (!confirm('确认把所有序列池写入通达信自定义板块？\n只创建/覆盖平台自己的 SEL_ 板块（写入前自动备份），不会动你原有的板块和自选。')) return
+  errorMsg.value = ''
+  tdxPushResult.value = null
+  tdxPushErr.value = ''
+  tdxPushing.value = true
+  try {
+    const res = await pushSelectionPoolsToTdx({ all_series: true })
+    tdxPushResult.value = res
+    const blocks = res.blocks.filter((b) => b.status !== 'skipped_empty')
+    infoMsg.value = `已推送 ${res.blocks_written} 个板块、${res.stocks_written} 只股票到通达信`
+      + (blocks.length ? '：' + blocks.map((b) => `${b.name}(${b.block_code})`).join('、') : '')
+    if (res.blocks_partial) {
+      tdxPushErr.value = `有 ${res.blocks_partial} 个板块回读数量与请求不一致，通达信可能过滤了部分代码`
+    }
+  } catch (e: any) {
+    tdxPushErr.value = `推送到通达信失败：${errMsg(e)}`
+  } finally {
+    tdxPushing.value = false
   }
 }
 
@@ -1200,10 +1228,20 @@ onUnmounted(() => {
           <button class="btn btn-sm" :disabled="delivering" @click="deliverAll">
             {{ delivering ? '交付中…' : '收盘交付（运行→冻结→双池）' }}
           </button>
+          <button class="btn btn-sm" :disabled="tdxPushing" @click="pushAllToTdx"
+                  title="把 SEL_ 序列池写入通达信自定义板块，看盘/手工下单可直接调用">
+            {{ tdxPushing ? '推送中…' : '推送全部序列池到通达信' }}
+          </button>
           <span class="hint">
             运行读取平台导入仓的 {{ dataStatus?.as_of || '导入日' }} 快照；只支持该日，历史回放暂不支持。
           </span>
         </div>
+        <p v-if="tdxPushResult" class="hint" style="color:var(--green)">
+          已写入 {{ tdxPushResult.blocks_written }} 个板块、{{ tdxPushResult.stocks_written }} 只股票
+          <span v-if="tdxPushResult.blocks_skipped">（跳过 {{ tdxPushResult.blocks_skipped }} 个空池）</span>；
+          文件：{{ tdxPushResult.target_files.join('、') || '—' }}；备份：{{ tdxPushResult.backup_dir }}
+        </p>
+        <p v-if="tdxPushErr" class="hint" style="color:var(--red)">{{ tdxPushErr }}</p>
         <p v-if="lastRunResult?.skipped?.length" class="hint" style="color:var(--red)">
           跳过：{{ lastRunResult.skipped.map((s) => `${s.scheme_name}（${s.error}）`).join('；') }}
         </p>
