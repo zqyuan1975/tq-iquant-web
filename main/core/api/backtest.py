@@ -97,6 +97,9 @@ class BacktestRequest(BaseModel):
     # same_day_bar=成交当根 bar 量（改动前行为）；prev5d_avg=前 5 个交易日
     # 日均量（显式选择才启用，与实盘同口径、无前视）。
     liquidity_caliber: str | None = None
+    # 限价成交模型（2026-11-25，默认 False=旧行为）：开启后仅当下一根 bar 的
+    # low（买）/high（卖）穿越委托价才成交，否则顺延并记 gate=limit_not_filled。
+    limit_fill_enabled: bool = False
     # 日末 peak 保护（默认关）：开启后 peak/max_drawdown 只在当日最后一根 bar 更新，
     # 避免混合周期粗 bar 的周期末 close 污染峰值；纯 1d 行为不变
     daily_close_peak_enabled: bool = False
@@ -160,6 +163,8 @@ class MultiBacktestRequest(BaseModel):
     capacity_impact_k: float | None = None
     # 成交量闸门流动性口径（None=same_day_bar 旧口径；prev5d_avg 需显式选择）
     liquidity_caliber: str | None = None
+    # 限价成交模型（默认 False=旧行为；True 才按 low/high 穿越判成交）
+    limit_fill_enabled: bool = False
     # 0021 E2 会话池动态额度（None/未启用=各组合现金独立、旧行为）：
     # {enabled, min_share?, max_share?, min_cash_reserve_pct?}
     capital_pool_plan: dict | None = None

@@ -599,7 +599,10 @@ class BacktestEngine:
         ``first_bar_no_fill``（每交易日首根 bar 不生成 BUY）/
         ``partial_fill_enabled``（成交量上限缩量后残量回队续成交）/
         ``liquidity_caliber``（成交量闸门分母：默认/缺失=``same_day_bar``
-        成交当根 bar 量，``prev5d_avg``=前 5 个交易日日均量，显式选择才生效）。
+        成交当根 bar 量，``prev5d_avg``=前 5 个交易日日均量，显式选择才生效）/
+        ``limit_fill_enabled``（限价成交模型，默认 False=旧行为：下一根 bar open
+        直接成交；True=只有该 bar 的 low/high 真的穿过委托价才成交，否则顺延并记
+        ``gate=limit_not_filled``）。
         cancel_check：K1 协作式取消（默认 None=不检查）。每根 bar 处理前调用，
         返回 True 即中止循环并返回 ``canceled=True`` + ``progress``，不产出部分结果。
         loan_model_plan：资金池 L2 借据建模（0021 B3，默认 None=不启用）。仅当组合
@@ -617,6 +620,9 @@ class BacktestEngine:
         run_options = run_options or {}
         _first_bar_no_fill = bool(run_options.get("first_bar_no_fill", False))
         _partial_fill = bool(run_options.get("partial_fill_enabled", False))
+        # 限价成交模型（2026-11-25，默认 False = 旧行为逐字不变）：开启后只有
+        # 下一根 bar 的价格区间真的穿过委托价才成交，否则顺延并记 limit_not_filled。
+        _limit_fill = bool(run_options.get("limit_fill_enabled", False))
         # 流动性口径（默认 same_day_bar=改动前行为，逐字不变）：只有显式选择
         # prev5d_avg 才启用「前 5 日日均量」分母并预计算索引。
         _liquidity_caliber = (
@@ -701,6 +707,8 @@ class BacktestEngine:
         price_limit_recorded: set = set()
         # #2 成交量约束：已记过 volume_cap_defer 事件的订单 id（每订单只记 1 条）
         volume_defer_recorded: set = set()
+        # 限价成交模型：已记过 limit_not_filled 的订单 id（每单只记 1 条）
+        limit_fill_recorded: set = set()
         # 层 1 容量模型（sqrt）：参与率 + 5 日累计 + 同日同票跨策略聚合。
         # 单组合路径一个实例；多组合路径共享同一实例以聚合各策略订单。
         capacity = self._build_capacity_budget(portfolio, klines)
@@ -1180,6 +1188,35 @@ class BacktestEngine:
                                         )
                                     deferred.append(order)
                                     continue
+                    # 限价成交模型（默认关）：只有下一根 bar 的价格区间真的穿过
+                    # 委托价才成交，否则顺延（TTL 同 pending_order_max_days）。
+                    if _limit_fill and order.price is not None and order.price > 0:
+                        _px_row = (price_index.get((t, period), {}) or {}).get(
+                            order.stock_code) or {}
+                        _hi = _px_row.get("high")
+                        _lo = _px_row.get("low")
+                        if _hi is not None and _lo is not None:
+                            _px = Decimal(str(order.price))
+                            _crossed = ((_lo <= _px)
+                                        if order.trade_type == TradeType.BUY
+                                        else (_hi >= _px))
+                            if not _crossed:
+                                if id(order) not in limit_fill_recorded:
+                                    limit_fill_recorded.add(id(order))
+                                    recorder.record(
+                                        gate="limit_not_filled",
+                                        layer="execution", action="defer",
+                                        portfolio_id=order.portfolio_id or 0,
+                                        strategy_id=order.strategy_id,
+                                        stock_code=order.stock_code,
+                                        bar_time=t,
+                                        requested_qty=order.quantity,
+                                        message=("限价未成交：委托价 %s，本 bar 区间 "
+                                                 "[%s, %s]，订单顺延"
+                                                 % (_px, _lo, _hi)),
+                                    )
+                                deferred.append(order)
+                                continue
                     # 成交日 = 当前 bar 时间 t（T+1 据此判断）
                     order.bar_time = t
                     ctx = portfolio.find_strategy(order.strategy_id)
@@ -1571,6 +1608,8 @@ class BacktestEngine:
             if _pool_enabled else None)
         _first_bar_no_fill = bool(run_options.get("first_bar_no_fill", False))
         _partial_fill = bool(run_options.get("partial_fill_enabled", False))
+        # 限价成交模型（2026-11-25，默认 False = 旧行为逐字不变）
+        _limit_fill = bool(run_options.get("limit_fill_enabled", False))
         # 流动性口径：默认 same_day_bar（改动前行为），prev5d_avg 需显式选择
         _liquidity_caliber = (
             run_options.get("liquidity_caliber") or "same_day_bar")
@@ -1624,6 +1663,7 @@ class BacktestEngine:
         no_price_recorded: set = set()
         price_limit_recorded: set = set()
         volume_defer_recorded: set = set()
+        limit_fill_recorded: set = set()
         _rule_cache: Dict[tuple, object] = {}
         # 层 1 容量模型（sqrt）：多组合共享**同一实例**（同日同票跨策略聚合），
         # 参数取首个启用 sqrt 的组合；未启用 sqrt 的组合不持有预算（旧行为）。
@@ -2154,6 +2194,33 @@ class BacktestEngine:
                                             message=_msg)
                                     deferred.append(order)
                                     continue
+                    if _limit_fill and order.price is not None and order.price > 0:
+                        _px_row = (price_index.get((t, period), {}) or {}).get(
+                            order.stock_code) or {}
+                        _hi = _px_row.get("high")
+                        _lo = _px_row.get("low")
+                        if _hi is not None and _lo is not None:
+                            _px = Decimal(str(order.price))
+                            _crossed = ((_lo <= _px)
+                                        if order.trade_type == TradeType.BUY
+                                        else (_hi >= _px))
+                            if not _crossed:
+                                if id(order) not in limit_fill_recorded:
+                                    limit_fill_recorded.add(id(order))
+                                    recorder.record(
+                                        gate="limit_not_filled",
+                                        layer="execution", action="defer",
+                                        portfolio_id=order.portfolio_id or 0,
+                                        strategy_id=order.strategy_id,
+                                        stock_code=order.stock_code,
+                                        bar_time=t,
+                                        requested_qty=order.quantity,
+                                        message=("限价未成交：委托价 %s，本 bar 区间 "
+                                                 "[%s, %s]，订单顺延"
+                                                 % (_px, _lo, _hi)),
+                                    )
+                                deferred.append(order)
+                                continue
                     order.bar_time = t
                     ctx = portfolio.find_strategy(order.strategy_id)
                     if ctx is None:

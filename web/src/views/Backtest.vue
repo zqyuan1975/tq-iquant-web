@@ -140,7 +140,7 @@ const submitting = ref(false)
 const { p2Blocked: tqP2Blocked, p2Reason: tqP2Reason, refresh: refreshTqGate } = useTdxGate()
 // 高级选项（评估口径 / IS-OOS 采纳门槛 / 费用预留 / 自适应滑点）默认折叠：发起回测默认走增强前的基础方式
 const showAdvanced = ref(false)
-const form = ref({ portfolio_strategy_id: 0, name: '', start_date: '', end_date: '', dividend_mode: 'exact', evaluation_profile: 'absolute', is_oos_gate_enabled: false, oos_gate_min_ratio: 0.5, fee_reserve_enabled: false, bond_t0_enabled: false, bond_lot_enabled: false, adaptive_slippage_enabled: undefined as boolean | undefined, slippage_impact_coef: undefined as string | undefined, volume_limit_enabled: undefined as boolean | undefined, volume_limit_ratio: undefined as string | undefined, equity_cap: undefined as string | undefined, capacity_model: '' as '' | 'linear' | 'sqrt', capacity_impact_k: '0.1' as string, liquidity_caliber: '' as '' | 'same_day_bar' | 'prev5d_avg', max_order_amount: undefined as string | undefined, daily_close_peak_enabled: false, daily_loss_basis: '' as '' | 'equity' | 'initial', market_gate_enabled: '' as '' | 'true' | 'false', industry_override: '' as '' | 'ab' | 'off' | 'all_relief' | 'all_strict', loan_model_plan: undefined as Record<string, unknown> | undefined, pairing_plan_id: undefined as number | undefined })
+const form = ref({ portfolio_strategy_id: 0, name: '', start_date: '', end_date: '', dividend_mode: 'exact', evaluation_profile: 'absolute', is_oos_gate_enabled: false, oos_gate_min_ratio: 0.5, fee_reserve_enabled: false, bond_t0_enabled: false, bond_lot_enabled: false, adaptive_slippage_enabled: undefined as boolean | undefined, slippage_impact_coef: undefined as string | undefined, volume_limit_enabled: undefined as boolean | undefined, volume_limit_ratio: undefined as string | undefined, equity_cap: undefined as string | undefined, capacity_model: '' as '' | 'linear' | 'sqrt', capacity_impact_k: '0.1' as string, liquidity_caliber: '' as '' | 'same_day_bar' | 'prev5d_avg', max_order_amount: undefined as string | undefined, daily_close_peak_enabled: false, limit_fill_enabled: false, daily_loss_basis: '' as '' | 'equity' | 'initial', market_gate_enabled: '' as '' | 'true' | 'false', industry_override: '' as '' | 'ab' | 'off' | 'all_relief' | 'all_strict', loan_model_plan: undefined as Record<string, unknown> | undefined, pairing_plan_id: undefined as number | undefined })
 
 // 行业门控 run 级覆盖预设（2026-11-22）：仅本次回测生效，不写组合配置。
 // 组合级长期开关在「组合策略 → 编辑 → 行业门控」里配置。
@@ -1896,6 +1896,7 @@ function openForm() {
     capacity_model: '',
     capacity_impact_k: '0.1',
     liquidity_caliber: '',
+    limit_fill_enabled: false,
     equity_cap: undefined,
     max_order_amount: undefined,
     daily_close_peak_enabled: false,
@@ -2002,6 +2003,8 @@ async function submit() {
                   'same_day_bar' | 'prev5d_avg',
               }
             : {}),
+          // 限价成交模型（默认关 = 旧行为；开启才按 low/high 穿越判成交）
+          ...(form.value.limit_fill_enabled ? { limit_fill_enabled: true } : {}),
           ...(form.value.loan_model_plan
             ? {
                 loan_model_plan: form.value.loan_model_plan,
@@ -4714,6 +4717,15 @@ watch(theme, () => {
                   </select>
                   <span class="field-hint">仅成交量闸门生效；口径写入快照，新旧结果不可混比</span>
                 </div>
+              </div>
+              <div class="field-row field-span-2">
+                <span class="field-label"></span>
+                <label class="switch-row">
+                  <input type="checkbox" v-model="form.limit_fill_enabled"
+                         data-field="limit_fill_enabled" />
+                  <span class="field-hint">限价成交模型：仅当下一根 bar 的 low（买）/high（卖）穿越委托价才成交，
+                    否则顺延并记 limit_not_filled（默认关 = 开盘直接成交，与既有结果逐字一致）</span>
+                </label>
               </div>
             </div>
           </div>

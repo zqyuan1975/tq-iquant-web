@@ -2539,6 +2539,59 @@ def test_run_ex_rights_prev_close_wired_for_backtest_raw():
     assert not [d for d in result["decisions"] if d["gate"] == "price_limit"]
 
 
+# ===========================================================================
+# 2026-11-25：限价成交模型（limit_fill_enabled，默认关）
+# ===========================================================================
+def _limit_fill_scenario():
+    """止损单 7/30 触发（委托价 9.0），7/31 区间 8.5–8.8 未穿越，8/3 穿越。"""
+    stock = "000001.SZ"
+    klines = _klines(stock, [
+        (datetime(2026, 7, 29), Decimal("10"), Decimal("10.3"), Decimal("9.9"),
+         Decimal("10.2"), 1000),
+        (datetime(2026, 7, 30), Decimal("10.2"), Decimal("10.5"), Decimal("8.9"),
+         Decimal("9.0"), 1000),
+        (datetime(2026, 7, 31), Decimal("8.6"), Decimal("8.8"), Decimal("8.5"),
+         Decimal("8.6"), 1000),
+        (datetime(2026, 8, 3), Decimal("9.1"), Decimal("9.2"), Decimal("9.0"),
+         Decimal("9.1"), 1000),
+    ])
+    port, ctx = _portfolio_with_strategy()
+    cache = {
+        (1, stock, datetime(2026, 7, 29)): [{"name": "open_sig", "value": 1}],
+    }
+    return stock, klines, port, ctx, cache
+
+
+def test_limit_fill_enabled_defers_until_price_crosses():
+    """开启后：7/31 high 8.8 < 委托价 9.0 未成交 → 顺延并记 limit_not_filled；
+    8/3 high 9.2 ≥ 9.0 成交（价取当日 open 9.1）。"""
+    stock, klines, port, ctx, cache = _limit_fill_scenario()
+    result = BacktestEngine().run(
+        port, klines=klines, signal_cache=cache,
+        run_options={"limit_fill_enabled": True})
+
+    sells = [t for t in result["trades"] if t.trade_type == TradeType.SELL]
+    assert len(sells) == 1
+    assert sells[0].trade_time.date() == date(2026, 8, 3)
+    assert sells[0].price == Decimal("9.1")
+    unfilled = [d for d in result["decisions"] if d["gate"] == "limit_not_filled"]
+    assert len(unfilled) == 1
+    assert unfilled[0]["bar_time"] == datetime(2026, 7, 31)
+    assert unfilled[0]["action"] == "defer"
+
+
+def test_limit_fill_disabled_keeps_next_bar_open_fill():
+    """默认关：7/31 开盘 8.6 直接成交（旧行为逐字不变），不产生 limit_not_filled。"""
+    stock, klines, port, ctx, cache = _limit_fill_scenario()
+    result = BacktestEngine().run(port, klines=klines, signal_cache=cache)
+
+    sells = [t for t in result["trades"] if t.trade_type == TradeType.SELL]
+    assert len(sells) == 1
+    assert sells[0].trade_time.date() == date(2026, 7, 31)
+    assert sells[0].price == Decimal("8.6")
+    assert not [d for d in result["decisions"] if d["gate"] == "limit_not_filled"]
+
+
 def _weekday_dates(start: date, n: int):
     out = []
     cur = start

@@ -5454,6 +5454,10 @@ def run_backtest(db: Session, ps: PortfolioStrategy, req,
     if liquidity_caliber not in LIQUIDITY_CALIBERS:
         liquidity_caliber = LIQUIDITY_CALIBER_DEFAULT
     exec_flags["liquidity_caliber"] = liquidity_caliber
+    # 限价成交模型（2026-11-25）：默认不写入 → run_options 与改动前逐字一致；
+    # 显式开启才让下一根 bar 的 low/high 穿越委托价才成交，否则顺延。
+    if bool(getattr(req, "limit_fill_enabled", False)):
+        exec_flags["limit_fill_enabled"] = True
     exec_snapshot = snapshot_payload(exec_flags)
     _exec_realistic = exec_flags["profile"] == PROFILE_REALISTIC
     if _exec_realistic:
@@ -5993,6 +5997,10 @@ def run_multi_backtest(db: Session, portfolios: list, req) -> dict:
     if liquidity_caliber not in LIQUIDITY_CALIBERS:
         liquidity_caliber = LIQUIDITY_CALIBER_DEFAULT
     exec_flags["liquidity_caliber"] = liquidity_caliber
+    # 限价成交模型（2026-11-25）：默认不写入 → run_options 与改动前逐字一致；
+    # 显式开启才让下一根 bar 的 low/high 穿越委托价才成交，否则顺延。
+    if bool(getattr(req, "limit_fill_enabled", False)):
+        exec_flags["limit_fill_enabled"] = True
     exec_snapshot = snapshot_payload(exec_flags)
     _exec_realistic = exec_flags["profile"] == PROFILE_REALISTIC
     # 层 1 容量模型 run 级覆盖（None/非法 → linear=旧口径）
