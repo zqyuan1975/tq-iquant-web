@@ -66,7 +66,7 @@ import {
   poolLabel,
 } from '../utils/selectionPoolGroups'
 
-type TabKey = 'schemes' | 'filters' | 'results' | 'snapshots' | 'data'
+type TabKey = 'schemes' | 'filters' | 'results' | 'snapshots' | 'data' | 'guide'
 
 const TABS: { key: TabKey; label: string }[] = [
   { key: 'schemes', label: '选股方案' },
@@ -74,6 +74,7 @@ const TABS: { key: TabKey; label: string }[] = [
   { key: 'results', label: '选股结果' },
   { key: 'snapshots', label: '快照与历史' },
   { key: 'data', label: '数据体检' },
+  { key: 'guide', label: '使用说明' },
 ]
 
 const TRACK_LABEL: Record<string, string> = {
@@ -1866,6 +1867,158 @@ onUnmounted(() => {
           取数入库需在导入窗口执行，页面不提供触发入口，避免实盘中占用 TQ 通道。
         </p>
         <pre v-if="gpAudit" class="card" style="padding:12px;overflow:auto;max-height:360px">{{ JSON.stringify(gpAudit, null, 2) }}</pre>
+      </div>
+    </div>
+
+    <!-- 6. 使用说明：口径与当前实现逐条对应，未实现的能力不写入 -->
+    <div v-show="tab === 'guide'">
+      <div class="card" style="padding:14px;margin-bottom:12px">
+        <h3 style="margin-top:0">最短使用路径</h3>
+        <ol style="margin:0;padding-left:20px;line-height:1.9">
+          <li>
+            <b>宽库构建</b>：「数据体检」→ 选「增量（只补缺口）」→「开始构建」。默认数据源是内置构建，
+            后台执行、可离开本页；「从外部宽库导入」只用于对账/灾备，整表替换、可重跑。
+          </li>
+          <li>
+            <b>方案初始化</b>：「选股方案」→「初始化默认方案（四风格 + 行业池）」。幂等：已有方案不覆盖，
+            为 4 个风格池 + 9 个 L1 + 14 个 L2 各补一个启用版 v1（首发参数未校准）。
+          </li>
+          <li>
+            <b>运行选股</b>：「选股结果」→「运行全部启用方案」。只读平台导入仓的当前 as_of；
+            页面不提供指定历史日的运行入口（历史由回放补建，见下文）。
+          </li>
+          <li>
+            <b>冻结发布</b>：「快照与历史」→ 快照「冻结」→「发布」（发布版本池或序列池）。
+            「收盘交付（运行→冻结→双池）」可一次完成运行、冻结、发版本池 + 序列池。
+          </li>
+          <li>
+            <b>挂接实盘</b>：同页「实盘会话挂接」→ 选一个<b>已冻结的版本池</b> →「挂所选池」，
+            组合的 pool_pit_enabled 自动打开；「回退」按挂接前快照还原。回测侧选序列池按日解析成分。
+          </li>
+        </ol>
+      </div>
+
+      <div class="card" style="padding:14px;margin-bottom:12px">
+        <h3 style="margin-top:0">当期池与历史池</h3>
+        <div class="card table-wrap">
+          <table>
+            <thead><tr><th>池</th><th>code 形态</th><th>内容</th><th>用途</th></tr></thead>
+            <tbody>
+              <tr>
+                <td><b>版本池</b></td>
+                <td><code>SEL_&lt;池&gt;_&lt;YYYYMMDD&gt;</code></td>
+                <td>单日快照的成分，冻结后不可变</td>
+                <td>实盘钉版本；单期复核/对照</td>
+              </tr>
+              <tr>
+                <td><b>序列池</b></td>
+                <td><code>SEL_&lt;池&gt;</code></td>
+                <td>跨期 PIT 成员区间（selection_pool_intervals）</td>
+                <td>回测/历史研究，按任意交易日解析成分</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <ul class="hint" style="margin:8px 0 0;padding-left:18px;line-height:1.8">
+          <li><b>当期池</b> = 最新 as_of 冻结并发布的版本池，反映构建日可见数据。</li>
+          <li>
+            <b>历史池</b> = 回放补建的季末快照（11 期：2024-04-30 ~ 2026-09-30）
+            以及历次发布累积的版本池。回放区间为封闭区间，最新一期为开口（effective_to 为空）。
+          </li>
+          <li>
+            解析优先级：先 stock_pool_memberships（发布写入），该日无覆盖时回落 selection_pool_intervals
+            （回放补建），仍无则返回当前成分并标 <code>source=current_fallback / available=false</code>，
+            调用方按 fail-open 处理、不冒充历史成分。
+          </li>
+        </ul>
+      </div>
+
+      <div class="card" style="padding:14px;margin-bottom:12px">
+        <h3 style="margin-top:0">三类池的口径</h3>
+        <div class="card table-wrap">
+          <table>
+            <thead><tr><th>类别</th><th>数量</th><th>口径</th></tr></thead>
+            <tbody>
+              <tr>
+                <td><b>因子风格</b></td>
+                <td>4</td>
+                <td>
+                  成长 / 质量 / 价值 / 红利，每池 TopN=100；四个风格池各自独立运行，同一股票可同时命中多个池。
+                  成长池为双轨：前瞻轨用 GO 一致预期（g_fwd_2y / neg_peg_fwd / g_rev_2y / accel / roic_trend），
+                  历史 as_of 无 GO 数据时自动切历史轨（np_yoy / neg_peg_hist / rev_yoy / g_hist_3y / roic_trend）。
+                </td>
+              </tr>
+              <tr>
+                <td><b>行业一级（L1）</b></td>
+                <td>9</td>
+                <td>
+                  周期、消费、科技、医药、高端制造、金融地产、公用事业、农业、其他综合；
+                  <b>互斥主池</b>，每只股票只归一个 L1。金融地产第一阶段只分组不打分。
+                </td>
+              </tr>
+              <tr>
+                <td><b>行业二级（L2 标签）</b></td>
+                <td>14</td>
+                <td>
+                  上游资源、中游材料、交运周期、产能周期、军工、农产品周期、可选消费、品牌、地产链、
+                  平台、必选消费、金融单列、高研发、高股息防御；<b>可重叠标签池</b>，同一股票可属多个 L2。
+                </td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <p class="hint" style="margin:8px 0 0">
+          行业映射为平台内置表（129 个二级行业 → L1/L2），运行期不读取外部目录；行业池与四风格池 key 正交，互不覆盖。
+        </p>
+      </div>
+
+      <div class="card" style="padding:14px;margin-bottom:12px">
+        <h3 style="margin-top:0">数据新鲜度与 as_of</h3>
+        <ul style="margin:0;padding-left:18px;line-height:1.8">
+          <li>
+            <b>as_of</b> = 宽库最后一次发布（publish）的交易日，落 selection_wh_meta.as_of；
+            构建失败不改变旧 as_of 的语义（新增行只补缺口，不改写旧日期已覆盖的值）。
+          </li>
+          <li>
+            「数据体检」展示 as_of、日线覆盖区间与行数、stale 天数；增量构建补到最近交易日，
+            非交易日/未构建时 as_of 停留在上一交易日（stale=1 属正常）。
+          </li>
+          <li>运行选股、冻结快照都按 as_of 读取；快照指纹由字段集版本 + 方案参数 + 导入仓版本共同决定，任一不同即不可直接比较。</li>
+        </ul>
+      </div>
+
+      <div class="card" style="padding:14px;margin-bottom:12px">
+        <h3 style="margin-top:0">回放的 PIT 边界与已知偏差</h3>
+        <ul style="margin:0;padding-left:18px;line-height:1.8">
+          <li>财报：只取 <code>announce_time &lt;= as_of</code> 的披露，逐期截断，同 tag 取截止日前最后一次披露。</li>
+          <li>市值：GP16（万元 → 亿元）按「年 + 月日」取 as_of 当时值；分红：除权日 &lt;= as_of。</li>
+          <li>K 线：<b>不复权收盘</b>，取 as_of 前 252 个交易日；除权日附近动量/回撤/均线类因子存在偏差，送转与分红未复权。</li>
+          <li>
+            <b>pit_unavailable（置空、绝不用导入日值冒充）</b>：<code>pe</code>、<code>pb</code>、
+            <code>ltsz</code>（无历史流通市值，规模用 GP16 总市值代理）、
+            <code>g_fwd_2y / g_rev_2y / neg_peg_fwd</code>（GO 无历史序列）、
+            <code>is_st</code>、<code>is_quit</code>（ST/退市只有当前值，回放置否并在此披露）。
+            因此历史成长池自动走历史轨。
+          </li>
+          <li><b>名单为构建时的当前上市名单，不含已退市股票</b>，历史回放存在幸存者偏差。</li>
+          <li>
+            <b>行业归属按 as_of 累积</b>：分类接口只有当前值，只能从首次刷新起逐期落库；更早的 as_of
+            回退最近一期归属（当前仅 2026-11-13/24 两期有记录），早期行业池的归属等同「按当前名单回看」。
+          </li>
+        </ul>
+      </div>
+
+      <div class="card" style="padding:14px">
+        <h3 style="margin-top:0">验证口径：池只是候选域</h3>
+        <ul style="margin:0;padding-left:18px;line-height:1.8">
+          <li><b>池只是候选域，最终买什么由导入公式择时决定</b>；池的作用是缩小范围，不构成买卖信号。</li>
+          <li>
+            召回率 = 池内入选 / 全市场入选。「入选」= 公式 OPEN 信号线在 as_of 前最近 N 个交易 bar 内触发
+            （择时脉冲稀疏，单日口径常为 0/0；N=1 即严格单日口径）。
+          </li>
+          <li>漏票收益 = as_of 起第 N 个交易日的<b>不复权</b>涨幅，取不到时置 null；漏票成因优先取快照留痕，未留痕按仓库快照重放基础闸门。</li>
+          <li>IC / 分组单调性仅作参考，不参与任何决策与调权。</li>
+        </ul>
       </div>
     </div>
   </template>
