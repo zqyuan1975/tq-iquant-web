@@ -1787,7 +1787,11 @@ def _run_incremental_locked(db: Session, session_id: int,
         # 涨跌停基准按「(代码, 交易日) 前收」显式传入：续跑首段从接缝日/游标起，
         # 引擎内部按本次 klines 现推会缺前收（首根 fail-open），用全量 klines_all
         # 推出的前收表保证与全量回测同一口径。
-        prev_close_by_day=build_prev_close_by_day(klines_all),
+        prev_close_by_day=build_prev_close_by_day(
+            klines_all,
+            corporate_timeline=getattr(portfolio, "corporate_timeline", None),
+            adjust_ex_rights=(
+                getattr(portfolio, "corporate_action_mode", "") == "backtest_raw")),
         # 在途单最大存活期（交易日；缺键=20，<=0 不限）：与全量回测同一配置项，
         # 防止停牌/连板单跨段无限顺延。
         pending_order_max_days=int(cfg.get("pending_order_max_days", 20)),
@@ -2020,7 +2024,12 @@ def run_validation(db: Session, session_id: int, ps_id: int,
             result = BacktestEngine().run(
                 portfolio, klines=klines, signal_cache=signal_cache,
                 stock_names=_pool_stock_names(ps, db),
-                prev_close_by_day=build_prev_close_by_day(klines_all),
+                prev_close_by_day=build_prev_close_by_day(
+                    klines_all,
+                    corporate_timeline=getattr(portfolio, "corporate_timeline", None),
+                    adjust_ex_rights=(
+                        getattr(portfolio, "corporate_action_mode", "")
+                        == "backtest_raw")),
                 pending_order_max_days=int(cfg.get("pending_order_max_days", 20)),
                 gate_tracker=gate_tracker)
         except Exception as exc:  # noqa: BLE001 — 校验失败要留痕，不吞

@@ -426,13 +426,22 @@ class _GateReleaseRunner:
         }
 
 
-def build_prev_close_by_day(klines: dict) -> Dict[tuple, Decimal]:
+def build_prev_close_by_day(
+        klines: dict, corporate_timeline=None,
+        adjust_ex_rights: bool = False) -> Dict[tuple, Decimal]:
     """按 ``(code, 交易日)`` 预计算「上一交易日最后一根 bar 的收盘」（任意周期）。
 
     依据（2026-11-16 P1 核查修复）：涨跌停价 = 前收 ×(1±幅度)，前收必须是**上一
     交易日收盘**且日内恒定。旧实现键为 ``(code, period)`` 并在每根 bar 收盘后覆写：
     5m/15m/30m/1h 策略当日第二根起「前收」变成上一根同周期收盘 → 涨停价≈1.1×
     5 分钟前收盘，封板买、跌停卖都能成交。
+
+    **除权日基准（2026-11-25 修复）**：``adjust_ex_rights=True`` 且传入
+    ``corporate_timeline`` 时，除权除息日的「前收」改用交易所除权参考价
+    ``(上一交易日收盘 - 每股现金) / (1 + 每股送转比例)``，与实盘
+    ``tdx_tq_dispatcher`` 用前复权前收同口径。仅在**不复权**（exact /
+    ``backtest_raw``）价空间启用：前复权/后复权序列在除权日连续，再调一次会
+    把基准压得过低（默认 False → 旧行为逐字不变）。
 
     口径：
       - 每个交易日取「该日最晚时间戳的收盘」（细→粗遍历，同时间戳取先遇到者）——
@@ -464,7 +473,29 @@ def build_prev_close_by_day(klines: dict) -> Dict[tuple, Decimal]:
         _days = sorted(per_day.keys())
         for _i in range(1, len(_days)):
             result[(_code, _days[_i])] = per_day[_days[_i - 1]][1]
+    # 除权除息日：前收改为交易所除权参考价（不复权价空间），避免除权日跌停价
+    # 被放宽成「除权前收盘×0.9」而高估可成交性。
+    if adjust_ex_rights and corporate_timeline is not None:
+        _apply_ex_rights(result, corporate_timeline)
     return result
+
+
+def _apply_ex_rights(result: Dict[tuple, Decimal], corporate_timeline) -> None:
+    """把除权除息日的「前收」改成交易所除权参考价（就地修改，可幂等去重调用）。"""
+    try:
+        ex_days = corporate_timeline.ex_rights_days()
+    except Exception:  # noqa: BLE001 — 口径数据异常时宁可退回旧口径
+        return
+    for _key, (_cash, _ratio) in ex_days.items():
+        _base = result.get(_key)
+        if _base is None:
+            continue
+        _denom = Decimal("1") + _ratio
+        if _denom <= 0:
+            continue
+        _ref = (_base - _cash) / _denom
+        if _ref > 0:
+            result[_key] = _ref
 
 
 def build_volume_ref_by_day(klines: dict, lookback: int = 5) -> Dict[tuple, int]:
@@ -662,7 +693,11 @@ class BacktestEngine:
         # 旧实现键含 period 且每根 bar 覆写，5m/15m/30m/1h 当日第二根起前收变成上
         # 一根同周期收盘 → 涨停价虚高、跌停价虚低，封板买/跌停卖都能成交。
         if prev_close_by_day is None:
-            prev_close_by_day = build_prev_close_by_day(klines)
+            prev_close_by_day = build_prev_close_by_day(
+                klines,
+                corporate_timeline=getattr(portfolio, "corporate_timeline", None),
+                adjust_ex_rights=(
+                    getattr(portfolio, "corporate_action_mode", "") == "backtest_raw"))
         price_limit_recorded: set = set()
         # #2 成交量约束：已记过 volume_cap_defer 事件的订单 id（每订单只记 1 条）
         volume_defer_recorded: set = set()
@@ -1551,6 +1586,17 @@ class BacktestEngine:
         times = self._build_timeline(klines)
         price_index = self._build_price_index(klines)
         prev_close_by_day = build_prev_close_by_day(klines)
+        # 除权日前收按交易所参考价（不复权口径）。多组合共享一份价格表，
+        # 同一 timeline 只应用一次，避免重复下调。
+        _seen_tl = set()
+        for _p in portfolios:
+            if getattr(_p, "corporate_action_mode", "") != "backtest_raw":
+                continue
+            _tl = getattr(_p, "corporate_timeline", None)
+            if _tl is None or id(_tl) in _seen_tl:
+                continue
+            _seen_tl.add(id(_tl))
+            _apply_ex_rights(prev_close_by_day, _tl)
         # P1-3：沪/北送转新增股落 ex_date+1 交易日桶所需的「下一交易日」查询。
         _trade_days = sorted({_t[0].date() for _t in times})
 

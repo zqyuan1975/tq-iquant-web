@@ -2424,6 +2424,121 @@ def test_build_volume_ref_by_day_weekly_only_gives_no_key():
     assert not table
 
 
+# ===========================================================================
+# 2026-11-25：除权日涨跌停基准（不复权口径按交易所除权参考价）
+# ===========================================================================
+def test_build_prev_close_by_day_ex_cash_dividend_uses_reference_price():
+    """除息日前收 = (上一交易日收盘 - 每股现金)；派生的涨停/跌停价同基准。
+
+    真实样本 600256.SH：2025-07-18 除息 0.622，7/17 收 6.08。
+    交易所除权参考价 = 6.08 - 0.622 = 5.458。旧口径仍用 6.08：
+    - 跌停价 5.47（真实 4.91）→ 除息日开盘 5.48 被误判「跌停卖不出」；
+    - 涨停价 6.69（真实 6.00）→ 开盘 6.20 的买单被误放行，高估成交。
+    """
+    from core.engine.backtest_engine import build_prev_close_by_day
+    from core.engine.corporate_actions import (
+        CorporateActionEvent, CorporateActionTimeline)
+    code = "600256.SH"
+    ex_date = date(2025, 7, 18)
+    klines = {code: {"1d": pl.DataFrame({
+        "datetime": [datetime(2025, 7, 17), datetime(2025, 7, 18)],
+        "Open": [Decimal("6.10"), Decimal("5.48")],
+        "High": [Decimal("6.12"), Decimal("5.50")],
+        "Low": [Decimal("6.05"), Decimal("5.40")],
+        "Close": [Decimal("6.08"), Decimal("5.45")],
+        "Volume": [1000, 2000],
+    })}}
+    tl = CorporateActionTimeline([
+        CorporateActionEvent(code=code, event_type="dividend",
+                             ex_date=ex_date,
+                             cash_per_share=Decimal("0.622")),
+    ])
+
+    raw = build_prev_close_by_day(klines)
+    assert raw[(code, ex_date)] == Decimal("6.08")   # 默认口径：旧行为逐字不变
+
+    adjusted = build_prev_close_by_day(
+        klines, corporate_timeline=tl, adjust_ex_rights=True)
+    assert adjusted[(code, ex_date)] == Decimal("5.458")
+
+    # 引擎内涨跌停价公式（front 主板 10%，量化到分）：按除权参考价派生
+    def _limits(pc):
+        return ((pc * Decimal("1.1")).quantize(Decimal("0.01")),
+                (pc * Decimal("0.9")).quantize(Decimal("0.01")))
+
+    assert _limits(raw[(code, ex_date)]) == (Decimal("6.69"), Decimal("5.47"))
+    assert _limits(adjusted[(code, ex_date)]) == (Decimal("6.00"), Decimal("4.91"))
+    # 旧口径 5.48 > 跌停 5.47（卖得出），但 6.20 的买单 6.20 < 6.69 被放行，
+    # 而真实涨停只有 6.00 → 正是「偏激进高估成交」。
+    assert Decimal("5.48") > Decimal("5.47")
+    assert Decimal("6.20") < Decimal("6.69")
+    assert Decimal("6.20") >= Decimal("6.00")
+
+
+def test_build_prev_close_by_day_ex_split_uses_reference_price():
+    """10 送 10（share_ratio=1）：前收 20 → 除权参考价 10，跌停 9.00 而非 18.00。"""
+    from core.engine.backtest_engine import build_prev_close_by_day
+    from core.engine.corporate_actions import (
+        CorporateActionEvent, CorporateActionTimeline)
+    code = "600001.SH"
+    ex_date = date(2026, 7, 30)
+    klines = {code: {"1d": pl.DataFrame({
+        "datetime": [datetime(2026, 7, 29), datetime(2026, 7, 30)],
+        "Close": [Decimal("20"), Decimal("10.5")],
+    })}}
+    tl = CorporateActionTimeline([
+        CorporateActionEvent(code=code, event_type="split", ex_date=ex_date,
+                             share_ratio=Decimal("1")),
+    ])
+    assert build_prev_close_by_day(klines)[(code, ex_date)] == Decimal("20")
+    table = build_prev_close_by_day(
+        klines, corporate_timeline=tl, adjust_ex_rights=True)
+    assert table[(code, ex_date)] == Decimal("10")
+    limit_down = (table[(code, ex_date)] * Decimal("0.9")).quantize(
+        Decimal("0.01"))
+    assert limit_down == Decimal("9.00")     # 旧口径 18.00：开盘 10.5 会被误判跌停
+
+
+def test_run_ex_rights_prev_close_wired_for_backtest_raw():
+    """端到端接线：backtest_raw 组合的除息日，挂单卖出不再被旧前收误判跌停。
+
+    7/29 收 10.00 → 触发 CLOSE；7/30 除息 0.6 元，open 8.80。
+    除权参考前收 9.40 → 跌停 8.46 → 8.80 卖得出（旧前收 10.00 → 9.00 → 被延后）。
+    """
+    from core.engine.corporate_actions import (
+        CorporateActionEvent, CorporateActionTimeline)
+    stock = "600001.SH"
+    klines = _klines(stock, [
+        (datetime(2026, 7, 29), Decimal("10.0"), Decimal("10.1"), Decimal("9.9"),
+         Decimal("10.0"), 1000),
+        (datetime(2026, 7, 30), Decimal("8.8"), Decimal("8.9"), Decimal("8.7"),
+         Decimal("8.8"), 1000),
+    ])
+    port, ctx = _portfolio_with_strategy(stop_loss=Decimal("0.5"))
+    ctx.formula_signals = [
+        {"signal_name": "close_sig", "signal_type": SignalType.CLOSE,
+         "trigger_value": 1},
+    ]
+    pos = ctx.positions.setdefault(stock, Position(stock))
+    pos.apply_trade(_buy_trade("10", 1000, datetime(2026, 6, 1, 9, 30)))
+    port.corporate_action_mode = "backtest_raw"
+    port.corporate_timeline = CorporateActionTimeline([
+        CorporateActionEvent(code=stock, event_type="dividend",
+                             ex_date=date(2026, 7, 30),
+                             cash_per_share=Decimal("0.6")),
+    ])
+    cache = {
+        (1, stock, datetime(2026, 7, 29)): [{"name": "close_sig", "value": 1}],
+    }
+    result = BacktestEngine().run(port, klines=klines, signal_cache=cache)
+
+    sells = [t for t in result["trades"] if t.trade_type == TradeType.SELL]
+    assert len(sells) == 1
+    assert sells[0].trade_time.date() == date(2026, 7, 30)
+    assert sells[0].price == Decimal("8.8")
+    assert not [d for d in result["decisions"] if d["gate"] == "price_limit"]
+
+
 def _weekday_dates(start: date, n: int):
     out = []
     cur = start
