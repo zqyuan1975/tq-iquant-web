@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, reactive, ref } from 'vue'
+import { computed, nextTick, onMounted, onUnmounted, reactive, ref } from 'vue'
 import PageHeader from '../components/PageHeader.vue'
 import {
   activateSelectionVersion,
@@ -155,12 +155,16 @@ const running = ref(false)
 const runs = ref<SelectionRunItem[]>([])
 const lastRunResult = ref<SelectionRunResult | null>(null)
 const runDetail = ref<SelectionRunDetail | null>(null)
+// 详情卡片渲染在长表格之后，点「查看」后需滚动到卡片，否则视口内看起来毫无反应
+const runDetailEl = ref<HTMLElement | null>(null)
 const stockFilter = ref<'selected' | 'all'>('selected')
 const expandedStock = ref<string>('')
 
 // 快照
 const snapshots = ref<SelectionSnapshotItem[]>([])
 const snapshotDetail = ref<SelectionSnapshotDetail | null>(null)
+// 同运行详情：卡片在长列表之后，点「查看」后滚动定位
+const snapshotDetailEl = ref<HTMLElement | null>(null)
 const publishForm = reactive({ code: '', name: '' })
 const publishResult = ref<{
   pool_id: number; pool_code: string; pool_name: string; stock_count: number; kind?: string
@@ -580,6 +584,8 @@ async function openRun(run: SelectionRunItem) {
       recallSnapshotId.value = runDetail.value.snapshot_id
     }
     recallResult.value = null
+    await nextTick()
+    runDetailEl.value?.scrollIntoView({ behavior: 'smooth', block: 'start' })
   } catch (e: any) {
     errorMsg.value = errMsg(e)
   }
@@ -677,6 +683,8 @@ async function openSnapshot(item: SelectionSnapshotItem) {
     snapshotDetail.value = await getSelectionSnapshot(item.id, {
       includeStocks: true, selectedOnly: true, limit: 600,
     })
+    await nextTick()
+    snapshotDetailEl.value?.scrollIntoView({ behavior: 'smooth', block: 'start' })
   } catch (e: any) {
     errorMsg.value = errMsg(e)
   }
@@ -1241,7 +1249,7 @@ onUnmounted(() => {
         <div v-if="runs.length === 0" class="empty-state"><p>还没有运行记录</p></div>
       </div>
 
-      <div v-if="runDetail" class="card" style="padding:12px;margin-top:12px">
+      <div v-if="runDetail" ref="runDetailEl" class="card" style="padding:12px;margin-top:12px">
         <h3 style="margin-top:0">
           运行 #{{ runDetail.id }} · {{ runDetail.scheme_name }} · {{ poolLabel(runDetail.pool_key) }}
           <span :class="statusClass(runDetail.status)" style="margin-left:8px">{{ runDetail.status }}</span>
@@ -1619,7 +1627,7 @@ onUnmounted(() => {
         <div v-if="snapshots.length === 0" class="empty-state"><p>还没有快照，先在「选股结果」运行一次</p></div>
       </div>
 
-      <div v-if="snapshotDetail" class="card" style="padding:12px;margin-top:12px">
+      <div v-if="snapshotDetail" ref="snapshotDetailEl" class="card" style="padding:12px;margin-top:12px">
         <h3 style="margin-top:0">
           快照 #{{ snapshotDetail.id }} · {{ snapshotDetail.scheme_name }} · {{ snapshotDetail.as_of }}
         </h3>
